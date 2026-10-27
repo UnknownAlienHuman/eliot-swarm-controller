@@ -195,13 +195,19 @@ one `(agent,generation)`.
 SourceOwner { agent, generation, family, source, mechanism }
 SourceState {
   agent, generation, source,
-  state: open | closed | gap,
+  state: open | closed,
+  health: ok | slow | stale | error,
   cursor?, last_store_seq?,
   last_batch_id?, last_batch_digest?,
   last_batch_first_seq?, last_batch_last_seq?,
   gap_id?, gap_digest?, gap_from?, gap_to?
 }
 ```
+
+Source lifecycle, health and the latest committed gap boundary are independent. A gap
+records incomplete historical coverage; it does not close the source or change family
+ownership. Exact readback/reconnect may restore health to `ok` while keeping the gap
+visible.
 
 Initial owner/state commits before native I/O. Live stream normally owns controlled
 lifecycle; transcript/history owns observe/repair; hook owns only an assigned missing
@@ -355,18 +361,21 @@ CREATE TABLE source_state (
   cursor TEXT, last_store_seq INTEGER,
   last_batch_id TEXT, last_batch_digest BLOB,
   last_batch_first_seq INTEGER, last_batch_last_seq INTEGER,
-  state TEXT NOT NULL,                    -- open|closed|gap
+  state TEXT NOT NULL,                    -- open|closed
+  health TEXT NOT NULL,                   -- ok|slow|stale|error
   gap_id TEXT, gap_digest BLOB, gap_from TEXT, gap_to TEXT,
   updated_at INTEGER NOT NULL,
   PRIMARY KEY(agent,generation,source),
-  CHECK(state IN ('open','closed','gap')),
+  CHECK(state IN ('open','closed')),
+  CHECK(health IN ('ok','slow','stale','error')),
   CHECK((last_batch_id IS NULL AND last_batch_digest IS NULL
          AND last_batch_first_seq IS NULL AND last_batch_last_seq IS NULL)
         OR
         (last_batch_id IS NOT NULL AND length(last_batch_digest)=32
          AND last_batch_first_seq IS NOT NULL
          AND last_batch_last_seq >= last_batch_first_seq)),
-  CHECK((gap_id IS NULL AND gap_digest IS NULL)
+  CHECK((gap_id IS NULL AND gap_digest IS NULL
+         AND gap_from IS NULL AND gap_to IS NULL)
         OR (gap_id IS NOT NULL AND length(gap_digest)=32))
 );
 
@@ -396,10 +405,10 @@ CREATE TABLE turns (
 );
 ```
 
-Current projections survive event retention. `source_state` last-batch receipt remains
-until replaced by the next committed batch or the source is safely closed/reclaimed.
-Ordinary old event/native-id rows may then prune because cursor sources cannot replay
-behind the committed cursor and no-cursor sources reconnect only at live edge plus gap.
-Linked/selector command sets follow [D-35](../decisions.md): open/unknown children retain
-the parent, terminal children prune first and the complete set disappears before
-`command.children` returns `history_gap`.
+Current projections survive event retention. `source_state` lifecycle, health, latest gap
+and last-batch receipt remain until the source is safely closed/reclaimed; a new batch
+replaces only the last-batch receipt. Ordinary old event/native-id rows may then prune
+because cursor sources cannot replay behind the committed cursor and no-cursor sources
+reconnect only at live edge plus gap. Linked/selector command sets follow
+[D-35](../decisions.md): open/unknown children retain the parent, terminal children prune
+first and the complete set disappears before `command.children` returns `history_gap`.

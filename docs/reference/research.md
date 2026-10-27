@@ -2,14 +2,14 @@
 
 Findings that shape the design, with the rule each one supports. Entries marked ✓
 were re-read on 2026-10-25; the others are carried over from v1's source notes
-(`git show v1-final:docs/agent-communication-fleet-scale-sources.md`,
-`...-field-evidence.md`, `...-peer-autonomy-sources.md`) and were not re-checked.
+(`git show dc6f70aa:docs/agent-communication-fleet-scale-sources.md` before L0.1;
+the same paths are available under `v1-final` afterward) and were not re-checked.
 
 ## Multi-agent scaling and coordination
 
 | Source | Finding | Design rule |
 | --- | --- | --- |
-| ✓ [When Agents Coordinate: Measuring Coordination in Multi-Agent AI Coding](https://arxiv.org/abs/2608.16801) (arXiv, 2026-08) | Direct messages grow nearly quadratically with team size; shared files instead of repeated 1:1 messages cut output tokens ~42% at 8 agents on message-heavy work; naming a coordinator gave no reliable gain. | Shared vars and `who` first, messages second ([coordination](../spec/coordination.md#communication-guidance-for-agent-prompts)); no mandatory manager relay. |
+| ✓ [When Agents Coordinate: Measuring Coordination in Multi-Agent AI Coding](https://arxiv.org/abs/2608.16801) (arXiv, 2026-08) | Direct messages grow nearly quadratically with team size; shared files instead of repeated 1:1 messages cut output tokens ~42% at 8 agents on message-heavy work; naming a coordinator gave no reliable gain. | Shared vars and `who` first, messages second ([coordination](../spec/coordination.md#prompt-guidance)); no mandatory manager relay. |
 | ✓ [Towards a Science of Scaling Agent Systems](https://arxiv.org/abs/2512.08296) (arXiv, 2025-12) | Coordination helps less when one agent is already strong; adds overhead on tool-heavy tasks; architecture–task fit decides (+80.8% to −70.0%); no central verification spreads errors. | Parallelism is a per-task choice, not a default; verification (checks, goal `check`) belongs to the workflow. |
 | ✓ [Building a C compiler with a team of parallel Claudes](https://www.anthropic.com/engineering/building-c-compiler) (Anthropic, 2026-02) | Parallel agents work on many independent, verifiable items; on one monolithic task they overwrite each other. Coordination was lock files in the repo plus Git sync, near-perfect tests, CI, concise output with logs in files. | Claims + Git-based `who`; tests as goal checks; quiet agents. |
 | [How we built our multi-agent research system](https://www.anthropic.com/engineering/multi-agent-research-system) (Anthropic) | Large gains on breadth-first research at ~15× the tokens; long-running agents need checkpoints and resume. | Budgets on goals; `resume` instead of restart. |

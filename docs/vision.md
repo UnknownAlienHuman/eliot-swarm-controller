@@ -46,13 +46,13 @@ Each requirement maps to the owner statement and to the layer that delivers it
 | R8 | One bus and one command language. The caller never uses harness-specific terms; the plugin translates. | 8 | L1 |
 | R9 | No architectural limit on the number of agents; parent/child trees of any depth (configurable guards only); native subagents appear as children. | 9 | L1, L5, L7 |
 | R10 | Agents talk to each other directly (messages, shared variables) and can ask "who works on this path" — answered from Git facts and the agents' own file-change events. | 10 | L3, L5 |
-| R11 | Core in Rust. Plugins and scripts may be written in any language during bring-up and are ported to Rust later. | 11 | L8 |
+| R11 | Core in Rust. Plugins and scripts may be written in any language during bring-up and are ported to Rust later. | 11 | all |
 
 ## Non-goals
 
 - **No Task/Issue/review/acceptance/publication engine in the core.** Such workflows
   are built from agents, rules and scripts (examples in
-  [automation](spec/automation.md#workflow-recipes)). v1 drowned in this machinery.
+  [automation](spec/automation.md#actions-are-commands)). v1 drowned in this machinery.
 - **No multi-user security platform.** One local owner; agents are processes of the
   same OS user. Inside a host, identity is for attribution and routing, not a security
   boundary. Remote access is a separate later layer.

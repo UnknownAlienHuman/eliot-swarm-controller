@@ -13,7 +13,7 @@ The design follows Waku and Paseo:
 ## Source ownership and health
 
 The current `(agent,generation,family) -> source` map lives in
-[`source_owners`](core.md#events-and-source-ownership). Typical assignment:
+[`source_owners`](core.md#events-and-authoritative-sources). Typical assignment:
 
 | Family | Controlled Agent | Observe/recovery Agent |
 | --- | --- | --- |
@@ -34,6 +34,11 @@ source epochs or independent lifecycle projections.
 Health states are `ok|slow|stale|error`. Event-stream silence is not stale by itself; a
 lost transport is stale until reconnect. Stale authoritative lifecycle means current
 turn progress is unknown, never idle/done.
+
+Source lifecycle (`open|closed`), health and the latest committed gap boundary are
+independent fields in the same `source_state` row. Recording a gap does not close the
+source or transfer family ownership. After exact readback and live-edge recovery, health
+may return to `ok` while the historical gap remains visible.
 
 ## Process identity and custody
 

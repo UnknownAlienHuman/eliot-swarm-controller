@@ -33,4 +33,5 @@ someone needs it ([defaults](../decisions.md#defaults)).
 ## Candidates noted in v1, not integrated
 
 CodeGraff/Harness, Sinew, Pi-Go, OpenChamber, Delta, Agent Teams AI, Vicoa,
-JetBrains Air, SWE-agent — see `git show v1-final:docs/candidate-notes.md`.
+JetBrains Air, SWE-agent — see `git show dc6f70aa:docs/candidate-notes.md` before L0.1;
+afterward the same path is available under `v1-final`.
