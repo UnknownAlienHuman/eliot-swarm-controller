@@ -18,11 +18,15 @@ Every harness page must answer:
 4. Which source owns each lifecycle family while controlled and while observe-only?
 5. Which source has an opaque exclusive replay cursor? If none, reconnect records a gap
    and starts at the live edge.
-6. What native id binds input→turn, steer/interrupt→turn and approval/answer→request?
-7. What exact readback settles a lost reply? Unsupported/unknown is preferable to
+6. What stable vendor/cursor-derived `native_id` makes a retried `events.put` safe? If
+   no stable id/cursor exists, the plugin must not retry a lost acknowledgement.
+7. What exact `source.handoff` transfers a family, and what cursor/gap boundary proves
+   it? A lost handoff reply is settled through `source.state`, not another blind handoff.
+8. What native id binds input→turn, steer/interrupt→turn and approval/answer→request?
+9. What exact readback settles a lost native reply? Unsupported/unknown is preferable to
    heuristic substitution.
-8. Can a native child receive an isolated Eliot environment before its tools run?
-9. What is the effective provider/account/permissions route, and how is it read back?
+10. Can a native child receive an isolated Eliot environment before its tools run?
+11. What is the effective provider/account/permissions route, and how is it read back?
 
 No plugin adds binding revisions, source epochs, adapter journals or its own workflow
 engine. It uses the common generation/source/cursor/command contracts.
@@ -61,7 +65,8 @@ qualification
 4. During L0–L6 run format + smallest changed-package Clippy. Keep named fixture/live
    cases for final L7 conformance; do not build a broad campaign around every partial
    task.
-5. Update this matrix from actual behavior.
+5. Update the page and this matrix from actual behavior, including exact generation,
+   source owner, cursor/native-id and handoff/readback facts.
 
 L7 runs one common black-box conformance suite over recordings and compact live runs for
 all required harnesses.
