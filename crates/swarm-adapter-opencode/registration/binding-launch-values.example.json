@@ -1,5 +1,0 @@
-{
-  "OPENCODE_SERVICE_ID": "<operator-stable-service-id>",
-  "OPENCODE_CONNECTION_FILE": "<absolute-path-to-existing-connection-record>",
-  "OPENCODE_DIRECTORY": "<absolute-workspace-path>"
-}

@@ -1,8 +1,8 @@
 # Lessons from v1
 
-Historical reference: `dc6f70aa` (later `v1-final`). These are constraints learned from
-v1 records, not new runtime measurements. Do not make reading the old audit history an
-implementation prerequisite.
+Historical reference: `dc6f70aa`, preserved on branch `archive/v1-final`. These are
+constraints learned from v1 records, not new runtime measurements. Do not make reading
+the old audit history an implementation prerequisite.
 
 | Failure | Small v2 response |
 | --- | --- |

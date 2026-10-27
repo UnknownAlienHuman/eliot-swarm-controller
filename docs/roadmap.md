@@ -35,14 +35,18 @@ to create every crate/table immediately.
 
 ## L0 — Archive and smallest workspace
 
-- [ ] **L0.1 Archive/reset.** Verify tag `v1-final` names commit `dc6f70aa` before
-      deleting v1 implementation/tests/workflows/vendor material. Keep v2 docs and
-      repository metadata; preserve notices for any code actually retained. Do not
-      delete an existing different archive tag or overwrite another manager's work.
-- [ ] **L0.2 Build.** Rust 2024 workspace, pinned stable toolchain, `eliot --version`,
-      fmt and scoped Clippy on Windows/Ubuntu. No empty framework crates or test platform.
+- [x] **L0.1 Archive/reset.** v1 is preserved on branch `archive/v1-final` at
+      `dc6f70aa08ea5fad3da04624ce50c46d45edd57c`. The legacy implementation, migrations,
+      tests, tooling, vendor files, workflows and embedded owner-decisions are removed
+      from main; v2 docs and root agent instructions remain. The archive retains the
+      original third-party notices. Use the pinned commit, not an assumed tag.
+- [x] **L0.2 Build.** Rust 2024 workspace, resolver 3, pinned Rust 1.99.1, one dependency-
+      free `eliot` binary with help/version. CI runs fmt, scoped Clippy and brief
+      help/version smoke commands on Windows/Ubuntu. No empty framework crates or
+      test platform.
 
-**Result:** the smallest compiling binary, with v1 available as a source donor.
+**Next:** L1.1. The current executable is only the build skeleton; it does not advertise
+or pretend to implement daemon/Agent commands. v1 remains available as a source donor.
 
 ## L1 — Core, Store, bus and one fake command path
 

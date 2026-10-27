@@ -24,5 +24,8 @@ contract is not a requirement to implement every feature in the first layer.
 
 The first usable milestone is direct Codex/Luna after core/bus. Automation, communication
 and other harnesses follow. Update the page that owns a changed contract; do not create
-reports, addenda, proof packets or another status registry. v1 remains at `dc6f70aa`
-and, once created/verified, tag `v1-final`.
+reports, addenda, proof packets or another status registry.
+
+v1 code and its original notices are preserved on branch `archive/v1-final`, at commit
+`dc6f70aa08ea5fad3da04624ce50c46d45edd57c`. Read pinned donor files with
+`git show dc6f70aa:<path>`; the old owner-decisions and runtime are not active v2 inputs.
