@@ -1,41 +1,41 @@
 # Configuration
 
-## Data directory
+## Private data directory
 
-Default `%LOCALAPPDATA%\Eliot` (Windows) or `~/.local/share/eliot`; override with
-`--data-dir` or `ELIOT_HOME`. The daemon creates it on first start, readable only by
-the current user, and takes `daemon.lock` (one daemon per data dir).
+Default `%LOCALAPPDATA%\Eliot` on Windows or `~/.local/share/eliot`; override with
+`--data-dir` or `ELIOT_HOME`. The root and private files are current-user-only; reject
+symlink/reparse-point roots and unsafe ownership.
 
 ```text
 <data_dir>/
-  config.toml          global config (below)
-  eliot.db             SQLite store
-  daemon.json          pid, endpoint, version (written by the daemon)
-  daemon.lock
-  logs/daemon.log      rotated, bounded
-  rules/*.toml         global rules
-  plugins/<name>/      plugin private state (generated hook configs)
-  worktrees/<agent>/   worktrees created by Eliot (when workspace_mode = worktree)
+  config.toml
+  owner.token            local attribution token used automatically by owner CLI
+  eliot.db, eliot.db-wal, eliot.db-shm
+  daemon.json, daemon.lock
+  logs/daemon.log
+  rules/*.toml
+  plugins/<name>/...
+  services/<name>/...
+  frozen/<write-id>/...  bounded admitted note/setup/script copies when needed
+  worktrees/<agent>/...
 ```
 
-Project-level files live in the repository, so they are versioned with the code:
+`owner.token` is high-entropy local attribution, not same-user isolation. It is not
+stored in SQLite, logs or Agent environments. Ordinary CLI outside an Eliot Agent/rule
+environment reads it automatically; there is no `--owner` ceremony and no no-token
+owner fallback.
+
+Project files are loaded only from owner-registered checkouts, never an Agent worktree:
 
 ```text
-<repo>/.eliot/
-  config.toml          project profile overlays and settings
-  rules/*.toml
-  scripts/
+<registered repo>/.eliot/config.toml
+<registered repo>/.eliot/rules/*.toml
+<registered repo>/.eliot/scripts/*
 ```
 
-Project files are loaded only for repositories registered in the global config
-(`[projects.<name>] path = "C:/src/app"`), and only from that path, never from an
-agent's worktree. Agents can write files in the repo; a rule they add takes effect
-only when it reaches the registered checkout, and every reload is reported as a
-`source.health` event for `config` naming the changed files. A file that fails to load
-keeps the previous version active. The project name is the default `project` of
-agents launched in that repo.
+Invalid reload keeps the last valid configuration and reports source health.
 
-## `config.toml`
+## Global configuration example
 
 ```toml
 [daemon]
@@ -46,46 +46,45 @@ limits.max_children_per_agent = 20
 limits.max_tree_agents = 100
 limits.max_selector_targets = 1000
 automation.max_actions_per_minute = 120
-automation.max_parallel_checks = 2       # goal checks running at once
+automation.max_parallel_checks = 2
 automation.check_timeout = "10m"
 
 [process]
 scan_interval = "2s"
+terminal_drain_timeout = "10s"
 
 [git]
 poll_interval = "15s"
-remote_poll = "off"            # or "10m": periodic ls-remote
+remote_poll = "off"
+fingerprint_max_files = 5000
+fingerprint_max_bytes = 67108864
 
-[plugins.codex]                # built-in: no cmd needed
+[plugins.codex]                    # built in
 [plugins.claude]
-cmd = ["node", "C:/src/eliot/plugins/claude/main.mjs"]   # external plugin, any language
+cmd = ["node", "C:/src/eliot/plugins/claude/main.mjs"]
 
 [projects.app]
 path = "C:/src/app"
 
 [accounts.codex-main]
-max_live = 8                          # one subscription: cap live agents across every profile that uses it
+max_live = 8
 
 [proxies.opencodex]
-max_live = 8                          # optional: cap live agents across all profiles using this proxy
-attach = "http://127.0.0.1:10100"     # use a running service ...
-# launch = ["opencodex", "..."]       # ... or let Eliot start and supervise it
+max_live = 8
+attach = "http://127.0.0.1:10100"
 health = "/api/system/health"
-api_key_env = "OPENCODEX_API_KEY"     # name of the env var holding the client key; never the key itself
-
-[plugins.fake]
-verbs = ["launch", "send", "steer", "inject", "interrupt", "stop", "resume",
-         "approve", "deny", "answer", "configure"]   # optional: narrow the declared verbs
+api_key_env = "OPENCODEX_API_KEY"
 
 [profiles.codex]
 harness = "codex"
-model = "<model id>"                  # passed through to the harness as is
-effort = "high"                       # the harness's own value
+model = "<native model id>"
+effort = "high"
+permissions = "workspace-write"
 billing = "subscription"
 account = "codex-main"
 pass_env = ["CODEX_HOME"]
-permissions = "workspace-write"
-workspace_mode = "shared"             # "worktree" from L3.2
+secret_env = []
+workspace_mode = "shared"
 labels = { role = "writer" }
 
 [profiles.codex-opencodex]
@@ -99,115 +98,142 @@ control = "project"
 labels = { role = "manager" }
 ```
 
-Rules:
+Unknown keys are load errors with file/line, except plugin-private keys inside
+`[plugins.<name>]`, which the plugin validates at initialize. `extends` is one level.
+`eliot status` shows effective profile sources without secret values.
 
-- Credentials (API keys, OAuth tokens) never live in config, the Store, events or
-  messages. A profile's literal `env` holds non-secret values only. Secrets are named:
-  `api_key_env` (proxy key) and `pass_env` (variables passed from the daemon's
-  environment); `secret_env` marks which `pass_env` names hold secrets (a name not
-  in `pass_env` is a load error), so their
-  values are masked in events and refused in stored writes. The daemon reads the
-  values only when it starts the process. Agent tokens are routing handles, not
-  credentials ([D-07](../decisions.md)).
-- `extends` merges one profile over another (one level; `extends` of an `extends` is
-  an error). Missing fields take the [defaults](core.md#profile).
-- Rust projects: give each worktree its own `CARGO_TARGET_DIR` (profile `env`); two
-  live agents building in one target directory block or corrupt each other's builds.
-  Eliot does not serialize Cargo for them.
-- Windows: keep the data dir short (worktrees live under it and `MAX_PATH` is real);
-  Eliot passes `core.longpaths=true` to its own `git` calls and to agent processes
-  through `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0` (no config file is
-  written) and fails with a clear error when a path is still too long.
-- Unknown keys are an error at load time, with the file and line — except inside
-  `[plugins.<name>]`, whose extra keys are passed to the plugin and validated by it at
-  `initialize`.
-- `eliot status` shows the effective merged config source for each profile.
+## Authority and project overlays
 
-## Project overlays
+Global config defines harness/plugin executable, account, proxy/service, environment,
+permissions/control and base profiles. Project config can only narrow an existing
+same-name global profile:
 
-A project file can only **narrow** what the owner configured globally, because agents
-can write to the repository. A project `[profiles.X]` must name a global profile `X`
-(same name) and may set only: `labels` (added), `max_live` (not above the global
-value), `stall_after`, `notify_parent`, `wake_on_mail`, `system_note`, `setup` and
-`scratch` (paths inside the repository). Any other key — harness, cmd, args, model,
-effort, permissions, control, env, pass_env, inherit_env, secret_env, account, proxy,
-billing — is a load error naming the key; the owner adds a global profile instead.
-Other project tables merge key by key, project over global, for the keys documented
-as project-settable.
+- add bounded labels;
+- lower `max_live`;
+- choose `stall_after`, `notify_parent`, `wake_on_mail`;
+- reference project-local `system_note`, `setup` and relative `scratch` entries.
 
-## Environment
+It cannot change/add harness, plugin/cmd/args, model/effort, permissions, control,
+workspace mode, Git identity, literal/pass/secret/inherit environment, account, proxy,
+billing or endpoint. An owner adds another global profile for a different route.
 
-A harness process gets a **minimal environment**, not the daemon's:
+Project rules/scripts remain project principals and can target only that project.
 
-1. an OS baseline — Windows: `SystemRoot`, `SystemDrive`, `windir`, `ComSpec`,
-   `PATHEXT`, `PATH`, `TEMP`, `TMP`, `USERPROFILE`, `HOMEDRIVE`, `HOMEPATH`,
-   `APPDATA`, `LOCALAPPDATA`, `ProgramData`, `ProgramFiles`, `USERNAME`, `COMPUTERNAME`,
-   `PROCESSOR_ARCHITECTURE`, `NUMBER_OF_PROCESSORS`; Unix: `HOME`, `PATH`, `USER`,
-   `LOGNAME`, `SHELL`, `LANG`, `LC_*`, `TMPDIR`, `TERM` (v1 found that a fully
-   cleared environment breaks harness startup);
-2. the values of the variables named in the profile's `pass_env`;
-3. the profile's literal `env`;
-4. the proxy wiring the plugin needs (e.g. the variable named by `api_key_env`);
-5. the Eliot variables (`ELIOT_HOME`, `ELIOT_AGENT_ID`, `ELIOT_AGENT_TOKEN`, `PATH`
-   with `eliot`, Git identity, `GIT_CONFIG_*`).
+## Frozen profile and admitted files
 
-Later steps override earlier ones; on Windows names compare case-insensitively.
-`inherit_env = true` (global profiles only) starts from the daemon's whole environment
-instead of step 1; `eliot show` warns about it, because every secret the daemon can see
-then reaches the agent and everything it runs. Scripts get the same baseline plus the
-rule's literal `env`; a global rule may also name `pass_env`.
+Admission stores one bounded `profile_snapshot` on the Agent/command. It contains:
 
-## Accounts
+```text
+ProfileSnapshot {
+  profile_name, harness, plugin,
+  model?, effort?, permissions, control,
+  args, literal_env, pass_env_names, secret_env_names, inherit_env,
+  account?, proxy?, billing?, workspace_mode, git_identity,
+  labels, max_live?, stall_after, notify_parent, wake_on_mail,
+  system_note?, setup[], scratch, source_files
+}
+FrozenFile { canonical_path, size, digest, private_copy? }
+```
 
-A subscription or API key is shared by every profile that uses it, so limits live on
-the account:
+Secrets remain variable names only. Existing Agents never silently adopt a config reload.
+Resume/control takeover uses the stored snapshot unless the owner explicitly selects a
+new profile, which creates a new generation.
 
-| Key | Meaning |
-| --- | --- |
-| `[accounts.<name>] max_live` | Cap on live agents across all profiles with `account = "<name>"`. |
+For project notes/setup/scripts:
 
-A launch must fit its profile's, its account's and its proxy's `max_live`; it waits in
-`created` until all three have a free slot. Separate native logins are separate
-accounts whose profiles point the harness at their own config/auth dir (`CODEX_HOME`,
-`CLAUDE_CONFIG_DIR`, ... via `pass_env` or `env`).
+1. resolve under the registered allowed root;
+2. reject `..`, symlink/reparse-point escape, device/alternate-stream forms;
+3. bound size and compute digest at admission;
+4. copy small text/scripts to private `frozen/<write-id>/` or store bounded bytes;
+5. otherwise store canonical path+size+digest and verify immediately before dispatch;
+6. mismatch fails the command rather than running different bytes.
 
-After `provider.limited` of kind `rate_limit` or `quota`, new launches and new sends of
-that account wait (`hold`); agents already in a turn are not touched. `retry_after` is
-not proof of recovery: after it passes, one queued launch or send runs as a probe and
-the rest wait until the probe's turn succeeds. A probe whose outcome is unknown keeps
-the hold. `model_gone` and `auth` holds clear only by a config change or
-`eliot hold clear ACCOUNT`. Holds live in memory: after a daemon restart the first
-launch or send of the account is the probe. A rule may react to `provider.limited`,
-but Eliot itself never switches an agent to another account, model or route.
+This is not a global content-addressed artifact store and has no artifact graph/GC.
+Frozen files are deleted when no retained open/unknown command or current profile
+snapshot references them.
+
+## Environment and secrets
+
+Default process environment is minimal:
+
+1. OS baseline required to start normal programs;
+2. variables named by global profile `pass_env`;
+3. literal nonsecret profile `env`;
+4. account/proxy/plugin secret references resolved in memory;
+5. Eliot Agent or scoped run variables, Git identity and CLI path.
+
+Later layers override earlier ones. Windows keys compare case-insensitively.
+`inherit_env=true` is global-profile-only and visibly warned because all daemon secrets
+then reach the Agent/tools.
+
+`secret_env` names must also appear in `pass_env`; resolved values are masked from native
+output and rejected in caller-supplied durable semantic text. Raw owner, Agent and run
+tokens never appear in config/events/messages/fixtures/logs.
+
+A native child gets its own Agent token only when the plugin can inject an isolated
+environment before tools run. Otherwise it has `own_identity=false` and no independent
+CLI principal.
+
+## Accounts, capacity and provider holds
+
+A launch/control takeover must fit all named scopes:
+
+- profile `max_live`;
+- account `max_live` across every profile using it;
+- proxy/service `max_live`.
+
+Capacity is reserved atomically before native I/O and released only on exact no-session
+failure or terminal observation. Observe-only attach uses no capacity; control attach
+reserves before takeover. Detach of a still-live provider session does not pretend the
+provider capacity vanished.
+
+Provider holds are durable in the Store (schema in
+[monitoring](monitoring.md#provider-holds)). `rate_limit|quota` may permit one explicit
+probe after their boundary. Unknown probe remains reserved across restart. `auth` and
+`model_gone` clear only after explicit owner/config evidence. Eliot never silently
+changes account/model/provider/route.
 
 ## Plugins
 
+`[plugins.<name>] cmd` names an external plugin; omitted means built-in. Extra keys are
+private plugin configuration.
+
+The plugin manifest chooses `per_agent|shared`; config cannot weaken it. A per-Agent
+instance receives a private generation directory. A shared plugin must prove exact
+session attribution/readback/isolated stop according to the plugin protocol.
+
+The daemon obtains a manifest from a short initialize/shutdown probe and caches it until
+restart or command/config revision changes. Launch preflight uses the cached availability
+and capabilities; it does not create a native session.
+
+## Proxies and services
+
+A proxy/service entry is one of:
+
+- `attach`: owner-run/adopted endpoint; health-check/read-only, never stopped or repaired;
+- `launch`: daemon-managed service with separate service custody, endpoint/PID/birth
+  identity persisted before use.
+
 | Key | Meaning |
 | --- | --- |
-| `cmd` | Command of an external plugin. Omitted for built-in plugins. Global config only. |
-| anything else | Passed to the plugin as `plugin_config` (e.g. the fake plugin's `verbs`). |
+| `attach` | owner-run base URL |
+| `launch` | explicit argv for managed service |
+| `health` | bounded readiness probe |
+| `max_live` | capacity across profiles using the service |
+| `idle_stop` | managed only; default never |
+| `api_key_env` | environment-variable name holding client key |
+| `base_url_for` | optional per-harness explicit endpoint |
 
-Whether a plugin runs one process per agent or one for many is the plugin's manifest
-(`features.multi_session`), not configuration. A second entry can reuse a plugin under
-another name (`[plugins.fake-narrow] cmd = ["eliot", "plugin", "fake"]`).
+Agent stop never kills a shared service. Attached service is never killed by Eliot.
+Requested URL is not proof of routing: plugin reports effective provider/endpoint and
+live qualification verifies it.
 
-## Proxies
+## Paths and platform defaults
 
-A proxy entry describes a provider proxy (OpenCodex, any OpenAI/Anthropic-compatible
-gateway, or a [local model server](../harnesses/local-models.md)):
-
-| Key | Meaning |
-| --- | --- |
-| `attach` | Base URL of an already running proxy. Eliot checks `health` and never stops it. |
-| `max_live` | Optional cap on live agents across all profiles that use this proxy. |
-| `launch` | Command to start it. Eliot supervises it as a service: starts before the first agent that needs it, health-checks, restarts with backoff, stops when no agent uses it for `idle_stop` (default never). |
-| `idle_stop` | For `launch`ed proxies: stop after no agent used it for this long (default: never). |
-| `health` | Path for the health check (HTTP 200 = up). |
-| `api_key_env` | Env var with the key the harness must send to the proxy. |
-| `base_url_for` | Optional per-harness override, e.g. `{ claude = "http://127.0.0.1:10100/anthropic" }`. |
-
-How a profile's proxy reaches the harness is plugin knowledge (each plugin's manifest
-`proxy` section and its [harness page](../harnesses/README.md)): e.g. Claude Code via
-`ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`, Codex via a `model_providers` entry,
-OpenCode via a provider `options.baseURL`. The plugin reports the effective endpoint
-in `session.ready`.
+- keep Windows data/worktree paths short and pass `core.longpaths=true` without editing
+  repository config;
+- separate Cargo target directory per Agent worktree;
+- resolve executable and argv separately;
+- project cleanup/setup/scratch uses the path rules above;
+- no implicit fetch during launch admission or workspace dispatch;
+- configuration values/counts/strings are bounded before persistence or plugin framing.
