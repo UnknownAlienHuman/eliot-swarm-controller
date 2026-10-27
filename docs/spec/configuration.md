@@ -16,7 +16,7 @@ symlink/reparse-point roots and unsafe ownership.
   rules/*.toml
   plugins/<name>/...
   services/<name>/...
-  frozen/<opaque-safe-id>/... bounded admitted note/setup/script/plugin copies when needed
+  frozen/<opaque-safe-id>/... bounded admitted note/setup/script/plugin/service copies
   worktrees/<agent>/...
 ```
 
@@ -61,7 +61,7 @@ remote_poll = "off"
 fingerprint_max_files = 5000
 fingerprint_max_bytes = 67108864
 
-[plugins.codex]                    # built in
+[plugins.codex]
 [plugins.claude]
 cmd = ["C:/Program Files/nodejs/node.exe", "C:/src/eliot/plugins/claude/main.mjs"]
 
@@ -125,7 +125,7 @@ billing or endpoint. An owner adds another global profile for a different route.
 
 Project rules/scripts remain project principals and can target only that project.
 
-## Frozen profile, plugin route and admitted files
+## Frozen profile and route binding
 
 Admission stores one bounded `profile_snapshot` on the Agent/command:
 
@@ -135,61 +135,90 @@ ProfileSnapshot {
   plugin: PluginBinding,
   model?, effort?, permissions, control,
   args, literal_env,
-  pass_env_values,              // frozen nonsecret name→value
-  secret_env_names,             // names only; values resolved at execution
+  pass_env_values,
+  secret_env_names,
   inherit_env,
-  account?, proxy?, billing?, workspace_mode, git_identity,
+  account: AccountBinding?,
+  proxy: ProxyBinding?,
+  billing?, workspace_mode, git_identity,
   labels, max_live?, stall_after, notify_parent, wake_on_mail,
   system_note?, setup[], scratch, source_files
 }
 PluginBinding {
   name,
   kind: builtin | external,
-  cmd?,                         // exact argv frozen at admission
-  private_config,               // canonical bounded nonsecret plugin config
-  private_config_digest,
+  cmd?,
+  private_config, private_config_digest,
+  executable?, referenced_files[]
+}
+AccountBinding {
+  name, capacity_scope,
+  auth_store_names,
+  requested_billing
+}
+ProxyBinding {
+  name,
+  mode: adopted | managed,
+  endpoint?,
+  launch_cmd?,
+  health_path,
+  capacity_scope,
+  api_key_env_name?,
+  base_url_for?,
+  config_digest,
   executable?, referenced_files[]
 }
 FrozenFile { canonical_path, size, digest, private_copy? }
 ```
 
+### Plugin binding
+
 For a built-in plugin, the route is its name inside the installed Eliot binary; its
 reported version is diagnostic, not an authorization gate. For an external plugin,
-admission freezes the exact command argv and canonical private config. `cmd[0]` must
-resolve to an absolute owner-controlled executable. Every local script/module path named
-by the command is recorded as `FrozenFile` or copied to a private frozen path. Mutable
-working-directory-relative commands and a command that resolves differently at dispatch
-are rejected.
+admission freezes exact command argv and canonical private config. `cmd[0]` must resolve
+to an absolute owner-controlled executable. Every local script/module path named by the
+command is recorded as `FrozenFile` or copied privately. Mutable cwd-relative commands
+and a command that resolves differently at dispatch are rejected.
 
-Dispatch uses the frozen `PluginBinding`, never the current `[plugins.<name>]` table. It
-rechecks every referenced path/digest before starting the plugin. A mismatch or missing
-old version fails before plugin/native I/O; it never silently substitutes a new binary,
-account, endpoint or plugin-private setting. A config reload creates bindings for future
-admissions only. An owner who wants an existing terminal Agent to use a new plugin route
-must explicitly resume/control-attach with a newly selected profile snapshot.
+Dispatch uses frozen `PluginBinding`, never current `[plugins.<name>]`. It rechecks
+referenced paths/digests before start. Missing/changed old route fails before native I/O;
+it never substitutes another binary or private setting. Manifest probe/cache is keyed by
+binding digest. Version is display evidence, not an authorization gate.
 
-This freezes semantic route/configuration, not vendor-version equality: an owner may
-install a new built-in Eliot build or explicitly choose a new versioned external path.
-The plugin still reports its actual version/effective route and L7 qualifies semantics.
+### Account, proxy and service binding
 
-Secrets remain names only. Existing Agents never silently adopt config reloads. Resume
-uses the stored snapshot by default. A control takeover may use the stored snapshot or
-an explicitly selected owner profile; either choice is frozen before admission and
-targets the next generation.
+A profile freezes account name/capacity scope and all nonsecret route/store selectors
+such as admitted `CODEX_HOME`. Secret values remain execution-time references.
 
-For project notes/setup/scripts and external plugin files:
+An adopted proxy freezes direct normalized endpoint, health path, per-harness base URLs
+and key-variable name. A managed proxy freezes absolute launch argv, referenced files,
+health path and endpoint metadata. Dispatch never rereads current
+`[proxies.<name>]`.
 
-1. resolve under the registered allowed root;
+Managed/adopted service identity is `(proxy name, config_digest)`. A live service is
+reused only when that exact identity and custody/endpoint readback match. If config
+changes while an old binding is in use, future admissions use the new binding but Eliot
+does not mutate or kill the old service. Starting both versions under one conflicting
+endpoint/name is refused; owner waits for old users to drain or defines another proxy
+name. This is exact desired-state identity, not a provider-version gate.
+
+Existing Agents never silently adopt config reloads. Resume uses its stored snapshot by
+default. A control takeover may use stored snapshot or an explicitly selected owner
+profile; either is frozen before admission and targets the next generation.
+
+## Frozen files
+
+For project notes/setup/scripts and external plugin/service files:
+
+1. resolve under registered allowed root;
 2. reject `..`, symlink/reparse-point escape, device/alternate-stream forms;
 3. bound size and compute digest at admission;
-4. copy small text/scripts to a private `frozen/<opaque-safe-id>/` directory or store
-   bounded bytes;
+4. copy small text/scripts to private `frozen/<opaque-safe-id>/` or store bounded bytes;
 5. otherwise store canonical path+size+digest and verify immediately before dispatch;
-6. mismatch fails the command rather than running different bytes.
+6. mismatch fails rather than executing changed bytes.
 
-The Store allocates the opaque directory component from a filesystem-safe alphabet and
-stores the resulting private path in the owning snapshot/definition/command. It is not
-derived from a command string. There is no global content-addressed artifact store or
+Store allocates opaque path components from a filesystem-safe alphabet; they are not
+derived from command strings. There is no global content-addressed artifact store or
 artifact graph/GC. Frozen copies are removed only when no retained current snapshot/
 definition or open/unknown command references them.
 
@@ -213,17 +242,17 @@ billing identity shown to the user.
 
 Later layers override earlier ones. Windows keys compare case-insensitively.
 `inherit_env=true` is global-profile-only and visibly warned because all daemon secrets
-then reach the Agent/tools; an inherited profile freezes the nonsecret route values
-needed to identify its store/account and treats all remaining inherited values as
-execution-time environment, never durable semantic data.
+then reach the Agent/tools; an inherited profile freezes nonsecret route values needed
+to identify store/account and treats remaining inherited values as execution-time
+environment, never durable semantic data.
 
-Resolved secret values are masked from native output and rejected in caller-supplied
-durable semantic text. Raw owner, Agent and run tokens never appear in config/events/
-messages/fixtures/logs.
+Resolved secret values are masked from native output and rejected in caller durable
+semantic text. Raw owner, Agent and run tokens never appear in config/events/messages/
+fixtures/logs.
 
 A native child gets its own Agent token only when the plugin can inject an isolated
-environment before tools run. Otherwise it has no child principal; calls made from a
-shared parent environment are attributed to the parent generation.
+environment before tools run. Otherwise it has no child principal; calls from a shared
+parent environment are attributed to the parent generation.
 
 ## Accounts, capacity and provider holds
 
@@ -235,7 +264,7 @@ A launch/control takeover must fit all named scopes:
 
 Capacity is reserved atomically before native I/O and released only on exact no-session
 failure or terminal observation. Observe-only attach uses no capacity; control attach
-reserves before takeover. Detach of a still-live provider session does not pretend the
+reserves before takeover. Detach of a still-live provider session does not pretend
 provider capacity vanished.
 
 Provider holds are durable in the Store (schema in
@@ -247,40 +276,39 @@ changes account/model/provider/route.
 ## Plugins
 
 `[plugins.<name>] cmd` names an external plugin; omitted means built-in. Extra keys are
-private plugin configuration. Secret values are referenced by names and resolved only in
+private plugin config. Secret values are referenced by names and resolved only in
 memory; frozen private config contains no secret values.
 
-The plugin manifest chooses `per_agent|shared`; config cannot weaken it. A per-Agent
-instance receives a private generation directory. A shared plugin must prove exact
-session attribution/readback/isolated stop according to the plugin protocol.
+Manifest chooses `per_agent|shared`; config cannot weaken it. A per-Agent instance gets
+a private generation directory. A shared plugin must prove exact session attribution,
+readback and isolated stop.
 
-The daemon obtains a manifest from a short initialize/shutdown probe of the **current
-configured route** and caches it by `PluginBinding` digest. Launch preflight for an
-admitted Agent uses the manifest corresponding to its frozen binding; a later config
-reload cannot replace that route. Availability is rechecked at dispatch without creating
-a native session.
+Daemon gets a manifest from short initialize/shutdown probe of current configured route
+and caches by `PluginBinding` digest. Launch preflight uses the manifest matching the
+admitted frozen binding; reload cannot replace it. Availability is rechecked at dispatch
+without creating a native session.
 
 ## Proxies and services
 
-A proxy/service entry is one of:
+A proxy entry is one of:
 
-- `attach`: owner-run/adopted endpoint; health-check/read-only, never stopped or repaired;
+- `attach`: owner-run/adopted endpoint; health-check/read-only, never stopped/repaired;
 - `launch`: daemon-managed service with separate service custody, endpoint/PID/birth
   identity persisted before use.
 
 | Key | Meaning |
 | --- | --- |
-| `attach` | owner-run base URL |
+| `attach` | owner-run direct base URL |
 | `launch` | explicit argv for managed service |
 | `health` | bounded readiness probe |
-| `max_live` | capacity across profiles using the service |
+| `max_live` | capacity across profiles using service |
 | `idle_stop` | managed only; default never |
-| `api_key_env` | environment-variable name holding client key |
-| `base_url_for` | optional per-harness explicit endpoint |
+| `api_key_env` | variable name holding client key |
+| `base_url_for` | optional per-harness direct endpoint |
 
-Agent stop never kills a shared service. Attached service is never killed by Eliot.
-Requested URL is not proof of routing: plugin reports effective provider/endpoint and
-live qualification verifies it.
+Agent stop never kills a shared service. Adopted service is never killed by Eliot.
+Requested URL is not proof of routing: plugin reports effective endpoint and L7 verifies
+it.
 
 ## Paths and platform defaults
 
@@ -288,6 +316,6 @@ live qualification verifies it.
   repository config;
 - separate Cargo target directory per Agent worktree;
 - resolve executable and argv separately;
-- project cleanup/setup/scratch and external plugin files use the path rules above;
-- no implicit fetch during launch admission or workspace dispatch;
-- configuration values/counts/strings are bounded before persistence or plugin framing.
+- project cleanup/setup/scratch and external plugin/service files use path rules above;
+- no implicit fetch during launch admission/workspace dispatch;
+- values/counts/strings are bounded before persistence or plugin framing.
