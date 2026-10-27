@@ -1,5 +1,6 @@
 use eliot_core::{Error, Result};
 use std::process::ExitStatus;
+#[cfg(windows)]
 use std::time::Duration;
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
@@ -82,28 +83,18 @@ impl OwnedChild {
 
     /// Separate from leader wait(): only Windows can prove exact family exit.
     /// `false` means the bounded wait expired, never that the family was killed.
+    #[cfg(windows)]
     pub async fn wait_family_empty(&mut self, timeout: Duration) -> Result<bool> {
-        #[cfg(windows)]
-        {
-            let deadline = tokio::time::Instant::now() + timeout;
-            loop {
-                if self.job.is_empty()? {
-                    return Ok(true);
-                }
-                let now = tokio::time::Instant::now();
-                if now >= deadline {
-                    return Ok(false);
-                }
-                tokio::time::sleep((deadline - now).min(Duration::from_millis(10))).await;
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.job.is_empty()? {
+                return Ok(true);
             }
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = timeout;
-            Err(Error::new(
-                "unsupported",
-                "Unix process-group custody cannot prove exact family exit",
-            ))
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Ok(false);
+            }
+            tokio::time::sleep((deadline - now).min(Duration::from_millis(10))).await;
         }
     }
 
