@@ -147,7 +147,7 @@ CREATE TABLE workspaces (
   base_oid TEXT NOT NULL,
   worktree_path TEXT NOT NULL UNIQUE,
   frozen_setup TEXT NOT NULL,
-  phase TEXT NOT NULL,       -- creating|setup|ready|unknown|failed
+  phase TEXT NOT NULL,       -- creating|setup_ready|setup_running|ready|unknown|failed
   setup_index INTEGER NOT NULL DEFAULT 0,
   outcome TEXT,
   updated_at INTEGER NOT NULL
@@ -162,14 +162,18 @@ Flow:
 
 1. create Agent generation 0 and workspace phase `creating`;
 2. run `git worktree add` against frozen OID;
-3. read back exact path, branch and HEAD; then phase `setup`;
-4. run setup entries sequentially, updating `setup_index` only after each exact success;
-5. phase `ready`; only then dispatch native start.
+3. read back exact path, branch and HEAD; then set `phase=setup_ready`,
+   `setup_index=0`;
+4. before setup entry `i` starts, commit `phase=setup_running`, `setup_index=i` and its
+   frozen argv/file identity; only then spawn it in workspace custody;
+5. exact success commits `setup_ready,i+1`; after the last entry, commit `ready`;
+6. only `ready` permits native `agent.start`.
 
-A lost Git response is settled by exact worktree/path/branch/OID readback. A setup step
-has no generic readback: if its process may have run, phase becomes `unknown` and is not
-rerun. The owner removes/recreates or explicitly resolves the workspace. No
-`workspace_steps` journal or content-addressed artifact service is required.
+A lost Git response is settled by exact worktree/path/branch/OID readback. A setup entry
+has no generic readback: after restart or lost process result, `setup_running` becomes
+`unknown` unless exact platform evidence proves the process never started. It is never
+rerun. The owner removes/recreates or explicitly resolves the workspace. This needs one
+row and one running marker, not a `workspace_steps` journal or artifact service.
 
 Cancellation stops the current custody. Native start never begins from a non-ready
 workspace. Removal is explicit, terminal-Agent only and clean-only except allowed
@@ -186,10 +190,12 @@ git -c core.fsmonitor=false --no-optional-locks <command> ...
 
 Diff/log commands additionally pass `--no-ext-diff --no-textconv`. The daemon sets
 `GIT_TERMINAL_PROMPT=0`, disables editors and aliases, and never invokes repository
-hooks, fsmonitor helpers, external diff drivers, textconv filters or remote helpers.
-Monitoring never accepts a caller-supplied remote URL/refspec; optional remote polling
-uses an owner-configured remote name that has passed the same validation as automation
-Git actions.
+hooks, fsmonitor helpers, external diff drivers or textconv filters. It never permits an
+unapproved/custom remote-helper scheme: any optional network read uses an
+owner-configured remote whose complete effective URL set passed the validation in
+[automation](automation.md#actions-are-commands). Approved built-in Git transports may
+use Git's normal transport helper internally; “disabled remote helpers” never means
+silently disabling the configured HTTPS/SSH transport itself.
 
 - refresh on debounced filesystem invalidation and poll interval, at most once per 2 s;
 - `status --porcelain=v2 --branch -z` for current state;
