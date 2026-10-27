@@ -16,7 +16,7 @@ symlink/reparse-point roots and unsafe ownership.
   rules/*.toml
   plugins/<name>/...
   services/<name>/...
-  frozen/<write-id>/...  bounded admitted note/setup/script copies when needed
+  frozen/<command-id>/... bounded admitted note/setup/script copies when needed
   worktrees/<agent>/...
 ```
 
@@ -136,21 +136,23 @@ FrozenFile { canonical_path, size, digest, private_copy? }
 ```
 
 Secrets remain variable names only. Existing Agents never silently adopt a config reload.
-Resume/control takeover uses the stored snapshot unless the owner explicitly selects a
-new profile, which creates a new generation.
+Resume uses its stored snapshot by default. A control takeover may use the stored snapshot
+or an explicitly selected owner profile; either choice is frozen before admission and
+the takeover targets the next Agent generation.
 
 For project notes/setup/scripts:
 
 1. resolve under the registered allowed root;
 2. reject `..`, symlink/reparse-point escape, device/alternate-stream forms;
 3. bound size and compute digest at admission;
-4. copy small text/scripts to private `frozen/<write-id>/` or store bounded bytes;
+4. copy small text/scripts to private `frozen/<command-id>/` or store bounded bytes;
 5. otherwise store canonical path+size+digest and verify immediately before dispatch;
 6. mismatch fails the command rather than running different bytes.
 
-This is not a global content-addressed artifact store and has no artifact graph/GC.
-Frozen files are deleted when no retained open/unknown command or current profile
-snapshot references them.
+The directory key is the durable command/action id, including derived internal ids—not
+only an external write id. This is not a global content-addressed artifact store and has
+no artifact graph/GC. Frozen files are deleted only when no retained current snapshot or
+open/unknown command references them.
 
 ## Environment and secrets
 
