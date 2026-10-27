@@ -100,13 +100,45 @@ impl OwnedChild {
 
     /// Start the configured command under a Windows Job or a new Unix group.
     /// Configure Tokio's stdin/stdout/stderr as piped before passing the command.
-    pub fn spawn(mut command: Command) -> Result<Self> {
+    pub fn spawn(command: Command) -> Result<Self> {
+        Self::spawn_with_policy(command, false)
+    }
+
+    /// Start a read-only Git leaf with child-process creation fenced before exec.
+    /// The caller must select the actual executable, not a launcher requiring children.
+    pub fn spawn_leaf(command: Command) -> Result<Self> {
+        #[cfg(any(windows, unix))]
+        {
+            #[cfg(unix)]
+            let command = super::unix::prepare_leaf_command(command)?;
+            Self::spawn_with_policy(command, true).map_err(|_| {
+                Error::new(
+                    "git_leaf_fence_unavailable",
+                    "cannot start process with verified leaf restrictions",
+                )
+            })
+        }
+        #[cfg(not(any(windows, unix)))]
+        {
+            let _ = command;
+            Err(Error::new(
+                "git_leaf_fence_unavailable",
+                "leaf process restrictions are not verified on this platform",
+            ))
+        }
+    }
+
+    fn spawn_with_policy(mut command: Command, leaf: bool) -> Result<Self> {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
             use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
 
-            let job = super::windows::Job::new_kill_on_close()?;
+            let job = if leaf {
+                super::windows::Job::new_leaf()?
+            } else {
+                super::windows::Job::new_kill_on_close()?
+            };
             command
                 .as_std_mut()
                 .creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW);
@@ -133,6 +165,7 @@ impl OwnedChild {
 
         #[cfg(unix)]
         {
+            let _ = leaf;
             command.process_group(0);
             let child = command
                 .spawn()
@@ -149,7 +182,7 @@ impl OwnedChild {
 
         #[cfg(not(any(windows, unix)))]
         {
-            let _ = command;
+            let _ = (command, leaf);
             Err(Error::new(
                 "platform_unsupported",
                 "owned child custody is implemented for Windows and Unix",
@@ -247,6 +280,122 @@ impl Drop for OwnedChild {
         if let Some(identity) = self.identity.as_ref() {
             let _ = super::unix::terminate_process_group(identity);
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod leaf_tests {
+    use super::OwnedChild;
+    use std::{fs, path::PathBuf, process::ExitStatus, process::Stdio, time::Duration};
+    use tokio::{process::Command, time::timeout};
+
+    struct FreshTemp(PathBuf);
+
+    impl Drop for FreshTemp {
+        fn drop(&mut self) {
+            // Only the fixed files created by this test; never recurse.
+            let _ = fs::remove_file(self.0.join("attempt.cmd"));
+            let _ = fs::remove_file(self.0.join("child.out"));
+            let _ = fs::remove_dir(&self.0);
+        }
+    }
+
+    async fn finish(mut child: OwnedChild) -> ExitStatus {
+        let status = timeout(Duration::from_secs(5), child.wait())
+            .await
+            .expect("owned process deadline")
+            .expect("owned process exit");
+        assert!(
+            child
+                .wait_family_empty(Duration::from_secs(5))
+                .await
+                .expect("owned family query"),
+            "owned family did not exit"
+        );
+        status
+    }
+
+    #[tokio::test]
+    async fn leaf_process_runs_but_cannot_start_existing_absolute_child() {
+        let system_root =
+            PathBuf::from(std::env::var_os("SystemRoot").expect("Windows SystemRoot"));
+        assert!(system_root.is_absolute(), "SystemRoot must be absolute");
+        let parent = system_root.join("System32").join("cmd.exe");
+        let child_program = system_root.join("System32").join("whoami.exe");
+        assert!(
+            parent.is_file(),
+            "known absolute parent executable must exist"
+        );
+        assert!(
+            child_program.is_file(),
+            "known absolute child executable must exist"
+        );
+
+        let temp =
+            FreshTemp(std::env::temp_dir().join(format!("eliot-leaf-fence-{}", ulid::Ulid::new())));
+        fs::create_dir(&temp.0).expect("create fresh test directory");
+        let command = || {
+            let mut command = Command::new(&parent);
+            command
+                .current_dir(&temp.0)
+                .env_clear()
+                .env("SystemRoot", &system_root)
+                .kill_on_drop(true)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            command.arg("/d").arg("/c");
+            command
+        };
+
+        let mut basic = command();
+        basic.arg("exit /b 0");
+        assert!(
+            finish(OwnedChild::spawn_leaf(basic).expect("spawn leaf parent"))
+                .await
+                .success(),
+            "the leaf parent itself must run"
+        );
+
+        fs::write(
+            temp.0.join("attempt.cmd"),
+            format!(
+                "@echo off\n\"{}\" > child.out 2>nul\nif errorlevel 1 exit /b 0\nexit /b 23\n",
+                child_program.display(),
+            ),
+        )
+        .expect("write child-attempt script");
+
+        let mut control = command();
+        control.arg("attempt.cmd");
+        assert_eq!(
+            finish(OwnedChild::spawn(control).expect("spawn normal control"))
+                .await
+                .code(),
+            Some(23)
+        );
+        assert!(
+            !fs::read(temp.0.join("child.out"))
+                .expect("read control output")
+                .is_empty(),
+            "the existing child must actually execute without the leaf restriction"
+        );
+        fs::remove_file(temp.0.join("child.out")).expect("remove control output");
+
+        let mut leaf = command();
+        leaf.arg("attempt.cmd");
+        assert_eq!(
+            finish(OwnedChild::spawn_leaf(leaf).expect("spawn fenced parent"))
+                .await
+                .code(),
+            Some(0)
+        );
+        assert!(
+            fs::read(temp.0.join("child.out"))
+                .expect("read fenced output")
+                .is_empty(),
+            "the known absolute child must not execute in the leaf Job"
+        );
     }
 }
 

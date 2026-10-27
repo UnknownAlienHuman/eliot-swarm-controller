@@ -3,6 +3,8 @@
 mod bus;
 mod config;
 mod daemon;
+mod fs_invalidation;
+mod git_monitor;
 mod monitor;
 mod platform;
 mod plugin_host;

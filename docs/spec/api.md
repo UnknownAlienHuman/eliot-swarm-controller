@@ -48,6 +48,7 @@ rule actions have bounded derived ids. No general receipt/floor framework.
 | `daemon.status/shutdown` | current state, admission mode and exact drain/force |
 | `agent.list/get/wait/result` | scoped, paginated Agent state and exact results |
 | `agent.processes/stats` | scoped process records and ephemeral OS samples |
+| `agent.git/edits` | current Git snapshot and paginated native-attributed edits |
 | `command.submit/get/children/resolve` | immutable admission, linked input, fixed selector/action children |
 | `turn.get/resolve` | running/completed/unknown turn; constrained owner assertion |
 | `events.read/subscribe` | persisted replay plus bounded live delivery |
@@ -85,6 +86,25 @@ and absent values remain unknown, never zero. Process activity does not establis
 model progress; incomplete observation does not prove custody empty. `agent.get` retains
 the Agent object and may enrich it with `observation`; `show` prints that object unchanged.
 Windows canonical path strings remain opaque to these CLI reads.
+
+Git and edit reads use the same existing daemon:
+
+```text
+agent.git {id, generation?}
+agent.edits {id, generation?, after?, limit?}
+```
+
+Generation is nonnegative and defaults to the current generation. The Router validates
+scope and requires the current generation for Git snapshots; owners may query historical
+edit attribution. Edit pages default to 100 rows, with limits 1–1,000. `after` is an
+opaque path string passed back unchanged; the CLI does not resolve it against the local
+filesystem or normalize Windows canonical paths.
+
+Git snapshots report current HEAD/branch/dirty paths and recovered commit history, with
+`complete`, `history_complete` and `history_gap` describing observation coverage. Missing
+or incomplete history is not an unchanged or clean workspace. Edit attribution requires
+verified, generation-matched native file-change hints; a Git dirty set alone never proves
+Agent authorship. Git polling alone updates neither process statistics nor model progress.
 
 ## Command admission
 
@@ -208,6 +228,8 @@ eliot launch --profile P --workspace PATH [PROMPT] [--wait]
 eliot ls | show A | watch [A|SELECTOR] | top
 eliot processes A [--generation N] [--after CURSOR] [--limit N]
 eliot stats A [--generation N]
+eliot git-status A [--generation N]
+eliot edits A [--generation N] [--after PATH] [--limit N]
 eliot send A TEXT [--wait] [--generation N]
 eliot steer|inject A TEXT [--generation N] [--turn ID]
 eliot interrupt|abort A [--generation N] [--turn ID]
@@ -234,6 +256,6 @@ Only current-layer commands appear in help and Agent guidance. Exit codes: 0 suc
 queued; 1 definite failure; 2 usage; 3 pre-effect rejection; 4 unknown; 5 wait timeout;
 6 still dispatched/pending. A queued/applied input is not successful task completion.
 
-`processes` and `stats` make one read call and print the bounded JSON response. They
-do not start a daemon or submit a mutation. `processes --after` forwards the opaque
-cursor string to the Router for validation.
+`processes`, `stats`, `git-status` and `edits` make one read call and print the bounded
+JSON response. They do not start a daemon or submit a mutation. The `--after` strings
+for `processes` and `edits` are forwarded unchanged to the Router for validation.

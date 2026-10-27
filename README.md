@@ -28,6 +28,34 @@ requests carrying `grantRoot` remain unsupported. [Roadmap](docs/roadmap.md) own
 `show AGENT` includes the same observation view. Missing or stale counters are null,
 and process activity never counts as model progress.
 
+`git-status AGENT` reads the cached Git view; `edits AGENT` pages durable edit
+attribution. Check freshness (`available`, `age_ms`) separately from `complete` and
+history coverage: stale or partial data does not prove a clean workspace. Attribution
+requires a filesystem-validated native completed `fileChange` hint contained in the
+admitted workspace; dirty files or ordinary shell writes alone never identify their
+author. Git polling alone does not advance model progress.
+
+Strict Git reads use a dedicated no-child fence: Windows limits each Git Job to one
+process; Linux requires verified unprivileged nonroot credentials and irreversible
+process-creation limits. Root, privileged Linux and other Unix contexts report unavailable
+without an unfenced fallback. Normal harness/plugin custody is unchanged.
+Native filesystem invalidation reports `filesystem_invalidation.state`; degraded or
+unavailable watching retains polling. Neither a notification nor watcher health
+establishes Git freshness or model progress.
+
+Bounded Windows checks on 2026-10-27 with Git 2.55.0.windows.5 left the trap fixture's
+index, HEAD, refs and objects unchanged, with no trap sentinel. Restart recovered the
+commit made while the daemon was down. One native `note.txt` edit retained its cause
+timestamp and generation-1 attribution through rapid resume to generation 2 with no
+extra turn. A live fake observer then removed that old-generation row after an explicit
+restore proved the path clean. All exercise Agents stopped and owned daemons exited.
+A Windows leaf-process regression also passed 1/1: the fenced parent ran, and an existing
+absolute child executable ran under ordinary custody but was blocked by the leaf Job.
+Two fake Agents sharing a workspace each received the same commit exactly once, without
+edit attribution. A healthy watcher observed an external file change without advancing
+model progress or attributing the write to the fake Agent.
+These checks do not qualify the full L7 or cross-platform behavior.
+
 ## Quick start
 
 From the repository root, build the binary and replace the workspace, data-directory, and

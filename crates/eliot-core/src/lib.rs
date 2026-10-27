@@ -8,6 +8,61 @@ fn empty_object() -> Value {
     Value::Object(serde_json::Map::new())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitPathStatus {
+    pub path: String,
+    pub status: String,
+    pub original_path: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitCommit {
+    pub oid: String,
+    pub paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitBaseline {
+    pub head: Option<String>,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitSnapshot {
+    pub workspace: String,
+    pub head: Option<String>,
+    pub branch: Option<String>,
+    pub dirty: Vec<GitPathStatus>,
+    pub commits: Vec<GitCommit>,
+    pub clean_paths: Vec<String>,
+    pub observed_at: i64,
+    pub complete: bool,
+    pub history_complete: bool,
+    pub history_gap: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileChangeHint {
+    pub path: String,
+    pub event_seq: u64,
+    pub ts: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentEdit {
+    pub agent: String,
+    pub generation: i64,
+    pub workspace: String,
+    pub path: String,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GitHintPage {
+    pub events: Vec<Event>,
+    pub through: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ProcessIdentity {
     pub host_boot_id: String,

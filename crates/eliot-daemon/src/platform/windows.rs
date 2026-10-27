@@ -34,10 +34,11 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_FLAG_OVERLAPPED, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
 };
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
-    SetInformationJobObject, TerminateJobObject,
+    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_PROCESS_ID_LIST,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicProcessIdList,
+    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+    TerminateJobObject,
 };
 use windows_sys::Win32::System::Pipes::{
     CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
@@ -313,6 +314,14 @@ impl Job {
     /// Source: v1 donor dc6f70aa, process_group.rs. This uses only its Job
     /// Object lifetime/assignment mechanism; process schemas and wrappers stay local.
     pub(crate) fn new_kill_on_close() -> Result<Self> {
+        Self::new_with_leaf_limit(false)
+    }
+
+    pub(crate) fn new_leaf() -> Result<Self> {
+        Self::new_with_leaf_limit(true)
+    }
+
+    fn new_with_leaf_limit(leaf: bool) -> Result<Self> {
         // SAFETY: null attributes/name request a private unnamed Job Object.
         let handle = unsafe { CreateJobObjectW(null(), null()) };
         if handle.is_null() {
@@ -324,6 +333,12 @@ impl Job {
 
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if leaf {
+            // Microsoft JOBOBJECT_BASIC_LIMIT_INFORMATION: a second process
+            // exceeds this Job's limit and cannot be admitted. No breakaway flags.
+            limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+            limits.BasicLimitInformation.ActiveProcessLimit = 1;
+        }
         // SAFETY: `limits` has the exact structure and size required by this
         // information class and remains valid for the duration of the call.
         if unsafe {

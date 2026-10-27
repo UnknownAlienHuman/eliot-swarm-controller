@@ -45,8 +45,8 @@ to create every crate/table immediately.
       help/version smoke commands on Windows/Ubuntu. No empty framework crates or
       test platform.
 
-**Next:** L3.1 observation. The direct Codex/Luna session, result and control paths
-have been exercised; v1 remains available as a source donor.
+**Next:** L3.2 workspaces. The direct Codex/Luna and Windows observation paths have
+been exercised; v1 remains available as a source donor.
 
 ## L1 — Core, Store, bus and one fake command path
 
@@ -118,10 +118,11 @@ to invent a model alias or silently switch accounts.
 Read [monitoring](spec/monitoring.md), relevant [configuration](spec/configuration.md)
 sections, and [OpenCodex](harnesses/opencodex.md) only for the proxy task.
 
-- [ ] **L3.1 Observation.** Exact process identity, source drain before loss, bounded
+- [x] **L3.1 Observation.** Exact process identity, source drain before loss, bounded
       stats, busy-vs-waiting liveness, read-only Git/fs monitor and `agent_edits`.
       The process/stats/liveness path is implemented and exercised on Windows with
-      fake and native Codex; Git/fs observation and edit attribution remain.
+      fake and native Codex. Git/fs observation, shared commit delivery and durable
+      native edit attribution are connected and exercised on Windows.
 - [ ] **L3.2 Workspaces.** Existing workspaces remain the default. Add opt-in worktree
       creation with frozen base OID, one preparation row, explicit setup and no replay
       of unknown setup. Exact readback and clean-only removal; preserve the branch.
@@ -130,6 +131,16 @@ sections, and [OpenCodex](harnesses/opencodex.md) only for the proxy task.
 - [ ] **L3.4 Proxy/capacity.** First attach to an already-running OpenCodex endpoint.
       Add managed service launch only when actually needed. Add account/proxy caps and
       persistent provider holds with that route; no automatic model/account fallback.
+
+L3.1 checks on Windows on 2026-10-27: formatting, scoped Clippy and debug build;
+read-only Git traps left index/HEAD/refs/objects unchanged; persisted HEAD recovered a
+commit across daemon restart. A native Luna edit retained its exact cause/timestamp
+through rapid stop/resume, and a live observer cleared terminal-generation provenance
+only after clean readback. Two fake Agents each received one shared commit event;
+filesystem observation did not invent authorship or model progress. One focused Windows
+regression proved the Git leaf Job blocks child execution. Privileged/root Linux and
+other Unix Git contexts return unavailable; Linux runtime and full L7 qualification
+remain unverified. All exercise Agents and owned daemons stopped.
 
 **Result:** useful Codex work is observable and restart outcomes are explicit. The direct
 route still works without any proxy installation or worktree machinery.

@@ -7,9 +7,10 @@ pub mod error;
 
 pub use crate::error::{Error, Result};
 use eliot_core::{
-    self as core, Agent, AgentState, BatchAck, Command, CommandState, Effect, Event, NativeEvent,
-    PendingRequest, ProcessIdentity, ProcessRecord, ProcessState, SourceBatch, SourceGap,
-    SourceGapAck, SubmitCommand, Turn, TurnState,
+    self as core, Agent, AgentEdit, AgentState, BatchAck, Command, CommandState, Effect, Event,
+    FileChangeHint, GitBaseline, GitHintPage, GitSnapshot, NativeEvent, PendingRequest,
+    ProcessIdentity, ProcessRecord, ProcessState, SourceBatch, SourceGap, SourceGapAck,
+    SubmitCommand, Turn, TurnState,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::de::DeserializeOwned;
@@ -27,6 +28,7 @@ const RETRY_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 const COMMAND_METHOD: &str = "command.submit";
 const INITIAL_SOURCE: &str = "stream";
 const PROCESS_SOURCE: &str = "os";
+const GIT_SOURCE: &str = "git";
 
 macro_rules! db {
     ($expression:expr) => {
@@ -119,7 +121,7 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(sql_error)?;
-        if current > 4 {
+        if current > 5 {
             return Err(Error::new(
                 "unsupported",
                 format!("Store schema version {current} is newer than this binary"),
@@ -320,6 +322,31 @@ impl Store {
                  );
                  CREATE INDEX processes_owner ON processes(owner, state);
                  INSERT INTO schema_migrations(version) VALUES (4);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 5 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE TABLE agent_edits (
+                     agent INTEGER NOT NULL,
+                     generation INTEGER NOT NULL,
+                     workspace TEXT NOT NULL,
+                     path TEXT NOT NULL,
+                     updated_at INTEGER NOT NULL,
+                     PRIMARY KEY(agent, generation, path)
+                 );
+                 CREATE INDEX agent_edits_workspace ON agent_edits(workspace, path);
+                 CREATE TABLE git_workspaces (
+                     workspace TEXT PRIMARY KEY,
+                     head TEXT,
+                     updated_at INTEGER NOT NULL
+                 );
+                 INSERT INTO schema_migrations(version) VALUES (5);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
@@ -1436,7 +1463,7 @@ impl Store {
                 }
                 db!(tx.execute(
                     "UPDATE source_state SET state = 'closed', updated_at = ?1
-                     WHERE agent = ?2 AND generation = ?3 AND state = 'open' AND source <> 'os'",
+                     WHERE agent = ?2 AND generation = ?3 AND state = 'open' AND source NOT IN ('os', 'git')",
                     params![now, agent_num, agent.generation],
                 ));
                 db!(tx.execute(
@@ -2116,7 +2143,7 @@ impl Store {
         ));
         db!(tx.execute(
             "UPDATE source_state SET health = 'stale', updated_at = ?1
-             WHERE source = 'os' AND state = 'open'",
+             WHERE source IN ('os', 'git') AND state = 'open'",
             [now],
         ));
         let mut dispatched_statement = tx
@@ -2613,7 +2640,7 @@ impl Store {
         Ok(records)
     }
 
-    /// Only committed native model facts for this exact generation count as progress.
+    /// Native model facts and validated file-change causes count at their original timestamps.
     pub fn last_model_progress(&self, agent: &str, generation: i64) -> Result<Option<i64>> {
         let agent_num = parse_agent_id(agent)?;
         self.connection
@@ -2622,15 +2649,1038 @@ impl Store {
                    ON o.agent = e.agent AND o.generation = e.generation
                   AND o.family = e.family AND o.source = e.source
                  WHERE e.agent = ?1 AND e.generation = ?2
-                   AND e.source NOT IN ('os', 'daemon') AND e.native_id IS NOT NULL
+                   AND ((e.source NOT IN ('os', 'daemon', 'git') AND e.native_id IS NOT NULL
                    AND e.kind IN ('turn.started', 'turn.completed', 'message.completed',
                                   'tool.started', 'tool.completed',
-                                  'request.opened', 'request.resolved', 'request.closed')",
+                                  'request.opened', 'request.resolved', 'request.closed'))
+                     OR (e.source = 'git' AND e.kind = 'file.changed'))",
                 params![agent_num, generation],
                 |row| row.get(0),
             )
             .map_err(sql_error)
     }
+}
+
+impl Store {
+    pub fn ensure_git_source(
+        &mut self,
+        agent: &str,
+        generation: i64,
+        workspace: &str,
+        now: i64,
+    ) -> Result<Vec<Event>> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let current = current_git_agent(&tx, agent, generation, Some(workspace))?;
+            let agent_num = parse_agent_id(agent)?;
+            let mut statement = tx
+                .prepare(
+                    "SELECT source, mechanism FROM source_owners
+                 WHERE agent = ?1 AND generation = ?2 AND family IN ('git', 'file')",
+                )
+                .map_err(sql_error)?;
+            let rows = statement
+                .query_map(params![agent_num, generation], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(sql_error)?;
+            let owners = rows
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(sql_error)?;
+            drop(statement);
+            let source = load_source_state(&tx, agent_num, generation, GIT_SOURCE)?;
+            let mut events = Vec::new();
+            if owners.is_empty() && source.is_none() && !current.is_terminal() {
+                for family in ["git", "file"] {
+                    db!(tx.execute(
+                        "INSERT INTO source_owners(agent, generation, family, source, mechanism)
+                         VALUES (?1, ?2, ?3, 'git', 'git')",
+                        params![agent_num, generation, family],
+                    ));
+                }
+                db!(tx.execute(
+                    "INSERT INTO source_state(agent, generation, source, state, health, updated_at)
+                     VALUES (?1, ?2, 'git', 'open', 'ok', ?3)",
+                    params![agent_num, generation, now],
+                ));
+                events.push(insert_daemon_event(
+                    &tx, now, "source.opened", "source", Some(agent_num), Some(generation),
+                    json!({"source": GIT_SOURCE, "families": ["git", "file"], "workspace": workspace}),
+                )?);
+            } else if owners.len() != 2
+                || source.is_none()
+                || owners
+                    .iter()
+                    .any(|(source, mechanism)| source != GIT_SOURCE || mechanism != "git")
+            {
+                return Err(Error::new(
+                    "source_integrity",
+                    "Git source ownership is missing, conflicting, or terminal",
+                ));
+            }
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(events)
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    pub fn record_git_observation(
+        &mut self,
+        agent: &str,
+        generation: i64,
+        snapshot: &GitSnapshot,
+        hints: &[FileChangeHint],
+        through: u64,
+        now: i64,
+    ) -> Result<Vec<Event>> {
+        self.ensure_writer_healthy()?;
+        let result =
+            self.record_git_observation_inner(agent, generation, snapshot, hints, through, now);
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    fn record_git_observation_inner(
+        &mut self,
+        agent: &str,
+        generation: i64,
+        snapshot: &GitSnapshot,
+        hints: &[FileChangeHint],
+        through: u64,
+        now: i64,
+    ) -> Result<Vec<Event>> {
+        validate_git_snapshot(snapshot)?;
+        if hints.len() > MAX_PAGE_ENTRIES || encode_json(&hints)?.len() > MAX_PAGE_BYTES {
+            return Err(Error::new(
+                "frame_too_large",
+                "Git hint observation exceeds its bound",
+            ));
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        if retained_git_workspace(&tx, agent, generation)? != snapshot.workspace {
+            return Err(Error::new(
+                "source_integrity",
+                "Git workspace does not match its retained generation",
+            ));
+        }
+        let agent_num = parse_agent_id(agent)?;
+        let source = require_git_source(&tx, agent_num, generation)?;
+        if source.state != "open" {
+            return Err(Error::new("bad_state", "Git source is closed"));
+        }
+        let cursor = git_source_cursor(&source)?;
+        let boundary = git_sequence(through)?;
+        let high_water: i64 = tx
+            .query_row(
+                "SELECT MAX(COALESCE((SELECT MAX(seq) FROM events), 0),
+                 COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'events'), 0))",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        if through < cursor || boundary > high_water {
+            return Err(Error::new(
+                "invalid",
+                "Git hint cursor is outside the committed interval",
+            ));
+        }
+        let scanned = scan_git_hints(&tx, agent, generation, cursor, boundary, MAX_PAGE_ENTRIES)?;
+        if scanned.through != through {
+            return Err(Error::new(
+                "invalid",
+                "Git hint cursor skips beyond a bounded scanned page",
+            ));
+        }
+        let file_gap =
+            git_interval_gap_covers(&tx, agent_num, generation, &source, cursor, through, "file")?;
+        let mut metadata_uncovered = false;
+        let mut expected = HashSet::new();
+        for event in &scanned.events {
+            metadata_uncovered |= event
+                .data
+                .get("changed_paths_truncated")
+                .and_then(Value::as_bool)
+                == Some(true)
+                || event.data.get("redacted").and_then(Value::as_bool) == Some(true);
+            let Some(paths) = event.data.get("changed_paths").and_then(Value::as_array) else {
+                metadata_uncovered = true;
+                continue;
+            };
+            for path in paths {
+                let Some(path) = path.as_str() else {
+                    metadata_uncovered = true;
+                    continue;
+                };
+                if let Ok(path) = normalized_native_git_path(&snapshot.workspace, path) {
+                    expected.insert((event.seq as u64, git_path_key(&snapshot.workspace, &path)));
+                } else {
+                    metadata_uncovered = true;
+                }
+            }
+        }
+        let baseline = load_git_baseline(&tx, &snapshot.workspace)?;
+        if baseline
+            .as_ref()
+            .is_some_and(|old| old.updated_at > snapshot.observed_at)
+        {
+            return Err(Error::new(
+                "bad_state",
+                "Git snapshot predates the stored HEAD baseline",
+            ));
+        }
+        let mut seen = HashSet::with_capacity(hints.len());
+        let mut covered = HashSet::with_capacity(hints.len());
+        let mut attributed = Vec::new();
+        for hint in hints {
+            validate_git_path(&hint.path)?;
+            if hint.event_seq == 0
+                || hint.event_seq > through
+                || !seen.insert((
+                    hint.event_seq,
+                    git_path_key(&snapshot.workspace, &hint.path),
+                ))
+            {
+                return Err(Error::new(
+                    "source_integrity",
+                    "Git hint has an invalid or repeated cause",
+                ));
+            }
+            let event = load_native_git_hint(&tx, agent_num, generation, hint.event_seq)?;
+            if hint.ts != event.ts {
+                return Err(Error::new(
+                    "source_integrity",
+                    "Git hint timestamp does not match its native cause",
+                ));
+            }
+            let paths = event
+                .data
+                .get("changed_paths")
+                .and_then(Value::as_array)
+                .ok_or_else(|| Error::new("source_integrity", "native file change has no paths"))?;
+            let mut belongs = false;
+            for path in paths {
+                let path = path.as_str().ok_or_else(|| {
+                    Error::new("source_integrity", "native changed path is not text")
+                })?;
+                if let Ok(path) = normalized_native_git_path(&snapshot.workspace, path) {
+                    belongs |= git_path_key(&snapshot.workspace, &path)
+                        == git_path_key(&snapshot.workspace, &hint.path);
+                }
+            }
+            if !belongs {
+                return Err(Error::new(
+                    "source_integrity",
+                    "claimed path is absent from its native file change",
+                ));
+            }
+            // Lost-ack retry: old causes stay historical and never recreate a cleaned row.
+            if hint.event_seq <= cursor {
+                continue;
+            }
+            covered.insert((
+                hint.event_seq,
+                git_path_key(&snapshot.workspace, &hint.path),
+            ));
+            attributed.push(hint);
+        }
+        if (covered != expected || metadata_uncovered) && !file_gap {
+            return Err(Error::new(
+                "source_integrity",
+                "Git cursor would skip an unconsumed in-scope native file-change path",
+            ));
+        }
+        let mut events = Vec::new();
+        if !git_interval_gap_covers(&tx, agent_num, generation, &source, cursor, through, "git")?
+            && let Some(event) = git_history_gap(
+                &tx,
+                agent_num,
+                generation,
+                snapshot,
+                baseline.as_ref(),
+                &source,
+            )?
+        {
+            events.push(event);
+        }
+        let mut dirty = snapshot.dirty.clone();
+        dirty.sort_by(|a, b| {
+            (&a.path, &a.status, &a.original_path).cmp(&(&b.path, &b.status, &b.original_path))
+        });
+        let data = json!({
+            "workspace": snapshot.workspace, "head": snapshot.head, "branch": snapshot.branch,
+            "dirty": dirty, "complete": snapshot.complete,
+            "history_complete": snapshot.history_complete, "history_gap": snapshot.history_gap,
+        });
+        let previous: Option<String> = tx
+            .query_row(
+                "SELECT data FROM events WHERE agent = ?1 AND generation = ?2
+             AND source = 'git' AND kind = 'git.changed' ORDER BY seq DESC LIMIT 1",
+                params![agent_num, generation],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        let previous = previous.as_deref().map(decode_json).transpose()?;
+        // Delivery belongs to this binding. A partial view is not a commit receipt.
+        let delivered = if previous
+            .as_ref()
+            .is_some_and(|view| view.get("complete").and_then(Value::as_bool) == Some(true))
+        {
+            previous.clone()
+        } else {
+            let complete: Option<String> = tx
+                .query_row(
+                    "SELECT data FROM events WHERE agent = ?1 AND generation = ?2
+                 AND source = 'git' AND kind = 'git.changed'
+                 AND json_extract(data, '$.complete') = 1 ORDER BY seq DESC LIMIT 1",
+                    params![agent_num, generation],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sql_error)?;
+            complete.as_deref().map(decode_json).transpose()?
+        };
+        let deliver_commits = delivered
+            .as_ref()
+            .is_none_or(|view| view.get("head") != data.get("head"));
+        let changed = match previous {
+            Some(previous) => canonical::digest(&previous)? != canonical::digest(&data)?,
+            None => true,
+        };
+        if changed {
+            events.push(insert_git_event(
+                &tx,
+                agent_num,
+                generation,
+                snapshot.observed_at,
+                "git.changed",
+                "git",
+                data,
+            )?);
+        }
+        if snapshot.complete && deliver_commits {
+            for commit in &snapshot.commits {
+                events.push(insert_git_event(&tx, agent_num, generation, snapshot.observed_at,
+                    "git.committed", "git", json!({"workspace": snapshot.workspace, "oid": commit.oid, "paths": commit.paths}))?);
+            }
+        }
+        for hint in attributed {
+            db!(tx.execute(
+                "INSERT INTO agent_edits(agent, generation, workspace, path, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(agent, generation, path) DO UPDATE
+                 SET updated_at = MAX(agent_edits.updated_at, excluded.updated_at)",
+                params![
+                    agent_num,
+                    generation,
+                    snapshot.workspace,
+                    hint.path,
+                    hint.ts
+                ],
+            ));
+            events.push(insert_git_event(&tx, agent_num, generation, hint.ts, "file.changed", "file",
+                json!({"workspace": snapshot.workspace, "path": hint.path, "cause_seq": hint.event_seq}))?);
+        }
+        if snapshot.complete {
+            // Only explicit clean proofs clear attribution, including older generations.
+            for path in &snapshot.clean_paths {
+                db!(tx.execute(
+                    "DELETE FROM agent_edits WHERE workspace = ?1 AND path = ?2 AND updated_at <= ?3",
+                    params![snapshot.workspace, path, snapshot.observed_at],
+                ));
+            }
+            if baseline.as_ref().is_none_or(|old| {
+                old.head != snapshot.head || old.updated_at != snapshot.observed_at
+            }) {
+                db!(tx.execute(
+                    "INSERT INTO git_workspaces(workspace, head, updated_at) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(workspace) DO UPDATE SET head = excluded.head, updated_at = excluded.updated_at",
+                    params![snapshot.workspace, snapshot.head, snapshot.observed_at],
+                ));
+            }
+        }
+        db!(tx.execute(
+            "UPDATE source_state SET cursor = ?1, last_store_seq = COALESCE(?2, last_store_seq), updated_at = ?3
+             WHERE agent = ?4 AND generation = ?5 AND source = 'git'",
+            params![through.to_string(), events.last().map(|event| event.seq), now, agent_num, generation],
+        ));
+        commit_transaction(tx, &self.write_faulted)?;
+        Ok(events)
+    }
+
+    pub fn git_baseline(&self, workspace: &str) -> Result<Option<GitBaseline>> {
+        require_nonempty(workspace, "Git workspace")?;
+        load_git_baseline(&self.connection, workspace)
+    }
+
+    pub fn git_cursor(&self, agent: &str, generation: i64) -> Result<u64> {
+        retained_git_workspace(&self.connection, agent, generation)?;
+        let source = require_git_source(&self.connection, parse_agent_id(agent)?, generation)?;
+        git_source_cursor(&source)
+    }
+
+    pub fn git_hint_page(
+        &self,
+        agent: &str,
+        generation: i64,
+        after: u64,
+        limit: usize,
+    ) -> Result<GitHintPage> {
+        retained_git_workspace(&self.connection, agent, generation)?;
+        require_git_source(&self.connection, parse_agent_id(agent)?, generation)?;
+        validate_limit(limit)?;
+        scan_git_hints(
+            &self.connection,
+            agent,
+            generation,
+            after,
+            self.high_water()?,
+            limit,
+        )
+    }
+
+    /// Cleanup candidates include retained provenance from every Agent generation.
+    pub fn git_edit_paths(&self, workspace: &str, limit: usize) -> Result<(Vec<String>, bool)> {
+        require_nonempty(workspace, "Git workspace")?;
+        validate_limit(limit)?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT DISTINCT path FROM agent_edits WHERE workspace = ?1
+             ORDER BY path LIMIT ?2",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(params![workspace, limit as i64 + 1], |row| row.get(0))
+            .map_err(sql_error)?;
+        let mut paths = rows
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .map_err(sql_error)?;
+        let complete = paths.len() <= limit;
+        paths.truncate(limit);
+        Ok((paths, complete))
+    }
+
+    pub fn list_agent_edits(
+        &self,
+        agent: &str,
+        generation: i64,
+        after_path: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<AgentEdit>> {
+        let agent_num = parse_agent_id(agent)?;
+        validate_limit(limit)?;
+        if let Some(path) = after_path {
+            validate_git_path(path)?;
+        }
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT workspace, path, updated_at FROM agent_edits
+             WHERE agent = ?1 AND generation = ?2 AND (?3 IS NULL OR path > ?3)
+             ORDER BY path LIMIT ?4",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(
+                params![agent_num, generation, after_path, limit as i64],
+                |row| {
+                    Ok(AgentEdit {
+                        agent: agent.to_owned(),
+                        generation,
+                        workspace: row.get(0)?,
+                        path: row.get(1)?,
+                        updated_at: row.get(2)?,
+                    })
+                },
+            )
+            .map_err(sql_error)?;
+        let mut edits = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql_error)?;
+        enforce_page_bytes(&mut edits)?;
+        Ok(edits)
+    }
+
+    pub fn set_git_source_status(
+        &mut self,
+        agent: &str,
+        generation: i64,
+        health: &str,
+        closed: bool,
+        now: i64,
+    ) -> Result<Vec<Event>> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            if !matches!(health, "ok" | "slow" | "stale" | "error") {
+                return Err(Error::new(
+                    "invalid",
+                    "Git source health must be ok, slow, stale, or error",
+                ));
+            }
+            let agent_num = parse_agent_id(agent)?;
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let current = load_agent_by_num(&tx, agent_num)?
+                .ok_or_else(|| Error::new("not_found", "Git source Agent was not found"))?;
+            if generation <= 0 || generation > current.generation {
+                return Err(Error::new(
+                    "stale_generation",
+                    "Git source generation is not committed",
+                ));
+            }
+            let source = require_git_source(&tx, agent_num, generation)?;
+            if closed && pending_git_hints(&tx, agent_num, generation, git_source_cursor(&source)?)?
+            {
+                return Err(Error::new(
+                    "bad_state",
+                    "Git source still has unconsumed native file-change hints",
+                ));
+            }
+            let state = if closed {
+                "closed"
+            } else {
+                source.state.as_str()
+            };
+            let mut events = Vec::new();
+            if state != source.state || health != source.health {
+                db!(tx.execute(
+                    "UPDATE source_state SET state = ?1, health = ?2, updated_at = ?3
+                     WHERE agent = ?4 AND generation = ?5 AND source = 'git'",
+                    params![state, health, now, agent_num, generation],
+                ));
+                events.push(insert_daemon_event(
+                    &tx,
+                    now,
+                    if state != source.state {
+                        "source.closed"
+                    } else {
+                        "source.health"
+                    },
+                    "source",
+                    Some(agent_num),
+                    Some(generation),
+                    json!({"source": GIT_SOURCE, "state": state, "health": health}),
+                )?);
+            }
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(events)
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+}
+
+fn retained_git_workspace(connection: &Connection, agent: &str, generation: i64) -> Result<String> {
+    let agent_num = parse_agent_id(agent)?;
+    let current = load_agent_by_num(connection, agent_num)?
+        .ok_or_else(|| Error::new("not_found", "Git observation Agent was not found"))?;
+    if generation <= 0 || generation > current.generation {
+        return Err(Error::new(
+            "stale_generation",
+            "Git generation is not committed",
+        ));
+    }
+    let opened: Option<String> = connection.query_row(
+        "SELECT data FROM events WHERE agent = ?1 AND generation = ?2 AND kind = 'source.opened'
+         AND json_extract(data, '$.source') = 'git' ORDER BY seq DESC LIMIT 1",
+        params![agent_num, generation], |row| row.get(0),
+    ).optional().map_err(sql_error)?;
+    if let Some(opened) = opened {
+        return decode_json(&opened)?
+            .get("workspace")
+            .and_then(Value::as_str)
+            .filter(|workspace| !workspace.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| Error::new("source_integrity", "Git source has no retained workspace"));
+    }
+    if generation == current.generation {
+        return current
+            .workspace
+            .ok_or_else(|| Error::new("invalid", "Git workspace is missing"));
+    }
+    Err(Error::new(
+        "source_integrity",
+        "historical Git workspace evidence is unavailable",
+    ))
+}
+
+fn git_interval_gap_covers(
+    connection: &Connection,
+    agent: i64,
+    generation: i64,
+    source: &SourceStateRecord,
+    cursor: u64,
+    through: u64,
+    family: &str,
+) -> Result<bool> {
+    if source.gap_from.as_deref() != Some(cursor.to_string().as_str())
+        || source.gap_to.as_deref() != Some(through.to_string().as_str())
+    {
+        return Ok(false);
+    }
+    let Some(seq) = source.gap_seq else {
+        return Ok(false);
+    };
+    let data: Option<String> = connection.query_row(
+        "SELECT data FROM events WHERE seq = ?1 AND agent = ?2 AND generation = ?3 AND kind = 'source.gap'",
+        params![seq, agent, generation], |row| row.get(0),
+    ).optional().map_err(sql_error)?;
+    let Some(data) = data else {
+        return Ok(false);
+    };
+    let data = decode_json(&data)?;
+    Ok(
+        data.get("source").and_then(Value::as_str) == Some(GIT_SOURCE)
+            && data.get("gap_id").and_then(Value::as_str) == source.gap_id.as_deref()
+            && data
+                .get("families")
+                .and_then(Value::as_array)
+                .is_some_and(|families| {
+                    families.iter().any(|value| value.as_str() == Some(family))
+                })
+            && source.gap_digest.as_deref() == Some(canonical::digest(&data)?.as_slice()),
+    )
+}
+
+fn pending_git_hints(
+    connection: &Connection,
+    agent: i64,
+    generation: i64,
+    cursor: u64,
+) -> Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM events e JOIN source_owners o
+              ON o.agent = e.agent AND o.generation = e.generation AND o.family = e.family AND o.source = e.source
+            WHERE e.agent = ?1 AND e.generation = ?2 AND e.seq > ?3 AND e.family = 'tool'
+              AND e.kind = 'tool.completed' AND e.native_id IS NOT NULL
+              AND e.source NOT IN ('git', 'os', 'daemon')
+              AND json_extract(e.data, '$.tool') = 'fileChange'
+              AND json_extract(e.data, '$.status') = 'completed'
+              AND (json_array_length(e.data, '$.changed_paths') > 0
+                   OR json_extract(e.data, '$.changed_paths_truncated') = 1
+                   OR json_extract(e.data, '$.redacted') = 1))",
+        params![agent, generation, git_sequence(cursor)?], |row| row.get(0),
+    ).map_err(sql_error)
+}
+
+fn current_git_agent(
+    connection: &Connection,
+    agent: &str,
+    generation: i64,
+    workspace: Option<&str>,
+) -> Result<Agent> {
+    let current = load_agent_by_num(connection, parse_agent_id(agent)?)?
+        .ok_or_else(|| Error::new("not_found", "Git observation Agent was not found"))?;
+    if generation <= 0 || generation != current.generation {
+        return Err(Error::new(
+            "stale_generation",
+            "Git observation generation is not current",
+        ));
+    }
+    let admitted = current
+        .workspace
+        .as_deref()
+        .ok_or_else(|| Error::new("invalid", "Git observation requires an admitted workspace"))?;
+    require_nonempty(admitted, "Git workspace")?;
+    if workspace.is_some_and(|value| value != admitted) {
+        return Err(Error::new(
+            "source_integrity",
+            "Git workspace does not match the Agent",
+        ));
+    }
+    Ok(current)
+}
+
+fn require_git_source(
+    connection: &Connection,
+    agent: i64,
+    generation: i64,
+) -> Result<SourceStateRecord> {
+    let count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM source_owners WHERE agent = ?1 AND generation = ?2
+         AND family IN ('git', 'file') AND source = 'git' AND mechanism = 'git'",
+            params![agent, generation],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if count != 2 {
+        return Err(Error::new(
+            "source_integrity",
+            "Git/file ownership was not committed before observation",
+        ));
+    }
+    load_source_state(connection, agent, generation, GIT_SOURCE)?
+        .ok_or_else(|| Error::new("source_integrity", "Git source state is missing"))
+}
+
+fn git_source_cursor(source: &SourceStateRecord) -> Result<u64> {
+    source
+        .cursor
+        .as_deref()
+        .unwrap_or("0")
+        .parse::<u64>()
+        .map_err(|_| Error::new("internal", "invalid stored Git hint cursor"))
+}
+
+fn load_git_baseline(connection: &Connection, workspace: &str) -> Result<Option<GitBaseline>> {
+    connection
+        .query_row(
+            "SELECT head, updated_at FROM git_workspaces WHERE workspace = ?1",
+            [workspace],
+            |row| {
+                Ok(GitBaseline {
+                    head: row.get(0)?,
+                    updated_at: row.get(1)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(sql_error)
+}
+
+fn git_sequence(seq: u64) -> Result<i64> {
+    i64::try_from(seq)
+        .map_err(|_| Error::new("invalid", "Git cursor exceeds signed 64-bit event sequence"))
+}
+
+fn is_native_file_hint(event: &Event) -> bool {
+    event.kind == "tool.completed"
+        && event.native_id.is_some()
+        && event.data.get("tool").and_then(Value::as_str) == Some("fileChange")
+        && event.data.get("status").and_then(Value::as_str) == Some("completed")
+        && (event
+            .data
+            .get("changed_paths")
+            .and_then(Value::as_array)
+            .is_some_and(|paths| !paths.is_empty())
+            || event
+                .data
+                .get("changed_paths_truncated")
+                .and_then(Value::as_bool)
+                == Some(true)
+            || event.data.get("redacted").and_then(Value::as_bool) == Some(true))
+}
+
+fn scan_git_hints(
+    connection: &Connection,
+    agent: &str,
+    generation: i64,
+    after: u64,
+    through: i64,
+    limit: usize,
+) -> Result<GitHintPage> {
+    let after = git_sequence(after)?;
+    if after > through {
+        return Err(Error::new(
+            "invalid",
+            "Git cursor exceeds committed high-water",
+        ));
+    }
+    let owner: Option<String> = connection.query_row(
+        "SELECT source FROM source_owners WHERE agent = ?1 AND generation = ?2 AND family = 'tool'",
+        params![parse_agent_id(agent)?, generation], |row| row.get(0),
+    ).optional().map_err(sql_error)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT seq, ts, kind, agent, generation, source, native_id, data
+         FROM events WHERE seq > ?1 AND seq <= ?2 ORDER BY seq LIMIT ?3",
+        )
+        .map_err(sql_error)?;
+    let rows = statement
+        .query_map(params![after, through, limit as i64], event_record_from_row)
+        .map_err(sql_error)?;
+    let mut scanned = Vec::new();
+    for row in rows {
+        scanned.push(event_from_record(row.map_err(sql_error)?)?);
+    }
+    enforce_page_bytes(&mut scanned)?;
+    let boundary = scanned.last().map_or(through, |event| event.seq);
+    scanned.retain(|event| {
+        event.agent.as_deref() == Some(agent)
+            && event.generation == Some(generation)
+            && owner.as_deref() == Some(event.source.as_str())
+            && event.source != GIT_SOURCE
+            && event.source != PROCESS_SOURCE
+            && event.source != "daemon"
+            && is_native_file_hint(event)
+    });
+    Ok(GitHintPage {
+        events: scanned,
+        through: boundary as u64,
+    })
+}
+
+fn load_native_git_hint(
+    connection: &Connection,
+    agent: i64,
+    generation: i64,
+    seq: u64,
+) -> Result<Event> {
+    let record = connection
+        .query_row(
+            "SELECT e.seq, e.ts, e.kind, e.agent, e.generation, e.source, e.native_id, e.data
+         FROM events e JOIN source_owners o ON o.agent = e.agent AND o.generation = e.generation
+           AND o.family = e.family AND o.source = e.source
+         WHERE e.seq = ?1 AND e.agent = ?2 AND e.generation = ?3 AND e.family = 'tool'
+           AND e.source NOT IN ('git', 'os', 'daemon') AND e.native_id IS NOT NULL",
+            params![git_sequence(seq)?, agent, generation],
+            event_record_from_row,
+        )
+        .optional()
+        .map_err(sql_error)?
+        .ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "file hint has no exact authoritative native event",
+            )
+        })?;
+    let event = event_from_record(record)?;
+    if !is_native_file_hint(&event)
+        || event.data.get("redacted").and_then(Value::as_bool) == Some(true)
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "file hint is not a completed native file change",
+        ));
+    }
+    Ok(event)
+}
+
+fn validate_git_path(path: &str) -> Result<()> {
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.contains('\\')
+        || path.contains('\0')
+        || path.contains(':')
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(Error::new(
+            "invalid",
+            "Git path must be normalized and workspace-relative",
+        ));
+    }
+    Ok(())
+}
+
+// Lexical only: filesystem containment and symlink checks belong to the daemon.
+fn normalized_native_git_path(workspace: &str, path: &str) -> Result<String> {
+    fn portable(value: &str) -> String {
+        let value = value.replace('\\', "/");
+        if let Some(rest) = value.strip_prefix("//?/UNC/") {
+            format!("//{rest}")
+        } else {
+            value.strip_prefix("//?/").unwrap_or(&value).to_owned()
+        }
+    }
+    fn parts(value: &str) -> Result<Vec<&str>> {
+        let mut parts = Vec::new();
+        for part in value
+            .split('/')
+            .filter(|part| !part.is_empty() && *part != ".")
+        {
+            if part == ".." {
+                if parts.pop().is_none() {
+                    return Err(Error::new("invalid", "file hint escapes its workspace"));
+                }
+            } else {
+                parts.push(part);
+            }
+        }
+        Ok(parts)
+    }
+    let workspace = portable(workspace);
+    let path = portable(path);
+    let windows = workspace.starts_with("//") || workspace.as_bytes().get(1) == Some(&b':');
+    let absolute = path.starts_with('/') || path.as_bytes().get(1) == Some(&b':');
+    let base = parts(&workspace)?;
+    let candidate = parts(&path)?;
+    let relative = if absolute {
+        if candidate.len() <= base.len()
+            || !base.iter().zip(&candidate).all(|(base, candidate)| {
+                if windows {
+                    base.eq_ignore_ascii_case(candidate)
+                } else {
+                    base == candidate
+                }
+            })
+        {
+            return Err(Error::new(
+                "invalid",
+                "native file hint is outside its workspace",
+            ));
+        }
+        candidate[base.len()..].join("/")
+    } else {
+        candidate.join("/")
+    };
+    validate_git_path(&relative)?;
+    Ok(relative)
+}
+
+fn git_path_key(workspace: &str, path: &str) -> String {
+    if workspace.starts_with("\\\\")
+        || workspace.starts_with("//")
+        || workspace.as_bytes().get(1) == Some(&b':')
+    {
+        path.to_ascii_lowercase()
+    } else {
+        path.to_owned()
+    }
+}
+
+fn validate_git_oid(oid: &str) -> Result<()> {
+    if !matches!(oid.len(), 40 | 64) || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Error::new(
+            "invalid",
+            "Git object id must be a full SHA-1 or SHA-256 hex id",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_git_snapshot(snapshot: &GitSnapshot) -> Result<()> {
+    require_nonempty(&snapshot.workspace, "Git workspace")?;
+    if snapshot.dirty.len() > MAX_PAGE_ENTRIES
+        || snapshot.commits.len() > MAX_PAGE_ENTRIES
+        || snapshot.clean_paths.len() > MAX_PAGE_ENTRIES
+        || encode_json(snapshot)?.len() > MAX_PAGE_BYTES
+    {
+        return Err(Error::new(
+            "frame_too_large",
+            "Git snapshot exceeds its bound",
+        ));
+    }
+    if let Some(head) = &snapshot.head {
+        validate_git_oid(head)?;
+    }
+    if let Some(branch) = &snapshot.branch {
+        require_nonempty(branch, "Git branch")?;
+    }
+    let mut dirty = HashSet::new();
+    for status in &snapshot.dirty {
+        validate_git_path(&status.path)?;
+        require_nonempty(&status.status, "Git path status")?;
+        dirty.insert(git_path_key(&snapshot.workspace, &status.path));
+        if let Some(path) = &status.original_path {
+            validate_git_path(path)?;
+            dirty.insert(git_path_key(&snapshot.workspace, path));
+        }
+    }
+    for commit in &snapshot.commits {
+        validate_git_oid(&commit.oid)?;
+        for path in &commit.paths {
+            validate_git_path(path)?;
+        }
+    }
+    for path in &snapshot.clean_paths {
+        validate_git_path(path)?;
+        if snapshot.complete && dirty.contains(&git_path_key(&snapshot.workspace, path)) {
+            return Err(Error::new(
+                "source_integrity",
+                "Git path is reported both dirty and clean",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn git_history_gap(
+    tx: &Transaction<'_>,
+    agent: i64,
+    generation: i64,
+    snapshot: &GitSnapshot,
+    baseline: Option<&GitBaseline>,
+    source: &SourceStateRecord,
+) -> Result<Option<Event>> {
+    let moved = baseline.is_none_or(|old| old.head != snapshot.head);
+    if baseline.is_some()
+        && (snapshot.history_complete && !snapshot.history_gap || !moved && source.gap_id.is_some())
+    {
+        return Ok(None);
+    }
+    let from = baseline.and_then(|old| old.head.as_deref());
+    let anchor = baseline
+        .map(|old| old.updated_at.to_string())
+        .unwrap_or_else(|| "missing".to_owned());
+    let gap_id = format!(
+        "git-history:a{agent}#{generation}:{anchor}:{}:{}",
+        from.unwrap_or("unborn"),
+        snapshot.head.as_deref().unwrap_or("unborn")
+    );
+    if source.gap_id.as_deref() == Some(gap_id.as_str()) {
+        return Ok(None);
+    }
+    let data = json!({
+        "gap_id": gap_id, "agent_id": format_agent_id(agent), "generation": generation,
+        "source": GIT_SOURCE, "families": ["git"],
+        "reason": if baseline.is_none() { "initial_baseline" } else { "history_gap" },
+        "from": from, "to": snapshot.head,
+    });
+    let digest = canonical::digest(&data)?;
+    let event = insert_git_event(
+        tx,
+        agent,
+        generation,
+        snapshot.observed_at,
+        "source.gap",
+        "git",
+        data,
+    )?;
+    db!(tx.execute(
+        "UPDATE source_state SET gap_id = ?1, gap_digest = ?2, gap_from = ?3,
+             gap_to = ?4, gap_seq = ?5 WHERE agent = ?6 AND generation = ?7 AND source = 'git'",
+        params![
+            gap_id,
+            digest,
+            from,
+            snapshot.head,
+            event.seq,
+            agent,
+            generation
+        ],
+    ));
+    Ok(Some(event))
+}
+
+fn insert_git_event(
+    tx: &Transaction<'_>,
+    agent: i64,
+    generation: i64,
+    ts: i64,
+    kind: &str,
+    family: &str,
+    data: Value,
+) -> Result<Event> {
+    insert_event(
+        tx,
+        EventInsert {
+            ts,
+            kind,
+            family: Some(family),
+            agent: Some(agent),
+            generation: Some(generation),
+            source: GIT_SOURCE,
+            native_id: None,
+            cursor: None,
+            payload_digest: None,
+            data,
+        },
+    )
 }
 
 fn validate_process_identity(identity: &ProcessIdentity) -> Result<i64> {
@@ -4536,7 +5586,7 @@ fn transition_lost_tx(
     ));
     db!(tx.execute(
         "UPDATE source_state SET state = 'closed', health = 'stale', updated_at = ?1
-         WHERE agent = ?2 AND generation = ?3 AND source <> 'os'",
+         WHERE agent = ?2 AND generation = ?3 AND source NOT IN ('os', 'git')",
         params![now, agent_num, generation],
     ));
     events.push(insert_daemon_event(
@@ -4599,7 +5649,7 @@ fn fail_start_tx(
     ));
     db!(tx.execute(
         "UPDATE source_state SET state = 'closed', health = 'error', updated_at = ?1
-         WHERE agent = ?2 AND generation = ?3 AND source <> 'os'",
+         WHERE agent = ?2 AND generation = ?3 AND source NOT IN ('os', 'git')",
         params![now, agent_num, generation],
     ));
     events.push(insert_daemon_event(
@@ -4703,7 +5753,7 @@ fn stop_agent_tx(
     ));
     db!(tx.execute(
         "UPDATE source_state SET state = 'closed', updated_at = ?1
-         WHERE agent = ?2 AND generation = ?3 AND source <> 'os'",
+         WHERE agent = ?2 AND generation = ?3 AND source NOT IN ('os', 'git')",
         params![now, agent_num, generation],
     ));
     events.push(insert_daemon_event(
@@ -5091,7 +6141,13 @@ impl Store {
             .map_err(sql_error)?;
         let agent = load_agent_by_num(&tx, agent_num)?
             .ok_or_else(|| Error::new("not_found", "source gap Agent was not found"))?;
-        if agent.generation != gap.generation {
+        let historical_git = gap.source == GIT_SOURCE
+            && gap.generation > 0
+            && gap.generation < agent.generation
+            && families
+                .iter()
+                .all(|family| matches!(family.as_str(), "git" | "file"));
+        if agent.generation != gap.generation && !historical_git {
             return Err(Error::new(
                 "stale_generation",
                 format!(

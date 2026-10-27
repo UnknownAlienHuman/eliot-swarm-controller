@@ -81,6 +81,117 @@ pub(crate) fn validate_private_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn prepare_leaf_command(
+    mut command: tokio::process::Command,
+) -> Result<tokio::process::Command> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        verify_unprivileged_leaf().map_err(|_| {
+            Error::new(
+                "git_leaf_fence_unavailable",
+                "leaf execution requires verified unprivileged nonroot Linux credentials",
+            )
+        })?;
+        // SAFETY: this callback captures nothing and only uses stack storage
+        // and direct credential/limit syscalls. No allocation, locks, or I/O.
+        unsafe {
+            command.as_std_mut().pre_exec(|| {
+                verify_unprivileged_leaf()?;
+                // Prevent setuid/file capabilities from restoring privileges on exec.
+                if libc::prctl(
+                    libc::PR_SET_NO_NEW_PRIVS,
+                    1 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                ) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::setrlimit(libc::RLIMIT_NPROC, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut actual = libc::rlimit {
+                    rlim_cur: libc::RLIM_INFINITY,
+                    rlim_max: libc::RLIM_INFINITY,
+                };
+                if libc::getrlimit(libc::RLIMIT_NPROC, &mut actual) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if actual.rlim_cur != 0 || actual.rlim_max != 0 {
+                    return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+                }
+                Ok(())
+            });
+        }
+        Ok(command)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = &mut command;
+        Err(Error::new(
+            "git_leaf_fence_unavailable",
+            "leaf process restrictions are not verified on this Unix platform",
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn verify_unprivileged_leaf() -> std::io::Result<()> {
+    let (mut real, mut effective, mut saved) = (0, 0, 0);
+    // SAFETY: all three outputs point to writable uid_t-sized local values.
+    if unsafe { libc::getresuid(&mut real, &mut effective, &mut saved) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if real == 0 || effective == 0 || saved == 0 || real != effective || real != saved {
+        return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+    }
+    // Linux capget v3 uses two 32-bit capability words. Query the calling
+    // thread again after fork: capabilities are thread-local, not daemon-global.
+    #[repr(C)]
+    struct Header {
+        version: u32,
+        pid: i32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Capabilities {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    let mut header = Header {
+        version: 0x2008_0522,
+        pid: 0,
+    };
+    let mut caps = [Capabilities::default(); 2];
+    // SAFETY: the v3 header and two correctly sized output words remain live.
+    if unsafe {
+        libc::syscall(
+            libc::SYS_capget,
+            &mut header as *mut Header,
+            caps.as_mut_ptr(),
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // CAP_SYS_ADMIN and CAP_SYS_RESOURCE bypass RLIMIT_NPROC. Reject every
+    // capability-bearing context, including privileges that could change UID.
+    if caps
+        .iter()
+        .any(|caps| caps.effective != 0 || caps.permitted != 0 || caps.inheritable != 0)
+    {
+        return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+    }
+    Ok(())
+}
+
 pub(crate) fn effective_uid() -> u32 {
     // SAFETY: geteuid has no pointer arguments or preconditions.
     unsafe { libc::geteuid() }

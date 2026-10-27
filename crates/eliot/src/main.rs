@@ -161,6 +161,24 @@ enum CliCommand {
         #[arg(long, value_name = "GENERATION", value_parser = clap::value_parser!(i64).range(0..))]
         generation: Option<i64>,
     },
+    /// Read the current Git snapshot for an Agent's workspace.
+    GitStatus {
+        #[arg(value_name = "AGENT")]
+        agent: String,
+        #[arg(long, value_name = "GENERATION", value_parser = clap::value_parser!(i64).range(0..))]
+        generation: Option<i64>,
+    },
+    /// Read one page of edits attributed to an Agent by native file-change hints.
+    Edits {
+        #[arg(value_name = "AGENT")]
+        agent: String,
+        #[arg(long, value_name = "GENERATION", value_parser = clap::value_parser!(i64).range(0..))]
+        generation: Option<i64>,
+        #[arg(long, value_name = "PATH")]
+        after: Option<String>,
+        #[arg(long, default_value_t = PAGE_SIZE)]
+        limit: usize,
+    },
     /// Follow committed events. With an Agent argument, filter to that Agent.
     Watch { agent: Option<String> },
     /// Read an Agent's retained turn results.
@@ -693,6 +711,33 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 params["generation"] = json!(generation);
             }
             let result = read_call(&data_dir, "agent.stats", params).await?;
+            print_value(&result, json_output);
+            Ok(0)
+        }
+        CliCommand::GitStatus { agent, generation } => {
+            let mut params = json!({ "id": agent });
+            if let Some(generation) = generation {
+                params["generation"] = json!(generation);
+            }
+            let result = read_call(&data_dir, "agent.git", params).await?;
+            print_value(&result, json_output);
+            Ok(0)
+        }
+        CliCommand::Edits {
+            agent,
+            generation,
+            after,
+            limit,
+        } => {
+            validate_limit(limit)?;
+            let mut params = json!({ "id": agent, "limit": limit });
+            if let Some(generation) = generation {
+                params["generation"] = json!(generation);
+            }
+            if let Some(after) = after {
+                params["after"] = Value::String(after);
+            }
+            let result = read_call(&data_dir, "agent.edits", params).await?;
             print_value(&result, json_output);
             Ok(0)
         }

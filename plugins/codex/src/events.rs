@@ -15,8 +15,9 @@ use crate::native::{
     NativeClient, NativeFrame, StreamState,
     requests::{self, CorePending},
     types::{
-        NativeItemCompletedNotification, NativeServerRequestResolvedNotification,
-        NativeTurnCompletedNotification, NativeTurnStartedNotification, NativeTurnStatus,
+        NativeFileChangeItem, NativeItemCompletedNotification, NativePatchChangeKind,
+        NativeServerRequestResolvedNotification, NativeTurnCompletedNotification,
+        NativeTurnStartedNotification, NativeTurnStatus,
     },
 };
 
@@ -26,6 +27,7 @@ const EARLY_EVENT_LIMIT: usize = 128;
 const EARLY_EVENT_BYTES: usize = 256 * 1024;
 const MAX_PENDING_REQUESTS: usize = 128;
 const RESOLVED_REQUEST_HISTORY: usize = 128;
+const MAX_CHANGED_PATHS: usize = 1_000;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EventStatus {
@@ -1116,6 +1118,8 @@ impl EventProcessor {
             &item_id,
             "tool.completed",
         )?;
+        let completed_file_change =
+            item_type == "fileChange" && native_status.as_deref() == Some("completed");
         let mut data = json!({
             "command_id": command_id,
             "turn_id": turn_id,
@@ -1124,6 +1128,53 @@ impl EventProcessor {
         });
         if let Some(native_status) = native_status {
             data["status"] = Value::String(native_status);
+        }
+        if completed_file_change {
+            // Installed 0.161 ThreadItem/FileUpdateChange: only native path fields,
+            // including update.move_path, are edit hints; diffs are never persisted.
+            let file_change: NativeFileChangeItem =
+                serde_json::from_value(item.clone()).map_err(|_| {
+                    Error::new(
+                        "native_protocol",
+                        "Codex completed fileChange did not match the 0.161 schema",
+                    )
+                })?;
+            data["changed_paths"] = json!([]);
+            data["changed_paths_truncated"] = Value::Bool(false);
+            // Reserve the complete envelope and escaped path bytes. `true` is
+            // shorter than `false`, so marking truncation cannot exceed this budget.
+            let mut metadata_bytes = serde_json::to_vec(&data)
+                .map_err(|_| {
+                    Error::new("internal", "Codex fileChange metadata could not be encoded")
+                })?
+                .len();
+            let mut changed_paths = Vec::new();
+            let mut truncated = false;
+            'paths: for change in file_change.changes {
+                let move_path = match change.kind {
+                    NativePatchChangeKind::Update { move_path } => move_path,
+                    _ => None,
+                };
+                for path in std::iter::once(change.path).chain(move_path) {
+                    let path_bytes = serde_json::to_vec(&path)
+                        .map_err(|_| {
+                            Error::new("internal", "Codex fileChange path could not be encoded")
+                        })?
+                        .len()
+                        + usize::from(!changed_paths.is_empty());
+                    if path.is_empty()
+                        || changed_paths.len() >= MAX_CHANGED_PATHS
+                        || metadata_bytes.saturating_add(path_bytes) > MAX_EVENT_BYTES
+                    {
+                        truncated = true;
+                        break 'paths;
+                    }
+                    metadata_bytes += path_bytes;
+                    changed_paths.push(path);
+                }
+            }
+            data["changed_paths"] = json!(changed_paths);
+            data["changed_paths_truncated"] = Value::Bool(truncated);
         }
         self.commit_event("tool.completed", native_id, data).await
     }

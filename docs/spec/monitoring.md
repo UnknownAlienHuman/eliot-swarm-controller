@@ -207,12 +207,20 @@ clean-only except allowed relative scratch paths; the branch is retained.
 
 ## Git and filesystem monitor
 
-One monitor per distinct live worktree. Monitoring commands use a hermetic read-only Git
-invocation:
+The current increment shares one Git monitor per admitted live worktree, which must
+be the exact Git worktree root. Monitoring commands use a hermetic read-only Git invocation:
 
 ```text
 git -c core.fsmonitor=false --no-optional-locks <command> ...
 ```
+
+Current local monitoring invocations use dedicated leaf custody. Windows installs a private Job's
+`ActiveProcessLimit=1` before resuming the suspended Git process. The runner resolves the
+actual installed executable, such as `mingw64/bin/git.exe`, rather than a launcher that
+needs a child process. Linux requires equal real/effective/saved nonroot UIDs, no
+capabilities, `PR_SET_NO_NEW_PRIVS` and irreversible `RLIMIT_NPROC=0`. Root/privileged
+Linux and other Unix contexts return explicit unavailable; there is no unfenced retry
+or fallback. These restrictions apply to Git reads, not normal harness/plugin custody.
 
 Diff/log commands additionally pass `--no-ext-diff --no-textconv`. The daemon sets
 `GIT_TERMINAL_PROMPT=0`, disables editors and aliases, and never invokes repository
@@ -235,8 +243,42 @@ silently disabling the configured HTTPS/SSH transport itself.
 - slow status backs off and reports source health;
 - monitor never writes index, refs or objects.
 
-Current per-worktree Git sets live in memory and rebuild after restart. Per-Agent edit
-attribution is durable because Git cannot reconstruct authorship in a shared checkout:
+The current subset polls local state at least 2 s apart without submodule recursion;
+slow/error probes back off up to 30 s. CLI reads return the cache without forcing a scan.
+The target requirements above remain binding. `git-status AGENT` / `agent.git` returns
+the current generation's cached view; `edits AGENT` / `agent.edits` pages retained
+attribution, including historical generations for an authorized owner.
+
+Native filesystem invalidation watches the admitted root on Windows/Linux. Linux
+registration disables symlink following; notify's option does not apply to the Windows
+backend. Notifications never establish path containment: Git/path checks remain
+authoritative. Notifications coalesce into wake hints; access-only events do not
+trigger a read feedback loop. Backend errors or rescan notices latch degraded watcher
+health, while periodic polling remains authoritative. Neither a healthy watcher nor a
+notification proves fresh Git coverage or counts as model progress.
+
+The Git view exposes `filesystem_invalidation.state`: `healthy` means an active watcher
+without reported degradation; `degraded` means an active watcher reported an error/rescan;
+`unavailable` means an active watch slot has no watcher; `inactive` means the
+watch slot is inactive or absent. Nested `retry_after_ms` reports the remaining watcher
+retry delay for degraded/unavailable states and is null or absent otherwise. This is
+independent of the top-level Git probe retry delay and cache `available`/coverage fields;
+watcher degradation alone does not invalidate a usable Git sample.
+
+Freshness and coverage are independent. The view exposes `observed_at`, `age_ms`,
+`ttl_ms` (4,000), `available`, `clock_regressed`, `retry_after_ms`, `error` and `source`.
+No sample, a probe/monitor error, clock regression or an expired sample makes the view
+unavailable; cached values may remain visible as diagnostics. An available sample can
+still have `complete=false`. Executable Git filters are disabled, and applicable filter
+attributes make raw status partial; bounded attribution-path coverage can also make a
+snapshot partial. An empty partial dirty set does not prove the workspace clean.
+
+`history_complete` / `history_gap` describe commit coverage separately. Recovery uses
+the persisted workspace HEAD baseline, with at most 64 commits per probe and bounded
+time/output. No baseline or non-ancestor history records a gap; bounded/truncated history
+must not be presented as complete. Current Git sets rebuild in memory after restart.
+Per-Agent edit attribution is durable because Git cannot reconstruct authorship in a
+shared checkout:
 
 ```sql
 CREATE TABLE agent_edits (
@@ -249,8 +291,32 @@ CREATE TABLE agent_edits (
 );
 ```
 
-Generation-matched `file.changed` upserts it; when Git proves a path clean, rows are
-removed. Old generations are cleanup provenance, not current workers.
+Only an authoritative, generation-matched native completed `fileChange` tool event can
+supply edit hints. Codex retains bounded path metadata, not patch contents; the daemon
+validates each hint against the admitted workspace's filesystem containment. Store
+verifies the exact native cause before publishing `file.changed` and upserting attribution.
+A current dirty-path intersection is not required: native writes reverted before polling
+are still consumed, then explicit clean proofs can remove their provenance. Dirty sets,
+commits or shell activity alone never establish authorship. Truncated/redacted/unusable
+hint metadata records a coverage gap.
+
+Rows, including terminal/older generations, are removed only by explicit clean-path
+proofs from a complete scan; ignored, skip-worktree or otherwise unproven paths do not
+authorize cleanup. Git polling and `git.changed` / `git.committed` alone do not advance
+OS samples or model progress. Validated `file.changed` retains its native cause's timestamp.
+
+On 2026-10-27, bounded Windows checks with Git 2.55.0.Windows.5 observed partial trap
+status without authorship or trap execution; SHA-256 inventories of `.git/index`, `HEAD`,
+refs and objects were unchanged. Removing the fixture traps produced complete dirty
+status, still without attribution. Restart recovered the commit made while the daemon
+was down. A native `note.txt` edit retained its original cause timestamp; generation-1
+attribution survived immediate stop/resume to generation 2 with no additional turn.
+It remained queryable after terminal settlement, then a live fake's complete clean scan
+removed it after explicit restoration. All exercise Agents stopped and owned daemons
+exited. The Windows leaf-process regression passed 1/1: the fenced parent ran, while an
+existing absolute child executable ran in the ordinary-custody control and was blocked
+by the leaf Job. This evidence covers those paths on Windows, not full L7 qualification
+or Unix.
 
 ### Read-only progress fingerprint
 

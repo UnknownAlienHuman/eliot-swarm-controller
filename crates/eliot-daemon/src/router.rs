@@ -84,7 +84,7 @@ impl Router {
         let agent_credentials: AgentCredentials = Arc::new(Mutex::new(Default::default()));
         let unknown_commands: UnknownCommands = Arc::new(Mutex::new(Default::default()));
         let (progress, _) = watch::channel(0_u64);
-        let monitoring = Monitoring::new(Arc::clone(&store), bus.clone());
+        let monitoring = Monitoring::new(Arc::clone(&store), bus.clone(), Arc::clone(&secrets));
         let plugin_host = PluginHost::new(
             PluginHostOptions::new(data_root.clone(), owner_token.clone()),
             Arc::clone(&store),
@@ -133,6 +133,8 @@ impl Router {
             "agent.result" => self.agent_result(&params, &principal).await,
             "agent.processes" => self.agent_processes(&params, &principal).await,
             "agent.stats" => self.agent_stats(&params, &principal).await,
+            "agent.git" => self.agent_git(&params, &principal).await,
+            "agent.edits" => self.agent_edits(&params, &principal).await,
             "turn.get" => self.turn_get(&params, &principal).await,
             "events.read" => self.events_read(&params, &principal).await,
             "events.subscribe" => self.events_subscribe(&params, &principal).await,
@@ -542,6 +544,71 @@ impl Router {
             .transpose()
             .map_err(|_| Error::new("internal", "cannot encode process cursor"))?;
         Ok(json!({"agent": id, "generation": generation, "processes": processes, "next": next}))
+    }
+
+    async fn agent_git(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        reject_unknown_keys(params, &["id", "generation"], "agent.git")?;
+        let id = required_text(params, "id")?;
+        let expected = optional_observation_generation(params)?;
+        authorize_agent_read(principal, id, expected)?;
+        let agent = {
+            let store = self.inner.store.lock().await;
+            store.get_agent(id)?
+        }
+        .ok_or_else(|| Error::new("not_found", format!("Agent {id} was not found")))?;
+        if expected.is_some_and(|generation| generation != agent.generation) {
+            return Err(Error::new(
+                "stale_generation",
+                "Git view requires the current Agent generation",
+            ));
+        }
+        let mut value = match self.inner.monitoring.git_view(&agent).await {
+            Ok(value) => value,
+            Err(error) => json!({"available": false, "error_code": error.code}),
+        };
+        value["agent"] = json!(agent.id);
+        value["generation"] = json!(agent.generation);
+        Ok(value)
+    }
+
+    async fn agent_edits(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        reject_unknown_keys(
+            params,
+            &["id", "generation", "after", "limit"],
+            "agent.edits",
+        )?;
+        let id = required_text(params, "id")?;
+        let generation = optional_observation_generation(params)?;
+        authorize_agent_read(principal, id, generation)?;
+        let after = match params.get("after") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(path))
+                if !path.is_empty() && path.len() <= 64 * 1_024 && !path.contains('\0') =>
+            {
+                Some(path.as_str())
+            }
+            Some(_) => return Err(Error::new("invalid", "invalid edit cursor")),
+        };
+        let limit = page_limit(params)?;
+        let (generation, edits) = {
+            let store = self.inner.store.lock().await;
+            let agent = store
+                .get_agent(id)?
+                .ok_or_else(|| Error::new("not_found", format!("Agent {id} was not found")))?;
+            let generation = generation.unwrap_or(agent.generation);
+            if generation > agent.generation {
+                return Err(Error::new(
+                    "stale_generation",
+                    "edit generation does not exist",
+                ));
+            }
+            (
+                generation,
+                store.list_agent_edits(id, generation, after, limit)?,
+            )
+        };
+        let next = edits.last().map(|edit| edit.path.clone());
+        Ok(json!({"agent": id, "generation": generation, "edits": edits, "next": next}))
     }
 
     async fn agent_stats(&self, params: &Value, principal: &Principal) -> Result<Value> {
