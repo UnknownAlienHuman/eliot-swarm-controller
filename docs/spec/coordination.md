@@ -33,27 +33,32 @@ ordinary command rights on the recipient.
 
 ## Mailbox
 
+One `Message` row is one concrete recipient delivery:
+
 ```text
 Message {
   id, delivery_id,
   sender, sender_generation?,
+  recipient, recipient_generation,
   thread?, reply_to_delivery?,
   mode, text, content_digest,
-  admitted_at
-}
-RecipientState {
-  message, recipient, recipient_generation,
+  admitted_at,
   presented_at?, presentation_command?, read_at?
 }
 ```
 
-- `delivery_id` is the external write id for a direct send or a derived id for each
-  selector recipient. Same id + different sender generation, recipients, mode or body
-  digest is `id_conflict`.
+- direct send uses the external mutation id as `delivery_id`;
 - selector expansion captures concrete recipient ids/generations in one bounded
-  transaction. A later replacement generation is not silently retargeted.
-- unknown recipient is an error; it never creates identity.
-- text is at most 32 KiB and known credential values are rejected.
+  transaction, sorts them by Agent id and creates one row per recipient with derived
+  delivery id `<parent-write-id>/<recipient-agent>`. Rows share one `thread` id;
+- same delivery id + different sender generation, recipient generation, mode or body
+  digest is `id_conflict`;
+- a later replacement generation is never silently retargeted. An unread delivery for
+  an older recipient generation is historical: it cannot be presented or acknowledged
+  by the replacement generation. Owner/history queries may inspect it; the sender must
+  create a new delivery to reach the replacement;
+- unknown recipient is an error; it never creates identity;
+- text is at most 32 KiB and known credential values are rejected;
 - reply references the original delivery and stays inside the original participant set.
 
 ### Delivery modes
@@ -68,7 +73,7 @@ RecipientState {
 Full delivered text is clearly marked:
 
 ```text
-[eliot message m12 from a7#3 writer-1 | reply-to: m12]
+[eliot message m12 from a7#3 writer-1 | reply-to: delivery-id]
 <text>
 ```
 
@@ -91,19 +96,22 @@ Parent completion notices obey the same policy.
 
 ### Inbox acknowledgement
 
-`mail.inbox` returns at most 100 oldest unread deliveries and their exact ids; it marks
-nothing. CLI writes complete output and then calls:
+`mail.inbox` returns at most 100 oldest unread deliveries for the caller's exact
+`(agent,generation)` and their exact delivery ids; it marks nothing. CLI writes complete
+output and then calls:
 
 ```text
-mail.ack { id: <write id>, messages: [m1,m2,...] }
+mail.ack { id: <write id>, deliveries: [delivery-1,delivery-2,...] }
 ```
 
-Only those recipient rows are marked read. A crash or lost reply may display them again
-but cannot lose them; messages arriving after the fetch are untouched. Ack is
-idempotent. `mail.read` reads/acks one exact message.
+Only rows whose recipient and recipient generation match the authenticated caller are
+marked read. A crash or lost reply may display them again but cannot lose them; messages
+arriving after the fetch are untouched. Ack is idempotent. `mail.read` reads/acks one
+exact current-generation delivery.
 
-Unread messages do not expire. Acknowledged history may be pruned after retention with
-explicit `history_gap` for old cursors.
+Unread current-generation messages do not expire. Old-generation unread deliveries are
+historical rather than reassigned. Acknowledged history may be pruned after retention
+with explicit `history_gap` for old cursors.
 
 ```sql
 CREATE TABLE messages (
@@ -111,24 +119,21 @@ CREATE TABLE messages (
   delivery_id TEXT NOT NULL UNIQUE,
   sender TEXT NOT NULL,
   sender_generation INTEGER,
-  thread INTEGER,
+  recipient INTEGER NOT NULL,
+  recipient_generation INTEGER NOT NULL,
+  thread TEXT,
   reply_to_delivery TEXT,
   mode TEXT NOT NULL,
   text TEXT NOT NULL,
   content_digest BLOB NOT NULL,
-  admitted_at INTEGER NOT NULL
-);
-CREATE TABLE message_recipients (
-  message INTEGER NOT NULL REFERENCES messages(id),
-  recipient INTEGER NOT NULL,
-  recipient_generation INTEGER NOT NULL,
+  admitted_at INTEGER NOT NULL,
   presented_at INTEGER,
   presentation_command TEXT,
-  read_at INTEGER,
-  PRIMARY KEY(message,recipient)
+  read_at INTEGER
 );
 CREATE INDEX messages_inbox
-  ON message_recipients(recipient,read_at,message);
+  ON messages(recipient,recipient_generation,read_at,id);
+CREATE INDEX messages_thread ON messages(thread,id);
 ```
 
 ## Shared variables
