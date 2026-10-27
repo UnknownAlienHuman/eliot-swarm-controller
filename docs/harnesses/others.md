@@ -25,6 +25,6 @@ No plugin is planned without a concrete native control surface and need.
 
 ## Historical candidates
 
-The older catalogue remains at `git show dc6f70aa:docs/candidate-notes.md` (or the archive
-tag once created). It is not a backlog of mandatory integrations. Select one adapter,
-read its actual native interface, and connect it to the existing plugin contract.
+The older catalogue remains at `git show dc6f70aa:docs/candidate-notes.md`, preserved
+on branch `archive/v1-final`. It is not a backlog of mandatory integrations. Select one
+adapter, read its native interface, and connect it to the existing plugin contract.

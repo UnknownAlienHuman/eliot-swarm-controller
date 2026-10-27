@@ -3,7 +3,8 @@
 Build the next useful path in [roadmap](docs/roadmap.md), not the entire final design.
 Read [vision](docs/vision.md) and [architecture](docs/architecture.md) once, then only
 that task's owning spec, touched code and donor entry. Later-layer sections are not
-prerequisites. Until L0.1, v1 code is reference material, not an implementation to extend.
+prerequisites. v1 is archived at `dc6f70aa` on `archive/v1-final`; do not restore its
+runtime or tooling. L0 is complete; begin with L1.1.
 
 ## Work loop
 

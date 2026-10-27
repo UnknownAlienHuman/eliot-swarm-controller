@@ -2,8 +2,8 @@
 
 Findings that shape the design, with the rule each one supports. Entries marked ✓
 were re-read on 2026-10-25; the others are carried over from v1's source notes
-(`git show dc6f70aa:docs/agent-communication-fleet-scale-sources.md` before L0.1;
-the same paths are available under `v1-final` afterward) and were not re-checked.
+(`git show dc6f70aa:docs/agent-communication-fleet-scale-sources.md`) and were not
+re-checked. The pinned v1 commit remains on branch `archive/v1-final`.
 
 ## Multi-agent scaling and coordination
 

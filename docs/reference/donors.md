@@ -54,15 +54,7 @@ If extraction drags in a scheduler, proof system or several application crates, 
 extracting that route. Use the already-selected library/OS API and the donor's small
 behavioral contract instead. A donor is evidence, not an architectural authority.
 
-v1 is available at `dc6f70aa08ea5fad3da04624ce50c46d45edd57c` before the archive tag
-exists. Never import its Task/Attempt/review/acceptance schema, compatibility executors,
+v1 is preserved on branch `archive/v1-final` at
+`dc6f70aa08ea5fad3da04624ce50c46d45edd57c`. Its original notices remain in that tree.
+Never import its Task/Attempt/review/acceptance schema, compatibility executors,
 per-adapter journals, policy hashes, executable provenance or audit tooling.
-
-## Source and license boundary
-
-No external source code is imported by this documentation change. The external
-supervisor/reducer/mail/service references above are **patterns**, not blanket license
-clearance. Check the exact revision's license and notices once when importing code;
-unknown/incompatible terms mean no copying, not a request to copy first and document
-later. Package versions/MSRV are selected when adding the actual dependency, not
-continually re-approved in every task.

@@ -1,74 +1,14 @@
-[package]
-name = "eliot-swarm-controller"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.89"
-publish = false
-description = "Headless local controller for native coding-agent harnesses"
-
-[lib]
-name = "eliot_swarm_controller"
-path = "src/lib.rs"
-
-[[bin]]
-name = "swarm-host"
-path = "src/main.rs"
-
-[dependencies]
-swarm-kernel-host = { path = "crates/swarm-kernel-host" }
-swarm-process = { path = "crates/swarm-process" }
-
-[dev-dependencies]
-serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "sync", "signal", "time"] }
-toml = "0.9"
-uuid = { version = "1", features = ["v4", "serde"] }
-
-[profile.release]
-lto = "thin"
-strip = "debuginfo"
-
-[profile.test]
-debug = "line-tables-only"
-
-[profile.iterate]
-inherits = "dev"
-opt-level = 1
-debug = "line-tables-only"
-strip = "none"
-incremental = true
-lto = "off"
-
-# Public default entrypoint is the lightweight IPC CLI; host/admin code remains the explicit root package.
 [workspace]
-members = [
-    "crates/swarm-kernel-host",
-    "crates/swarm-adapter-codex",
-    "crates/swarm-adapter-command",
-    "crates/swarm-adapter-claude",
-    "crates/swarm-adapter-opencode",
-    "crates/swarm-adapter-muse",
-    "crates/swarm-contracts",
-    "crates/swarm-client",
-    "crates/swarm-cli",
-    "crates/swarm-checks",
-    "crates/swarm-observer",
-    "crates/swarm-forge-worker",
-    "crates/swarm-bus",
-    "crates/swarm-automation",
-    "crates/swarm-kernel",
-    "crates/swarm-mcp",
-    "crates/swarm-process",
-    "crates/swarm-script-worker",
-    "crates/swarm-scripts",
-    "crates/swarm-store",
-    "crates/swarm-supervisor",
-    "crates/swarm-telemetry",
-    "crates/swarm-gateway",
-    "modules/antigravity-rust",
-]
-default-members = ["crates/swarm-cli"]
+members = ["crates/eliot"]
 resolver = "3"
-# Note: the vendored atlas-redact path dependency becomes a workspace member. Never run a bare
-# `cargo fmt` at the root: it would reformat the preserved upstream Atlas snapshot (vendor/atlas,
-# hash-verified in CI). Format explicit owned packages with cargo fmt -p <name>.
+
+[workspace.package]
+version = "0.2.0-dev"
+edition = "2024"
+rust-version = "1.99"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = "warn"
