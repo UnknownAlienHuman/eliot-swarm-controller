@@ -55,7 +55,9 @@ reports, packets, inventories, progress documents or addenda.
 - **Fence before effect.** A generation-changing dispatch advances the fence, revokes
   old identity/source ownership and—when direct identity is possible—commits the one
   random target-generation token before plugin/native I/O. Unknown never rolls back the
-  generation or rotates another token. Do not add a routing key or derived-token system.
+  generation or rotates another token. Terminal `stopped|failed|lost` and detach clear
+  the current token atomically, even when degraded Unix custody cannot prove every
+  descendant died. Do not add a routing key or derived-token system.
 - **Unknown stays unknown.** Never replay a possible native/external effect—not start,
   input, interrupt, stop, setup, script or push. Exact readback or explicit owner
   resolution only. Its narrow lane remains blocked.
