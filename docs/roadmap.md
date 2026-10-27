@@ -68,13 +68,15 @@ Specs: [core](spec/core.md), [API](spec/api.md),
       subject and pure reducer. No binding revisions or Task/workflow model.
 - [ ] **L1.2 Store.** Numbered migrations, L1 projections, one writer/group commit,
       read pool and query paths. Persist command principal/method/payload identity,
-      source owners/cursors, turns and current Agent state. Commit failure blocks new
-      writes and never repeats the external cause.
+      source owners/state, turns and current Agent state. Generation-changing dispatch
+      advances the fence and commits the one target-generation token before native I/O.
+      Commit failure blocks new writes and never repeats the external cause.
 - [ ] **L1.3 Bus/source intake.** Persist-before-broadcast; bounded live fan-out;
       subscribe live-buffer → persisted watermark replay → live. Plugin native-record
-      batch commits events/cursor/reducer atomically and is acknowledged afterward.
-      One family owner; cursor or explicit gap; duplicate native id with another digest
-      is integrity failure.
+      batch commits events, daemon-computed digests, source state/cursor and reducer
+      atomically and is acknowledged afterward. One family owner; exclusive cursor or
+      stable `gap_id`; a repeated native record is wholly new or an exact duplicate;
+      mixed replay or same id/different payload/cursor is integrity failure.
 - [ ] **L1.4 Daemon/IPC/principals.** Data-dir lock, boot/PID identity, current-user IPC,
       background/foreground daemon, status/drain/force. Owner CLI automatically uses
       private owner token; Agent/run/plugin principals are scoped; missing identity never
@@ -83,22 +85,24 @@ Specs: [core](spec/core.md), [API](spec/api.md),
       minimal environment, accounts/proxies, bounded frozen note/setup/script inputs and
       strict keys. Existing Agent snapshots do not silently follow reloads.
 - [ ] **L1.6 Plugin host/custody.** Typed framing/deadlines, per-Agent plugin generation
-      and shared-service mode only after exact isolation. Source plan before native I/O,
-      event commit ack, attach/snapshot/readback, Windows Job and honest degraded Unix
-      process group.
+      and shared-service mode only after exact isolation. Source plan/state and target
+      generation token/environment are committed before native I/O; event batch commit
+      ack, idempotent child registration, attach/snapshot/readback, Windows Job and
+      honest degraded Unix process group.
 - [ ] **L1.7 Router/readiness lanes.** Immutable admission, expected generation,
       linked first input, exact turn/request controls, FIFO future sends, unknown input/
-      turn gate, selectors/pagination, idempotent external ids, profile/account/proxy
-      launch queue, no replay after restart.
+      turn/transition gates, selectors/pagination, idempotent external ids,
+      profile/account/proxy launch queue and no replay after restart.
 - [ ] **L1.8 Fake plugin.** Deterministic isolated sessions supporting session-first and
-      input-created starts, exact generation/turn/request rejection, cursor/gap,
-      requests/children, crash/hang/exit and snapshot readback.
+      input-created starts, exact generation/turn/request rejection, atomic
+      native-record batches, cursor/gap/source-state readback, requests/children,
+      crash/hang/exit and snapshot readback.
 - [ ] **L1.9 CLI.** Daemon/status, launch/list/show/watch/events, core verbs,
       wait/result/turn, command children/cancel/resolve, JSON output, stable ids and
       documented exit codes.
-- [ ] **L1.10 Identity/secrets.** Agent token lifecycle by generation, no independent
-      token for routing-disabled children, known-value masking and durable payload
-      rejection.
+- [ ] **L1.10 Identity/secrets.** Agent token lifecycle by generation, dispatch-time
+      rotation/revocation, no independent token for routing-disabled children,
+      known-value masking and durable payload rejection.
 - [ ] **L1.11 Qualification entrypoints.** Minimal recording/replay and `plugin-test`
       command surface only; complete cases are implemented/run in L7.
 
@@ -114,16 +118,18 @@ Goal: one useful real harness through its native app-server.
       installed Codex; add bounded sanitized record/replay transport and record only
       scenarios required while implementing current verbs.
 - [ ] **L2.2 Session and turns.** One plugin + app-server per controlled Agent
-      generation; arm native source before `thread/start`; exact effective settings;
-      ready before turn; linked `turn/start`; final text/usage.
+      generation; arm native source before `thread/start`; exact target-generation
+      environment/effective settings; ready before turn; linked `turn/start`; final
+      text/usage.
 - [ ] **L2.3 Control/readback.** Send, exact-turn steer/inject/interrupt, stop with
       native Goal clear, resume as new generation, configure application point. Every
       lost response is exact readback or unknown; no repeated effect.
 - [ ] **L2.4 Requests.** Exact approval/question ids and approve/deny/answer.
 - [ ] **L2.5 Native Goal.** Set/pause/resume/clear/status, generation binding and stop
       cleanup.
-- [ ] **L2.6 Children.** Canonical subagent subjects, parent generation, honest
-      environment/identity limitations and guard-exceeded visibility.
+- [ ] **L2.6 Children.** Canonical subagent subjects, parent generation, idempotent
+      registration, honest environment/identity limitations and guard-exceeded
+      visibility.
 - [ ] **L2.7 Account/proxy.** Native permissions, persisted capacity/holds/probe,
       managed/adopted OpenCodex, effective endpoint/billing readback.
 - [ ] **L2.8 Useful manual path.** One compact direct and proxy run demonstrates real
@@ -140,19 +146,21 @@ Specs: [monitoring](spec/monitoring.md).
 - [ ] **L3.1 Process monitor.** Boot/PID/birth identity, Agent vs service custody,
       OS-authoritative lifecycle/stats and source-drain-before-loss. Exact Windows,
       degraded Unix reporting.
-- [ ] **L3.2 Workspaces.** Frozen local base OID, one durable preparation phase,
-      worktree readback, frozen setup inputs, no rerun after unknown setup and explicit
-      clean-only removal.
-- [ ] **L3.3 Git/filesystem/edit projection.** Read-only Git commands without hooks or
-      index/object writes, watcher debounce, slow backoff, frozen-base diff,
-      generation-bound `agent_edits` and bounded progress fingerprint.
+- [ ] **L3.2 Workspaces.** Frozen local base OID, one durable preparation row with
+      `creating|setup_ready|setup_running|ready|unknown|failed`, exact worktree readback,
+      frozen setup inputs, no rerun after unknown setup and explicit clean-only removal.
+- [ ] **L3.3 Git/filesystem/edit projection.** Read-only Git commands without hooks,
+      fsmonitor, external diff, textconv or unapproved/custom remote helpers; watcher
+      debounce, slow backoff, frozen-base diff, generation-bound `agent_edits` and
+      bounded progress fingerprint.
 - [ ] **L3.4 Discovery/source handoff.** Paged Codex discovery/observe attach,
-      authoritative stream vs transcript ownership, opaque cursor recovery or explicit
-      gap, canonical Agent row.
+      authoritative stream vs transcript ownership, opaque cursor recovery or stable
+      explicit gap, canonical Agent row.
 - [ ] **L3.5 Liveness/restart.** Progress-only stall, source freshness, provider holds
       and level-based reconciliation keys for Agents/workspaces/services/Git.
-- [ ] **L3.6 Views.** Generation, turn/input gate, source owner/cursor/gap, custody,
-      provider hold, workspace phase, requested/effective route and Git/edit facts.
+- [ ] **L3.6 Views.** Generation, turn/input gate, source owner/state/cursor/gap,
+      custody, provider hold, workspace phase, requested/effective route and Git/edit
+      facts.
 
 **Layer result:** real Codex process/native/Git facts are visible without monitors
 changing work or guessing completion.
@@ -204,11 +212,14 @@ chatter.
 Specs: [automation](spec/automation.md).
 
 - [ ] **L6.1 Rules.** Strict TOML, committed-event cursor, event-time subject,
-      match/render guardrails and current+retiring definition handoff at high-water H.
+      match/render guardrails, referenced-file digest watching and current+retiring
+      definition handoff at high-water H.
 - [ ] **L6.2 Timers.** Anchored interval, cron/DST, one-shot, latest-only catch-up and
       durable schedule revision/key.
 - [ ] **L6.3 Actions as commands.** Agent, Git, mail, var, notify and emit commands in
-      order with deterministic ids, generation binding and verb-specific readback.
+      order with deterministic ids, generation binding and verb-specific readback. Git
+      fetch and push endpoint sets are frozen/validated separately; push readback uses
+      every effective `pushurl`, never the fetch URL by assumption.
 - [ ] **L6.4 Scripts.** Frozen file bytes/digest, scoped run token, bounded streams,
       validate-all then atomically create stdout actions; unknown script never reruns.
 - [ ] **L6.5 Approval policy.** Exact async request commands and deadline-bound
@@ -229,44 +240,48 @@ do not add proof documents or compatibility wrappers.
 ### L7.1 Core, Store and fake E2E
 
 - [ ] reducer table including stale generation/turn/request and duplicate inputs;
-- [ ] migrations/reopen, commit failure, group commit, source-owner/cursor/digest and
-      idempotent write identity;
-- [ ] bus replay/live boundary, lag/history gap and event atomic batch;
+- [ ] migrations/reopen, commit failure, group commit, source-owner/state/cursor/gap/
+      daemon-digest and idempotent write identity;
+- [ ] bus replay/live boundary, lag/history gap and all-new/exact-duplicate native-record
+      batch atomicity;
 - [ ] CLI fake path: linked launch/input, requests, FIFO/readiness lanes, unknown input/
-      turn gate, stop/resume generation, selectors and capacity;
+      turn/transition gate, dispatch-time target token, stop/resume generation,
+      selectors and capacity;
 - [ ] daemon/plugin crash at each admission/commit/ack/readback boundary; no replay.
 
 ### L7.2 Plugin conformance and live harnesses
 
 - [ ] one black-box suite for manifest, source plan before native I/O, generation fence,
-      cursor/gap, exact turn/request, unknown non-retry, attach/readback and custody;
+      target environment/token, cursor/gap/state, exact turn/request, unknown non-retry,
+      attach/readback, child registration and custody;
 - [ ] replay current fixtures on supported platforms;
 - [ ] one compact live run per required harness/proxy, cheapest useful route;
 - [ ] requested vs effective route/model/permissions and child/source behavior.
 
 ### L7.3 Monitoring, coordination and automation
 
-- [ ] process exit vs final source drain, adopted service isolation, workspace/setup
-      recovery and Git monitor noninterference;
+- [ ] process exit vs final source drain, adopted service isolation, workspace
+      `setup_running` crash recovery and Git monitor noninterference;
 - [ ] exact mail recipient/ack crash cases, vars CAS, who/claims/hierarchy;
-- [ ] rule edit high-water handoff, deterministic failure cursor advance, timer/DST,
-      persisted provider probe and every external action crash phase;
+- [ ] rule edit/high-water plus referenced-file change, deterministic failure cursor
+      advance, timer/DST, persisted provider probe and every external action crash phase;
+- [ ] fetch URL vs pushurl validation/readback, including rejected custom remote helper;
 - [ ] Goal round/restart/generation/budget/no-progress/unknown gates.
 
 ### L7.4 Platform, security and recovery
 
 - [ ] Windows Job/handles/paths/non-ASCII/long input/file locks;
 - [ ] degraded Unix claims and optional exact Linux custody if required;
-- [ ] current-user IPC/private files, missing-principal rejection, minimal env, project
-      overlay/path escape/secret negatives;
+- [ ] current-user IPC/private files, missing-principal rejection, generation-token
+      revocation, minimal env, project overlay/path escape/secret negatives;
 - [ ] drain/force with unknown blockers and attached services never killed.
 
 ### L7.5 Load and retention
 
 - [ ] CI-sized load each PR after suite exists; full owner run: 10,000 fake Agents and
       2,000 persisted events/s for one hour with bounded RSS/WAL and responsive reads;
-- [ ] retention of events/commands/source cursors/turns/edits/mail without replay or
-      lost current state;
+- [ ] retention of events/commands/source state/turns/edits/mail without replay or lost
+      current state;
 - [ ] drain 1,000 busy fake Agents without new automation or lost result/request.
 
 **Qualification exit:** complete suite green on Windows and supported Linux paths,
