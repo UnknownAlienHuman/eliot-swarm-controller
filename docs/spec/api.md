@@ -105,15 +105,19 @@ snapshot. A mismatch is rejected before native I/O.
 Launch creates Agent generation 0 and a start command targeting generation 1. Resume,
 control takeover and detach expect current generation and target current + 1. For every
 generation-changing command, the dispatch transaction advances the Agent fence to the
-target generation **before native I/O**, rotates/revokes routing identity as appropriate,
-stales old-generation queued work, releases old-generation claims and pauses Goals.
-The command then owns the only open transition for that Agent.
+target generation **before native I/O**, revokes the old controller/source principal and
+Agent token, stales old-generation queued work, releases old-generation claims, pauses
+Goals and installs the target generation's source plan. The command then owns the only
+open transition for that Agent.
 
 Exact transport reconnect to the same still-current controller/source ownership may
-preserve generation. Definite no-effect failure never decrements the fence; the Agent
-retains its last proven control projection in the target generation. Unknown transition
-keeps the target generation current and blocks another transition, send, configure and
-Goal continuation until exact readback or explicit owner resolution.
+preserve generation. A first start/resume that definitely fails settles `failed`. A
+control takeover/detach that definitely fails settles `lost`: the old Eliot controller
+was intentionally revoked at dispatch and is not rolled back, even if the native subject
+may still exist externally. Unknown transition keeps the target generation current, old
+controller revoked and last observed projection diagnostic-only; it blocks another
+transition, send, configure and Goal continuation until exact readback or explicit owner
+resolution. Recovery is an explicit later attach/resume targeting another generation.
 
 ### Linked first input
 
@@ -131,7 +135,9 @@ An external selector command is a Store-only parent. Admission resolves and sort
 concrete Agent ids, checks `max_selector_targets`, captures each current generation,
 creates derived children with deterministic ordinals and applies the parent with
 `{count}`. Parent applied means only that expansion committed. `command.children` pages
-the fixed set and each child settles independently.
+the fixed set and each child settles independently. Retention keeps a parent while any
+required child is open/unknown, prunes terminal children first, then the parent; after
+the complete set is gone the API returns `history_gap`, never a partial set.
 
 ## Input, turn and unknown gates
 
@@ -188,26 +194,29 @@ metadata; it creates no Agent rows.
 
 - first observe attach targets generation 1; later observe/control takeover targets the
   next generation;
-- dispatch advances the fence and installs the target generation's source plan before
-  native I/O, while retaining the last proven observe/control projection until outcome;
+- dispatch advances the fence, revokes the prior controller/source/token and installs
+  the target generation's source plan before native I/O;
 - control attach validates owner-selected global profile, capacity and native
   compatibility before dispatch;
 - exact success commits the new controlled/observe projection, effective facts and a
   rotated Agent token only when an isolated environment is available;
-- definite no-effect failure leaves the target generation on the last proven projection;
-- unknown takeover leaves the target generation and previous projection visible but
-  blocks another transition/turn until readback;
+- definite failure of first attach is `failed`; definite failure of a takeover is
+  `lost` for the target generation, with the native subject still discoverable if it
+  remains external;
+- unknown takeover leaves the target generation current and last observation visible as
+  diagnostic, but no current controller is assumed and ordinary work remains blocked;
 - another live controller or unverified replacement is `not_allowed`.
 
 `detach` is valid only for independently living service/external sessions. Its dispatch
-advances generation and revokes the old Agent token immediately so old tools cannot
-command replacement work. Exact success changes the target generation to observe-only
-and releases control claims; failure keeps the last proven control projection in the new
-generation; unknown blocks further work. It never settles an unknown input and never
-kills the service.
+advances generation and revokes the old Agent token/controller immediately so old tools
+cannot command replacement work. Exact success changes the target generation to
+observe-only and releases control claims. Definite failure settles `lost`; unknown keeps
+the transition gate until readback. It never settles an unknown input and never kills
+the service.
 
 `resume` targets the next generation and starts the same native subject. Old input is
-never resent.
+never resent. A failed resume is `failed`; an unknown resume remains `starting` and
+blocks another start.
 
 ## Event replay
 
