@@ -1,30 +1,33 @@
 # Documentation
 
-Everything an agent needs to build Eliot v2: current specs plus a few reference pages
-(lessons, donors, research). Status lives only in the roadmap checkboxes.
+Everything needed to build Eliot v2: one current specification per topic, one roadmap
+and compact lessons/donor/research references. Status lives only in roadmap checkboxes.
 
 | Read | When |
 | --- | --- |
-| [vision](vision.md) | What Eliot is; the owner's statement (source of truth); requirements R1–R11. |
-| [architecture](architecture.md) | Components, data flows, scale model, repository layout. |
-| [roadmap](roadmap.md) | Layers L0–L9, one task per PR, exit tests, code budgets. **Start here to pick work.** |
-| [decisions](decisions.md) | Why things are the way they are; open questions with defaults. |
-| [spec/core](spec/core.md) | Ids, agent model and states, events, verbs, commands, schema. |
-| [spec/api](spec/api.md) | Daemon API and the CLI. |
-| [spec/plugin-protocol](spec/plugin-protocol.md) | How harness plugins talk to the daemon; hooks; conformance kit. |
-| [spec/monitoring](spec/monitoring.md) | Process custody, workspaces, Git, transcript and liveness monitoring; views. |
-| [spec/automation](spec/automation.md) | Rules, timers, actions, scripts, approvals, Goal loop, guardrails. |
-| [spec/coordination](spec/coordination.md) | Permissions, mailbox, shared vars, `who`, claims, hierarchy. |
-| [spec/configuration](spec/configuration.md) | Data dir, config files, project overlays, environment, accounts, proxies. |
-| [harnesses/](harnesses/README.md) | Capability matrix and one page per vendor harness, with official sources. |
-| [reference/lessons-v1](reference/lessons-v1.md) | What went wrong in v1 and the rule that prevents it. |
-| [reference/donors](reference/donors.md) | Code and patterns to borrow, and what not to borrow. |
-| [reference/research](reference/research.md) | Research findings behind the coordination and automation rules. |
+| [vision](vision.md) | Product purpose, owner's source statement and R1–R11. |
+| [architecture](architecture.md) | Components, donor-backed identity/event/recovery boundaries and data flows. |
+| [roadmap](roadmap.md) | Connected layers, code budgets, implementation gate and final qualification. **Start here to pick work.** |
+| [decisions](decisions.md) | Non-obvious current choices; no addenda. |
+| [spec/core](spec/core.md) | Stable Agent + generation fence, events/source owners, verbs, commands and Store projections. |
+| [spec/api](spec/api.md) | Local principals, API/CLI, exact wait/readback/drain semantics. |
+| [spec/plugin-protocol](spec/plugin-protocol.md) | Plugin framing, source plan/cursors, generation binding, custody and recordings. |
+| [spec/monitoring](spec/monitoring.md) | Source health, process custody, workspaces, Git, liveness and reconciliation. |
+| [spec/automation](spec/automation.md) | Rule cursor/handoff, timers, actions-as-commands, scripts, approvals and Goals. |
+| [spec/coordination](spec/coordination.md) | Authority, delivery identity/mail ack, vars, `who`, claims and hierarchy. |
+| [spec/configuration](spec/configuration.md) | Private data root, frozen profiles/files, environment, accounts, plugins and services. |
+| [harnesses/](harnesses/README.md) | Required native identity/process/source/cursor contract per harness. |
+| [reference/lessons-v1](reference/lessons-v1.md) | Confirmed failure → compact prevention rule. |
+| [reference/donors](reference/donors.md) | Exact donor source path and mechanism to copy; rejected application machinery. |
+| [reference/research](reference/research.md) | Findings that constrain communication/automation. |
 
-How to change docs: edit the page that owns the topic in the same PR as the code
-that needs it. Do not add new documents for reports, audits, plans or status.
+Edit the page that owns a topic in the same PR as the code that needs it. Replace
+superseded text in place. Do not add report, audit, packet, inventory, plan or status
+pages.
 
-v1 documentation (61k lines) was removed from the tree; read it with
-`git show v1-final:docs/<path>` (until the tag exists: `git show dc6f70aa:docs/<path>`).
-`docs/owner-decisions.md` is still present only because v1 code embeds it in a test;
-it is not a requirement and is deleted with the v1 code in L0.1.
+Implementation PRs use formatting plus smallest changed-package Clippy. The complete
+runtime/conformance/live/platform/load suite is built and run after the connected local
+product exists; docs or Clippy are never reported as runtime qualification.
+
+v1 documentation remains at frozen commit `dc6f70aa` and, after L0.1, tag `v1-final`.
+`docs/owner-decisions.md` remains only while v1 code embeds it; L0.1 removes both.
