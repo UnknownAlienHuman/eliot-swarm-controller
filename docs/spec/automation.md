@@ -132,8 +132,22 @@ is applied; rejected/failed/unknown stops the remaining commands.
 | `git.fetch|pull|push|worktree` | daemon command with explicit repo/remote/ref/OID/path and verb-specific readback |
 | `msg.send`, `var.set` | normal coordination mutation under rule principal |
 | `run` | bounded managed process command |
-| `notify` | bounded log/desktop or named webhook command |
+| `notify` | bounded log/desktop or owner-configured named webhook command |
 | `emit` | persisted `x.user.*` event command |
+
+Git action arguments are data, not command-line syntax:
+
+- `repo`/`workspace` resolves to an owner-registered project path allowed to the rule;
+  project rules cannot select arbitrary cwd;
+- `remote` is an owner-configured remote name, never a URL from event data. Reject empty
+  names, leading `-`, control characters, `::`, `ext::` and any value whose exact
+  `git remote get-url --all` result uses an unapproved remote-helper scheme;
+- refs are full validated refnames (`git check-ref-format`) and may not begin with `-`;
+  OIDs are exact hexadecimal object ids read from Git, never free-form placeholders;
+- commands place `--` before pathspecs where supported and use explicit refspec argv;
+- a placeholder-filled remote/ref/path must pass the same validation after rendering;
+- monitoring/action Git calls disable hooks, fsmonitor, external diff and textconv as
+  specified in [monitoring](monitoring.md#git-and-filesystem-monitor).
 
 No unknown command is run again. Git push readback compares the exact intended local OID
 with the exact remote ref after the process tree is gone; it never pushes again merely
@@ -154,6 +168,10 @@ Paths must remain under the registered project/global script root and may not tr
 verifies size/digest; mismatch fails rather than running different bytes. Small generated
 system text may be copied directly into the definition row. There is no global artifact
 CAS or garbage collector.
+
+A project `run` uses a frozen script under the registered `.eliot/scripts` root and an
+owner-approved interpreter; it cannot choose an arbitrary executable. A global rule may
+use only an executable/argv declared in owner configuration.
 
 A `run` command receives one JSON object on stdin and may return bounded NDJSON action
 objects. The daemon buffers all output, validates every action under the parent rule
