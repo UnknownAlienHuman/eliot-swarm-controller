@@ -1,105 +1,139 @@
 # OpenCode
 
-Layer L4.4. Plugin: `plugins/opencode` (HTTP + SSE client; Rust or TypeScript with
-`@opencode-ai/sdk`).
+Layer L4.4. Plugin is an HTTP/SSE client implemented against one installed OpenCode API
+generation selected from `GET /doc`; do not mix public/v2/v1 endpoints opportunistically.
 
-Facts checked 2026-10-25: repo [anomalyco/opencode](https://github.com/anomalyco/opencode)
-(`sst/opencode` redirects there), latest release v1.19.4 (2026-10-22); docs
-[server](https://opencode.ai/docs/server), [SDK](https://opencode.ai/docs/sdk),
-[providers](https://opencode.ai/docs/providers),
-[permissions](https://opencode.ai/docs/permissions),
-[troubleshooting](https://opencode.ai/docs/troubleshooting) (pages updated
-2026-10-24).
+Facts checked 2026-10-25/26 against `anomalyco/opencode` release v1.19.4, official
+server/SDK/provider/permission docs and OpenCode source. Waku's current OpenCode driver is
+the donor for ownership/reconnect semantics: one shared event hub, exact session
+demultiplexing, subscribe before create, adopted service never killed and reconnect by
+readback rather than fabricated completion.
 
-**Two API generations.** Current docs describe the endpoints below and also a v2 API
-(`@opencode-ai/sdk/v2`). v1 Eliot used the v2 `/api/...` surface of a 2.0.7 build.
-Pick one generation in L4.4 against the owner's installed version (`GET /doc`) and
-implement only that one. The v2 paths v1 used: `GET /api/info` (version),
-`POST /api/session/{id}/agent|model|background`, `GET /api/session/{id}/diff`,
-`GET /api/fs/read/*`, `GET /api/experimental/session/{id}/log?follow=false`
-(durable session log).
+## Native identity and process mode
+
+```text
+native_scope = opencode:<canonical server identity/URL + persistent store identity>
+native_ref   = exact OpenCode session id
+```
+
+One server can host many sessions, but shared control is allowed only after the installed
+API proves all of:
+
+- every event/request/readback is attributable to exact session id;
+- each session's tools receive isolated Eliot token/Git/account environment before input;
+- one session can be aborted/stopped without killing or mutating another;
+- server restart lets environment be restored before the next input.
+
+Otherwise Eliot launches one server per Agent generation or attaches owner server
+sessions observe-only. The server PID belongs to service custody, not Agent custody.
+Owner-run/adopted server is never killed or “repaired” by Eliot.
+
+First control creates generation 1; control takeover/resume after server/session
+reattach creates the next generation unless the same current controller ownership is
+proven. SSE/readback/plugin messages all carry Eliot generation.
 
 ## Transport
 
-- `opencode serve [--port 4096] [--hostname 127.0.0.1]`; one server, many sessions.
-- Tools of every session run with the server's environment, so by default the plugin
-  starts **one server per agent** (in that agent's custody, with its token and Git
-  identity). Sessions of an owner-run server are attached observe-only. Controlling
-  several agents in one server needs per-session environments: public source on
-  2026-10-26 showed `PUT /api/session/{sessionID}/environment` feeding shell spawning,
-  but kept in process memory (lost when the server restarts). Use it only after L4.4
-  proves two sessions' tools see different tokens, and set it again after every
-  server restart before the next input. Never drive sessions through repeated CLI
-  invocations (v1: CLI recovery under load caused restart storms and lost writers).
-- Events: SSE `GET /event` (first event `server.connected`), `GET /global/event`.
-- One server can serve several directories: every session request carries the
-  agent's directory (the exact parameter per the installed schema), otherwise the
-  server falls back to its own cwd; `/global/event` mixes directories — drop events of
-  other directories, and an event without directory metadata is a gap.
-- OpenAPI: `GET /doc`.
-- A freshly started server may report a configured model as unavailable until its
-  catalogue refresh finishes (2.0.7 published a bundled catalogue first): retry on
-  that error only, for a bounded time (v1 used 15 s), and only for a request whose
-  complete error response proves nothing was accepted.
-- HTTP writes: 400/401/403/404/405/409/413/422 mean rejected (not applied); any other
-  non-2xx or a transport error means `unknown`, resolved only by reading back. A 404 or
-  405 proves a missing route only if its body was read completely.
+- start/attach `opencode serve` on loopback;
+- SSE from the exact installed `/event` or `/global/event` route;
+- install one server-level event hub and demultiplex by exact session id; events missing
+  session/directory identity are dropped with source health/gap, never guessed;
+- subscribe before creating/sending to a session so no early event is lost;
+- carry exact workspace/directory parameter on every session request;
+- read full HTTP error bodies. A complete client error may prove rejection; transport
+  failure/timeout/ambiguous server error after write is unknown.
 
-## Verb mapping (current docs endpoints)
+A temporary model-catalogue startup retry is allowed only when the complete native error
+proves no session/input was admitted.
 
-| Eliot verb | OpenCode | Notes |
+## Source ownership and reconnect
+
+For controlled sessions, the exact-session SSE stream owns lifecycle families it
+provides. Native message/session reads are readback and bounded repair, not a second
+concurrent publisher. Observe-only sessions may use native history only when the
+installed API exposes an opaque exclusive cursor.
+
+Most OpenCode event streams do not provide such a durable history cursor. Therefore on
+SSE break/reconnect:
+
+1. mark stream stale; do not mark Agent/session lost merely because transport broke;
+2. reconnect the shared hub and increment its transport generation;
+3. discard stale resync work from an older transport generation;
+4. read current session, active execution, permissions/forms/inbox and paged current
+   messages;
+5. gap-fill only the known active assistant step/output using exact message/part ids;
+6. record `source.gap` for the uncovered stream interval;
+7. continue at the new live edge.
+
+Do **not** replay the full old message history after event retention merely because ids
+are available. `native_id` removes bounded overlap only. A running execution absent from
+an active list is not terminal without the exact native delimiter/result; silence and
+session update time prove nothing.
+
+If an installed version provides a true exclusive durable session-log cursor, record it
+and resume strictly after it; update this page/fixture for that version.
+
+## Verb mapping
+
+Every request is bound to Eliot generation. Controls use exact current execution/request
+where the installed API exposes it; otherwise the verb is rejected.
+
+| Eliot verb | Native operation | Settlement |
 | --- | --- | --- |
-| `launch` | `POST /session` → `session.ready`; the prompt is the linked send | `start_requires_input: false`. |
-| `send` | `POST /session/:id/prompt_async` (204) | The 204 means accepted into the inbox, not executed: the command stays `dispatched` until the execution that consumes this input starts (`applied`), and a timeout before that is `unknown`. In the v2 log: `session.inbox.enqueued` → `session.inbox.delivered` → `session.execution.started`; one `execution.started` can cover several inputs (a busy period, not one turn) — its `turn.started.commands` lists them all. |
-| `steer` | verify in L4.4 (v1 research found queue/steer in the v2 API; v1 rejected exact-turn steer) | Reject until verified. |
-| `inject` | verify (v2 API had instruction entries applied at the next step); else prepend to next send | |
-| `interrupt` | `POST /session/:id/abort` | Check whether abort also stops child sessions. |
-| `stop` | abort, then end the agent's own server; on an owner-run server only stop tracking | Never stop a server another agent or the owner uses. |
-| `resume` | sessions persist in the server DB; re-attach by id | After a server restart an input is settled only by its exact continuation or by the interrupted terminal the server writes for the previous execution; idle state, list absence or a new PID settle nothing. |
-| `fork` | `POST /session/:id/fork` `{messageID?}` | |
-| `background` | v2: `POST /api/session/{id}/background` (204, no body) | Moves running backgroundable tools to the background; idle is a no-op; the only proof is a new synthetic notice naming the moved work. Not interrupt, not steer. |
-| `approve` / `deny` | `POST /session/:id/permissions/:permissionID` `{response: once|always|reject}` | `remember` → `always`. |
-| `goal.*` | no native goal → Eliot Goal loop | |
-| `configure` | v1-style API: model/agent per prompt; v2 API: session setters `POST /api/session/{id}/model` and `/agent` (apply to following turns, confirm by reading the session back) | A model is `providerID` + a model id that may itself contain `/` (e.g. `kilo` + `stepfun/step-5-preview-free`): split at the first `/` only, never flatten. Availability comes from this server's model list, not the public catalogue. |
+| `launch` | create exact session without prompt | commit `session.ready`; linked input is separate |
+| `send` | installed async prompt/inbox endpoint | HTTP 204/inbox enqueue is intermediate; applied only when exact native execution starts and names/contains this input |
+| `steer` | exact active-execution steer only | queueing another prompt is not steer; reject until recorded |
+| `inject` | verified instruction/safe-point mechanism or prepend to next send | report actual mechanism/application point |
+| `interrupt` | exact session/execution abort | unknown is read back, never retried; verify child scope |
+| `stop` | exact session close/abort where supported, then detach tracking | never kill shared/adopted server for one Agent |
+| `resume` | attach exact persisted session id as a new Eliot generation | old input never resent |
+| `fork` | exact session fork | new native subject/new Agent |
+| `background` | installed exact background operation | 204 is not proof; settle by exact resulting notice/state |
+| `approve|deny` | exact permission id reply | use offered values; bind request/generation |
+| `answer` | exact installed user-input id reply | otherwise unsupported |
+| `goal.*` | Eliot Goal | no qualified generic native Goal |
+| `configure` | installed per-session/per-prompt model/agent controls | read back and report application point |
 
-## Observation
+Several input commands may join one native execution. `turn.started` lists all associated
+command ids. An unknown input keeps Eliot's input lane blocked until inbox/execution
+readback proves association/drop/unknown.
 
-- Live events from SSE; final text from message reads. Message reads are paged: follow
-  the cursor to the last page before treating a message as the final result (v1 failed
-  on sessions over 50 messages).
-- Activity comes from message/part updates; the session's update time does not move
-  while tools run.
-- Children: paginated `GET /session/:id/children` (on versions without it, a paginated
-  query by `parentID`). `GET /session/active` lists running sessions, not the family:
-  a parent missing from it may still have live children.
-- The SSE stream is volatile: after a gap, rebuild from message reads. Facts read
-  both live and on rebuild carry `native_id` (message/part id plus kind), so the
-  rebuild stores nothing twice; a running execution that disappears without its
-  terminal message is not a finished turn.
-- The installed client registers its server in `$XDG_STATE_HOME/opencode/service.json`
-  (default `~/.local/state/opencode/service.json`): `url`, `pid`, optional `version`,
-  `id` and local HTTP `password` — use it to find the owner's server URL; the
-  password, if any, comes from the env var named in config (`password_env`), never
-  from that file or a log.
-- Data dir `~/.local/share/opencode` (`%USERPROFILE%\.local\share\opencode` on
-  Windows) with `opencode.db` (SQLite: projects, sessions, messages). Read-only access
-  for `discover`; never write; it is a live WAL database.
+## Current-state reconciliation
 
-## Proxy
+Waku's ordering is retained:
 
-Custom provider in OpenCode config: `provider.<id>` with
-`npm = "@ai-sdk/openai-compatible"`, `options.baseURL`, a `models` map. Pass it per
-launch via `OPENCODE_CONFIG_CONTENT` or a generated config file
-(`OPENCODE_CONFIG`) so the owner's config is not edited.
+1. permission/forms snapshots first—a pending native request proves the resumed turn is
+   live;
+2. inbox snapshot settles only whether a pending input remains undelivered;
+3. active-session/execution snapshot;
+4. gap-fill current assistant output;
+5. exact native idle/terminal delimiter settles the turn; otherwise keep running/unknown.
 
-## v1 pitfalls
+A server restart can suspend a run temporarily. A grace/readback path may wait for native
+resume, but absence from the active list alone never manufactures completion.
 
-- Per-tool Git snapshots competed for the index; turning them off cut median edit
-  time 42 s → 4.9 s (owner report, 2.0.7). Recommend `snapshot: false` for managed
-  agents if the installed version still snapshots per tool.
-- In 2.0.7 the event bus did not persist events by default; after a disconnect, rebuild
-  from message reads, not from the event stream.
-- The OpenCode desktop app restarted its own `serve --service` when the swarm stopped
-  it: distinguish the owner's server from one the plugin started.
-- An old pinned contract lacked the assistant `parentID`, so results could not be tied
-  to inputs; check that the chosen API returns it.
+## Children, messages and discovery
+
+- route every event by exact session/parent id, never title/cwd/time/count;
+- child lists/history are paged; parent absent from active set may still have live
+  children;
+- final text requires following message pagination to the terminal record;
+- native store/database may be opened read-only for discovery only when API lacks that
+  fact; never write it and never make it a parallel lifecycle source.
+
+## Provider/proxy configuration
+
+Generate per-Agent/server config or `OPENCODE_CONFIG_CONTENT`; never edit owner global
+config. Report requested and effective provider/model/endpoint/billing route separately.
+Model ids may contain `/`; follow installed schema instead of flattening.
+
+## Retained L7 cases
+
+- two controlled sessions prove isolated token/Git/account environment and stop;
+- owner/adopted server is never killed;
+- HTTP accepted input is not applied until execution association;
+- stream disconnect while run continues yields stale+gap+readback, not terminal;
+- reconnect generation discards stale resync;
+- current-output gap fill does not republish old messages/rules;
+- exact request/input/turn ids survive pagination and restart;
+- no installed exact steer/answer is reported as supported.
