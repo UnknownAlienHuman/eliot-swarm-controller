@@ -142,12 +142,22 @@ admitted or the turn completed. A lost result never causes another start or inpu
 | Method | Fields | Result |
 | --- | --- | --- |
 | `events.put` | agent, generation, source, one native-record batch of persisted events, optional exclusive cursor | committed Store `seq` range and saved cursor |
+| `source.handoff` | agent, generation, families, expected predecessor source, successor source/mechanism, predecessor final cursor or explicit gap | new owner map after one committed handoff transaction |
 | `process.put` | agent, generation, exact PID/start time/role | committed process identity after custody verification |
 | `child` | stable registration id, parent Agent/generation, exact child subject, name/labels?, request own identity? | canonical child Agent/current generation and optional memory-only token |
 
 An `events.put` batch is atomic and bounded. Each event includes `kind`, derived family,
-`native_id?`, canonical payload digest, timestamp and data. One native record that yields
-several normalized events is one batch; its cursor advances only with the entire batch.
+`native_id`, canonical payload digest, timestamp and data. One native record that yields
+several normalized events is one batch; each normalized event gets a distinct stable id
+(for example vendor item id + kind/ordinal), and its cursor advances only with the entire
+batch.
+
+A durable batch that may be resent after a lost acknowledgement **must** provide a stable
+`native_id` for every event. Prefer a vendor event/item id. For a cursor-backed record,
+the plugin may derive ids from the opaque record cursor plus record-local ordinal/kind.
+A source with neither stable ids nor an exclusive cursor cannot safely repeat a lost
+`events.put`: it records `source.gap`, reconciles current state and continues at the live
+edge instead.
 
 The host:
 
@@ -158,7 +168,14 @@ The host:
 5. replies only after commit.
 
 Same native id + same digest returns the original `seq`; another digest is
-`source_integrity` and advances nothing. A lost reply may resend the identical batch.
+`source_integrity` and advances nothing. A lost reply may resend only an identical batch
+whose events all have stable ids.
+
+`source.handoff` is the only dynamic owner-change operation. The daemon verifies the
+expected predecessor for every family and, in one transaction, records the predecessor's
+final exclusive cursor or explicit `source.gap`, then installs the successor. The
+successor must not publish until the reply commits. This is a small compare-and-swap
+boundary, not a source epoch/open-id/sequence protocol.
 
 `process.put` is valid only for a process inside the calling per-Agent custody. Shared
 service PIDs are service-owned. The OS monitor remains the lifecycle authority; plugin
@@ -186,10 +203,10 @@ it:
 `native_id` handles bounded live/readback overlap, not indefinite replay after event
 retention.
 
-One source owns each family. Planned replacement is one Store transaction that verifies
-the predecessor, records its final cursor or gap boundary and installs the successor.
-The successor publishes only after that transaction. No `source_epoch`, `open_id`,
-`source_seq` or watermark protocol exists.
+One source owns each family. Initial ownership is committed by the host before native
+I/O. Planned dynamic replacement uses `source.handoff`; a non-atomic close/reopen is
+allowed only with an explicit gap. No `source_epoch`, `open_id`, `source_seq` or
+watermark protocol exists.
 
 A live stream is normally authoritative for controlled lifecycle. Transcript/history is
 a repair/observe source. Hook owns only explicitly assigned missing facts or the
