@@ -184,17 +184,22 @@ invocation:
 git -c core.fsmonitor=false --no-optional-locks <command> ...
 ```
 
-Diff/log commands additionally pass `--no-ext-diff`. The daemon sets
-`GIT_TERMINAL_PROMPT=0`, disables editors and does not inherit aliases. It never runs
-repository hooks, fsmonitor helpers, external diff drivers or textconv commands.
+Diff/log commands additionally pass `--no-ext-diff --no-textconv`. The daemon sets
+`GIT_TERMINAL_PROMPT=0`, disables editors and aliases, and never invokes repository
+hooks, fsmonitor helpers, external diff drivers, textconv filters or remote helpers.
+Monitoring never accepts a caller-supplied remote URL/refspec; optional remote polling
+uses an owner-configured remote name that has passed the same validation as automation
+Git actions.
 
 - refresh on debounced filesystem invalidation and poll interval, at most once per 2 s;
 - `status --porcelain=v2 --branch -z` for current state;
-- bounded `log --no-ext-diff` on HEAD movement from the last stored HEAD, so commits made
-  while daemon was down are recovered; no prior baseline yields an explicit gap;
-- committed-but-unmerged paths are computed with `diff --no-ext-diff` against frozen
-  `base_oid` when available;
-- remote refs change only after explicit fetch or optional read-only `ls-remote` poll;
+- bounded `log --no-ext-diff --no-textconv` on HEAD movement from the last stored HEAD,
+  so commits made while daemon was down are recovered; no prior baseline yields an
+  explicit gap;
+- committed-but-unmerged paths are computed with
+  `diff --no-ext-diff --no-textconv` against frozen `base_oid` when available;
+- remote refs change only after explicit safe fetch or optional validated read-only
+  `ls-remote` poll;
 - slow status backs off and reports source health;
 - monitor never writes index, refs or objects.
 
@@ -245,7 +250,7 @@ CREATE TABLE provider_holds (
 A hold blocks new provider-backed launch/send/Goal for that scope, not local readback,
 request replies, interrupt or stop. One explicit eligible command may claim a probe.
 Unknown probe remains reserved across restart; time alone does not clear it. Auth and
-model removal require explicit configuration/recovery evidence.
+model removal require explicit owner/configuration evidence.
 
 ## Liveness
 
