@@ -61,6 +61,13 @@ RuleState {
   firing;
 - Store failure advances nothing.
 
+Semantic edits are serialized per `(principal,rule)`. While a retiring definition
+exists, another changed file is **not** installed and no third definition row is
+created. The config source reports the rule as `deferred`; after retirement the
+reconciler rereads the latest valid file and performs one new handoff. Intermediate file
+versions may therefore coalesce, but no retained event is reinterpreted by an arbitrary
+newer definition.
+
 This is the whole edit model—no activation graph, compiled-definition hierarchy or
 run journal.
 
@@ -92,6 +99,7 @@ its previous commands are queued/dispatched/unknown.
 
 Changing a schedule increments its revision and starts after the reload boundary.
 Changing actions only keeps the schedule and applies the new definition to later slots.
+A schedule edit is also serialized behind an existing retiring definition.
 
 ## Matching and rendering
 
@@ -176,8 +184,9 @@ Goal {
 }
 ```
 
-Generation change pauses the Goal. Explicit resume/set rebinds it to the current
-generation and increments revision.
+Generation change pauses the Goal. Every `goal.set`, `goal.resume`, replacement of its
+text/check/budget/cadence, and explicit rebind increments `revision`. Pause/clear also
+increment it so an in-flight round can never publish a late result.
 
 Round identity:
 
@@ -193,8 +202,11 @@ Before a round:
    health, unknown input/turn/commands and native Goal status;
 2. skip/block if any exact gate forbids work; `on_idle` waits for active native Goal;
 3. run bounded check/fingerprint read-only;
-4. pass → done; budget/no-progress → blocked;
-5. reread generation/revision/round key and admit one ordinary send only if unchanged.
+4. compute pass/budget/no-progress/continuation outcome without mutating Store;
+5. in one conditional transaction, reread generation, Goal revision and round key;
+6. only when all still match may the transaction commit **any** round result: `done`,
+   `blocked`, progress counters/fingerprints, budget usage or the ordinary continuation
+   send. Otherwise the stale result is discarded without changing the replacement Goal.
 
 An incomplete fingerprint never counts as no progress. A dispatched/unknown input or
 turn blocks continuation. Goal checks/scripts use the same frozen-file and custody
@@ -204,8 +216,8 @@ rules as other managed commands.
 
 ```sql
 CREATE TABLE rule_state (
-  rule TEXT PRIMARY KEY,
   principal TEXT NOT NULL,
+  rule TEXT NOT NULL,
   revision INTEGER NOT NULL,
   current_definition TEXT NOT NULL,
   current_cursor INTEGER NOT NULL,
@@ -214,16 +226,19 @@ CREATE TABLE rule_state (
   retiring_cursor INTEGER,
   retire_through INTEGER,
   enabled INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(principal,rule)
 );
 
 CREATE TABLE timers (
-  rule TEXT PRIMARY KEY,
+  principal TEXT NOT NULL,
+  rule TEXT NOT NULL,
   schedule_revision INTEGER NOT NULL,
   trigger TEXT NOT NULL,
   anchor INTEGER NOT NULL,
   last_key TEXT,
-  next_due_at INTEGER
+  next_due_at INTEGER,
+  PRIMARY KEY(principal,rule)
 );
 
 CREATE TABLE goals (
