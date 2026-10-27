@@ -202,8 +202,10 @@ Selector children remain independent. No second run/action journal is introduced
 Queued future sends are FIFO but do not block current-turn control/request replies.
 An unresolved dispatched/unknown input without exact turn association blocks later
 send/configure/Goal continuation. Active/unknown turn blocks the next turn; unknown
-transition blocks another takeover. Stop/readback and valid exact request replies remain
-available.
+transition blocks another takeover. A dispatched/unknown configure holds later configure,
+new input and native/Eliot Goal start/resume until exact settings/outcome readback or
+explicit resolution. These gates are predicates over command/turn rows, not separate
+queues or tables. Stop/interrupt/readback and valid exact request replies remain available.
 
 `rejected` proves no native I/O. `failed` means an authoritative unsuccessful completed
 attempt and may include partial side effects; it is not rollback or permission to retry.
