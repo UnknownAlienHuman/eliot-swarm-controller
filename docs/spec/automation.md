@@ -68,6 +68,11 @@ reconciler rereads the latest valid file and performs one new handoff. Intermedi
 versions may therefore coalesce, but no retained event is reinterpreted by an arbitrary
 newer definition.
 
+The config watcher also tracks every frozen note/script referenced by the current or
+retiring definition. A size/digest change is a semantic rule edit and enters the same
+serialized handoff. If a watcher event is missed, the mandatory dispatch-time digest
+check fails the command instead of executing changed bytes.
+
 This is the whole edit model—no activation graph, compiled-definition hierarchy or
 run journal.
 
@@ -124,7 +129,11 @@ rule:<principal>/<rule>@<revision>:<trigger-key>/<index>[/<agent>]
 
 The same trigger can therefore be reconciled repeatedly without duplicate effects.
 Actions execute in listed order: later commands stay queued until the previous command
-is applied; rejected/failed/unknown stops the remaining commands.
+is applied; rejected/failed/unknown stops the remaining commands. `Applied` keeps the
+meaning of the underlying command—for example, an applied `send` means exact turn
+association, not terminal task success. A workflow that needs the result uses a later
+rule on the exact `turn.completed`/cause relationship; Eliot does not add a hidden wait
+or workflow state between actions.
 
 | Action | Implementation |
 | --- | --- |
@@ -140,8 +149,13 @@ Git action arguments are data, not command-line syntax:
 - `repo`/`workspace` resolves to an owner-registered project path allowed to the rule;
   project rules cannot select arbitrary cwd;
 - `remote` is an owner-configured remote name, never a URL from event data. Reject empty
-  names, leading `-`, control characters, `::`, `ext::` and any value whose exact
-  `git remote get-url --all` result uses an unapproved remote-helper scheme;
+  names, leading `-`, control characters, `::`, `ext::` and option-like values;
+- at admission, freeze the effective endpoint set from Git config. `fetch`/`pull` check
+  every `git remote get-url --all <remote>` result; `push` separately checks every
+  `git remote get-url --push --all <remote>` result because `pushurl` may differ from
+  the fetch URL. Every URL must use an owner-approved scheme and must not invoke an
+  unapproved/custom remote helper. Revalidate that the frozen endpoint set is unchanged
+  immediately before dispatch; a mismatch fails before Git I/O;
 - refs are full validated refnames (`git check-ref-format`) and may not begin with `-`;
   OIDs are exact hexadecimal object ids read from Git, never free-form placeholders;
 - commands place `--` before pathspecs where supported and use explicit refspec argv;
@@ -150,7 +164,9 @@ Git action arguments are data, not command-line syntax:
   specified in [monitoring](monitoring.md#git-and-filesystem-monitor).
 
 No unknown command is run again. Git push readback compares the exact intended local OID
-with the exact remote ref after the process tree is gone; it never pushes again merely
+with the exact remote ref at **every frozen effective push URL** after the process tree
+is gone; it uses those URLs directly rather than a mutable remote name. If any endpoint
+cannot be read or disagrees, the action remains unknown—it is never pushed again merely
 to discover the answer. Generic scripts/webhooks without exact readback remain unknown.
 A narrow repository writer hold prevents a later write from passing an older unknown
 write.
