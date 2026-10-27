@@ -62,8 +62,9 @@ UIs, ledgers or proof systems.
 3. **Start ≠ input ≠ turn result.** Each has its own command/fact/outcome.
 4. **Unknown stays unknown.** No possible native/external effect is automatically
    replayed. Its narrow lane remains blocked until exact readback/resolution.
-5. **One source owns each lifecycle family.** Replacement is a cursor boundary or an
-   explicit gap; stream/transcript/hook never publish the same completion independently.
+5. **One source owns each lifecycle family.** Replacement is one compare-and-swap
+   handoff with a cursor boundary or an explicit gap; stream/transcript/hook never
+   publish the same completion independently.
 6. **Persist before publish/ack.** Event, reducer projection and source cursor commit in
    one transaction; only then does plugin/client receive success.
 7. **Events describe what happened; projections describe current state.** Views query
@@ -80,11 +81,22 @@ UIs, ledgers or proof systems.
 One `(native_scope,native_ref)` maps to one Agent row. `generation` fences who currently
 controls/observes it:
 
-- first launch/attach enters generation 1;
-- resume, uncertain/new controller takeover and detach/control transition increment it;
-- exact reconnect to the same still-current ownership may preserve it;
-- queued commands, claims and Goals bind the generation and stale on change;
+- first launch/attach targets generation 1;
+- resume, detach and a new/uncertain controller takeover target current generation + 1;
+- the generation-changing command stores expected and target generation;
+- its **dispatch transaction** advances the fence before native I/O, rotates/revokes
+  routing identity, releases old claims, pauses Goals and stales old queued commands;
+- exact success updates the requested control/observe/profile projection;
+- definite no-effect failure does not decrement the fence; unknown transition leaves the
+  target generation current and blocks another transition/ordinary turn work until
+  readback;
+- exact reconnect to the same still-current writer/source ownership may preserve the
+  generation;
 - exact turn/request ids bind work inside a generation.
+
+This intentionally copies a generation fence, not a lease/binding hierarchy. A command,
+source or process from an older generation can remain in history but cannot mutate the
+current projection or fire ordinary automation.
 
 Per-Agent plugins own one generation and custody unit. A shared plugin is allowed only
 when a native service already isolates session identity/events/readback/stop. Its server
@@ -110,9 +122,10 @@ A queued future send does not block current-turn steer/interrupt/request reply. 
 input that is dispatched/unknown without exact turn association blocks later send,
 configure and Eliot Goal continuation.
 
-Launch with a prompt creates `launch L` plus linked input `L/send`. `session.ready`
-applies L only; exact `turn.started` associates/applies `L/send`; terminal result settles
-the turn separately.
+Launch with a prompt creates `launch L` plus linked input `L/send`. Both are stored as
+one command parent/child set. `session.ready` applies L only; exact `turn.started`
+associates/applies `L/send`; terminal result settles the turn separately. Selector
+fanout uses the same parent/derived-child representation and pages the fixed child set.
 
 ## Event/source flow
 
@@ -127,10 +140,19 @@ native record R
  → bus → clients/rules/Goals
 ```
 
+Every durable event that may be resent after a lost acknowledgement has a stable
+normalized native id. A cursor-backed source may derive ids from cursor + record-local
+ordinal; a source with neither stable ids nor cursor records a gap instead of retrying a
+lost acknowledgement.
+
 A replayable source resumes strictly after its opaque committed cursor. A source with no
 exclusive cursor reconnects at the live edge, records `source.gap`, snapshots current
 state and never republishes old history. `native_id` removes only bounded overlap; the
 same id with different payload is an integrity error.
+
+Dynamic family replacement is one `source.handoff` compare-and-swap transaction: verify
+predecessor, record final cursor or gap, install successor. The successor publishes only
+after commit. There are no source epochs, open ids or source sequence protocol.
 
 ## Restart reconciliation
 
@@ -143,7 +165,8 @@ and native current state; one key is never reconciled concurrently with itself.
 - source owners/cursors determine recovery or gap;
 - workspace/provider state prevents repeated setup/probe;
 - rules drain old/new definitions at their stored high-water boundary;
-- queued work runs only if its captured generation is still current.
+- queued work runs only if its captured generation is still current;
+- an open unknown generation transition blocks another takeover until exact readback.
 
 ## Process and service model
 
