@@ -1,77 +1,106 @@
 # Working on Eliot
 
-Eliot v2 is built from scratch in layers. Read, in this order:
-[vision](docs/vision.md) → [architecture](docs/architecture.md) →
-[roadmap](docs/roadmap.md) → the spec pages your task links to.
+Read, in order: [vision](docs/vision.md) → [architecture](docs/architecture.md) →
+[roadmap](docs/roadmap.md) → only the specifications/harness page linked by your task →
+[donors](docs/reference/donors.md) for the exact mechanism being implemented.
 
-## The tree right now
+Until L0.1 lands, current crates/modules/migrations/tests/tools/vendor/config/old
+workflows are v1 legacy. Do not repair or extend them. Read only the exact donor path
+named by v2 docs, copy the small mechanism and remove its old coupling.
 
-Until roadmap task **L0.1** lands, `crates/`, `modules/`, `migrations/`, `src/`,
-`tests/`, `tools/`, `vendor/`, `config/`, `Justfile` and the CI workflows are **v1
-legacy code**. Do not change it, do not take requirements from it, and do not build
-on it. Borrow from it only what [donors](docs/reference/donors.md) lists.
+## Ownership
 
-## How to do a task
+- One manager owns one worktree, branch and PR.
+- Delegated assignments are narrow and disjoint; the manager reviews/integrates every
+  returned diff.
+- No two managers share an index/worktree.
+- One roadmap task normally lands one connected useful path, not scaffolding.
 
-1. Take the first unchecked task of the current layer in the
-   [roadmap](docs/roadmap.md) (or the task you were given). One task = one branch =
-   one PR, owned by one agent in its own worktree; never two agents in one
-   worktree/index.
-2. Read only the spec sections it links to and the code it touches.
-3. Implement it with tests through the real path. Run `just check` (fmt, clippy
-   `-D warnings`, tests). A task is done when its tests pass; a layer is done when its
-   **exit test** passes in CI. Compiling, Clippy or a reviewed diff alone is never
-   "done", and no test is postponed to a later layer.
-4. Tick the task's box in `docs/roadmap.md` in the same PR.
-5. PR description, three short parts: **What** (behavior added), **Tested** (commands
-   and what they showed), **Spec changes** (if any). CI prints line counts.
+## Implementation loop
 
-If the spec is wrong or silent, fix the owning spec page in the same PR with the
-smallest edit and say so under *Spec changes*. If a vendor fact on a harness page is
-wrong, correct it there with the source URL and date. If a real product decision is
-needed, pick the simplest choice that fits the vision, record it in the
-[defaults](docs/decisions.md#defaults) table, and keep going.
+1. Take the first unchecked current-layer task or the exact assigned task.
+2. Read its linked contract and touched code.
+3. Before inventing a mechanism, read the exact donor source named in
+   `docs/reference/donors.md`. Use its proven boundary unless a concrete Eliot
+   constraint makes it incompatible; state that incompatibility in the PR.
+4. Write the real caller → Store/router → plugin/native → readback path first.
+5. Run only the implementation gate:
 
-## Rules
+   ```text
+   cargo fmt --check
+   cargo clippy -p <changed-package> --lib --bins -- -D warnings
+   ```
 
-- **Build what the task says, through the real path.** No shims, fallbacks,
-  compatibility layers, placeholder code or code without a caller.
-- **Replace means delete.** When new code replaces old code, the old code goes in the
-  same PR.
-- **No paperwork.** Do not add reports, audits, inventories, status files, plans or
-  new docs pages. The roadmap checkbox and the tests are the status.
-- **Stay small.** Respect the [code budgets](docs/roadmap.md#code-budgets). No new
-  crate, trait or abstraction without two real users today.
-- **Unknown stays unknown.** Never resend a command whose outcome is unknown — not
-  `send`, `interrupt`, `stop`, a setup step or a `git push`
-  ([core](docs/spec/core.md#commands)); never treat silence or a missing source as
-  idle, zero or done.
-- **Start ≠ input ≠ result.** `session.ready` does not mean the prompt arrived; `send`
-  applied does not mean the turn succeeded. Each is its own fact.
-- **Native first.** Use the harness's own mechanism. Where the plugin protocol allows an
-  equivalent mechanism (reported in `detail.mechanism`, e.g. `inject` by prepending),
-  use it; never substitute a weaker action silently — reject the verb instead.
-- **No secrets** in code, config, events, messages, fixtures or logs.
-- **No model calls in CI.** CI replays recordings. Real harness runs
-  (`just record-*`, `just live-*`) are fine on a machine where the harness is
-  installed and logged in; keep them short and cheap.
+   Add another package only when the changed contract must compile together. Do not
+   pause partial layers to construct a broad unit/E2E/live/load campaign. A tiny local
+   regression is allowed only when review cannot establish a critical contract without
+   it. The complete deterministic, crash/restart, plugin conformance, live-harness,
+   platform and load suite is built/run after the connected product exists.
+6. Tick the roadmap task in the same PR.
+7. PR description: **What**, **Checked**, **Spec changes**—short and factual.
+
+Fix an incorrect owning spec in the same PR, replacing text in place. Correct unstable
+harness facts from installed/official source with date. Do not add audits, readiness
+reports, packets, inventories, progress documents or addenda.
+
+## Runtime rules
+
+- **Connected path, no substitutes.** No shim, hidden fallback, compatibility family,
+  dead API or abstraction without a current caller.
+- **Replace means delete.** The old route leaves in the PR that activates its
+  replacement.
+- **Stable Agent, one generation fence.** Every Agent command/fact carries the current
+  generation and exact turn/request where relevant. Do not add binding revisions,
+  epochs or another identity layer.
+- **Unknown stays unknown.** Never replay a possible native/external effect—not start,
+  input, interrupt, stop, setup, script or push. Exact readback or explicit owner
+  resolution only. Its narrow lane remains blocked.
+- **Start ≠ input ≠ turn result.** `session.ready`, input admission/association and
+  terminal turn outcome are separate facts.
+- **One source per lifecycle family.** A stream, transcript or hook owns each family for
+  one generation. Handoff uses an opaque cursor or explicit gap. Never duplicate
+  lifecycle through two sources.
+- **Commit before acknowledgement.** Plugin facts, source cursor and reducer projection
+  commit before success is returned or broadcast.
+- **Explicit principal.** Owner CLI uses its private local token automatically; Agents
+  and scripts use scoped tokens. Missing/mismatched identity rejects and never becomes
+  owner.
+- **Native first.** Use the harness's exact mechanism. Unsupported semantics reject;
+  never silently turn steer into send, resume into fresh unrelated launch or
+  force-stop into killing a shared service.
+- **Actions are commands.** Do not introduce a second automation operation graph/run
+  engine.
+- **No secrets** in source, config values, Store semantic data, messages, fixtures or
+  logs.
+- **No model calls in CI.** Record native traffic for the later replay/conformance
+  campaign.
 
 ## Code
 
-- Rust 2024, stable toolchain from `rust-toolchain.toml`, workspace lints.
-- `thiserror` in libraries, `anyhow` in the binary, `tracing` for logs, `tokio` runtime.
-- No `unwrap()` outside tests; `expect("why this cannot fail")` for real invariants.
-- `unsafe` only in `eliot-daemon::platform` (Windows/Unix process and pipe calls).
-- Windows is a first-class target: CI runs on Windows; UTF-8 without BOM; no console
-  windows for child processes; long inputs via files, not argv.
-- Before adding a dependency, check its current version, license and maintenance on
-  docs.rs/crates.io, and name it in the PR.
+- Rust 2024, pinned stable, workspace lints.
+- `thiserror` in libraries, `anyhow` at binary boundary, `tracing`, Tokio async I/O.
+- No production `unwrap`; `expect` states a true invariant.
+- `unsafe` only in the documented platform boundary.
+- Explicit executable/argv/cwd/env; no implicit shell.
+- Windows first-class: assign-before-resume Job, explicit inherited handles, no child
+  console, UTF-8 without BOM/LF, long input via stdin/private file, environment keys
+  case-insensitive.
+- SQLite ids fit signed 64-bit and exhaustion fails before mutation.
+- Lists, histories, fanouts and discovery are bounded/paginated.
+- Before adding a dependency, verify current version, license, maintenance and MSRV and
+  state it in the PR.
 
-## Tests
+## Final qualification
 
-- `eliot-core`: table-driven unit tests (state reducer, matchers, selectors).
-- `eliot-store`: temp-file databases, including reopen and migration.
-- Everything else: end-to-end through the `eliot` binary with the fake plugin
-  (`plugins/fake`) in a temp data dir.
-- Harness plugins: recordings + `eliot plugin-test` in replay mode; live runs via
-  `just live-<name>`.
+After L0–L6 produce the connected local product, build and run one complete campaign:
+
+- reducer/Store/API and migration invariants;
+- fake-harness E2E through the CLI;
+- crash/restart and unknown-outcome boundaries;
+- plugin recordings/conformance and compact live runs;
+- coordination/automation simulated-time cases;
+- Windows/degraded-Unix custody/security/recovery;
+- retention/WAL/load.
+
+Do not claim runtime correctness from documentation, Clippy or fixtures alone. During
+implementation report only the connected behavior and compile gate actually completed.
