@@ -4,94 +4,81 @@
 queries. Wire names are `snake_case`; timestamps are Unix milliseconds UTC; persisted
 integers fit SQLite signed `INTEGER`.
 
-The identity model follows Agent Sessions and sandbox-driver: one stable logical
-session/resource, one monotonically increasing incarnation fence and exact execution
-ids below it. Eliot does **not** have binding revisions or a second lease epoch.
+The identity model copies Agent Sessions and sandbox-driver: one stable logical Agent/
+native subject, one monotonically increasing incarnation fence and exact execution ids
+below it. Eliot has no binding revisions or second lease epoch.
 
 ## Identifiers
 
 | Identity | Form | Meaning |
 | --- | --- | --- |
 | `AgentId` | `a<positive i64>` | Stable Eliot row. |
-| `generation` | nonnegative `i64`, per Agent | Current observation/control incarnation. 0 means no native incarnation has been admitted yet. |
+| `generation` | nonnegative `i64`, per Agent | Current observation/control incarnation; 0 before first native dispatch. |
 | `CommandId` | external ULID or bounded derived string | Stable mutation identity. |
 | `seq` | positive `i64` | Total order of persisted Eliot events. |
-| `MessageId` | `m<positive i64>` | Mail delivery row. |
-| native subject | `(native_scope,native_ref)` | Opaque vendor session/thread identity inside one store/server/account namespace. |
-| `turn_id` | opaque string from plugin | One native execution/turn inside an Agent generation. |
-| `request_id` | opaque string from plugin | One exact approval/question/request inside an Agent generation. |
-| `native_id` | opaque string from plugin | One normalized native fact, stable across the overlap that its source may replay. |
+| `MessageId` | `m<positive i64>` | One concrete mailbox delivery. |
+| native subject | `(native_scope,native_ref)` | Opaque vendor session/thread id inside one store/server/account namespace. |
+| `turn_id` | opaque plugin value | One native turn/execution inside an Agent generation. |
+| `request_id` | opaque plugin value | One exact approval/question inside a generation. |
+| `native_id` | opaque plugin value | One normalized fact inside one native-record batch. |
 
-Agent names are optional and unique. A name may not look like an Agent id or begin with
-`@`.
+Names are optional and unique; they may not resemble Agent ids or selectors.
 
 **One native subject, one Agent.** A `(native_scope,native_ref)` belongs to at most one
-Agent row. Observe attach, control attach, detach, resume and re-attach update that row;
-a native fork is a new subject and Agent.
+Agent row. Attach, detach, resume and controller replacement update that row; a native
+fork is a new subject and Agent.
 
-### Generation fence
+## Generation fence
 
 `generation` is the only incarnation/control fence:
 
-- an admitted first launch/attach targets generation 1;
-- resume, detach or a new controller/plugin taking ownership of a still-live native
-  subject targets current generation + 1;
-- exact transport reconnect to the same still-current plugin/source ownership may keep
-  the current generation; uncertain takeover increments it;
-- every generation-changing command stores both `expected_generation` and
-  `generation` (its target generation);
-- its dispatch transaction advances the Agent to the target generation **before native
-  I/O**, revokes the old plugin/source principal and old Agent token, stales queued
-  old-generation work, releases old-generation claims, pauses Goals and commits the
-  target generation's source-owner/source-state plan;
-- when the target can receive a distinct Eliot environment, that same dispatch
-  transaction creates and commits one random target-generation Agent token before the
-  plugin/native process starts. The complete target environment contains that token;
-  old tools are stale immediately. There is no derived-token/routing-key platform;
-- the old controller is never silently reactivated under the new fence. Exact success
-  installs the requested control/observe/profile projection. Definite failure of a
-  first start/resume becomes `failed`; definite failure of a takeover/detach becomes
-  `lost` from Eliot's perspective even if the native subject may still exist externally;
-- an unknown transition keeps the target generation current, its target token (if one
-  may have reached a process) bound to that blocked generation, the old controller
-  revoked and the last observed projection diagnostic-only. The open transition blocks
-  another transition and ordinary turn work until exact readback/owner resolution;
-- exact readback may install the requested target projection or prove no current Eliot
-  controller and settle `lost`. If it proves no process/session could have received the
-  target environment, the daemon may clear the target token in the same settlement
-  transaction. Recovery is an explicit later attach/resume targeting another
-  generation; generation never rolls back;
-- an exact attach snapshot may move an already-running native turn/request set into the
-  target generation in the same success transaction. Without exact readback those items
-  remain unknown; they are never guessed complete.
+- first launch/attach targets generation 1;
+- resume, detach or a new/uncertain controller takeover targets current + 1;
+- exact transport reconnect to the same still-current controller/source ownership may
+  preserve generation;
+- every generation-changing command stores `expected_generation` and target
+  `generation`;
+- its dispatch transaction advances the Agent fence **before native I/O**, revokes old
+  plugin/source principal and old Agent token, stales old queued work, releases claims,
+  pauses Goals and commits target source owners/state;
+- when direct Agent identity is possible, the same transaction creates one random
+  target-generation token. The plugin/native process receives only that token in its
+  frozen environment; there is no routing key, token derivation or binding revision;
+- exact success installs the requested control/observe/profile projection;
+- definite first-start/resume failure becomes `failed`; definite takeover/detach failure
+  becomes `lost` from Eliot's perspective because the old controller was revoked;
+- unknown transition keeps target generation/current token and blocks another
+  transition plus ordinary turn work until exact readback/owner resolution. Generation
+  never rolls back and another token is not rotated merely because the reply was lost;
+- readback may clear the target token only when it proves no process/session could have
+  received the target environment;
+- an exact attach snapshot may move a running native turn/request set into the target
+  generation. Without exact readback those items remain unknown, never guessed complete.
 
 Every Agent-scoped command, plugin request/event, turn, pending request, claim, Goal and
-native process registration carries the generation. Input from another generation is
-historical/debug input only: it cannot reduce current state or fire normal automation.
+process registration carries generation. Another generation is historical/debug input
+only: it cannot reduce current state or fire normal automation.
 
-## External write ids
+## External mutation ids
 
-Every external mutation carries a ULID generated before send. Idempotency identity is:
+Every external mutation carries a ULID generated before send. Its identity is:
 
 ```text
-(principal, method, canonical semantic payload, write_id)
+(principal, method, canonical semantic payload, id)
 ```
 
-The canonical payload excludes JSON-RPC id, output format, pager, client wait timeout and
-other presentation fields.
+Canonical payload excludes JSON-RPC id, output/pager and client wait timeout.
 
-- same id + same principal/method/payload returns the retained result;
-- same id with any difference fails `invalid` (`id_conflict`);
-- an absent id older than the supported retry window (default 24 h, while command/write
-  rows are retained at least 30 days) fails `invalid` (`id_expired`);
-- internal linked, selector and automation commands use bounded derived ids:
-  `<launch>/send`, `<selector>/<agent>`, `rule:<rule>@<key>/<n>`,
-  `goal:<agent>@<key>`.
+- same tuple returns retained result;
+- same id with another principal/method/payload is `invalid/id_conflict`;
+- absent id older than the supported retry window (default 24 h, while rows live at
+  least 30 days) is `invalid/id_expired`;
+- linked/selector/automation commands use bounded derived ids such as `<launch>/send`,
+  `<selector>/<agent>`, `rule:<rule>@<key>/<n>` and `goal:<agent>@<key>`.
 
 Commands store principal/method/payload digest directly. Non-command mutations use the
-small `writes` table defined by the API; there is no universal receipt/floor subsystem.
-The single Store writer checks both namespaces before inserting an external id, so one
-id cannot be reused for a different method.
+small `writes` table in the API. The single Store writer checks both id namespaces; no
+universal receipt/floor subsystem exists.
 
 ## Agent
 
@@ -102,73 +89,67 @@ Agent {
   origin: eliot | native | external,
   harness, profile, profile_snapshot,
   native_scope?, native_ref?,
-  workspace?, branch?, base_ref?, base_oid?, workspace_phase?,
+  workspace?, workspace_phase?, branch?, base_ref?, base_oid?,
   state, active_turn?, stalled_since?, last_progress_at?,
-  pending: [Request], goal?, effective?,
-  labels: map<string,string>,
+  pending: [Request], goal?, effective?, labels,
   control: self | tree | project,
-  observe_only: bool,
-  own_identity: bool,
-  token?,
+  observe_only, own_identity, token?,
   created_at, updated_at
 }
 ```
 
-`profile_snapshot` is the bounded resolved profile frozen at admission. It contains
-literal nonsecret values, variable names and frozen note/setup/script bytes or
-path+size+digest references—never resolved secret values.
+`profile_snapshot` is the bounded resolved profile and frozen plugin binding from
+[configuration](configuration.md). It stores literal nonsecret values, variable names
+and bounded bytes or canonical path+size+digest references—never resolved secret values.
 
-`origin=native` children are always represented once their exact native subject is
-known, even when Eliot's launch/tree guard is exceeded. An over-limit child is visible
-and safely controllable through its parent plugin where supported, but gets
-`control=self`, no project authority, no direct wake and no independent token unless the
-plugin can inject a distinct environment before its tools run.
+Native children are always recorded once their exact subject is known, even above
+controller fanout guards. An over-limit child is visible and safely parent-controlled
+where supported, but gets `control=self`, no project authority/wake and no independent
+token unless the plugin can inject an isolated environment before tools run.
 
-`origin=external` Agents are observe-only until an exact control attach succeeds.
-`own_identity=false` means the session cannot authenticate its own Eliot CLI; it is
-controlled through the parent/plugin. Eliot does not inject a CLI principal and absence
-of a token never becomes owner.
+External Agents are observe-only until exact control attach succeeds.
+`own_identity=false` means no independent Eliot CLI principal; absence of token never
+means owner.
 
-### States
+### States and reducer
 
-Live states are `starting`, `idle`, `busy`, `waiting`. An open stop or generation
-transition is displayed beside the observed state; it does not create another synthetic
-state machine. While a generation transition is open, that displayed state is only the
-last observation: ordinary turn work is blocked and no controller is assumed current.
+Live states: `starting`, `idle`, `busy`, `waiting`. Open stop/transition is shown beside
+the last observed state; it is not another state machine. While a generation transition
+is open, ordinary turn work is blocked and no controller is assumed current.
 
-| From | Generation-matched input | To/effect |
+| From | Generation-matched input | Effect |
 | --- | --- | --- |
 | — | launch/first attach admitted | `created`, generation 0 |
-| `created` or terminal | `start_dispatched {target_generation}` | `starting`, generation becomes target, old identity revoked |
-| live observe/control row | `transition_dispatched {target_generation}` | generation becomes target; old controller/source/token revoked; last state remains diagnostic while command is open |
-| `created` | stop/cancel before dispatch | `stopped`; linked input cancelled; no native I/O |
-| `starting` | `session.ready` or exact `attached` snapshot | reported `idle|busy|waiting` |
-| `starting` | definite no-effect start/resume failure | `failed` |
-| `starting` | possible start with lost result | remains `starting`; start command unknown; no replacement start |
-| open takeover/detach | exact success/readback | install target projection and exact reported state |
-| open takeover/detach | definite failure/no current controller | `lost`; native subject may remain discoverable externally |
-| open takeover/detach | possible effect with lost result | retain diagnostic state + unknown transition gate until readback; no ordinary work |
-| `idle` | `turn.started {turn_id}` | `busy`, set `active_turn` |
-| `busy` | first exact request | `waiting` |
+| `created` or terminal | `start_dispatched {target_generation}` | generation becomes target; `starting`; old identity revoked |
+| live row | `transition_dispatched {target_generation}` | generation becomes target; old controller/source/token revoked; diagnostic prior state retained while command open |
+| `created` | stop/cancel before dispatch | `stopped`; no native I/O |
+| `starting` | exact `session.ready`/attach snapshot | reported `idle|busy|waiting` |
+| `starting` | definite no-effect failure | `failed` |
+| `starting` | possible start with lost reply | remains `starting`; command unknown |
+| open takeover/detach | exact success | install target projection/state |
+| open takeover/detach | definite no current controller | `lost` |
+| open takeover/detach | possible effect, lost reply | retain unknown transition gate |
+| `idle` | `turn.started` | `busy`, set exact `active_turn` |
+| `busy` | first pending request | `waiting` |
 | `waiting` | last request resolved | `busy` |
-| `busy|waiting` | exact terminal result of `active_turn` | `idle`, clear turn requests |
-| any live | exact native/session end | `stopped` |
+| `busy|waiting` | terminal result of exact active turn | `idle`, clear turn requests |
+| any live | exact normal session end | `stopped` |
 | any live | fatal session error | `failed` |
-| any live | daemon-derived exact loss of session control | `lost` |
+| any live | daemon-derived exact loss of control | `lost` |
 
-Entering `stopped`, `failed` or `lost` cancels accepted/queued commands of that
-generation, clears active turn/pending requests, releases its claims, pauses Goals and
-atomically clears `token`/`own_identity`. Dispatched/unknown commands stay historical and
-are never reissued. This revocation is required even on degraded Unix: an escaped
-same-user descendant may survive, but it cannot keep using Eliot as the terminal Agent.
+Entering `stopped|failed|lost` cancels accepted/queued commands of that generation,
+clears active turn/requests, releases claims, pauses Goals and atomically clears
+`token`/`own_identity`. Dispatched/unknown commands remain historical and are never
+reissued. Token revocation is required even on degraded Unix where an escaped process
+may survive.
 
-`stalled` is a flag. Only model-progress facts update `last_progress_at`: turn,
-message, tool, plan, file edit and exact request/answer. CPU, Git polling, mail and
-source health do not clear it. A stale authoritative source makes progress unknown,
-not automatically stalled.
+`stalled` is a flag. Only generation-matched model progress updates
+`last_progress_at`: turn/message/tool/plan/edit and exact request/answer. CPU, Git poll,
+mail and source health do not clear it. A stale authoritative source means progress
+unknown, not automatically stalled.
 
-`apply(agent, input) -> Effects` is the only state reducer. It is pure; the Store
-commits the source event, projection changes and derived `agent.<state>` event together.
+`apply(agent,input) -> Effects` is the only state reducer. It is pure. Store commits the
+source event, projections and derived `agent.<state>` event together.
 
 ## Profile
 
@@ -185,10 +166,9 @@ Profile {
 ```
 
 Profile/account/proxy caps all apply. Excess launches remain `created` FIFO. Model and
-effort are native values, never translated across harnesses. Requested and effective
-settings are displayed separately.
+effort are native values. Requested and effective settings are displayed separately.
 
-## Events and source ownership
+## Events and authoritative sources
 
 ```text
 Event {
@@ -198,21 +178,18 @@ Event {
 }
 ```
 
-- `subject` is the bounded post-transition Agent snapshot used by rules:
+- `subject` is bounded post-transition Agent state for rules:
   `{id,generation,project,parent,root,depth,harness,profile,state,workspace?,branch?,
-  control,observe_only,own_identity,labels}`. Rules never join a later Agent row for
-  historical match/render.
-- `cause` links commands/rules/timers/Goals and carries loop depth.
-- persisted `data` and projected final text are bounded (default 64 KiB); full detail
-  stays native.
-- known credential values are masked from native output. Caller-supplied durable text
-  containing a known credential is rejected.
-- `payload_digest` is computed by the daemon from one versioned canonical encoding of
-  the normalized semantic event. A plugin never supplies or chooses the digest.
+  control,observe_only,own_identity,labels}`;
+- `cause` links commands/rules/timers/Goals and carries loop depth;
+- persisted data/final text are bounded; full detail stays native;
+- known credentials are masked from native output; caller durable text containing one
+  is rejected;
+- daemon computes `payload_digest` from one versioned canonical semantic encoding.
 
-Normalized **native/plugin-published** families are `session`, `turn`, `message`,
-`tool`, `request`, `child`, `goal`, `usage`, `provider`, and `edit`. Exactly one source
-owns each family for one `(agent,generation)`.
+Plugin-published native families are `session`, `turn`, `message`, `tool`, `request`,
+`child`, `goal`, `usage`, `provider`, `edit`. Exactly one source owns each family for
+one `(agent,generation)`.
 
 ```text
 SourceOwner { agent, generation, family, source, mechanism }
@@ -220,78 +197,80 @@ SourceState {
   agent, generation, source,
   state: open | closed | gap,
   cursor?, last_store_seq?,
+  last_batch_id?, last_batch_digest?,
+  last_batch_first_seq?, last_batch_last_seq?,
   gap_id?, gap_digest?, gap_from?, gap_to?
 }
 ```
 
-The owner map and initial source state are committed before a plugin may perform the
-first native start/input. A live stream normally owns lifecycle; transcript owns
-observe/recovery; a hook owns only a family absent from the primary stream or one
-synchronous decision.
+Initial owner/state commits before native I/O. Live stream normally owns controlled
+lifecycle; transcript/history owns observe/repair; hook owns only an assigned missing
+fact or immediate decision.
 
-Source ownership does **not** let plugins publish daemon-derived state. `agent.*`,
-`session.lost`, `turn.resolved`, command/rule/mail/claim events and process/Git facts are
-emitted only by their owning daemon subsystem. A plugin may report native
-`session.ready|ended|error` and exact attach/snapshot/process evidence; daemon
-reconciliation combines process/source/readback evidence and emits `session.lost` once.
+Plugins cannot publish daemon-owned `agent.*`, `session.lost`, `turn.resolved`, command,
+rule, mail, claim, process or Git events. They publish native
+`session.ready|ended|error` and exact native facts; daemon reconciliation derives loss.
 
-Handoff is one Store transaction: verify current owner, record its final cursor or an
-explicit gap, install the new owner and successor source state, then allow publication.
-There are no source epochs, open ids or source sequence numbers.
+A replayable source supplies an opaque exclusive cursor and resumes strictly after it.
+A source without one reconnects at live edge, records one idempotent gap and never
+publishes old history. Dynamic ownership change is one predecessor-aware CAS handoff
+with final cursor or gap. There are no source epochs, open ids or source sequence
+numbers.
 
-A replayable source must provide an opaque exclusive cursor and resume strictly after
-the committed cursor. A source with no such cursor starts at the live edge after
-reconnect, records an idempotent `source.gap`, and never republishes history. `native_id`
-handles only bounded overlap: same `(agent,generation,source,native_id)` and same daemon-
-computed canonical payload/cursor returns the original `seq`; another payload/cursor is
-`source_integrity` and does not advance source state.
+### One-row commit acknowledgement
 
-Every event in a durable batch that the plugin may resend after a lost acknowledgement
-must have a stable normalized `native_id`. Prefer the vendor id; for a cursor-backed
-record derive it from the opaque record cursor plus a bounded record-local ordinal/kind.
-A source with neither a stable id nor an exclusive cursor must not retry a lost
-acknowledgement: it records a gap and reconciles current state instead.
+One native record becomes one bounded atomic `events.put` batch. The plugin supplies a
+stable `batch_id` and stable per-event `native_id`; daemon computes event and batch
+digests. Plugin permits at most one unacknowledged batch per source.
 
-Plugin records derived from one native record are submitted as one bounded atomic batch;
-the cursor advances with the whole batch, so a crash cannot commit half a record. A
-retry of that batch must be all-new or an exact duplicate of the complete committed
-batch; a mixed set is integrity failure.
+Store accepts only:
 
-### Main persisted kinds
+- a wholly new batch; or
+- an exact duplicate of the **last committed batch** recorded in `source_state`.
 
-- native/plugin: `session.ready|ended|error`, `input.admitted|dropped`,
-  `turn.started|completed`, `message.user|agent`, `tool.started|completed`,
-  `file.changed`, `plan.updated`, request/child/goal/usage/provider facts;
-- daemon-derived: `session.lost`, `turn.resolved`,
-  `agent.created|starting|idle|busy|waiting|stopped|failed|lost|stalled|unstalled`;
-- process/Git: `process.started|exited`, `git.status|commit|ref`;
-- command/rule/mail/var/claim/source health/gap events;
-- ephemeral: `message.delta`, in-turn usage delta, `process.stats`, `fs.changed`.
+Same batch/native id with another digest/cursor, or a mixed new/duplicate set, is
+`source_integrity`. New batch commit replaces the one-row last-batch receipt. After a
+lost reply, plugin/replacement reads `source.state` and retries only if that exact batch
+is still the last receipt. A source with neither stable record id nor cursor cannot
+retry; it records a gap and reconciles current state.
 
-Plugins may emit `x.<harness>.*`; these never reduce core state unless promoted to a
-documented family.
+This keeps commit acknowledgement durable after ordinary event pruning without a
+seen-events table or adapter journal. Cross-source overlap is prevented by owner/handoff;
+a no-cursor source is contractually live-edge-only after reconnect.
+
+### Persisted kinds
+
+- native: `session.ready|ended|error`, `input.admitted|dropped`,
+  `turn.started|completed`, message/tool/edit/plan/request/child/goal/usage/provider;
+- daemon: `session.lost`, `turn.resolved`, Agent state/stall, commands/rules/mail/vars/
+  claims/source health/gap;
+- process/Git: process start/exit and Git status/commit/ref;
+- ephemeral: deltas, in-turn usage, process stats, filesystem invalidation.
+
+Unknown `x.<harness>.*` diagnostics never reduce core state unless promoted to a defined
+family.
 
 ## Verbs
 
 | Verb | Semantics |
 | --- | --- |
-| `launch` | Create Agent and generation 1 native session; optional prompt is a linked send. |
-| `attach` | Observe or control one exact native subject on the canonical Agent row. A new control/observe lease targets the next generation. |
-| `send` | Start/join a new native turn. Applied only at exact command→turn association. |
-| `steer` | Add input to the exact active turn captured at admission. No implicit fallback. |
-| `inject` | Add context at a reported native safe point or prepend to next send. |
-| `interrupt` | Abort the exact captured active turn; session remains live. |
-| `stop` | End the exact generation. Force only through exact Agent custody or isolated native session stop. |
-| `resume` | Re-open terminal Agent/native subject as a new generation; never resend old input. |
-| `approve|deny|answer` | Answer the exact pending request id in the captured generation. |
+| `launch` | Create Agent and generation-1 session; optional prompt is linked send. |
+| `attach` | Observe/control exact native subject on canonical row; new lease targets next generation. |
+| `send` | Start/join native turn; applied only at exact command→turn association. |
+| `steer` | Input to exact active turn captured at admission; no implicit fallback. |
+| `inject` | Context at reported safe point or prepend to next send. |
+| `interrupt` | Abort exact captured turn; session remains live. |
+| `stop` | End exact generation; force only exact custody/isolated native stop. |
+| `resume` | Reopen terminal Agent as new generation; never resend old input. |
+| `approve|deny|answer` | Answer exact pending request in captured generation. |
 | `configure` | Change settings and report `now|next_tool|next_turn|next_session`. |
-| `goal.*` | Native or Eliot Goal, generation-bound. |
+| `goal.*` | Native/Eliot Goal, generation-bound. |
 | `cancel` | Withdraw queued command before native I/O. |
-| `detach` | Release control as the next generation and remain observe-only; never kill an independent service session. |
+| `detach` | Release control as next generation, remain observe-only, never kill independent service. |
 | `compact|fork|background` | Native-only declared operations. |
 
-Input text is at most 512 KiB UTF-8. Larger immutable material is referenced by a
-frozen allowed file/digest or copied bounded bytes.
+Input text is at most 512 KiB. Larger immutable material is bounded bytes or a frozen
+allowed file reference.
 
 ## Commands and narrow gates
 
@@ -307,40 +286,29 @@ state = accepted -> [queued ->] dispatched -> applied | rejected | failed | unkn
         queued -> cancelled
 ```
 
-- launch/resume with text creates a linked input `<start-id>/send` in the same
-  transaction. Session start and input settle independently. The linked input stores
-  `parent_command=<start-id>`, `link_kind=linked_input`, `ordinal=0`.
-- selector expansion creates one child per captured Agent with
-  `parent_command=<selector-id>`, `link_kind=selector_target` and a deterministic
-  ordinal sorted by Agent id. `command.children` pages this fixed set through the
-  `(parent_command,ordinal)` index; no separate link state machine is needed.
-- every concrete Agent command captures current `expected_generation`. Generation
-  mismatch rejects before native I/O. A generation-changing command also stores its
-  target `generation=current+1` and advances the fence/token/source plan in its dispatch
-  transaction before native I/O.
-- queued sends stay FIFO but leave the ready lane while the Agent is busy; current-turn
-  controls and exact request replies may pass them.
-- one dispatched or unknown input with no exact turn association blocks later `send`,
-  `configure` and Eliot Goal continuation in that generation. Exact interrupt, stop,
-  request reply and readback remain available.
-- an active/unknown turn blocks the next turn until exact terminal readback or explicit
-  owner resolution. Resolution is recorded as owner assertion, never plugin completion.
-- an unknown generation transition blocks another transition and ordinary turn work;
-  exact readback/owner resolution settles only that transition.
-- `rejected` proves no native I/O; `failed` proves no effect; `unknown` may have applied
-  and is never retried.
-- daemon restart changes `dispatched` to `unknown`; queued commands stay queued only if
-  their generation is still current.
-- selector expansion is one bounded transaction, sorted by Agent id, with derived child
-  commands and paginated results.
+- launch/resume with text creates linked `<start-id>/send` with parent/link/ordinal;
+- selector parent creates deterministic per-Agent children sorted by Agent id; API pages
+  them via parent/ordinal;
+- every concrete command captures expected generation; generation-changing dispatch
+  advances fence/token/source plan before native I/O;
+- queued sends stay FIFO but leave ready lane while Agent busy, so current-turn controls
+  and request replies may pass;
+- one dispatched/unknown input without turn association blocks later send/configure/
+  Eliot Goal; exact control/request reply/readback remains available;
+- active/unknown turn blocks next turn; unknown generation transition blocks another
+  transition and ordinary work;
+- `rejected` proves no native I/O, `failed` proves no effect, `unknown` may have applied
+  and is never retried;
+- restart changes dispatched to unknown; queued work survives only while captured
+  generation remains current;
+- selector expansion is one bounded transaction and parent applied means only expansion
+  committed.
 
 ## Storage
 
-Use bundled SQLite, WAL, `synchronous=FULL`, one writer task with bounded group commit
-and a small read pool. Nothing is reported accepted/applied before its transaction
-commits. A commit failure blocks new writes and never repeats the external cause.
-
-Layer 1 projections:
+Use bundled SQLite, WAL, `synchronous=FULL`, one writer with bounded group commit and a
+small read pool. Nothing is reported accepted/applied before commit. Commit failure
+blocks new writes and never repeats its external cause.
 
 ```sql
 CREATE TABLE agents (
@@ -370,7 +338,7 @@ CREATE TABLE events (
   agent INTEGER, generation INTEGER, source TEXT NOT NULL,
   native_id TEXT, cursor TEXT, payload_digest BLOB,
   cause TEXT, subject TEXT, data TEXT NOT NULL,
-  CHECK(payload_digest IS NULL OR length(payload_digest) = 32)
+  CHECK(payload_digest IS NULL OR length(payload_digest)=32)
 );
 CREATE INDEX events_agent ON events(agent,seq);
 CREATE INDEX events_kind ON events(kind,seq);
@@ -383,16 +351,23 @@ CREATE TABLE source_owners (
   PRIMARY KEY(agent,generation,family)
 );
 CREATE TABLE source_state (
-  agent INTEGER NOT NULL, generation INTEGER NOT NULL,
-  source TEXT NOT NULL,
+  agent INTEGER NOT NULL, generation INTEGER NOT NULL, source TEXT NOT NULL,
   cursor TEXT, last_store_seq INTEGER,
-  state TEXT NOT NULL,                 -- open|closed|gap
+  last_batch_id TEXT, last_batch_digest BLOB,
+  last_batch_first_seq INTEGER, last_batch_last_seq INTEGER,
+  state TEXT NOT NULL,                    -- open|closed|gap
   gap_id TEXT, gap_digest BLOB, gap_from TEXT, gap_to TEXT,
   updated_at INTEGER NOT NULL,
   PRIMARY KEY(agent,generation,source),
   CHECK(state IN ('open','closed','gap')),
-  CHECK((gap_id IS NULL AND gap_digest IS NULL) OR
-        (gap_id IS NOT NULL AND length(gap_digest) = 32))
+  CHECK((last_batch_id IS NULL AND last_batch_digest IS NULL
+         AND last_batch_first_seq IS NULL AND last_batch_last_seq IS NULL)
+        OR
+        (last_batch_id IS NOT NULL AND length(last_batch_digest)=32
+         AND last_batch_first_seq IS NOT NULL
+         AND last_batch_last_seq >= last_batch_first_seq)),
+  CHECK((gap_id IS NULL AND gap_digest IS NULL)
+        OR (gap_id IS NOT NULL AND length(gap_digest)=32))
 );
 
 CREATE TABLE commands (
@@ -416,20 +391,15 @@ CREATE UNIQUE INDEX commands_children
 CREATE TABLE turns (
   agent INTEGER NOT NULL, generation INTEGER NOT NULL, turn_id TEXT NOT NULL,
   state TEXT NOT NULL, status TEXT, resolution_source TEXT,
-  final_text TEXT, usage TEXT,
-  started_at INTEGER, completed_at INTEGER,
+  final_text TEXT, usage TEXT, started_at INTEGER, completed_at INTEGER,
   PRIMARY KEY(agent,generation,turn_id)
 );
 ```
 
-Current projections (`pending`, Goals, turns, source owners/state) survive event
-retention. A cursor-backed source can no longer replay a record once its committed
-exclusive cursor has advanced past it. A source without a cursor must start at the live
-edge after reconnect and therefore cannot replay pruned history. Native-id rows are kept
-at least through the source's declared bounded-overlap window; they may be pruned only
-when the cursor or explicit closed/gapped boundary makes replay of that fact impossible.
-The source-state row retains the latest idempotent gap/readback boundary even after its
-human-facing event is pruned. Linked/selector command sets follow
-[D-35](../decisions.md): open/unknown children retain the parent, terminal children are
-pruned before it, and the entire paged set disappears before `command.children` returns
-`history_gap`.
+Current projections survive event retention. `source_state` last-batch receipt remains
+until replaced by the next committed batch or the source is safely closed/reclaimed.
+Ordinary old event/native-id rows may then prune because cursor sources cannot replay
+behind the committed cursor and no-cursor sources reconnect only at live edge plus gap.
+Linked/selector command sets follow [D-35](../decisions.md): open/unknown children retain
+the parent, terminal children prune first and the complete set disappears before
+`command.children` returns `history_gap`.
