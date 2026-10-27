@@ -115,8 +115,8 @@ Waku's subscribe-before-create pattern is the model.
 
 If the native subject is not yet known, events are still scoped by Eliot Agent and
 generation; `session.ready` later supplies the subject. The plugin buffers only within a
-bounded in-memory/spool budget until the daemon can commit events. Overflow produces an
-explicit gap and leaves uncertain commands unknown.
+bounded in-memory/spool budget until the daemon can commit events. Overflow requests an
+explicit source gap and leaves uncertain commands unknown.
 
 ### Session-first harness
 
@@ -143,6 +143,7 @@ admitted or the turn completed. A lost result never causes another start or inpu
 | Method | Fields | Result |
 | --- | --- | --- |
 | `events.put` | agent, generation, source, one native-record batch of persisted events, optional exclusive cursor | committed Store `seq` range and saved cursor |
+| `source.gap` | agent, generation, source, owned families, reason, optional from/to cursor metadata | committed daemon `source.gap` boundary; owner remains unchanged unless paired with handoff |
 | `source.state` | agent, generation, optional families | current family owners, mechanisms, committed cursors and latest explicit gap boundary |
 | `source.handoff` | agent, generation, families, expected predecessor source, successor source/mechanism, predecessor final cursor or explicit gap | new owner map after one committed handoff transaction |
 | `process.put` | agent, generation, exact PID/start time/role | committed process identity after custody verification |
@@ -164,20 +165,27 @@ A durable batch that may be resent after a lost acknowledgement **must** provide
 `native_id` for every event. Prefer a vendor event/item id. For a cursor-backed record,
 the plugin may derive ids from the opaque record cursor plus record-local ordinal/kind.
 A source with neither stable ids nor an exclusive cursor cannot safely repeat a lost
-`events.put`: it records `source.gap`, reconciles current state and continues at the live
+`events.put`: it calls `source.gap`, reconciles current state and continues at the live
 edge instead.
 
 The host:
 
 1. verifies current generation and that `source` owns every family;
 2. verifies exact turn/request identity where applicable;
-3. compares a repeated native id with the stored canonical payload digest;
+3. compares a repeated native id with the stored canonical payload digest and record
+   cursor; the same ids/digests with another cursor are an integrity error;
 4. commits events, cursor, reducer/projections and derived state together;
 5. replies only after commit.
 
-Same native id + same digest returns the original `seq`; another digest is
+Same native id + same digest/cursor returns the original `seq`; another digest/cursor is
 `source_integrity` and advances nothing. A lost reply may resend only an identical batch
 whose events all have stable ids.
+
+`source.gap` is a daemon-recorded boundary, not a plugin lifecycle event. The daemon
+verifies the caller currently owns every named family, commits one bounded gap event and
+health state, and replies after commit. Same canonical request is idempotent; conflicting
+boundary/reason is an integrity error. The request never changes family ownership by
+itself.
 
 `source.handoff` is the only dynamic owner-change operation. All named families in one
 request must currently have the same predecessor; otherwise split the handoff. The
@@ -211,7 +219,7 @@ A source without an exclusive cursor has no historical replay contract. After re
 it:
 
 1. starts at the native live edge;
-2. emits `source.gap` for the uncovered interval;
+2. calls `source.gap` for the uncovered interval;
 3. reconciles current state through snapshot/readback;
 4. never republishes old lifecycle history.
 
@@ -277,8 +285,8 @@ A hook does not publish tool/request lifecycle already owned by the native strea
   subject; otherwise recovery refuses rather than switching account;
 - a shared/adopted service is never killed for one Agent;
 - process exit races final stdout/native events: drain the authoritative source to EOF or
-  a bounded terminal deadline; timeout records a gap, then daemon reconciliation may
-  emit `session.lost` from combined evidence;
+  a bounded terminal deadline; timeout calls `source.gap`, then daemon reconciliation
+  may emit `session.lost` from combined evidence;
 - requests have one absolute deadline; timeout after possible native I/O is unknown;
 - plugin stdout is always drained; persisted events backpressure, ephemeral telemetry may
   be dropped with visible lag.
