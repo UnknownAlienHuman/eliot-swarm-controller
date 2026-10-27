@@ -89,8 +89,8 @@ Versions are facts, not authority gates.
 | Method | Essential fields | Result |
 | --- | --- | --- |
 | `initialize` | protocol, plugin config, private instance directory | manifest |
-| `agent.start` | agent, generation, frozen profile, workspace, complete environment, frozen system note, source-owner plan, saved cursors, optional `resume_from`, optional linked `initial` | exact native subject, Agent-owned PIDs, effective settings; session and initial outcome remain separate |
-| `agent.attach` | agent, generation, exact subject, observe/control mode, frozen profile for control, source-owner plan, cursors, known active turn/requests | exact state/readback/PIDs/effective or `not_found` |
+| `agent.start` | agent, generation, frozen profile, workspace, complete target-generation environment, frozen system note, source-owner plan, saved cursors, optional `resume_from`, optional linked `initial` | exact native subject, Agent-owned PIDs, effective settings; session and initial outcome remain separate |
+| `agent.attach` | agent, generation, exact subject, observe/control mode, frozen profile for control, complete target-generation environment when direct identity is qualified, source-owner plan, cursors, known active turn/requests | exact state/readback/PIDs/effective or `not_found` |
 | `agent.command` | agent, generation, command id, verb/args, expected turn/request | `applied|rejected|failed|unknown`, mechanism and application point |
 | `agent.snapshot` | agent, generation, command ids?, turn ids?, pagination cursor? | exact session/turn/request/command readback in bounded pages |
 | `agent.stop` | agent, generation, command id, force | success only after that generation no longer controls the native session |
@@ -103,15 +103,25 @@ initial = { command_id, text }
 Pid = { pid, start_time, role: harness|tool|server|proxy }
 ```
 
+For a generation-changing start/control attach, the daemon's dispatch transaction has
+already advanced the Agent fence, revoked the old identity and committed the new random
+Agent token **before** this request when the target can receive its own environment. The
+complete environment therefore contains only the target generation's token; old tools
+are stale immediately. If the native result is unknown, that token remains bound to the
+blocked target generation—it is not rotated again and the generation never rolls back.
+If exact readback proves no process/session could have received the environment, the
+daemon may clear the token while settling the generation failed/lost. This is one token
+per generation, not a routing-key, derivation or binding-revision subsystem.
+
 A plugin validates generation before native I/O. A stale generation is rejected and may
 never be redirected to the current session.
 
 ## Source plan before native I/O
 
-The daemon commits `source_owners` for the target generation before `agent.start` or
-`agent.attach` is dispatched. The plugin receives the exact plan and must arm every
-selected reader/subscription **before** the first native create/resume/input effect.
-Waku's subscribe-before-create pattern is the model.
+The daemon commits `source_owners` and a current source-state row for the target
+generation before `agent.start` or `agent.attach` is dispatched. The plugin receives the
+exact plan and must arm every selected reader/subscription **before** the first native
+create/resume/input effect. Waku's subscribe-before-create pattern is the model.
 
 If the native subject is not yet known, events are still scoped by Eliot Agent and
 generation; `session.ready` later supplies the subject. The plugin buffers only within a
@@ -142,18 +152,23 @@ admitted or the turn completed. A lost result never causes another start or inpu
 
 | Method | Fields | Result |
 | --- | --- | --- |
-| `events.put` | agent, generation, source, one native-record batch of persisted events, optional exclusive cursor | committed Store `seq` range and saved cursor |
-| `source.gap` | agent, generation, source, owned families, reason, optional from/to cursor metadata | committed daemon `source.gap` boundary; owner remains unchanged unless paired with handoff |
-| `source.state` | agent, generation, optional families | current family owners, mechanisms, committed cursors and latest explicit gap boundary |
+| `events.put` | agent, generation, source, one native-record batch of persisted event fields, optional exclusive record cursor | committed Store `seq` range and saved cursor |
+| `source.gap` | stable `gap_id`, agent, generation, source, owned families, reason, optional from/to cursor metadata | committed daemon `source.gap` boundary; owner remains unchanged unless paired with handoff |
+| `source.state` | agent, generation, optional families | current family owners, mechanisms, committed cursor, source state and latest explicit gap id/boundary |
 | `source.handoff` | agent, generation, families, expected predecessor source, successor source/mechanism, predecessor final cursor or explicit gap | new owner map after one committed handoff transaction |
 | `process.put` | agent, generation, exact PID/start time/role | committed process identity after custody verification |
 | `child` | stable registration id, parent Agent/generation, exact child subject, name/labels?, request own identity? | canonical child Agent/current generation and optional memory-only token |
 
-An `events.put` batch is atomic and bounded. Each event includes `kind`, derived native
-family, `native_id`, canonical payload digest, timestamp and data. One native record that
-yields several normalized events is one batch; each normalized event gets a distinct
-stable id (for example vendor item id + kind/ordinal), and its cursor advances only with
-the entire batch.
+An `events.put` batch is atomic and bounded. Each event supplies `kind`, derived native
+family, stable `native_id`, timestamp, exact turn/request correlations and bounded data.
+The plugin does **not** choose the integrity digest: the daemon computes one versioned
+canonical digest from the normalized semantic fields (`kind`, family, native id,
+turn/request/input correlations and canonical data). Transport request id and receipt
+timing are excluded. The record cursor is compared separately.
+
+One native record that yields several normalized events is one batch; each event gets a
+distinct stable id (for example vendor item id + kind/ordinal), and its cursor advances
+only with the entire batch.
 
 `events.put` accepts only plugin-owned native families declared in the committed source
 plan. A plugin cannot publish `agent.*`, `session.lost`, `turn.resolved`, command/rule/
@@ -172,27 +187,32 @@ The host:
 
 1. verifies current generation and that `source` owns every family;
 2. verifies exact turn/request identity where applicable;
-3. compares a repeated native id with the stored canonical payload digest and record
-   cursor; the same ids/digests with another cursor are an integrity error;
-4. commits events, cursor, reducer/projections and derived state together;
-5. replies only after commit.
+3. computes each canonical payload digest and compares repeated native ids plus record
+   cursor with retained identity;
+4. requires a retry of one atomic native-record batch to be either all-new or an exact
+   duplicate of the entire previously committed batch. A mixed new/duplicate/absent set
+   is `source_integrity` because an atomic batch can never have committed partially;
+5. commits events, source state/cursor, reducer/projections and derived state together;
+6. replies only after commit.
 
-Same native id + same digest/cursor returns the original `seq`; another digest/cursor is
-`source_integrity` and advances nothing. A lost reply may resend only an identical batch
-whose events all have stable ids.
+Same native id + same daemon-computed digest/cursor returns the original `seq`; another
+digest/cursor is `source_integrity` and advances nothing. A lost reply may resend only an
+identical batch whose events all have stable ids.
 
-`source.gap` is a daemon-recorded boundary, not a plugin lifecycle event. The daemon
-verifies the caller currently owns every named family, commits one bounded gap event and
-health state, and replies after commit. Same canonical request is idempotent; conflicting
-boundary/reason is an integrity error. The request never changes family ownership by
-itself.
+`source.gap` is a daemon-recorded boundary, not a plugin lifecycle event. `gap_id` is a
+stable plugin-generated operation id for that exact uncovered interval. The daemon
+verifies the caller currently owns every named family, computes/stores the canonical gap
+digest, updates source state and commits one bounded gap event before replying. The same
+`gap_id` plus identical fields returns the stored result; the same id with another
+boundary/reason, or another id that conflicts with an already committed boundary, is
+`source_integrity`. A gap never changes family ownership by itself.
 
 `source.handoff` is the only dynamic owner-change operation. All named families in one
 request must currently have the same predecessor; otherwise split the handoff. The
 daemon verifies that predecessor and, in one transaction, records its final exclusive
-cursor or explicit `source.gap`, then installs the successor. The successor must not
-publish until the reply commits. This is a small compare-and-swap boundary, not a source
-epoch/open-id/sequence protocol.
+cursor or explicit gap, then installs the successor and its source-state row. The
+successor must not publish until the reply commits. This is a small compare-and-swap
+boundary, not a source epoch/open-id/sequence protocol.
 
 A lost `source.handoff` reply is **not** answered by blindly issuing another handoff. The
 plugin or its replacement calls `source.state`: successor ownership with the supplied
@@ -204,10 +224,14 @@ paginated/bounded by the normal frame limits.
 service PIDs are service-owned. The OS monitor remains the lifecycle authority; plugin
 registration and OS enumeration upsert one identity/event.
 
-`child` is idempotent by `(parent generation, native subject, registration id)`. Tree
-limits never erase a child the harness already created. A distinct token is returned
-only when `child_environment=true` and the plugin can inject it before tools run; the
-plugin keeps it only in memory.
+`child` is idempotent by `(parent generation, registration id, native subject)`. Repeating
+that tuple returns the same canonical child and, only while its current child generation
+is unchanged and `child_environment=true`, the same current memory-only token. Reusing a
+registration id for another subject, or the subject with a conflicting parent, is
+`source_integrity`. The plugin never persists the raw token and a retry from an old
+parent generation is rejected. Tree limits never erase a child the harness already
+created. A distinct token is returned only when the plugin can inject it before tools
+run.
 
 ## Cursors, replay and handoff
 
