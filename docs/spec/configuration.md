@@ -41,6 +41,7 @@ Invalid reload keeps the last valid configuration and reports source health.
 [daemon]
 retention.events_days = 30
 retention.commands_days = 30
+idempotency_window = "24h"
 limits.max_depth = 8
 limits.max_children_per_agent = 20
 limits.max_tree_agents = 100
@@ -48,6 +49,7 @@ limits.max_selector_targets = 1000
 automation.max_actions_per_minute = 120
 automation.max_parallel_checks = 2
 automation.check_timeout = "10m"
+automation.max_event_backlog = 100000
 
 [process]
 scan_interval = "2s"
@@ -61,7 +63,7 @@ fingerprint_max_bytes = 67108864
 
 [plugins.codex]                    # built in
 [plugins.claude]
-cmd = ["node", "C:/src/eliot/plugins/claude/main.mjs"]
+cmd = ["C:/Program Files/nodejs/node.exe", "C:/src/eliot/plugins/claude/main.mjs"]
 
 [projects.app]
 path = "C:/src/app"
@@ -102,6 +104,10 @@ Unknown keys are load errors with file/line, except plugin-private keys inside
 `[plugins.<name>]`, which the plugin validates at initialize. `extends` is one level.
 `eliot status` shows effective profile sources without secret values.
 
+`retention.commands_days` and non-command write retention must cover
+`idempotency_window` plus allowed future clock skew; invalid shorter configurations are
+rejected. Rule `limit.window` may not exceed retained rule-event accounting history.
+
 ## Authority and project overlays
 
 Global config defines harness/plugin executable, account, proxy/service, environment,
@@ -128,7 +134,10 @@ ProfileSnapshot {
   profile_name, harness,
   plugin: PluginBinding,
   model?, effort?, permissions, control,
-  args, literal_env, pass_env_names, secret_env_names, inherit_env,
+  args, literal_env,
+  pass_env_values,              // frozen nonsecret name→value
+  secret_env_names,             // names only; values resolved at execution
+  inherit_env,
   account?, proxy?, billing?, workspace_mode, git_identity,
   labels, max_live?, stall_after, notify_parent, wake_on_mail,
   system_note?, setup[], scratch, source_files
@@ -146,11 +155,11 @@ FrozenFile { canonical_path, size, digest, private_copy? }
 
 For a built-in plugin, the route is its name inside the installed Eliot binary; its
 reported version is diagnostic, not an authorization gate. For an external plugin,
-admission freezes the exact command argv and canonical private config. The executable
-and every local script/module path named directly by `cmd` are resolved under an
-owner-controlled root and recorded as `FrozenFile` (or copied to a private frozen path
-when bounded). `PATH` lookup, mutable working-directory-relative commands and a command
-that resolves differently at dispatch are rejected.
+admission freezes the exact command argv and canonical private config. `cmd[0]` must
+resolve to an absolute owner-controlled executable. Every local script/module path named
+by the command is recorded as `FrozenFile` or copied to a private frozen path. Mutable
+working-directory-relative commands and a command that resolves differently at dispatch
+are rejected.
 
 Dispatch uses the frozen `PluginBinding`, never the current `[plugins.<name>]` table. It
 rechecks every referenced path/digest before starting the plugin. A mismatch or missing
@@ -163,10 +172,10 @@ This freezes semantic route/configuration, not vendor-version equality: an owner
 install a new built-in Eliot build or explicitly choose a new versioned external path.
 The plugin still reports its actual version/effective route and L7 qualifies semantics.
 
-Secrets remain variable names only. Existing Agents never silently adopt a config reload.
-Resume uses its stored snapshot by default. A control takeover may use the stored snapshot
-or an explicitly selected owner profile; either choice is frozen before admission and
-the takeover targets the next Agent generation.
+Secrets remain names only. Existing Agents never silently adopt config reloads. Resume
+uses the stored snapshot by default. A control takeover may use the stored snapshot or
+an explicitly selected owner profile; either choice is frozen before admission and
+targets the next generation.
 
 For project notes/setup/scripts and external plugin files:
 
@@ -179,33 +188,42 @@ For project notes/setup/scripts and external plugin files:
 6. mismatch fails the command rather than running different bytes.
 
 The Store allocates the opaque directory component from a filesystem-safe alphabet and
-stores the resulting private path in the owning Agent snapshot, rule definition or
-command. It is not derived from an external/derived command string (which may contain
-`/`, `:` or other platform-invalid characters). There is no global content-addressed
-artifact store and no artifact graph/GC. Frozen copies are removed only when no retained
-current snapshot/definition or open/unknown command references them.
+stores the resulting private path in the owning snapshot/definition/command. It is not
+derived from a command string. There is no global content-addressed artifact store or
+artifact graph/GC. Frozen copies are removed only when no retained current snapshot/
+definition or open/unknown command references them.
 
 ## Environment and secrets
 
 Default process environment is minimal:
 
 1. OS baseline required to start normal programs;
-2. variables named by global profile `pass_env`;
-3. literal nonsecret profile `env`;
-4. account/proxy/plugin secret references resolved in memory;
-5. Eliot Agent or scoped run variables, Git identity and CLI path.
+2. frozen values of nonsecret variables named by global profile `pass_env`;
+3. frozen literal nonsecret profile `env`;
+4. current values of names in `secret_env` and account/proxy/plugin secret references,
+   resolved in memory immediately before process start;
+5. target-generation Agent or scoped run variables, Git identity and CLI path.
+
+At admission every `pass_env` name not listed in `secret_env` is read once, bounded and
+stored as `pass_env_values`; this freezes route-bearing values such as `CODEX_HOME`.
+`secret_env` must be a subset of `pass_env`; its values are never persisted. A missing
+or changed secret may cause auth/readback failure but cannot silently alter the frozen
+nonsecret store/endpoint/account binding. Explicit account/profile fields remain the
+billing identity shown to the user.
 
 Later layers override earlier ones. Windows keys compare case-insensitively.
 `inherit_env=true` is global-profile-only and visibly warned because all daemon secrets
-then reach the Agent/tools.
+then reach the Agent/tools; an inherited profile freezes the nonsecret route values
+needed to identify its store/account and treats all remaining inherited values as
+execution-time environment, never durable semantic data.
 
-`secret_env` names must also appear in `pass_env`; resolved values are masked from native
-output and rejected in caller-supplied durable semantic text. Raw owner, Agent and run
-tokens never appear in config/events/messages/fixtures/logs.
+Resolved secret values are masked from native output and rejected in caller-supplied
+durable semantic text. Raw owner, Agent and run tokens never appear in config/events/
+messages/fixtures/logs.
 
 A native child gets its own Agent token only when the plugin can inject an isolated
-environment before tools run. Otherwise it has `own_identity=false` and no independent
-CLI principal.
+environment before tools run. Otherwise it has no child principal; calls made from a
+shared parent environment are attributed to the parent generation.
 
 ## Accounts, capacity and provider holds
 
@@ -230,7 +248,7 @@ changes account/model/provider/route.
 
 `[plugins.<name>] cmd` names an external plugin; omitted means built-in. Extra keys are
 private plugin configuration. Secret values are referenced by names and resolved only in
-memory; the frozen private config contains no secret values.
+memory; frozen private config contains no secret values.
 
 The plugin manifest chooses `per_agent|shared`; config cannot weaken it. A per-Agent
 instance receives a private generation directory. A shared plugin must prove exact
