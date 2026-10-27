@@ -156,9 +156,11 @@ last observation: ordinary turn work is blocked and no controller is assumed cur
 | any live | fatal session error | `failed` |
 | any live | daemon-derived exact loss of session control | `lost` |
 
-Entering a terminal state cancels accepted/queued commands of that generation, clears
-active turn/pending requests and pauses Goals. Dispatched/unknown commands stay
-historical and are never reissued.
+Entering `stopped`, `failed` or `lost` cancels accepted/queued commands of that
+generation, clears active turn/pending requests, releases its claims, pauses Goals and
+atomically clears `token`/`own_identity`. Dispatched/unknown commands stay historical and
+are never reissued. This revocation is required even on degraded Unix: an escaped
+same-user descendant may survive, but it cannot keep using Eliot as the terminal Agent.
 
 `stalled` is a flag. Only model-progress facts update `last_progress_at`: turn,
 message, tool, plan, file edit and exact request/answer. CPU, Git polling, mail and
