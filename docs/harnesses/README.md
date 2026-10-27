@@ -1,72 +1,55 @@
 # Harnesses
 
-Implementation order: Codex (L2) → Claude Code, Muse, OpenCode, Antigravity and ACP
-(L4) → [others](others.md) only on concrete need. Provider services are separate:
-[OpenCodex](opencodex.md), [local models](local-models.md).
+The [roadmap](../roadmap.md) owns build order: useful direct Codex first; monitoring,
+automation and coordination on Codex next; Claude/OpenCode and selected optional adapters
+in L6. A catalogue entry is not a requirement to build that adapter before L2 works.
 
-Each page records official/installed sources, check date, native identity, process mode,
-source ownership/cursor behavior and unverified facts. Update it from actual installed
-behavior when the plugin is implemented; advertised capability alone is not support.
+Provider services are separate: [OpenCodex](opencodex.md), [local models](local-models.md).
 
 ## Common plugin contract
 
-Every harness page must answer:
+The owning [plugin protocol](../spec/plugin-protocol.md) defines generation, source
+acknowledgement, unknown outcomes and custody once. Each implemented adapter supplies only
+its native mapping: exact subject/turn/request ids, process mode, effective settings,
+readback/cursor limitations and child environment. It does not duplicate core machinery.
 
-1. What exact `(native_scope,native_ref)` identifies one session?
-2. What creates a new Eliot `generation`, and what reconnect preserves it?
-3. Is the plugin `per_agent` or a proven isolated `shared` service client?
-4. Which source owns each lifecycle family while controlled and while observe-only?
-5. Which source has an opaque exclusive replay cursor? If none, reconnect records a gap
-   and starts at the live edge.
-6. What stable vendor/cursor-derived `native_id` makes a retried `events.put` safe? If
-   no stable id/cursor exists, the plugin must not retry a lost acknowledgement.
-7. What exact `source.handoff` transfers a family, and what cursor/gap boundary proves
-   it? A lost handoff reply is settled through `source.state`, not another blind handoff.
-8. What native id binds input→turn, steer/interrupt→turn and approval/answer→request?
-9. What exact readback settles a lost native reply? Unsupported/unknown is preferable to
-   heuristic substitution.
-10. Can a native child receive an isolated Eliot environment before its tools run?
-11. What is the effective provider/account/permissions route, and how is it read back?
-
-No plugin adds binding revisions, source epochs, adapter journals or its own workflow
-engine. It uses the common generation/source/cursor/command contracts.
+Declare only implemented capabilities. A vendor's documented method is a candidate,
+not proof of a working Eliot integration. Historical source-check dates on adapter pages
+are not fresh installed-version verification. Update a page while integrating that native
+route, not by conducting a vendor-wide research campaign before every layer.
 
 ## Capability matrix
 
-✓ qualified/documented native mechanism · ~ explicit weaker Eliot mechanism with its
-actual application point · ✗ rejected · ? unresolved until installed recording/live
-qualification
+This is a design/reference matrix, **not runtime qualification**. A question mark means
+unresolved until the selected installed protocol is inspected. All operations still pass
+the common exact-identity and authority checks.
 
 | Feature | [Codex](codex.md) | [Claude](claude-code.md) | [Muse](muse.md) | [OpenCode](opencode.md) | [Antigravity](antigravity.md) | [ACP](acp.md) |
 | --- | --- | --- | --- | --- | --- | --- |
-| Transport | app-server NDJSON stdio | Agent SDK / stream-json | MSP JSON-RPC stdio | HTTP + SSE service | `agy` stream-json | JSON-RPC stdio |
-| Eliot process mode | per-Agent | per-Agent | per-Agent | shared only after isolation proof; otherwise per-Agent server/observe | per-Agent | per-Agent |
-| Native subject | Codex store + thread id | Claude config/project + session id | Muse host/store + session id | server identity + session id | auth/config + conversation id | agent command/store + session id |
-| Controlled lifecycle owner | app-server stream | SDK/message stream | MSP stream | session-filtered SSE | stdout stream | ACP connection |
-| Observe/recovery cursor | rollout byte offset / native readback | JSONL offset / session readback | native view/page cursor | native history cursor if installed API proves it; else gap+snapshot | none qualified → gap+snapshot | agent-dependent; none by default |
-| session before first input | ✓ thread start | ? | ✓ session start | ✓ session create | ? | ✓ session/new |
-| isolated child environment | ✗ app-server shared | ✗ in-process | ? | ? installed per-session env | ✗ | agent capability-dependent |
-| `steer` | ✓ exact turn | ~ next hook context; not exact immediate steer | ✓ exact turn | ? exact native API only | ✗ | ✗ v1 |
-| `inject` | exact steer or next-send prepend | ✓ assigned hook context | steer/prepend | verified safe point or prepend | prepend next send | prepend next prompt |
-| `interrupt` | ✓ exact turn | ✓ active query | ✓ exact turn | ✓ exact session execution, verify scope | ? → reject until proven | ✓ active prompt cancel |
-| `resume` | ✓ thread resume, new Eliot generation | ✓ session resume | ✓ session resume | attach same native subject, new control generation | ✓ conversation | capability-dependent load/resume |
-| approvals/questions | exact request replies | exact SDK callbacks | exact choice/requirement ids | exact permission/input ids if installed API exposes them | no request channel | negotiated request ids |
-| native Goal | ✓ | ? | ✓ | ✗ Eliot Goal | ✗ Eliot Goal | ✗ Eliot Goal |
-| children | exact subagent threads | provenance/hooks | native child provenance | exact parent/session API | `subagent_info` | capability-dependent |
-| proxy route | named provider | base URL/auth env | none | provider base URL | none | agent-specific |
+| Transport | app-server stdio | SDK / stream-json | MSP stdio | HTTP/SSE | agy stream-json | ACP stdio |
+| Initial mode | per-Agent | per-Agent | per-Agent | per-Agent server unless shared isolation is demonstrated | per-Agent | per-Agent |
+| Native subject | store + thread | config/project + session | host/store + session | server/store + session | config + conversation | command/store + session |
+| Controlled source | app-server stream | SDK stream | MSP stream | exact-session SSE | stdout | ACP connection |
+| Steer | exact turn | unsupported unless an exact native method is demonstrated | exact turn | ? exact native method | unsupported | unsupported in generic v1 |
+| Inject | steer / next send | next supported hook safe point | steer / next send | ? / next send | next send | next prompt |
+| Interrupt | exact turn | active query | exact turn | verify session/execution scope | ? | active prompt cancel |
+| Requests | native approval/input ids | SDK callbacks | native choice/request ids | installed permission/input ids | no known headless reply channel | negotiated permission/input |
+| Resume | exact thread | exact session | exact session | installed attach/resume | conversation | negotiated load/resume |
+| Native Goal | installed method | ? | installed method | no assumed support | none assumed | none generic |
+| Child identity | shared parent environment | shared parent environment | ? | ? | shared parent environment | agent-specific |
+| Proxy | named provider | base URL/auth env | none assumed | provider base URL | none assumed | agent-specific |
 
-## Implementing a plugin
+`additionalContext` delivered by a later Claude hook is **inject**, not steer. A native
+abort that leaves a session reusable is **interrupt**, not stop. There is no silent
+renaming to make the matrix look complete.
 
-1. Read its page, [plugin protocol](../spec/plugin-protocol.md) and the exact donor
-   boundary named in [donors](../reference/donors.md).
-2. Implement the real native path first. Missing semantics reject; no hidden fallback.
-3. Record only traffic needed to discover/implement the current verb; sanitize secrets
-   and record installed version/date.
-4. During L0–L6 run format + smallest changed-package Clippy. Keep named fixture/live
-   cases for final L7 conformance; do not build a broad campaign around every partial
-   task.
-5. Update the page and this matrix from actual behavior, including exact generation,
-   source owner, cursor/native-id and handoff/readback facts.
+## Implementing an adapter
 
-L7 runs one common black-box conformance suite over recordings and compact live runs for
-all required harnesses.
+Read its native page and the relevant donor-map entry. Connect launch/input/result first;
+add real controls next. Generate/use installed schemas where provided. Retain exact
+unknown outcomes; do not build guessed fallback APIs. Use short manual native runs only
+to establish the current path. Full common conformance/recording/platform runs are L7.
+
+Future APIs/tables from the complete specification are not first-adapter prerequisites.
+The first plugin needs one per-Agent stream; source handoff, discovery, children and
+shared pools enter only with their actual callers.

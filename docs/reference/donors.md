@@ -1,90 +1,68 @@
 # Donors
 
-Borrow one proven mechanism at a time. Do not import an application, its workflow model
-or its document hierarchy. Before implementing a boundary listed below, read the exact
-source path and copy the shape unless a concrete Eliot constraint makes it incompatible;
-record that incompatibility in the PR.
+Use existing code before designing another mechanism. This is an extraction map for the
+current layer, not a required tour of every agent framework. The pinned early-layer source entries were
+inspected on 2026-10-27. Later entries are deferred reading pointers, not claims of fresh
+verification or plug-compatible code. A reference commit is not a runtime version gate.
 
-Vendor protocol facts live on the [harness pages](../harnesses/README.md).
+**Dependency:** use the maintained library directly. **Extract:** copy the named small
+helper into Eliot and remove donor coupling. **Pattern:** implement the narrow contract
+with Eliot types; do not import the donor application. Pattern-only is not a claim that
+copy-ready code exists for Eliot's wire protocol.
 
-## Adopted runtime patterns
+## L1–L2 implementation map
 
-| Eliot boundary | Primary donor and exact source | Pattern to copy | Explicitly reject |
+Target paths are v2 destinations, not claims that these files already exist.
+
+| Need | Mode and source | Put it in Eliot | Exact boundary |
 | --- | --- | --- | --- |
-| Stable Agent + incarnation fencing | [`agent-primitives/sessions`](https://github.com/agent-primitives/sessions): `api/session.proto`, `api/harness.proto`, `eventlog/store.go`; [`sandbox-driver`](https://github.com/lithoscomputer/sandbox-driver): `crates/sandbox-driver-protocol/src/supervisor.rs` | Stable session/resource id; separate execution/turn id; one monotonic fence/generation; every append/call checks current fence; replacement serves only future work; old handles/results are stale. | Eliot's former `agent_bindings`, binding revisions/current pointer, grants or proof packets. |
-| Durable state reduction | [`Petri`](https://github.com/lithoscomputer/petri): `crates/core/execution/src/state.rs`, `crates/core/engine/src/apply.rs`, `replay.rs`; Agent Sessions `eventlog/store.go` | Validate against current state, durably append, then apply one pure reducer; replay reconstructs projection. Stable logical invocation id is separate from execution id. | Workflow DSL and Petri's product graph. |
-| Input/turn settlement | [`ACPX`](https://github.com/openclaw/acpx): `docs/shared-sessions.md`, `docs/session-watch.md`, `docs/2026-02-27-acpx-session-model.md` | Queue acceptance, actual prompt start and final result are separate; request id survives queueing; owner death without a result is unknown and not safely retryable; one authoritative journal and one derived checkpoint. | ACPX flow graph or queue format as Eliot's public model. |
-| Live/history reconciliation | [`Paseo`](https://github.com/getpaseo/paseo): `docs/timeline-sync.md`, `packages/app/src/timeline/viewed-timeline-sync.ts`; ACPX watch docs | Live stream is immediate overlay; authoritative paged history/cursor proves coverage; gaps are explicit; epoch/range replacement is atomic; never keep two discontiguous canonical ranges. | Paseo UI, client cache and JSON stores. |
-| Shared native service | [`Waku`](https://github.com/egoist/waku): `crates/waku-core/src/opencode_service.rs`, `driver/opencode.rs` | Adopted service is never killed; exact demultiplex by session id; subscribe before create; one settle point; stream disconnect is not process/session death; reconnect generation orders readback/reconciliation; HTTP acceptance is not delivery. | GPL code copying; app/UI architecture. Pattern only. |
-| Workspace materialization and recovery | [`Kandev`](https://github.com/kdlbs/kandev): `apps/backend/internal/worktree/worktree.go`; `docs/decisions/2026-09-29-missing-worktree-checkout-recovery.md` | Persist canonical worktree/session/repository/path/branch identity; attach-only reuse is read-only; preserve exact recorded slot/head; uncertain path/owner/branch/liveness fails closed; replacement is an explicit recovery action; external materialization is serialized and revalidated. | Kandev's Task/environment product model, broad recovery workflow and remote-executor architecture. |
-| Restart reconciliation | [`controller-runtime`](https://github.com/kubernetes-sigs/controller-runtime): `pkg/reconcile/reconcile.go`, `pkg/internal/controller/controller.go` | Queue a stable object key; deduplicate keys; read durable desired/current state every pass; never reconcile one key concurrently with itself. | Kubernetes stack and retrying uncertain external effects. |
-| Plugin/provider conformance | sandbox-driver: `crates/sandbox-driver-conformance/`, `crates/sandbox-driver-protocol/src/supervisor.rs`; Agent Sessions: `conformance/` | One semantic interface in-process and over transport; same black-box suite; real persistent Store plus fake/echo backend; replacement preserves provider namespace. | A second adapter interface or one-off fixture as proof. |
-| Mail identity and acknowledgement | [`CCCC`](https://github.com/ChesterRa/cccc): `crates/cccc-contracts/src/connect_message.rs`, `crates/cccc-core/src/connect_delivery.rs`; [`MCP Agent Mail`](https://github.com/Dicklesworthstone/mcp_agent_mail_rust): recipient/read/ack schema and conformance | Stable delivery id; sender id + generation; concrete recipients; content digest; persist before acknowledge; same id/different body rejects; reply/cancel bound to original delivery; read and ack are recipient-scoped and idempotent. | CCCC scheduler/ledger/PTY model; MCP Agent Mail liveness chatter, implicit identities and restrictive code. |
+| JSON/NDJSON and async child pipes | **Dependency:** `serde`, `serde_json`, Tokio and `tokio-util::codec::LinesCodec` with a maximum frame length | `eliot-plugin` framing; `eliot-daemon/src/plugin_host/` | Use existing codecs/process I/O. One continuous reader and bounded channels. Do not write a new JSON-RPC transport framework. |
+| SQLite and CLI | **Dependency:** bundled `rusqlite`; `clap` | `eliot-store`; `eliot` CLI | One writer connection and normal numbered migrations. Use transactions, not event-sourcing/database frameworks. |
+| Process birth and Windows Job ownership | **Extract:** [v1 process_group.rs](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/dc6f70aa08ea5fad3da04624ce50c46d45edd57c/crates/swarm-process/src/process_group.rs), especially `process_creation_filetime`, `process_birth_identity` and the Job OS calls | `eliot-daemon/src/platform/windows.rs` and small custody module | Keep OS handle lifetime, birth checks, Job assignment/termination. Replace v1 JSON/error wrappers with local typed data. Do **not** copy `hash_process_image`, named proof identities, scheduler purposes or `swarm_contracts` dependencies. |
+| Bounded output on platforms where Tokio is insufficient | **Extract only if needed:** [v1 capture.rs](https://github.com/UnknownAlienHuman/eliot-swarm-controller/blob/dc6f70aa08ea5fad3da04624ce50c46d45edd57c/crates/swarm-process/src/capture.rs), `PipeRead`, `PipeWrite`, nonblocking pipe helpers | same process-I/O module | Prefer Tokio first. Do not copy `CaptureReceipt`, SHA archives, 64-MiB spool defaults or the capture-file subsystem. |
+| One generation for replacement plugins | **Pattern:** [sandbox-driver supervisor.rs at 5043331e](https://github.com/lithoscomputer/sandbox-driver/blob/5043331e9294bfbc98903d0bf3af675f9768198a/crates/sandbox-driver-protocol/src/supervisor.rs), `PluginGeneration`, `PluginSupervisor::current` | `eliot-daemon/src/plugin_host/` | Single-flight replacement, increasing generation, old handles remain stale, failed call is not replayed. Keep one frozen route. Do not import Sandbox/Volume APIs, executable-checksum policy or the whole supervisor. |
+| Pure transition function | **Pattern:** [Petri apply.rs at cfd57a52](https://github.com/lithoscomputer/petri/blob/cfd57a52245e54b702d60321d94144800fdd92c2/crates/core/engine/src/apply.rs), `apply` | `eliot-core/src/reducer.rs` | No I/O/clock/randomness in reduction; return new state and effects. Eliot commits before publication. Do not copy graph/IR/firing/join/middleware code. |
+| Codex protocol types and native calls | **Generate/use upstream:** [official app-server](https://learn.chatgpt.com/docs/app-server), installed `codex app-server generate-json-schema --out <dir>`; [upstream protocol source](https://github.com/openai/codex/tree/main/codex-rs/app-server-protocol/src) | `plugins/codex/src/native/` | Generate the installed version's schemas; deserialize the required messages into typed structs. Native types stay in the plugin. Do not hand-invent method/field names or import the Codex model loop. |
 
-## Resulting Eliot model
+For the first path, these entries are sufficient. No agent-session service, Kubernetes
+controller, mailbox framework or second harness is a prerequisite.
 
-The donor patterns above deliberately produce a small middle ground:
+## Later layers: one donor per concrete need
 
-1. one stable Agent/native subject row;
-2. one integer `generation` fencing the current controlled incarnation;
-3. exact turn/request ids beneath it;
-4. one authoritative source per lifecycle family;
-5. an opaque cursor for every source that may replay; no cursor means live-edge + gap,
-   never historical replay;
-6. commit acknowledgement for persisted plugin events;
-7. one pure reducer and level-based restart reconciliation;
-8. unknown effects remain unknown and block their narrow lane;
-9. automation actions are ordinary commands;
-10. one durable workspace phase with exact identity/readback and no blind setup replay;
-11. mail uses explicit delivery/recipient identities.
+These are source-reading entry points. Pin the selected file revision in the first PR
+that actually extracts code; do not install all these projects as dependencies.
 
-This does **not** require binding revisions, source epochs/sequences, universal receipts,
-activation hierarchies, a generic run/action engine or content-addressed artifact GC.
-
-## v1 code donors
-
-Frozen source is commit `dc6f70aa`; after L0.1 the same tree is tag `v1-final`.
-Copy the narrow helper into v2 and cut every old dependency.
-
-| Mechanism | v1 path | Keep / reject |
+| Layer / need | Source | Use in Eliot; exclude |
 | --- | --- | --- |
-| Windows Job objects, process birth identity, Unix groups | `crates/swarm-process/src/process_group.rs` | Keep assign-before-resume Job, exact `(pid,start_time)` and kill/verify. Unix process group is degraded. Reject operation/scheduler coupling. |
-| Bounded child pipe capture | `crates/swarm-process/src/capture.rs` | Keep nonblocking bounded drain; v2 caps script streams at 1 MiB. |
-| Private file permissions and durable replace | `crates/swarm-process/src/permissions.rs` | Keep only helpers used by daemon/token/config files. |
-| Current-user Windows named-pipe ACL | `crates/swarm-kernel-host/src/platform/windows.rs` | Small direct helper; no internal auth platform. |
-| Multiplexed line IPC with frame limits | `crates/swarm-client/src/multiplex.rs`, `client.rs` | Keep framing/correlation; drop v1 grants/provenance. |
-| Process CPU/RSS sampling | `crates/swarm-observer/src/process_metrics.rs` | Use only if smaller/more exact than `sysinfo`. |
-| Codex app-server edge cases | `crates/swarm-adapter-codex/src/lib.rs` | Read method/correlation failures; do not port journals, checkpoints or receipts. |
-| Antigravity examples | `modules/antigravity/fixtures/*.stream.json` | Syntax hints only, not live evidence. |
-| Atlas redaction (Apache-2.0) | `vendor/atlas/crates/atlas-redact` | Optional late pattern matcher after known-value masking exists. |
+| L2 input vs result | [ACPX shared sessions](https://github.com/openclaw/acpx/blob/main/docs/shared-sessions.md), [watch](https://github.com/openclaw/acpx/blob/main/docs/session-watch.md) | Pattern for queued/admitted/started/terminal outcomes. Target: router/Codex result mapping. No queue/flow graph import. |
+| L3 live/history recovery | [Paseo timeline-sync](https://github.com/getpaseo/paseo/blob/main/docs/timeline-sync.md), `packages/app/src/timeline/viewed-timeline-sync.ts` | Pattern for bounded history coverage and explicit gaps. Target: monitoring/plugin recovery. No UI/cache/timeline product. |
+| L3 worktrees | [Kandev worktree.go](https://github.com/kdlbs/kandev/blob/main/apps/backend/internal/worktree/worktree.go) and neighboring implementation | Preserve exact repository/path/branch identity; read back before reuse. Target: workspaces. Do not port Task/Environment/cleanup workflow types. |
+| L3/L6 service ownership | [Waku OpenCode service](https://github.com/egoist/waku/blob/main/crates/waku-core/src/opencode_service.rs), `driver/opencode.rs` | Pattern only: subscribe before create, exact session routing, adopted service never killed. No GPL code copying or application/UI import. |
+| L4 restart reconciliation | [controller-runtime reconcile.go](https://github.com/kubernetes-sigs/controller-runtime/blob/main/pkg/reconcile/reconcile.go), `pkg/internal/controller/controller.go` | Read current state by deduplicated key; implement a small Tokio worker. No Kubernetes dependency and no automatic retry of uncertain writes. |
+| L5 mail | [CCCC connect_message.rs](https://github.com/ChesterRa/cccc/blob/main/crates/cccc-contracts/src/connect_message.rs), `crates/cccc-core/src/connect_delivery.rs`; [MCP Agent Mail](https://github.com/Dicklesworthstone/mcp_agent_mail_rust) recipient/read/ack behavior | Pattern only: exact delivery/recipient, content binding, independent acknowledgement. Target: coordination/mail. Do not copy restrictive code or import ledger, PTY, scheduler, identity discovery or liveness chatter. |
+| L7 conformance | [sandbox-driver conformance](https://github.com/lithoscomputer/sandbox-driver/tree/5043331e9294bfbc98903d0bf3af675f9768198a/crates/sandbox-driver-conformance) | One black-box capability suite over fake/recorded adapters. Do not build it before the real Codex path. |
 
-Never donate v1 Task/Attempt/review/acceptance/publication state, proof/receipt types,
-policy editions, adapter journals/tombstones, module descriptors, compatibility
-executors, CI patchers or audit/remediation trees.
+## Reuse procedure
 
-## Rust dependencies
+For a dependency, add the narrow needed features and use its API. For extraction, copy
+only the helper and required support functions, retain license notices, replace old
+project types, and connect its caller in the same change. Record repository/commit/path
+in a source comment or PR; no donor dossier, receipt, generated inventory or approval
+packet is required.
 
-Check current release, license, maintenance and MSRV in the PR that first uses a crate.
-Do not add it merely because it appears here.
+If extraction drags in a scheduler, proof system or several application crates, stop
+extracting that route. Use the already-selected library/OS API and the donor's small
+behavioral contract instead. A donor is evidence, not an architectural authority.
 
-| Crate | Concrete use |
-| --- | --- |
-| `tokio`, `serde`, `serde_json`, `thiserror`, `anyhow`, `tracing` | runtime/data/error/logging boundaries |
-| `rusqlite` with bundled SQLite and no bindgen hooks | Store |
-| `clap` derive | CLI |
-| `interprocess` or Tokio platform sockets | local IPC; choose one after a Windows spike |
-| `ulid` | external write ids |
-| `sysinfo` | bounded process metrics |
-| `notify` + one debouncer | filesystem invalidation |
-| `globset` | rule/path matching and claims |
-| one maintained cron parser | timers; verify timezone/DST semantics before choosing |
-| `windows-sys` | exact Job, process, handle and ACL calls |
-| `agent-client-protocol` | ACP plugin |
-| `rmcp` | MCP surface only if a required harness cannot use the CLI |
+v1 is available at `dc6f70aa08ea5fad3da04624ce50c46d45edd57c` before the archive tag
+exists. Never import its Task/Attempt/review/acceptance schema, compatibility executors,
+per-adapter journals, policy hashes, executable provenance or audit tooling.
 
-## Other systems
+## Source and license boundary
 
-Overstory, Agency Swarm and Gas Town remain product references for worktrees,
-directional communication and durable work outside model context, but they do not own a
-v2 core mechanism. Systems reviewed in v1 remain available under `v1-final`; do not
-re-import them without a concrete missing boundary.
+No external source code is imported by this documentation change. The external
+supervisor/reducer/mail/service references above are **patterns**, not blanket license
+clearance. Check the exact revision's license and notices once when importing code;
+unknown/incompatible terms mean no copying, not a request to copy first and document
+later. Package versions/MSRV are selected when adding the actual dependency, not
+continually re-approved in every task.

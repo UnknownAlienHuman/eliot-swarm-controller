@@ -1,220 +1,108 @@
 # Architecture
 
-This page is the map. Exact contracts live in [spec/](spec/), build order in the
-[roadmap](roadmap.md), donor provenance in [reference/donors](reference/donors.md).
+Eliot is a local controller around existing coding-agent harnesses, not another harness
+or workflow platform. [Vision](vision.md) owns requirements; [roadmap](roadmap.md) owns
+build order. Specs describe the final contract, but a layer implements only what it uses.
 
-## Picture
+## One command path, one event path
 
 ```text
- owner / manager Agent / scoped scripts                    vendor harnesses
- ──────────────────────────────────────                    ────────────────
-  eliot CLI ──┐                                         ┌─► Codex app-server
-  eliot MCP ──┼─ current-user IPC ────────┐             │   Claude SDK / stream-json
-  hook shim ──┘                            │             │   OpenCode / ACP / ...
-                                           ▼             │
- ┌──────────────────────────── Eliot daemon ─────────────┼────────────────┐
- │ API → Router → readiness lanes → Plugin host ───────► plugins/native  │
- │  │       │                              ▲             │                │
- │  │       ▼                              │ commit-ack  │                │
- │  │  commands + narrow gates             │ events      │                │
- │  ▼                                      │             │                │
- │ one SQLite WAL Store ↔ persisted bus + bounded live fan-out          │
- │  ▲           ▲              ▲                    ▲                    │
- │ custody    Git/fs      Coordination           Automation               │
- │ monitor    monitor     mail/vars/who          rules/timers/Goals      │
- └───────────────────────────────────────────────────────────────────────┘
-              managed or adopted provider/native services
+CLI / Agent / later rules
+          |
+          v
+     daemon API -> router -> plugin host -> harness plugin -> native harness
+                      |                         ^
+                      v                         | native facts/readback
+                SQLite writer <----------------+
+                      |
+              commit event + projection
+                      |
+              bus -> CLI / later consumers
 ```
 
-## Donor-backed boundaries
+The bus is an in-process persisted log plus bounded live subscriptions, not Kafka,
+Redis or another service. Plugins are separate processes; internal daemon features are
+ordinary Rust modules. There is no internal plugin framework or dependency-injection
+platform to build first.
 
-| Boundary | Eliot shape | Proven pattern |
+## Modules and dependency direction
+
+| Location | Responsibility | Allowed dependencies |
 | --- | --- | --- |
-| logical vs live identity | stable Agent/native subject + one monotonic `generation` | Agent Sessions fence token; sandbox-driver plugin generation |
-| turn lifecycle | queue/admission, actual turn start and terminal result are separate | ACPX shared turns/watch |
-| event history | one family owner; live stream immediate, cursor history authoritative; gaps explicit | Paseo timeline; ACPX watch; Waku OpenCode stream |
-| state | one persisted event + pure reducer + compact projections | Petri; Agent Sessions event log |
-| restart | deduplicated reconciliation keys reread durable/native current state | controller-runtime |
-| mail | stable delivery id, sender generation, exact recipients/digest, separate ack | CCCC; MCP Agent Mail |
-| plugin compatibility | one semantic interface and one black-box conformance suite | sandbox-driver; Agent Sessions |
+| `eliot-core` | ids, verbs, events, pure reducer | data/error crates; no I/O, database, runtime or vendor SDK |
+| `eliot-store` | migrations, one writer, bounded queries | core + SQLite |
+| `eliot-plugin` | small wire types/framing shared by host and plugins | core + transport/serialization; no Store |
+| `eliot-daemon` | API, router, bus, process/plugin ownership | core, store, plugin protocol |
+| `plugins/codex` | app-server translation and native readback | plugin protocol; no daemon/Store dependency |
+| `eliot` | CLI and composition/entry points | application crates and built-in plugin entry points |
 
-These are the only borrowed abstractions. Eliot does not import donor workflow graphs,
-UIs, ledgers or proof systems.
+Inside `eliot-daemon`, add `monitoring/`, `workspaces/`, `automation/` and
+`coordination/` when their roadmap layer starts. Each owns its feature logic; its SQL queries and
+migrations live in Store. Every module calls the same router for effects. No automation-to-vendor or coordination-to-vendor
+shortcut. Only Store code issues SQL. Plugins never receive a database connection.
 
-## Components
+The fake uses the same protocol as Codex. It is initially an echo/turn process, not a
+large simulator. Create crates as their callers arrive; this table is the eventual map,
+not six empty crates required for `--version`.
 
-| Component | Owns | Does not own |
-| --- | --- | --- |
-| CLI/API | syntax/output, write id and principal forwarding | product state or PID-based authority |
-| Router | authority/capability/state, generation/turn/request binding, durable admission, readiness lanes | vendor translation |
-| Store/bus | ordered events, commands, Agent/turn/source projections, subscriptions | native sessions |
-| Plugin host | plugin generations, deadlines, commit acknowledgement and custody wiring | harness semantics |
-| Plugin | one harness protocol, native ids/readback/normalization | SQLite or retrying unknown effects |
-| Monitors | process, Git/fs, source freshness/gaps, workspace/provider projections | commanding Agents |
-| Coordination | mail, vars, `who`, claims | locks or hidden model turns |
-| Automation | rule cursors/handoff, timers, Goals; actions are commands | Task/review/workflow engine |
+## First useful slice
 
-## Core invariants
+L1 delivers local CLI → Store/router → fixed-source fake → bus/result. L2 replaces
+only the fake with a per-Agent Codex app-server and adds native controls/readback. It
+uses an existing workspace and account, with Luna selected explicitly when available.
 
-1. **One semantic command language.** Unsupported semantics fail before native I/O.
-2. **One stable Agent, one current generation.** Every Agent-scoped effect/fact carries
-   generation; old-generation output cannot mutate replacement work.
-3. **Start ≠ input ≠ turn result.** Each has its own command/fact/outcome.
-4. **Unknown stays unknown.** No possible native/external effect is automatically
-   replayed. Its narrow lane remains blocked until exact readback/resolution.
-5. **One source owns each lifecycle family.** Replacement is one compare-and-swap
-   handoff with a cursor boundary or an explicit stable gap; stream/transcript/hook never
-   publish the same completion independently.
-6. **Persist before publish/ack.** One native-record batch, daemon-computed digest,
-   source state/cursor, reducer projection and derived events commit in one transaction;
-   only then does plugin/client receive success.
-7. **Events describe what happened; projections describe current state.** Views query
-   them and are not another state machine.
-8. **Automation uses ordinary commands.** A deterministic rule/timer/Goal key creates
-   the same commands on repeated reconciliation.
-9. **Routes and authority are explicit.** No silent provider/model/account/permission
-   fallback; missing Agent/run identity never becomes owner.
-10. **Custody claims only what the OS proves.** Windows Job exact; Unix process group
-    degraded; adopted service never killed.
+L3 adds monitoring/worktrees and the optional OpenCodex route. L4 adds automation on
+Codex; L5 adds communication between two Codex Agents; L6 adds other harnesses. Neither
+mail nor timers require a second vendor. Unimplemented features are not advertised.
 
-## Identity and lifetime
+## State and effects
 
-One `(native_scope,native_ref)` maps to one Agent row. `generation` fences who currently
-controls/observes it:
+Compute the next projection with the pure reducer without mutating published state.
+In one Store transaction write the event, projection and any accepted commands; only
+after commit publish the result and acknowledge it. Native I/O runs outside that
+transaction and only after command dispatch is recorded.
 
-- first launch/attach targets generation 1;
-- resume, detach and a new/uncertain controller takeover target current generation + 1;
-- the generation-changing command stores expected and target generation;
-- its **dispatch transaction** advances the fence before native I/O, revokes the old
-  controller/source/token, releases old claims, pauses Goals, stales old queued commands
-  and commits the target source plan/state;
-- if the target can receive its own Eliot environment, the same transaction creates the
-  one random target-generation token that the plugin/native process will receive. It is
-  never installed only after tools may already have started;
-- exact success installs the requested control/observe/profile projection;
-- definite failure never restores the revoked controller or decrements the fence:
-  first start/resume becomes `failed`; takeover/detach becomes `lost` from Eliot's
-  perspective, while the native subject may remain externally discoverable;
-- unknown transition leaves the target generation current, preserves any token that may
-  have reached the target environment, leaves the previous observation diagnostic-only
-  and blocks ordinary work until exact readback/resolution;
-- exact readback may clear the target token only when it proves no process/session could
-  have received that environment;
-- exact reconnect to the same still-current writer/source ownership may preserve the
-  generation;
-- exact turn/request ids bind work inside a generation.
+Store failure stops new writes and external dispatch. It does not rerun an external
+effect to reconstruct a missing result. Restart reconciles the durable current objects
+and exact native state; it is not an event-by-event replay of external side effects.
 
-This intentionally copies a generation fence, not a lease/binding hierarchy. A command,
-source or process from an older generation can remain in history but cannot mutate the
-current projection or fire ordinary automation. Recovery after failed/unknown takeover
-is an explicit later attach/resume targeting another generation; there is no rollback.
+The detailed invariants have one owner:
 
-Per-Agent plugins own one generation and custody unit. A shared plugin is allowed only
-when a native service already isolates session identity/events/readback/stop. Its server
-belongs to service custody; stopping one Agent never signals it.
+| Invariant | Owning specification |
+| --- | --- |
+| Stable Agent + monotonic generation; exact turn/request; command states | [core](spec/core.md) |
+| Caller identity, write idempotency, wait and shutdown | [API](spec/api.md) |
+| One lifecycle source, commit acknowledgement, cursor/gap and native translation | [plugin protocol](spec/plugin-protocol.md) |
+| Process ownership, source drain, Git/workspace observation | [monitoring](spec/monitoring.md) |
+| Profile/route snapshot, environment and secrets | [configuration](spec/configuration.md) |
+| Timers, rules, checks and actions using ordinary commands | [automation](spec/automation.md) |
+| Mail, variables, hierarchy and advisory attribution | [coordination](spec/coordination.md) |
 
-A plugin crash or daemon restart never rebinds an uncertain call to a replacement
-plugin generation. Recovery attaches/snapshots the exact native subject; absent proof
-means unknown/lost, not replay.
+Do not duplicate these contracts in worker instructions or add another decision for each
+edge case. Repair the owning spec and its actual caller together.
 
-## Command flow
+## Process and recovery boundary
 
-```text
-eliot steer a12 "use v2" --generation 4
- → admission transaction:
-      validate principal, capability, Agent generation=4 and active turn=t9
-      insert command accepted {generation:4, turn_id:t9}
- → readiness lane dispatches to plugin generation 4
- → native exact-turn mechanism
- → plugin result/event commits command outcome
-```
+Use one process-owning plugin/app-server per Agent generation. A replacement never
+inherits an uncertain call. Resume is explicit and does not resend the old prompt.
+Shared services are later capabilities and require exact per-session isolation; stopping
+one Agent never kills another session or an owner-run service.
 
-A queued future send does not block current-turn steer/interrupt/request reply. But an
-input that is dispatched/unknown without exact turn association blocks later send,
-configure and Eliot Goal continuation.
+Windows Jobs provide the specified exact custody. A Unix process group is degraded and
+must report that limitation. Process exit races final output: drain the source before
+concluding loss. Silence, transport loss and missing history are not completion.
 
-Launch with a prompt creates `launch L` plus linked input `L/send`. Both are stored as
-one command parent/child set. `session.ready` applies L only; exact `turn.started`
-associates/applies `L/send`; terminal result settles the turn separately. Selector
-fanout uses the same parent/derived-child representation and pages the fixed child set.
+A source's `open|closed` lifecycle, health and historical gap are independent.
+Handoff transfers only the named event families; it does not imply that the previous
+source process closed. The protocol owns the exact transition rules.
 
-## Event/source flow
+## Scale without a cluster
 
-```text
-native record R
- → the family owner normalizes one bounded atomic event batch
- → events.put {agent:a12, generation:4, source:stream, events, cursor?}
- → daemon validates source ownership + generation + turn/request/native ids
- → daemon computes canonical event digests
- → one transaction:
-      events + source state/cursor + reducer/projections + derived state
- → commit acknowledgement
- → bus → clients/rules/Goals
-```
+Historical/idle Agents are indexed records. Live harnesses consume their native process
+resources; logical fleet capacity is not a promise that one host runs a million model
+processes. Queries, event buffers, histories and fanouts are bounded/paginated. Add a
+pool, scheduler or new persistence table only for an implemented caller.
 
-Every durable event that may be resent after a lost acknowledgement has a stable
-normalized native id. A cursor-backed source may derive ids from cursor + record-local
-ordinal; a source with neither stable ids nor cursor records an idempotent gap instead of
-retrying a lost acknowledgement. One native-record batch is all-new or an exact duplicate
-as a whole; a mixed retry is integrity failure.
-
-A replayable source resumes strictly after its opaque committed cursor. A source with no
-exclusive cursor reconnects at the live edge, records `source.gap` with a stable gap id,
-snapshots current state and never republishes old history. `native_id` removes only
-bounded overlap; the same id with different daemon-computed payload/cursor is an
-integrity error.
-
-Dynamic family replacement is one `source.handoff` compare-and-swap transaction: verify
-predecessor, record final cursor or gap, install successor. The successor publishes only
-after commit. A lost response is settled by read-only `source.state`, not by blindly
-issuing another handoff. There are no source epochs, open ids or source sequence protocol.
-
-## Restart reconciliation
-
-Restart/callbacks enqueue stable keys (`agent:<id>`, `workspace:<id>`, `service:<name>`,
-`provider:<scope>`, rule/timer/Goal/mail/Git keys). A deduplicated worker rereads Store
-and native current state; one key is never reconciled concurrently with itself.
-
-- dispatched effects become unknown until verb-specific readback;
-- no reconcile pass replays an uncertain effect;
-- source owners/state determine recovery or gap;
-- workspace/provider state prevents repeated setup/probe;
-- rules drain old/new definitions at their stored high-water boundary;
-- queued work runs only if its captured generation is still current;
-- an open unknown generation transition blocks another takeover until exact readback.
-
-## Process and service model
-
-- one process-owning plugin + native descendants per Agent generation;
-- Windows Job contains/terminates/verifies exact tree;
-- Unix process group is degraded and reports possible escaped descendants;
-- owner-run/adopted service registration is read-only and never stopped by Eliot;
-- managed service has separate custody and lifecycle;
-- process exit is followed by authoritative-source drain to EOF/deadline before loss is
-  concluded.
-
-## Scale
-
-Idle/historical Agents are indexed rows, not tasks. Real live sessions cost what their
-vendor harness costs; one host realistically runs tens/hundreds. Shared isolated fake/
-service plugins can exercise 10,000 logical Agents. Lists, histories, discovery and
-fanout are paginated; trees use parent/root indexes; no hot path scans every Agent.
-
-## Target repository layout
-
-```text
-Cargo.toml
-crates/
-  eliot-core/       pure ids/events/verbs/reducer
-  eliot-store/      SQLite migrations/writer/queries
-  eliot-daemon/     router/bus/plugin host/custody/monitors/automation/coordination
-  eliot-plugin/     typed plugin SDK + recording/replay
-  eliot/            CLI/daemon/plugin/hook/MCP entries
-plugins/
-  fake/
-  codex/
-  claude/ opencode/ ...
-docs/
-```
-
-Create another crate/trait/service only after two current callers require the boundary.
+Use [donors](reference/donors.md) as an extraction map, not a list of frameworks to
+combine. Ready-made dependencies/helpers come first; incompatible workflow/UI/security
+platforms stay out.

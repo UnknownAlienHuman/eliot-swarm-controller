@@ -1,83 +1,47 @@
 # OpenCodex provider proxy
 
-OpenCodex is a provider service, not an Agent harness. Harness plugins remain owners of
-Agent/native session identity and lifecycle; OpenCodex supplies one explicit inference
-route. Layer L2.7.
-
-Facts checked 2026-10-25 against `lidge-jun/opencodex` release v2.92.0. It is
-fast-moving; recheck installed README/source/API before implementation and record the
-installed version.
+Optional route in L3, after direct Codex already works. OpenCodex is an inference service,
+not another Agent harness. Source: [lidge-jun/opencodex](https://github.com/lidge-jun/opencodex).
+Inherited source check: 2026-10-25, v2.92.0. Recheck the selected installed API; this is
+not a required version or current runtime qualification.
 
 ## Ownership
 
-Configuration selects exactly one mode:
-
-- `attach`: owner-run/adopted service. Eliot health-checks/read-only monitors it, never
-  starts, stops, restarts or rewrites it;
-- `launch`: Eliot-managed service in separate service custody. It may be started/stopped
-  by service lifecycle, never because one Agent stops.
-
-This follows Waku's adopted-service rule. An adopted service PID/registration is not
-proof Eliot owns it.
+`attach` adopts an owner-run endpoint: bounded health/read only, never start/stop/repair.
+`launch` explicitly supervises a service in separate custody. Start with attach; managed
+service orchestration must not delay the first working route. Agent stop never signals
+a shared or adopted service.
 
 ```toml
 [proxies.opencodex]
 attach = "http://127.0.0.1:10100"
-health = "/api/system/health"       # verify on installed version
+health = "/api/system/health" # verify installed route
 api_key_env = "OPENCODEX_API_KEY"
 max_live = 8
-# launch = ["C:/tools/opencodex/ocx.exe", "start"]  # absolute owner-controlled path
 ```
 
-The admitted profile freezes the selected proxy mode, direct endpoint or exact managed
-launch argv, health path, per-harness base URLs, capacity scope and secret-variable
-names. Reload affects future admissions only. A managed service is reused only when the
-frozen proxy name/config digest and endpoint/custody readback match; Eliot never swaps a
-queued/running Agent onto a different OpenCodex process because configuration changed.
-
-Owner performs install/init/login. `OPENCODEX_HOME` and provider credentials stay owner
-configuration; Eliot stores only frozen nonsecret route/store selectors and environment-
-variable names, never token values. Client and management credentials are distinct and
-never persisted in events/messages/fixtures.
+Owner performs install/init/login. Client/admin credentials remain separate secret
+references. Frozen profile captures endpoint, mode, health path, route/account and, for
+managed service, exact launch/config inputs. Reload affects future admissions only;
+service reuse requires matching binding and endpoint/custody readback.
 
 ## Harness wiring
 
-| Harness | Explicit wiring |
-| --- | --- |
-| Codex | named Responses-compatible provider with `<origin>/v1` and client key headers |
-| Claude Code | documented Anthropic base URL/auth/header variables |
-
-Eliot injects route configuration only into the frozen per-Agent profile environment.
-It never runs global integration installers or edits owner client configuration.
-Requested URL is not proof of use: plugin reports effective provider/endpoint where
-available and L7 verifies main/auxiliary requests.
+Codex uses an explicit named Responses-compatible provider at the configured endpoint.
+Claude later uses documented Anthropic base URL/auth/header variables. Inject configuration
+per Agent; do not run global integration installers or alter owner client configuration.
+Keep native sessions, generation and lifecycle in the harness plugin.
 
 ## Monitoring, capacity and holds
 
-Optional management API is read-only and version-checked. It may feed service health,
-provider/model availability, usage and proven rate/quota facts. A management timeout
-marks only the proxy source stale; it does not change Agent state or trigger fallback.
+Optional management reads check supported endpoints/fields/capabilities. Version is
+diagnostic, never an equality gate. A timeout marks only that source stale; it neither
+completes Agent work nor authorizes fallback. Shared account/service capacity and provider
+holds survive restart. Unknown probe remains reserved; no silent model/account switch.
 
-Profiles using the same OpenCodex service/account share capacity and persisted provider
-holds. A 429 is rate limit unless exact response proves quota. One explicit probe may
-claim a hold; unknown probe stays reserved across restart. Eliot never silently selects
-another provider/account/model.
+## Billing visibility and final checks
 
-## Billing visibility
-
-Billing follows the configured OpenCodex provider/account/auth mode. Eliot displays the
-profile's intended account/billing and every effective fact exposed by harness/proxy.
-A successful main chat does not prove title/compaction/subagent traffic used the same
-route; unverified scope remains labelled unknown.
-
-## Retained L7 cases
-
-- adopted service is never signalled/restarted by Agent stop or daemon recovery;
-- managed service uses separate custody and exact frozen endpoint/launch/PID birth
-  identity;
-- config reload does not alter an admitted Agent's proxy binding;
-- client/admin keys never cross roles or persist;
-- stale/failed management read does not reroute or complete Agent work;
-- effective Codex/Claude route and auxiliary calls are verified;
-- provider hold/capacity is shared correctly across profiles and restart;
-- stale integration/config write is never blindly retried.
+Display intended profile/billing and native/proxy effective facts separately. Requested
+URL or one successful main request does not prove auxiliary/subagent traffic used the
+same route. Mark unobservable scope unknown. L7 exercises actual direct/proxy requests,
+secret separation, config reload, service ownership, effective routing and hold recovery.

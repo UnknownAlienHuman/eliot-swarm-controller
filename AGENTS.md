@@ -1,125 +1,49 @@
 # Working on Eliot
 
-Read, in order: [vision](docs/vision.md) → [architecture](docs/architecture.md) →
-[roadmap](docs/roadmap.md) → only the specifications/harness page linked by your task →
-[donors](docs/reference/donors.md) for the exact mechanism being implemented.
+Build the next useful path in [roadmap](docs/roadmap.md), not the entire final design.
+Read [vision](docs/vision.md) and [architecture](docs/architecture.md) once, then only
+that task's owning spec, touched code and donor entry. Later-layer sections are not
+prerequisites. Until L0.1, v1 code is reference material, not an implementation to extend.
 
-Until L0.1 lands, current crates/modules/migrations/tests/tools/vendor/config/old
-workflows are v1 legacy. Do not repair or extend them. Read only the exact donor path
-named by v2 docs, copy the small mechanism and remove its old coupling.
+## Work loop
 
-## Ownership
+1. One manager owns one worktree/branch/PR. Delegate disjoint work; integrate it there.
+2. Select the next unchecked task. Read its donor entry: **dependency**, **extract** or
+   **pattern**. Use existing code where it fits; do not import the donor's application.
+3. Implement a connected caller-to-result path. Add only the schema, commands and
+   modules used by that path. Unsupported later features return `unsupported`.
+4. Run `cargo fmt --check` and
+   `cargo clippy -p <changed-package> -- -D warnings`. Repeat for other changed packages
+   only. This works for library-only and binary-only packages; no unconditional `--lib`.
+5. Exercise the changed path briefly when its runtime is available. Full test suites,
+   conformance infrastructure, load campaigns and routine paid-model runs wait for L7.
+   A focused regression is permitted for a concrete defect; no framework-building detour.
+6. Tick completed work and state the actual checks in the PR. Do not claim a runtime
+   property from compilation or source review alone.
 
-- One manager owns one worktree, branch and PR.
-- Delegated assignments are narrow and disjoint; the manager reviews/integrates every
-  returned diff.
-- No two managers share an index/worktree.
-- One roadmap task normally lands one connected useful path, not scaffolding.
+## Keep the implementation small
 
-## Implementation loop
+- Core types/reducer contain no I/O. Store owns SQLite; plugins own vendor protocols.
+  Automation and coordination call the router, never another harness executor.
+- Preserve generation/turn/request binding, commit-before-ack and explicit unknown
+  outcomes from the owning specs. Do not replay an uncertain external effect.
+- Add a crate or trait for a real boundary, not a future caller or a line-count target.
+  A simple internal module is enough for most later features.
+- Replace obsolete code in place. No hidden fallback, compatibility executor, proof
+  packets, audit/readiness documents, task-acceptance engine or generated status registry.
+- Change an incorrect owning spec in the same PR; remove contradictory text rather
+  than adding another exception. Roadmap checkboxes are the only project status list.
+- Keep secrets out of persisted semantic data, fixtures and logs. Use explicit argv
+  and scoped process ownership; Windows is a first-class platform.
 
-1. Take the first unchecked current-layer task or the exact assigned task.
-2. Read its linked contract and touched code.
-3. Before inventing a mechanism, read the exact donor source named in
-   `docs/reference/donors.md`. Use its proven boundary unless a concrete Eliot
-   constraint makes it incompatible; state that incompatibility in the PR.
-4. Write the real caller → Store/router → plugin/native → readback path first.
-5. Run only the implementation gate:
+## Donor use
 
-   ```text
-   cargo fmt --check
-   cargo clippy -p <changed-package> --lib --bins -- -D warnings
-   ```
+[donors.md](docs/reference/donors.md) names source, target and extraction boundary.
+Use the listed reference revision to understand the mechanism. At the first actual
+code import/dependency addition, check that revision's license, retain required notices,
+record the source in the code/PR, and verify toolchain compatibility. This is a one-time
+import check, not a gate on every operation or PR. Pattern-only sources are not copied.
 
-   Add another package only when the changed contract must compile together. Do not
-   pause partial layers to construct a broad unit/E2E/live/load campaign. A tiny local
-   regression is allowed only when review cannot establish a critical contract without
-   it. The complete deterministic, crash/restart, plugin conformance, live-harness,
-   platform and load suite is built/run after the connected product exists.
-6. Tick the roadmap task in the same PR.
-7. PR description: **What**, **Checked**, **Spec changes**—short and factual.
-
-Fix an incorrect owning spec in the same PR, replacing text in place. Correct unstable
-harness facts from installed/official source with date. Do not add audits, readiness
-reports, packets, inventories, progress documents or addenda.
-
-## Runtime rules
-
-- **Connected path, no substitutes.** No shim, hidden fallback, compatibility family,
-  dead API or abstraction without a current caller.
-- **Replace means delete.** The old route leaves in the PR that activates its
-  replacement.
-- **Stable Agent, one generation fence.** Every Agent command/fact carries the current
-  generation and exact turn/request where relevant. Do not add binding revisions,
-  epochs or another identity layer.
-- **Fence before effect.** A generation-changing dispatch advances the fence, revokes
-  old identity/source ownership and—when direct identity is possible—commits the one
-  random target-generation token before plugin/native I/O. Unknown never rolls back the
-  generation or rotates another token. Terminal `stopped|failed|lost` and detach clear
-  the current token atomically, even when degraded Unix custody cannot prove every
-  descendant died. Do not add a routing key or derived-token system.
-- **Unknown stays unknown.** Never replay a possible native/external effect—not start,
-  input, interrupt, stop, setup, script or push. Exact readback or explicit owner
-  resolution only. Its narrow lane remains blocked.
-- **Start ≠ input ≠ turn result.** `session.ready`, input admission/association and
-  terminal turn outcome are separate facts.
-- **One source per lifecycle family.** A stream, transcript or hook owns each family for
-  one generation. Handoff uses an opaque cursor or explicit stable gap. Never duplicate
-  lifecycle through two sources.
-- **Commit before acknowledgement.** One complete native-record batch, its daemon-
-  computed digest, source state/cursor and reducer projection commit before success is
-  returned or broadcast. A source has at most one unacknowledged batch; a retry is the
-  exact last batch or an integrity error. Do not add a source journal/epoch protocol.
-- **Explicit principal.** Owner CLI uses its private local token automatically; Agents
-  and scripts use scoped tokens. Missing/mismatched identity rejects and never becomes
-  owner.
-- **Native first.** Use the harness's exact mechanism. Unsupported semantics reject;
-  never silently turn steer into send, resume into fresh unrelated launch or
-  force-stop into killing a shared service.
-- **Actions are commands.** Do not introduce a second automation operation graph/run
-  engine. An applied send is associated with a turn, not proof that the turn succeeded.
-- **Freeze admitted implementation.** The resolved profile includes the exact external
-  plugin command/private config, frozen nonsecret route environment and every referenced
-  note/setup/script/plugin file as bounded bytes or canonical-path+size+digest under an
-  allowed root. Reload affects future admissions only. Changed/missing bytes fail before
-  execution; unknown setup is never rerun. Do not add version gates or a global artifact
-  CAS/GC.
-- **Git network actions use an isolated transport view.** Do not execute fetch/push/
-  readback through mutable repository/global config or URL rewrites. Freeze direct
-  approved endpoints and refs/OIDs. Push `<frozen-oid>:<destination-ref>`, never a
-  mutable source branch; read back through the same isolated transport configuration.
-  There is no generic built-in pull.
-- **No secrets** in source, config values, Store semantic data, messages, fixtures or
-  logs.
-- **No model calls in CI.** Record native traffic for the later replay/conformance
-  campaign.
-
-## Code
-
-- Rust 2024, pinned stable, workspace lints.
-- `thiserror` in libraries, `anyhow` at binary boundary, `tracing`, Tokio async I/O.
-- No production `unwrap`; `expect` states a true invariant.
-- `unsafe` only in the documented platform boundary.
-- Explicit executable/argv/cwd/env; no implicit shell.
-- Windows first-class: assign-before-resume Job, explicit inherited handles, no child
-  console, UTF-8 without BOM/LF, long input via stdin/private file, environment keys
-  case-insensitive.
-- SQLite ids fit signed 64-bit and exhaustion fails before mutation.
-- Lists, histories, fanouts and discovery are bounded/paginated.
-- Before adding a dependency, verify current version, license, maintenance and MSRV and
-  state it in the PR.
-
-## Final qualification
-
-After L0–L6 produce the connected local product, build and run one complete campaign:
-
-- reducer/Store/API and migration invariants;
-- fake-harness E2E through the CLI;
-- crash/restart and unknown-outcome boundaries;
-- plugin recordings/conformance and compact live runs;
-- coordination/automation simulated-time cases;
-- Windows/degraded-Unix custody/security/recovery;
-- retention/WAL/load.
-
-Do not claim runtime correctness from documentation, Clippy or fixtures alone. During
-implementation report only the connected behavior and compile gate actually completed.
+The complete API/spec is the target contract, not permission to build everything before
+Codex works. First deliver core/bus with a tiny fake, then direct Codex/Luna; automation,
+mail and additional harnesses come afterward in the order defined by the roadmap.

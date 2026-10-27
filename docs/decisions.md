@@ -1,59 +1,50 @@
 # Decisions
 
-Short records of non-obvious product choices. Change the owning entry in the PR that
-changes behavior; do not append a contradictory addendum.
+Only non-obvious choices belong here. Exact fields/state transitions live in their
+owning specs; do not reproduce them in every page. Existing IDs remain stable for links.
 
-The mechanisms below are intentionally borrowed from the donor implementations in
-[reference/donors](reference/donors.md). Eliot copies their small correctness
-boundaries, not their applications or workflow systems.
-
-| ID | Decision | Why |
+| ID | Decision | Reason / owning contract |
 | --- | --- | --- |
-| D-01 | **v2 is a fresh layered build.** v1 is frozen at commit `dc6f70aa`; L0.1 creates tag `v1-final` there before deleting v1 from `main`. | v1 reached about 533k Rust lines and 61k lines of process/audit documents without qualifying its core path. |
-| D-02 | One `eliot` binary contains the CLI, daemon entry, built-in plugin entry, hook shim and optional MCP entry. | One installation and one version; no sibling-artifact platform. |
-| D-03 | A process-owning plugin runs once per controlled Agent generation. A shared plugin is allowed only for a native service that already isolates sessions, attributes every event to one exact session and can stop one session without killing the service. | This is the custody boundary used by `sandbox-driver` and Waku: replacement generations do not inherit old handles, and adopted services are never killed for one session. |
-| D-04 | One SQLite database in WAL mode, one writer task and numbered `user_version` migrations. | Enough for one host and millions of logical Agents; no database server or schema-hash ceremony. |
-| D-05 | Persist bounded normalized events with a global `seq`; deltas and process samples are ephemeral. Native transcripts remain the detailed record. | Replayable state without storing token streams. |
-| D-06 | Core has no Task/Issue/review/acceptance/publication engine. Automation actions are ordinary commands. | That product was not requested and was v1's largest growth source. |
-| D-07 | One local OS user is the trust boundary, but every API call still carries an explicit principal for correctness: owner CLI automatically reads one private local owner token; Agents and managed scripts use scoped tokens. Missing, incomplete or mismatched identity rejects and never becomes owner. | Same-user credentials are not hostile-user security, but they prevent an Agent whose environment was filtered from accidentally receiving owner authority. CCCC and MCP Agent Mail likewise bind work to explicit actor identities. |
-| D-08 | Agent command authority is `self`, `tree` or `project`; owner/global automation may target all projects, project automation only its project. | Covers manager/child operation without policy editions or handover epochs. |
-| D-09 | Native Goal and Eliot Goal are independent; at most one of each may exist per Agent. | Preserves native autonomy while providing a uniform fallback. |
-| D-10 | Rules are strict TOML. Event rules have a durable cursor and at most two stored definitions during an edit: the old definition processes through captured high-water H, the new definition starts after H. A second semantic edit is deferred until the retiring definition drains. Actions are commands with deterministic ids. | This is the smallest gap-free edit boundary; no activation hierarchy, unbounded definition queue or generic run engine. |
-| D-11 | `who` combines current Git facts, durable Agent edit attribution and advisory claims; history is provenance, not current ownership. | Git alone cannot attribute dirty bytes in a shared checkout. |
-| D-12 | Claims are advisory and never lock files. | Eliot cannot enforce a lock against an unrestricted native shell. |
-| D-13 | First real harness is Codex app-server; first provider proxy is OpenCodex. | Codex exposes the richest native control protocol and is a direct Rust first slice. |
-| D-14 | **No native or external effect with an unknown outcome is retried automatically**, including start, input, interrupt, stop, setup, script and Git push. | ACPX, Agent Sessions and sandbox-driver all keep uncertain work distinct from safe retry. A late retry may duplicate work or hit a replacement turn/session. |
-| D-15 | `docs/` contains current specification, roadmap and compact donor/research references only. | No audit/readiness/report hierarchy. |
-| D-16 | Documentation is English; the owner's source statement in vision remains verbatim Russian. | Exact owner intent plus the language of vendor documentation and implementation. |
-| D-17 | Harness/software versions are reported and recorded with fixtures, never used as authority gates. | Version equality does not prove semantics. |
-| D-18 | Early stdio sessions are daemon/plugin owned. Long-lived continuity is added only through a native service with exact re-attach. | No detached ambiguous processes; Waku's adopted-service rule is the model. |
-| D-19 | `on_idle` Eliot Goal waits while an active native Goal drives; explicit cadence may intentionally queue another turn. | Avoids accidental dual idle loops. |
-| D-20 | Commands use readiness lanes. Ready native calls serialize per Agent; future queued sends stay FIFO but do not block exact control/request replies for the current turn. An unresolved input/turn/transition gate blocks later send, configure and Eliot Goal continuation. | Preserves configure→send ordering without allowing unknown input or takeover overlap. |
-| D-21 | Capacity is capped by explicit profile, account and proxy scopes; provider holds are persisted per account/route. | Several profiles can spend one subscription, and restart must not launch a second probe over an unknown first probe. |
-| D-22 | One stable Agent/native subject has one monotonically increasing `generation` fencing the current controlled/observed incarnation. A generation-changing command stores expected and target generation; dispatch advances the fence before native I/O and it never rolls back. The same transaction revokes the old identity and, when direct Agent identity is qualified, creates the one random target-generation token that the new process environment receives. Terminal `stopped|failed|lost` and detach revoke the current token atomically; an escaped degraded-Unix process therefore cannot keep commanding Eliot. Every plugin message, command, turn, request, claim and Goal carries the fence. There is no binding revision, routing key or derived-token layer. | Agent Sessions uses a monotonic fence token; sandbox-driver numbers replacement plugin generations and freezes their environment before launch. One integer plus one live-generation token prevents late old-process output from mutating replacement work. |
-| D-23 | Session start, optional first input, input-to-turn association and terminal turn result are separate outcomes. | ACPX exposes queue admission, prompt start and final result separately; `session.ready` must never prove that a prompt ran. |
-| D-24 | One `(native_scope,native_ref)` maps to one canonical Agent row. Attach, detach, resume and control takeover change that row/generation rather than creating another row for the same native subject. | Duplicate rows duplicate lifecycle, automation and capacity. |
-| D-25 | Exactly one source owns each normalized lifecycle family for `(agent,generation)`. Initial ownership and a small source-state row commit before native I/O; dynamic replacement is one predecessor-aware compare-and-swap handoff with an opaque cursor or explicit stable gap id. The daemon computes canonical event/gap digests. A plugin permits at most one unacknowledged native-record batch per source; `source_state` stores only the last batch receipt, so a lost acknowledgement is read back without a source journal. Same id/different payload/cursor is integrity failure. There are no source epochs, open ids or source sequence numbers. | ACPX has one authoritative journal; Paseo separates immediate live delivery from authoritative history; Waku subscribes before create and reconciles on reconnect. This is the minimal implementable boundary. |
-| D-26 | Harness environment is minimal by default; inherit-all is an explicit global-profile opt-in. | Prevents unrelated daemon credentials leaking into every Agent/tool. |
-| D-27 | Project config may only narrow an owner-defined global profile. Routes, executable/plugin, account/proxy, environment and broader permissions/control are global-only. | Agents can write the repository; project files cannot widen authority or spending. |
-| D-28 | Custody claims only what the OS proves: Windows Job is exact; Unix process group is degraded until a qualified cgroup/equivalent is implemented. | Process groups neither die with the daemon nor prevent `setsid` escape. |
-| D-29 | Worktree admission freezes the local `base_oid` and one durable preparation row. The row distinguishes `creating`, `setup_ready`, `setup_running`, `ready`, `unknown` and `failed`; it records the current setup index before the process starts. A lost `setup_running` effect is never rerun. | Moving refs and non-idempotent setup must not change queued work after admission, but a per-step journal is unnecessary. |
-| D-30 | External mutation ids are bound to `(principal, method, canonical payload)`. Commands store that binding directly; non-command writes use one small `writes` table. The single writer checks both id namespaces. Missing old ids are rejected after the supported retry window. | CCCC persists a delivery id plus actor/generation/content binding and rejects the same id with different content. No universal receipt/floor subsystem is needed. |
-| D-31 | Admission freezes every semantic implementation input without a global artifact platform: the resolved external plugin command/private config and every referenced plugin/note/setup/script file are stored as bounded bytes or canonical allowed path+size+digest and verified before dispatch. Reload affects future admissions only; a changed/missing old route fails instead of silently substituting another implementation. | sandbox-driver freezes replacement provider/environment configuration before launch; mutable checkout/config files must not rewrite queued work, but content-addressed artifact GC and version authority gates are unnecessary. |
-| D-32 | Restart is level-reconciled from durable current state through deduplicated keys; callbacks only wake reconciliation. Reconciliation never blindly repeats a non-idempotent external effect. | controller-runtime's level-based pattern avoids a second edge-driven state machine. |
-| D-33 | Mail has one stable delivery row per concrete recipient, with sender and recipient generation, content digest and exact acknowledgement id. Selector sends share a thread but derive one delivery id per recipient. Queue delivery never injects the full body without ordinary command authority. | CCCC binds delivery/reply/cancel to actor generation and digest; MCP Agent Mail keeps read/ack state per recipient. |
-| D-34 | L0–L6 are implementation-first: formatting plus the smallest changed-package Clippy gate. Targeted regressions are added only where a local contract cannot be reviewed safely. The complete deterministic, crash/restart, conformance, live, platform and load campaign starts after the connected feature set exists. | Follows the owner's current development instruction and avoids rebuilding v1's ceremony while retaining a real final qualification gate. |
-| D-35 | Linked-input and selector fanout use parent/child fields on ordinary command rows. Retention treats each parent set as a unit: an open/unknown child retains the parent and siblings required by the API; terminal children are pruned before the parent; after the complete set is pruned, `command.children` returns `history_gap`. | Avoids a separate link subsystem while keeping the parent foreign key implementable and preventing partial fanout history. |
-| D-36 | Automated Git network actions run in a private bare transport view containing only frozen direct approved endpoints and owner-approved credential transport configuration. Repository/global URL rewrites, aliases, hooks, filters and helpers are not loaded. Push uses the frozen object id as refspec source and readback uses the same frozen direct endpoints. There is no generic built-in pull. | A safe fetch URL may have a different pushurl; `insteadOf` can rewrite an already-resolved URL again; a source branch can advance after admission. Standard Git object-directory/alternate and exact refspec/update-ref mechanisms close these races without a Git workflow subsystem. |
+| D-01 | Fresh v2; archive v1 at `dc6f70aa` before removing it. | v1 is a narrow code donor, not the refactor base. [Roadmap](roadmap.md) |
+| D-02 | One `eliot` binary, separate plugin processes. | Simple installation and process isolation; no artifact-distribution platform. |
+| D-03 | Start with per-Agent plugins. Shared services come only with demonstrated session/environment/stop isolation. | [Plugin protocol](spec/plugin-protocol.md) |
+| D-04 | One SQLite WAL database, one writer, ordinary numbered migrations. | No database server, schema hashes or event-sourcing framework. |
+| D-05 | Persist bounded facts; stream deltas/stats ephemerally. | Native transcripts retain full output. |
+| D-06 | No Task/Issue/review/acceptance engine; actions are ordinary commands. | [Automation](spec/automation.md#actions-are-commands) |
+| D-07 | Current-user IPC plus automatically supplied scoped identity. | Missing managed credentials must not accidentally become owner; not hostile-same-user isolation. [API](spec/api.md#transport-and-principal-identity) |
+| D-08 | Agent control is self/tree/project; project rules remain project-scoped. | No policy editions or authority handover platform. |
+| D-09 | At most one native and one Eliot Goal, independent. | Native autonomy plus explicit bounded continuation. |
+| D-10 | Rule edits keep current and at most one retiring definition at high-water H. | Do not reinterpret backlog or add an activation hierarchy. [Automation](spec/automation.md#event-cursor-and-compact-definition-handoff) |
+| D-11 | `who` combines Git, current Agent edits and advisory claims. | Git does not identify every writer of uncommitted shared bytes. |
+| D-12 | Claims are advisory, never file locks. | Unrestricted native shells are not sandboxed by Eliot. |
+| D-13 | Direct Codex/Luna is the first useful path; optional OpenCodex follows in L3. | Do not wait for proxies or more adapters before one real harness works. |
+| D-14 | Never automatically replay an uncertain native/external effect. | Exact readback or explicit resolution; unsuccessful execution can also have partial effects. [Core](spec/core.md#commands-and-narrow-gates) |
+| D-15 | One current spec per topic and one roadmap. | No audit/readiness/status hierarchies. |
+| D-16 | Docs in English; original owner statement remains verbatim Russian. | Later explicit owner clarifications can change delivery order without rewriting the historical quote. |
+| D-17 | Report versions; negotiate actual available fields/capabilities. | Version equality alone is not semantic compatibility. |
+| D-18 | Early stdio sessions are owned; service continuity is a later concrete feature. | No detached ambiguous process lifetime. |
+| D-19 | On-idle Eliot Goal waits for an active native Goal. | Avoid two accidental continuation loops. |
+| D-20 | Ready controls bypass future queued sends, not unknown-input fences. | Exact interrupt/reply/readback remains available while uncertain turn-producing work is held. |
+| D-21 | Named profile/account/proxy capacity and holds survive restart. | No second probe or overbooking behind an uncertain launch. |
+| D-22 | One stable Agent and one monotonic generation fence. | Old messages/handles cannot change replacement work; no binding-revision hierarchy. [Core](spec/core.md#generation-fence) |
+| D-23 | Session ready, input association and terminal result are distinct. | Acceptance of bytes is not execution or task success. |
+| D-24 | One canonical Agent per native scope/ref. | Attach/resume do not duplicate lifecycle and capacity. |
+| D-25 | One source owner per family; independent lifecycle, health, latest gap and last-batch receipt in `source_state`. | One unacknowledged batch per source permits bounded lost-ack recovery. New gaps get new IDs; same-ID conflicts reject. No source epochs/journals. [Plugin protocol](spec/plugin-protocol.md#gap-and-handoff) |
+| D-26 | Minimal environment by default. | Inherit-all is an explicit owner opt-in, not automatic credential distribution. |
+| D-27 | Project config narrows global profiles. | Repository changes cannot silently widen routing, billing or authority. |
+| D-28 | Windows Job exact; Unix group explicitly degraded. | Claims match OS containment, not wishful orphan-free guarantees. |
+| D-29 | One worktree preparation row records exact identity and setup phase. | No automatic repeat of unknown setup, no per-step workflow journal. |
+| D-30 | Mutation IDs bind principal, method and semantic payload. | Repeated admission returns the same result; conflicts reject. Bounded `commands`/`writes`, not a universal receipt service. |
+| D-31 | Freeze explicit admitted route/config and entry-file inputs. | Reload changes future admissions; a file digest is not a hermetic transitive runtime or artifact platform. |
+| D-32 | Restart rereads durable/native state by deduplicated key. | A small reconciliation worker, not Kubernetes or another workflow engine. |
+| D-33 | Mailbox belongs to stable Agent; automatic presentation is generation-bound. | Current authenticated Agent may explicitly read old unread mail. Do not replay old send/inject/steer automatically. Read then exact acknowledgement; bounded inbox. [Coordination](spec/coordination.md) |
+| D-34 | Core/bus → useful Codex → monitoring → automation → coordination → more adapters. | Build only the current subset; fmt/scoped Clippy during implementation, full campaign at L7. No line-count or per-task report gate. |
+| D-35 | Parent/child command rows represent linked input, selector expansion and ordered rule actions. | No link/run subsystem. Retain a referenced set; prune children then parent in one transaction, never expose partial fanout history. |
+| D-36 | Optional automated Git wrappers use isolated transport configuration and frozen OIDs. | Mutable branch/rewrite settings must not retarget admitted pushes. No generic pull or interception of a harness's own Git. [Automation](spec/automation.md#git-actions) |
 
 ## Defaults
 
-| Topic | Default |
-| --- | --- |
-| L4.7 harnesses | Do not build until a concrete need. |
-| Git identity | Per Agent; `git_identity = "inherit"` opts out. |
-| Native child without isolated environment | `own_identity=false`; it is controlled through its parent plugin and receives no independent CLI principal. |
-| Selector fanout | `limits.max_selector_targets = 1000`; no logical fleet-size limit. |
-| Environment | minimal; `inherit_env=true` only in trusted global profiles. |
-| Source reconnect without an opaque cursor | start at live edge and record a gap; never replay retained history heuristically. |
-| Remote access / multi-host / GUI / Memory OS | Not built without a new owner decision. |
+Direct Codex first; configured native model only. Optional vendors do not block the
+selected release. Git identity is per Agent unless `git_identity="inherit"`. Native
+children without isolated environment have no independent CLI principal. Remote,
+multi-host, GUI and Memory OS are outside current scope.

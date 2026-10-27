@@ -1,33 +1,28 @@
 # Documentation
 
-Everything needed to build Eliot v2: one current specification per topic, one roadmap
-and compact lessons/donor/research references. Status lives only in roadmap checkboxes.
+Start with [vision](vision.md), [architecture](architecture.md) and the next task in
+[roadmap](roadmap.md). Then read only its owning spec and donor entry. The final product
+contract is not a requirement to implement every feature in the first layer.
 
-| Read | When |
+| Page | Owns |
 | --- | --- |
-| [vision](vision.md) | Product purpose, owner's source statement and R1–R11. |
-| [architecture](architecture.md) | Components, donor-backed identity/event/recovery boundaries and data flows. |
-| [roadmap](roadmap.md) | Connected layers, code budgets, implementation gate and final qualification. **Start here to pick work.** |
-| [decisions](decisions.md) | Non-obvious current choices; no addenda. |
-| [spec/core](spec/core.md) | Stable Agent + generation fence, events/source owners, verbs, commands and Store projections. |
-| [spec/api](spec/api.md) | Local principals, API/CLI, exact wait/readback/drain semantics. |
-| [spec/plugin-protocol](spec/plugin-protocol.md) | Plugin framing, source plan/cursors, generation binding, custody and recordings. |
-| [spec/monitoring](spec/monitoring.md) | Source health, process custody, workspaces, Git, liveness and reconciliation. |
-| [spec/automation](spec/automation.md) | Rule cursor/handoff, timers, actions-as-commands, scripts, approvals and Goals. |
-| [spec/coordination](spec/coordination.md) | Authority, delivery identity/mail ack, vars, `who`, claims and hierarchy. |
-| [spec/configuration](spec/configuration.md) | Private data root, frozen profiles/files, environment, accounts, plugins and services. |
-| [harnesses/](harnesses/README.md) | Required native identity/process/source/cursor contract per harness. |
-| [reference/lessons-v1](reference/lessons-v1.md) | Confirmed failure → compact prevention rule. |
-| [reference/donors](reference/donors.md) | Exact donor source path and mechanism to copy; rejected application machinery. |
-| [reference/research](reference/research.md) | Findings that constrain communication/automation. |
+| [vision](vision.md) | Owner statement and product requirements |
+| [architecture](architecture.md) | Modules, dependency direction and single command/event paths |
+| [roadmap](roadmap.md) | Build order, current checkboxes and deferred qualification |
+| [decisions](decisions.md) | Short rationale for choices, not another specification |
+| [core](spec/core.md) | Identities, states, commands, events and Store projections |
+| [API](spec/api.md) | IPC, caller identity, admission, wait/readback and CLI |
+| [plugin protocol](spec/plugin-protocol.md) | Implemented capabilities, transport and native fact settlement |
+| [monitoring](spec/monitoring.md) | Process/source/Git/workspace facts and liveness |
+| [automation](spec/automation.md) | Rules, timers, scripts and Goals using normal commands |
+| [coordination](spec/coordination.md) | Mail, variables, hierarchy, who and advisory claims |
+| [configuration](spec/configuration.md) | Profiles, environment, routes and services |
+| [harnesses](harnesses/README.md) | Native capability notes; Codex first |
+| [donors](reference/donors.md) | Dependency/extract/pattern map with source and target paths |
+| [v1 lessons](reference/lessons-v1.md) | Historical failure evidence, not additional implementation gates |
+| [research](reference/research.md) | Background evidence, not a required reading queue |
 
-Edit the page that owns a topic in the same PR as the code that needs it. Replace
-superseded text in place. Do not add report, audit, packet, inventory, plan or status
-pages.
-
-Implementation PRs use formatting plus smallest changed-package Clippy. The complete
-runtime/conformance/live/platform/load suite is built and run after the connected local
-product exists; docs or Clippy are never reported as runtime qualification.
-
-v1 documentation remains at frozen commit `dc6f70aa` and, after L0.1, tag `v1-final`.
-`docs/owner-decisions.md` remains only while v1 code embeds it; L0.1 removes both.
+The first usable milestone is direct Codex/Luna after core/bus. Automation, communication
+and other harnesses follow. Update the page that owns a changed contract; do not create
+reports, addenda, proof packets or another status registry. v1 remains at `dc6f70aa`
+and, once created/verified, tag `v1-final`.

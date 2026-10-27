@@ -1,373 +1,237 @@
 # Automation
 
-Automation turns committed events and time into ordinary Eliot commands. It has no
-Task/review/workflow engine and no generic run/action state machine.
-
-The implementation follows two donor patterns:
-
-- controller-runtime: callbacks/restart enqueue a stable reconciliation key; every pass
-  rereads durable current state and one key never reconciles concurrently with itself;
-- Petri: validate current state, commit the event/commands, then apply the pure reducer.
+Delivered in L4, after the Codex command path and monitoring work. Rules, timers,
+scripts and Goals submit ordinary commands through the existing router. There is no
+Task/review engine, second executor or generic run/action graph.
 
 ## Rule files and authority
 
-Rules live in:
-
-- `<data_dir>/rules/*.toml`: global owner automation;
-- `<registered-project>/.eliot/rules/*.toml`: project principal, limited to that
-  project and its allowed global profiles/actions.
+Global rules: `<data_dir>/rules/*.toml`. Project rules: the registered checkout's
+`.eliot/rules/*.toml`, with project-scoped authority and approved profiles/actions.
+Invalid reload keeps the last valid definition and reports the error.
 
 ```toml
 [[rule]]
 id = "push-writer-commits"
-on = { event = "git.commit", match = { "agent.labels.role" = "writer" } }
-do = [{ action = "git.push", workspace = "${agent.workspace}" }]
+on = { event = "git.commit", match = { "subject.labels.role" = "writer" } }
+do = [{ action = "git.push", workspace = "${subject.workspace}" }]
 limit = { max = 3, per = "agent", window = "1h" }
 ```
 
-Required keys: `id`, `on`, `do`; optional: `enabled`, `limit`, `catch_up`,
-`allow_self`. Unknown keys and duplicate ids are load errors. Invalid reload keeps the
-last valid definition active and reports config health.
-
-A project rule cannot target another project, global vars, arbitrary cwd/executable,
-an unapproved webhook, account, proxy or profile route.
+This example requires a Git event with an unambiguous Agent `subject`; unattributed
+shared-worktree commits do not match it. Required keys are `id`, `on`, `do`; optional
+keys are `enabled`, `limit`, `catch_up`, `allow_self`. Unknown keys and duplicate ids
+are errors. A project rule cannot widen project, command, credential or route authority.
 
 ## Event cursor and compact definition handoff
 
-Event rules read the persisted event log in bounded pages. Matching and rendering use
-the event's stored `subject`, never the current Agent row.
-
-One `rule_state` row keeps the current definition and, only during an edit, one retiring
-definition:
+Rules read committed events in bounded pages. Matching/rendering use the event-time
+`subject` stored with the event, not a later Agent row. A rule has one current definition
+and at most one retiring definition:
 
 ```text
 RuleState {
-  principal, rule,
-  revision,
-  current_definition, current_cursor,
+  principal, rule, revision, current_definition, current_cursor,
   retiring_revision?, retiring_definition?, retiring_cursor?, retire_through?,
   enabled, paused_reason?, updated_at
 }
 ```
 
-- new rule: capture current event high-water H; current cursor starts at H;
-- semantic edit: in one transaction capture H, move old definition/cursor to retiring
-  through H, install new definition with cursor H and increment revision;
-- retiring definition processes `(retiring_cursor,H]`; current processes events after H;
-  when retiring reaches H it is discarded;
-- identical reload is a no-op;
-- disable/pause records one skipped range and advances relevant cursors without firing;
-- Store failure advances nothing.
+New rule: start at current event high-water H. Semantic edit: atomically retire the old
+definition through H and start the new definition after H. While retirement remains,
+defer another edit and report it; reread the latest valid file when retirement finishes.
+Identical reload is a no-op. This is not a definition/activation hierarchy.
 
-Semantic edits are serialized per `(principal,rule)`. While a retiring definition
-exists, another changed file is not installed and no third definition row appears. The
-config source reports `deferred`; after retirement the reconciler rereads the latest
-valid file and performs one new handoff. Intermediate file versions may coalesce, but no
-retained event is reinterpreted by an arbitrary newer definition.
+For each event, atomically either admit deterministic command rows and advance the
+cursor, advance without a match, or record a deterministic validation failure and advance.
+Store failure rolls back both. Disable/pause explicitly records the skipped range and
+advances without firing. No silent history reinterpretation.
 
-The watcher tracks every frozen note/script referenced by current or retiring
-definition. Size/digest change is a semantic edit and uses the same serialized handoff.
-A missed watcher event is caught by mandatory dispatch-time digest verification.
-
-This is the whole edit model—no activation graph, compiled-definition hierarchy or run
-journal.
-
-For each event under its owning definition:
-
-- no match: advance cursor;
-- valid firing: create all deterministic command rows and advance cursor in one
-  transaction;
-- deterministic render/authority/capability/fanout error: commit one `rule.failed` and
-  advance cursor;
-- Store failure: rollback and retry that event after Store recovery.
+Referenced script changes are semantic edits. Frozen content/path validation catches
+missed watcher notifications. Already admitted commands retain their original inputs.
 
 ### Retention and bounded backlog
 
-Event retention may delete only through the minimum cursor needed by every enabled
-current/retiring definition. A retiring definition pins only through its captured
-`retire_through` boundary. Disabled rules pin nothing because disable advances and
-records the skipped range.
-
-`automation.max_event_backlog` (default 100,000 events) bounds one rule's lag. When any
-required cursor falls more than that many retained events behind current high-water, one
-transaction:
-
-1. records `rule.suppressed reason=backlog_exceeded` with exact skipped range;
-2. advances current and retiring cursors to the captured high-water;
-3. clears the retiring definition;
-4. sets the rule disabled/paused with `paused_reason=backlog_exceeded`.
-
-Already admitted commands continue; no new firing is created. Retention is then free to
-advance. Owner must inspect and explicitly re-enable or run an explicit retained-range
-catch-up; catch-up fails `history_gap` if the range no longer exists. There is no silent
-skip and no indefinitely pinned database.
+Enabled current/retiring cursors pin the events they still need. Disabled rules pin
+nothing. At `automation.max_event_backlog` (default 100,000), atomically record the
+skipped range, advance to captured high-water, clear retirement and pause the rule with
+`backlog_exceeded`. Existing commands continue. Explicit catch-up fails `history_gap`
+when its requested history has already been pruned. A lagging rule cannot pin storage
+indefinitely.
 
 ## Triggers
 
-| Trigger | Key |
-| --- | --- |
-| persisted event | event `seq` + definition revision |
-| `every` | anchored schedule slot + schedule revision |
-| cron | scheduled UTC instant + schedule revision |
-| `at` | UTC instant + schedule revision |
-| manual | external mutation id |
+| Trigger | `on` fields | Durable key |
+| --- | --- | --- |
+| persisted event | `event`, optional `match` | event seq + definition revision |
+| interval | `every="30m"`, optional `anchor` | anchored slot + schedule revision |
+| cron | five-field `cron`, optional `tz` (UTC default) | scheduled UTC instant + schedule revision |
+| once | `at` RFC3339 timestamp | UTC instant + schedule revision |
+| manual | `timer run ID` | external mutation id |
 
-Ephemeral events cannot trigger durable work.
+Ephemeral samples never trigger durable actions. Intervals use `anchor + k*period`.
+Missed ticks coalesce to `latest` or `none`, never burst. Cron evaluates in its configured
+timezone; a repeated DST hour has distinct UTC instants and a missing local time is
+coalesced to the first valid instant afterward. Persist the chosen instant, not local
+text alone. Do not stack timer firings while the previous command set is open/unknown.
 
-Intervals use `anchor + k·period`; missed slots coalesce to latest or none, never burst.
-Cron persists UTC instants and handles repeated/skipped DST local times explicitly.
-Timer rows reconcile on startup; one rule does not stack another timer firing while its
-previous commands are queued/dispatched/unknown.
-
-Changing a schedule increments its revision and starts after reload boundary. Changing
-actions only keeps schedule and applies the new definition to later slots. Schedule edit
-is serialized behind an existing retiring definition.
+Schedule edits increment schedule revision and start after the edit boundary; action-
+only edits preserve the schedule. Reconcile timers from stored state on restart.
 
 ## Matching and rendering
 
-`match` uses dotted paths in committed `{event,subject,data}`: exact, glob, regex,
-one-of and presence. All entries must match.
+The only template roots are `{event, subject, data}`. `subject` may be absent for
+non-Agent facts. Exact, `glob:`, `re:`, one-of and `exists` matches combine with AND.
+Missing required fields do not match; an unresolved action placeholder fails admission.
+There is no undocumented `agent.*` alias.
 
-`${path}` may fill an argument value only. It cannot choose executable, action kind, cwd
-root, environment name, option name, credential, project or control scope. Unknown
-placeholder is a deterministic failed firing.
-
-Selectors resolve transactionally at firing to concrete Agent ids and captured
-`generation`; delayed work never retargets a replacement. Steer/interrupt and request
-replies also freeze exact turn/request id.
+Substitution fills argument values, never executable/action kind, option name,
+environment name, credential or authority scope. Workspace/ref/remote substitutions
+still pass their normal validation. Selectors resolve once at firing to concrete
+Agents/generations; delayed steer/interrupt/replies also retain exact turn/request ids.
+Dispatch revalidates that binding without retargeting newer work.
 
 ## Actions are commands
 
-Each action is a command with id:
+A firing has a Store-only parent command and ordered children using existing command
+fields: `parent_command`, `link_kind=rule_action`, `ordinal`. Parent outcome identifies
+the fixed child set; its applied status means admission, not completion of the workflow.
+Child ids derive from principal/rule/revision/trigger/index. No additional run tables.
 
-```text
-rule:<principal>/<rule>@<revision>:<trigger-key>/<index>[/<agent>]
-```
+For `rule_action` siblings, dispatch waits for the preceding sibling to be applied.
+Rejected/failed/cancelled cancels undispatched successors; unknown holds them until
+resolution. Selector children remain independent and are not accidentally serialized by
+this rule. The renderer defines the nesting for a selector action before any dispatch;
+its parent is complete for ordering only when every concrete child is applied.
 
-Repeated reconciliation therefore returns the same command rows. Actions execute in
-listed order: later commands stay queued until the previous command is applied;
-rejected/failed/unknown stops the remainder. `Applied` keeps the underlying command
-meaning—an applied send is associated with a turn, not proof the turn succeeded. A
-workflow needing its result uses a later rule on exact `turn.completed`/cause; Eliot
-adds no hidden wait/workflow state.
+Applied `send` means exact input-to-turn association, not successful task completion.
+To react to a result, use a later rule on that turn's terminal event/cause. Do not add a
+hidden wait/acceptance state to the router.
 
-| Action | Implementation |
+| Action | Existing implementation path |
 | --- | --- |
-| any core verb | normal generation/turn/request-bound command |
-| `git.fetch|git.push|git.worktree` | daemon command with frozen desired state and verb-specific readback |
-| `msg.send`, `var.set` | normal coordination mutation under rule principal |
-| `run` | bounded managed process command |
-| `notify` | bounded log/desktop or owner-configured named webhook command |
-| `emit` | persisted `x.user.*` event command |
+| Agent verb | router with generation/turn/request binding |
+| `msg.send`, `var.set` | scoped coordination command; available after L5 |
+| `run` | bounded child process under the rule's authority |
+| `notify`, `emit` | bounded log/desktop or approved named webhook; persisted `x.user.*` event |
+| `git.fetch`, `git.push`, `git.worktree` | optional native Git wrapper with frozen intent/readback below |
 
-There is no generic built-in `git.pull`: updating a checked-out worktree safely also
-requires project-specific policy for dirtiness, filters and generated files. Use
-`git.fetch` plus an explicit trusted script/Agent workflow when a project needs it.
+Scripts/commands that finish unsuccessfully can have partial effects. `failed` does not
+mean rollback; uncertain outcomes stay `unknown`, and neither is automatically rerun.
 
 ## Git actions
 
-Git action arguments are data, not command-line syntax:
+Implement these wrappers only with a concrete automation recipe. They do not intercept
+Git used by a coding harness, and do not block the first Codex or rule/timer path.
+There is no generic built-in pull; project integration belongs to an explicit script.
 
-- repo/workspace resolves to an owner-registered project path allowed to the rule;
-- remote is an owner-configured remote name, never a URL from event data. Reject empty,
-  leading `-`, control characters, `::`, `ext::` and option-like values;
-- read raw `remote.<name>.url` and `remote.<name>.pushurl` values. Automated network
-  actions reject any applicable `url.*.insteadOf` or `pushInsteadOf`; the owner must
-  configure direct approved endpoints for Eliot. `pushurl` is read separately and may
-  differ from fetch URL;
-- select one explicit approved fetch endpoint; push freezes every effective push
-  endpoint (all pushurls, otherwise the selected fetch URL). Each endpoint must use an
-  owner-approved transport and may not invoke an unapproved/custom remote helper;
-- refs are full `git check-ref-format` names and may not begin `-`; OIDs are exact
-  hexadecimal object ids read from Git;
-- placeholder-filled remote/ref/path values pass the same validation after rendering;
-- local monitoring/update commands disable hooks, fsmonitor, external diff and textconv.
+Validate an owner-registered repository, approved remote, full refs and exact OIDs.
+Reject option/control-character injection and custom unapproved helper schemes.
+Read raw fetch URL and pushurls separately; applicable `insteadOf`/`pushInsteadOf`
+requires direct approved endpoints rather than guessing a second rewrite.
 
 ### Isolated transport view
 
-Network fetch/push/readback never runs through the mutable repository/global Git
-configuration. Before admission Eliot creates one private temporary bare transport view
-for the action and freezes its canonical configuration:
-
-- system/global/XDG Git config are disabled or pointed to private empty files;
-- the private view contains only the direct frozen endpoint(s), owner-approved transport
-  and credential settings, object format and no `url.*`, aliases, hooks, filters,
-  fsmonitor, external diff or textconv;
-- the action process gets only the minimal environment and named secret references;
-- repository objects are shared through the documented object-directory/alternate
-  mechanism, while refs/config remain private to the transport view;
-- the private view and config digest are stored in the command intent and revalidated
-  before dispatch/readback.
-
-Because the direct endpoint is used in a config with no URL rewrite rules, readback does
-not feed an already rewritten URL through `insteadOf` a second time. A config/endpoint
-change fails before network I/O rather than silently changing transport.
+Use one private bare transport view for a command, with frozen endpoints and approved
+credential settings. Disable system/global/XDG config, repository hooks, aliases,
+rewrites, filters, fsmonitor, external diff and textconv in that view. Share only the
+object database through standard Git object-directory/alternate mechanisms. Revalidate
+its saved config before network dispatch/readback. No Git workflow service or global
+artifact store is needed.
 
 ### Frozen desired state
 
-Each Git command stores one immutable desired-state intent before its process starts:
+Before an effect, retain:
 
-- `git.fetch`: selected direct endpoint, source full ref, its advertised frozen OID,
-  target local tracking ref, expected old tracking OID and private transport digest;
-- `git.push`: source full ref for diagnostics, **frozen local OID**, destination full
-  ref, expected pre-push remote OID (or explicit absence), every direct push endpoint
-  and private transport digest;
-- `git.worktree`: repository, exact path, branch and base OID.
+- fetch: direct endpoint, source ref and advertised OID, destination tracking ref and
+  expected old OID;
+- push: frozen local OID, destination ref, pre-push remote observation and all approved
+  push endpoints;
+- worktree: exact repository/path/branch/base OID.
 
-Fetch runs in the private transport view and writes objects to the registered repository
-object database without changing its refs. It fetches the selected source ref into a
-private temporary ref, then verifies that ref equals the frozen advertised OID. Only
-then does Eliot update the real tracking ref with an atomic compare-and-swap
-`update-ref <target> <frozen-oid> <expected-old>`, with hooks disabled. If the remote ref
-moved, the action fails without changing the real tracking ref; a later firing may
-admit a new intent.
-
-Push uses the private transport view and explicit refspec:
-
-```text
-<frozen-local-oid>:<destination-full-ref>
-```
-
-never `<source-ref>:<destination-ref>`, because the source branch may advance after
-admission. Force is never used. If the remote destination is not an ancestor-compatible
-update, native push rejects it; Eliot never silently force-updates.
+Fetch to a private ref, verify the advertised OID, then CAS-update the real tracking ref
+with hooks disabled. A moved remote fails without updating the real ref. Push uses
+`<frozen-local-oid>:<destination-ref>`, never a mutable source branch and never force.
 
 ### Unknown readback
 
-No unknown Git command is rerun. After its process custody is proven gone, readback uses
-the same private transport digest and direct endpoint(s):
-
-| Action | Exact applied state |
-| --- | --- |
-| fetch | target tracking ref equals frozen advertised OID |
-| push | destination ref at every frozen push endpoint equals frozen local OID |
-| worktree | exact path is registered on frozen branch at intended OID |
-
-If readback does not prove the intended state, the action remains `unknown` unless the
-native/process result separately proves no effect. A narrow repository writer hold
-blocks later writes behind an older unknown write. Generic scripts/webhooks without
-exact readback remain unknown.
+After proving the process stopped, read back through the same frozen configuration.
+Fetch is settled by the target tracking OID; push by the destination at every endpoint;
+worktree by exact registered path/branch/intended OID. Readback proves the desired state,
+not unique authorship of an indistinguishable concurrent change. No proof means unknown.
+Hold later writes to the same repository behind an unknown write; unrelated work runs.
 
 ## Frozen script inputs
 
-A definition stores every referenced project note/script as:
+A project script is inside registered `.eliot/scripts` and uses an approved interpreter.
+Capture small entry-file bytes or canonical allowed path/size/digest at admission.
+Verify before execution; changed bytes fail rather than silently replacing queued work.
+Do not claim that this freezes an arbitrary interpreter's entire dependency graph.
 
-```text
-FrozenFile { canonical_path, size, digest, allowed_root }
-```
+`run` fields are `cmd:[executable,arg,...]`, `cwd?`, `timeout?`, `env?`; project rules
+resolve these through the approved interpreter/script/root policy, not arbitrary event
+text. Default timeout is 10 minutes; output and environment are bounded.
 
-Reject `..`, symlink/reparse escape, alternate streams and devices. Dispatch verifies
-size/digest; mismatch fails. Small generated text may be copied into definition row. No
-global artifact CAS/GC.
-
-A project `run` uses a frozen script under registered `.eliot/scripts` plus an
-owner-approved interpreter; it cannot choose arbitrary executable. Global rules use only
-owner-configured executable/argv.
-
-`run` receives one JSON object on stdin and may return bounded NDJSON actions. Daemon
-buffers all output, validates under parent rule principal, then creates command rows
-atomically. Process receives scoped run token; losing it never becomes owner. Timeout
-kills/verifies custody. Lost outcome is unknown and script is not rerun.
+`run` receives bounded JSON `{event,subject,rule,command}` on stdin and may emit at most
+1 MiB of NDJSON actions. Wait for successful exit, validate all actions under the parent
+principal, then admit them atomically as ordered command children. Execute no action
+while stdout is still incomplete. A scoped run token never falls back to owner.
+Timeout terminates owned custody; an uncertain script result is not rerun.
 
 ## Approvals and hooks
 
-Asynchronous request rules create exact-generation ordinary commands. Synchronous hook
-policy runs inside native deadline. Non-default decision is returned only after its
-immediate durable record commits while the same request is pending. Timeout/Store failure
-returns safe default; late result is discarded and never queued for another request.
+Async approval rules use exact Agent generation, turn and request. For synchronous
+hooks, return only an immediate decision that committed while the request/deadline was
+valid. On timeout/Store failure return the safe native default; discard late results,
+never enqueue a later approval. Build the shim only with a harness that needs it.
 
 ## Goal loop
 
-A Goal is bound to `(agent,generation,mode,revision)`:
+A Goal is keyed by `(agent,generation,mode,revision)`; native and Eliot modes are
+independent. `set`, definition changes, pause, clear and resume advance revision.
+Generation change pauses the old Goal. `on_idle` waits while an active native Goal drives.
 
-```text
-Goal {
-  agent, generation, mode: native|eliot, revision,
-  text, check?, cadence,
-  status, max_turns, turns_used, max_cost_usd?, cost_used?, no_progress,
-  last_round_key?, last_fingerprint?, last_check_hash?, updated_at
-}
-```
+Round key is an exact idle event seq or anchored cadence slot. Before work, read state,
+requests, source health and unknown gates. Perform the bounded check and read-only
+workspace fingerprint, then conditionally commit **all** results only if generation,
+revision and round still match: completion/block, counters, budget or one ordinary send.
+No stale round can publish a successful check or continuation. Incomplete fingerprints
+cannot prove no progress. Exact status/budgets and limits are visible in `goal show`.
 
-Generation change pauses Goal. Every set/resume or definition change increments
-revision; pause/clear also increment it so stale rounds cannot publish.
-
-Round identity:
-
-- `on_idle`: exact committed `agent.idle` event seq;
-- cadence: exact anchored slot.
-
-Command id: `goal:<agent>@<generation>:<revision>:<round-key>`.
-
-Before a round:
-
-1. reread generation/revision/state, pending requests, source health, unknown input/turn/
-   commands and native Goal status;
-2. skip/block if gated; on-idle waits active native Goal;
-3. run bounded read-only check/fingerprint;
-4. compute pass/budget/no-progress/continuation outside Store;
-5. conditionally reread generation/revision/round key in one transaction;
-6. only if unchanged commit **any** result—done/blocked, counters/fingerprints/budget or
-   ordinary continuation send. Otherwise discard stale result.
-
-Incomplete fingerprint never counts as no progress. Unknown input/turn blocks
-continuation. Checks/scripts follow same frozen-file/custody rules.
+Checks are arbitrary explicit commands, not magically read-only. Fingerprinting itself
+is read-only. Check outcomes use the same frozen inputs/custody/no-blind-retry rules.
 
 ## Durable tables
 
+Add these in L4, not L1:
+
 ```sql
 CREATE TABLE rule_state (
-  principal TEXT NOT NULL,
-  rule TEXT NOT NULL,
-  revision INTEGER NOT NULL,
-  current_definition TEXT NOT NULL,
-  current_cursor INTEGER NOT NULL,
-  retiring_revision INTEGER,
-  retiring_definition TEXT,
-  retiring_cursor INTEGER,
-  retire_through INTEGER,
-  enabled INTEGER NOT NULL,
-  paused_reason TEXT,
-  updated_at INTEGER NOT NULL,
-  PRIMARY KEY(principal,rule)
+  principal TEXT NOT NULL, rule TEXT NOT NULL, revision INTEGER NOT NULL,
+  current_definition TEXT NOT NULL, current_cursor INTEGER NOT NULL,
+  retiring_revision INTEGER, retiring_definition TEXT, retiring_cursor INTEGER,
+  retire_through INTEGER, enabled INTEGER NOT NULL, paused_reason TEXT,
+  updated_at INTEGER NOT NULL, PRIMARY KEY(principal,rule)
 );
-
 CREATE TABLE timers (
-  principal TEXT NOT NULL,
-  rule TEXT NOT NULL,
-  schedule_revision INTEGER NOT NULL,
-  trigger TEXT NOT NULL,
-  anchor INTEGER NOT NULL,
-  last_key TEXT,
-  next_due_at INTEGER,
+  principal TEXT NOT NULL, rule TEXT NOT NULL, schedule_revision INTEGER NOT NULL,
+  trigger TEXT NOT NULL, anchor INTEGER NOT NULL, last_key TEXT, next_due_at INTEGER,
   PRIMARY KEY(principal,rule)
 );
-
 CREATE TABLE goals (
-  agent INTEGER NOT NULL,
-  mode TEXT NOT NULL,
-  generation INTEGER NOT NULL,
-  revision INTEGER NOT NULL,
-  definition TEXT NOT NULL,
-  state TEXT NOT NULL,
-  last_round_key TEXT,
-  updated_at INTEGER NOT NULL,
-  PRIMARY KEY(agent,mode)
+  agent INTEGER NOT NULL, mode TEXT NOT NULL, generation INTEGER NOT NULL,
+  revision INTEGER NOT NULL, definition TEXT NOT NULL, state TEXT NOT NULL,
+  last_round_key TEXT, updated_at INTEGER NOT NULL, PRIMARY KEY(agent,mode)
 );
 ```
 
-Action state lives in commands; there are no automation run/action tables. Recent
-rule events plus current commands provide history/rate accounting. Current keys are
-level-reconciled after restart.
+Goal definition/state retain text/check/cadence, budgets, counters and previous progress
+observations. Action state lives in commands. Recent rule events provide rate accounting.
 
 ## Guardrails
 
-- cause depth > 5 suppresses firing;
-- default per-rule 10/minute and global 120 actions/minute, reconstructed from retained
-  events/current commands;
-- configured `limit.window` may not exceed retained rule-event accounting horizon;
-- self-send/steer/inject from own event requires `allow_self=true`;
-- draining/paused automation admits no new firing/Goal continuation;
-- every action passes normal router at dispatch.
-
-Workflow examples remain small rule/script recipes, never core product states.
+Cause depth above 5 suppresses firing. Default per-rule limit is 10/minute, global
+120 actions/minute; configured windows must fit retained accounting history. Own-event
+send/steer/inject requires `allow_self=true`. Draining or paused automation admits no new
+firings. Every action uses normal router checks. These are execution limits, not a task
+approval process.

@@ -1,314 +1,192 @@
 # Plugin protocol
 
-A plugin translates one native harness and normalizes facts. It never writes SQLite and
-never retries a native effect whose outcome is uncertain.
+A plugin translates one native harness, normalizes its facts and supplies native
+readback. It never writes SQLite or repeats an uncertain native effect. Host and plugin
+share wire types, not vendor SDK types or the daemon's implementation.
 
-The protocol borrows three proven boundaries:
+## First harness subset
 
-- sandbox-driver: each replacement plugin is a numbered generation and old handles are
-  dead;
-- ACPX/Paseo: one authoritative journal/history cursor, live delivery as an overlay and
-  explicit gaps;
-- Waku: subscribe before create, exact session demultiplexing, adopted services are not
-  killed, reconnect triggers readback rather than synthetic completion.
+L1/L2 implement `initialize`, `agent.start`, `agent.command`, `agent.stop`,
+`agent.snapshot`, `shutdown` and durable `events.put` for one per-Agent source. Start
+with the actual fake/Codex verbs. The manifest advertises only implemented capabilities.
+
+Add discovery, control takeover, transcript handoff, shared services, children and hooks
+with their first roadmap caller. A missing feature returns `unsupported`; do not create
+empty handlers, tables or generic frameworks to anticipate it.
 
 ## Process modes
 
-- `per_agent`: one plugin process and custody unit per controlled Agent generation.
-- `shared`: one plugin process talks to a native service that proves exact per-session
-  identity, event attribution, readback and isolated stop. Its server process belongs to
-  service custody, never an Agent.
-
-Hosting several chats is not sufficient for `shared`. If session environment/identity or
-isolated stop is missing, use one service per Agent or observe-only attachment.
+`per_agent` is one plugin/native process tree per controlled Agent generation. `shared`
+is for a service with demonstrated exact session attribution/environment/readback and
+isolated stop. Hosting multiple chats alone is insufficient. Adopted services are never
+killed for an Agent. Shared support is not required for the first Codex path.
 
 ## Framing and bounds
 
-- JSON-RPC 2.0 over UTF-8 NDJSON; stdout is protocol, stderr is bounded log text.
-- Both directions may issue requests. Request ids are unique per direction.
-- Every Agent-scoped message carries `agent_id` and `generation`.
-- Protocol version is `eliot-plugin/1`; fields may be added but existing meaning does
-  not change.
-- Maximum frame 1 MiB. Inline input is at most 512 KiB; persisted event data and final
-  text at most 64 KiB; list/history pages at most 1,000 items and below 900 KiB.
-- Readers are continuously drained and cancel-safe. A long-lived native reader owns its
-  own task; do not cancel a partial line read.
-- Credentials and Agent/owner/run tokens are excluded from logs, recordings and plugin
-  state.
+JSON-RPC 2.0 over UTF-8 NDJSON, stdout protocol only, bounded stderr. Both directions may
+send requests with direction-local ids. Agent messages carry `agent_id` and `generation`.
+Wire version is `eliot-plugin/1`. Add fields compatibly; do not change existing meanings.
+
+Maximum encoded frame is 1 MiB. Inline input is at most 512 KiB; persisted event data/final
+text 64 KiB; pages at most 1,000 entries and below 900 KiB. Both semantic and encoded
+limits apply, including JSON escaping. Reject oversize input before native I/O.
+Continuously drain cancel-safe readers; never cancel a partially read line. Credentials
+are excluded from logs, recordings and plugin state.
 
 ## Manifest
+
+An initial plugin may declare:
 
 ```json
 {
   "name": "codex",
   "version": "0.1.0",
   "protocol": "eliot-plugin/1",
-  "harness_version": "codex-cli 0.164.0",
+  "harness_version": "installed version",
   "available": true,
   "mode": "per_agent",
-  "verbs": ["launch", "attach", "send", "steer", "inject", "interrupt", "stop",
-            "resume", "approve", "deny", "answer", "configure",
-            "goal.set", "goal.pause", "goal.resume", "goal.clear"],
-  "child_verbs": ["send", "interrupt"],
-  "features": {
-    "start_requires_input": false,
-    "native_goal": true,
-    "native_children": true,
-    "child_environment": false,
-    "hooks": false,
-    "transcripts": true,
-    "discover": true,
-    "cost": false,
-    "isolated_force_stop": true
-  },
-  "sources": {
-    "controlled": {
-      "session": "stream", "turn": "stream", "message": "stream",
-      "tool": "stream", "request": "stream", "child": "stream",
-      "goal": "stream", "usage": "stream", "edit": "stream",
-      "provider": "stream"
-    },
-    "observe": {
-      "session": "transcript", "turn": "transcript", "message": "transcript",
-      "tool": "transcript", "request": "transcript", "edit": "transcript"
-    }
-  },
-  "proxy": "config"
+  "verbs": ["launch", "send", "stop"],
+  "child_verbs": [],
+  "features": {"start_requires_input": false, "native_children": false},
+  "sources": {"controlled": {"session": "stream", "turn": "stream", "message": "stream"}},
+  "proxy": "none"
 }
 ```
 
-The manifest declares available mechanisms. The daemon chooses and commits one owner for
-each native family before dispatching start/attach. A hook may replace only a family not
-provided by the primary stream, or provide a synchronous decision without also
-publishing duplicate lifecycle. Versions are facts, not authority gates.
+Extend verbs/families/features only when their paths exist. Version is diagnostic;
+methods/fields/capabilities establish compatibility. The host selects one owner per
+normalized native family. Hooks never mirror lifecycle already supplied by the stream.
 
-## Host → plugin requests
+## Host requests
 
-| Method | Essential fields | Result |
+| Method | Essential fields | Meaning |
 | --- | --- | --- |
-| `initialize` | protocol, frozen plugin config, private instance directory | manifest |
-| `agent.start` | agent, generation, frozen profile/plugin binding, workspace, complete target-generation environment, frozen system note, source-owner plan/state, saved cursors, optional `resume_from`, optional linked `initial` | exact native subject, Agent-owned PIDs, effective settings; session and initial outcome remain separate |
-| `agent.attach` | agent, generation, exact subject, observe/control mode, frozen profile/plugin binding for control, complete target-generation environment when direct identity is qualified, source-owner plan/state, cursors, known active turn/requests | exact state/readback/PIDs/effective or `not_found` |
-| `agent.command` | agent, generation, command id, verb/args, expected turn/request | `applied|rejected|failed|unknown`, mechanism and application point |
-| `agent.snapshot` | agent, generation, command ids?, turn ids?, pagination cursor? | exact session/turn/request/command readback in bounded pages |
-| `agent.stop` | agent, generation, command id, force | success only after that generation no longer controls the native session |
-| `discover` | cursor?, limit≤1000 | bounded native-subject page + next cursor |
-| `shutdown` | — | reply, drain owned output, exit |
+| `initialize` | protocol, frozen plugin config, private instance directory | return actual manifest |
+| `agent.start` | agent/generation, profile, workspace, target environment, note, source plan/state, optional resume subject/linked initial input | establish session; input/result settle separately |
+| `agent.command` | agent/generation, command id, verb/args, exact turn/request where required | applied/rejected/failed/unknown, native mechanism and application point |
+| `agent.stop` | agent/generation, command id, force | success means the bound controlled session/generation ended, not merely that observation detached |
+| `agent.snapshot` | agent/generation, exact command/turn ids, page cursor | bounded exact native readback; missing proof remains unknown |
+| `agent.attach` | exact subject, generation, observe/control, profile/environment, source plan/cursors | attach only to that subject; otherwise not found/unsupported |
+| `discover` | cursor, bounded limit | read-only native-subject page |
+| `shutdown` | none | close owned paths, drain, exit; never kill an adopted service |
 
-```text
-resume_from = { native_scope, native_ref }
-initial = { command_id, text }
-Pid = { pid, start_time, role: harness|tool|server|proxy }
-```
+`resume_from={native_scope,native_ref}` is an `agent.start` option, not replay of the
+old input. `initial={command_id,text}` is supplied only for a harness that requires
+input to create a session. Explicit new text remains a separate linked command.
 
-For a generation-changing start/control attach, the daemon dispatch transaction has
-already advanced the Agent fence, revoked the old identity and committed the new random
-Agent token **before** this request when the target can receive its own environment. The
-complete environment therefore contains only the target generation token. If the native
-result is unknown, that token remains bound to the blocked target generation; it is not
-rotated again and generation never rolls back. Exact readback may clear it only after
-proving no process/session could have received that environment.
+The dispatch transaction already advanced the Agent generation, revoked old identity
+and installed the target token/source plan before native I/O. A plugin rejects stale
+generation/turn/request before sending bytes. Unknown never rolls generation back or
+rebinds a failed call to another process.
 
-A plugin validates generation before native I/O. A stale generation is rejected and is
-never redirected to the current session.
+## Start ordering
 
-## Source plan before native I/O
+Arm the reader/subscription before native create/resume/input. For a session-first
+harness: create/resume without input → establish subject/effective settings → commit
+`session.ready` → return start success → host sends the linked input normally.
 
-The daemon commits `source_owners` plus one current `source_state` row per selected source
-before `agent.start`/`agent.attach` dispatch. The plugin receives that plan and arms every
-selected reader/subscription **before** the first native create/resume/input effect.
-Waku's subscribe-before-create pattern is the model.
+For an input-created session, perform start+linked input once but report session,
+input-to-turn association and terminal result independently. Ready alone never proves
+input delivery. Buffer early facts within a bound; overflow records a gap rather than
+inventing completion or issuing another start.
 
-If the native subject is not yet known, facts are still scoped by Eliot Agent/generation;
-`session.ready` later supplies the subject. The plugin buffers only within a bounded
-budget. Overflow records an explicit gap and leaves uncertain commands unknown.
+## Durable plugin requests
 
-### Session-first harness
+| Method | Fields / result |
+| --- | --- |
+| `events.put` | stable batch id, agent/generation/source, complete bounded normalized native-record batch, optional exclusive cursor; returns committed seq range/cursor |
+| `source.state` | read-only family owners, cursor, lifecycle, health, latest gap and last-batch acknowledgement |
+| `source.gap` | stable gap id, owned families, reason and optional from/to cursor; commits one gap boundary |
+| `source.handoff` | named families, expected predecessor, successor/mechanism and final cursor or gap; atomic ownership transfer |
+| `process.put` | agent/generation, PID/birth/role; OS-verified registration, not plugin-authoritative process lifecycle |
+| `child` | registration id, parent/generation, exact child subject and optional identity request; canonical child row/source plan |
 
-1. arm selected sources;
-2. start/resume native session without user input;
-3. establish exact subject/effective settings;
-4. commit `session.ready` through `events.put`;
-5. return start applied;
-6. daemon dispatches the linked input normally.
+### Commit acknowledgement
 
-### Input-created session
+Normalize one native record into one atomic batch. Each event carries stable native id,
+kind/family, timestamp, exact correlations and bounded data. The daemon computes
+canonical event/batch digests, excluding transport ids/timing; cursor is compared too.
+A source permits at most one unacknowledged batch. Keep later input in a bounded spool.
 
-1. arm selected sources;
-2. receive one linked `initial` command in `agent.start`;
-3. perform one native start+input operation;
-4. commit `session.ready` and input/turn facts separately;
-5. return separate session/initial outcomes.
+Host validates generation/owner/correlations and accepts either a wholly new batch or
+an exact duplicate of its last committed batch. Commit events, current projections,
+derived facts, cursor and last-batch acknowledgement together before replying/publishing.
+The next commit replaces only that last-batch acknowledgement in `source_state`.
 
-`session.ready` proves only the session/control path. It never proves input admission or
-turn completion. A lost result never causes another start or input.
+Same id with another semantic payload/cursor, or mixed new/duplicate events, is
+`source_integrity`. After a lost reply, read `source.state`; retry only that exact last
+batch. This retry is Store admission, never a native command retry. No adapter journal
+or unbounded seen-event store is required by this contract.
 
-## Plugin → host durable requests
+A replayable source resumes strictly after its opaque committed cursor. A source with
+no exclusive cursor reconnects at the live edge, records a gap and reads current native
+state; it does not republish history. With neither stable record id nor cursor, a lost
+acknowledgement is a gap/reconciliation case, not a speculative batch retry.
 
-| Method | Fields | Result |
-| --- | --- | --- |
-| `events.put` | stable `batch_id`, agent, generation, source, one native-record batch of persisted event fields, optional exclusive record cursor | committed Store seq range and saved cursor |
-| `source.gap` | stable `gap_id`, agent, generation, source, owned families, reason, optional from/to cursor metadata | committed daemon `source.gap` boundary; owner unchanged unless paired with handoff |
-| `source.state` | agent, generation, optional families | family owners, mechanisms, committed cursor, source state, latest batch receipt and latest gap boundary |
-| `source.handoff` | agent, generation, families, expected predecessor, successor/mechanism, predecessor final cursor or explicit gap | new owner map after one committed CAS transaction |
-| `process.put` | agent, generation, exact PID/start time/role | committed process identity after custody verification |
-| `child` | stable registration id, parent Agent/generation, exact child subject, name/labels?, request own identity? | canonical child Agent/current generation and optional memory-only token |
-
-### Commit-acknowledged native-record batches
-
-One native record that yields several normalized events is one atomic bounded batch. Each
-event carries kind/family, stable normalized `native_id`, timestamp, exact turn/request/
-input correlations and bounded data. The plugin does **not** choose integrity digests.
-The daemon computes one versioned canonical event digest and one canonical batch digest
-from semantic fields; transport ids/timing are excluded. The opaque record cursor is
-compared separately and advances only with the complete batch.
-
-`batch_id` is stable for that native record: use the vendor record id, or for a
-cursor-backed record a domain-separated encoding of `(source,cursor)`. It is not a
-monotonic source sequence. The plugin permits at most **one unacknowledged** `events.put`
-per `(agent,generation,source)`. Later native facts wait in a bounded spool. Therefore a
-lost reply requires only the last batch receipt in `source_state`, not an adapter journal
-or an unbounded seen-events table.
-
-The host:
-
-1. verifies current generation and source ownership of every family;
-2. verifies exact turn/request identity where applicable;
-3. computes canonical event/batch digests;
-4. compares `batch_id`, batch digest, cursor and event ids with the last committed batch;
-5. accepts only a wholly new batch or the exact duplicate of the last committed batch;
-6. commits events, `source_state` last-batch receipt/cursor, reducer/projections and
-   derived state together;
-7. replies only after commit.
-
-An exact duplicate returns the original seq range. Same `batch_id` with another digest or
-cursor, or a mixed new/duplicate event set, is `source_integrity` and advances nothing.
-Once the plugin receives the reply it may send the next batch; that next commit replaces
-the one-row last-batch receipt. If the plugin dies before receiving the reply, its
-replacement reads `source.state` and retries only when the exact batch is still the last
-committed receipt.
-
-A source with neither a stable record id nor an exclusive cursor cannot safely retry a
-lost `events.put`. It records a gap, reconciles current state and continues at the live
-edge instead. A no-cursor source never republishes historical records after reconnect;
-`native_id` handles only overlap within a currently committed batch/current live edge.
-
-`events.put` accepts only plugin-owned native families declared in the source plan. A
-plugin cannot publish `agent.*`, `session.lost`, `turn.resolved`, command/rule/mail/claim
-or process/Git lifecycle. It supplies native `session.ready|ended|error`, exact attach/
-snapshot facts and process registration; daemon subsystems derive the rest.
+Plugins publish only assigned native families. Agent/command/rule/mail/Git/process
+lifecycle, `session.lost` and owner resolutions are daemon facts, not arbitrary plugin
+notifications.
 
 ### Gap and handoff
 
-`source.gap` is a daemon-recorded boundary, not plugin lifecycle. `gap_id` is stable for
-one exact uncovered interval. The daemon verifies ownership, computes/stores its canonical
-digest, updates source state and commits one bounded gap event before replying. Same id
-and fields returns the stored result; same id with another boundary/reason or a
-conflicting second boundary is `source_integrity`. Gap alone does not change ownership.
+A source row's `open|closed` lifecycle, health and latest historical gap are independent.
+A gap neither closes the source nor changes its owner or health automatically.
 
-At most one unacknowledged source-control operation (`source.gap` or `source.handoff`) is
-allowed per source. After a lost reply the plugin calls `source.state` and settles that
-boundary before issuing another.
+`gap_id` identifies one uncovered interval. Same id and canonical fields return its
+stored result; the same id with different fields is an integrity error. After that
+operation is acknowledged/read back, a new interval uses a new stable id and replaces
+only the latest gap metadata; the previous gap event remains in retained history.
 
-`source.handoff` is the only dynamic owner change. All named families must currently have
-the same predecessor. In one transaction the daemon verifies predecessor, records its
-final exclusive cursor or explicit gap and installs successor/source state. Successor
-publishes only after commit. Lost response is settled through `source.state`: successor
-ownership plus supplied boundary proves applied; predecessor ownership proves not
-applied; mixed/other state remains unknown. Do not blindly issue another handoff.
+At most one unacknowledged gap/handoff operation is allowed per source. Settle a lost
+reply with `source.state` before issuing the next operation.
 
-This is a small compare-and-swap boundary, not a source epoch/open-id/sequence protocol.
+Handoff checks that all named families have the expected predecessor, records the
+final exclusive cursor or gap, and transfers only those families to an open successor
+in one transaction. The predecessor may remain open for other families or as a private
+standby. Its lifecycle changes only on its own close/drain facts. Successor publication
+starts after commit. Readback of owner plus supplied boundary settles a lost reply;
+unproven/mixed state remains unknown. No source epoch, open-id or source sequence layer.
 
-### Processes and children
+### Children and processes
 
-`process.put` is valid only for a PID inside the calling per-Agent custody. Shared
-service PIDs are service-owned. The OS monitor remains lifecycle authority; plugin
-registration and OS enumeration upsert one identity/event.
+Register only PIDs verified inside the calling Agent custody; shared server PIDs have
+service custody. OS enumeration and registration upsert one process identity.
 
-`child` is idempotent by `(parent generation, registration id, native subject)`. Its
-commit creates/returns child row/generation and initial source plan before reply. The
-plugin buffers child facts until reply, then publishes under the returned identity;
-overflow is an explicit child gap. Repeating the tuple returns the same child and, only
-while its current generation is unchanged and `child_environment=true`, the same current
-memory-only token. Conflicting registration/subject/parent is `source_integrity`.
-Plugin never persists raw token. Old-parent-generation retry rejects. Tree limits never
-erase a child already created natively.
+Child registration is idempotent for parent generation/registration id/native subject.
+Commit its canonical row and source plan before reply; buffer child facts until then.
+Conflicting identity rejects; overflow becomes a child gap. Independent child tokens
+exist only when the plugin can install an isolated environment before its tools run.
+Otherwise native child calls inherit the parent principal and that limitation is shown.
+A fanout guard never hides an already-created native child.
 
-## Cursors, replay and handoff
+## Translation and normalization
 
-A replayable source exposes an opaque **exclusive** cursor. The plugin includes it in the
-atomic batch and resumes strictly after the committed value supplied on attach/resume.
-The daemon never interprets cursor bytes.
+Unsupported semantics reject; never quietly map steer to send, resume to fresh launch,
+answer to a default choice or force-stop to shared-service termination. Steer/interrupt
+carry exact turn and replies exact request. Report delayed application points.
 
-A source without an exclusive cursor has no historical replay contract. After reconnect
-it starts at live edge, records a gap, snapshots/readbacks current state and never
-publishes old lifecycle history.
+Native inbox/HTTP acceptance is intermediate; send applies at exact input-to-turn
+association. A correlated terminal response can establish that association even
+when the vendor emitted no intermediate start notification; it is not a synthetic
+completion inferred from silence. Final text precedes terminal turn; process exit or silence is not a turn
+result. Cumulative usage replaces its prior scope value rather than being summed.
+Requested route/settings are not proof of effective values; unavailable readback is
+reported as such. The host owns queued-send FIFO and unknown gates.
 
-Initial ownership is host-committed before native I/O. Planned replacement uses
-`source.handoff`; non-atomic close/reopen requires a gap. Live stream normally owns
-controlled lifecycle; transcript/history owns observe/repair; hook owns only an assigned
-missing fact or immediate decision. Two sources never independently publish the same
-completion/request.
+`failed` means a known unsuccessful completed operation, which may have partial side
+effects; it does not mean rollback. `rejected` proves no native I/O. Missing authoritative
+outcome is `unknown`. None authorizes automatic re-execution of an external effect.
 
-## Translation rules
+## Lifecycle, hooks and qualification
 
-1. Translate one Eliot verb to one documented native mechanism and report it.
-2. Unsupported semantics reject before native I/O. Never silently map steer→send,
-   resume→fresh unrelated session, answer→default choice or force-stop→shared service.
-3. Steer/interrupt require supplied exact active turn; replies require exact request.
-4. Transport/inbox acceptance is intermediate. Send applies only at exact command→turn
-   association.
-5. Unknown native effect is never retried.
-6. Effective model/permissions/endpoint are read back; requested values are not proof.
-7. Daemon owns queued-send FIFO and unknown input/turn/transition gates.
+Contain owned children before tools run; use absolute deadlines. Drain buffered native
+output before declaring loss. Plugin replacement never rebinds an uncertain old call.
+Persisted facts backpressure; ephemeral telemetry may drop with visible lag.
 
-## Event normalization
+Add hooks only for a missing native fact/decision. Config is session-scoped; decisions
+bind exact generation/request/deadline. Timeout uses the safe native default; late
+approval is discarded, not queued. Hooks do not duplicate the authoritative stream.
 
-- plugin native session facts are `session.ready|ended|error`; `session.lost` is daemon-
-  derived after source drain/gap plus exact custody/session evidence;
-- `session.ready` precedes first `turn.started` for the generation;
-- one native turn produces one start and one terminal completion with exact turn id;
-- final assistant message commits before terminal turn;
-- tool/request facts retain exact native item/request/turn ids;
-- cumulative usage replaces prior value and names its scope;
-- 429 is rate limit unless native evidence proves quota;
-- process exit/stream disconnect never fabricates completion;
-- unknown native events may be `x.<harness>.*` but cannot reduce core state.
-
-## Hooks
-
-Hook config is session-scoped. Shim receives Agent id, generation and token and calls
-`hook.event` with exact hook/request id/deadline. A non-default decision is usable only by
-that immediate response. Timeout returns safe default (`ask` for decisions, `allow` for
-observation); late result is discarded. No durable hook queue. A hook never republishes
-lifecycle already owned by stream.
-
-## Lifecycle and custody
-
-- per-Agent plugin/descendants enter Agent Job/process group before native tools run;
-- plugin exit closes that control generation; old calls are never rebound;
-- replacement must report same provider/native namespace and exact subject;
-- shared/adopted service is never killed for one Agent;
-- process exit drains authoritative source to EOF/deadline; timeout records a gap before
-  daemon reconciliation may emit `session.lost`;
-- requests use one absolute deadline; possible effect on timeout is unknown;
-- stdout is always drained; persisted events backpressure, ephemeral telemetry may drop
-  with visible lag.
-
-## Fake plugin
-
-`plugins/fake` is deterministic and may be shared because sessions are isolated. It
-implements session-first and input-created starts, generation/turn/request checks,
-commit-ack batches, cursor/gap/state recovery, children, requests, crash/hang/exit and
-snapshot readback. Script steps: `say`, `sleep_ms`, `tool`, `approval`, `question`,
-`spawn`, `usage`, `crash`, `hang`, `exit`.
-
-## Recordings and conformance
-
-Real native traffic uses bounded sanitized NDJSON. Replay checks method/path/stable
-payload fields and can inject hang/exit; CI never calls a model.
-
-The eventual common black-box suite covers manifest/start/input/turn, generation fence,
-request binding, batch lost-ack, cursor/gap/handoff, unknown non-retry, custody/attach and
-declared capabilities. During L0–L6 add only targeted regressions required to review a
-local contract; complete conformance/live runs belong to L7.
+The initial fake echoes turns over this same transport. Add request/crash/child/recovery
+steps with their real caller. Record/replay and common conformance are completed in L7,
+not a separate framework blocking L2. CI never calls a model.

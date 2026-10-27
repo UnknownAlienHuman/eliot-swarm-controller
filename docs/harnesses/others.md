@@ -1,37 +1,30 @@
-# Other harnesses (L4.7, only when needed)
+# Other harnesses — only when selected
 
-Short notes carried over from v1 so nothing is lost. None of these is built until
-someone needs it ([defaults](../decisions.md#defaults)).
+Optional L6 candidates; none blocks the core/Codex/automation/coordination path.
+The following are inherited v1 notes, not current capability verification.
 
 ## Command Code
 
-- Docs: [mods](https://commandcode.ai/docs/mods), [headless](https://commandcode.ai/docs/headless),
-  [CLI](https://commandcode.ai/docs/reference/cli), [sessions](https://commandcode.ai/docs/sessions),
-  [goal](https://commandcode.ai/docs/goal) (v1 links, not re-checked).
-- Batch `cmd -p` with NDJSON output, or ACP (`cmd acp`) → use the [ACP plugin](acp.md).
-- v1: a mod exception could leave the CLI running; steer via `queueMessage` applies
-  only after a tool batch; goal did not persist across resume; `turn_end` can arrive
-  before the agent's last commit (push on `git.commit`, not on `turn.completed`).
+Source entry points: [headless](https://commandcode.ai/docs/headless),
+[CLI](https://commandcode.ai/docs/reference/cli),
+[sessions](https://commandcode.ai/docs/sessions). Inspect the installed native or ACP
+route only when selected. Delayed queued messages are not necessarily exact steer;
+turn end need not coincide with the agent's last Git commit.
 
 ## Kilo Code
 
-- OpenCode-derived CLI (`kilo serve`, HTTP + SSE); endpoints mirror OpenCode
-  (`/session`, `/session/{id}/prompt_async`, `/session/{id}/abort`,
-  `/session/{id}/children`, permission replies). Likely served by the
-  [OpenCode plugin](opencode.md) with a different command.
-- v1: abort without an explicit scope could stop descendants; queued prompts are
-  in-process and lost on restart.
-- Kilo sends titles, summaries, compaction and update checks to external services and
-  may fall back to Kilo Gateway: disable or explicitly allow those before attaching.
-  Observe over HTTP, never with `kilo run`.
+Investigate compatibility with the selected OpenCode API before sharing that adapter;
+do not assume endpoint/stop/queue semantics match merely because the project is derived
+from OpenCode. Inspect auxiliary requests and default provider fallback so the explicit
+route is preserved. Observe without launching an extra billed run.
 
 ## Zed
 
-- Zed is an ACP **client** (editor), not an agent to drive. Its `eval-cli` is a
-  one-shot batch evaluator, not a control server (v1 finding). No plugin planned.
+Treat the editor as an ACP client, not automatically a headless Agent control server.
+No plugin is planned without a concrete native control surface and need.
 
-## Candidates noted in v1, not integrated
+## Historical candidates
 
-CodeGraff/Harness, Sinew, Pi-Go, OpenChamber, Delta, Agent Teams AI, Vicoa,
-JetBrains Air, SWE-agent — see `git show dc6f70aa:docs/candidate-notes.md` before L0.1;
-afterward the same path is available under `v1-final`.
+The older catalogue remains at `git show dc6f70aa:docs/candidate-notes.md` (or the archive
+tag once created). It is not a backlog of mandatory integrations. Select one adapter,
+read its actual native interface, and connect it to the existing plugin contract.
