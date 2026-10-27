@@ -84,19 +84,23 @@ controls/observes it:
 - first launch/attach targets generation 1;
 - resume, detach and a new/uncertain controller takeover target current generation + 1;
 - the generation-changing command stores expected and target generation;
-- its **dispatch transaction** advances the fence before native I/O, rotates/revokes
-  routing identity, releases old claims, pauses Goals and stales old queued commands;
-- exact success updates the requested control/observe/profile projection;
-- definite no-effect failure does not decrement the fence; unknown transition leaves the
-  target generation current and blocks another transition/ordinary turn work until
-  readback;
+- its **dispatch transaction** advances the fence before native I/O, revokes the old
+  controller/source/token, releases old claims, pauses Goals and stales old queued
+  commands;
+- exact success installs the requested control/observe/profile projection;
+- definite failure never restores the revoked controller or decrements the fence:
+  first start/resume becomes `failed`; takeover/detach becomes `lost` from Eliot's
+  perspective, while the native subject may remain externally discoverable;
+- unknown transition leaves the target generation current, the previous observation
+  diagnostic-only and ordinary work blocked until exact readback/resolution;
 - exact reconnect to the same still-current writer/source ownership may preserve the
   generation;
 - exact turn/request ids bind work inside a generation.
 
 This intentionally copies a generation fence, not a lease/binding hierarchy. A command,
 source or process from an older generation can remain in history but cannot mutate the
-current projection or fire ordinary automation.
+current projection or fire ordinary automation. Recovery after failed/unknown takeover
+is an explicit later attach/resume targeting another generation; there is no rollback.
 
 Per-Agent plugins own one generation and custody unit. A shared plugin is allowed only
 when a native service already isolates session identity/events/readback/stop. Its server
@@ -152,7 +156,8 @@ same id with different payload is an integrity error.
 
 Dynamic family replacement is one `source.handoff` compare-and-swap transaction: verify
 predecessor, record final cursor or gap, install successor. The successor publishes only
-after commit. There are no source epochs, open ids or source sequence protocol.
+after commit. A lost response is settled by read-only `source.state`, not by blindly
+issuing another handoff. There are no source epochs, open ids or source sequence protocol.
 
 ## Restart reconciliation
 
