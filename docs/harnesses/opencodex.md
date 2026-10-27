@@ -1,73 +1,74 @@
-# OpenCodex (provider proxy)
+# OpenCodex provider proxy
 
-Not a harness: a provider proxy that harnesses talk to. Eliot treats it as a
-**service** ([configuration](../spec/configuration.md#proxies)). Layer L2.7.
+OpenCodex is a provider service, not an Agent harness. Harness plugins remain owners of
+Agent/native session identity and lifecycle; OpenCodex supplies one explicit inference
+route. Layer L2.7.
 
-Facts checked 2026-10-25 against [lidge-jun/opencodex](https://github.com/lidge-jun/opencodex)
-(MIT; latest release v2.92.0, 2026-10-24). Third-party project, fast-moving: re-check
-the README before L2.7.
+Facts checked 2026-10-25 against `lidge-jun/opencodex` release v2.92.0. It is
+fast-moving; recheck installed README/source/API before implementation and record the
+installed version.
 
-## What it does
+## Ownership
 
-"Universal provider proxy for OpenAI Codex, Claude Code, Claude Desktop & Grok Build":
-it accepts Codex's Responses API (and Anthropic-style requests for Claude Code) and
-routes them to configured providers.
+Configuration selects exactly one mode:
 
-## Run
+- `attach`: owner-run/adopted service. Eliot health-checks/read-only monitors it, never
+  starts, stops, restarts or rewrites it;
+- `launch`: Eliot-managed service in separate service custody. It may be started/stopped
+  by service lifecycle, never because one Agent stops.
 
-- Install `npm install -g @bitkyc08/opencodex`, then `ocx init`, `ocx start`.
-- Default port 10100; proxy and dashboard on `http://localhost:10100`; inference base
-  `http://127.0.0.1:<port>/v1`.
-- Home dir `OPENCODEX_HOME` (default `~/.opencodex`); admin token in
-  `<home>/admin-api-token`.
-- Clients authenticate with header `x-opencodex-api-key`.
-  `OPENCODEX_API_AUTH_TOKEN` is required before binding beyond loopback.
-
-Eliot config (attach to an owner-run instance is the default; `launch` only if the
-owner wants Eliot to supervise it):
+This follows Waku's adopted-service rule. An adopted service PID/registration is not
+proof Eliot owns it.
 
 ```toml
 [proxies.opencodex]
 attach = "http://127.0.0.1:10100"
-health = "/api/system/health"        # verify path in L2.7; v1 used it against v2.75
+health = "/api/system/health"       # verify on installed version
 api_key_env = "OPENCODEX_API_KEY"
-# launch = ["ocx", "start"]          # check whether it stays in the foreground
+max_live = 8
+# launch = ["ocx", "start"]        # only after foreground/lifecycle is recorded
 ```
 
-## Pointing harnesses at it
+Owner performs install/init/login. `OPENCODEX_HOME` and provider credentials stay owner
+configuration; Eliot stores only environment-variable names. Client and management
+credentials are distinct and never persisted in events/messages/fixtures.
 
-| Harness | Wiring | Source |
-| --- | --- | --- |
-| Codex | named `model_providers` entry with `base_url = <origin>/v1`, `wire_api = "responses"` ([Codex page](codex.md#proxy-opencodex-or-any-responses-compatible-endpoint)); OpenCodex's own alternative is `ocx codex-shim install` | README |
-| Claude Code | `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN` (+ `ANTHROPIC_*_MODEL` slots) — exactly what `ocx claude` sets | `src/cli/claude.ts` (source, not README) |
+## Harness wiring
 
-Eliot sets these per agent process only; it never runs `ocx ... install` or changes
-global client config. If OpenCodex's own client-integration feature is used, the owner
-does it.
+| Harness | Explicit wiring |
+| --- | --- |
+| Codex | named Responses-compatible provider with `<origin>/v1` and client key headers |
+| Claude Code | documented Anthropic base URL/auth/header variables |
 
-## Management API (optional monitoring)
+Eliot injects route configuration only into the frozen per-Agent profile environment.
+It never runs global integration installers or edits owner client configuration.
+Requested URL is not proof of use: plugin reports effective provider/endpoint where
+available and L7 verifies main/auxiliary requests.
 
-Base `/api/` with the admin token. Documented: `GET /api/system/memory`; v1 also used
-`GET /api/system/health`, providers, models and usage reads (against v2.75). Use only
-read endpoints for `source.health` and `provider.limited`; Eliot does not change
-OpenCodex settings.
+## Monitoring, capacity and holds
 
-## Billing and routes
+Optional management API is read-only and version-checked. It may feed service health,
+provider/model availability, usage and proven rate/quota facts. A management timeout
+marks only the proxy source stale; it does not change Agent state or trigger fallback.
 
-- Billing follows the provider's `authMode` in OpenCodex: `forward` = the ChatGPT plan
-  behind the caller's Codex login, `oauth` = that provider account's subscription,
-  `key` = the key's own account. OpenCodex reports quota windows but not the plan tier.
-- A working main chat does not prove the whole route: titles, compaction and subagent
-  calls may use other models or endpoints. Check them in the L2.8 live run; until then
-  `eliot show` marks the route as verified for the main chat only.
-- Management reads use the admin token (header `X-OpenCodex-API-Key` or bearer), which
-  is separate from the client key `x-opencodex-api-key`. Changing OpenCodex settings
-  stays with the owner (v1 had a config-write module; v2 drops it).
+Profiles using the same OpenCodex service/account share capacity and persisted provider
+holds. A 429 is rate limit unless exact response proves quota. One explicit probe may
+claim a hold; unknown probe stays reserved across restart. Eliot never silently selects
+another provider/account/model.
 
-## v1 pitfalls
+## Billing visibility
 
-- Claude via OpenCodex's `anthropic` provider in OAuth mode spends the subscription
-  stored in OpenCodex, not the native route — make the route visible in `eliot show`.
-- `activeTurnCount = 0` in OpenCodex does not mean native children stopped.
-- A stale (409) integration plan must not be blindly retried.
-- v1 never stopped/restarted the service; keep that: attached services are not ours.
+Billing follows the configured OpenCodex provider/account/auth mode. Eliot displays the
+profile's intended account/billing and every effective fact exposed by harness/proxy.
+A successful main chat does not prove title/compaction/subagent traffic used the same
+route; unverified scope remains labelled unknown.
+
+## Retained L7 cases
+
+- adopted service is never signalled/restarted by Agent stop or daemon recovery;
+- managed service uses separate custody and exact endpoint/PID birth identity;
+- client/admin keys never cross roles or persist;
+- stale/failed management read does not reroute or complete Agent work;
+- effective Codex/Claude route and auxiliary calls are verified;
+- provider hold/capacity is shared correctly across profiles and restart;
+- stale integration/config write is never blindly retried.
