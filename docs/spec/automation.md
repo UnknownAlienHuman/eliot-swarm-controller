@@ -5,10 +5,9 @@ Task/review/workflow engine and no generic run/action state machine.
 
 The implementation follows two donor patterns:
 
-- controller-runtime: restart and callbacks enqueue a stable reconciliation key; each
-  pass rereads durable current state and one key never reconciles concurrently with
-  itself;
-- Petri: validate against current state, commit the record, then apply the pure reducer.
+- controller-runtime: callbacks/restart enqueue a stable reconciliation key; every pass
+  rereads durable current state and one key never reconciles concurrently with itself;
+- Petri: validate current state, commit the event/commands, then apply the pure reducer.
 
 ## Rule files and authority
 
@@ -47,7 +46,7 @@ RuleState {
   revision,
   current_definition, current_cursor,
   retiring_revision?, retiring_definition?, retiring_cursor?, retire_through?,
-  enabled, updated_at
+  enabled, paused_reason?, updated_at
 }
 ```
 
@@ -57,24 +56,21 @@ RuleState {
 - retiring definition processes `(retiring_cursor,H]`; current processes events after H;
   when retiring reaches H it is discarded;
 - identical reload is a no-op;
-- disable/pause records one skipped range and advances the relevant cursor without
-  firing;
+- disable/pause records one skipped range and advances relevant cursors without firing;
 - Store failure advances nothing.
 
 Semantic edits are serialized per `(principal,rule)`. While a retiring definition
-exists, another changed file is **not** installed and no third definition row is
-created. The config source reports the rule as `deferred`; after retirement the
-reconciler rereads the latest valid file and performs one new handoff. Intermediate file
-versions may therefore coalesce, but no retained event is reinterpreted by an arbitrary
-newer definition.
+exists, another changed file is not installed and no third definition row appears. The
+config source reports `deferred`; after retirement the reconciler rereads the latest
+valid file and performs one new handoff. Intermediate file versions may coalesce, but no
+retained event is reinterpreted by an arbitrary newer definition.
 
-The config watcher also tracks every frozen note/script referenced by the current or
-retiring definition. A size/digest change is a semantic rule edit and enters the same
-serialized handoff. If a watcher event is missed, the mandatory dispatch-time digest
-check fails the command instead of executing changed bytes.
+The watcher tracks every frozen note/script referenced by current or retiring
+definition. Size/digest change is a semantic edit and uses the same serialized handoff.
+A missed watcher event is caught by mandatory dispatch-time digest verification.
 
-This is the whole edit model—no activation graph, compiled-definition hierarchy or
-run journal.
+This is the whole edit model—no activation graph, compiled-definition hierarchy or run
+journal.
 
 For each event under its owning definition:
 
@@ -83,7 +79,28 @@ For each event under its owning definition:
   transaction;
 - deterministic render/authority/capability/fanout error: commit one `rule.failed` and
   advance cursor;
-- Store failure: rollback and retry the same event after Store recovery.
+- Store failure: rollback and retry that event after Store recovery.
+
+### Retention and bounded backlog
+
+Event retention may delete only through the minimum cursor needed by every enabled
+current/retiring definition. A retiring definition pins only through its captured
+`retire_through` boundary. Disabled rules pin nothing because disable advances and
+records the skipped range.
+
+`automation.max_event_backlog` (default 100,000 events) bounds one rule's lag. When any
+required cursor falls more than that many retained events behind current high-water, one
+transaction:
+
+1. records `rule.suppressed reason=backlog_exceeded` with exact skipped range;
+2. advances current and retiring cursors to the captured high-water;
+3. clears the retiring definition;
+4. sets the rule disabled/paused with `paused_reason=backlog_exceeded`.
+
+Already admitted commands continue; no new firing is created. Retention is then free to
+advance. Owner must inspect and explicitly re-enable or run an explicit retained-range
+catch-up; catch-up fails `history_gap` if the range no longer exists. There is no silent
+skip and no indefinitely pinned database.
 
 ## Triggers
 
@@ -99,25 +116,25 @@ Ephemeral events cannot trigger durable work.
 
 Intervals use `anchor + k·period`; missed slots coalesce to latest or none, never burst.
 Cron persists UTC instants and handles repeated/skipped DST local times explicitly.
-Timer rows are reconciled on startup; one rule does not stack another timer firing while
-its previous commands are queued/dispatched/unknown.
+Timer rows reconcile on startup; one rule does not stack another timer firing while its
+previous commands are queued/dispatched/unknown.
 
-Changing a schedule increments its revision and starts after the reload boundary.
-Changing actions only keeps the schedule and applies the new definition to later slots.
-A schedule edit is also serialized behind an existing retiring definition.
+Changing a schedule increments its revision and starts after reload boundary. Changing
+actions only keeps schedule and applies the new definition to later slots. Schedule edit
+is serialized behind an existing retiring definition.
 
 ## Matching and rendering
 
-`match` uses dotted paths in the committed `{event,subject,data}` snapshot: exact,
-glob, regex, one-of and presence. All entries must match.
+`match` uses dotted paths in committed `{event,subject,data}`: exact, glob, regex,
+one-of and presence. All entries must match.
 
-`${path}` may fill an argument **value** only. It cannot choose executable, action kind,
-cwd root, environment-variable name, option name, credential, project or control scope.
-Unknown placeholder is a deterministic failed firing.
+`${path}` may fill an argument value only. It cannot choose executable, action kind, cwd
+root, environment name, option name, credential, project or control scope. Unknown
+placeholder is a deterministic failed firing.
 
 Selectors resolve transactionally at firing to concrete Agent ids and captured
-`generation`; delayed work never retargets a replacement session. Steer/interrupt and
-request replies also freeze exact turn/request id.
+`generation`; delayed work never retargets a replacement. Steer/interrupt and request
+replies also freeze exact turn/request id.
 
 ## Actions are commands
 
@@ -127,106 +144,93 @@ Each action is a command with id:
 rule:<principal>/<rule>@<revision>:<trigger-key>/<index>[/<agent>]
 ```
 
-The same trigger can therefore be reconciled repeatedly without duplicate effects.
-Actions execute in listed order: later commands stay queued until the previous command
-is applied; rejected/failed/unknown stops the remaining commands. `Applied` keeps the
-meaning of the underlying command—for example, an applied `send` means exact turn
-association, not terminal task success. A workflow that needs the result uses a later
-rule on the exact `turn.completed`/cause relationship; Eliot does not add a hidden wait
-or workflow state between actions.
+Repeated reconciliation therefore returns the same command rows. Actions execute in
+listed order: later commands stay queued until the previous command is applied;
+rejected/failed/unknown stops the remainder. `Applied` keeps the underlying command
+meaning—an applied send is associated with a turn, not proof the turn succeeded. A
+workflow needing its result uses a later rule on exact `turn.completed`/cause; Eliot
+adds no hidden wait/workflow state.
 
 | Action | Implementation |
 | --- | --- |
-| any core verb | normal generation/turn/request-bound command through the router |
-| `git.fetch|pull|push|worktree` | daemon command with explicit repo/remote/ref/OID/path and verb-specific readback |
+| any core verb | normal generation/turn/request-bound command |
+| `git.fetch|pull|push|worktree` | daemon command with frozen desired state and verb-specific readback |
 | `msg.send`, `var.set` | normal coordination mutation under rule principal |
 | `run` | bounded managed process command |
 | `notify` | bounded log/desktop or owner-configured named webhook command |
 | `emit` | persisted `x.user.*` event command |
 
-Git action arguments are data, not command-line syntax:
+### Git actions
 
-- `repo`/`workspace` resolves to an owner-registered project path allowed to the rule;
-  project rules cannot select arbitrary cwd;
-- `remote` is an owner-configured remote name, never a URL from event data. Reject empty
-  names, leading `-`, control characters, `::`, `ext::` and option-like values;
-- at admission, freeze the effective endpoint set from Git config. `fetch`/`pull` check
-  every `git remote get-url --all <remote>` result; `push` separately checks every
-  `git remote get-url --push --all <remote>` result because `pushurl` may differ from
-  the fetch URL. Every URL must use an owner-approved scheme and must not invoke an
-  unapproved/custom remote helper. Revalidate that the frozen endpoint set is unchanged
-  immediately before dispatch; a mismatch fails before Git I/O;
-- refs are full validated refnames (`git check-ref-format`) and may not begin with `-`;
-  OIDs are exact hexadecimal object ids read from Git, never free-form placeholders;
-- commands place `--` before pathspecs where supported and use explicit refspec argv;
-- a placeholder-filled remote/ref/path must pass the same validation after rendering;
-- monitoring/action Git calls disable hooks, fsmonitor, external diff and textconv as
-  specified in [monitoring](monitoring.md#git-and-filesystem-monitor).
+Arguments are data, not command-line syntax:
 
-Each Git command stores one immutable desired-state intent before its process starts:
+- repo/workspace resolves to an owner-registered project path allowed to the rule;
+- remote is an owner-configured remote name, never a URL from event data. Reject empty,
+  leading `-`, control characters, `::`, `ext::` and option-like values;
+- at admission freeze effective endpoints. Fetch/pull inspect every
+  `git remote get-url --all`; push separately inspects every
+  `git remote get-url --push --all`, because `pushurl` may differ. Every URL must use an
+  owner-approved scheme and no unapproved/custom helper. Revalidate unchanged before
+  dispatch;
+- refs are full `git check-ref-format` names and may not begin `-`; OIDs are exact
+  hexadecimal object ids read from Git;
+- put `--` before pathspecs where supported and use explicit refspec argv;
+- monitoring/action Git calls disable hooks, fsmonitor, external diff and textconv.
 
-- `git.fetch`: freeze the configured full fetch refspecs plus the exact advertised remote
-  OID for every selected source ref and the corresponding local tracking ref. A ref
-  already at its intended OID is a no-op; otherwise fetch the exact frozen OID/refspec,
-  not whatever the moving remote ref names later;
-- `git.pull`: freeze current branch, upstream full ref and intended upstream OID; perform
-  only fetch + fast-forward to that OID—never merge/rebase or another branch;
-- `git.push`: freeze source full ref, its local OID, destination full ref and every
-  effective push URL. If refs are omitted, resolve the current branch and its configured
-  upstream; detached HEAD, missing/ambiguous upstream or non-fast-forward intent is a
-  deterministic failure. Execute one explicit `<source-ref>:<destination-ref>` refspec,
-  never force;
-- `git.worktree`: freeze repository, exact path, branch and base OID.
+Each command stores one immutable desired-state intent before process start:
 
-No unknown command is run again. After the process tree is proven gone, readback can
-prove **applied** only from that frozen intent:
+- fetch: configured full fetch refspecs, exact advertised remote OID per selected source
+  ref and corresponding local tracking ref. Fetch exact frozen OID/refspec, not a later
+  moving ref;
+- pull: current branch, upstream full ref and intended upstream OID; only fetch +
+  fast-forward to that OID, never merge/rebase/another branch;
+- push: source full ref, its local OID, destination full ref and every effective push
+  URL. If omitted, resolve current branch/upstream; detached HEAD, missing/ambiguous
+  upstream or non-fast-forward intent fails. Use explicit
+  `<source-ref>:<destination-ref>`, never force;
+- worktree: repository, exact path, branch and base OID.
 
-| Action | Applied readback |
+Unknown is never rerun. After custody is gone, readback proves applied only when:
+
+| Action | Exact applied state |
 | --- | --- |
-| fetch | every intended local tracking ref equals its frozen remote OID |
-| pull | the intended local branch HEAD equals the frozen upstream OID |
-| push | the destination ref at every frozen effective push URL equals the frozen local OID |
-| worktree | the exact frozen path is registered on the frozen branch at the intended base/current OID |
+| fetch | every intended tracking ref equals its frozen remote OID |
+| pull | intended local branch HEAD equals frozen upstream OID |
+| push | destination ref at every frozen push URL equals frozen local OID |
+| worktree | exact path is registered on frozen branch at intended OID |
 
-If readback does not prove the intended state, the action remains `unknown` unless the
-process/native result separately proves no effect; it is never rerun merely to discover
-the answer. Push readback uses the frozen URLs directly rather than a mutable remote
-name. A narrow repository writer hold prevents a later write from passing an older
-unknown write. Generic scripts/webhooks without exact readback remain unknown.
+Otherwise action remains unknown unless native/process result proves no effect. Push
+readback uses frozen URLs directly, not mutable remote name. A narrow repository writer
+hold blocks later writes behind an older unknown write. Generic scripts/webhooks without
+exact readback remain unknown.
 
 ## Frozen script inputs
 
-A rule definition stores for every referenced project note/script:
+A definition stores every referenced project note/script as:
 
 ```text
 FrozenFile { canonical_path, size, digest, allowed_root }
 ```
 
-Paths must remain under the registered project/global script root and may not traverse
-`..`, symlink/reparse-point escape, alternate streams or devices. Dispatch rereads and
-verifies size/digest; mismatch fails rather than running different bytes. Small generated
-system text may be copied directly into the definition row. There is no global artifact
-CAS or garbage collector.
+Reject `..`, symlink/reparse escape, alternate streams and devices. Dispatch verifies
+size/digest; mismatch fails. Small generated text may be copied into definition row. No
+global artifact CAS/GC.
 
-A project `run` uses a frozen script under the registered `.eliot/scripts` root and an
-owner-approved interpreter; it cannot choose an arbitrary executable. A global rule may
-use only an executable/argv declared in owner configuration.
+A project `run` uses a frozen script under registered `.eliot/scripts` plus an
+owner-approved interpreter; it cannot choose arbitrary executable. Global rules use only
+owner-configured executable/argv.
 
-A `run` command receives one JSON object on stdin and may return bounded NDJSON action
-objects. The daemon buffers all output, validates every action under the parent rule
-principal, then creates their command rows atomically. The process receives a scoped
-run token; losing it never becomes owner. Timeout kills/verifies its custody. Lost
-outcome is unknown and the script is not rerun.
+`run` receives one JSON object on stdin and may return bounded NDJSON actions. Daemon
+buffers all output, validates under parent rule principal, then creates command rows
+atomically. Process receives scoped run token; losing it never becomes owner. Timeout
+kills/verifies custody. Lost outcome is unknown and script is not rerun.
 
 ## Approvals and hooks
 
-Asynchronous `approval.requested`/`question.asked` rules create ordinary exact-generation
-request commands. A stale generation/request is rejected.
-
-Synchronous hook policy is evaluated inside the native deadline. A non-default decision
-is returned only after its immediate durable decision record commits while the same
-request remains pending. Timeout/Store failure returns safe native default and a late
-result is discarded; it never becomes a queued approval for another request.
+Asynchronous request rules create exact-generation ordinary commands. Synchronous hook
+policy runs inside native deadline. Non-default decision is returned only after its
+immediate durable record commits while the same request is pending. Timeout/Store failure
+returns safe default; late result is discarded and never queued for another request.
 
 ## Goal loop
 
@@ -241,33 +245,29 @@ Goal {
 }
 ```
 
-Generation change pauses the Goal. Every `goal.set`, `goal.resume`, replacement of its
-text/check/budget/cadence, and explicit rebind increments `revision`. Pause/clear also
-increment it so an in-flight round can never publish a late result.
+Generation change pauses Goal. Every set/resume or definition change increments
+revision; pause/clear also increment it so stale rounds cannot publish.
 
 Round identity:
 
-- `on_idle`: the exact committed `agent.idle` event seq;
-- cadence: the exact anchored schedule slot.
+- `on_idle`: exact committed `agent.idle` event seq;
+- cadence: exact anchored slot.
 
-Command id is `goal:<agent>@<generation>:<revision>:<round-key>`. Restart cannot send the
-same round twice; a later real idle event/slot can create another.
+Command id: `goal:<agent>@<generation>:<revision>:<round-key>`.
 
 Before a round:
 
-1. reread current generation, Goal revision, Agent state, pending requests, source
-   health, unknown input/turn/commands and native Goal status;
-2. skip/block if any exact gate forbids work; `on_idle` waits for active native Goal;
-3. run bounded check/fingerprint read-only;
-4. compute pass/budget/no-progress/continuation outcome without mutating Store;
-5. in one conditional transaction, reread generation, Goal revision and round key;
-6. only when all still match may the transaction commit **any** round result: `done`,
-   `blocked`, progress counters/fingerprints, budget usage or the ordinary continuation
-   send. Otherwise the stale result is discarded without changing the replacement Goal.
+1. reread generation/revision/state, pending requests, source health, unknown input/turn/
+   commands and native Goal status;
+2. skip/block if gated; on-idle waits active native Goal;
+3. run bounded read-only check/fingerprint;
+4. compute pass/budget/no-progress/continuation outside Store;
+5. conditionally reread generation/revision/round key in one transaction;
+6. only if unchanged commit **any** result—done/blocked, counters/fingerprints/budget or
+   ordinary continuation send. Otherwise discard stale result.
 
-An incomplete fingerprint never counts as no progress. A dispatched/unknown input or
-turn blocks continuation. Goal checks/scripts use the same frozen-file and custody
-rules as other managed commands.
+Incomplete fingerprint never counts as no progress. Unknown input/turn blocks
+continuation. Checks/scripts follow same frozen-file/custody rules.
 
 ## Durable tables
 
@@ -283,6 +283,7 @@ CREATE TABLE rule_state (
   retiring_cursor INTEGER,
   retire_through INTEGER,
   enabled INTEGER NOT NULL,
+  paused_reason TEXT,
   updated_at INTEGER NOT NULL,
   PRIMARY KEY(principal,rule)
 );
@@ -311,20 +312,18 @@ CREATE TABLE goals (
 );
 ```
 
-Action state lives in `commands`; no `automation_runs` or `automation_actions` tables.
-Recent `rule.fired|failed|suppressed` events provide history/rate accounting. Current
-rule/timer/Goal keys are level-reconciled after restart.
+Action state lives in commands; there are no automation run/action tables. Recent
+rule events plus current commands provide history/rate accounting. Current keys are
+level-reconciled after restart.
 
 ## Guardrails
 
 - cause depth > 5 suppresses firing;
-- default per-rule 10 firings/minute and global 120 actions/minute, reconstructed from
-  retained events/current command rows;
-- a configured `limit.window` may not exceed the retained rule-event accounting horizon;
-  otherwise the rule is rejected at load rather than silently resetting its limit after
-  retention/restart;
-- self-send/steer/inject from the Agent's own event requires `allow_self=true`;
+- default per-rule 10/minute and global 120 actions/minute, reconstructed from retained
+  events/current commands;
+- configured `limit.window` may not exceed retained rule-event accounting horizon;
+- self-send/steer/inject from own event requires `allow_self=true`;
 - draining/paused automation admits no new firing/Goal continuation;
-- every action passes the normal router again at dispatch.
+- every action passes normal router at dispatch.
 
 Workflow examples remain small rule/script recipes, never core product states.
