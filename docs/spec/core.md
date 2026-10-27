@@ -144,6 +144,15 @@ Agent/command/mail/rule/Git/process facts and `session.lost` cannot be supplied 
 arbitrary plugin lifecycle. Persist bounded final facts; deltas/samples stay ephemeral.
 Mask known secrets in native output; reject known secrets in caller durable text.
 
+Within the request family, `request.resolved` remains bound to an exact owner reply
+command. Native cleanup uses `request.closed {request_id,turn_id}` with no `command_id`.
+It requires the current generation, the source owning the request family, the exact
+live turn and an existing pending row with that Agent/generation/request/turn binding.
+It removes only that pending request, deriving waiting while others remain and busy
+otherwise. The durable request row becomes `resolved`; this records closure, never
+application or acknowledgement of a reply command. Any unknown reply stays unknown.
+Request closure neither creates nor resolves a source gap.
+
 Lifecycle, health and gap metadata are independent. Handoff changes named family
 ownership, not predecessor lifecycle. Cursor-backed recovery resumes strictly after
 its opaque committed cursor. No cursor means live-edge recovery plus explicit gap,

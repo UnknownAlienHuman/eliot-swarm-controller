@@ -396,7 +396,7 @@ impl EventProcessor {
                 }
             }
             Some(NativeFrame::Notification { method, params }) => {
-                if self.should_buffer(&method) {
+                if self.should_buffer(&method, &params) {
                     self.buffer_frame(BufferedNativeFrame::Notification { method, params });
                 } else if let Err(error) = self.process_notification(method, params).await {
                     self.status.source_unknown = true;
@@ -446,7 +446,15 @@ impl EventProcessor {
         }
     }
 
-    fn should_buffer(&self, method: &str) -> bool {
+    fn should_buffer(&self, method: &str, params: &Value) -> bool {
+        if method == "serverRequest/resolved"
+            && params
+                .get("requestId")
+                .and_then(|id| transport_key(id).ok())
+                .is_some_and(|key| self.resolved_transport_ids.contains(&key))
+        {
+            return false;
+        }
         matches!(
             method,
             "turn/started"
@@ -582,7 +590,15 @@ impl EventProcessor {
     async fn flush_buffer(&mut self) -> Result<()> {
         while let Some(frame) = self.buffer.pop_front() {
             self.buffer_bytes = self.buffer_bytes.saturating_sub(frame.size);
-            if !self.status.ready || self.status.active_turn_id.is_none() {
+            let should_buffer = match &frame.frame {
+                BufferedNativeFrame::Notification { method, params } => {
+                    self.should_buffer(method, params)
+                }
+                BufferedNativeFrame::Request { .. } => {
+                    !self.status.ready || self.status.active_turn_id.is_none()
+                }
+            };
+            if should_buffer {
                 self.buffer.push_front(frame);
                 self.buffer_bytes = self
                     .buffer_bytes
@@ -873,22 +889,25 @@ impl EventProcessor {
                 .record_gap("Codex request resolution arrived outside its active turn")
                 .await;
         }
-        let Some(command_id) = entry.reply_command_id.clone() else {
-            return self
-                .record_gap("Codex resolved a request without an exact Eliot reply command")
-                .await;
+        let (kind, data) = match (entry.reply_state, entry.reply_command_id.as_ref()) {
+            (NativeReplyState::Written, Some(command_id)) => (
+                "request.resolved",
+                json!({
+                    "command_id": command_id,
+                    "request_id": request_id,
+                    "turn_id": turn_id,
+                }),
+            ),
+            _ => (
+                "request.closed",
+                json!({
+                    "request_id": request_id,
+                    "turn_id": turn_id,
+                }),
+            ),
         };
-        let native_id = request_event_id(&request_id, "request.resolved")?;
-        self.commit_event(
-            "request.resolved",
-            native_id,
-            json!({
-                "command_id": command_id,
-                "request_id": request_id,
-                "turn_id": turn_id,
-            }),
-        )
-        .await?;
+        let native_id = request_event_id(&request_id, kind)?;
+        self.commit_event(kind, native_id, data).await?;
         self.pending_requests.remove(&request_id);
         self.transport_requests.remove(&key);
         self.remember_resolved_transport(key);
@@ -1149,6 +1168,21 @@ impl EventProcessor {
             "turn.completed",
         )?;
         self.commit_event("turn.completed", native_id, data).await?;
+        let closed_requests = self
+            .transport_requests
+            .iter()
+            .filter(|(_, request_id)| {
+                self.pending_requests
+                    .get(request_id.as_str())
+                    .is_some_and(|entry| entry.request.turn_id == notification.turn.id)
+            })
+            .map(|(key, request_id)| (key.clone(), request_id.clone()))
+            .collect::<Vec<_>>();
+        for (key, request_id) in closed_requests {
+            self.pending_requests.remove(&request_id);
+            self.transport_requests.remove(&key);
+            self.remember_resolved_transport(key);
+        }
         self.status.last_turn = Some(TurnFacts {
             command_id,
             turn_id: notification.turn.id,
@@ -1410,6 +1444,7 @@ fn request_event_id(request_id: &str, kind: &str) -> Result<String> {
     let prefix = match kind {
         "request.opened" => "codex-o:",
         "request.resolved" => "codex-r:",
+        "request.closed" => "codex-c:",
         _ => {
             return Err(Error::new(
                 "invalid",

@@ -244,6 +244,10 @@ pub enum Effect {
         #[serde(default)]
         details: Option<Value>,
     },
+    RequestClosed {
+        request_id: String,
+        turn_id: String,
+    },
     MessageCompleted {
         command_id: String,
         turn_id: String,
@@ -383,12 +387,18 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
                 });
             }
         }
-        "request.resolved" => {
+        "request.resolved" | "request.closed" => {
             require_live_turn(agent, event)?;
+            if event.kind == "request.closed" && event.data.get("command_id").is_some() {
+                return Err(Error::new(
+                    "invalid",
+                    "request.closed must not acknowledge a command",
+                ));
+            }
             if agent.state != AgentState::Waiting {
                 return Err(bad_state(
                     event,
-                    "request.resolved requires a waiting Agent",
+                    "request completion requires a waiting Agent",
                 ));
             }
             let request_id = required_text(event, "request_id")?;
@@ -401,8 +411,8 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
                 return Err(Error::new(
                     "source_integrity",
                     format!(
-                        "request.resolved {request_id} is not pending for Agent {} turn {turn_id}",
-                        agent.id
+                        "{} {request_id} is not pending for Agent {} turn {turn_id}",
+                        event.kind, agent.id
                     ),
                 ));
             };
@@ -412,13 +422,20 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
             } else {
                 AgentState::Waiting
             };
-            effects.push(Effect::RequestPending {
-                request_id,
-                turn_id,
-                pending: false,
-                kind: None,
-                details: None,
-            });
+            if event.kind == "request.closed" {
+                effects.push(Effect::RequestClosed {
+                    request_id,
+                    turn_id,
+                });
+            } else {
+                effects.push(Effect::RequestPending {
+                    request_id,
+                    turn_id,
+                    pending: false,
+                    kind: None,
+                    details: None,
+                });
+            }
         }
         "turn.completed" => {
             require_live_turn(agent, event)?;

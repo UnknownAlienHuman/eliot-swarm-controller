@@ -13,9 +13,15 @@ turns: create `hello.txt` containing `hello`, append `world`, then return exactl
 Old turns were not replayed. Live watch observed all three results; final Agent stop
 and daemon drain succeeded.
 
-The basic native workflow was checked; full L7 qualification remains pending.
-Steer, interrupt, and approval/question callbacks are compiled and schema mapped
-but were not exercised with native Codex. [Roadmap](docs/roadmap.md) owns milestone status.
+Three further native control exercises with Codex 0.161.0, Luna and effort `medium`
+verified steer, approval, a retained same-ID approval retry without a second native
+write, interruption with another callback pending, denial without executing the denied
+command, and plan-mode question validation and answering. All three stopped the Agent
+and exited the daemon, with sources closed/healthy, zero gaps or duplicate native IDs,
+and no workspace files created.
+
+Full L7 qualification remains pending. File-change approval was not live exercised;
+requests carrying `grantRoot` remain unsupported. [Roadmap](docs/roadmap.md) owns milestone status.
 
 ## Quick start
 
@@ -76,6 +82,10 @@ Turn controls require an active turn; request replies require a pending native r
 request is captured by the Store only when exactly one native request is pending.
 `answer --answers-file` submits the bounded parsed `{ question: { answers: [string] } }`
 body, not a path. Secret-question answers stay unsupported before Store persistence.
+For command approvals set profile `approval_policy = "on-request"`. For native questions
+set optional `collaboration_mode = "plan"`; the question exercise used
+`permissions = "read-only"`. Clearing pending requests during interrupt/stop or closing
+a source proves cleanup, not acknowledgement of an answer.
 `inject` and `configure` are currently unsupported.
 
 Other read commands include `show AGENT` and `cmd show ID`. `watch [AGENT]` streams

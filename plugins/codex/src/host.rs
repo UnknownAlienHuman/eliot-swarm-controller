@@ -3,8 +3,10 @@ use crate::{
     native::{
         NativeClient, NativeLaunch, NativeProcess,
         types::{
-            NativeClientInfo, NativeInitializeParams, NativeInitializeResponse, NativeModelEntry,
-            NativeModelListParams, NativeModelListResponse, NativeSandboxMode, NativeTextUserInput,
+            NativeClientInfo, NativeCollaborationMode, NativeCollaborationModeKind,
+            NativeCollaborationSettings, NativeInitializeCapabilities, NativeInitializeParams,
+            NativeInitializeResponse, NativeModelEntry, NativeModelListParams,
+            NativeModelListResponse, NativeSandboxMode, NativeTextUserInput,
             NativeThreadConfigOverrides, NativeThreadResumeParams, NativeThreadStartParams,
             NativeTurnInterruptParams, NativeTurnStartParams, NativeTurnStartResponse,
             NativeTurnSteerParams, NativeTurnSteerResponse, NativeUserInput, ThreadReadback,
@@ -74,6 +76,7 @@ struct AgentSession {
     native_scope: String,
     requested_model: String,
     selected_effort: String,
+    collaboration_mode: Option<NativeCollaborationModeKind>,
     secrets: Vec<String>,
     native: NativeProcess,
     native_client: NativeClient,
@@ -286,6 +289,18 @@ impl CodexPlugin {
             .ok_or_else(|| Error::new("profile_error", "Codex profile requires an exact model id"))?
             .to_owned();
         let requested_effort = optional_profile_text(profile, "effort")?;
+        let collaboration_mode =
+            match optional_profile_text(profile, "collaboration_mode")?.as_deref() {
+                None => None,
+                Some("default") => Some(NativeCollaborationModeKind::Default),
+                Some("plan") => Some(NativeCollaborationModeKind::Plan),
+                Some(_) => {
+                    return Err(Error::new(
+                        "profile_error",
+                        "Codex collaboration_mode must be default or plan",
+                    ));
+                }
+            };
         let permissions = profile
             .get("permissions")
             .and_then(Value::as_str)
@@ -373,6 +388,7 @@ impl CodexPlugin {
             native_scope: String::new(),
             requested_model: requested_model.clone(),
             selected_effort: String::new(),
+            collaboration_mode,
             secrets,
             native,
             native_client,
@@ -391,6 +407,7 @@ impl CodexPlugin {
                 &workspace,
                 &requested_model,
                 requested_effort.as_deref(),
+                collaboration_mode.is_some(),
             )
             .await
         {
@@ -641,7 +658,7 @@ impl CodexPlugin {
             ));
         }
         session.phase = SessionPhase::Ready;
-        let result = json!({
+        let mut result = json!({
             "agent_id": params.agent_id,
             "generation": params.generation,
             "command_id": params.command_id,
@@ -657,6 +674,9 @@ impl CodexPlugin {
             },
             "effective": effective,
         });
+        if let Some(mode) = session.collaboration_mode {
+            result["requested"]["collaboration_mode"] = json!(mode);
+        }
         session.start_result = Some(result.clone());
         self.session = Some(session);
         Ok(result)
@@ -668,6 +688,7 @@ impl CodexPlugin {
         workspace: &Path,
         requested_model: &str,
         requested_effort: Option<&str>,
+        experimental_api: bool,
     ) -> Result<(String, String)> {
         let init_params = NativeInitializeParams {
             client_info: NativeClientInfo {
@@ -675,7 +696,9 @@ impl CodexPlugin {
                 version: env!("CARGO_PKG_VERSION").to_owned(),
                 title: Some("Eliot".to_owned()),
             },
-            capabilities: None,
+            capabilities: experimental_api.then_some(NativeInitializeCapabilities {
+                experimental_api: true,
+            }),
         };
         let init_value = serde_json::to_value(init_params)
             .map_err(|_| Error::new("internal", "Codex initialize params could not be encoded"))?;
@@ -897,6 +920,16 @@ impl CodexPlugin {
             cwd: None,
             model: Some(session.requested_model.clone()),
             effort: Some(session.selected_effort.clone()),
+            collaboration_mode: session
+                .collaboration_mode
+                .map(|mode| NativeCollaborationMode {
+                    mode,
+                    settings: NativeCollaborationSettings {
+                        model: session.requested_model.clone(),
+                        reasoning_effort: Some(session.selected_effort.clone()),
+                        developer_instructions: None,
+                    },
+                }),
             sandbox_policy: None,
             client_user_message_id: None,
         };

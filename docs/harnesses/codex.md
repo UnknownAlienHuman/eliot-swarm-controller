@@ -14,9 +14,25 @@ Both generations verified provider `openai`, effort `medium` (`effort_verified=t
 sandbox `workspaceWrite`, and approval policy `never`. Persisted events included five
 messages, two tool starts, two tool completions, and three turn completions.
 
-The basic native workflow was checked; full L7 qualification remains pending.
-Steer, interrupt, and approval/question callbacks are compiled and schema mapped
-but were not exercised with native Codex. [Roadmap](../roadmap.md) owns milestone status.
+Three further native control exercises passed on 2026-10-27 with Codex 0.161.0,
+`gpt-6-luna` and effort `medium`:
+
+- With approval policy `on-request`, two callbacks were observed. Steer and approve
+  reached `applied`; retrying the same approval mutation ID returned retained `applied`
+  without a second native write. Interrupt while the second callback was pending
+  ended the native turn as interrupted and cleared pending requests.
+- Deny reached `applied`, the final reply was `DECLINED`, and the denied command did
+  not execute.
+- With `collaboration_mode = "plan"` and read-only permissions, native
+  `request_user_input` opened a question. A reply containing an unoffered question ID
+  was rejected; answering the offered question with `Continue` reached `applied`,
+  followed by final reply `ACK`.
+
+All three ended with the Agent stopped, daemon exited and sources closed/healthy
+(`closed`/`ok`), with zero gaps, duplicate native IDs or workspace files.
+File-change approval was not live exercised; file-change requests carrying `grantRoot`
+remain unsupported. Full L7 qualification remains pending.
+[Roadmap](../roadmap.md) owns milestone status.
 
 ## Sources
 
@@ -70,6 +86,12 @@ approval_policy = "never"
 pass_env = ["CODEX_HOME"]
 ```
 
+For command approval callbacks, change `approval_policy` to `"on-request"`. For native
+questions, add optional `collaboration_mode = "plan"` to the profile; the live question
+exercise used `permissions = "read-only"`. The mode also accepts `"default"`; omission
+preserves the native default. Model and effort stay pinned, and permissions are configured
+independently of the collaboration mode.
+
 Example lifecycle:
 
 ```powershell
@@ -83,7 +105,7 @@ $agent = 'AGENT_ID_FROM_OUTPUT'
 ```
 
 Turn controls require an active turn; request replies require a pending native request.
-These command examples were not exercised with native Codex:
+The native exercises above used this control surface:
 
 ```powershell
 & $eliot --data-dir $dataDir steer $agent "Adjust course." --generation 1 --turn TURN_ID
@@ -100,6 +122,11 @@ A missing request is captured only for a single pending native request.
 never echo file contents. `resume --wait` with a prompt follows the new linked
 `<id>/send` in generation N+1, without it follows resume readiness. No old input
 is replayed.
+
+An empty pending set after interrupt/stop, or a source becoming closed, records cleanup.
+Neither proves that an approval or answer was acknowledged. Request application must
+be established by the retained command result for that exact request; the interrupted
+second callback above was cleared without being answered.
 
 The plugin uses `model/list` internally; a separate model-catalogue product/UI is not
 required. Keep the model choice in the profile, outside core types and tests.

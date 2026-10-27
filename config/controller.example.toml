@@ -10,3 +10,5 @@ effort = "medium"
 permissions = "workspace-write"
 approval_policy = "never"
 pass_env = ["CODEX_HOME"]
+# Optional native preset for planning and user questions; sandbox remains separate.
+# collaboration_mode = "plan"

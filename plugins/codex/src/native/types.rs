@@ -30,14 +30,21 @@ pub struct NativeClientInfo {
     pub title: Option<String>,
 }
 
-/// Minimal `initialize` params. `capabilities` is passed through as native
-/// JSON when present; Eliot never fabricates capability flags.
+/// Minimal installed-schema capability opt-in, sent for an explicit mode only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeInitializeCapabilities {
+    #[serde(default)]
+    pub experimental_api: bool,
+}
+
+/// Minimal `initialize` params; capabilities are omitted without an opt-in.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NativeInitializeParams {
     #[serde(rename = "clientInfo")]
     pub client_info: NativeClientInfo,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capabilities: Option<serde_json::Value>,
+    pub capabilities: Option<NativeInitializeCapabilities>,
 }
 
 /// Fresh `v1/InitializeResponse.json` (all required).
@@ -231,6 +238,31 @@ pub enum NativeUserInput {
     Other(serde_json::Value),
 }
 
+/// Installed experimental `TurnStartParams.json` definitions: ModeKind,
+/// CollaborationMode and Settings. Settings keep their snake_case wire keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeCollaborationModeKind {
+    Default,
+    Plan,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NativeCollaborationSettings {
+    pub model: String,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    // Serialize None as null to select the native built-in mode instructions.
+    #[serde(default)]
+    pub developer_instructions: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NativeCollaborationMode {
+    pub mode: NativeCollaborationModeKind,
+    pub settings: NativeCollaborationSettings,
+}
+
 /// Minimal `turn/start` params (fresh `v2/TurnStartParams.json`;
 /// required: threadId + input).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -244,6 +276,8 @@ pub struct NativeTurnStartParams {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collaboration_mode: Option<NativeCollaborationMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_policy: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

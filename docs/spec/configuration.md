@@ -49,6 +49,14 @@ selects the explicitly requested native sandbox: `read-only`, `workspace-write`,
 at admission. The supported approval and question callbacks are handled through exact
 pending request IDs; an unsupported callback receives an error, never a default choice.
 
+An optional `collaboration_mode` selects Codex's `default` or `plan` preset for each
+turn. The selected mode is frozen with the profile; omission preserves the native
+default. Plan mode enables the native user-question workflow. Model and effort stay
+pinned when applying the preset, and the sandbox is configured independently. This
+uses the installed experimental `turn/start.collaborationMode` field, so only profiles
+that explicitly select a mode opt into `initialize.capabilities.experimentalApi`.
+No global Codex configuration is changed.
+
 ## Later configuration example
 
 ```toml

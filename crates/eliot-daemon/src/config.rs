@@ -7,10 +7,10 @@
 //! overlays) are rejected with unsupported, never silently substituted.
 //!
 //! Returns a bounded nonsecret snapshot object with the keys harness, cmd,
-//! model, effort, permissions, approval_policy and pass_env. pass_env carries admitted
-//! environment variable names only; secret values are never resolved or
-//! copied into the snapshot. The parent daemon calls resolve_profile before
-//! Store admission.
+//! model, effort, collaboration_mode, permissions, approval_policy and pass_env.
+//! pass_env carries admitted environment variable names only; secret values are never
+//! resolved or copied into the snapshot. The parent daemon calls resolve_profile
+//! before Store admission.
 use eliot_core as core;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -47,6 +47,8 @@ struct ProfileEntry {
     model: Option<String>,
     #[serde(default)]
     effort: Option<String>,
+    #[serde(default)]
+    collaboration_mode: Option<String>,
     #[serde(default)]
     permissions: Option<String>,
     #[serde(default)]
@@ -196,6 +198,17 @@ fn snapshot_from_entry(
             "profile_error",
         ));
     }
+    let collaboration_mode = entry.collaboration_mode.as_deref().map(str::trim);
+    if collaboration_mode.is_some_and(|mode| !matches!(mode, "default" | "plan")) {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "collaboration_mode",
+            "must be default or plan",
+            "profile_error",
+        ));
+    }
     let permissions = entry
         .permissions
         .as_deref()
@@ -245,6 +258,12 @@ fn snapshot_from_entry(
     snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
     if let Some(effort) = effort {
         snapshot.insert("effort".to_owned(), Value::String(effort.to_owned()));
+    }
+    if let Some(collaboration_mode) = collaboration_mode {
+        snapshot.insert(
+            "collaboration_mode".to_owned(),
+            Value::String(collaboration_mode.to_owned()),
+        );
     }
     snapshot.insert(
         "permissions".to_owned(),

@@ -2193,7 +2193,9 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::{Store, contains_secret_marker};
-    use eliot_core::{CommandState, NativeEvent, SourceBatch, SubmitCommand};
+    use eliot_core::{
+        AgentState, CommandState, NativeEvent, SourceBatch, SourceGap, SubmitCommand,
+    };
     use serde_json::json;
     use std::{
         path::Path,
@@ -2366,6 +2368,244 @@ mod tests {
                 .is_none(),
             "rejected answer args must not be persisted"
         );
+    }
+
+    #[test]
+    fn native_request_cleanup_does_not_acknowledge_reply() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time is after the Unix epoch")
+            .as_millis()
+            .try_into()
+            .expect("system time in milliseconds fits in i64");
+        let mut store = Store::open(Path::new(":memory:")).expect("open in-memory Store");
+        let command = |verb: &str, target, args, request_id| SubmitCommand {
+            id: Ulid::new().to_string(),
+            target,
+            verb: verb.to_owned(),
+            args,
+            expected_generation: None,
+            expected_turn_id: None,
+            request_id,
+        };
+        let launch = command(
+            "launch",
+            None,
+            json!({
+                "project": "native-request-cleanup",
+                "workspace": "synthetic-workspace",
+                "harness": "codex",
+                "profile": "synthetic-codex",
+                "profile_snapshot": {}
+            }),
+            None,
+        );
+        let launch_id = launch.id.clone();
+        let agent_id = store
+            .submit("owner", launch, now)
+            .expect("admit launch")
+            .command
+            .target
+            .expect("launch returns an Agent");
+        store.dispatch(&launch_id, now).expect("dispatch launch");
+        let batch = |kind: &str, data| SourceBatch {
+            batch_id: Ulid::new().to_string(),
+            agent_id: agent_id.clone(),
+            generation: 1,
+            source: "stream".to_owned(),
+            events: vec![NativeEvent {
+                kind: kind.to_owned(),
+                native_id: Ulid::new().to_string(),
+                data,
+            }],
+            cursor: None,
+        };
+        store
+            .put_batch(batch("session.ready", json!({})), now)
+            .expect("commit session readiness");
+        store
+            .settle(&launch_id, CommandState::Applied, None, now)
+            .expect("settle launch");
+        let send = command(
+            "send",
+            Some(agent_id.clone()),
+            json!({"text": "open native requests"}),
+            None,
+        );
+        let send_id = send.id.clone();
+        store.submit("owner", send, now).expect("admit input");
+        store.dispatch(&send_id, now).expect("dispatch input");
+        store
+            .put_batch(
+                batch(
+                    "turn.started",
+                    json!({"command_id": send_id, "turn_id": "turn-1"}),
+                ),
+                now,
+            )
+            .expect("commit exact turn association");
+        for request_id in ["cleanup-only", "uncertain-reply"] {
+            store
+                .put_batch(
+                    batch(
+                        "request.opened",
+                        json!({
+                            "command_id": send_id,
+                            "request_id": request_id,
+                            "turn_id": "turn-1",
+                            "kind": "approval",
+                            "details": {}
+                        }),
+                    ),
+                    now,
+                )
+                .expect("commit pending request");
+        }
+        let reply = command(
+            "approve",
+            Some(agent_id.clone()),
+            json!({}),
+            Some("uncertain-reply".to_owned()),
+        );
+        let reply_id = reply.id.clone();
+        store.submit("owner", reply, now).expect("admit reply");
+        store.dispatch(&reply_id, now).expect("dispatch reply");
+        let unknown_reply = store
+            .settle(
+                &reply_id,
+                CommandState::Unknown,
+                Some(json!({"reason": "native reply outcome unknown"})),
+                now,
+            )
+            .expect("retain unknown reply outcome")
+            .value;
+
+        let close_data = json!({"request_id": "cleanup-only", "turn_id": "turn-1"});
+        let mut wrong_source = batch("request.closed", close_data.clone());
+        wrong_source.source = "unowned".to_owned();
+        let mut wrong_generation = batch("request.closed", close_data.clone());
+        wrong_generation.generation = 2;
+        let before_rejections = store.high_water().expect("read event high water");
+        for (invalid, code) in [
+            (wrong_source, "source_integrity"),
+            (wrong_generation, "stale_generation"),
+            (
+                batch(
+                    "request.closed",
+                    json!({"request_id": "missing", "turn_id": "turn-1"}),
+                ),
+                "source_integrity",
+            ),
+            (
+                batch(
+                    "request.closed",
+                    json!({"request_id": "cleanup-only", "turn_id": "other-turn"}),
+                ),
+                "source_integrity",
+            ),
+            (batch("request.resolved", close_data.clone()), "invalid"),
+            (
+                batch(
+                    "request.resolved",
+                    json!({
+                        "request_id": "cleanup-only", "turn_id": "turn-1",
+                        "command_id": send_id
+                    }),
+                ),
+                "source_integrity",
+            ),
+            (
+                batch(
+                    "request.closed",
+                    json!({
+                        "request_id": "cleanup-only", "turn_id": "turn-1",
+                        "command_id": reply_id
+                    }),
+                ),
+                "invalid",
+            ),
+        ] {
+            let error = store
+                .put_batch(invalid, now)
+                .expect_err("reject wrong binding");
+            assert_eq!(error.code, code);
+        }
+        assert_eq!(
+            store.high_water().expect("read event high water"),
+            before_rejections
+        );
+
+        store
+            .record_source_gap(
+                SourceGap {
+                    gap_id: "independent-gap".to_owned(),
+                    agent_id: agent_id.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    families: vec!["request".to_owned()],
+                    reason: "synthetic source gap".to_owned(),
+                    from: None,
+                    to: None,
+                },
+                now,
+            )
+            .expect("record independent source gap");
+        let source_before = store
+            .read_source_state(&agent_id, 1, "stream")
+            .expect("read source gap before cleanup");
+        for (request_id, expected_state, remaining) in [
+            ("cleanup-only", AgentState::Waiting, 1),
+            ("uncertain-reply", AgentState::Busy, 0),
+        ] {
+            let cleanup = store
+                .put_batch(
+                    batch(
+                        "request.closed",
+                        json!({"request_id": request_id, "turn_id": "turn-1"}),
+                    ),
+                    now,
+                )
+                .expect("commit native request cleanup without a reply acknowledgement");
+            assert_eq!(cleanup.events.len(), 1);
+            assert_eq!(cleanup.events[0].kind, "request.closed");
+            assert!(cleanup.events[0].data.get("command_id").is_none());
+            let agent = store
+                .get_agent(&agent_id)
+                .expect("read Agent")
+                .expect("Agent exists");
+            assert_eq!(agent.state, expected_state);
+            assert_eq!(agent.pending.len(), remaining);
+            assert!(!agent.pending.iter().any(|pending| pending.id == request_id));
+            assert_eq!(agent.active_turn.as_deref(), Some("turn-1"));
+            assert_eq!(
+                store.get_command(&reply_id).expect("read reply"),
+                Some(unknown_reply.clone())
+            );
+
+            let late_reply = command(
+                "approve",
+                Some(agent_id.clone()),
+                json!({}),
+                Some(request_id.to_owned()),
+            );
+            let late_reply_id = late_reply.id.clone();
+            let error = store
+                .submit("owner", late_reply, now)
+                .expect_err("durable pending row must already be resolved");
+            assert_eq!(error.code, "source_integrity");
+            assert!(
+                store
+                    .get_command(&late_reply_id)
+                    .expect("read late reply")
+                    .is_none()
+            );
+        }
+        let source_after = store
+            .read_source_state(&agent_id, 1, "stream")
+            .expect("read source gap after cleanup");
+        for field in ["gap_id", "gap_digest", "gap_seq", "health"] {
+            assert_eq!(source_after[field], source_before[field]);
+        }
     }
 }
 
@@ -3012,7 +3252,7 @@ fn family_for_kind(kind: &str) -> Result<&'static str> {
         "turn.started" | "turn.completed" => Ok("turn"),
         "message.completed" => Ok("message"),
         "tool.started" | "tool.completed" => Ok("tool"),
-        "request.opened" | "request.resolved" => Ok("request"),
+        "request.opened" | "request.resolved" | "request.closed" => Ok("request"),
         other => Err(Error::new(
             "unsupported",
             format!("L1 Store does not persist native event {other}"),
@@ -3376,6 +3616,54 @@ fn persist_effects(
                             "pending request changed before resolution was stored",
                         ));
                     }
+                }
+            }
+            Effect::RequestClosed {
+                request_id,
+                turn_id,
+            } => {
+                if native_event.kind != "request.closed"
+                    || native_event.data.get("command_id").is_some()
+                    || required_string(&native_event.data, "request_id")?.as_str()
+                        != request_id.as_str()
+                    || required_string(&native_event.data, "turn_id")?.as_str() != turn_id.as_str()
+                    || next_agent
+                        .pending
+                        .iter()
+                        .any(|request| request.id == *request_id)
+                {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "request.closed is not an exact pending-request cleanup",
+                    ));
+                }
+                let Some((existing, state)) =
+                    load_pending_request(tx, agent_num, generation, request_id)?
+                else {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "request.closed references no durable pending request",
+                    ));
+                };
+                if state != "pending" || existing.turn_id.as_str() != turn_id.as_str() {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "request.closed does not match its durable pending binding",
+                    ));
+                }
+                let changed = tx
+                    .execute(
+                        "UPDATE pending_requests SET state = 'resolved'
+                         WHERE agent = ?1 AND generation = ?2 AND request_id = ?3
+                           AND turn_id = ?4 AND state = 'pending'",
+                        params![agent_num, generation, request_id, turn_id],
+                    )
+                    .map_err(sql_error)?;
+                if changed != 1 {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "pending request changed before native cleanup was stored",
+                    ));
                 }
             }
             Effect::MessageCompleted {

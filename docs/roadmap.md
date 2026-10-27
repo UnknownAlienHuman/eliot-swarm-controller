@@ -45,8 +45,8 @@ to create every crate/table immediately.
       help/version smoke commands on Windows/Ubuntu. No empty framework crates or
       test platform.
 
-**Next:** L2.2 control checks. The executable provides the direct Codex/Luna
-session/input/result and stop/resume path; v1 remains available as a source donor.
+**Next:** L3.1 observation. The direct Codex/Luna session, result and control paths
+have been exercised; v1 remains available as a source donor.
 
 ## L1 — Core, Store, bus and one fake command path
 
@@ -88,6 +88,10 @@ and `gpt-6-luna`: three completed turns created/read/updated one file, streamed 
 and tool events, stopped and resumed the same native thread in generation 2 without
 replaying input, then stopped and drained. Native readback confirmed the requested
 `medium` effort, provider and sandbox. This is a useful-path check, not L7 qualification.
+Three additional native control turns checked steer, one-shot approve/deny, interrupt
+with an unanswered request, and a plan-mode question/answer. Same-ID approval retry
+returned the retained result; an unoffered question ID rejected before a native reply.
+All three control runs stopped/drained with no source gaps or duplicate native ids.
 
 Read [Codex bring-up](harnesses/codex.md#first-useful-path) and only the native operations
 it uses. Start with the owner's installed Codex and existing login. Prefer the explicitly
@@ -97,11 +101,9 @@ model or billing route silently.
 - [x] **L2.1 Session/input/result.** Add the Codex plugin to the existing path:
       initialize/initialized → model discovery → thread/start → turn/start → events →
       final result. One app-server per Agent. Preserve requested/effective model and cwd.
-- [ ] **L2.2 Control.** Exact-turn steer/interrupt, exact approval/question replies,
+- [x] **L2.2 Control.** Exact-turn steer/interrupt, exact approval/question replies,
       stop and explicit resume of the retained thread. Implement the unknown outcome
       path as part of each verb, not as a later recovery subsystem.
-      Handlers are implemented and native stop/resume was exercised; native
-      steer/interrupt and approval/question checks remain before closing this item.
 - [x] **L2.3 Use it.** In a disposable existing workspace, launch one small file-edit
       task, watch tool/text events, collect its result, send another turn, stop and
       resume. Keep this brief; do not build all L7 fixtures before continuing.
