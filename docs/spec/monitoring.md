@@ -26,8 +26,9 @@ A hook may own a fact absent from the primary stream; it does not mirror lifecyc
 stream already owns. Transcript/history may privately track its cursor while the stream
 owns lifecycle, but it publishes only after an explicit handoff.
 
-Source handoff is one transaction: verify predecessor, record final cursor or
-`source.gap`, install successor. The successor publishes only afterward. There are no
+Initial ownership is committed before native I/O. Dynamic handoff uses the plugin
+protocol's single compare-and-swap request: verify predecessor, record final cursor or
+`source.gap`, install successor. The successor publishes only after commit. There are no
 source epochs or independent lifecycle projections.
 
 Health states are `ok|slow|stale|error`. Event-stream silence is not stale by itself; a
@@ -176,17 +177,26 @@ relative scratch paths; the branch is retained.
 
 ## Git and filesystem monitor
 
-One monitor per distinct live worktree:
+One monitor per distinct live worktree. Monitoring commands use a hermetic read-only Git
+invocation:
+
+```text
+git -c core.fsmonitor=false --no-optional-locks <command> ...
+```
+
+Diff/log commands additionally pass `--no-ext-diff`. The daemon sets
+`GIT_TERMINAL_PROMPT=0`, disables editors and does not inherit aliases. It never runs
+repository hooks, fsmonitor helpers, external diff drivers or textconv commands.
 
 - refresh on debounced filesystem invalidation and poll interval, at most once per 2 s;
-- `git --no-optional-locks status --porcelain=v2 --branch -z` for current state;
-- bounded log on HEAD movement from the last stored HEAD, so commits made while daemon
-  was down are recovered; no prior baseline yields an explicit gap;
-- committed-but-unmerged paths are computed against frozen `base_oid` when available;
+- `status --porcelain=v2 --branch -z` for current state;
+- bounded `log --no-ext-diff` on HEAD movement from the last stored HEAD, so commits made
+  while daemon was down are recovered; no prior baseline yields an explicit gap;
+- committed-but-unmerged paths are computed with `diff --no-ext-diff` against frozen
+  `base_oid` when available;
 - remote refs change only after explicit fetch or optional read-only `ls-remote` poll;
 - slow status backs off and reports source health;
-- monitor never runs hooks/fsmonitor/external diff helpers and never writes index, refs
-  or objects.
+- monitor never writes index, refs or objects.
 
 Current per-worktree Git sets live in memory and rebuild after restart. Per-Agent edit
 attribution is durable because Git cannot reconstruct authorship in a shared checkout:
@@ -271,6 +281,7 @@ repeats a native or external write.
 ## Views
 
 `watch`, `top`, `show`, `daemon.status` query projections/events. They expose generation,
-active/unknown turn/input gate, source owner/cursor/gap, custody capability/orphans,
-provider hold, workspace phase, requested/effective route and Git/edit facts. A stale or
-unknown value is shown explicitly, never hidden or converted to zero.
+active/unknown turn/input/transition gate, source owner/cursor/gap, custody
+capability/orphans, provider hold, workspace phase, requested/effective route and
+Git/edit facts. A stale or unknown value is shown explicitly, never hidden or converted
+to zero.
