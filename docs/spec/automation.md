@@ -163,13 +163,36 @@ Git action arguments are data, not command-line syntax:
 - monitoring/action Git calls disable hooks, fsmonitor, external diff and textconv as
   specified in [monitoring](monitoring.md#git-and-filesystem-monitor).
 
-No unknown command is run again. Git push readback compares the exact intended local OID
-with the exact remote ref at **every frozen effective push URL** after the process tree
-is gone; it uses those URLs directly rather than a mutable remote name. If any endpoint
-cannot be read or disagrees, the action remains unknown—it is never pushed again merely
-to discover the answer. Generic scripts/webhooks without exact readback remain unknown.
-A narrow repository writer hold prevents a later write from passing an older unknown
-write.
+Each Git command stores one immutable desired-state intent before its process starts:
+
+- `git.fetch`: freeze the configured full fetch refspecs plus the exact advertised remote
+  OID for every selected source ref and the corresponding local tracking ref. A ref
+  already at its intended OID is a no-op; otherwise fetch the exact frozen OID/refspec,
+  not whatever the moving remote ref names later;
+- `git.pull`: freeze current branch, upstream full ref and intended upstream OID; perform
+  only fetch + fast-forward to that OID—never merge/rebase or another branch;
+- `git.push`: freeze source full ref, its local OID, destination full ref and every
+  effective push URL. If refs are omitted, resolve the current branch and its configured
+  upstream; detached HEAD, missing/ambiguous upstream or non-fast-forward intent is a
+  deterministic failure. Execute one explicit `<source-ref>:<destination-ref>` refspec,
+  never force;
+- `git.worktree`: freeze repository, exact path, branch and base OID.
+
+No unknown command is run again. After the process tree is proven gone, readback can
+prove **applied** only from that frozen intent:
+
+| Action | Applied readback |
+| --- | --- |
+| fetch | every intended local tracking ref equals its frozen remote OID |
+| pull | the intended local branch HEAD equals the frozen upstream OID |
+| push | the destination ref at every frozen effective push URL equals the frozen local OID |
+| worktree | the exact frozen path is registered on the frozen branch at the intended base/current OID |
+
+If readback does not prove the intended state, the action remains `unknown` unless the
+process/native result separately proves no effect; it is never rerun merely to discover
+the answer. Push readback uses the frozen URLs directly rather than a mutable remote
+name. A narrow repository writer hold prevents a later write from passing an older
+unknown write. Generic scripts/webhooks without exact readback remain unknown.
 
 ## Frozen script inputs
 
@@ -297,6 +320,9 @@ rule/timer/Goal keys are level-reconciled after restart.
 - cause depth > 5 suppresses firing;
 - default per-rule 10 firings/minute and global 120 actions/minute, reconstructed from
   retained events/current command rows;
+- a configured `limit.window` may not exceed the retained rule-event accounting horizon;
+  otherwise the rule is rejected at load rather than silently resetting its limit after
+  retention/restart;
 - self-send/steer/inject from the Agent's own event requires `allow_self=true`;
 - draining/paused automation admits no new firing/Goal continuation;
 - every action passes the normal router again at dispatch.
