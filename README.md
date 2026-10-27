@@ -1,11 +1,9 @@
 # Eliot
 
-A small local controller for vendor coding-agent harnesses — Codex, Claude Code,
-Muse, OpenCode, Antigravity, ACP agents. Eliot launches them (optionally through a provider
-proxy such as OpenCodex), watches them in real time (events, processes, Git), controls
-them with one harness-neutral command language (`send`, `steer`, `inject`,
-`interrupt`, `approve`, `goal`, ...), automates reactions with rules and cron timers,
-and lets agents coordinate directly.
+A small local controller for vendor coding-agent harnesses—Codex, Claude Code, Muse,
+OpenCode, Antigravity and ACP agents. Eliot launches them through explicit provider
+routes, watches native/process/Git facts, controls them with one harness-neutral command
+language, automates bounded reactions and lets Agents coordinate directly.
 
 ```text
 eliot launch --profile codex-opencodex --worktree feat/routes "Add the /v2 routes"
@@ -18,19 +16,29 @@ eliot send a13 "review the diff of a12" --wait
 
 ## Status
 
-**v2 is being rebuilt from scratch, layer by layer** ([roadmap](docs/roadmap.md)).
-The v1 controller grew to 533k lines of Rust and 61k lines of process documents
-without qualifying its core paths. Its last commit is `dc6f70aa`; roadmap task L0.1
-tags it `v1-final` and removes v1 from `main`. Until then the code in this tree is v1
-and is not maintained (`git show dc6f70aa:<path>` reads it).
+**v2 is being rebuilt from scratch in connected layers.** v1 grew to roughly 533k Rust
+lines and 61k lines of process/audit documents without qualifying its core live paths.
+Its frozen pre-reset commit is `dc6f70aa`; roadmap L0.1 creates `v1-final` there before
+removing v1 from `main`. Until then, current implementation code is v1 legacy and must
+not be extended.
 
-## Documentation
+v2 copies small proven mechanisms from active donor projects—stable session + one
+incarnation fence, single authoritative event history, opaque cursors, level-based
+reconciliation and explicit delivery identity—rather than inventing another framework.
+See [donors](docs/reference/donors.md).
 
-- [Vision](docs/vision.md) — what and why, with the owner's original statement.
-- [Architecture](docs/architecture.md) — how it fits together.
-- [Roadmap](docs/roadmap.md) — what to build next and how it is tested.
-- [All docs](docs/README.md).
+## Start here
 
-Contributors and agents: read [AGENTS.md](AGENTS.md).
+1. [Vision](docs/vision.md)
+2. [Architecture](docs/architecture.md)
+3. [Roadmap](docs/roadmap.md)
+4. Only the linked specification/harness page and exact donor source
+5. [AGENTS.md](AGENTS.md)
 
-Third-party material in the v1 tree: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+During L0–L6: write the connected code first, run formatting plus smallest changed-package
+Clippy and avoid broad test bureaucracy. After the connected feature set exists, L7
+builds/runs the complete crash/restart, conformance, live, platform and load campaign.
+
+Third-party material still present in the v1 tree is listed in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md); L0.1 removes it with v1 code after the
+archive tag exists.
