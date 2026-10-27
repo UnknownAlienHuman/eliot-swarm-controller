@@ -66,9 +66,10 @@ reports, packets, inventories, progress documents or addenda.
 - **One source per lifecycle family.** A stream, transcript or hook owns each family for
   one generation. Handoff uses an opaque cursor or explicit stable gap. Never duplicate
   lifecycle through two sources.
-- **Commit before acknowledgement.** A complete native-record batch, daemon-computed
-  digest, source state/cursor and reducer projection commit before success is returned or
-  broadcast. A retried batch is wholly identical or an integrity error.
+- **Commit before acknowledgement.** One complete native-record batch, its daemon-
+  computed digest, source state/cursor and reducer projection commit before success is
+  returned or broadcast. A source has at most one unacknowledged batch; a retry is the
+  exact last batch or an integrity error. Do not add a source journal/epoch protocol.
 - **Explicit principal.** Owner CLI uses its private local token automatically; Agents
   and scripts use scoped tokens. Missing/mismatched identity rejects and never becomes
   owner.
@@ -78,13 +79,16 @@ reports, packets, inventories, progress documents or addenda.
 - **Actions are commands.** Do not introduce a second automation operation graph/run
   engine. An applied send is associated with a turn, not proof that the turn succeeded.
 - **Freeze admitted implementation.** The resolved profile includes the exact external
-  plugin command/private config and every referenced note/setup/script/plugin file as
-  bounded bytes or canonical-path+size+digest under an allowed root. Reload affects
-  future admissions only. Changed/missing bytes fail before execution; unknown setup is
-  never rerun. Do not add version gates or a global artifact CAS/GC.
-- **Git endpoints are data.** Validate fetch URLs and push URLs separately; `pushurl`
-  may differ from the fetch URL. Reject unapproved/custom remote helpers and use the
-  frozen effective push endpoint set for readback.
+  plugin command/private config, frozen nonsecret route environment and every referenced
+  note/setup/script/plugin file as bounded bytes or canonical-path+size+digest under an
+  allowed root. Reload affects future admissions only. Changed/missing bytes fail before
+  execution; unknown setup is never rerun. Do not add version gates or a global artifact
+  CAS/GC.
+- **Git network actions use an isolated transport view.** Do not execute fetch/push/
+  readback through mutable repository/global config or URL rewrites. Freeze direct
+  approved endpoints and refs/OIDs. Push `<frozen-oid>:<destination-ref>`, never a
+  mutable source branch; read back through the same isolated transport configuration.
+  There is no generic built-in pull.
 - **No secrets** in source, config values, Store semantic data, messages, fixtures or
   logs.
 - **No model calls in CI.** Record native traffic for the later replay/conformance
