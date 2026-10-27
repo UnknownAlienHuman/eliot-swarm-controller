@@ -63,10 +63,11 @@ UIs, ledgers or proof systems.
 4. **Unknown stays unknown.** No possible native/external effect is automatically
    replayed. Its narrow lane remains blocked until exact readback/resolution.
 5. **One source owns each lifecycle family.** Replacement is one compare-and-swap
-   handoff with a cursor boundary or an explicit gap; stream/transcript/hook never
+   handoff with a cursor boundary or an explicit stable gap; stream/transcript/hook never
    publish the same completion independently.
-6. **Persist before publish/ack.** Event, reducer projection and source cursor commit in
-   one transaction; only then does plugin/client receive success.
+6. **Persist before publish/ack.** One native-record batch, daemon-computed digest,
+   source state/cursor, reducer projection and derived events commit in one transaction;
+   only then does plugin/client receive success.
 7. **Events describe what happened; projections describe current state.** Views query
    them and are not another state machine.
 8. **Automation uses ordinary commands.** A deterministic rule/timer/Goal key creates
@@ -85,14 +86,20 @@ controls/observes it:
 - resume, detach and a new/uncertain controller takeover target current generation + 1;
 - the generation-changing command stores expected and target generation;
 - its **dispatch transaction** advances the fence before native I/O, revokes the old
-  controller/source/token, releases old claims, pauses Goals and stales old queued
-  commands;
+  controller/source/token, releases old claims, pauses Goals, stales old queued commands
+  and commits the target source plan/state;
+- if the target can receive its own Eliot environment, the same transaction creates the
+  one random target-generation token that the plugin/native process will receive. It is
+  never installed only after tools may already have started;
 - exact success installs the requested control/observe/profile projection;
 - definite failure never restores the revoked controller or decrements the fence:
   first start/resume becomes `failed`; takeover/detach becomes `lost` from Eliot's
   perspective, while the native subject may remain externally discoverable;
-- unknown transition leaves the target generation current, the previous observation
-  diagnostic-only and ordinary work blocked until exact readback/resolution;
+- unknown transition leaves the target generation current, preserves any token that may
+  have reached the target environment, leaves the previous observation diagnostic-only
+  and blocks ordinary work until exact readback/resolution;
+- exact readback may clear the target token only when it proves no process/session could
+  have received that environment;
 - exact reconnect to the same still-current writer/source ownership may preserve the
   generation;
 - exact turn/request ids bind work inside a generation.
@@ -137,22 +144,25 @@ fanout uses the same parent/derived-child representation and pages the fixed chi
 native record R
  → the family owner normalizes one bounded atomic event batch
  → events.put {agent:a12, generation:4, source:stream, events, cursor?}
- → daemon validates source ownership + generation + turn/request/native-id digest
+ → daemon validates source ownership + generation + turn/request/native ids
+ → daemon computes canonical event digests
  → one transaction:
-      events + cursor + reducer/projections + derived state
+      events + source state/cursor + reducer/projections + derived state
  → commit acknowledgement
  → bus → clients/rules/Goals
 ```
 
 Every durable event that may be resent after a lost acknowledgement has a stable
 normalized native id. A cursor-backed source may derive ids from cursor + record-local
-ordinal; a source with neither stable ids nor cursor records a gap instead of retrying a
-lost acknowledgement.
+ordinal; a source with neither stable ids nor cursor records an idempotent gap instead of
+retrying a lost acknowledgement. One native-record batch is all-new or an exact duplicate
+as a whole; a mixed retry is integrity failure.
 
 A replayable source resumes strictly after its opaque committed cursor. A source with no
-exclusive cursor reconnects at the live edge, records `source.gap`, snapshots current
-state and never republishes old history. `native_id` removes only bounded overlap; the
-same id with different payload is an integrity error.
+exclusive cursor reconnects at the live edge, records `source.gap` with a stable gap id,
+snapshots current state and never republishes old history. `native_id` removes only
+bounded overlap; the same id with different daemon-computed payload/cursor is an
+integrity error.
 
 Dynamic family replacement is one `source.handoff` compare-and-swap transaction: verify
 predecessor, record final cursor or gap, install successor. The successor publishes only
@@ -167,7 +177,7 @@ and native current state; one key is never reconciled concurrently with itself.
 
 - dispatched effects become unknown until verb-specific readback;
 - no reconcile pass replays an uncertain effect;
-- source owners/cursors determine recovery or gap;
+- source owners/state determine recovery or gap;
 - workspace/provider state prevents repeated setup/probe;
 - rules drain old/new definitions at their stored high-water boundary;
 - queued work runs only if its captured generation is still current;
