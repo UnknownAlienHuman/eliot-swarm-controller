@@ -75,34 +75,36 @@ Specs: [core](spec/core.md), [API](spec/api.md),
       subscribe live-buffer → persisted watermark replay → live. Plugin native-record
       batch commits events, daemon-computed digests, source state/cursor and reducer
       atomically and is acknowledged afterward. One family owner; exclusive cursor or
-      stable `gap_id`; a repeated native record is wholly new or an exact duplicate;
-      mixed replay or same id/different payload/cursor is integrity failure.
+      stable `gap_id`; at most one unacknowledged batch per source; last-batch receipt in
+      `source_state`; a retry is the exact last batch or integrity failure.
 - [ ] **L1.4 Daemon/IPC/principals.** Data-dir lock, boot/PID identity, current-user IPC,
       background/foreground daemon, status/drain/force. Owner CLI automatically uses
       private owner token; Agent/run/plugin principals are scoped; missing identity never
       becomes owner.
 - [ ] **L1.5 Configuration.** Global profiles/routes, narrowing project overlays,
-      minimal environment, accounts/proxies, bounded frozen note/setup/script inputs and
-      strict keys. Existing Agent snapshots do not silently follow reloads.
+      minimal environment, accounts/proxies and strict keys. Freeze external plugin
+      command/private config, nonsecret route environment and note/setup/script/plugin
+      files as bounded bytes or allowed path+size+digest. Existing Agent snapshots do
+      not silently follow reloads.
 - [ ] **L1.6 Plugin host/custody.** Typed framing/deadlines, per-Agent plugin generation
       and shared-service mode only after exact isolation. Source plan/state and target
-      generation token/environment are committed before native I/O; event batch commit
-      ack, idempotent child registration, attach/snapshot/readback, Windows Job and
-      honest degraded Unix process group.
+      generation token/environment are committed before native I/O; event-batch commit
+      acknowledgement, idempotent child registration, attach/snapshot/readback, Windows
+      Job and honest degraded Unix process group.
 - [ ] **L1.7 Router/readiness lanes.** Immutable admission, expected generation,
       linked first input, exact turn/request controls, FIFO future sends, unknown input/
       turn/transition gates, selectors/pagination, idempotent external ids,
       profile/account/proxy launch queue and no replay after restart.
 - [ ] **L1.8 Fake plugin.** Deterministic isolated sessions supporting session-first and
-      input-created starts, exact generation/turn/request rejection, atomic
+      input-created starts, exact generation/turn/request rejection, one-at-a-time atomic
       native-record batches, cursor/gap/source-state readback, requests/children,
       crash/hang/exit and snapshot readback.
 - [ ] **L1.9 CLI.** Daemon/status, launch/list/show/watch/events, core verbs,
       wait/result/turn, command children/cancel/resolve, JSON output, stable ids and
       documented exit codes.
 - [ ] **L1.10 Identity/secrets.** Agent token lifecycle by generation, dispatch-time
-      rotation/revocation, no independent token for routing-disabled children,
-      known-value masking and durable payload rejection.
+      rotation/revocation, terminal token revocation, no independent token for
+      routing-disabled children, known-value masking and durable payload rejection.
 - [ ] **L1.11 Qualification entrypoints.** Minimal recording/replay and `plugin-test`
       command surface only; complete cases are implemented/run in L7.
 
@@ -146,9 +148,10 @@ Specs: [monitoring](spec/monitoring.md).
 - [ ] **L3.1 Process monitor.** Boot/PID/birth identity, Agent vs service custody,
       OS-authoritative lifecycle/stats and source-drain-before-loss. Exact Windows,
       degraded Unix reporting.
-- [ ] **L3.2 Workspaces.** Frozen local base OID, one durable preparation row with
-      `creating|setup_ready|setup_running|ready|unknown|failed`, exact worktree readback,
-      frozen setup inputs, no rerun after unknown setup and explicit clean-only removal.
+- [ ] **L3.2 Workspaces.** Frozen local base OID, one durable preparation row bound to
+      target generation with `creating|setup_ready|setup_running|ready|unknown|failed`,
+      exact worktree readback, frozen setup inputs, no rerun after unknown setup and
+      explicit clean-only removal.
 - [ ] **L3.3 Git/filesystem/edit projection.** Read-only Git commands without hooks,
       fsmonitor, external diff, textconv or unapproved/custom remote helpers; watcher
       debounce, slow backoff, frozen-base diff, generation-bound `agent_edits` and
@@ -212,14 +215,16 @@ chatter.
 Specs: [automation](spec/automation.md).
 
 - [ ] **L6.1 Rules.** Strict TOML, committed-event cursor, event-time subject,
-      match/render guardrails, referenced-file digest watching and current+retiring
-      definition handoff at high-water H.
+      match/render guardrails, referenced-file digest watching, bounded backlog/retention
+      release and current+retiring definition handoff at high-water H.
 - [ ] **L6.2 Timers.** Anchored interval, cron/DST, one-shot, latest-only catch-up and
       durable schedule revision/key.
-- [ ] **L6.3 Actions as commands.** Agent, Git, mail, var, notify and emit commands in
-      order with deterministic ids, generation binding and verb-specific readback. Git
-      fetch and push endpoint sets are frozen/validated separately; push readback uses
-      every effective `pushurl`, never the fetch URL by assumption.
+- [ ] **L6.3 Actions as commands.** Agent, Git fetch/push/worktree, mail, var, notify and
+      emit commands in order with deterministic ids, generation binding and verb-specific
+      readback. Network Git uses a private isolated transport view with no mutable
+      repository/global URL rewrites; direct fetch endpoints and every pushurl are frozen
+      separately. Push sends `<frozen-oid>:<destination-ref>` and readback uses the same
+      frozen direct endpoints. There is no generic built-in pull.
 - [ ] **L6.4 Scripts.** Frozen file bytes/digest, scoped run token, bounded streams,
       validate-all then atomically create stdout actions; unknown script never reruns.
 - [ ] **L6.5 Approval policy.** Exact async request commands and deadline-bound
@@ -241,19 +246,19 @@ do not add proof documents or compatibility wrappers.
 
 - [ ] reducer table including stale generation/turn/request and duplicate inputs;
 - [ ] migrations/reopen, commit failure, group commit, source-owner/state/cursor/gap/
-      daemon-digest and idempotent write identity;
-- [ ] bus replay/live boundary, lag/history gap and all-new/exact-duplicate native-record
-      batch atomicity;
+      last-batch receipt, daemon-digest and idempotent write identity;
+- [ ] bus replay/live boundary, lag/history gap and exact-last-batch lost-ack recovery;
 - [ ] CLI fake path: linked launch/input, requests, FIFO/readiness lanes, unknown input/
-      turn/transition gate, dispatch-time target token, stop/resume generation,
-      selectors and capacity;
+      turn/transition gate, dispatch-time target token, terminal token revocation,
+      stop/resume generation, selectors and capacity;
 - [ ] daemon/plugin crash at each admission/commit/ack/readback boundary; no replay.
 
 ### L7.2 Plugin conformance and live harnesses
 
-- [ ] one black-box suite for manifest, source plan before native I/O, generation fence,
-      target environment/token, cursor/gap/state, exact turn/request, unknown non-retry,
-      attach/readback, child registration and custody;
+- [ ] one black-box suite for manifest, frozen plugin binding, source plan before native
+      I/O, generation fence, target environment/token, cursor/gap/state, one-at-a-time
+      batch lost-ack, exact turn/request, unknown non-retry, attach/readback, child
+      registration and custody;
 - [ ] replay current fixtures on supported platforms;
 - [ ] one compact live run per required harness/proxy, cheapest useful route;
 - [ ] requested vs effective route/model/permissions and child/source behavior.
@@ -263,9 +268,12 @@ do not add proof documents or compatibility wrappers.
 - [ ] process exit vs final source drain, adopted service isolation, workspace
       `setup_running` crash recovery and Git monitor noninterference;
 - [ ] exact mail recipient/ack crash cases, vars CAS, who/claims/hierarchy;
-- [ ] rule edit/high-water plus referenced-file change, deterministic failure cursor
-      advance, timer/DST, persisted provider probe and every external action crash phase;
-- [ ] fetch URL vs pushurl validation/readback, including rejected custom remote helper;
+- [ ] rule edit/high-water plus referenced-file change, bounded backlog pause/skipped
+      range, deterministic failure cursor advance, timer/DST, persisted provider probe
+      and every external action crash phase;
+- [ ] raw remote URL vs pushurl, applicable rewrite rejection, isolated transport config,
+      frozen-OID push, readback through frozen direct endpoints and rejected custom
+      remote helper;
 - [ ] Goal round/restart/generation/budget/no-progress/unknown gates.
 
 ### L7.4 Platform, security and recovery
@@ -273,7 +281,8 @@ do not add proof documents or compatibility wrappers.
 - [ ] Windows Job/handles/paths/non-ASCII/long input/file locks;
 - [ ] degraded Unix claims and optional exact Linux custody if required;
 - [ ] current-user IPC/private files, missing-principal rejection, generation-token
-      revocation, minimal env, project overlay/path escape/secret negatives;
+      revocation, minimal/frozen nonsecret env, project overlay/path escape/secret
+      negatives and frozen external plugin route;
 - [ ] drain/force with unknown blockers and attached services never killed.
 
 ### L7.5 Load and retention
