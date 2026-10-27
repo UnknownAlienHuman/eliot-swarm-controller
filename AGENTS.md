@@ -52,16 +52,21 @@ reports, packets, inventories, progress documents or addenda.
 - **Stable Agent, one generation fence.** Every Agent command/fact carries the current
   generation and exact turn/request where relevant. Do not add binding revisions,
   epochs or another identity layer.
+- **Fence before effect.** A generation-changing dispatch advances the fence, revokes
+  old identity/source ownership and—when direct identity is possible—commits the one
+  random target-generation token before plugin/native I/O. Unknown never rolls back the
+  generation or rotates another token. Do not add a routing key or derived-token system.
 - **Unknown stays unknown.** Never replay a possible native/external effect—not start,
   input, interrupt, stop, setup, script or push. Exact readback or explicit owner
   resolution only. Its narrow lane remains blocked.
 - **Start ≠ input ≠ turn result.** `session.ready`, input admission/association and
   terminal turn outcome are separate facts.
 - **One source per lifecycle family.** A stream, transcript or hook owns each family for
-  one generation. Handoff uses an opaque cursor or explicit gap. Never duplicate
+  one generation. Handoff uses an opaque cursor or explicit stable gap. Never duplicate
   lifecycle through two sources.
-- **Commit before acknowledgement.** Plugin facts, source cursor and reducer projection
-  commit before success is returned or broadcast.
+- **Commit before acknowledgement.** A complete native-record batch, daemon-computed
+  digest, source state/cursor and reducer projection commit before success is returned or
+  broadcast. A retried batch is wholly identical or an integrity error.
 - **Explicit principal.** Owner CLI uses its private local token automatically; Agents
   and scripts use scoped tokens. Missing/mismatched identity rejects and never becomes
   owner.
@@ -69,7 +74,13 @@ reports, packets, inventories, progress documents or addenda.
   never silently turn steer into send, resume into fresh unrelated launch or
   force-stop into killing a shared service.
 - **Actions are commands.** Do not introduce a second automation operation graph/run
-  engine.
+  engine. An applied send is associated with a turn, not proof that the turn succeeded.
+- **Freeze admitted inputs.** Notes/setup/scripts are bounded bytes or
+  canonical-path+size+digest under an allowed root. Changed bytes fail before execution;
+  unknown setup is never rerun.
+- **Git endpoints are data.** Validate fetch URLs and push URLs separately; `pushurl`
+  may differ from the fetch URL. Reject unapproved/custom remote helpers and use the
+  frozen effective push endpoint set for readback.
 - **No secrets** in source, config values, Store semantic data, messages, fixtures or
   logs.
 - **No model calls in CI.** Record native traffic for the later replay/conformance
