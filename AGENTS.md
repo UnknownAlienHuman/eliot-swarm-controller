@@ -77,9 +77,11 @@ reports, packets, inventories, progress documents or addenda.
   force-stop into killing a shared service.
 - **Actions are commands.** Do not introduce a second automation operation graph/run
   engine. An applied send is associated with a turn, not proof that the turn succeeded.
-- **Freeze admitted inputs.** Notes/setup/scripts are bounded bytes or
-  canonical-path+size+digest under an allowed root. Changed bytes fail before execution;
-  unknown setup is never rerun.
+- **Freeze admitted implementation.** The resolved profile includes the exact external
+  plugin command/private config and every referenced note/setup/script/plugin file as
+  bounded bytes or canonical-path+size+digest under an allowed root. Reload affects
+  future admissions only. Changed/missing bytes fail before execution; unknown setup is
+  never rerun. Do not add version gates or a global artifact CAS/GC.
 - **Git endpoints are data.** Validate fetch URLs and push URLs separately; `pushurl`
   may differ from the fetch URL. Reject unapproved/custom remote helpers and use the
   frozen effective push endpoint set for readback.
