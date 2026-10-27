@@ -46,7 +46,7 @@ Custody owners are simple strings:
 agent:<agent>#<generation>
 service:<name>
 action:<command-id>
-workspace:<agent>#<generation>
+workspace:<agent>#<target-generation>
 ```
 
 A process has one owner. Shared service PIDs belong to `service:<name>`, not every Agent
@@ -139,7 +139,7 @@ These rules apply to plugins, services, hooks, scripts, checks, Git and workspac
 ```sql
 CREATE TABLE workspaces (
   agent INTEGER PRIMARY KEY REFERENCES agents(id),
-  generation INTEGER NOT NULL,
+  target_generation INTEGER NOT NULL,
   project TEXT NOT NULL,
   repo_path TEXT NOT NULL,
   requested_branch TEXT NOT NULL,
@@ -154,20 +154,25 @@ CREATE TABLE workspaces (
 );
 ```
 
+The row belongs to the generation that the pending launch/resume will dispatch, while
+the Agent itself may still be generation 0 or the previous terminal generation.
 Admission resolves `REF^{commit}` locally, without fetch, and freezes the resulting OID.
 It also freezes each note/setup file as bounded bytes or canonical allowed
 `path+size+digest`; dispatch verifies the digest before executing.
 
 Flow:
 
-1. create Agent generation 0 and workspace phase `creating`;
+1. create/retain the Agent projection and workspace row for `target_generation` with
+   phase `creating`;
 2. run `git worktree add` against frozen OID;
 3. read back exact path, branch and HEAD; then set `phase=setup_ready`,
    `setup_index=0`;
 4. before setup entry `i` starts, commit `phase=setup_running`, `setup_index=i` and its
-   frozen argv/file identity; only then spawn it in workspace custody;
+   frozen argv/file identity; only then spawn it in
+   `workspace:<agent>#<target_generation>` custody;
 5. exact success commits `setup_ready,i+1`; after the last entry, commit `ready`;
-6. only `ready` permits native `agent.start`.
+6. only a `ready` row whose target generation matches the start command permits that
+   generation's native dispatch.
 
 A lost Git response is settled by exact worktree/path/branch/OID readback. A setup entry
 has no generic readback: after restart or lost process result, `setup_running` becomes
@@ -175,9 +180,9 @@ has no generic readback: after restart or lost process result, `setup_running` b
 rerun. The owner removes/recreates or explicitly resolves the workspace. This needs one
 row and one running marker, not a `workspace_steps` journal or artifact service.
 
-Cancellation stops the current custody. Native start never begins from a non-ready
-workspace. Removal is explicit, terminal-Agent only and clean-only except allowed
-relative scratch paths; the branch is retained.
+Cancellation stops the current custody. Native start never begins from a non-ready or
+wrong-target-generation workspace. Removal is explicit, terminal-Agent only and
+clean-only except allowed relative scratch paths; the branch is retained.
 
 ## Git and filesystem monitor
 
@@ -280,7 +285,7 @@ Callbacks and timers only enqueue stable keys. Deduplicated reconciliation reads
 and native current state, one key at a time:
 
 - `agent:<id>`: custody, attach/snapshot, open commands/input/turn/request, source owners;
-- `workspace:<id>`: phase/readback without repeating unknown setup;
+- `workspace:<id>`: target generation, phase/readback without repeating unknown setup;
 - `service:<name>`: adopted/managed service state;
 - `provider:<scope>`: hold/probe state;
 - `git:<worktree>`: rebuild current facts;
