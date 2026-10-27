@@ -23,11 +23,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install the repository-pinned toolchain
-        run: rustup show
+        # Keep this version aligned with rust-toolchain.toml.
+        run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
       - name: Formatting
         run: cargo fmt --check
       - name: Scoped Clippy and compile
