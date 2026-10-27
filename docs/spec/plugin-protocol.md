@@ -207,6 +207,11 @@ digest, updates source state and commits one bounded gap event before replying. 
 boundary/reason, or another id that conflicts with an already committed boundary, is
 `source_integrity`. A gap never changes family ownership by itself.
 
+A plugin permits at most one unacknowledged source-control operation (`source.gap` or
+`source.handoff`) per `(agent,generation,source)`. After a lost reply it calls
+`source.state` and settles that exact boundary before issuing another gap/handoff. This
+keeps one compact source-state row sufficient; there is no hidden boundary journal.
+
 `source.handoff` is the only dynamic owner-change operation. All named families in one
 request must currently have the same predecessor; otherwise split the handoff. The
 daemon verifies that predecessor and, in one transaction, records its final exclusive
@@ -224,14 +229,17 @@ paginated/bounded by the normal frame limits.
 service PIDs are service-owned. The OS monitor remains the lifecycle authority; plugin
 registration and OS enumeration upsert one identity/event.
 
-`child` is idempotent by `(parent generation, registration id, native subject)`. Repeating
-that tuple returns the same canonical child and, only while its current child generation
-is unchanged and `child_environment=true`, the same current memory-only token. Reusing a
-registration id for another subject, or the subject with a conflicting parent, is
-`source_integrity`. The plugin never persists the raw token and a retry from an old
-parent generation is rejected. Tree limits never erase a child the harness already
-created. A distinct token is returned only when the plugin can inject it before tools
-run.
+`child` is idempotent by `(parent generation, registration id, native subject)`. Its
+commit creates/returns the child row, child generation and initial source-owner/state
+plan before the reply. The plugin buffers child facts until that reply, then publishes
+them under the returned Agent/generation; overflow becomes an explicit child source gap,
+not guessed history. Repeating the tuple returns the same canonical child and, only
+while its current child generation is unchanged and `child_environment=true`, the same
+current memory-only token. Reusing a registration id for another subject, or the subject
+with a conflicting parent, is `source_integrity`. The plugin never persists the raw
+token and a retry from an old parent generation is rejected. Tree limits never erase a
+child the harness already created. A distinct token is returned only when the plugin can
+inject it before tools run.
 
 ## Cursors, replay and handoff
 
