@@ -154,54 +154,98 @@ adds no hidden wait/workflow state.
 | Action | Implementation |
 | --- | --- |
 | any core verb | normal generation/turn/request-bound command |
-| `git.fetch|pull|push|worktree` | daemon command with frozen desired state and verb-specific readback |
+| `git.fetch|git.push|git.worktree` | daemon command with frozen desired state and verb-specific readback |
 | `msg.send`, `var.set` | normal coordination mutation under rule principal |
 | `run` | bounded managed process command |
 | `notify` | bounded log/desktop or owner-configured named webhook command |
 | `emit` | persisted `x.user.*` event command |
 
-### Git actions
+There is no generic built-in `git.pull`: updating a checked-out worktree safely also
+requires project-specific policy for dirtiness, filters and generated files. Use
+`git.fetch` plus an explicit trusted script/Agent workflow when a project needs it.
 
-Arguments are data, not command-line syntax:
+## Git actions
+
+Git action arguments are data, not command-line syntax:
 
 - repo/workspace resolves to an owner-registered project path allowed to the rule;
 - remote is an owner-configured remote name, never a URL from event data. Reject empty,
   leading `-`, control characters, `::`, `ext::` and option-like values;
-- at admission freeze effective endpoints. Fetch/pull inspect every
-  `git remote get-url --all`; push separately inspects every
-  `git remote get-url --push --all`, because `pushurl` may differ. Every URL must use an
-  owner-approved scheme and no unapproved/custom helper. Revalidate unchanged before
-  dispatch;
+- read raw `remote.<name>.url` and `remote.<name>.pushurl` values. Automated network
+  actions reject any applicable `url.*.insteadOf` or `pushInsteadOf`; the owner must
+  configure direct approved endpoints for Eliot. `pushurl` is read separately and may
+  differ from fetch URL;
+- select one explicit approved fetch endpoint; push freezes every effective push
+  endpoint (all pushurls, otherwise the selected fetch URL). Each endpoint must use an
+  owner-approved transport and may not invoke an unapproved/custom remote helper;
 - refs are full `git check-ref-format` names and may not begin `-`; OIDs are exact
   hexadecimal object ids read from Git;
-- put `--` before pathspecs where supported and use explicit refspec argv;
-- monitoring/action Git calls disable hooks, fsmonitor, external diff and textconv.
+- placeholder-filled remote/ref/path values pass the same validation after rendering;
+- local monitoring/update commands disable hooks, fsmonitor, external diff and textconv.
 
-Each command stores one immutable desired-state intent before process start:
+### Isolated transport view
 
-- fetch: configured full fetch refspecs, exact advertised remote OID per selected source
-  ref and corresponding local tracking ref. Fetch exact frozen OID/refspec, not a later
-  moving ref;
-- pull: current branch, upstream full ref and intended upstream OID; only fetch +
-  fast-forward to that OID, never merge/rebase/another branch;
-- push: source full ref, its local OID, destination full ref and every effective push
-  URL. If omitted, resolve current branch/upstream; detached HEAD, missing/ambiguous
-  upstream or non-fast-forward intent fails. Use explicit
-  `<source-ref>:<destination-ref>`, never force;
-- worktree: repository, exact path, branch and base OID.
+Network fetch/push/readback never runs through the mutable repository/global Git
+configuration. Before admission Eliot creates one private temporary bare transport view
+for the action and freezes its canonical configuration:
 
-Unknown is never rerun. After custody is gone, readback proves applied only when:
+- system/global/XDG Git config are disabled or pointed to private empty files;
+- the private view contains only the direct frozen endpoint(s), owner-approved transport
+  and credential settings, object format and no `url.*`, aliases, hooks, filters,
+  fsmonitor, external diff or textconv;
+- the action process gets only the minimal environment and named secret references;
+- repository objects are shared through the documented object-directory/alternate
+  mechanism, while refs/config remain private to the transport view;
+- the private view and config digest are stored in the command intent and revalidated
+  before dispatch/readback.
+
+Because the direct endpoint is used in a config with no URL rewrite rules, readback does
+not feed an already rewritten URL through `insteadOf` a second time. A config/endpoint
+change fails before network I/O rather than silently changing transport.
+
+### Frozen desired state
+
+Each Git command stores one immutable desired-state intent before its process starts:
+
+- `git.fetch`: selected direct endpoint, source full ref, its advertised frozen OID,
+  target local tracking ref, expected old tracking OID and private transport digest;
+- `git.push`: source full ref for diagnostics, **frozen local OID**, destination full
+  ref, expected pre-push remote OID (or explicit absence), every direct push endpoint
+  and private transport digest;
+- `git.worktree`: repository, exact path, branch and base OID.
+
+Fetch runs in the private transport view and writes objects to the registered repository
+object database without changing its refs. It fetches the selected source ref into a
+private temporary ref, then verifies that ref equals the frozen advertised OID. Only
+then does Eliot update the real tracking ref with an atomic compare-and-swap
+`update-ref <target> <frozen-oid> <expected-old>`, with hooks disabled. If the remote ref
+moved, the action fails without changing the real tracking ref; a later firing may
+admit a new intent.
+
+Push uses the private transport view and explicit refspec:
+
+```text
+<frozen-local-oid>:<destination-full-ref>
+```
+
+never `<source-ref>:<destination-ref>`, because the source branch may advance after
+admission. Force is never used. If the remote destination is not an ancestor-compatible
+update, native push rejects it; Eliot never silently force-updates.
+
+### Unknown readback
+
+No unknown Git command is rerun. After its process custody is proven gone, readback uses
+the same private transport digest and direct endpoint(s):
 
 | Action | Exact applied state |
 | --- | --- |
-| fetch | every intended tracking ref equals its frozen remote OID |
-| pull | intended local branch HEAD equals frozen upstream OID |
-| push | destination ref at every frozen push URL equals frozen local OID |
+| fetch | target tracking ref equals frozen advertised OID |
+| push | destination ref at every frozen push endpoint equals frozen local OID |
 | worktree | exact path is registered on frozen branch at intended OID |
 
-Otherwise action remains unknown unless native/process result proves no effect. Push
-readback uses frozen URLs directly, not mutable remote name. A narrow repository writer
-hold blocks later writes behind an older unknown write. Generic scripts/webhooks without
+If readback does not prove the intended state, the action remains `unknown` unless the
+native/process result separately proves no effect. A narrow repository writer hold
+blocks later writes behind an older unknown write. Generic scripts/webhooks without
 exact readback remain unknown.
 
 ## Frozen script inputs
