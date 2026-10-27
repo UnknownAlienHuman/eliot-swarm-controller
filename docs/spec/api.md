@@ -57,7 +57,7 @@ subsystem.
 
 | Method | Semantics |
 | --- | --- |
-| `daemon.status/shutdown` | version, admission mode, caller, Store/WAL, plugins/services, source owners/gaps, custody and provider holds; exact drain/force |
+| `daemon.status/shutdown` | version, admission mode, caller, Store/WAL, plugins/services, source owners/state/gaps, custody and provider holds; exact drain/force |
 | `agent.list/get` | paginated Agent projection including generation, native subject, active turn/input/transition gate, source owners and pending requests |
 | `agent.wait/result` | exact captured generation/turn/Goal result |
 | `command.submit/get/children` | immutable admission, selector snapshot, linked first input and readback |
@@ -94,7 +94,7 @@ One Store transaction:
 
 1. resolves a concrete target or selector snapshot;
 2. validates principal/control, plugin capability and state;
-3. compares caller-supplied expected binding when present;
+3. compares any caller-supplied expected generation/turn/request;
 4. captures current generation and exact active turn/request;
 5. stores principal/method/payload identity and command rows/events.
 
@@ -106,18 +106,22 @@ Launch creates Agent generation 0 and a start command targeting generation 1. Re
 control takeover and detach expect current generation and target current + 1. For every
 generation-changing command, the dispatch transaction advances the Agent fence to the
 target generation **before native I/O**, revokes the old controller/source principal and
-Agent token, stales old-generation queued work, releases old-generation claims, pauses
-Goals and installs the target generation's source plan. The command then owns the only
-open transition for that Agent.
+old Agent token, stales old-generation queued work, releases old-generation claims,
+pauses Goals and installs the target generation's source plan/state. When the target can
+receive a distinct Eliot environment, that transaction also creates and commits one
+random target-generation token; the plugin receives it only in that target environment.
 
-Exact transport reconnect to the same still-current controller/source ownership may
-preserve generation. A first start/resume that definitely fails settles `failed`. A
-control takeover/detach that definitely fails settles `lost`: the old Eliot controller
-was intentionally revoked at dispatch and is not rolled back, even if the native subject
-may still exist externally. Unknown transition keeps the target generation current, old
-controller revoked and last observed projection diagnostic-only; it blocks another
-transition, send, configure and Goal continuation until exact readback or explicit owner
-resolution. Recovery is an explicit later attach/resume targeting another generation.
+The command then owns the only open transition for that Agent. Exact transport reconnect
+to the same still-current controller/source ownership may preserve generation. A first
+start/resume that definitely fails settles `failed`. A control takeover/detach that
+definitely fails settles `lost`: the old Eliot controller was intentionally revoked at
+dispatch and is not rolled back, even if the native subject may still exist externally.
+Unknown transition keeps the target generation and target token (when it may have reached
+a process) current, old controller revoked and last observed projection diagnostic-only;
+it blocks another transition, send, configure and Goal continuation until exact
+readback or explicit owner resolution. If readback proves no process/session could have
+received the target environment, settlement may clear that token. Recovery is an
+explicit later attach/resume targeting another generation.
 
 ### Linked first input
 
@@ -194,12 +198,14 @@ metadata; it creates no Agent rows.
 
 - first observe attach targets generation 1; later observe/control takeover targets the
   next generation;
-- dispatch advances the fence, revokes the prior controller/source/token and installs
-  the target generation's source plan before native I/O;
+- dispatch advances the fence, revokes the prior controller/source/token, commits the
+  target source plan/state and—only for qualified direct identity—the target token before
+  native I/O;
 - control attach validates owner-selected global profile, capacity and native
   compatibility before dispatch;
-- exact success commits the new controlled/observe projection, effective facts and a
-  rotated Agent token only when an isolated environment is available;
+- exact success commits the new controlled/observe projection and effective facts; it
+  confirms the already-created target token rather than rotating identity after tools
+  may have started;
 - definite failure of first attach is `failed`; definite failure of a takeover is
   `lost` for the target generation, with the native subject still discoverable if it
   remains external;
@@ -210,9 +216,9 @@ metadata; it creates no Agent rows.
 `detach` is valid only for independently living service/external sessions. Its dispatch
 advances generation and revokes the old Agent token/controller immediately so old tools
 cannot command replacement work. Exact success changes the target generation to
-observe-only and releases control claims. Definite failure settles `lost`; unknown keeps
-the transition gate until readback. It never settles an unknown input and never kills
-the service.
+observe-only and leaves it without an Agent token; definite failure settles `lost`;
+unknown keeps the transition gate until readback. It never settles an unknown input and
+never kills the service.
 
 `resume` targets the next generation and starts the same native subject. Old input is
 never resent. A failed resume is `failed`; an unknown resume remains `starting` and
