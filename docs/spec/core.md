@@ -371,12 +371,14 @@ CREATE TABLE source_state (
   CHECK((last_batch_id IS NULL AND last_batch_digest IS NULL
          AND last_batch_first_seq IS NULL AND last_batch_last_seq IS NULL)
         OR
-        (last_batch_id IS NOT NULL AND length(last_batch_digest)=32
+        (last_batch_id IS NOT NULL AND last_batch_digest IS NOT NULL
+         AND length(last_batch_digest)=32
          AND last_batch_first_seq IS NOT NULL
          AND last_batch_last_seq >= last_batch_first_seq)),
   CHECK((gap_id IS NULL AND gap_digest IS NULL
          AND gap_from IS NULL AND gap_to IS NULL)
-        OR (gap_id IS NOT NULL AND length(gap_digest)=32))
+        OR (gap_id IS NOT NULL AND gap_digest IS NOT NULL
+            AND length(gap_digest)=32))
 );
 
 CREATE TABLE commands (
