@@ -1,68 +1,88 @@
 # Donors
 
-What to borrow, from where, for which layer. A donor is a source of mechanisms or
-code; it is never a reason to import an application. Check the license before copying
-code. Vendor harness documentation is on the [harness pages](../harnesses/README.md).
+Borrow one proven mechanism at a time. Do not import an application, its workflow model
+or its document hierarchy. Before implementing a boundary listed below, read the exact
+source path and copy the shape unless a concrete Eliot constraint makes it incompatible;
+record that incompatibility in the PR.
 
-## Code from v1 (`git show v1-final:<path>`; before L0.1: `git show dc6f70aa:<path>`)
+Vendor protocol facts live on the [harness pages](../harnesses/README.md).
 
-Copy and cut down; do not depend on v1 crates. Paths are as of `dc6f70aa`.
+## Adopted runtime patterns
 
-| Mechanism | v1 path | Use in | Note |
+| Eliot boundary | Primary donor and exact source | Pattern to copy | Explicitly reject |
 | --- | --- | --- | --- |
-| Windows Job objects, process birth/image identity, Unix groups | `crates/swarm-process/src/process_group.rs` | L3.1 | 1,555 lines; take identity + job + kill-tree only. A Unix process group is degraded custody (members can `setsid` away, the group survives the daemon) — do not copy a claim that it is exact. |
-| Bounded child pipe capture | `crates/swarm-process/src/capture.rs` | L1.6, L6.4 | v1 capped 64 MiB per stream; v2 caps script output at 1 MiB. |
-| Private files (0600 / Windows ACL), durable replace | `crates/swarm-process/src/permissions.rs` | L1.4 (`daemon.json`, lock) | Keep only what L1.4 needs. |
-| Named pipe with user-only ACL | `crates/swarm-kernel-host/src/platform/windows.rs` | L1.4 | 145 lines, small and direct. |
-| Line-framed multiplexed IPC with frame limits | `crates/swarm-client/src/multiplex.rs`, `client.rs` | L1.4 | Drop the authentication layer. |
-| Process CPU/RSS sampling on Windows | `crates/swarm-observer/src/process_metrics.rs` | L3.1 | Or replace with `sysinfo`. |
-| Codex app-server protocol knowledge | `crates/swarm-adapter-codex/src/lib.rs` | L2 | Read for method names and edge cases; do not port its journals/checkpoints. |
-| Antigravity stream examples (from official docs) | `modules/antigravity/fixtures/*.stream.json` | L4.5 | Doc-derived, not live captures. |
-| Secret redaction (Apache-2.0, vendored Atlas) | `vendor/atlas/crates/atlas-redact` | L7.9 | Pattern-based redaction of persisted event text. |
+| Stable Agent + incarnation fencing | [`agent-primitives/sessions`](https://github.com/agent-primitives/sessions): `api/session.proto`, `api/harness.proto`, `eventlog/store.go`; [`sandbox-driver`](https://github.com/lithoscomputer/sandbox-driver): `crates/sandbox-driver-protocol/src/supervisor.rs` | Stable session/resource id; separate execution/turn id; one monotonic fence/generation; every append/call checks current fence; replacement serves only future work; old handles/results are stale. | Eliot's former `agent_bindings`, binding revisions/current pointer, grants or proof packets. |
+| Durable state reduction | [`Petri`](https://github.com/lithoscomputer/petri): `crates/core/execution/src/state.rs`, `crates/core/engine/src/apply.rs`, `replay.rs`; Agent Sessions `eventlog/store.go` | Validate against current state, durably append, then apply one pure reducer; replay reconstructs projection. Stable logical invocation id is separate from execution id. | Workflow DSL and Petri's product graph. |
+| Input/turn settlement | [`ACPX`](https://github.com/openclaw/acpx): `docs/shared-sessions.md`, `docs/session-watch.md`, `docs/2026-02-27-acpx-session-model.md` | Queue acceptance, actual prompt start and final result are separate; request id survives queueing; owner death without a result is unknown and not safely retryable; one authoritative journal and one derived checkpoint. | ACPX flow graph or queue format as Eliot's public model. |
+| Live/history reconciliation | [`Paseo`](https://github.com/getpaseo/paseo): `docs/timeline-sync.md`, `packages/app/src/timeline/viewed-timeline-sync.ts`; ACPX watch docs | Live stream is immediate overlay; authoritative paged history/cursor proves coverage; gaps are explicit; epoch/range replacement is atomic; never keep two discontiguous canonical ranges. | Paseo UI, client cache and JSON stores. |
+| Shared native service | [`Waku`](https://github.com/egoist/waku): `crates/waku-core/src/opencode_service.rs`, `driver/opencode.rs` | Adopted service is never killed; exact demultiplex by session id; subscribe before create; one settle point; stream disconnect is not process/session death; reconnect generation orders readback/reconciliation; HTTP acceptance is not delivery. | GPL code copying; app/UI architecture. Pattern only. |
+| Restart reconciliation | [`controller-runtime`](https://github.com/kubernetes-sigs/controller-runtime): `pkg/reconcile/reconcile.go`, `pkg/internal/controller/controller.go` | Queue a stable object key; deduplicate keys; read durable desired/current state every pass; never reconcile one key concurrently with itself. | Kubernetes stack and retrying uncertain external effects. |
+| Plugin/provider conformance | sandbox-driver: `crates/sandbox-driver-conformance/`, `crates/sandbox-driver-protocol/src/supervisor.rs`; Agent Sessions: `conformance/` | One semantic interface in-process and over transport; same black-box suite; real persistent Store plus fake/echo backend; replacement preserves provider namespace. | A second adapter interface or one-off fixture as proof. |
+| Mail identity and acknowledgement | [`CCCC`](https://github.com/ChesterRa/cccc): `crates/cccc-contracts/src/connect_message.rs`, `crates/cccc-core/src/connect_delivery.rs`; [`MCP Agent Mail`](https://github.com/Dicklesworthstone/mcp_agent_mail_rust): recipient/read/ack schema and conformance | Stable delivery id; sender id + generation; concrete recipients; content digest; persist before acknowledge; same id/different body rejects; reply/cancel bound to original delivery; read and ack are recipient-scoped and idempotent. | CCCC scheduler/ledger/PTY model; MCP Agent Mail liveness chatter, implicit identities and restrictive code. |
 
-Anti-donors in v1: result paging/assembly, per-adapter journals and tombstones,
-receipt/proof types, the Task/Attempt/review/acceptance Store, policy editions,
-module descriptors and provenance packaging.
+## Resulting Eliot model
 
-## Rust crates (check current version, license and MSRV when adding)
+The donor patterns above deliberately produce a small middle ground:
 
-| Crate | For |
+1. one stable Agent/native subject row;
+2. one integer `generation` fencing the current controlled incarnation;
+3. exact turn/request ids beneath it;
+4. one authoritative source per lifecycle family;
+5. an opaque cursor for every source that may replay; no cursor means live-edge + gap,
+   never historical replay;
+6. commit acknowledgement for persisted plugin events;
+7. one pure reducer and level-based restart reconciliation;
+8. unknown effects remain unknown and block their narrow lane;
+9. automation actions are ordinary commands;
+10. mail uses explicit delivery/recipient identities.
+
+This does **not** require binding revisions, source epochs/sequences, universal receipts,
+activation hierarchies, a generic run/action engine or content-addressed artifact GC.
+
+## v1 code donors
+
+Frozen source is commit `dc6f70aa`; after L0.1 the same tree is tag `v1-final`.
+Copy the narrow helper into v2 and cut every old dependency.
+
+| Mechanism | v1 path | Keep / reject |
+| --- | --- | --- |
+| Windows Job objects, process birth identity, Unix groups | `crates/swarm-process/src/process_group.rs` | Keep assign-before-resume Job, exact `(pid,start_time)` and kill/verify. Unix process group is degraded. Reject operation/scheduler coupling. |
+| Bounded child pipe capture | `crates/swarm-process/src/capture.rs` | Keep nonblocking bounded drain; v2 caps script streams at 1 MiB. |
+| Private file permissions and durable replace | `crates/swarm-process/src/permissions.rs` | Keep only helpers used by daemon/token/config files. |
+| Current-user Windows named-pipe ACL | `crates/swarm-kernel-host/src/platform/windows.rs` | Small direct helper; no internal auth platform. |
+| Multiplexed line IPC with frame limits | `crates/swarm-client/src/multiplex.rs`, `client.rs` | Keep framing/correlation; drop v1 grants/provenance. |
+| Process CPU/RSS sampling | `crates/swarm-observer/src/process_metrics.rs` | Use only if smaller/more exact than `sysinfo`. |
+| Codex app-server edge cases | `crates/swarm-adapter-codex/src/lib.rs` | Read method/correlation failures; do not port journals, checkpoints or receipts. |
+| Antigravity examples | `modules/antigravity/fixtures/*.stream.json` | Syntax hints only, not live evidence. |
+| Atlas redaction (Apache-2.0) | `vendor/atlas/crates/atlas-redact` | Optional late pattern matcher after known-value masking exists. |
+
+Never donate v1 Task/Attempt/review/acceptance/publication state, proof/receipt types,
+policy editions, adapter journals/tombstones, module descriptors, compatibility
+executors, CI patchers or audit/remediation trees.
+
+## Rust dependencies
+
+Check current release, license, maintenance and MSRV in the PR that first uses a crate.
+Do not add it merely because it appears here.
+
+| Crate | Concrete use |
 | --- | --- |
-| `tokio`, `serde`, `serde_json`, `thiserror`, `anyhow`, `tracing` | everywhere |
-| `rusqlite` (`bundled`, no bindgen features) | L1.2 |
-| `clap` (derive) | L1.9 |
-| `interprocess` or `tokio::net` named pipes + `UnixListener` | L1.4 |
-| `ulid` | command ids |
-| `sysinfo` | L3.1 |
-| `notify` (+ debouncer) | L3.3 |
-| `globset` | matchers, claims |
-| `croner` | L6.2 cron |
-| `windows-sys` | Job objects, pipe ACLs |
-| `agent-client-protocol` (Apache-2.0) | L4.6 ACP plugin |
-| `rmcp` (Apache-2.0) | L5.5 MCP server |
+| `tokio`, `serde`, `serde_json`, `thiserror`, `anyhow`, `tracing` | runtime/data/error/logging boundaries |
+| `rusqlite` with bundled SQLite and no bindgen hooks | Store |
+| `clap` derive | CLI |
+| `interprocess` or Tokio platform sockets | local IPC; choose one after a Windows spike |
+| `ulid` | external write ids |
+| `sysinfo` | bounded process metrics |
+| `notify` + one debouncer | filesystem invalidation |
+| `globset` | rule/path matching and claims |
+| one maintained cron parser | timers; verify timezone/DST semantics before choosing |
+| `windows-sys` | exact Job, process, handle and ACL calls |
+| `agent-client-protocol` | ACP plugin |
+| `rmcp` | MCP surface only if a required harness cannot use the CLI |
 
-## External design patterns
+## Other systems
 
-| Project | License | Borrow | Do not borrow |
-| --- | --- | --- | --- |
-| [sandbox-driver](https://github.com/lithoscomputer/sandbox-driver) | MIT | One provider trait usable in-process and over JSON-RPC; a conformance suite every provider must pass. | Its isolation claims. |
-| [agentsessions](https://github.com/aramase/agentsessions) | Apache-2.0 | Session/Harness/Runtime split; zero-model replay conformance tests. | Pre-1.0 wire as a stable API. |
-| [Paseo](https://github.com/getpaseo/paseo) | Apache-2.0 | Live vs canonical timeline, ranges/gaps, declaration-first child discovery, profiles with "when to use". | App, UI, JSON stores. |
-| [ACPX](https://github.com/openclaw/acpx) | MIT | One session owner, opaque cursors, replay/live boundary for ACP. | Its flows, queue as replay key, storage. |
-| [Waku](https://github.com/egoist/waku) | GPL-3.0 (pattern only, no code) | One ordered state owner; stream break ≠ session death; reconnect ≠ exit. | Any source. |
-| [Overstory](https://github.com/Nokodoko/overstory) | — | Typed SQLite mail, isolated worktrees per agent, agent discovery. | — |
-| [MCP Agent Mail](https://github.com/Dicklesworthstone/mcp_agent_mail_rust) | restrictive rider | Mail not chat; exact recipients; advisory path reservations. | Liveness chatter (92% of its mail), implicit identities. |
-| [Agency Swarm](https://github.com/VRSEN/agency-swarm) | — | Directional communication flows; handoff separate from send. | — |
-| [Gas Town](https://github.com/gastownhall/gastown) | — | Durable work state outside the model context; tiered escalation. | Separate work graph. |
-| [CCCC](https://github.com/ChesterRa/cccc) | Apache-2.0 | Delivery id, recipient scope, reply/cancel binding, size limits. | Scheduler, JSONL ledger, PTY heuristics. |
-| [Petri](https://github.com/lithoscomputer/petri) | MIT | Pure `apply(state, event)` reducer; replay tests. | Workflow DSL. |
-| [controller-runtime](https://github.com/kubernetes-sigs/controller-runtime) | Apache-2.0 | Level-based reconcile, dedup keys, error backoff. | Kubernetes stack. |
-| [OpenCodex](https://github.com/lidge-jun/opencodex) | MIT | Documented Management API (health, usage, settings). | Provider translation inside Eliot. |
-| Claude Swarm scripts (v1 predecessor) | — | Corrections before fresh work; explicit model/effort per agent; compact task cards; all review findings at once. | Marker files, lockdirs, newest-log ownership, hidden fallbacks. |
-
-Reviewed in v1 and not needed for v2 (details at `v1-final:docs/remediation/2026-10-08/36-donor-registry.md`):
-Restate, DBOS, ractor, Kingfisher, AgentGateway, OpenTelemetry, Langfuse, MCPProxy,
-portable-pty, alacritty_terminal, landlock, seccompiler, Snyk Agent Scan, Kandev
-(AGPL), OpenHands, Fabro, Cayu, systemd, REAPI, Pebble, Emdash, Goose, Helicon,
-Claw, Agent of Empires, Poracode, Sinew, CodeGraff, Pi-Go, OpenChamber, Delta,
-Agent Teams AI, Vicoa, JetBrains Air.
+Overstory, Agency Swarm and Gas Town remain product references for worktrees,
+directional communication and durable work outside model context, but they do not own a
+v2 core mechanism. Systems reviewed in v1 remain available under `v1-final`; do not
+re-import them without a concrete missing boundary.
