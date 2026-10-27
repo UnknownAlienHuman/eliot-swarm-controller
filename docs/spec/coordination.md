@@ -109,9 +109,11 @@ marked read. A crash or lost reply may display them again but cannot lose them; 
 arriving after the fetch are untouched. Ack is idempotent. `mail.read` reads/acks one
 exact current-generation delivery.
 
-Unread current-generation messages do not expire. Old-generation unread deliveries are
-historical rather than reassigned. Acknowledged history may be pruned after retention
-with explicit `history_gap` for old cursors.
+Unread deliveries of the **current** generation do not expire. An unread delivery from
+an older terminal/replaced generation is historical, never reassigned, and may be pruned
+after configured mail-history retention once no reply/thread reference needs it.
+Acknowledged history follows the same bounded retention. Requests before retained
+history return `history_gap` rather than silently skipping rows.
 
 ```sql
 CREATE TABLE messages (
