@@ -1,43 +1,67 @@
 # Harnesses
 
-Plugin order: Codex (L2) → Claude Code, Muse, OpenCode, Antigravity, ACP agents (L4)
-→ [others](others.md) only when needed. Proxies: [OpenCodex](opencodex.md),
-[local model servers](local-models.md). Each harness page lists official sources with
-the date they were checked and the facts still unverified (the short notes in
-[others](others.md) and [local-models](local-models.md) carry v1 facts only). When a plugin lands, update its column below
-from what the plugin actually does (not from docs).
+Implementation order: Codex (L2) → Claude Code, Muse, OpenCode, Antigravity and ACP
+(L4) → [others](others.md) only on concrete need. Provider services are separate:
+[OpenCodex](opencodex.md), [local models](local-models.md).
 
-## Capability matrix (from official docs, 2026-10-25)
+Each page records official/installed sources, check date, native identity, process mode,
+source ownership/cursor behavior and unverified facts. Update it from actual installed
+behavior when the plugin is implemented; advertised capability alone is not support.
 
-✓ documented native mechanism · ~ emulated by the plugin (mechanism reported) ·
-✗ not available (verb rejected) · ? to verify in that plugin's layer
+## Common plugin contract
 
-| Verb / feature | [Codex](codex.md) | [Claude Code](claude-code.md) | [Muse](muse.md) | [OpenCode](opencode.md) | [Antigravity](antigravity.md) | [ACP](acp.md) |
+Every harness page must answer:
+
+1. What exact `(native_scope,native_ref)` identifies one session?
+2. What creates a new Eliot `generation`, and what reconnect preserves it?
+3. Is the plugin `per_agent` or a proven isolated `shared` service client?
+4. Which source owns each lifecycle family while controlled and while observe-only?
+5. Which source has an opaque exclusive replay cursor? If none, reconnect records a gap
+   and starts at the live edge.
+6. What native id binds input→turn, steer/interrupt→turn and approval/answer→request?
+7. What exact readback settles a lost reply? Unsupported/unknown is preferable to
+   heuristic substitution.
+8. Can a native child receive an isolated Eliot environment before its tools run?
+9. What is the effective provider/account/permissions route, and how is it read back?
+
+No plugin adds binding revisions, source epochs, adapter journals or its own workflow
+engine. It uses the common generation/source/cursor/command contracts.
+
+## Capability matrix
+
+✓ qualified/documented native mechanism · ~ explicit weaker Eliot mechanism with its
+actual application point · ✗ rejected · ? unresolved until installed recording/live
+qualification
+
+| Feature | [Codex](codex.md) | [Claude](claude-code.md) | [Muse](muse.md) | [OpenCode](opencode.md) | [Antigravity](antigravity.md) | [ACP](acp.md) |
 | --- | --- | --- | --- | --- | --- | --- |
-| Transport | app-server, NDJSON stdio | Agent SDK / `-p` stream-json | MSP (JSON-RPC stdio) | HTTP + SSE | `agy` stream-json stdio | JSON-RPC stdio |
-| `launch` / `send` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| session before first input (else `start_requires_input`) | ✓ `thread/start` | ? init before first message | ✓ `session/start` | ✓ `POST /session` | ? `init` before first line | ✓ `session/new` |
-| process per agent | plugin + app-server | plugin + SDK/CLI | plugin + host | plugin + own `serve` (owner server: observe) | plugin + `agy` | plugin + agent |
-| children get their own environment (`child_environment`) | ✗ shared app-server | ✗ in-process | ? | ? per-session env API | ✗ in-process | ? |
-| `steer` | ✓ `turn/steer` | ~ PostToolUse `additionalContext` ? | ✓ expected-turn steer | ? | ✗ | ✗ |
-| `inject` | ~ steer / prepend | ✓ hook `additionalContext` | ~ steer / prepend | ? / prepend | ~ prepend | ~ prepend |
-| `interrupt` | ✓ `turn/interrupt` | ✓ `interrupt()` | ✓ `turn/interrupt` | ✓ `abort` | ? | ✓ `session/cancel` |
-| `resume` | ✓ `thread/resume` | ✓ `resume` | ✓ session resume | ✓ re-attach | ✓ `--conversation` | ? `session/load` |
-| `approve` / `deny` | ✓ request replies | ✓ `canUseTool` | ✓ choice ids | ✓ permission reply | ✗ policy only | ✓ `request_permission` |
-| `answer` | ✓ `requestUserInput` | ? AskUserQuestion | ✓ requirement ids | ? | ✗ | ✗ |
-| native goal | ✓ `thread/goal/*` | ? `/goal` | ✓ `goal/*` | ✗ → Eliot loop | ✗ → Eliot loop | ✗ → Eliot loop |
-| children | ✓ subagent threads | ✓ `parent_tool_use_id`, Subagent hooks | ✓ child provenance | ✓ `/children` | ✓ `subagent_info` | ? |
-| hooks | ✓ 12 events | ✓ 33 events | ? `hook/list` | ? plugins | ✓ (page exists) | ✗ |
-| transcripts | ✓ rollout JSONL | ✓ project JSONL | ? | ✓ SQLite (read-only) | ✗ | ✗ |
-| proxy wiring | ✓ `model_providers` | ✓ `ANTHROPIC_BASE_URL` | ✗ (Muse owns inference) | ✓ provider `baseURL` | ✗ | per agent |
+| Transport | app-server NDJSON stdio | Agent SDK / stream-json | MSP JSON-RPC stdio | HTTP + SSE service | `agy` stream-json | JSON-RPC stdio |
+| Eliot process mode | per-Agent | per-Agent | per-Agent | shared only after isolation proof; otherwise per-Agent server/observe | per-Agent | per-Agent |
+| Native subject | Codex store + thread id | Claude config/project + session id | Muse host/store + session id | server identity + session id | auth/config + conversation id | agent command/store + session id |
+| Controlled lifecycle owner | app-server stream | SDK/message stream | MSP stream | session-filtered SSE | stdout stream | ACP connection |
+| Observe/recovery cursor | rollout byte offset / native readback | JSONL offset / session readback | native view/page cursor | native history cursor if installed API proves it; else gap+snapshot | none qualified → gap+snapshot | agent-dependent; none by default |
+| session before first input | ✓ thread start | ? | ✓ session start | ✓ session create | ? | ✓ session/new |
+| isolated child environment | ✗ app-server shared | ✗ in-process | ? | ? installed per-session env | ✗ | agent capability-dependent |
+| `steer` | ✓ exact turn | ~ next hook context; not exact immediate steer | ✓ exact turn | ? exact native API only | ✗ | ✗ v1 |
+| `inject` | exact steer or next-send prepend | ✓ assigned hook context | steer/prepend | verified safe point or prepend | prepend next send | prepend next prompt |
+| `interrupt` | ✓ exact turn | ✓ active query | ✓ exact turn | ✓ exact session execution, verify scope | ? → reject until proven | ✓ active prompt cancel |
+| `resume` | ✓ thread resume, new Eliot generation | ✓ session resume | ✓ session resume | attach same native subject, new control generation | ✓ conversation | capability-dependent load/resume |
+| approvals/questions | exact request replies | exact SDK callbacks | exact choice/requirement ids | exact permission/input ids if installed API exposes them | no request channel | negotiated request ids |
+| native Goal | ✓ | ? | ✓ | ✗ Eliot Goal | ✗ Eliot Goal | ✗ Eliot Goal |
+| children | exact subagent threads | provenance/hooks | native child provenance | exact parent/session API | `subagent_info` | capability-dependent |
+| proxy route | named provider | base URL/auth env | none | provider base URL | none | agent-specific |
 
-## Writing a plugin
+## Implementing a plugin
 
-1. Read the harness page and the [plugin protocol](../spec/plugin-protocol.md).
-2. Record scenarios with `just record-<name>`
-   ([recordings](../spec/plugin-protocol.md#recordings)): the same scenarios as the
-   [Codex list](codex.md#scenarios), skipping what the harness cannot do.
-3. Implement against the recordings; pass `eliot plugin-test` in replay mode.
-4. Add `just live-<name>`, run it, paste the output in the PR.
-5. Where the harness behaved differently from this page or the matrix, correct them
-   with the source (recording name, version, date).
+1. Read its page, [plugin protocol](../spec/plugin-protocol.md) and the exact donor
+   boundary named in [donors](../reference/donors.md).
+2. Implement the real native path first. Missing semantics reject; no hidden fallback.
+3. Record only traffic needed to discover/implement the current verb; sanitize secrets
+   and record installed version/date.
+4. During L0–L6 run format + smallest changed-package Clippy. Keep named fixture/live
+   cases for final L7 conformance; do not build a broad campaign around every partial
+   task.
+5. Update this matrix from actual behavior.
+
+L7 runs one common black-box conformance suite over recordings and compact live runs for
+all required harnesses.
