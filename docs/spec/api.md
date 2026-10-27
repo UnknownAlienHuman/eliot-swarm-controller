@@ -96,6 +96,12 @@ track its result independently. Unassociated dispatched/unknown input blocks lat
 send/configure/Goal continuation; active/unknown turn blocks next turn; unknown transition
 blocks further takeover. Exact stop/interrupt/request replies/readback remain available.
 
+A dispatched or unknown `configure` also holds the settings lane: do not dispatch a
+later configure, new input or native/Eliot Goal start/resume until its exact outcome and
+effective settings are read back or explicitly resolved. Timeout does not release this
+hold, even when the observed Agent state is idle. This is a predicate over existing
+command rows, not another queue/table. Stop/interrupt/request replies/readback still work.
+
 ```text
 turn.get -> {agent,generation,turn_id,state:running|completed|unknown,
              command_ids,status?,final_text?,usage?,resolution_source?}
@@ -113,9 +119,10 @@ Known failure can include partial effects; it never implies rollback or automati
 
 Capture generation at call start. `turn --after-command ID` follows that input's exact
 association/result; without an id, capture the current turn or the first after the call
-high-water. `idle` requires no open input/turn/transition gate. `stopped` means terminal;
-`goal` captures its revision. Replacement returns `stale_generation`; timeout never
-cancels admitted work. Several native inputs may legitimately share one turn result.
+high-water. `idle` requires no open input/turn/transition or unresolved settings gate.
+`stopped` means terminal; `goal` captures its revision. Replacement returns
+`stale_generation`; timeout never cancels admitted work. Several native inputs may
+legitimately share one turn result.
 
 ## Discover, attach, detach and resume
 
@@ -145,8 +152,7 @@ mail for that same Agent; responses show the original recipient generation and a
 presentation. Resume does not resend the old prompt or retarget its presentation command.
 
 `mail.inbox` returns at most 100 deliveries within the encoded response-frame limit
-and marks nothing. `mail.read` is also
-read-only. After writing complete output, CLI sends:
+and marks nothing. `mail.read` is also read-only. After writing complete output, CLI sends:
 
 ```text
 mail.ack { id: <new write id>, deliveries: [<exact delivery id>, ...] }
