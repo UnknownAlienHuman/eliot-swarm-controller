@@ -16,7 +16,7 @@ symlink/reparse-point roots and unsafe ownership.
   rules/*.toml
   plugins/<name>/...
   services/<name>/...
-  frozen/<command-id>/... bounded admitted note/setup/script copies when needed
+  frozen/<opaque-safe-id>/... bounded admitted note/setup/script copies when needed
   worktrees/<agent>/...
 ```
 
@@ -145,14 +145,17 @@ For project notes/setup/scripts:
 1. resolve under the registered allowed root;
 2. reject `..`, symlink/reparse-point escape, device/alternate-stream forms;
 3. bound size and compute digest at admission;
-4. copy small text/scripts to private `frozen/<command-id>/` or store bounded bytes;
+4. copy small text/scripts to a private `frozen/<opaque-safe-id>/` directory or store
+   bounded bytes;
 5. otherwise store canonical path+size+digest and verify immediately before dispatch;
 6. mismatch fails the command rather than running different bytes.
 
-The directory key is the durable command/action id, including derived internal ids—not
-only an external write id. This is not a global content-addressed artifact store and has
-no artifact graph/GC. Frozen files are deleted only when no retained current snapshot or
-open/unknown command references them.
+The Store allocates the opaque directory component from a filesystem-safe alphabet and
+stores the resulting private path in the owning Agent snapshot, rule definition or
+command. It is not derived from an external/derived command string (which may contain
+`/`, `:` or other platform-invalid characters). There is no global content-addressed
+artifact store and no artifact graph/GC. Frozen copies are removed only when no retained
+current snapshot/definition or open/unknown command references them.
 
 ## Environment and secrets
 
