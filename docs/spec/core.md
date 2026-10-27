@@ -41,15 +41,22 @@ a native fork is a new subject and Agent.
 - every generation-changing command stores both `expected_generation` and
   `generation` (its target generation);
 - its dispatch transaction advances the Agent to the target generation **before native
-  I/O**, rotates or revokes direct routing identity as appropriate, stales queued work
-  from the old generation, releases old-generation claims and pauses Goals;
-- exact success updates the requested projection (for example controlled vs observe-only
-  and effective profile). Definite failure does not decrement the fence. An unknown
-  transition leaves the new generation current and blocks another transition or ordinary
-  turn work until exact readback or explicit owner resolution;
+  I/O**, revokes the old plugin/source principal and direct Agent token, stales queued
+  old-generation work, releases old-generation claims, pauses Goals and commits the
+  target generation's source-owner plan;
+- the old controller is never silently reactivated under the new fence. Exact success
+  installs the requested control/observe/profile projection. Definite failure of a
+  first start/resume becomes `failed`; definite failure of a takeover/detach becomes
+  `lost` from Eliot's perspective even if the native subject may still exist externally;
+- an unknown transition keeps the target generation current, the old controller
+  revoked and the last observed projection diagnostic-only. The open transition blocks
+  another transition and ordinary turn work until exact readback/owner resolution;
+- exact readback may install the requested target projection or prove no current Eliot
+  controller and settle `lost`. Recovery is an explicit later attach/resume targeting
+  another generation; generation never rolls back;
 - an exact attach snapshot may move an already-running native turn/request set into the
-  target generation in the same transaction. Without exact readback those items become
-  unknown; they are never guessed complete.
+  target generation in the same success transaction. Without exact readback those items
+  remain unknown; they are never guessed complete.
 
 Every Agent-scoped command, plugin request/event, turn, pending request, claim, Goal and
 native process registration carries the generation. Input from another generation is
@@ -119,19 +126,21 @@ of a token never becomes owner.
 
 Live states are `starting`, `idle`, `busy`, `waiting`. An open stop or generation
 transition is displayed beside the observed state; it does not create another synthetic
-state machine.
+state machine. While a generation transition is open, that displayed state is only the
+last observation: ordinary turn work is blocked and no controller is assumed current.
 
 | From | Generation-matched input | To/effect |
 | --- | --- | --- |
 | — | launch/first attach admitted | `created`, generation 0 |
-| `created` or terminal | `start_dispatched {target_generation}` | `starting`, generation becomes target, token rotates when `own_identity` |
-| live observe/control row | `transition_dispatched {target_generation}` | generation becomes target; retain last observed native state while the transition is open |
+| `created` or terminal | `start_dispatched {target_generation}` | `starting`, generation becomes target, old identity revoked |
+| live observe/control row | `transition_dispatched {target_generation}` | generation becomes target; old controller/source/token revoked; last state remains diagnostic while command is open |
 | `created` | stop/cancel before dispatch | `stopped`; linked input cancelled; no native I/O |
 | `starting` | `session.ready` or exact `attached` snapshot | reported `idle|busy|waiting` |
-| `starting` | definite pre-effect start failure | `failed` |
-| `starting` | possible start with lost result | state remains `starting`; start command unknown; no replacement start |
-| any transition | definite no-effect failure | retain the target generation and previous control projection; transition command failed |
-| any transition | possible effect with lost result | retain target generation and previous projection; transition command unknown and blocks another transition/turn |
+| `starting` | definite no-effect start/resume failure | `failed` |
+| `starting` | possible start with lost result | remains `starting`; start command unknown; no replacement start |
+| open takeover/detach | exact success/readback | install target projection and exact reported state |
+| open takeover/detach | definite failure/no current controller | `lost`; native subject may remain discoverable externally |
+| open takeover/detach | possible effect with lost result | retain diagnostic state + unknown transition gate until readback; no ordinary work |
 | `idle` | `turn.started {turn_id}` | `busy`, set `active_turn` |
 | `busy` | first exact request | `waiting` |
 | `waiting` | last request resolved | `busy` |
@@ -389,3 +398,6 @@ exclusive cursor has advanced past it. A source without a cursor must start at t
 edge after reconnect and therefore cannot replay pruned history. Native-id rows are kept
 at least through the source's declared bounded-overlap window; they may be pruned only
 when the cursor or explicit closed/gapped boundary makes replay of that fact impossible.
+Linked/selector command sets follow [D-35](../decisions.md): open/unknown children retain
+the parent, terminal children are pruned before it, and the entire paged set disappears
+before `command.children` returns `history_gap`.
