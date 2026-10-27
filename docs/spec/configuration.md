@@ -16,7 +16,7 @@ symlink/reparse-point roots and unsafe ownership.
   rules/*.toml
   plugins/<name>/...
   services/<name>/...
-  frozen/<opaque-safe-id>/... bounded admitted note/setup/script copies when needed
+  frozen/<opaque-safe-id>/... bounded admitted note/setup/script/plugin copies when needed
   worktrees/<agent>/...
 ```
 
@@ -119,28 +119,56 @@ billing or endpoint. An owner adds another global profile for a different route.
 
 Project rules/scripts remain project principals and can target only that project.
 
-## Frozen profile and admitted files
+## Frozen profile, plugin route and admitted files
 
-Admission stores one bounded `profile_snapshot` on the Agent/command. It contains:
+Admission stores one bounded `profile_snapshot` on the Agent/command:
 
 ```text
 ProfileSnapshot {
-  profile_name, harness, plugin,
+  profile_name, harness,
+  plugin: PluginBinding,
   model?, effort?, permissions, control,
   args, literal_env, pass_env_names, secret_env_names, inherit_env,
   account?, proxy?, billing?, workspace_mode, git_identity,
   labels, max_live?, stall_after, notify_parent, wake_on_mail,
   system_note?, setup[], scratch, source_files
 }
+PluginBinding {
+  name,
+  kind: builtin | external,
+  cmd?,                         // exact argv frozen at admission
+  private_config,               // canonical bounded nonsecret plugin config
+  private_config_digest,
+  executable?, referenced_files[]
+}
 FrozenFile { canonical_path, size, digest, private_copy? }
 ```
+
+For a built-in plugin, the route is its name inside the installed Eliot binary; its
+reported version is diagnostic, not an authorization gate. For an external plugin,
+admission freezes the exact command argv and canonical private config. The executable
+and every local script/module path named directly by `cmd` are resolved under an
+owner-controlled root and recorded as `FrozenFile` (or copied to a private frozen path
+when bounded). `PATH` lookup, mutable working-directory-relative commands and a command
+that resolves differently at dispatch are rejected.
+
+Dispatch uses the frozen `PluginBinding`, never the current `[plugins.<name>]` table. It
+rechecks every referenced path/digest before starting the plugin. A mismatch or missing
+old version fails before plugin/native I/O; it never silently substitutes a new binary,
+account, endpoint or plugin-private setting. A config reload creates bindings for future
+admissions only. An owner who wants an existing terminal Agent to use a new plugin route
+must explicitly resume/control-attach with a newly selected profile snapshot.
+
+This freezes semantic route/configuration, not vendor-version equality: an owner may
+install a new built-in Eliot build or explicitly choose a new versioned external path.
+The plugin still reports its actual version/effective route and L7 qualifies semantics.
 
 Secrets remain variable names only. Existing Agents never silently adopt a config reload.
 Resume uses its stored snapshot by default. A control takeover may use the stored snapshot
 or an explicitly selected owner profile; either choice is frozen before admission and
 the takeover targets the next Agent generation.
 
-For project notes/setup/scripts:
+For project notes/setup/scripts and external plugin files:
 
 1. resolve under the registered allowed root;
 2. reject `..`, symlink/reparse-point escape, device/alternate-stream forms;
@@ -201,15 +229,18 @@ changes account/model/provider/route.
 ## Plugins
 
 `[plugins.<name>] cmd` names an external plugin; omitted means built-in. Extra keys are
-private plugin configuration.
+private plugin configuration. Secret values are referenced by names and resolved only in
+memory; the frozen private config contains no secret values.
 
 The plugin manifest chooses `per_agent|shared`; config cannot weaken it. A per-Agent
 instance receives a private generation directory. A shared plugin must prove exact
 session attribution/readback/isolated stop according to the plugin protocol.
 
-The daemon obtains a manifest from a short initialize/shutdown probe and caches it until
-restart or command/config revision changes. Launch preflight uses the cached availability
-and capabilities; it does not create a native session.
+The daemon obtains a manifest from a short initialize/shutdown probe of the **current
+configured route** and caches it by `PluginBinding` digest. Launch preflight for an
+admitted Agent uses the manifest corresponding to its frozen binding; a later config
+reload cannot replace that route. Availability is rechecked at dispatch without creating
+a native session.
 
 ## Proxies and services
 
@@ -239,6 +270,6 @@ live qualification verifies it.
   repository config;
 - separate Cargo target directory per Agent worktree;
 - resolve executable and argv separately;
-- project cleanup/setup/scratch uses the path rules above;
+- project cleanup/setup/scratch and external plugin files use the path rules above;
 - no implicit fetch during launch admission or workspace dispatch;
 - configuration values/counts/strings are bounded before persistence or plugin framing.
