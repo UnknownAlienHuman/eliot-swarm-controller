@@ -42,6 +42,13 @@ Use the exact model advertised by the installed account's `model/list`; unavaila
 fails explicitly. [Codex](../harnesses/codex.md#first-useful-path) owns bring-up steps.
 Existing workspace and owner login suffice; no proxy/account registry is mandatory.
 
+The first native profile also accepts `cmd` (one executable, not a shell command),
+`effort`, and `approval_policy` (`never`, the default, or `on-request`). `permissions`
+selects the explicitly requested native sandbox: `read-only`, `workspace-write`, or
+`danger-full-access`; the default remains `workspace-write`. These values are frozen
+at admission. The supported approval and question callbacks are handled through exact
+pending request IDs; an unsupported callback receives an error, never a default choice.
+
 ## Later configuration example
 
 ```toml

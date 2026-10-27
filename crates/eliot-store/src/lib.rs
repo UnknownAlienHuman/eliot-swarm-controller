@@ -8,7 +8,7 @@ pub mod error;
 pub use crate::error::{Error, Result};
 use eliot_core::{
     self as core, Agent, AgentState, BatchAck, Command, CommandState, Effect, Event, NativeEvent,
-    SourceBatch, SubmitCommand, Turn, TurnState,
+    PendingRequest, SourceBatch, SourceGap, SourceGapAck, SubmitCommand, Turn, TurnState,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::de::DeserializeOwned;
@@ -18,6 +18,7 @@ use ulid::Ulid;
 
 const MAX_PAGE_ENTRIES: usize = 1_000;
 const MAX_PAGE_BYTES: usize = 900 * 1024;
+const MAX_NATIVE_FAMILIES: i64 = 9;
 const MAX_EVENT_BYTES: usize = 64 * 1024;
 const MAX_INPUT_BYTES: usize = 512 * 1024;
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -116,22 +117,19 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(sql_error)?;
-        if current > 1 {
+        if current > 3 {
             return Err(Error::new(
                 "unsupported",
                 format!("Store schema version {current} is newer than this binary"),
             ));
         }
-        if current == 1 {
-            return Ok(());
-        }
-
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sql_error)?;
-        tx.execute_batch(
-            "CREATE TABLE agents (
+        if current == 0 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE TABLE agents (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  generation INTEGER NOT NULL DEFAULT 0,
                  name TEXT UNIQUE,
@@ -243,9 +241,64 @@ impl Store {
                  created_at INTEGER NOT NULL
              );
              INSERT INTO schema_migrations(version) VALUES (1);",
-        )
-        .map_err(sql_error)?;
-        tx.commit().map_err(sql_error)
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 2 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE agents ADD COLUMN profile_snapshot TEXT NOT NULL DEFAULT '{}';
+                 ALTER TABLE agents ADD COLUMN native_scope TEXT;
+                 ALTER TABLE agents ADD COLUMN native_ref TEXT;
+                 ALTER TABLE agents ADD COLUMN effective TEXT;
+                 CREATE UNIQUE INDEX agents_native
+                     ON agents(native_scope, native_ref)
+                     WHERE native_scope IS NOT NULL AND native_ref IS NOT NULL;
+                 ALTER TABLE source_state ADD COLUMN gap_id TEXT;
+                 ALTER TABLE source_state ADD COLUMN gap_digest BLOB
+                     CHECK(gap_digest IS NULL OR length(gap_digest) = 32);
+                 ALTER TABLE source_state ADD COLUMN gap_from TEXT;
+                 ALTER TABLE source_state ADD COLUMN gap_to TEXT;
+                 ALTER TABLE source_state ADD COLUMN gap_seq INTEGER;
+                 INSERT INTO schema_migrations(version) VALUES (2);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 3 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE agents ADD COLUMN pending TEXT NOT NULL DEFAULT '[]';
+                 ALTER TABLE commands ADD COLUMN request_id TEXT;
+                 CREATE INDEX commands_request_open
+                     ON commands(target, generation, request_id, state)
+                     WHERE request_id IS NOT NULL;
+                 CREATE TABLE pending_requests (
+                     agent INTEGER NOT NULL REFERENCES agents(id),
+                     generation INTEGER NOT NULL,
+                     request_id TEXT NOT NULL,
+                     turn_id TEXT NOT NULL,
+                     kind TEXT NOT NULL,
+                     details TEXT NOT NULL,
+                     state TEXT NOT NULL CHECK(state IN ('pending', 'resolved', 'stale')),
+                     PRIMARY KEY(agent, generation, request_id)
+                 );
+                 CREATE INDEX pending_requests_open
+                     ON pending_requests(agent, generation, turn_id, request_id)
+                     WHERE state = 'pending';
+                 INSERT INTO schema_migrations(version) VALUES (3);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        Ok(())
     }
 
     fn ensure_writer_healthy(&self) -> Result<()> {
@@ -302,13 +355,22 @@ impl Store {
             ));
         }
         validate_ulid(&request.id)?;
-        let semantic_payload = json!({
+        let mut semantic_payload = json!({
             "target": request.target,
             "verb": request.verb,
             "args": request.args,
             "expected_generation": request.expected_generation,
             "expected_turn_id": request.expected_turn_id,
         });
+        if let Some(request_id) = request.request_id.as_deref() {
+            let object = semantic_payload.as_object_mut().ok_or_else(|| {
+                Error::new("internal", "command semantic payload is not an object")
+            })?;
+            object.insert(
+                "request_id".to_owned(),
+                Value::String(request_id.to_owned()),
+            );
+        }
         let payload_digest = canonical::digest(&semantic_payload)?;
         let tx = self
             .connection
@@ -351,6 +413,12 @@ impl Store {
                 if request.target.is_some() {
                     return Err(Error::new("invalid", "launch does not take a target"));
                 }
+                if request.request_id.is_some() {
+                    return Err(Error::new(
+                        "invalid",
+                        "launch does not take a native request id",
+                    ));
+                }
                 if request.expected_turn_id.is_some()
                     || request
                         .expected_generation
@@ -362,19 +430,46 @@ impl Store {
                     ));
                 }
                 let project = required_string(&request.args, "project")?;
-                let profile = required_string(&request.args, "profile")?;
-                let workspace = required_string(&request.args, "workspace")?;
-                let harness = request
-                    .args
-                    .get("harness")
-                    .and_then(Value::as_str)
-                    .unwrap_or("fake");
-                if profile != "fake" || harness != "fake" {
+                let harness = if request.args.get("harness").is_none() {
+                    "fake".to_owned()
+                } else {
+                    required_string(&request.args, "harness")?
+                };
+                if !matches!(harness.as_str(), "fake" | "codex") {
                     return Err(Error::new(
                         "unsupported",
-                        "L1 launch currently supports the fake profile and harness",
+                        format!("unsupported launch harness {harness}"),
                     ));
                 }
+                let profile = if request.args.get("profile").is_none() && harness == "fake" {
+                    "fake".to_owned()
+                } else {
+                    required_string(&request.args, "profile")?
+                };
+                if harness == "fake" && profile != "fake" {
+                    return Err(Error::new(
+                        "unsupported",
+                        "the fake harness requires the fake profile",
+                    ));
+                }
+                let profile_snapshot = match request.args.get("profile_snapshot") {
+                    Some(Value::Object(_)) => request.args["profile_snapshot"].clone(),
+                    Some(_) => {
+                        return Err(Error::new(
+                            "invalid",
+                            "args.profile_snapshot must be a JSON object",
+                        ));
+                    }
+                    None if harness == "fake" => json!({}),
+                    None => {
+                        return Err(Error::new(
+                            "invalid",
+                            "the codex harness requires a frozen profile_snapshot",
+                        ));
+                    }
+                };
+                let encoded_profile_snapshot = encode_json(&profile_snapshot)?;
+                let workspace = required_string(&request.args, "workspace")?;
                 if request.args.get("prompt").is_some() {
                     return Err(Error::new(
                         "invalid",
@@ -394,15 +489,23 @@ impl Store {
                         "command_id": request.id,
                         "profile": profile,
                         "workspace": workspace,
-                        "source_plan": {"session": "stream", "turn": "stream", "message": "stream"}
+                        "source_plan": source_plan_for_harness(&harness)?
                     }),
                 )?;
 
                 db!(tx.execute(
-                    "INSERT INTO agents(generation, project, harness, profile, workspace,
-                                            state, created_at, updated_at)
-                         VALUES (0, ?1, 'fake', 'fake', ?2, 'created', ?3, ?3)",
-                    params![project, workspace, now],
+                    "INSERT INTO agents(generation, project, harness, profile,
+                                            profile_snapshot, workspace, state,
+                                            created_at, updated_at)
+                         VALUES (0, ?1, ?2, ?3, ?4, ?5, 'created', ?6, ?6)",
+                    params![
+                        project,
+                        harness,
+                        profile,
+                        encoded_profile_snapshot,
+                        workspace,
+                        now
+                    ],
                 ));
                 let agent_num = tx.last_insert_rowid();
                 let agent_id = format_agent_id(agent_num);
@@ -413,7 +516,7 @@ impl Store {
                         "agent",
                         Some(agent_num),
                         Some(0),
-                        json!({"agent_id": agent_id, "project": project, "harness": "fake", "profile": "fake"}),
+                        json!({"agent_id": agent_id, "project": project, "harness": harness, "profile": profile}),
                     )?);
 
                 let state = CommandState::Accepted;
@@ -432,6 +535,7 @@ impl Store {
                         link_kind: None,
                         ordinal: None,
                         turn_id: None,
+                        request_id: None,
                         verb: "launch",
                         args: &request.args,
                         state,
@@ -486,6 +590,7 @@ impl Store {
                             link_kind: Some("send"),
                             ordinal: Some(0),
                             turn_id: None,
+                            request_id: None,
                             verb: "send",
                             args: &linked_args,
                             state: CommandState::Queued,
@@ -509,6 +614,12 @@ impl Store {
                 }
             }
             "send" | "stop" => {
+                if request.request_id.is_some() {
+                    return Err(Error::new(
+                        "invalid",
+                        "send and stop do not take a native request id",
+                    ));
+                }
                 let target = request.target.as_deref().ok_or_else(|| {
                     Error::new("invalid", "send and stop require an Agent target")
                 })?;
@@ -579,6 +690,7 @@ impl Store {
                             link_kind: None,
                             ordinal: None,
                             turn_id: None,
+                            request_id: None,
                             verb: "send",
                             args: &request.args,
                             state,
@@ -634,6 +746,7 @@ impl Store {
                             link_kind: None,
                             ordinal: None,
                             turn_id: request.expected_turn_id.as_deref(),
+                            request_id: None,
                             verb: "stop",
                             args: &request.args,
                             state,
@@ -654,10 +767,386 @@ impl Store {
                     None
                 }
             }
+            "resume" => {
+                let target = request
+                    .target
+                    .as_deref()
+                    .ok_or_else(|| Error::new("invalid", "resume requires an Agent target"))?;
+                let agent_num = parse_agent_id(target)?;
+                let agent = load_agent_by_num(&tx, agent_num)?.ok_or_else(|| {
+                    Error::new("not_found", format!("Agent {target} was not found"))
+                })?;
+                if agent.harness != "codex" {
+                    return Err(Error::new(
+                        "unsupported",
+                        "resume is only supported for a Codex Agent with a retained native subject",
+                    ));
+                }
+                if let Some(expected) = request.expected_generation
+                    && expected != agent.generation
+                {
+                    return Err(Error::new(
+                        "stale_generation",
+                        format!(
+                            "expected generation {expected}, current is {}",
+                            agent.generation
+                        ),
+                    ));
+                }
+                if request.expected_turn_id.is_some() {
+                    return Err(Error::new(
+                        "stale_generation",
+                        "resume cannot target an active turn",
+                    ));
+                }
+                if request.request_id.is_some() {
+                    return Err(Error::new(
+                        "invalid",
+                        "resume does not take a native request id",
+                    ));
+                }
+                if !matches!(
+                    agent.state,
+                    AgentState::Stopped | AgentState::Failed | AgentState::Lost
+                ) || agent.active_turn.is_some()
+                {
+                    return Err(Error::new(
+                        "bad_state",
+                        "resume requires a stopped, failed, or lost Agent with no active turn",
+                    ));
+                }
+                let native_scope = agent
+                    .native_scope
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| {
+                        Error::new(
+                            "unsupported",
+                            "resume requires a retained native_scope and native_ref",
+                        )
+                    })?;
+                let native_ref = agent
+                    .native_ref
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| {
+                        Error::new(
+                            "unsupported",
+                            "resume requires a retained native_scope and native_ref",
+                        )
+                    })?;
+                if request
+                    .args
+                    .as_object()
+                    .is_some_and(|args| args.keys().any(|key| key != "text"))
+                {
+                    return Err(Error::new(
+                        "unsupported",
+                        "resume accepts only new linked input text; profile and subject are retained",
+                    ));
+                }
+                let text = optional_string(&request.args, "text")?;
+                if let Some(text) = &text {
+                    require_nonempty(text, "args.text")?;
+                    check_input(text)?;
+                }
+                let next_generation = agent.generation.checked_add(1).ok_or_else(|| {
+                    Error::new("bad_state", "Agent generation cannot be incremented")
+                })?;
+                check_rpc_frame(
+                    "agent.start",
+                    &json!({
+                        "agent_id": agent.id,
+                        "generation": next_generation,
+                        "command_id": request.id,
+                        "profile": agent.profile,
+                        "workspace": agent.workspace,
+                        "resume_from": {
+                            "native_scope": native_scope,
+                            "native_ref": native_ref
+                        },
+                        "source_plan": source_plan_for_harness(&agent.harness)?
+                    }),
+                )?;
+                let resume_args = json!({});
+                insert_command(
+                    &tx,
+                    &CommandInsert {
+                        id: &request.id,
+                        principal,
+                        method: COMMAND_METHOD,
+                        payload_digest: &payload_digest,
+                        target: Some(agent_num),
+                        expected_generation: request.expected_generation,
+                        generation: Some(agent.generation),
+                        expected_turn_id: request.expected_turn_id.as_deref(),
+                        parent_command: None,
+                        link_kind: None,
+                        ordinal: None,
+                        turn_id: None,
+                        request_id: None,
+                        verb: "resume",
+                        args: &resume_args,
+                        state: CommandState::Accepted,
+                        outcome: None,
+                        created_at: now,
+                        updated_at: now,
+                    },
+                )?;
+                events.push(insert_daemon_event(
+                    &tx,
+                    now,
+                    "command.accepted",
+                    "command",
+                    Some(agent_num),
+                    Some(agent.generation),
+                    json!({"command_id": request.id, "verb": "resume"}),
+                )?);
+
+                if let Some(text) = text {
+                    let linked_id = format!("{}/send", request.id);
+                    let linked_args = json!({"text": text});
+                    check_rpc_frame(
+                        "agent.command",
+                        &json!({
+                            "agent_id": agent.id,
+                            "generation": next_generation,
+                            "command_id": linked_id,
+                            "verb": "send",
+                            "args": linked_args,
+                        }),
+                    )?;
+                    let linked_semantic = json!({
+                        "target": agent.id,
+                        "verb": "send",
+                        "args": linked_args,
+                        "expected_generation": next_generation,
+                        "expected_turn_id": Value::Null,
+                    });
+                    let linked_digest = canonical::digest(&linked_semantic)?;
+                    insert_command(
+                        &tx,
+                        &CommandInsert {
+                            id: &linked_id,
+                            principal,
+                            method: COMMAND_METHOD,
+                            payload_digest: &linked_digest,
+                            target: Some(agent_num),
+                            expected_generation: Some(next_generation),
+                            generation: Some(next_generation),
+                            expected_turn_id: None,
+                            parent_command: Some(&request.id),
+                            link_kind: Some("send"),
+                            ordinal: Some(0),
+                            turn_id: None,
+                            request_id: None,
+                            verb: "send",
+                            args: &linked_args,
+                            state: CommandState::Queued,
+                            outcome: None,
+                            created_at: now,
+                            updated_at: now,
+                        },
+                    )?;
+                    events.push(insert_daemon_event(
+                        &tx,
+                        now,
+                        "command.queued",
+                        "command",
+                        Some(agent_num),
+                        Some(next_generation),
+                        json!({
+                            "command_id": linked_id,
+                            "parent_command": request.id,
+                            "verb": "send"
+                        }),
+                    )?);
+                    Some(linked_id)
+                } else {
+                    None
+                }
+            }
+            "steer" | "interrupt" | "approve" | "deny" | "answer" => {
+                let target = request.target.as_deref().ok_or_else(|| {
+                    Error::new("invalid", "control command requires an Agent target")
+                })?;
+                let agent_num = parse_agent_id(target)?;
+                let agent = load_agent_by_num(&tx, agent_num)?.ok_or_else(|| {
+                    Error::new("not_found", format!("Agent {target} was not found"))
+                })?;
+                if agent.harness != "codex" {
+                    return Err(Error::new(
+                        "unsupported",
+                        format!(
+                            "{} is not supported by the {} harness",
+                            request.verb, agent.harness
+                        ),
+                    ));
+                }
+                if let Some(expected) = request.expected_generation
+                    && expected != agent.generation
+                {
+                    return Err(Error::new(
+                        "stale_generation",
+                        format!(
+                            "expected generation {expected}, current is {}",
+                            agent.generation
+                        ),
+                    ));
+                }
+                if !matches!(agent.state, AgentState::Busy | AgentState::Waiting) {
+                    return Err(Error::new(
+                        "bad_state",
+                        "turn controls require a busy or waiting Agent",
+                    ));
+                }
+                let turn_id = agent.active_turn.clone().ok_or_else(|| {
+                    Error::new("bad_state", "turn control requires an exact active turn")
+                })?;
+                if request
+                    .expected_turn_id
+                    .as_deref()
+                    .is_some_and(|expected| expected != turn_id.as_str())
+                {
+                    return Err(Error::new(
+                        "stale_generation",
+                        "expected turn does not match the current Agent turn",
+                    ));
+                }
+
+                let request_id = match request.verb.as_str() {
+                    "steer" | "interrupt" => {
+                        if request.request_id.is_some() {
+                            return Err(Error::new(
+                                "invalid",
+                                "steer and interrupt do not take a native request id",
+                            ));
+                        }
+                        None
+                    }
+                    _ => {
+                        let pending = if let Some(request_id) = request.request_id.as_deref() {
+                            require_nonempty(request_id, "request_id")?;
+                            let (pending, state) = load_pending_request(
+                                &tx,
+                                agent_num,
+                                agent.generation,
+                                request_id,
+                            )?
+                            .ok_or_else(|| {
+                                Error::new(
+                                    "not_found",
+                                    "pending request was not found in this Agent generation",
+                                )
+                            })?;
+                            if state != "pending" {
+                                return Err(Error::new(
+                                    "source_integrity",
+                                    "native request is no longer pending",
+                                ));
+                            }
+                            pending
+                        } else {
+                            capture_single_pending_request(&tx, agent_num, agent.generation)?
+                        };
+                        if pending.turn_id.as_str() != turn_id.as_str()
+                            || request
+                                .expected_turn_id
+                                .as_deref()
+                                .is_some_and(|expected| expected != pending.turn_id.as_str())
+                        {
+                            return Err(Error::new(
+                                "stale_generation",
+                                "pending request does not belong to the captured active turn",
+                            ));
+                        }
+                        if !agent.pending.contains(&pending) {
+                            return Err(Error::new(
+                                "source_integrity",
+                                "pending request row does not match the Agent projection",
+                            ));
+                        }
+                        if request.verb == "answer" && contains_secret_marker(&pending.details) {
+                            return Err(Error::new(
+                                "secret_in_payload",
+                                "answer to a secret question is not permitted",
+                            ));
+                        }
+                        if has_open_request_reply(
+                            &tx,
+                            agent_num,
+                            agent.generation,
+                            &pending.id,
+                            None,
+                        )? {
+                            return Err(Error::new(
+                                "bad_state",
+                                "a reply command is already unresolved for this native request",
+                            ));
+                        }
+                        Some(pending.id)
+                    }
+                };
+                if request.verb == "steer" {
+                    let text = required_string(&request.args, "text")?;
+                    check_input(&text)?;
+                }
+                let mut params = json!({
+                    "agent_id": agent.id,
+                    "generation": agent.generation,
+                    "command_id": request.id,
+                    "verb": request.verb,
+                    "turn_id": turn_id,
+                    "args": request.args,
+                });
+                if let Some(request_id) = request_id.as_deref() {
+                    params["request_id"] = Value::String(request_id.to_owned());
+                }
+                check_rpc_frame("agent.command", &params)?;
+                insert_command(
+                    &tx,
+                    &CommandInsert {
+                        id: &request.id,
+                        principal,
+                        method: COMMAND_METHOD,
+                        payload_digest: &payload_digest,
+                        target: Some(agent_num),
+                        expected_generation: request.expected_generation,
+                        generation: Some(agent.generation),
+                        expected_turn_id: request.expected_turn_id.as_deref(),
+                        parent_command: None,
+                        link_kind: None,
+                        ordinal: None,
+                        turn_id: Some(&turn_id),
+                        request_id: request_id.as_deref(),
+                        verb: &request.verb,
+                        args: &request.args,
+                        state: CommandState::Accepted,
+                        outcome: None,
+                        created_at: now,
+                        updated_at: now,
+                    },
+                )?;
+                events.push(insert_daemon_event(
+                    &tx,
+                    now,
+                    "command.accepted",
+                    "command",
+                    Some(agent_num),
+                    Some(agent.generation),
+                    json!({
+                        "command_id": request.id,
+                        "verb": request.verb,
+                        "turn_id": turn_id,
+                        "request_id": request_id
+                    }),
+                )?);
+                None
+            }
             verb => {
                 return Err(Error::new(
                     "unsupported",
-                    format!("L1 Store does not admit the {verb} verb"),
+                    format!("Store does not admit the {verb} verb"),
                 ));
             }
         };
@@ -802,7 +1291,7 @@ impl Store {
                             "command_id": id,
                         "profile": agent.profile,
                         "workspace": agent.workspace,
-                        "source_plan": {"session": "stream", "turn": "stream", "message": "stream"}
+                        "source_plan": source_plan_for_harness(&agent.harness)?
                     }),
                 )?;
                 let token = format!("{}{}", Ulid::new(), Ulid::new());
@@ -818,7 +1307,7 @@ impl Store {
                         "launch target changed before its generation token was committed",
                     ));
                 }
-                install_initial_source_plan(&tx, agent_num, 1, now)?;
+                install_initial_source_plan(&tx, agent_num, 1, &agent.harness, now)?;
                 update_command_state(&tx, id, CommandState::Dispatched, None, Some(1), now)?;
                 events.push(insert_daemon_event(
                     &tx,
@@ -837,6 +1326,155 @@ impl Store {
                     Some(agent_num),
                     Some(1),
                     json!({"command_id": id, "verb": "launch"}),
+                )?);
+            }
+            "resume" => {
+                if command.state != CommandState::Accepted
+                    || command_generation != agent.generation
+                    || command
+                        .command
+                        .expected_generation
+                        .is_some_and(|expected| expected != agent.generation)
+                    || !matches!(
+                        agent.state,
+                        AgentState::Stopped | AgentState::Failed | AgentState::Lost
+                    )
+                    || agent.active_turn.is_some()
+                {
+                    return Err(Error::new(
+                        "stale_generation",
+                        "resume no longer targets the captured terminal Agent generation",
+                    ));
+                }
+                if agent.harness != "codex" {
+                    return Err(Error::new(
+                        "unsupported",
+                        "resume is only supported for a Codex Agent",
+                    ));
+                }
+                let native_scope = agent
+                    .native_scope
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| {
+                        Error::new("unsupported", "resume has no retained native subject")
+                    })?;
+                let native_ref = agent
+                    .native_ref
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| {
+                        Error::new("unsupported", "resume has no retained native subject")
+                    })?;
+                let next_generation = agent.generation.checked_add(1).ok_or_else(|| {
+                    Error::new("bad_state", "Agent generation cannot be incremented")
+                })?;
+                check_rpc_frame(
+                    "agent.start",
+                    &json!({
+                        "agent_id": agent.id,
+                        "generation": next_generation,
+                        "command_id": id,
+                        "profile": agent.profile,
+                        "workspace": agent.workspace,
+                        "resume_from": {
+                            "native_scope": native_scope,
+                            "native_ref": native_ref
+                        },
+                        "source_plan": source_plan_for_harness(&agent.harness)?
+                    }),
+                )?;
+
+                for old_id in pending_command_ids(&tx, agent_num, agent.generation)? {
+                    if old_id == id {
+                        continue;
+                    }
+                    let outcome = json!({"reason": "generation_resumed"});
+                    update_command_state(
+                        &tx,
+                        &old_id,
+                        CommandState::Cancelled,
+                        Some(&outcome),
+                        None,
+                        now,
+                    )?;
+                    events.push(insert_daemon_event(
+                        &tx,
+                        now,
+                        "command.cancelled",
+                        "command",
+                        Some(agent_num),
+                        Some(agent.generation),
+                        json!({"command_id": old_id, "reason": "generation_resumed"}),
+                    )?);
+                }
+                db!(tx.execute(
+                    "UPDATE source_state SET state = 'closed', updated_at = ?1
+                     WHERE agent = ?2 AND generation = ?3 AND state = 'open'",
+                    params![now, agent_num, agent.generation],
+                ));
+                db!(tx.execute(
+                    "UPDATE pending_requests SET state = 'stale'
+                     WHERE agent = ?1 AND generation = ?2 AND state = 'pending'",
+                    params![agent_num, agent.generation],
+                ));
+                let token = format!("{}{}", Ulid::new(), Ulid::new());
+                let changed = db!(tx.execute(
+                    "UPDATE agents
+                     SET generation = ?1, state = 'starting', active_turn = NULL,
+                         pending = '[]', token = ?2, updated_at = ?3
+                     WHERE id = ?4 AND generation = ?5
+                       AND state IN ('stopped', 'failed', 'lost')
+                       AND active_turn IS NULL AND native_scope = ?6 AND native_ref = ?7",
+                    params![
+                        next_generation,
+                        token,
+                        now,
+                        agent_num,
+                        agent.generation,
+                        native_scope,
+                        native_ref
+                    ],
+                ));
+                if changed != 1 {
+                    return Err(Error::new(
+                        "stale_generation",
+                        "resume target changed before its new generation was committed",
+                    ));
+                }
+                install_initial_source_plan(&tx, agent_num, next_generation, &agent.harness, now)?;
+                update_command_state(
+                    &tx,
+                    id,
+                    CommandState::Dispatched,
+                    None,
+                    Some(next_generation),
+                    now,
+                )?;
+                events.push(insert_daemon_event(
+                    &tx,
+                    now,
+                    "agent.starting",
+                    "agent",
+                    Some(agent_num),
+                    Some(next_generation),
+                    json!({
+                        "agent_id": agent.id,
+                        "command_id": id,
+                        "resume_from": {
+                            "native_scope": native_scope,
+                            "native_ref": native_ref
+                        }
+                    }),
+                )?);
+                events.push(insert_daemon_event(
+                    &tx,
+                    now,
+                    "command.dispatched",
+                    "command",
+                    Some(agent_num),
+                    Some(next_generation),
+                    json!({"command_id": id, "verb": "resume"}),
                 )?);
             }
             "send" => {
@@ -949,10 +1587,118 @@ impl Store {
                     json!({"command_id": id, "verb": "stop"}),
                 )?);
             }
+            "steer" | "interrupt" | "approve" | "deny" | "answer" => {
+                if command_generation != agent.generation
+                    || command
+                        .command
+                        .expected_generation
+                        .is_some_and(|expected| expected != agent.generation)
+                {
+                    return Err(Error::new(
+                        "stale_generation",
+                        "control command targets a stale Agent generation",
+                    ));
+                }
+                if agent.harness != "codex" {
+                    return Err(Error::new(
+                        "unsupported",
+                        "control command is not supported by this harness",
+                    ));
+                }
+                if !matches!(agent.state, AgentState::Busy | AgentState::Waiting) {
+                    return Err(Error::new(
+                        "bad_state",
+                        "control command requires a busy or waiting Agent",
+                    ));
+                }
+                let turn_id = command.command.turn_id.as_deref().ok_or_else(|| {
+                    Error::new("source_integrity", "control command has no captured turn")
+                })?;
+                if command
+                    .expected_turn_id
+                    .as_deref()
+                    .is_some_and(|expected| expected != turn_id)
+                    || agent.active_turn.as_deref() != Some(turn_id)
+                {
+                    return Err(Error::new(
+                        "stale_generation",
+                        "control command no longer targets the exact active turn",
+                    ));
+                }
+                if matches!(command.command.verb.as_str(), "approve" | "deny" | "answer") {
+                    let request_id = command.command.request_id.as_deref().ok_or_else(|| {
+                        Error::new(
+                            "source_integrity",
+                            "request reply has no captured request id",
+                        )
+                    })?;
+                    let Some((pending, state)) =
+                        load_pending_request(&tx, agent_num, agent.generation, request_id)?
+                    else {
+                        return Err(Error::new(
+                            "stale_generation",
+                            "captured native request is no longer present",
+                        ));
+                    };
+                    if state != "pending"
+                        || pending.turn_id.as_str() != turn_id
+                        || !agent.pending.contains(&pending)
+                    {
+                        return Err(Error::new(
+                            "stale_generation",
+                            "request reply no longer matches its exact pending request",
+                        ));
+                    }
+                    if has_open_request_reply(
+                        &tx,
+                        agent_num,
+                        agent.generation,
+                        request_id,
+                        Some(id),
+                    )? {
+                        return Err(Error::new(
+                            "bad_state",
+                            "another reply command is unresolved for this native request",
+                        ));
+                    }
+                } else if command.command.request_id.is_some() {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "turn control unexpectedly has a native request id",
+                    ));
+                }
+                let mut params = json!({
+                    "agent_id": agent.id,
+                    "generation": agent.generation,
+                    "command_id": id,
+                    "verb": command.command.verb,
+                    "turn_id": turn_id,
+                    "args": command.command.args,
+                });
+                if let Some(request_id) = command.command.request_id.as_deref() {
+                    params["request_id"] = Value::String(request_id.to_owned());
+                }
+                check_rpc_frame("agent.command", &params)?;
+                update_command_state(&tx, id, CommandState::Dispatched, None, None, now)?;
+                events.push(insert_daemon_event(
+                    &tx,
+                    now,
+                    "command.dispatched",
+                    "command",
+                    Some(agent_num),
+                    Some(agent.generation),
+                    json!({
+                        "command_id": id,
+                        "verb": command.command.verb,
+                        "turn_id": turn_id,
+                        "request_id": command.command.request_id
+                    }),
+                )?);
+            }
             verb => {
                 return Err(Error::new(
                     "unsupported",
-                    format!("L1 Store does not dispatch the {verb} verb"),
+                    format!("Store does not dispatch the {verb} verb"),
                 ));
             }
         }
@@ -1091,6 +1837,9 @@ impl Store {
                 "send is applied only after exact turn association is committed",
             ));
         }
+        if state == CommandState::Applied && is_turn_control(&record.command.verb) {
+            validate_control_applied_outcome(&record.command, id, outcome.as_ref())?;
+        }
 
         let target = record.target;
         let generation = record.command.generation;
@@ -1107,11 +1856,16 @@ impl Store {
             json!({"command_id": id, "state": state_name, "outcome": outcome}),
         )?);
 
-        if record.command.verb == "launch"
+        if matches!(record.command.verb.as_str(), "launch" | "resume")
             && matches!(state, CommandState::Rejected | CommandState::Failed)
         {
             if let (Some(agent_num), Some(generation)) = (target, generation) {
-                fail_start_tx(&tx, agent_num, generation, id, now, &mut events)?;
+                let reason = if record.command.verb == "resume" {
+                    "resume_failed"
+                } else {
+                    "launch_failed"
+                };
+                fail_start_tx(&tx, agent_num, generation, id, reason, now, &mut events)?;
             }
         } else if record.command.verb == "stop"
             && state == CommandState::Applied
@@ -1155,8 +1909,9 @@ impl Store {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT id, generation, name, project, harness, profile, workspace,
-                        state, active_turn, created_at, updated_at
+                "SELECT id, generation, name, project, harness, profile,
+                        profile_snapshot, native_scope, native_ref, workspace, effective,
+                        pending, state, active_turn, created_at, updated_at
                  FROM agents WHERE id > ?1 ORDER BY id LIMIT ?2",
             )
             .map_err(sql_error)?;
@@ -1177,8 +1932,9 @@ impl Store {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT id, generation, name, project, harness, profile, workspace,
-                        state, active_turn, created_at, updated_at
+                "SELECT id, generation, name, project, harness, profile,
+                        profile_snapshot, native_scope, native_ref, workspace, effective,
+                        pending, state, active_turn, created_at, updated_at
                  FROM agents
                  WHERE state IN ('created', 'starting', 'idle', 'busy', 'waiting')
                  ORDER BY id LIMIT ?1",
@@ -1202,7 +1958,7 @@ impl Store {
             .connection
             .prepare(
                 "SELECT id, principal, method, target, expected_generation, generation,
-                        expected_turn_id, turn_id, verb, args, state, outcome,
+                        expected_turn_id, turn_id, request_id, verb, args, state, outcome,
                         created_at, updated_at
                  FROM commands
                  WHERE state IN ('accepted', 'queued', 'dispatched', 'unknown')
@@ -1434,6 +2190,185 @@ impl Store {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{Store, contains_secret_marker};
+    use eliot_core::{CommandState, NativeEvent, SourceBatch, SubmitCommand};
+    use serde_json::json;
+    use std::{
+        path::Path,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+    use ulid::Ulid;
+
+    #[test]
+    fn secret_question_answer_is_rejected_before_command_persistence() {
+        assert!(contains_secret_marker(
+            &json!({"questions": [{"is_secret": true}]})
+        ));
+        assert!(contains_secret_marker(
+            &json!({"native": {"question": {"isSecret": true}}})
+        ));
+        assert!(!contains_secret_marker(
+            &json!({"questions": [{"is_secret": false}]})
+        ));
+
+        let launch_id = Ulid::new().to_string();
+        let send_id = Ulid::new().to_string();
+        let answer_id = Ulid::new().to_string();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time is after the Unix epoch")
+            .as_millis()
+            .try_into()
+            .expect("system time in milliseconds fits in i64");
+        let mut store = Store::open(Path::new(":memory:")).expect("open in-memory Store");
+        let admission = store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: launch_id.clone(),
+                    target: None,
+                    verb: "launch".to_owned(),
+                    args: json!({
+                        "project": "secret-answer-regression",
+                        "workspace": "synthetic-workspace",
+                        "harness": "codex",
+                        "profile": "synthetic-codex",
+                        "profile_snapshot": {}
+                    }),
+                    expected_generation: Some(0),
+                    expected_turn_id: None,
+                    request_id: None,
+                },
+                now,
+            )
+            .expect("admit Codex launch");
+        let started = store
+            .dispatch(&launch_id, now)
+            .expect("dispatch Codex launch");
+        let agent_id = admission
+            .command
+            .target
+            .expect("launch admission returns its Agent");
+        assert_eq!(started.value.generation, Some(1));
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: Ulid::new().to_string(),
+                    agent_id: agent_id.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        kind: "session.ready".to_owned(),
+                        native_id: "ready-1".to_owned(),
+                        data: json!({
+                            "native_scope": "synthetic-codex-home",
+                            "native_ref": "synthetic-thread",
+                            "effective": {}
+                        }),
+                    }],
+                    cursor: None,
+                },
+                now,
+            )
+            .expect("commit synthetic session readiness");
+        store
+            .settle(
+                &launch_id,
+                CommandState::Applied,
+                Some(json!({"state": "ready"})),
+                now,
+            )
+            .expect("settle launch");
+        store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: send_id.clone(),
+                    target: Some(agent_id.clone()),
+                    verb: "send".to_owned(),
+                    args: json!({"text": "trigger synthetic request"}),
+                    expected_generation: Some(1),
+                    expected_turn_id: None,
+                    request_id: None,
+                },
+                now,
+            )
+            .expect("admit synthetic input");
+        store
+            .dispatch(&send_id, now)
+            .expect("dispatch synthetic input");
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: Ulid::new().to_string(),
+                    agent_id: agent_id.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        kind: "turn.started".to_owned(),
+                        native_id: "turn-started-1".to_owned(),
+                        data: json!({"command_id": send_id, "turn_id": "turn-1"}),
+                    }],
+                    cursor: None,
+                },
+                now,
+            )
+            .expect("commit synthetic turn start");
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: Ulid::new().to_string(),
+                    agent_id: agent_id.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        kind: "request.opened".to_owned(),
+                        native_id: "request-opened-1".to_owned(),
+                        data: json!({
+                            "command_id": send_id,
+                            "request_id": "public-request-1",
+                            "turn_id": "turn-1",
+                            "kind": "question",
+                            "details": {
+                                "questions": [{"id": "q1", "is_secret": true}]
+                            }
+                        }),
+                    }],
+                    cursor: None,
+                },
+                now,
+            )
+            .expect("commit synthetic secret question");
+
+        let marker = "synthetic-answer-secret-marker";
+        let error = store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: answer_id.clone(),
+                    target: Some(agent_id),
+                    verb: "answer".to_owned(),
+                    args: json!({"text": marker}),
+                    expected_generation: None,
+                    expected_turn_id: None,
+                    request_id: None,
+                },
+                now,
+            )
+            .expect_err("secret question answers must be rejected");
+        assert_eq!(error.code, "secret_in_payload");
+        assert!(
+            store
+                .get_command(&answer_id)
+                .expect("read rejected answer command")
+                .is_none(),
+            "rejected answer args must not be persisted"
+        );
+    }
+}
+
 struct AgentRecord {
     id: i64,
     generation: i64,
@@ -1441,7 +2376,12 @@ struct AgentRecord {
     project: String,
     harness: String,
     profile: String,
+    profile_snapshot: String,
+    native_scope: Option<String>,
+    native_ref: Option<String>,
     workspace: Option<String>,
+    effective: Option<String>,
+    pending: String,
     state: String,
     active_turn: Option<String>,
     created_at: i64,
@@ -1468,11 +2408,18 @@ struct TurnRecord {
 
 struct SourceStateRecord {
     cursor: Option<String>,
+    last_store_seq: Option<i64>,
     last_batch_id: Option<String>,
     last_batch_digest: Option<Vec<u8>>,
     last_batch_first_seq: Option<i64>,
     last_batch_last_seq: Option<i64>,
     state: String,
+    health: String,
+    gap_id: Option<String>,
+    gap_digest: Option<Vec<u8>>,
+    gap_from: Option<String>,
+    gap_to: Option<String>,
+    gap_seq: Option<i64>,
 }
 
 struct CommandInsert<'a> {
@@ -1488,6 +2435,7 @@ struct CommandInsert<'a> {
     link_kind: Option<&'a str>,
     ordinal: Option<i64>,
     turn_id: Option<&'a str>,
+    request_id: Option<&'a str>,
     verb: &'a str,
     args: &'a Value,
     state: CommandState,
@@ -1550,15 +2498,21 @@ fn agent_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecor
         project: row.get(3)?,
         harness: row.get(4)?,
         profile: row.get(5)?,
-        workspace: row.get(6)?,
-        state: row.get(7)?,
-        active_turn: row.get(8)?,
-        created_at: row.get(9)?,
-        updated_at: row.get(10)?,
+        profile_snapshot: row.get(6)?,
+        native_scope: row.get(7)?,
+        native_ref: row.get(8)?,
+        workspace: row.get(9)?,
+        effective: row.get(10)?,
+        pending: row.get(11)?,
+        state: row.get(12)?,
+        active_turn: row.get(13)?,
+        created_at: row.get(14)?,
+        updated_at: row.get(15)?,
     })
 }
 
 fn agent_from_record(record: AgentRecord) -> Result<Agent> {
+    let pending = decode_pending_requests(&record.pending)?;
     Ok(Agent {
         id: format_agent_id(record.id),
         generation: record.generation,
@@ -1566,9 +2520,17 @@ fn agent_from_record(record: AgentRecord) -> Result<Agent> {
         project: record.project,
         harness: record.harness,
         profile: record.profile,
+        profile_snapshot: decode_json(&record.profile_snapshot)?,
+        native_scope: record.native_scope,
+        native_ref: record.native_ref,
         workspace: record.workspace,
+        effective: record
+            .effective
+            .map(|value| decode_json(&value))
+            .transpose()?,
         state: parse_enum(&record.state, "Agent state")?,
         active_turn: record.active_turn,
+        pending,
         created_at: record.created_at,
         updated_at: record.updated_at,
     })
@@ -1577,8 +2539,9 @@ fn agent_from_record(record: AgentRecord) -> Result<Agent> {
 fn load_agent_by_num(connection: &Connection, id: i64) -> Result<Option<Agent>> {
     let record = connection
         .query_row(
-            "SELECT id, generation, name, project, harness, profile, workspace,
-                    state, active_turn, created_at, updated_at
+            "SELECT id, generation, name, project, harness, profile,
+                    profile_snapshot, native_scope, native_ref, workspace, effective,
+                    pending, state, active_turn, created_at, updated_at
              FROM agents WHERE id = ?1",
             [id],
             agent_record_from_row,
@@ -1598,12 +2561,13 @@ fn command_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandR
         generation: row.get(5)?,
         expected_turn_id: row.get(6)?,
         turn_id: row.get(7)?,
-        verb: row.get(8)?,
-        args: row.get(9)?,
-        state: row.get(10)?,
-        outcome: row.get(11)?,
-        created_at: row.get(12)?,
-        updated_at: row.get(13)?,
+        request_id: row.get(8)?,
+        verb: row.get(9)?,
+        args: row.get(10)?,
+        state: row.get(11)?,
+        outcome: row.get(12)?,
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
     })
 }
 
@@ -1616,6 +2580,7 @@ struct CommandRecordRaw {
     generation: Option<i64>,
     expected_turn_id: Option<String>,
     turn_id: Option<String>,
+    request_id: Option<String>,
     verb: String,
     args: String,
     state: String,
@@ -1639,6 +2604,7 @@ fn command_from_raw(raw: CommandRecordRaw) -> Result<CommandRecord> {
             args: decode_json(&raw.args)?,
             state,
             turn_id: raw.turn_id,
+            request_id: raw.request_id,
             outcome: raw.outcome.as_deref().map(decode_json).transpose()?,
             created_at: raw.created_at,
             updated_at: raw.updated_at,
@@ -1653,7 +2619,7 @@ fn load_command_record(connection: &Connection, id: &str) -> Result<Option<Comma
     let raw = connection
         .query_row(
             "SELECT id, principal, method, target, expected_generation,
-                    generation, expected_turn_id, turn_id, verb, args,
+                    generation, expected_turn_id, turn_id, request_id, verb, args,
                     state, outcome, created_at, updated_at
              FROM commands WHERE id = ?1",
             [id],
@@ -1676,6 +2642,27 @@ fn command_binding(connection: &Connection, id: &str) -> Result<Option<(String, 
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()
+        .map_err(sql_error)
+}
+
+fn has_open_request_reply(
+    connection: &Connection,
+    agent: i64,
+    generation: i64,
+    request_id: &str,
+    except_command: Option<&str>,
+) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM commands
+                 WHERE target = ?1 AND generation = ?2 AND request_id = ?3
+                   AND state IN ('accepted', 'queued', 'dispatched', 'unknown', 'applied')
+                   AND (?4 IS NULL OR id != ?4)
+             )",
+            params![agent, generation, request_id, except_command],
+            |row| row.get(0),
+        )
         .map_err(sql_error)
 }
 
@@ -1724,9 +2711,9 @@ fn insert_command(tx: &Transaction<'_>, command: &CommandInsert<'_>) -> Result<(
         "INSERT INTO commands(
              id, principal, method, payload_digest, target, expected_generation,
              generation, expected_turn_id, parent_command, link_kind, ordinal,
-             turn_id, verb, args, state, outcome, created_at, updated_at
+             turn_id, request_id, verb, args, state, outcome, created_at, updated_at
          ) VALUES (
-             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18
+             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
          )",
         params![
             command.id,
@@ -1741,6 +2728,7 @@ fn insert_command(tx: &Transaction<'_>, command: &CommandInsert<'_>) -> Result<(
             command.link_kind,
             command.ordinal,
             command.turn_id,
+            command.request_id,
             command.verb,
             args,
             command_state_name(command.state),
@@ -1950,18 +2938,26 @@ fn load_source_state(
 ) -> Result<Option<SourceStateRecord>> {
     connection
         .query_row(
-            "SELECT cursor, last_batch_id, last_batch_digest,
-                    last_batch_first_seq, last_batch_last_seq, state
+            "SELECT cursor, last_store_seq, last_batch_id, last_batch_digest,
+                    last_batch_first_seq, last_batch_last_seq, state, health,
+                    gap_id, gap_digest, gap_from, gap_to, gap_seq
              FROM source_state WHERE agent = ?1 AND generation = ?2 AND source = ?3",
             params![agent, generation, source],
             |row| {
                 Ok(SourceStateRecord {
                     cursor: row.get(0)?,
-                    last_batch_id: row.get(1)?,
-                    last_batch_digest: row.get(2)?,
-                    last_batch_first_seq: row.get(3)?,
-                    last_batch_last_seq: row.get(4)?,
-                    state: row.get(5)?,
+                    last_store_seq: row.get(1)?,
+                    last_batch_id: row.get(2)?,
+                    last_batch_digest: row.get(3)?,
+                    last_batch_first_seq: row.get(4)?,
+                    last_batch_last_seq: row.get(5)?,
+                    state: row.get(6)?,
+                    health: row.get(7)?,
+                    gap_id: row.get(8)?,
+                    gap_digest: row.get(9)?,
+                    gap_from: row.get(10)?,
+                    gap_to: row.get(11)?,
+                    gap_seq: row.get(12)?,
                 })
             },
         )
@@ -1973,9 +2969,10 @@ fn install_initial_source_plan(
     tx: &Transaction<'_>,
     agent: i64,
     generation: i64,
+    harness: &str,
     now: i64,
 ) -> Result<()> {
-    for family in ["session", "turn", "message"] {
+    for family in source_families_for_harness(harness)? {
         db!(tx.execute(
             "INSERT INTO source_owners(agent, generation, family, source, mechanism)
              VALUES (?1, ?2, ?3, ?4, 'stream')",
@@ -1990,11 +2987,31 @@ fn install_initial_source_plan(
     Ok(())
 }
 
+fn source_families_for_harness(harness: &str) -> Result<&'static [&'static str]> {
+    match harness {
+        "fake" => Ok(&["session", "turn", "message"]),
+        "codex" => Ok(&["session", "turn", "message", "tool", "request"]),
+        other => Err(Error::new(
+            "unsupported",
+            format!("unsupported launch harness {other}"),
+        )),
+    }
+}
+
+fn source_plan_for_harness(harness: &str) -> Result<Value> {
+    let mut plan = serde_json::Map::new();
+    for family in source_families_for_harness(harness)? {
+        plan.insert((*family).to_owned(), json!("stream"));
+    }
+    Ok(Value::Object(plan))
+}
+
 fn family_for_kind(kind: &str) -> Result<&'static str> {
     match kind {
         "session.ready" | "session.ended" => Ok("session"),
         "turn.started" | "turn.completed" => Ok("turn"),
         "message.completed" => Ok("message"),
+        "tool.started" | "tool.completed" => Ok("tool"),
         "request.opened" | "request.resolved" => Ok("request"),
         other => Err(Error::new(
             "unsupported",
@@ -2058,41 +3075,93 @@ fn earliest_pending_send(
         .map_err(sql_error)
 }
 
-fn pending_request_ids(
+fn decode_pending_request(
+    id: String,
+    turn_id: String,
+    kind: String,
+    details: String,
+) -> Result<PendingRequest> {
+    Ok(PendingRequest {
+        id,
+        turn_id,
+        kind,
+        details: decode_json(&details)?,
+    })
+}
+
+fn load_pending_request(
     connection: &Connection,
     agent: i64,
     generation: i64,
-    turn_id: &str,
-) -> Result<HashSet<String>> {
+    request_id: &str,
+) -> Result<Option<(PendingRequest, String)>> {
+    let row = connection
+        .query_row(
+            "SELECT turn_id, kind, details, state FROM pending_requests
+             WHERE agent = ?1 AND generation = ?2 AND request_id = ?3",
+            params![agent, generation, request_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sql_error)?;
+    row.map(|(turn_id, kind, details, state)| {
+        Ok((
+            decode_pending_request(request_id.to_owned(), turn_id, kind, details)?,
+            state,
+        ))
+    })
+    .transpose()
+}
+
+fn capture_single_pending_request(
+    connection: &Connection,
+    agent: i64,
+    generation: i64,
+) -> Result<PendingRequest> {
     let mut statement = connection
         .prepare(
-            "SELECT kind, data FROM events
-             WHERE agent = ?1 AND generation = ?2
-               AND kind IN ('request.opened', 'request.resolved')
-             ORDER BY seq",
+            "SELECT request_id, turn_id, kind, details FROM pending_requests
+             WHERE agent = ?1 AND generation = ?2 AND state = 'pending'
+             ORDER BY request_id LIMIT 2",
         )
         .map_err(sql_error)?;
     let rows = statement
         .query_map(params![agent, generation], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
         })
         .map_err(sql_error)?;
-    let mut pending = HashSet::new();
+    let mut pending = Vec::with_capacity(2);
     for row in rows {
-        let (kind, data) = row.map_err(sql_error)?;
-        let data = decode_json(&data)?;
-        if data.get("turn_id").and_then(Value::as_str) != Some(turn_id) {
-            continue;
-        }
-        if let Some(request_id) = data.get("request_id").and_then(Value::as_str) {
-            if kind == "request.opened" {
-                pending.insert(request_id.to_owned());
-            } else {
-                pending.remove(request_id);
-            }
-        }
+        pending.push(row.map_err(sql_error)?);
     }
-    Ok(pending)
+    match pending.len() {
+        0 => Err(Error::new(
+            "not_found",
+            "Agent has no pending native request",
+        )),
+        1 => {
+            let (id, turn_id, kind, details) = pending
+                .pop()
+                .ok_or_else(|| Error::new("internal", "captured pending request disappeared"))?;
+            decode_pending_request(id, turn_id, kind, details)
+        }
+        _ => Err(Error::new(
+            "invalid",
+            "request_id is required when multiple native requests are pending",
+        )),
+    }
 }
 
 fn persist_effects(
@@ -2101,6 +3170,8 @@ fn persist_effects(
     agent_num: i64,
     generation: i64,
     now: i64,
+    native_event: &NativeEvent,
+    next_agent: &Agent,
 ) -> Result<()> {
     for effect in effects {
         match effect {
@@ -2122,7 +3193,7 @@ fn persist_effects(
                     || command
                         .expected_turn_id
                         .as_deref()
-                        .is_some_and(|expected| expected != turn_id)
+                        .is_some_and(|expected| expected != turn_id.as_str())
                 {
                     return Err(Error::new(
                         "source_integrity",
@@ -2155,9 +3226,157 @@ fn persist_effects(
                     params![turn_id, encode_json(&outcome)?, now, command_id],
                 ));
             }
-            Effect::RequestPending { .. } => {
-                // Request state is represented by durable native events. L1 has no
-                // request-reply caller or separate request table.
+            Effect::RequestPending {
+                request_id,
+                turn_id,
+                pending,
+                kind,
+                details,
+            } => {
+                let expected_kind = if *pending {
+                    "request.opened"
+                } else {
+                    "request.resolved"
+                };
+                if native_event.kind != expected_kind
+                    || required_string(&native_event.data, "request_id")?.as_str()
+                        != request_id.as_str()
+                    || required_string(&native_event.data, "turn_id")?.as_str() != turn_id.as_str()
+                {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "request effect is not bound to its exact native request and turn",
+                    ));
+                }
+                let command_id = required_string(&native_event.data, "command_id")?;
+                let command = load_command_record(tx, &command_id)?.ok_or_else(|| {
+                    Error::new(
+                        "source_integrity",
+                        "request event references an unknown command",
+                    )
+                })?;
+                if command.target != Some(agent_num)
+                    || command.command.generation != Some(generation)
+                {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "request event command is bound to another Agent or generation",
+                    ));
+                }
+                if *pending {
+                    require_effect_command(&command, agent_num, generation, "send", &command_id)?;
+                    let kind = kind.as_deref().ok_or_else(|| {
+                        Error::new("source_integrity", "request.opened is missing its kind")
+                    })?;
+                    let details = details.as_ref().ok_or_else(|| {
+                        Error::new("source_integrity", "request.opened is missing its details")
+                    })?;
+                    require_nonempty(kind, "request kind")?;
+                    if encode_json(details)?.len() > MAX_EVENT_BYTES {
+                        return Err(Error::new(
+                            "frame_too_large",
+                            "pending request details exceed 64 KiB",
+                        ));
+                    }
+                    if command.command.state != CommandState::Applied
+                        || command.command.turn_id.as_deref() != Some(turn_id.as_str())
+                    {
+                        return Err(Error::new(
+                            "source_integrity",
+                            "request.opened is not bound to its exact applied send turn",
+                        ));
+                    }
+                    let projected = PendingRequest {
+                        id: request_id.clone(),
+                        turn_id: turn_id.clone(),
+                        kind: kind.to_owned(),
+                        details: details.clone(),
+                    };
+                    if !next_agent.pending.contains(&projected) {
+                        return Err(Error::new(
+                            "source_integrity",
+                            "request.opened is missing from the next Agent projection",
+                        ));
+                    }
+                    match load_pending_request(tx, agent_num, generation, request_id)? {
+                        Some((old, state)) if state == "pending" && old == projected => {}
+                        Some(_) => {
+                            return Err(Error::new(
+                                "source_integrity",
+                                "request id was reused with another pending binding",
+                            ));
+                        }
+                        None => {
+                            let details = encode_json(details)?;
+                            db!(tx.execute(
+                                "INSERT INTO pending_requests(
+                                     agent, generation, request_id, turn_id, kind, details, state
+                                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending')",
+                                params![agent_num, generation, request_id, turn_id, kind, details],
+                            ));
+                        }
+                    }
+                } else {
+                    if kind.is_some() || details.is_some() {
+                        return Err(Error::new(
+                            "source_integrity",
+                            "request.resolved unexpectedly carries open-request details",
+                        ));
+                    }
+                    if !matches!(command.command.verb.as_str(), "approve" | "deny" | "answer")
+                        || command.command.request_id.as_deref() != Some(request_id.as_str())
+                        || command.command.turn_id.as_deref() != Some(turn_id.as_str())
+                        || !matches!(
+                            command.state,
+                            CommandState::Dispatched
+                                | CommandState::Unknown
+                                | CommandState::Applied
+                                | CommandState::Failed
+                        )
+                    {
+                        return Err(Error::new(
+                            "source_integrity",
+                            "request.resolved is not bound to its exact dispatched reply",
+                        ));
+                    }
+                    if next_agent.pending.iter().any(|request| {
+                        request.id.as_str() == request_id.as_str()
+                            && request.turn_id.as_str() == turn_id.as_str()
+                    }) {
+                        return Err(Error::new(
+                            "source_integrity",
+                            "request.resolved remains in the next Agent projection",
+                        ));
+                    }
+                    let Some((existing, state)) =
+                        load_pending_request(tx, agent_num, generation, request_id)?
+                    else {
+                        return Err(Error::new(
+                            "source_integrity",
+                            "request.resolved references no durable pending request",
+                        ));
+                    };
+                    if state != "pending" || existing.turn_id.as_str() != turn_id.as_str() {
+                        return Err(Error::new(
+                            "source_integrity",
+                            "request.resolved does not match its durable pending binding",
+                        ));
+                    }
+                    let changed = tx
+                        .execute(
+                            "UPDATE pending_requests SET state = 'resolved'
+                             WHERE agent = ?1 AND generation = ?2 AND request_id = ?3
+                               AND turn_id = ?4 AND state = 'pending'",
+                            params![agent_num, generation, request_id, turn_id],
+                        )
+                        .map_err(sql_error)?;
+                    if changed != 1 {
+                        return Err(Error::new(
+                            "source_integrity",
+                            "pending request changed before resolution was stored",
+                        ));
+                    }
+                }
             }
             Effect::MessageCompleted {
                 command_id,
@@ -2253,6 +3472,22 @@ fn persist_effects(
                         format!("terminal event references missing turn {turn_id}"),
                     ));
                 }
+                db!(tx.execute(
+                    "UPDATE pending_requests SET state = 'stale'
+                     WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3
+                       AND state = 'pending'",
+                    params![agent_num, generation, turn_id],
+                ));
+                if next_agent
+                    .pending
+                    .iter()
+                    .any(|request| request.turn_id == *turn_id)
+                {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "terminal turn retains pending requests in the Agent projection",
+                    ));
+                }
             }
         }
     }
@@ -2278,18 +3513,75 @@ fn require_effect_command(
     Ok(())
 }
 
+fn is_turn_control(verb: &str) -> bool {
+    matches!(verb, "steer" | "interrupt" | "approve" | "deny" | "answer")
+}
+
+fn contains_secret_marker(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => object.iter().any(|(key, child)| {
+            (matches!(key.as_str(), "is_secret" | "isSecret") && child.as_bool() == Some(true))
+                || contains_secret_marker(child)
+        }),
+        Value::Array(items) => items.iter().any(contains_secret_marker),
+        _ => false,
+    }
+}
+
+fn validate_control_applied_outcome(
+    command: &Command,
+    command_id: &str,
+    outcome: Option<&Value>,
+) -> Result<()> {
+    let Some(outcome) = outcome else {
+        return Err(Error::new(
+            "source_integrity",
+            "control command cannot be applied without its exact native result",
+        ));
+    };
+    let reported_command = outcome.get("command_id").and_then(Value::as_str);
+    let reported_turn = outcome.get("turn_id").and_then(Value::as_str);
+    let reported_request = outcome.get("request_id").and_then(Value::as_str);
+    if reported_command != Some(command_id)
+        || command
+            .turn_id
+            .as_deref()
+            .is_none_or(|turn_id| reported_turn != Some(turn_id))
+        || reported_request != command.request_id.as_deref()
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "control result does not match its exact command, turn, and request binding",
+        ));
+    }
+    Ok(())
+}
+
 fn update_agent_projection(tx: &Transaction<'_>, agent: &Agent) -> Result<()> {
     let agent_num = parse_agent_id(&agent.id)?;
+    let effective = agent.effective.as_ref().map(encode_json).transpose()?;
+    let pending = encode_json(&agent.pending)?;
+    if agent.pending.len() > MAX_PAGE_ENTRIES || pending.len() > MAX_PAGE_BYTES {
+        return Err(Error::new(
+            "frame_too_large",
+            "Agent pending request projection exceeds its bound",
+        ));
+    }
     let changed = tx
         .execute(
             "UPDATE agents SET generation = ?1, state = ?2, active_turn = ?3,
-                               updated_at = ?4,
-                               token = CASE WHEN ?5 THEN NULL ELSE token END
-             WHERE id = ?6",
+                               native_scope = ?4, native_ref = ?5, effective = ?6,
+                               pending = ?7, updated_at = ?8,
+                               token = CASE WHEN ?9 THEN NULL ELSE token END
+             WHERE id = ?10",
             params![
                 agent.generation,
                 agent_state_name(agent.state),
                 agent.active_turn,
+                agent.native_scope,
+                agent.native_ref,
+                effective,
+                pending,
                 agent.updated_at,
                 agent.is_terminal(),
                 agent_num,
@@ -2404,9 +3696,15 @@ fn transition_lost_tx(
     }
 
     db!(tx.execute(
-        "UPDATE agents SET state = 'lost', active_turn = NULL, token = NULL, updated_at = ?1
+        "UPDATE agents SET state = 'lost', active_turn = NULL, pending = '[]',
+                           token = NULL, updated_at = ?1
          WHERE id = ?2 AND generation = ?3",
         params![now, agent_num, generation],
+    ));
+    db!(tx.execute(
+        "UPDATE pending_requests SET state = 'stale'
+         WHERE agent = ?1 AND generation = ?2 AND state = 'pending'",
+        params![agent_num, generation],
     ));
     db!(tx.execute(
         "UPDATE source_state SET state = 'closed', health = 'stale', updated_at = ?1
@@ -2430,6 +3728,7 @@ fn fail_start_tx(
     agent_num: i64,
     generation: i64,
     command_id: &str,
+    reason: &str,
     now: i64,
     events: &mut Vec<Event>,
 ) -> Result<()> {
@@ -2440,7 +3739,7 @@ fn fail_start_tx(
         return Ok(());
     }
     for pending_id in pending_command_ids(tx, agent_num, generation)? {
-        let outcome = json!({"reason": "launch_failed"});
+        let outcome = json!({"reason": reason});
         update_command_state(
             tx,
             &pending_id,
@@ -2456,13 +3755,19 @@ fn fail_start_tx(
             "command",
             Some(agent_num),
             Some(generation),
-            json!({"command_id": pending_id, "reason": "launch_failed"}),
+            json!({"command_id": pending_id, "reason": reason}),
         )?);
     }
     db!(tx.execute(
-        "UPDATE agents SET state = 'failed', active_turn = NULL, token = NULL, updated_at = ?1
+        "UPDATE agents SET state = 'failed', active_turn = NULL, pending = '[]',
+                           token = NULL, updated_at = ?1
          WHERE id = ?2 AND generation = ?3",
         params![now, agent_num, generation],
+    ));
+    db!(tx.execute(
+        "UPDATE pending_requests SET state = 'stale'
+         WHERE agent = ?1 AND generation = ?2 AND state = 'pending'",
+        params![agent_num, generation],
     ));
     db!(tx.execute(
         "UPDATE source_state SET state = 'closed', health = 'error', updated_at = ?1
@@ -2476,7 +3781,7 @@ fn fail_start_tx(
         "agent",
         Some(agent_num),
         Some(generation),
-        json!({"agent_id": agent.id, "command_id": command_id, "reason": "launch_failed"}),
+        json!({"agent_id": agent.id, "command_id": command_id, "reason": reason}),
     )?);
     Ok(())
 }
@@ -2558,9 +3863,15 @@ fn stop_agent_tx(
         )?);
     }
     db!(tx.execute(
-        "UPDATE agents SET state = 'stopped', active_turn = NULL, token = NULL, updated_at = ?1
+        "UPDATE agents SET state = 'stopped', active_turn = NULL, pending = '[]',
+                           token = NULL, updated_at = ?1
          WHERE id = ?2 AND generation = ?3",
         params![now, agent_num, generation],
+    ));
+    db!(tx.execute(
+        "UPDATE pending_requests SET state = 'stale'
+         WHERE agent = ?1 AND generation = ?2 AND state = 'pending'",
+        params![agent_num, generation],
     ));
     db!(tx.execute(
         "UPDATE source_state SET state = 'closed', updated_at = ?1
@@ -2728,6 +4039,15 @@ fn decode_json(value: &str) -> Result<Value> {
     serde_json::from_str(value).map_err(|error| Error::new("internal", error.to_string()))
 }
 
+fn decode_pending_requests(value: &str) -> Result<Vec<PendingRequest>> {
+    serde_json::from_str(value).map_err(|error| {
+        Error::new(
+            "internal",
+            format!("invalid stored pending requests: {error}"),
+        )
+    })
+}
+
 fn parse_enum<T: DeserializeOwned>(value: &str, what: &str) -> Result<T> {
     serde_json::from_value(Value::String(value.to_owned()))
         .map_err(|error| Error::new("internal", format!("invalid stored {what}: {error}")))
@@ -2804,6 +4124,244 @@ fn turn_state_name(state: TurnState) -> &'static str {
 }
 
 impl Store {
+    /// Read the bounded source projection and its latest durable acknowledgements.
+    pub fn read_source_state(
+        &self,
+        agent: &str,
+        generation: i64,
+        source: &str,
+    ) -> Result<serde_json::Value> {
+        require_nonempty(source, "source")?;
+        let agent_num = parse_agent_id(agent)?;
+        let current_generation: i64 = self
+            .connection
+            .query_row(
+                "SELECT generation FROM agents WHERE id = ?1",
+                [agent_num],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?
+            .ok_or_else(|| Error::new("not_found", format!("Agent {agent} was not found")))?;
+        if current_generation != generation {
+            return Err(Error::new(
+                "stale_generation",
+                format!("Agent {agent} is at generation {current_generation}"),
+            ));
+        }
+        let state = load_source_state(&self.connection, agent_num, generation, source)?
+            .ok_or_else(|| Error::new("source_integrity", "source has no committed state"))?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT family FROM source_owners
+                 WHERE agent = ?1 AND generation = ?2 AND source = ?3
+                 ORDER BY family LIMIT ?4",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(
+                params![agent_num, generation, source, MAX_NATIVE_FAMILIES],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(sql_error)?;
+        let mut families = Vec::new();
+        for row in rows {
+            families.push(row.map_err(sql_error)?);
+        }
+        let state = json!({
+            "agent_id": agent,
+            "generation": generation,
+            "source": source,
+            "families": families,
+            "state": state.state,
+            "health": state.health,
+            "cursor": state.cursor,
+            "last_store_seq": state.last_store_seq,
+            "last_batch_id": state.last_batch_id,
+            "last_batch_digest": state.last_batch_digest,
+            "last_batch_first_seq": state.last_batch_first_seq,
+            "last_batch_last_seq": state.last_batch_last_seq,
+            "gap_id": state.gap_id,
+            "gap_digest": state.gap_digest,
+            "gap_from": state.gap_from,
+            "gap_to": state.gap_to,
+            "gap_seq": state.gap_seq,
+        });
+        if encode_json(&state)?.len() > MAX_PAGE_BYTES {
+            return Err(Error::new(
+                "frame_too_large",
+                "source state exceeds 900 KiB",
+            ));
+        }
+        Ok(state)
+    }
+
+    /// Commit one source-loss boundary and its retained acknowledgement.
+    pub fn record_source_gap(&mut self, gap: SourceGap, now: i64) -> Result<Change<SourceGapAck>> {
+        self.ensure_writer_healthy()?;
+        let result = self.record_source_gap_inner(gap, now);
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    fn record_source_gap_inner(
+        &mut self,
+        gap: SourceGap,
+        now: i64,
+    ) -> Result<Change<SourceGapAck>> {
+        require_nonempty(&gap.gap_id, "gap_id")?;
+        require_nonempty(&gap.agent_id, "agent_id")?;
+        require_nonempty(&gap.source, "source")?;
+        require_nonempty(&gap.reason, "reason")?;
+        if gap.families.is_empty() {
+            return Err(Error::new("invalid", "source gap must name a family"));
+        }
+        if gap.families.len() > MAX_PAGE_ENTRIES {
+            return Err(Error::new(
+                "frame_too_large",
+                "source gap names more than 1,000 families",
+            ));
+        }
+        if encode_json(&gap)?.len() > MAX_FRAME_BYTES {
+            return Err(Error::new(
+                "frame_too_large",
+                "source gap request exceeds 1 MiB",
+            ));
+        }
+
+        let agent_num = parse_agent_id(&gap.agent_id)?;
+        let mut families = gap.families.clone();
+        for family in &families {
+            require_nonempty(family, "family")?;
+        }
+        families.sort_unstable();
+        if families.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(Error::new("invalid", "source gap families must be unique"));
+        }
+        let gap_data = json!({
+            "gap_id": gap.gap_id,
+            "agent_id": gap.agent_id,
+            "generation": gap.generation,
+            "source": gap.source,
+            "families": families,
+            "reason": gap.reason,
+            "from": gap.from,
+            "to": gap.to,
+        });
+        if encode_json(&gap_data)?.len() > MAX_EVENT_BYTES {
+            return Err(Error::new(
+                "frame_too_large",
+                "source gap event data exceeds 64 KiB",
+            ));
+        }
+        let gap_digest = canonical::digest(&gap_data)?;
+
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let agent = load_agent_by_num(&tx, agent_num)?
+            .ok_or_else(|| Error::new("not_found", "source gap Agent was not found"))?;
+        if agent.generation != gap.generation {
+            return Err(Error::new(
+                "stale_generation",
+                format!(
+                    "source gap generation {} does not match Agent generation {}",
+                    gap.generation, agent.generation
+                ),
+            ));
+        }
+        for family in &families {
+            let owner: Option<String> = tx
+                .query_row(
+                    "SELECT source FROM source_owners
+                     WHERE agent = ?1 AND generation = ?2 AND family = ?3",
+                    params![agent_num, gap.generation, family],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sql_error)?;
+            if owner.as_deref() != Some(gap.source.as_str()) {
+                return Err(Error::new(
+                    "source_integrity",
+                    format!("source {} does not own family {family}", gap.source),
+                ));
+            }
+        }
+        let source_state = load_source_state(&tx, agent_num, gap.generation, &gap.source)?
+            .ok_or_else(|| Error::new("source_integrity", "source has no committed state"))?;
+        if source_state.gap_id.as_deref() == Some(gap.gap_id.as_str()) {
+            if source_state.gap_digest.as_deref() == Some(gap_digest.as_slice()) {
+                let seq = source_state.gap_seq.ok_or_else(|| {
+                    Error::new(
+                        "internal",
+                        "source gap acknowledgement is missing its sequence",
+                    )
+                })?;
+                commit_transaction(tx, &self.write_faulted)?;
+                return Ok(Change {
+                    value: SourceGapAck {
+                        gap_id: gap.gap_id,
+                        seq,
+                    },
+                    events: Vec::new(),
+                });
+            }
+            return Err(Error::new(
+                "source_integrity",
+                "the latest gap id was reused with different content",
+            ));
+        }
+        if source_state.state != "open" {
+            return Err(Error::new("source_integrity", "source is closed"));
+        }
+
+        let event = insert_daemon_event(
+            &tx,
+            now,
+            "source.gap",
+            "source",
+            Some(agent_num),
+            Some(gap.generation),
+            gap_data,
+        )?;
+        let changed = tx
+            .execute(
+                "UPDATE source_state
+                 SET gap_id = ?1, gap_digest = ?2, gap_from = ?3, gap_to = ?4,
+                     gap_seq = ?5, updated_at = ?6
+                 WHERE agent = ?7 AND generation = ?8 AND source = ?9",
+                params![
+                    gap.gap_id,
+                    gap_digest,
+                    gap.from,
+                    gap.to,
+                    event.seq,
+                    now,
+                    agent_num,
+                    gap.generation,
+                    gap.source,
+                ],
+            )
+            .map_err(sql_error)?;
+        if changed != 1 {
+            return Err(Error::new(
+                "source_integrity",
+                "source state changed before the gap was stored",
+            ));
+        }
+        let ack = SourceGapAck {
+            gap_id: gap.gap_id,
+            seq: event.seq,
+        };
+        commit_transaction(tx, &self.write_faulted)?;
+        Ok(Change {
+            value: ack,
+            events: vec![event],
+        })
+    }
+
     /// Commit one complete native batch, its reducer projections, derived
     /// command/turn facts, source cursor, and last-batch acknowledgement.
     pub fn put_batch(&mut self, batch: SourceBatch, now: i64) -> Result<BatchCommit> {
@@ -2953,17 +4511,7 @@ impl Store {
 
         let mut committed_events = Vec::with_capacity(batch.events.len());
         for (index, raw_event) in batch.events.iter().enumerate() {
-            let mut native_event = raw_event.clone();
-            if native_event.kind == "request.resolved" {
-                let turn_id = required_string(&native_event.data, "turn_id")?;
-                let request_id = required_string(&native_event.data, "request_id")?;
-                let mut pending = pending_request_ids(&tx, agent_num, batch.generation, &turn_id)?;
-                pending.remove(&request_id);
-                let object = native_event.data.as_object_mut().ok_or_else(|| {
-                    Error::new("invalid", "request.resolved data must be an object")
-                })?;
-                object.insert("last_pending".to_owned(), Value::Bool(pending.is_empty()));
-            }
+            let native_event = raw_event.clone();
             let event_data = encode_json(&native_event.data)?;
             if event_data.len() > MAX_EVENT_BYTES {
                 return Err(Error::new(
@@ -2999,7 +4547,15 @@ impl Store {
                     payload_digest: &event_digest,
                 },
             )?;
-            persist_effects(&tx, &effects, agent_num, batch.generation, now)?;
+            persist_effects(
+                &tx,
+                &effects,
+                agent_num,
+                batch.generation,
+                now,
+                &native_event,
+                &next,
+            )?;
             if next.is_terminal() {
                 terminalize_generation_commands(
                     &tx,
@@ -3008,6 +4564,11 @@ impl Store {
                     now,
                     "session_ended",
                 )?;
+                db!(tx.execute(
+                    "UPDATE pending_requests SET state = 'stale'
+                     WHERE agent = ?1 AND generation = ?2 AND state = 'pending'",
+                    params![agent_num, batch.generation],
+                ));
             }
             update_agent_projection(&tx, &next)?;
             projection = next;

@@ -28,6 +28,15 @@ impl AgentState {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PendingRequest {
+    pub id: String,
+    pub turn_id: String,
+    pub kind: String,
+    #[serde(default = "empty_object")]
+    pub details: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Agent {
     pub id: String,
     pub generation: i64,
@@ -35,9 +44,19 @@ pub struct Agent {
     pub project: String,
     pub harness: String,
     pub profile: String,
+    #[serde(default = "empty_object")]
+    pub profile_snapshot: Value,
+    #[serde(default)]
+    pub native_scope: Option<String>,
+    #[serde(default)]
+    pub native_ref: Option<String>,
     pub workspace: Option<String>,
+    #[serde(default)]
+    pub effective: Option<Value>,
     pub state: AgentState,
     pub active_turn: Option<String>,
+    #[serde(default)]
+    pub pending: Vec<PendingRequest>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -57,9 +76,14 @@ impl Agent {
             project: project.into(),
             harness: harness.into(),
             profile: profile.into(),
+            profile_snapshot: empty_object(),
+            native_scope: None,
+            native_ref: None,
             workspace: None,
+            effective: None,
             state: AgentState::Created,
             active_turn: None,
+            pending: Vec::new(),
             created_at: now,
             updated_at: now,
         }
@@ -104,6 +128,8 @@ pub struct Command {
     pub args: Value,
     pub state: CommandState,
     pub turn_id: Option<String>,
+    #[serde(default)]
+    pub request_id: Option<String>,
     pub outcome: Option<Value>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -150,6 +176,8 @@ pub struct SubmitCommand {
     pub args: Value,
     pub expected_generation: Option<i64>,
     pub expected_turn_id: Option<String>,
+    #[serde(default)]
+    pub request_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -176,6 +204,28 @@ pub struct BatchAck {
     pub cursor: Option<String>,
 }
 
+/// Stream-loss boundary reported by the Codex producer via `source.gap`.
+/// Plain I/O-free data: Store/host writers own the transaction handler.
+/// `from`/`to` use the API wire keys as named.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SourceGap {
+    pub gap_id: String,
+    pub agent_id: String,
+    pub generation: i64,
+    pub source: String,
+    pub families: Vec<String>,
+    pub reason: String,
+    pub from: Option<String>,
+    pub to: Option<String>,
+}
+
+/// Stored stream-loss boundary acknowledgement.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SourceGapAck {
+    pub gap_id: String,
+    pub seq: i64,
+}
+
 /// Store-facing facts derived by the reducer; callers persist them atomically with
 /// the event and next Agent projection.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -189,6 +239,10 @@ pub enum Effect {
         request_id: String,
         turn_id: String,
         pending: bool,
+        #[serde(default)]
+        kind: Option<String>,
+        #[serde(default)]
+        details: Option<Value>,
     },
     MessageCompleted {
         command_id: String,
@@ -248,6 +302,15 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
             if agent.state != AgentState::Starting || agent.active_turn.is_some() {
                 return Err(bad_state(event, "session.ready requires a starting Agent"));
             }
+            if let Some(scope) = optional_native_scope(event)? {
+                next.native_scope = Some(scope);
+            }
+            if let Some(native_ref) = optional_native_ref(event)? {
+                next.native_ref = Some(native_ref);
+            }
+            if let Some(effective) = optional_effective(event)? {
+                next.effective = Some(effective);
+            }
             next.state = AgentState::Idle;
         }
         "turn.started" => {
@@ -278,12 +341,47 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
             require_live_turn(agent, event)?;
             let request_id = required_text(event, "request_id")?;
             let turn_id = required_text(event, "turn_id")?;
-            next.state = AgentState::Waiting;
-            effects.push(Effect::RequestPending {
-                request_id,
-                turn_id,
-                pending: true,
-            });
+            let kind = required_text(event, "kind")?;
+            let details = optional_details(event)?;
+            if let Some(existing) = agent.pending.iter().find(|p| p.id == request_id) {
+                // Identical duplicate: Store owns native-id dedup; tolerate exact replay.
+                if existing.turn_id != turn_id
+                    || existing.kind != kind
+                    || existing.details != details
+                {
+                    return Err(Error::new(
+                        "source_integrity",
+                        format!(
+                            "request.opened {request_id} conflicts with pending request for Agent {}",
+                            agent.id
+                        ),
+                    ));
+                }
+                // State follows the pending set: open requests imply waiting.
+                next.state = AgentState::Waiting;
+                effects.push(Effect::RequestPending {
+                    request_id,
+                    turn_id,
+                    pending: true,
+                    kind: Some(kind),
+                    details: Some(details),
+                });
+            } else {
+                next.pending.push(PendingRequest {
+                    id: request_id.clone(),
+                    turn_id: turn_id.clone(),
+                    kind: kind.clone(),
+                    details: details.clone(),
+                });
+                next.state = AgentState::Waiting;
+                effects.push(Effect::RequestPending {
+                    request_id,
+                    turn_id,
+                    pending: true,
+                    kind: Some(kind),
+                    details: Some(details),
+                });
+            }
         }
         "request.resolved" => {
             require_live_turn(agent, event)?;
@@ -295,17 +393,21 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
             }
             let request_id = required_text(event, "request_id")?;
             let turn_id = required_text(event, "turn_id")?;
-            let last_pending = event
-                .data
-                .get("last_pending")
-                .and_then(Value::as_bool)
-                .ok_or_else(|| {
-                    Error::new(
-                        "invalid",
-                        "request.resolved requires Store-derived last_pending boolean",
-                    )
-                })?;
-            next.state = if last_pending {
+            let Some(pos) = agent
+                .pending
+                .iter()
+                .position(|p| p.id == request_id && p.turn_id == turn_id)
+            else {
+                return Err(Error::new(
+                    "source_integrity",
+                    format!(
+                        "request.resolved {request_id} is not pending for Agent {} turn {turn_id}",
+                        agent.id
+                    ),
+                ));
+            };
+            next.pending.remove(pos);
+            next.state = if next.pending.is_empty() {
                 AgentState::Busy
             } else {
                 AgentState::Waiting
@@ -314,6 +416,8 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
                 request_id,
                 turn_id,
                 pending: false,
+                kind: None,
+                details: None,
             });
         }
         "turn.completed" => {
@@ -324,6 +428,7 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
             let final_text = optional_text(event, "final_text")?;
             next.state = AgentState::Idle;
             next.active_turn = None;
+            next.pending.clear();
             effects.push(Effect::TurnTerminal {
                 command_id: Some(command_id),
                 turn_id,
@@ -358,6 +463,11 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
             }
             next.state = AgentState::Stopped;
             next.active_turn = None;
+            next.pending.clear();
+        }
+        "tool.started" | "tool.completed" => {
+            // Pure watch facts: exact active-turn binding only, no state change.
+            require_live_turn(agent, event)?;
         }
         kind => {
             return Err(Error::new(
@@ -410,6 +520,53 @@ fn optional_text(event: &NativeEvent, field: &str) -> Result<Option<String>> {
         Some(_) => Err(Error::new(
             "invalid",
             format!("{} field {field} must be a string", event.kind),
+        )),
+    }
+}
+
+fn optional_native_scope(event: &NativeEvent) -> Result<Option<String>> {
+    match event.data.get("native_scope") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(value.clone())),
+        Some(_) => Err(Error::new(
+            "invalid",
+            format!(
+                "{} field native_scope must be a non-empty string",
+                event.kind
+            ),
+        )),
+    }
+}
+
+fn optional_native_ref(event: &NativeEvent) -> Result<Option<String>> {
+    match event.data.get("native_ref") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(value.clone())),
+        Some(_) => Err(Error::new(
+            "invalid",
+            format!("{} field native_ref must be a non-empty string", event.kind),
+        )),
+    }
+}
+
+fn optional_effective(event: &NativeEvent) -> Result<Option<Value>> {
+    match event.data.get("effective") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Object(_)) => Ok(Some(event.data["effective"].clone())),
+        Some(_) => Err(Error::new(
+            "invalid",
+            format!("{} field effective must be an object", event.kind),
+        )),
+    }
+}
+
+fn optional_details(event: &NativeEvent) -> Result<Value> {
+    match event.data.get("details") {
+        None | Some(Value::Null) => Ok(empty_object()),
+        Some(Value::Object(_)) => Ok(event.data["details"].clone()),
+        Some(_) => Err(Error::new(
+            "invalid",
+            format!("{} field details must be an object", event.kind),
         )),
     }
 }

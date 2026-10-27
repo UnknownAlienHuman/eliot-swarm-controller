@@ -1,32 +1,25 @@
-use crate::protocol::{
-    AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
-    MAX_COMMAND_ID_BYTES, MAX_CREDENTIAL_BYTES, MAX_EVENT_BYTES, MAX_FRAME_BYTES, MAX_TEXT_BYTES,
-    RpcError, RpcRequest, RpcResponse, empty_object, fake_manifest,
+use crate::{
+    peer::{CommitSink, Peer, PeerClient, preserve_rpc_error},
+    protocol::{
+        AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams,
+        InitializeParams, MAX_COMMAND_ID_BYTES, MAX_CREDENTIAL_BYTES, MAX_EVENT_BYTES,
+        MAX_TEXT_BYTES, RpcError, RpcRequest, empty_object, fake_manifest,
+    },
 };
-use eliot_core::{BatchAck, NativeEvent, SourceBatch};
-use futures_util::{SinkExt, StreamExt};
-use serde::{Serialize, de::DeserializeOwned};
+use eliot_core::{BatchAck, Error as CoreError, NativeEvent, SourceBatch};
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
     error::Error,
     fmt::{self, Display, Formatter},
-    io,
-    sync::Arc,
     time::Duration,
 };
-use tokio::{
-    io::{stdin, stdout},
-    sync::{Mutex, mpsc, oneshot},
-    time::{Instant, timeout_at},
-};
-use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
-
-type Writer = Arc<Mutex<FramedWrite<tokio::io::Stdout, LinesCodec>>>;
-type PendingAcks = Arc<Mutex<HashMap<String, oneshot::Sender<RpcResponse>>>>;
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 
 const HOST_REQUEST_QUEUE: usize = 16;
 const EVENTS_PUT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
+const HOST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub struct PluginError {
@@ -49,95 +42,52 @@ impl Display for PluginError {
 
 impl Error for PluginError {}
 
-impl From<io::Error> for PluginError {
-    fn from(error: io::Error) -> Self {
-        Self::new(format!("plugin I/O failed: {error}"))
-    }
-}
-
-impl From<serde_json::Error> for PluginError {
-    fn from(error: serde_json::Error) -> Self {
-        Self::new(format!("plugin JSON encoding failed: {error}"))
-    }
-}
-
 /// Serve the bounded fake plugin over stdin/stdout JSON-RPC 2.0 NDJSON.
 /// Stdout is reserved for protocol frames; this function writes no log lines.
 pub async fn run_fake() -> Result<(), PluginError> {
-    let reader = FramedRead::new(
-        stdin(),
-        LinesCodec::new_with_max_length(MAX_FRAME_BYTES.saturating_sub(1)),
-    );
-    let mut reader = reader;
-    let writer = Arc::new(Mutex::new(FramedWrite::new(stdout(), LinesCodec::new())));
-    let pending = Arc::new(Mutex::new(HashMap::new()));
+    let mut peer = Peer::stdio();
+    let client = peer.client();
     let (request_tx, request_rx) = mpsc::channel(HOST_REQUEST_QUEUE);
     let (actor_done_tx, mut actor_done_rx) = oneshot::channel();
-    let actor_writer = Arc::clone(&writer);
-    let actor_pending = Arc::clone(&pending);
+    let actor_client = client.clone();
     let actor = tokio::spawn(async move {
-        let result = fake_actor(request_rx, actor_writer, actor_pending).await;
+        let result = fake_actor(request_rx, actor_client).await;
         let _ = actor_done_tx.send(result);
     });
 
     loop {
         tokio::select! {
-            frame = reader.next() => {
-                match frame {
-                    Some(Ok(line)) => {
-                        if line.len().saturating_add(1) > MAX_FRAME_BYTES {
-                            actor.abort();
-                            return Err(PluginError::new("incoming frame exceeds 1 MiB"));
-                        }
-                        match decode_frame(&line) {
-                            Ok(Incoming::Response(response)) => {
-                                route_ack(response, &pending).await;
-                            }
-                            Ok(Incoming::Request(request)) => {
-                                let id = request.id.clone();
-                                match request_tx.try_send(request) {
-                                    Ok(()) => {}
-                                    Err(mpsc::error::TrySendError::Full(_)) => {
-                                        write_message(
-                                            &writer,
-                                            &RpcResponse::failure(id, domain_error(
-                                                "busy",
-                                                -32020,
-                                                "plugin request queue is full",
-                                            )),
-                                        ).await?;
-                                    }
-                                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                                        write_message(
-                                            &writer,
-                                            &RpcResponse::failure(id, domain_error(
-                                                "unavailable",
-                                                -32021,
-                                                "plugin is shutting down",
-                                            )),
-                                        ).await?;
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                write_message(
-                                    &writer,
-                                    &RpcResponse::failure(Value::Null, error),
-                                ).await?;
-                            }
-                        }
-                    }
-                    Some(Err(_)) => {
-                        actor.abort();
-                        return Err(PluginError::new("invalid or oversized NDJSON frame"));
-                    }
-                    None => {
-                        actor.abort();
-                        let _ = actor.await;
-                        return Err(PluginError::new(
-                            "plugin input closed before a completed shutdown",
-                        ));
-                    }
+            request = peer.next_request() => {
+                let Some(request) = request else {
+                    actor.abort();
+                    let _ = actor.await;
+                    return Err(PluginError::new(
+                        "plugin input closed before a completed shutdown",
+                    ));
+                };
+                let id = request.id.clone();
+                let error = match request_tx.try_send(request) {
+                    Ok(()) => None,
+                    Err(mpsc::error::TrySendError::Full(_)) => Some(domain_error(
+                        "busy",
+                        -32020,
+                        "plugin request queue is full",
+                    )),
+                    Err(mpsc::error::TrySendError::Closed(_)) => Some(domain_error(
+                        "unavailable",
+                        -32021,
+                        "plugin is shutting down",
+                    )),
+                };
+                if let Some(error) = error {
+                    client
+                        .respond(
+                            id,
+                            Err(preserve_rpc_error(error)),
+                            Instant::now() + HOST_RESPONSE_TIMEOUT,
+                        )
+                        .await
+                        .map_err(|error| PluginError::new(error.message))?;
                 }
             }
             result = &mut actor_done_rx => {
@@ -151,21 +101,23 @@ pub async fn run_fake() -> Result<(), PluginError> {
 
 async fn fake_actor(
     mut requests: mpsc::Receiver<RpcRequest>,
-    writer: Writer,
-    pending: PendingAcks,
+    client: PeerClient,
 ) -> Result<(), PluginError> {
     let mut state = FakeState::default();
 
     while let Some(request) = requests.recv().await {
         let id = request.id.clone();
         let is_shutdown = request.method == "shutdown";
-        let result = dispatch(&request, &mut state, &writer, &pending).await;
+        let result = dispatch(&request, &mut state, &client).await;
         let shutdown_after_reply = is_shutdown && result.is_ok();
-        let response = match result {
-            Ok(value) => RpcResponse::success(id, value),
-            Err(error) => RpcResponse::failure(id, error),
-        };
-        write_message(&writer, &response).await?;
+        client
+            .respond(
+                id,
+                result.map_err(preserve_rpc_error),
+                Instant::now() + HOST_RESPONSE_TIMEOUT,
+            )
+            .await
+            .map_err(|error| PluginError::new(error.message))?;
 
         if shutdown_after_reply {
             state.credential.take();
@@ -181,14 +133,13 @@ async fn fake_actor(
 async fn dispatch(
     request: &RpcRequest,
     state: &mut FakeState,
-    writer: &Writer,
-    pending: &PendingAcks,
+    client: &PeerClient,
 ) -> Result<Value, RpcError> {
     match request.method.as_str() {
         "initialize" => handle_initialize(&request.params, state),
-        "agent.start" => handle_start(&request.params, state, writer, pending).await,
-        "agent.command" => handle_command(&request.params, state, writer, pending).await,
-        "agent.stop" => handle_stop(&request.params, state, writer, pending).await,
+        "agent.start" => handle_start(&request.params, state, client).await,
+        "agent.command" => handle_command(&request.params, state, client).await,
+        "agent.stop" => handle_stop(&request.params, state, client).await,
         "agent.snapshot" => handle_snapshot(&request.params, state),
         "shutdown" => handle_shutdown(state),
         _ => Err(domain_error(
@@ -236,8 +187,7 @@ fn handle_initialize(params: &Value, state: &mut FakeState) -> Result<Value, Rpc
 async fn handle_start(
     raw_params: &Value,
     state: &mut FakeState,
-    writer: &Writer,
-    pending: &PendingAcks,
+    client: &PeerClient,
 ) -> Result<Value, RpcError> {
     require_initialized(state)?;
     let params: AgentStartParams = decode_params(raw_params)?;
@@ -291,7 +241,6 @@ async fn handle_start(
 
     let credential = state.credential.clone().ok_or_else(not_initialized)?;
     let batch = session_ready_batch(&params.agent_id, params.generation);
-    ensure_batch_fits(&batch, &credential, state.next_rpc_id)?;
 
     state.binding = Some(Binding {
         agent_id: params.agent_id.clone(),
@@ -300,7 +249,7 @@ async fn handle_start(
     state.start_command_id = Some(params.command_id.clone());
     state.phase = SessionPhase::Starting;
 
-    match commit_batch(state, &batch, &credential, writer, pending).await {
+    match commit_batch(state, batch, &credential, client).await {
         Ok(_) => {
             state.phase = SessionPhase::Idle;
             Ok(json!({
@@ -324,8 +273,7 @@ async fn handle_start(
 async fn handle_command(
     raw_params: &Value,
     state: &mut FakeState,
-    writer: &Writer,
-    pending: &PendingAcks,
+    client: &PeerClient,
 ) -> Result<Value, RpcError> {
     require_initialized(state)?;
     let params: AgentCommandParams = decode_params(raw_params)?;
@@ -385,12 +333,11 @@ async fn handle_command(
         params.agent_id, params.generation, params.command_id
     );
     let batch = send_batch(&params, &turn_id, text);
-    ensure_batch_fits(&batch, &credential, state.next_rpc_id)?;
 
     state.phase = SessionPhase::Busy;
     state.active_turn = Some(turn_id.clone());
     state.active_command_id = Some(params.command_id.clone());
-    match commit_batch(state, &batch, &credential, writer, pending).await {
+    match commit_batch(state, batch, &credential, client).await {
         Ok(_) => {
             state.phase = SessionPhase::Idle;
             state.active_turn = None;
@@ -429,8 +376,7 @@ async fn handle_command(
 async fn handle_stop(
     raw_params: &Value,
     state: &mut FakeState,
-    writer: &Writer,
-    pending: &PendingAcks,
+    client: &PeerClient,
 ) -> Result<Value, RpcError> {
     require_initialized(state)?;
     let params: AgentStopParams = decode_params(raw_params)?;
@@ -456,11 +402,10 @@ async fn handle_stop(
 
     let credential = state.credential.clone().ok_or_else(not_initialized)?;
     let batch = session_ended_batch(&params.agent_id, params.generation);
-    ensure_batch_fits(&batch, &credential, state.next_rpc_id)?;
     state.phase = SessionPhase::Stopping;
     state.stop_command_id = Some(params.command_id);
 
-    match commit_batch(state, &batch, &credential, writer, pending).await {
+    match commit_batch(state, batch, &credential, client).await {
         Ok(_) => {
             state.phase = SessionPhase::Stopped;
             state.active_turn = None;
@@ -615,218 +560,41 @@ struct BatchFailure {
 
 async fn commit_batch(
     state: &mut FakeState,
-    batch: &SourceBatch,
+    batch: SourceBatch,
     credential: &str,
-    writer: &Writer,
-    pending: &PendingAcks,
+    client: &PeerClient,
 ) -> Result<BatchAck, BatchFailure> {
-    let rpc_id = format!("fake-events-put-{}", state.next_rpc_id);
-    let Some(next_rpc_id) = state.next_rpc_id.checked_add(1) else {
-        return Err(BatchFailure {
-            error: domain_error("internal", -32603, "plugin request id space exhausted"),
-            uncertain: false,
-        });
-    };
-    state.next_rpc_id = next_rpc_id;
-
-    let mut params = serde_json::to_value(batch).map_err(|_| BatchFailure {
-        error: domain_error("internal", -32603, "event batch could not be encoded"),
-        uncertain: false,
-    })?;
-    let Some(params) = params.as_object_mut() else {
-        return Err(BatchFailure {
-            error: domain_error("internal", -32603, "event batch encoding was not an object"),
-            uncertain: false,
-        });
-    };
-    params.insert(
-        "credential".to_owned(),
-        Value::String(credential.to_owned()),
-    );
-
-    let request = RpcRequest {
-        jsonrpc: "2.0".to_owned(),
-        id: Value::String(rpc_id.clone()),
-        method: "events.put".to_owned(),
-        params: Value::Object(params.clone()),
-    };
-    let encoded = encode_frame(&request).map_err(|error| BatchFailure {
-        error,
-        uncertain: false,
-    })?;
-
-    let deadline = Instant::now() + EVENTS_PUT_ACK_TIMEOUT;
-    let (ack_tx, ack_rx) = oneshot::channel();
-    pending.lock().await.insert(rpc_id.clone(), ack_tx);
-    state.batch_unknown = true;
-    if write_encoded(writer, encoded).await.is_err() {
-        pending.lock().await.remove(&rpc_id);
-        return Err(BatchFailure {
-            error: unknown_effect(),
-            uncertain: true,
-        });
-    }
-
-    let response = match timeout_at(deadline, ack_rx).await {
-        Ok(Ok(response)) => response,
-        Ok(Err(_)) | Err(_) => {
-            return Err(BatchFailure {
-                error: unknown_effect(),
-                uncertain: true,
-            });
-        }
-    };
-    if response.error.is_some() {
-        // The fake effect was already recorded before events.put. A host rejection
-        // does not prove the effect was absent or that the batch can be replayed.
-        return Err(BatchFailure {
-            error: unknown_effect(),
-            uncertain: true,
-        });
-    }
-    let Some(result) = response.result else {
-        return Err(BatchFailure {
-            error: unknown_effect(),
-            uncertain: true,
-        });
-    };
-    let ack: BatchAck = serde_json::from_value(result).map_err(|_| BatchFailure {
-        error: unknown_effect(),
-        uncertain: true,
-    })?;
-    let expected_count = i64::try_from(batch.events.len()).unwrap_or(i64::MAX);
-    let actual_count = ack
-        .last_seq
-        .checked_sub(ack.first_seq)
-        .and_then(|count| count.checked_add(1));
-    if ack.first_seq <= 0 || actual_count != Some(expected_count) {
-        return Err(BatchFailure {
-            error: unknown_effect(),
-            uncertain: true,
-        });
-    }
-
-    state.batch_unknown = false;
-    state.last_batch_ack = Some(ack.clone());
-    Ok(ack)
-}
-
-fn ensure_batch_fits(
-    batch: &SourceBatch,
-    credential: &str,
-    rpc_sequence: u64,
-) -> Result<(), RpcError> {
-    for event in &batch.events {
-        let encoded_data = serde_json::to_vec(&event.data)
-            .map_err(|_| domain_error("invalid", -32602, "event data could not be encoded"))?;
-        if encoded_data.len() > MAX_EVENT_BYTES {
-            return Err(frame_too_large(
-                "event data exceeds the 64 KiB persisted-event limit",
-            ));
-        }
-    }
-    let mut params = serde_json::to_value(batch)
-        .map_err(|_| domain_error("internal", -32603, "event batch could not be encoded"))?;
-    let Some(params) = params.as_object_mut() else {
-        return Err(domain_error(
-            "internal",
-            -32603,
-            "event batch encoding was not an object",
-        ));
-    };
-    params.insert(
-        "credential".to_owned(),
-        Value::String(credential.to_owned()),
-    );
-    let request = RpcRequest {
-        jsonrpc: "2.0".to_owned(),
-        id: Value::String(format!("fake-events-put-{rpc_sequence}")),
-        method: "events.put".to_owned(),
-        params: Value::Object(params.clone()),
-    };
-    encode_frame(&request).map(|_| ())
-}
-
-async fn route_ack(response: RpcResponse, pending: &PendingAcks) {
-    let Some(id) = response.id.as_str().map(str::to_owned) else {
-        return;
-    };
-    if let Some(sender) = pending.lock().await.remove(&id) {
-        let _ = sender.send(response);
-    }
-}
-
-async fn write_message<T: Serialize>(writer: &Writer, message: &T) -> Result<(), PluginError> {
-    let encoded = encode_frame(message).map_err(|error| PluginError::new(error.message))?;
-    write_encoded(writer, encoded).await
-}
-
-fn encode_frame<T: Serialize>(message: &T) -> Result<String, RpcError> {
-    let encoded = serde_json::to_string(message)
-        .map_err(|_| domain_error("internal", -32603, "JSON-RPC frame could not be encoded"))?;
-    if encoded.len().saturating_add(1) > MAX_FRAME_BYTES {
-        return Err(frame_too_large("encoded JSON-RPC frame exceeds 1 MiB"));
-    }
-    Ok(encoded)
-}
-
-async fn write_encoded(writer: &Writer, encoded: String) -> Result<(), PluginError> {
-    writer
-        .lock()
+    let mut sink = CommitSink::new(client.clone(), credential.to_owned());
+    match sink
+        .commit(batch, Instant::now() + EVENTS_PUT_ACK_TIMEOUT)
         .await
-        .send(encoded)
-        .await
-        .map_err(|_| PluginError::new("plugin protocol write failed"))
-}
-
-enum Incoming {
-    Request(RpcRequest),
-    Response(RpcResponse),
-}
-
-fn decode_frame(line: &str) -> Result<Incoming, RpcError> {
-    let value: Value = serde_json::from_str(line)
-        .map_err(|_| domain_error("invalid", -32700, "invalid JSON-RPC frame"))?;
-    let Some(object) = value.as_object() else {
-        return Err(domain_error(
-            "invalid",
-            -32600,
-            "JSON-RPC frame must be an object",
-        ));
-    };
-    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-        return Err(domain_error(
-            "invalid",
-            -32600,
-            "JSON-RPC version must be 2.0",
-        ));
-    }
-
-    if object.contains_key("method") {
-        let request: RpcRequest = serde_json::from_value(value)
-            .map_err(|_| domain_error("invalid", -32600, "invalid JSON-RPC request"))?;
-        if !valid_id(&request.id) || !request.params.is_object() {
-            return Err(invalid_params(
-                "JSON-RPC request requires an id and object params",
-            ));
+    {
+        Ok(ack) => {
+            state.batch_unknown = false;
+            state.last_batch_ack = Some(ack.clone());
+            Ok(ack)
         }
-        return Ok(Incoming::Request(request));
+        Err(error) => {
+            let uncertain = sink.is_unknown();
+            state.batch_unknown = uncertain;
+            let error = if uncertain {
+                unknown_effect()
+            } else {
+                core_error_to_rpc(error)
+            };
+            Err(BatchFailure { error, uncertain })
+        }
     }
-
-    let response: RpcResponse = serde_json::from_value(value)
-        .map_err(|_| domain_error("invalid", -32600, "invalid JSON-RPC response"))?;
-    if !valid_id(&response.id) || response.error.is_some() == response.result.is_some() {
-        return Err(domain_error(
-            "invalid",
-            -32600,
-            "JSON-RPC response must contain exactly one result or error",
-        ));
-    }
-    Ok(Incoming::Response(response))
 }
 
-fn valid_id(id: &Value) -> bool {
-    id.is_null() || id.is_string() || id.is_number()
+fn core_error_to_rpc(error: CoreError) -> RpcError {
+    let rpc_code = match error.code.as_str() {
+        "invalid" | "frame_too_large" => -32602,
+        "unsupported" => -32601,
+        "internal" => -32603,
+        _ => -32000,
+    };
+    domain_error(&error.code, rpc_code, &error.message)
 }
 
 fn decode_params<T: DeserializeOwned>(params: &Value) -> Result<T, RpcError> {
@@ -922,7 +690,6 @@ struct FakeState {
     last_turn: Option<LastTurn>,
     last_batch_ack: Option<BatchAck>,
     batch_unknown: bool,
-    next_rpc_id: u64,
 }
 
 struct Binding {

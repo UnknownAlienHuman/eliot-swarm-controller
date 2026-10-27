@@ -83,6 +83,11 @@ remain documented; their handlers/tables are added with their first caller.
 
 ## L2 — First useful harness: Codex with Luna
 
+The plugin, global profile loader and control integration are present in source.
+Native execution has not been qualified yet; the checkboxes below remain open until
+the actual installed Codex path is exercised. Compilation and fake-path checks do not
+prove native behavior.
+
 Read [Codex bring-up](harnesses/codex.md#first-useful-path) and only the native operations
 it uses. Start with the owner's installed Codex and existing login. Prefer the explicitly
 selected Luna model returned by that account's native `model/list`; never substitute a

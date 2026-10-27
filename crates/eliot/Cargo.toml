@@ -13,6 +13,7 @@ clap.workspace = true
 eliot-core.workspace = true
 eliot-daemon.workspace = true
 eliot-plugin.workspace = true
+eliot-plugin-codex.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 ulid.workspace = true

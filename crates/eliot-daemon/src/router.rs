@@ -1,6 +1,6 @@
 use crate::{
     bus::Bus,
-    plugin_host::{AgentCredentials, PluginHost, SecretSet, UnknownCommands},
+    plugin_host::{AgentCredentials, PluginHost, PluginHostOptions, SecretSet, UnknownCommands},
 };
 use eliot_core::{
     Agent, AgentState, Command, CommandState, Error, Event, Result, SubmitCommand, Turn, TurnState,
@@ -10,6 +10,7 @@ use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU8, Ordering},
@@ -29,6 +30,7 @@ const EVENT_RESPONSE_ENTRIES_MAX_BYTES: usize =
     EVENT_RESPONSE_MAX_BYTES - EVENT_RESPONSE_WRAPPER_RESERVE_BYTES;
 const LIVE_WAIT_MAX_MS: u64 = 30_000;
 const STATUS_BLOCKER_MAX: usize = 64;
+const CONTROLLED_PLUGIN_SOURCE: &str = "stream";
 
 type StoreHandle = Arc<AsyncMutex<eliot_store::Store>>;
 
@@ -42,6 +44,7 @@ pub(crate) struct Router {
 }
 
 struct RouterInner {
+    data_root: PathBuf,
     store: StoreHandle,
     bus: Bus,
     owner_token: String,
@@ -79,7 +82,7 @@ impl Router {
         let unknown_commands: UnknownCommands = Arc::new(Mutex::new(Default::default()));
         let (progress, _) = watch::channel(0_u64);
         let plugin_host = PluginHost::new(
-            data_root,
+            PluginHostOptions::new(data_root.clone(), owner_token.clone()),
             Arc::clone(&store),
             bus.clone(),
             Arc::clone(&secrets),
@@ -89,6 +92,7 @@ impl Router {
         );
         Self {
             inner: Arc::new(RouterInner {
+                data_root,
                 store,
                 bus,
                 owner_token,
@@ -295,6 +299,7 @@ impl Router {
                 "args",
                 "expected_generation",
                 "expected_turn_id",
+                "request_id",
             ],
             "command.submit",
         )?;
@@ -305,14 +310,22 @@ impl Router {
         if mode == MODE_FORCE {
             return Err(Error::new("unavailable", "daemon is forcing shutdown"));
         }
-        if matches!(request.verb.as_str(), "launch" | "send") && mode != MODE_OPEN {
+        if matches!(request.verb.as_str(), "launch" | "resume" | "send") && mode != MODE_OPEN {
             return Err(Error::new(
                 "unavailable",
-                "daemon is draining and rejects new launch or send commands",
+                "daemon is draining and rejects new launch, resume, or send commands",
             ));
         }
         if request.verb == "launch" {
             normalize_launch(&mut request)?;
+            self.freeze_launch_profile(&mut request).await?;
+        } else if request.verb == "resume" {
+            normalize_resume(&mut request)?;
+        } else if matches!(
+            request.verb.as_str(),
+            "send" | "steer" | "interrupt" | "approve" | "deny" | "answer"
+        ) {
+            validate_plugin_command_args(&request)?;
         }
         if contains_known_secret(&request.args, &self.inner.secrets) {
             return Err(Error::new(
@@ -320,7 +333,17 @@ impl Router {
                 "durable command text contains a known credential",
             ));
         }
-        if matches!(request.verb.as_str(), "launch" | "send")
+        if request.request_id.as_deref().is_some_and(|value| {
+            contains_known_secret(&Value::String(value.to_owned()), &self.inner.secrets)
+        }) || request.expected_turn_id.as_deref().is_some_and(|value| {
+            contains_known_secret(&Value::String(value.to_owned()), &self.inner.secrets)
+        }) {
+            return Err(Error::new(
+                "secret_in_payload",
+                "durable command binding contains a known credential",
+            ));
+        }
+        if matches!(request.verb.as_str(), "launch" | "resume" | "send")
             && request
                 .args
                 .get("text")
@@ -329,13 +352,29 @@ impl Router {
         {
             return Err(Error::new(
                 "frame_too_large",
-                "fake echo input exceeds the 64 KiB persisted-text limit",
+                "command text exceeds the 64 KiB persisted-text limit",
             ));
         }
 
         let admission = {
             let mut store = self.inner.store.lock().await;
-            let admission = store.submit(&principal_name(principal), request, now_ms())?;
+            if request.verb == "answer" {
+                validate_answer_request(&store, &request)?;
+            }
+            let principal = principal_name(principal);
+            let now = now_ms();
+            let admission = match store.submit(&principal, request.clone(), now) {
+                Ok(admission) => admission,
+                Err(error) if error.code == "id_conflict" && request.verb == "launch" => {
+                    if let Some(retained) = retained_launch_profile(&store, &request)? {
+                        install_retained_profile(&mut request, retained)?;
+                        store.submit(&principal, request, now)?
+                    } else {
+                        return Err(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            };
             self.publish_locked(&admission.events);
             admission
         };
@@ -362,6 +401,25 @@ impl Router {
             &admission.command,
             admission.linked_command.as_ref(),
         ))
+    }
+
+    async fn freeze_launch_profile(&self, request: &mut SubmitCommand) -> Result<()> {
+        if let Some(retained) = {
+            let store = self.inner.store.lock().await;
+            retained_launch_profile(&store, request)?
+        } {
+            return install_retained_profile(request, retained);
+        }
+
+        let profile_name = required_text(&request.args, "profile")?;
+        let snapshot = crate::config::resolve_profile(&self.inner.data_root, profile_name)?;
+        let harness = snapshot
+            .get("harness")
+            .and_then(Value::as_str)
+            .filter(|harness| !harness.trim().is_empty())
+            .ok_or_else(|| Error::new("invalid", "resolved profile must name its harness"))?
+            .to_owned();
+        install_frozen_profile(request, &harness, snapshot, true)
     }
 
     async fn command_get(&self, params: &Value, principal: &Principal) -> Result<Value> {
@@ -445,7 +503,7 @@ impl Router {
             id,
             params.get("generation").and_then(Value::as_i64),
         )?;
-        let (generation, mut turns) = {
+        let (agent_metadata, generation, mut turns) = {
             let store = self.inner.store.lock().await;
             let agent = store
                 .get_agent(id)?
@@ -461,13 +519,14 @@ impl Router {
             } else {
                 store.list_turns(id, generation, page_limit(params)?)?
             };
-            (generation, turns)
+            (agent, generation, turns)
         };
         self.mask_unknown_turns(id, generation, &mut turns).await?;
         Ok(json!({
             "agent": id,
             "generation": generation,
             "turns": turns,
+            "agent_metadata": agent_metadata,
         }))
     }
 
@@ -813,6 +872,13 @@ impl Router {
 
     async fn process_command_inner(self, id: String, linked_id: Option<String>) {
         let mut receiver = self.inner.bus.subscribe();
+        let resume_source_state = match self.capture_resume_source_state(&id).await {
+            Ok(source_state) => source_state,
+            Err(error) => {
+                self.reject_undispatched(&id, &error.code).await;
+                return;
+            }
+        };
         let dispatched = loop {
             let change = {
                 let mut store = self.inner.store.lock().await;
@@ -878,11 +944,11 @@ impl Router {
         };
 
         let _result = match dispatched.verb.as_str() {
-            "launch" => {
+            "launch" | "resume" => {
                 let start = self
                     .inner
                     .plugin_host
-                    .start(agent, dispatched.clone())
+                    .start(agent, dispatched.clone(), resume_source_state)
                     .await;
                 match start {
                     Ok(value) => {
@@ -904,10 +970,38 @@ impl Router {
                 let response = self
                     .inner
                     .plugin_host
-                    .send(&agent, dispatched.clone())
+                    .command(&agent, dispatched.clone())
                     .await;
                 match response {
                     Ok(value) => {
+                        let response_state = value.get("state").and_then(Value::as_str);
+                        if let Some(state) = match response_state {
+                            Some("rejected") => Some(CommandState::Rejected),
+                            Some("failed") => Some(CommandState::Failed),
+                            Some("unknown") => Some(CommandState::Unknown),
+                            _ => None,
+                        } {
+                            let mut value = value;
+                            if state == CommandState::Unknown
+                                && let Some(cause) = self
+                                    .inner
+                                    .plugin_host
+                                    .take_late_batch_cause(&agent.id, agent.generation)
+                            {
+                                value["cause"] = Value::String(cause);
+                            }
+                            self.redact_native_value(&mut value);
+                            let _ = self.settle(&id, state, Some(value.clone())).await;
+                            return;
+                        }
+                        if response_state != Some("applied") {
+                            let error = Error::new(
+                                "unknown",
+                                "plugin send response omitted its command outcome",
+                            );
+                            self.settle_plugin_error(&id, &error).await;
+                            return;
+                        }
                         let expected_turn = value
                             .get("turn_id")
                             .and_then(Value::as_str)
@@ -947,6 +1041,46 @@ impl Router {
                     }
                 }
             }
+            "steer" | "interrupt" | "approve" | "deny" | "answer" => {
+                match self
+                    .inner
+                    .plugin_host
+                    .command(&agent, dispatched.clone())
+                    .await
+                {
+                    Ok(mut value) => {
+                        let state = match value.get("state").and_then(Value::as_str) {
+                            Some("applied") => CommandState::Applied,
+                            Some("rejected") => CommandState::Rejected,
+                            Some("failed") => CommandState::Failed,
+                            Some("unknown") => CommandState::Unknown,
+                            _ => {
+                                let error = Error::new(
+                                    "unknown",
+                                    "plugin command response omitted its outcome",
+                                );
+                                self.settle_plugin_error(&id, &error).await;
+                                return;
+                            }
+                        };
+                        if state == CommandState::Unknown
+                            && let Some(cause) = self
+                                .inner
+                                .plugin_host
+                                .take_late_batch_cause(&agent.id, agent.generation)
+                        {
+                            value["cause"] = Value::String(cause);
+                        }
+                        self.redact_native_value(&mut value);
+                        let _ = self.settle(&id, state, Some(value.clone())).await;
+                        Ok(value)
+                    }
+                    Err(error) => {
+                        self.settle_plugin_error(&id, &error).await;
+                        Err(error)
+                    }
+                }
+            }
             "stop" => {
                 let force = dispatched
                     .args
@@ -979,9 +1113,78 @@ impl Router {
         self.signal_progress();
     }
 
+    async fn capture_resume_source_state(&self, command_id: &str) -> Result<Option<Value>> {
+        let (generation, source, latest_turn) = {
+            let store = self.inner.store.lock().await;
+            let command = store
+                .get_command(command_id)?
+                .ok_or_else(|| Error::new("not_found", "resume command was not found"))?;
+            if command.verb != "resume" {
+                return Ok(None);
+            }
+            if command.state != CommandState::Accepted {
+                return Err(Error::new(
+                    "bad_state",
+                    "resume source state must be captured before dispatch",
+                ));
+            }
+            let agent_id = command
+                .target
+                .ok_or_else(|| Error::new("not_found", "resume target Agent is missing"))?;
+            let generation = command.expected_generation.ok_or_else(|| {
+                Error::new(
+                    "stale_generation",
+                    "resume did not capture its old generation",
+                )
+            })?;
+            if command.generation != Some(generation) {
+                return Err(Error::new(
+                    "stale_generation",
+                    "resume command generation does not match its captured generation",
+                ));
+            }
+            let source =
+                store.read_source_state(&agent_id, generation, CONTROLLED_PLUGIN_SOURCE)?;
+            let latest_turn = store
+                .list_turns(&agent_id, generation, 1)?
+                .into_iter()
+                .next()
+                .map(|turn| {
+                    json!({
+                        "turn_id": turn.turn_id,
+                        "state": turn.state,
+                        "status": turn.status,
+                        "started_at": turn.started_at,
+                        "completed_at": turn.completed_at,
+                    })
+                });
+            (generation, source, latest_turn)
+        };
+        let mut source_state = json!({
+            "retained_generation": generation,
+            "retained_source": source,
+            "current_turn": latest_turn,
+        });
+        self.redact_native_value(&mut source_state);
+        Ok(Some(source_state))
+    }
+
     async fn reject_undispatched(&self, id: &str, reason: &str) {
         let outcome = json!({"reason": reason});
         let _ = self.settle(id, CommandState::Rejected, Some(outcome)).await;
+    }
+
+    fn redact_native_value(&self, value: &mut Value) {
+        let mut secrets = self
+            .inner
+            .secrets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+        crate::redaction::redact_value(value, &secrets);
     }
 
     async fn settle_plugin_error(&self, id: &str, error: &Error) {
@@ -1002,16 +1205,37 @@ impl Router {
         {
             return;
         }
+        let error = {
+            let mut secrets = self
+                .inner
+                .secrets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+            Error::new(
+                error.code.clone(),
+                crate::redaction::redact_text(&error.message, &secrets),
+            )
+        };
         let state = match error.code.as_str() {
             "unknown" => CommandState::Unknown,
-            "invalid" | "unsupported" | "not_allowed" | "not_found" | "bad_state"
-            | "stale_generation" | "source_integrity" | "frame_too_large" | "secret_in_payload" => {
-                CommandState::Rejected
-            }
+            "invalid"
+            | "unsupported"
+            | "not_allowed"
+            | "not_found"
+            | "bad_state"
+            | "stale_generation"
+            | "source_integrity"
+            | "frame_too_large"
+            | "secret_in_payload"
+            | "native_not_dispatched" => CommandState::Rejected,
             _ => CommandState::Failed,
         };
         let cause = if state == CommandState::Unknown {
-            late_batch_cause.unwrap_or_else(|| unknown_cause(error))
+            late_batch_cause.unwrap_or_else(|| unknown_cause(&error))
         } else {
             String::new()
         };
@@ -1217,16 +1441,312 @@ fn normalize_launch(request: &mut SubmitCommand) -> Result<()> {
         .args
         .as_object_mut()
         .ok_or_else(|| Error::new("invalid", "launch args must be an object"))?;
+    for reserved in [
+        "harness",
+        "profile_snapshot",
+        "source_plan",
+        "target_environment",
+    ] {
+        if args.contains_key(reserved) {
+            return Err(Error::new(
+                "invalid",
+                format!("launch field {reserved} is resolved by the daemon"),
+            ));
+        }
+    }
+    if !args
+        .get("profile")
+        .and_then(Value::as_str)
+        .is_some_and(|profile| !profile.trim().is_empty())
+    {
+        return Err(Error::new("invalid", "launch requires a profile name"));
+    }
     args.insert("workspace".to_owned(), Value::String(workspace.clone()));
     args.insert("project".to_owned(), Value::String(workspace));
     Ok(())
+}
+
+fn normalize_resume(request: &mut SubmitCommand) -> Result<()> {
+    let args = request
+        .args
+        .as_object()
+        .ok_or_else(|| Error::new("invalid", "resume args must be an object"))?;
+    for reserved in [
+        "profile",
+        "harness",
+        "profile_snapshot",
+        "workspace",
+        "project",
+        "source_plan",
+        "target_environment",
+        "resume_from",
+        "native_scope",
+        "native_ref",
+        "prompt",
+    ] {
+        if args.contains_key(reserved) {
+            return Err(Error::new(
+                "invalid",
+                format!("resume field {reserved} is retained by the Agent or Store"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_plugin_command_args(request: &SubmitCommand) -> Result<()> {
+    let args = request
+        .args
+        .as_object()
+        .ok_or_else(|| Error::new("invalid", "command args must be an object"))?;
+    for reserved in ["expected_turn_id", "turn_id", "request_id"] {
+        if args.contains_key(reserved) {
+            return Err(Error::new(
+                "invalid",
+                format!("command field {reserved} is captured by the daemon or Store"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_answer_request(store: &eliot_store::Store, request: &SubmitCommand) -> Result<()> {
+    if store.get_command(&request.id)?.is_some() {
+        // Store enforces the retained principal/payload binding on this retry.
+        return Ok(());
+    }
+    let Some(target) = request.target.as_deref() else {
+        return Ok(());
+    };
+    let agent = match store.get_agent(target) {
+        Ok(Some(agent)) => agent,
+        Ok(None) => return Ok(()),
+        Err(error) if matches!(error.code.as_str(), "invalid" | "not_found") => return Ok(()),
+        Err(_) => {
+            return Err(Error::new(
+                "unavailable",
+                "pending request details are unavailable before answer admission",
+            ));
+        }
+    };
+    if request
+        .expected_generation
+        .is_some_and(|expected| expected != agent.generation)
+    {
+        return Ok(());
+    }
+    let pending = match request.request_id.as_deref() {
+        Some(request_id) => agent
+            .pending
+            .iter()
+            .find(|pending| pending.id == request_id)
+            .cloned(),
+        None if agent.pending.len() == 1 => agent.pending.first().cloned(),
+        None => None,
+    };
+    let Some(pending) = pending else {
+        return Ok(());
+    };
+    if request
+        .expected_turn_id
+        .as_deref()
+        .is_some_and(|turn_id| turn_id != pending.turn_id)
+    {
+        return Ok(());
+    }
+    if contains_secret_question(&pending.details) {
+        return Err(Error::new(
+            "unsupported",
+            "secret native request answers are not supported",
+        ));
+    }
+    Ok(())
+}
+
+struct RetainedLaunchProfile {
+    harness: String,
+    snapshot: Value,
+    command_has_harness: bool,
+    command_has_snapshot: bool,
+}
+
+fn retained_launch_profile(
+    store: &eliot_store::Store,
+    request: &SubmitCommand,
+) -> Result<Option<RetainedLaunchProfile>> {
+    let Some(command) = store.get_command(&request.id)? else {
+        return Ok(None);
+    };
+    if command.verb != "launch" {
+        return Ok(None);
+    }
+
+    let command_has_harness = command.args.get("harness").is_some();
+    let command_has_snapshot = command.args.get("profile_snapshot").is_some();
+    let stored_snapshot = command
+        .args
+        .get("profile_snapshot")
+        .filter(|snapshot| snapshot.is_object())
+        .cloned();
+    let stored_harness = command
+        .args
+        .get("harness")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    if let (Some(harness), Some(snapshot)) = (stored_harness, stored_snapshot) {
+        return Ok(Some(RetainedLaunchProfile {
+            harness,
+            snapshot,
+            command_has_harness,
+            command_has_snapshot,
+        }));
+    }
+
+    // Older L1 admissions did not keep the resolved route in command.args. Their
+    // Agent row is already the retained source of truth, so reuse it without a
+    // config read and preserve the original command payload for Store id binding.
+    if let Some(target) = command.target.as_deref()
+        && let Some(agent) = store.get_agent(target)?
+    {
+        return Ok(Some(RetainedLaunchProfile {
+            harness: agent.harness,
+            snapshot: agent.profile_snapshot,
+            command_has_harness,
+            command_has_snapshot,
+        }));
+    }
+
+    Err(Error::new(
+        "bad_state",
+        "retained launch has no frozen profile on its Agent row",
+    ))
+}
+
+fn install_frozen_profile(
+    request: &mut SubmitCommand,
+    harness: &str,
+    snapshot: Value,
+    require_snapshot_harness: bool,
+) -> Result<()> {
+    if !matches!(harness, "fake" | "codex") {
+        return Err(Error::new(
+            "unsupported",
+            format!("unsupported launch harness {harness}"),
+        ));
+    }
+    let Some(snapshot_object) = snapshot.as_object() else {
+        return Err(Error::new(
+            "invalid",
+            "resolved profile snapshot must be a JSON object",
+        ));
+    };
+    match snapshot_object.get("harness").and_then(Value::as_str) {
+        Some(snapshot_harness) if snapshot_harness != harness => {
+            return Err(Error::new(
+                "invalid",
+                "resolved profile harness does not match its snapshot",
+            ));
+        }
+        None if require_snapshot_harness => {
+            return Err(Error::new(
+                "invalid",
+                "resolved profile snapshot must include its harness",
+            ));
+        }
+        _ => {}
+    }
+    validate_pass_env_references(snapshot_object, require_snapshot_harness)?;
+    let args = request
+        .args
+        .as_object_mut()
+        .ok_or_else(|| Error::new("invalid", "launch args must be an object"))?;
+    args.insert("harness".to_owned(), Value::String(harness.to_owned()));
+    args.insert("profile_snapshot".to_owned(), snapshot);
+    Ok(())
+}
+
+fn install_retained_profile(
+    request: &mut SubmitCommand,
+    retained: RetainedLaunchProfile,
+) -> Result<()> {
+    let RetainedLaunchProfile {
+        harness,
+        snapshot,
+        command_has_harness,
+        command_has_snapshot,
+    } = retained;
+    // Match the exact payload shape that Store admitted. This keeps retries of
+    // pre-snapshot L1 commands bound to their original caller arguments.
+    let args = request
+        .args
+        .as_object_mut()
+        .ok_or_else(|| Error::new("invalid", "launch args must be an object"))?;
+    if command_has_harness {
+        args.insert("harness".to_owned(), Value::String(harness));
+    } else {
+        args.remove("harness");
+    }
+    if command_has_snapshot {
+        args.insert("profile_snapshot".to_owned(), snapshot);
+    } else {
+        args.remove("profile_snapshot");
+    }
+    Ok(())
+}
+
+fn validate_pass_env_references(
+    snapshot: &serde_json::Map<String, Value>,
+    required: bool,
+) -> Result<()> {
+    let Some(value) = snapshot.get("pass_env") else {
+        if required {
+            return Err(Error::new(
+                "invalid",
+                "resolved profile must store pass_env references",
+            ));
+        }
+        return Ok(());
+    };
+    let names = value
+        .as_array()
+        .ok_or_else(|| Error::new("invalid", "profile pass_env must be an array of names"))?;
+    for name in names {
+        let name = name
+            .as_str()
+            .filter(|name| valid_environment_name(name))
+            .ok_or_else(|| {
+                Error::new(
+                    "invalid",
+                    "profile pass_env entries must be environment variable names",
+                )
+            })?;
+        if name
+            .get(..12)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("ELIOT_AGENT_"))
+        {
+            return Err(Error::new(
+                "invalid",
+                "profile pass_env cannot override Eliot Agent identity variables",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn valid_environment_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some('_' | 'A'..='Z' | 'a'..='z'))
+        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
 }
 
 fn authorize_command(principal: &Principal, request: &mut SubmitCommand) -> Result<()> {
     let Principal::Agent { id, generation } = principal else {
         return Ok(());
     };
-    if !matches!(request.verb.as_str(), "send" | "stop") {
+    if !matches!(
+        request.verb.as_str(),
+        "send" | "stop" | "steer" | "interrupt" | "approve" | "deny" | "answer"
+    ) {
         return Err(Error::new(
             "not_allowed",
             "managed Agent credentials cannot launch another Agent",
@@ -1369,6 +1889,18 @@ fn string_set(value: Option<&Value>, field: &str) -> Result<HashSet<String>> {
         result.insert(text.to_owned());
     }
     Ok(result)
+}
+
+fn contains_secret_question(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(contains_secret_question),
+        Value::Object(object) => {
+            object.get("is_secret").and_then(Value::as_bool) == Some(true)
+                || object.get("isSecret").and_then(Value::as_bool) == Some(true)
+                || object.values().any(contains_secret_question)
+        }
+        _ => false,
+    }
 }
 
 fn contains_known_secret(value: &Value, secrets: &SecretSet) -> bool {

@@ -1,0 +1,12 @@
+# Copy to <Eliot data directory>/config.toml. This does not replace Codex config.
+# The first Codex integration uses the installed executable and existing ChatGPT login.
+# Select an exact model and an effort supported by the native model/list response.
+
+[profiles.codex-luna]
+harness = "codex"
+cmd = "codex"
+model = "gpt-6-luna"
+effort = "medium"
+permissions = "workspace-write"
+approval_policy = "never"
+pass_env = ["CODEX_HOME"]

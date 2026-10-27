@@ -5,6 +5,7 @@ members = [
     "crates/eliot-store",
     "crates/eliot-plugin",
     "crates/eliot-daemon",
+    "plugins/codex",
 ]
 resolver = "3"
 
@@ -18,6 +19,7 @@ eliot-core = { path = "crates/eliot-core" }
 eliot-store = { path = "crates/eliot-store" }
 eliot-plugin = { path = "crates/eliot-plugin" }
 eliot-daemon = { path = "crates/eliot-daemon" }
+eliot-plugin-codex = { path = "plugins/codex" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "io-util", "io-std", "net", "process", "sync", "time", "signal"] }
@@ -29,6 +31,7 @@ sha2 = "0.11.1"
 ulid = "1.2"
 libc = "0.2.190"
 windows-sys = "0.61.2"
+toml = { version = "1.1.7", default-features = false, features = ["parse", "serde", "std"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

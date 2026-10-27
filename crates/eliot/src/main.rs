@@ -1,8 +1,10 @@
-use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use eliot_core::Error as CoreError;
 use serde_json::{Value, json};
 use std::{
     env,
+    fs::File,
+    io::Read,
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, ExitCode, Stdio},
     time::Duration,
@@ -13,6 +15,7 @@ use ulid::Ulid;
 const DEFAULT_WAIT_SECONDS: u64 = 30;
 const PAGE_SIZE: usize = 100;
 const MAX_TEXT_BYTES: usize = 512 * 1024;
+const MAX_ANSWERS_FILE_BYTES: usize = 512 * 1024;
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 #[derive(Parser)]
@@ -44,10 +47,10 @@ enum CliCommand {
     Daemon(DaemonArgs),
     /// Read daemon state without starting a daemon.
     Status,
-    /// Start an Agent using the L1 fake profile.
+    /// Start an Agent using the named profile.
     Launch {
-        #[arg(long, value_enum)]
-        profile: Profile,
+        #[arg(long, value_name = "PROFILE")]
+        profile: String,
         #[arg(long, value_name = "PATH")]
         workspace: PathBuf,
         #[arg(value_name = "PROMPT")]
@@ -69,6 +72,67 @@ enum CliCommand {
         generation: Option<i64>,
         #[arg(long, default_value_t = DEFAULT_WAIT_SECONDS, value_name = "SECONDS")]
         timeout_seconds: u64,
+    },
+    /// Resume a retained Codex thread, optionally with new input.
+    Resume {
+        #[arg(value_name = "AGENT")]
+        agent: String,
+        #[arg(value_name = "PROMPT", allow_hyphen_values = true)]
+        prompt: Option<String>,
+        #[arg(long)]
+        wait: bool,
+        #[arg(long, value_name = "GENERATION")]
+        generation: Option<i64>,
+    },
+    /// Steer the exact active turn.
+    Steer {
+        #[arg(value_name = "AGENT")]
+        agent: String,
+        #[arg(value_name = "TEXT", allow_hyphen_values = true)]
+        text: String,
+        #[arg(long, value_name = "GENERATION")]
+        generation: Option<i64>,
+        #[arg(long, value_name = "TURN")]
+        turn: Option<String>,
+    },
+    /// Interrupt the exact active turn. `abort` is an alias.
+    #[command(alias = "abort")]
+    Interrupt {
+        #[arg(value_name = "AGENT")]
+        agent: String,
+        #[arg(long, value_name = "GENERATION")]
+        generation: Option<i64>,
+        #[arg(long, value_name = "TURN")]
+        turn: Option<String>,
+    },
+    /// Approve a pending native request.
+    Approve {
+        #[arg(value_name = "AGENT")]
+        agent: String,
+        #[arg(long, value_name = "GENERATION")]
+        generation: Option<i64>,
+        #[arg(long, value_name = "REQUEST")]
+        request: Option<String>,
+    },
+    /// Deny a pending native request.
+    Deny {
+        #[arg(value_name = "AGENT")]
+        agent: String,
+        #[arg(long, value_name = "GENERATION")]
+        generation: Option<i64>,
+        #[arg(long, value_name = "REQUEST")]
+        request: Option<String>,
+    },
+    /// Answer a pending native question from a bounded JSON file.
+    Answer {
+        #[arg(value_name = "AGENT")]
+        agent: String,
+        #[arg(long, value_name = "PATH")]
+        answers_file: PathBuf,
+        #[arg(long, value_name = "GENERATION")]
+        generation: Option<i64>,
+        #[arg(long, value_name = "REQUEST")]
+        request: Option<String>,
     },
     /// List Agents.
     Ls {
@@ -149,19 +213,9 @@ enum CmdCommand {
 #[derive(Subcommand)]
 enum PluginCommand {
     Fake,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum Profile {
-    Fake,
-}
-
-impl Profile {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Fake => "fake",
-        }
-    }
+    /// Internal Codex plugin entry point (hidden until L2.2 caller).
+    #[command(hide = true)]
+    Codex,
 }
 
 struct Failure {
@@ -194,7 +248,8 @@ impl Failure {
                 | "frame_too_large"
                 | "secret_in_payload"
                 | "id_conflict"
-                | "id_expired" => 3,
+                | "id_expired"
+                | "profile_error" => 3,
                 "failed" => 1,
                 _ => 4,
             }
@@ -314,10 +369,13 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             wait,
             timeout_seconds,
         } => {
+            if profile.is_empty() {
+                return Err(Failure::new(2, "--profile must not be empty"));
+            }
             validate_text(prompt.as_deref())?;
             let deadline = wait_deadline(timeout_seconds)?;
             let mut args = json!({
-                "profile": profile.as_str(),
+                "profile": profile,
                 "workspace": workspace.to_string_lossy(),
             });
             if let Some(prompt) = &prompt {
@@ -406,6 +464,178 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             print_value(&completed, json_output);
             Ok(turn_exit_code(&completed))
         }
+        CliCommand::Resume {
+            agent,
+            prompt,
+            wait,
+            generation,
+        } => {
+            validate_text(prompt.as_deref())?;
+            let deadline = if wait {
+                Some(wait_deadline(DEFAULT_WAIT_SECONDS)?)
+            } else {
+                None
+            };
+            let mut args = json!({});
+            if let Some(prompt) = &prompt {
+                args["text"] = Value::String(prompt.clone());
+            }
+            let mut params = json!({
+                "target": agent,
+                "verb": "resume",
+                "args": args,
+            });
+            if let Some(generation) = generation {
+                params["expected_generation"] = json!(generation);
+            }
+            let submitted = mutation_call(&data_dir, "command.submit", params, id).await?;
+            let submit_exit = response_exit_code(&submitted);
+            if matches!(submit_exit, 1 | 3 | 4) {
+                print_value(&submitted, json_output);
+                return Ok(submit_exit);
+            }
+            if !wait {
+                print_value(&submitted, json_output);
+                return Ok(submit_exit);
+            }
+
+            let deadline = deadline.ok_or_else(|| Failure::new(2, "missing wait deadline"))?;
+            let command_id = submitted
+                .get("command_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| Failure::new(4, "resume response omitted command_id"))?;
+            let completed = if prompt.is_some() {
+                let linked = submitted
+                    .get("linked_command")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        Failure::new(4, "resume response omitted its linked input command")
+                    })?;
+                let old_generation = submitted
+                    .get("generation")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| {
+                        Failure::new(4, "resume response omitted its source generation")
+                    })?;
+                let generation = old_generation
+                    .checked_add(1)
+                    .ok_or_else(|| Failure::new(4, "resume generation could not be incremented"))?;
+                wait_for_turn(&data_dir, linked, &submitted, Some(generation), deadline).await?
+            } else {
+                wait_for_command(&data_dir, command_id, deadline).await?
+            };
+            let exit_code = if prompt.is_some() {
+                turn_exit_code(&completed)
+            } else {
+                response_exit_code(&completed)
+            };
+            print_value(&completed, json_output);
+            Ok(exit_code)
+        }
+        CliCommand::Steer {
+            agent,
+            text,
+            generation,
+            turn,
+        } => {
+            validate_text(Some(&text))?;
+            let mut params = json!({
+                "target": agent,
+                "verb": "steer",
+                "args": { "text": text },
+            });
+            if let Some(generation) = generation {
+                params["expected_generation"] = json!(generation);
+            }
+            if let Some(turn) = turn {
+                params["expected_turn_id"] = Value::String(turn);
+            }
+            let result = mutation_call(&data_dir, "command.submit", params, id).await?;
+            print_value(&result, json_output);
+            Ok(response_exit_code(&result))
+        }
+        CliCommand::Interrupt {
+            agent,
+            generation,
+            turn,
+        } => {
+            let mut params = json!({
+                "target": agent,
+                "verb": "interrupt",
+                "args": {},
+            });
+            if let Some(generation) = generation {
+                params["expected_generation"] = json!(generation);
+            }
+            if let Some(turn) = turn {
+                params["expected_turn_id"] = Value::String(turn);
+            }
+            let result = mutation_call(&data_dir, "command.submit", params, id).await?;
+            print_value(&result, json_output);
+            Ok(response_exit_code(&result))
+        }
+        CliCommand::Approve {
+            agent,
+            generation,
+            request,
+        } => {
+            let mut params = json!({
+                "target": agent,
+                "verb": "approve",
+                "args": {},
+            });
+            if let Some(generation) = generation {
+                params["expected_generation"] = json!(generation);
+            }
+            if let Some(request) = request {
+                params["request_id"] = Value::String(request);
+            }
+            let result = mutation_call(&data_dir, "command.submit", params, id).await?;
+            print_value(&result, json_output);
+            Ok(response_exit_code(&result))
+        }
+        CliCommand::Deny {
+            agent,
+            generation,
+            request,
+        } => {
+            let mut params = json!({
+                "target": agent,
+                "verb": "deny",
+                "args": {},
+            });
+            if let Some(generation) = generation {
+                params["expected_generation"] = json!(generation);
+            }
+            if let Some(request) = request {
+                params["request_id"] = Value::String(request);
+            }
+            let result = mutation_call(&data_dir, "command.submit", params, id).await?;
+            print_value(&result, json_output);
+            Ok(response_exit_code(&result))
+        }
+        CliCommand::Answer {
+            agent,
+            answers_file,
+            generation,
+            request,
+        } => {
+            let answers = read_answers_file(&answers_file)?;
+            let mut params = json!({
+                "target": agent,
+                "verb": "answer",
+                "args": { "answers": answers },
+            });
+            if let Some(generation) = generation {
+                params["expected_generation"] = json!(generation);
+            }
+            if let Some(request) = request {
+                params["request_id"] = Value::String(request);
+            }
+            let result = mutation_call(&data_dir, "command.submit", params, id).await?;
+            print_value(&result, json_output);
+            Ok(response_exit_code(&result))
+        }
         CliCommand::Ls { after, limit } => {
             validate_limit(limit)?;
             let mut params = json!({ "limit": limit });
@@ -482,6 +712,12 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                     .map_err(|error| Failure::new(1, error.to_string()))?;
                 Ok(0)
             }
+            PluginCommand::Codex => {
+                eliot_plugin_codex::run_codex()
+                    .await
+                    .map_err(|error| Failure::new(1, error.to_string()))?;
+                Ok(0)
+            }
         },
     }
 }
@@ -541,6 +777,48 @@ async fn mutation_call(
     eliot_daemon::client_call(data_dir, method, params)
         .await
         .map_err(|error| Failure::from_core(error, true))
+}
+
+fn read_answers_file(path: &Path) -> Result<Value, Failure> {
+    let file = File::open(path).map_err(|_| Failure::new(2, "answers file could not be read"))?;
+    let mut bounded = file.take(MAX_ANSWERS_FILE_BYTES as u64 + 1);
+    let mut bytes = Vec::new();
+    let byte_count = bounded
+        .read_to_end(&mut bytes)
+        .map_err(|_| Failure::new(2, "answers file could not be read"))?;
+    if byte_count > MAX_ANSWERS_FILE_BYTES {
+        return Err(Failure::new(2, "answers file exceeds the 512 KiB limit"));
+    }
+
+    let answers: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| Failure::new(2, "answers file must contain valid answer JSON"))?;
+    let Some(questions) = answers.as_object() else {
+        return Err(Failure::new(
+            2,
+            "answers file must be an object keyed by question id",
+        ));
+    };
+    for question in questions.values() {
+        let Some(question) = question.as_object() else {
+            return Err(Failure::new(
+                2,
+                "each answer entry must contain an answers array",
+            ));
+        };
+        let Some(values) = question.get("answers").and_then(Value::as_array) else {
+            return Err(Failure::new(
+                2,
+                "each answer entry must contain an answers array",
+            ));
+        };
+        if question.len() != 1 || values.iter().any(|value| !value.is_string()) {
+            return Err(Failure::new(
+                2,
+                "each answer entry must contain only an array of strings",
+            ));
+        }
+    }
+    Ok(answers)
 }
 
 fn validate_text(text: Option<&str>) -> Result<(), Failure> {

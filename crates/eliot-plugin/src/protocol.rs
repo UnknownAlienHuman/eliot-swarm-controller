@@ -144,6 +144,10 @@ pub struct AgentCommandParams {
     pub verb: String,
     #[serde(default = "empty_object")]
     pub args: Value,
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    #[serde(default)]
+    pub request_id: Option<String>,
 }
 
 #[derive(Deserialize)]

@@ -11,6 +11,7 @@ workspace = true
 eliot-core.workspace = true
 eliot-store.workspace = true
 eliot-plugin.workspace = true
+toml.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

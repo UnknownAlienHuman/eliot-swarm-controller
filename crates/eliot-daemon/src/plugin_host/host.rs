@@ -1,11 +1,12 @@
 use super::{PluginClient, PluginConnection};
 use crate::bus::Bus;
 use crate::platform::OwnedChild;
-use eliot_core::{Agent, Command, Error, Result, SourceBatch};
+use eliot_core::{Agent, Command, Error, Result, SourceBatch, SourceGap, SourceGapAck};
 use eliot_plugin::PluginManifest;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::{
     collections::{HashMap, HashSet},
+    ffi::OsString,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex, Weak},
@@ -29,6 +30,20 @@ pub(crate) type UnknownCommands = Arc<Mutex<HashSet<String>>>;
 
 type StoreHandle = Arc<AsyncMutex<eliot_store::Store>>;
 
+pub(crate) struct PluginHostOptions {
+    data_root: PathBuf,
+    owner_token: String,
+}
+
+impl PluginHostOptions {
+    pub(crate) fn new(data_root: PathBuf, owner_token: String) -> Self {
+        Self {
+            data_root,
+            owner_token,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct AgentKey {
     id: String,
@@ -37,10 +52,11 @@ struct AgentKey {
 
 struct RuntimeEntry {
     sender: mpsc::Sender<RuntimeMessage>,
+    verbs: HashSet<String>,
 }
 
 enum RuntimeMessage {
-    Send {
+    Command {
         command: Command,
         reply: oneshot::Sender<Result<Value>>,
     },
@@ -56,6 +72,7 @@ enum RuntimeMessage {
 
 struct HostState {
     data_root: PathBuf,
+    owner_token: String,
     store: StoreHandle,
     bus: Bus,
     secrets: SecretSet,
@@ -73,13 +90,16 @@ struct AgentActorConfig {
     start_command: Command,
     instance_dir: String,
     plugin_credential: String,
-    agent_token: String,
+    target_environment: Value,
+    source_credentials: Arc<[String]>,
+    resume_from: Option<Value>,
+    source_state: Option<Value>,
 }
 
 struct EventSource {
     store: StoreHandle,
     bus: Bus,
-    secrets: SecretSet,
+    source_credentials: Arc<[String]>,
     state: Weak<HostState>,
     key: AgentKey,
     agent_id: String,
@@ -94,7 +114,7 @@ pub(crate) struct PluginHost {
 
 impl PluginHost {
     pub(crate) fn new(
-        data_root: PathBuf,
+        options: PluginHostOptions,
         store: StoreHandle,
         bus: Bus,
         secrets: SecretSet,
@@ -102,9 +122,14 @@ impl PluginHost {
         unknown_commands: UnknownCommands,
         progress: watch::Sender<u64>,
     ) -> Self {
+        let PluginHostOptions {
+            data_root,
+            owner_token,
+        } = options;
         Self {
             state: Arc::new(HostState {
                 data_root,
+                owner_token,
                 store,
                 bus,
                 secrets,
@@ -117,23 +142,69 @@ impl PluginHost {
         }
     }
 
-    pub(crate) async fn start(&self, agent: Agent, command: Command) -> Result<Value> {
+    pub(crate) async fn start(
+        &self,
+        agent: Agent,
+        command: Command,
+        mut source_state: Option<Value>,
+    ) -> Result<Value> {
+        if !matches!(command.verb.as_str(), "launch" | "resume")
+            || command.target.as_deref() != Some(agent.id.as_str())
+            || command.generation != Some(agent.generation)
+        {
+            return Err(Error::new(
+                "stale_generation",
+                "start command does not match its Agent generation",
+            ));
+        }
         let workspace = agent
             .workspace
             .as_deref()
-            .ok_or_else(|| Error::new("invalid", "fake launch requires a workspace"))?;
+            .ok_or_else(|| Error::new("invalid", "Agent launch requires a workspace"))?;
         if !Path::new(workspace).is_dir() {
             return Err(Error::new(
                 "invalid",
-                "fake launch workspace must be an existing directory",
+                "Agent launch workspace must be an existing directory",
             ));
         }
-        if agent.profile != "fake" || agent.harness != "fake" || agent.generation <= 0 {
+        if !matches!(agent.harness.as_str(), "fake" | "codex") || agent.generation <= 0 {
             return Err(Error::new(
                 "unsupported",
-                "L1 plugin host only starts the fake harness and profile",
+                format!("unsupported Agent harness {}", agent.harness),
             ));
         }
+        if !agent.profile_snapshot.is_object() {
+            return Err(Error::new(
+                "invalid",
+                "Agent profile snapshot must be a JSON object",
+            ));
+        }
+        let resume_from = if command.verb == "resume" {
+            let retained_generation = source_state
+                .as_ref()
+                .and_then(|state| state.get("retained_generation"))
+                .and_then(Value::as_i64);
+            if retained_generation != command.expected_generation {
+                return Err(Error::new(
+                    "stale_generation",
+                    "resume readback does not match the retained Agent generation",
+                ));
+            }
+            let (Some(native_scope), Some(native_ref)) =
+                (agent.native_scope.as_ref(), agent.native_ref.as_ref())
+            else {
+                return Err(Error::new(
+                    "bad_state",
+                    "resume requires the Agent's retained native subject",
+                ));
+            };
+            Some(json!({
+                "native_scope": native_scope,
+                "native_ref": native_ref,
+            }))
+        } else {
+            None
+        };
         let key = AgentKey {
             id: agent.id.clone(),
             generation: agent.generation,
@@ -164,6 +235,17 @@ impl PluginHost {
                     )
                 })?
         };
+        let mut source_credentials = vec![
+            self.state.owner_token.clone(),
+            agent_token.clone(),
+            credential.clone(),
+        ];
+        source_credentials.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+        let source_credentials: Arc<[String]> = source_credentials.into();
+        if let Some(source_state) = source_state.as_mut() {
+            crate::redaction::redact_value(source_state, &source_credentials);
+        }
+        let target_environment = build_target_environment(&agent, &agent_token)?;
         {
             let mut credentials = self
                 .state
@@ -195,7 +277,7 @@ impl PluginHost {
             self.remove_plugin_secret(&credential);
             return Err(Error::new(
                 "process_pipes",
-                "fake plugin did not expose all three owned pipes",
+                "Agent plugin did not expose all three owned pipes",
             ));
         };
 
@@ -212,7 +294,7 @@ impl PluginHost {
             EventSource {
                 store: Arc::clone(&self.state.store),
                 bus: self.state.bus.clone(),
-                secrets: Arc::clone(&self.state.secrets),
+                source_credentials: Arc::clone(&source_credentials),
                 state: Arc::downgrade(&self.state),
                 key: key.clone(),
                 agent_id: key.id.clone(),
@@ -229,7 +311,16 @@ impl PluginHost {
                 .running
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            running.insert(actor_key.clone(), RuntimeEntry { sender: message_tx });
+            running.insert(
+                actor_key.clone(),
+                RuntimeEntry {
+                    sender: message_tx,
+                    verbs: ["launch", "send", "stop"]
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
+                },
+            );
         }
         let actor = AgentActorConfig {
             state: Arc::downgrade(&self.state),
@@ -238,7 +329,10 @@ impl PluginHost {
             start_command: command.clone(),
             instance_dir: instance_dir.to_string_lossy().into_owned(),
             plugin_credential: credential.clone(),
-            agent_token: agent_token.clone(),
+            target_environment,
+            source_credentials,
+            resume_from,
+            source_state,
         };
         tokio::spawn(async move {
             run_agent(actor, child, client, event_task, message_rx, started_tx).await;
@@ -249,38 +343,63 @@ impl PluginHost {
             Ok(Ok(Err(error))) => Err(error),
             Ok(Err(_)) => Err(Error::new(
                 "unknown",
-                "fake plugin ended before start readiness was established",
+                "Agent plugin ended before start readiness was established",
             )),
             Err(_) => Err(Error::new(
                 "unknown",
-                "fake plugin start exceeded its absolute deadline",
+                "Agent plugin start exceeded its absolute deadline",
             )),
         }
     }
 
-    pub(crate) async fn send(&self, agent: &Agent, command: Command) -> Result<Value> {
+    pub(crate) async fn command(&self, agent: &Agent, command: Command) -> Result<Value> {
         let key = AgentKey {
             id: agent.id.clone(),
             generation: agent.generation,
         };
-        let sender = self.sender(&key)?;
+        if command.target.as_deref() != Some(agent.id.as_str())
+            || command.generation != Some(agent.generation)
+        {
+            return Err(Error::new(
+                "stale_generation",
+                "command does not match the owned Agent generation",
+            ));
+        }
+        match command.verb.as_str() {
+            "steer" | "interrupt" if command.turn_id.is_none() => {
+                return Err(Error::new(
+                    "stale_generation",
+                    "turn control requires the captured active turn",
+                ));
+            }
+            "approve" | "deny" | "answer"
+                if command.request_id.is_none() || command.turn_id.is_none() =>
+            {
+                return Err(Error::new(
+                    "bad_state",
+                    "request reply requires its captured request and turn ids",
+                ));
+            }
+            _ => {}
+        }
+        let sender = self.sender(&key, &command.verb)?;
         let (reply, response) = oneshot::channel();
         timeout_at(
             Instant::now() + RPC_DEADLINE,
-            sender.send(RuntimeMessage::Send { command, reply }),
+            sender.send(RuntimeMessage::Command { command, reply }),
         )
         .await
-        .map_err(|_| Error::new("busy", "fake plugin command queue is full"))?
-        .map_err(|_| Error::new("unknown", "owned fake plugin is no longer available"))?;
+        .map_err(|_| Error::new("busy", "Agent plugin command queue is full"))?
+        .map_err(|_| Error::new("unknown", "owned Agent plugin is no longer available"))?;
         match timeout_at(Instant::now() + RPC_DEADLINE + RPC_GRACE, response).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(Error::new(
                 "unknown",
-                "fake plugin ended before the command outcome was returned",
+                "Agent plugin ended before the command outcome was returned",
             )),
             Err(_) => Err(Error::new(
                 "unknown",
-                "fake plugin command exceeded its absolute deadline",
+                "Agent plugin command exceeded its absolute deadline",
             )),
         }
     }
@@ -290,7 +409,7 @@ impl PluginHost {
             id: agent.id.clone(),
             generation: agent.generation,
         };
-        let sender = self.sender(&key)?;
+        let sender = self.sender(&key, "stop")?;
         let (reply, response) = oneshot::channel();
         timeout_at(
             Instant::now() + RPC_DEADLINE,
@@ -301,8 +420,8 @@ impl PluginHost {
             }),
         )
         .await
-        .map_err(|_| Error::new("busy", "fake plugin command queue is full"))?
-        .map_err(|_| Error::new("unknown", "owned fake plugin is no longer available"))?;
+        .map_err(|_| Error::new("busy", "Agent plugin command queue is full"))?
+        .map_err(|_| Error::new("unknown", "owned Agent plugin is no longer available"))?;
         match timeout_at(
             Instant::now() + RPC_DEADLINE + STOP_GRACE + STOP_GRACE + RPC_GRACE,
             response,
@@ -312,11 +431,11 @@ impl PluginHost {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(Error::new(
                 "unknown",
-                "fake plugin ended before stop custody was settled",
+                "Agent plugin ended before stop custody was settled",
             )),
             Err(_) => Err(Error::new(
                 "unknown",
-                "fake plugin stop exceeded its absolute deadline",
+                "Agent plugin stop exceeded its absolute deadline",
             )),
         }
     }
@@ -378,13 +497,12 @@ impl PluginHost {
             })
     }
 
-    fn sender(&self, key: &AgentKey) -> Result<mpsc::Sender<RuntimeMessage>> {
+    fn sender(&self, key: &AgentKey, verb: &str) -> Result<mpsc::Sender<RuntimeMessage>> {
         self.state
             .running
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(key)
-            .map(|entry| entry.sender.clone())
             .ok_or_else(|| {
                 Error::new(
                     "not_found",
@@ -394,6 +512,38 @@ impl PluginHost {
                     ),
                 )
             })
+            .and_then(|entry| {
+                if entry.verbs.contains(verb) {
+                    Ok(entry.sender.clone())
+                } else {
+                    Err(Error::new(
+                        "unsupported",
+                        format!("Agent plugin does not advertise {verb}"),
+                    ))
+                }
+            })
+    }
+
+    fn install_runtime_verbs(
+        state: &Weak<HostState>,
+        key: &AgentKey,
+        verbs: HashSet<String>,
+    ) -> Result<()> {
+        let state = state
+            .upgrade()
+            .ok_or_else(|| Error::new("unknown", "plugin host stopped during initialization"))?;
+        let mut running = state
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = running.get_mut(key).ok_or_else(|| {
+            Error::new(
+                "unknown",
+                "Agent plugin ownership changed during initialization",
+            )
+        })?;
+        entry.verbs = verbs;
+        Ok(())
     }
 
     fn create_instance_dir(&self, key: &AgentKey) -> Result<(PathBuf, String)> {
@@ -433,15 +583,16 @@ impl PluginHost {
         let workspace = agent
             .workspace
             .as_deref()
-            .ok_or_else(|| Error::new("invalid", "fake launch requires a workspace"))?;
+            .ok_or_else(|| Error::new("invalid", "Agent launch requires a workspace"))?;
         let mut command = ProcessCommand::new(executable);
         command
             .arg("--data-dir")
             .arg(&self.state.data_root)
             .arg("plugin")
-            .arg("fake")
+            .arg(&agent.harness)
             .current_dir(workspace)
             .env_clear()
+            .envs(minimal_plugin_environment())
             .kill_on_drop(true)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -486,7 +637,10 @@ async fn run_agent(
         start_command,
         instance_dir,
         plugin_credential,
-        agent_token,
+        target_environment,
+        source_credentials,
+        resume_from,
+        source_state,
     } = actor;
     let mut last_command_id = start_command.id.clone();
     let init = client
@@ -496,7 +650,7 @@ async fn run_agent(
                 "protocol": "eliot-plugin/1",
                 "credential": plugin_credential,
                 "instance_dir": instance_dir,
-                "config": {"harness": "fake"},
+                "config": {"harness": agent.harness},
             }),
             deadline(),
         )
@@ -504,7 +658,7 @@ async fn run_agent(
     let init = match init {
         Ok(value) => value,
         Err(error) => {
-            let _ = started.send(Err(error));
+            let _ = started.send(Err(redact_native_error(error, &source_credentials)));
             terminate_child(child).await;
             let _ = event_task.await;
             cleanup_actor(&state, &key, &plugin_credential, false).await;
@@ -516,7 +670,7 @@ async fn run_agent(
         Err(_) => {
             let _ = started.send(Err(Error::new(
                 "unsupported",
-                "fake plugin returned a malformed manifest",
+                "Agent plugin returned a malformed manifest",
             )));
             terminate_child(child).await;
             let _ = event_task.await;
@@ -524,11 +678,33 @@ async fn run_agent(
             return;
         }
     };
-    if !valid_fake_manifest(&manifest) {
+    let source_plan = match manifest_source_plan(&manifest, &agent.harness) {
+        Ok(source_plan) => source_plan,
+        Err(error) => {
+            let _ = started.send(Err(error));
+            terminate_child(child).await;
+            let _ = event_task.await;
+            cleanup_actor(&state, &key, &plugin_credential, false).await;
+            return;
+        }
+    };
+    if !manifest
+        .verbs
+        .iter()
+        .any(|verb| verb == &start_command.verb)
+    {
         let _ = started.send(Err(Error::new(
             "unsupported",
-            "plugin manifest does not advertise the implemented fake capabilities",
+            format!("Agent plugin does not advertise {}", start_command.verb),
         )));
+        terminate_child(child).await;
+        let _ = event_task.await;
+        cleanup_actor(&state, &key, &plugin_credential, false).await;
+        return;
+    }
+    let verbs: HashSet<String> = manifest.verbs.iter().cloned().collect();
+    if let Err(error) = PluginHost::install_runtime_verbs(&state, &key, verbs) {
+        let _ = started.send(Err(error));
         terminate_child(child).await;
         let _ = event_task.await;
         cleanup_actor(&state, &key, &plugin_credential, false).await;
@@ -539,21 +715,13 @@ async fn run_agent(
         "agent_id": agent.id,
         "generation": agent.generation,
         "command_id": start_command.id,
-        "profile": agent.profile,
+        "profile": agent.profile_snapshot,
         "workspace": agent.workspace,
-        "target_environment": {
-            "ELIOT_AGENT_ID": agent.id,
-            "ELIOT_AGENT_GENERATION": agent.generation.to_string(),
-            "ELIOT_AGENT_TOKEN": agent_token,
-        },
+        "target_environment": target_environment,
         "note": null,
-        "source_plan": {
-            "session": "stream",
-            "turn": "stream",
-            "message": "stream",
-        },
-        "source_state": null,
-        "resume_from": null,
+        "source_plan": source_plan,
+        "source_state": source_state,
+        "resume_from": resume_from,
         "initial": null,
     });
     let start = client.call("agent.start", start_params, deadline()).await;
@@ -572,6 +740,7 @@ async fn run_agent(
             }
         }
         Err(error) => {
+            let error = redact_native_error(error, &source_credentials);
             let uncertain = error.code == "unknown";
             let _ = started.send(Err(error));
             if !uncertain {
@@ -610,18 +779,32 @@ async fn run_agent(
                     break;
                 };
                 match message {
-                    RuntimeMessage::Send { command, reply } => {
+                    RuntimeMessage::Command { command, reply } => {
                         last_command_id = command.id.clone();
-                        let args = command.args.clone();
-                        let params = json!({
-                            "agent_id": agent.id,
-                            "generation": agent.generation,
-                            "command_id": command.id,
-                            "verb": "send",
-                            "args": args,
-                        });
-                        let result = client.call("agent.command", params, deadline()).await
-                            .and_then(validate_send_result);
+                        let verb = command.verb.clone();
+                        let result = match plugin_command_args(&command) {
+                            Err(error) => Err(error),
+                            Ok(args) => {
+                                let params = json!({
+                                    "agent_id": agent.id,
+                                    "generation": agent.generation,
+                                    "command_id": command.id,
+                                    "verb": verb.clone(),
+                                    "turn_id": command.turn_id,
+                                    "request_id": command.request_id,
+                                    "args": args,
+                                });
+                                client.call("agent.command", params, deadline()).await
+                                    .map_err(|error| redact_native_error(error, &source_credentials))
+                                    .and_then(|mut value| {
+                                        crate::redaction::redact_value(
+                                            &mut value,
+                                            &source_credentials,
+                                        );
+                                        validate_agent_command_result(value, &verb)
+                                    })
+                            }
+                        };
                         let _ = reply.send(result);
                     }
                     RuntimeMessage::Stop { command, force, reply } => {
@@ -636,6 +819,7 @@ async fn run_agent(
                         let cooperative = client
                             .call("agent.stop", params, deadline())
                             .await
+                            .map_err(|error| redact_native_error(error, &source_credentials))
                             .and_then(validate_applied);
                         match cooperative {
                             Ok(result) => {
@@ -779,7 +963,7 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
     let EventSource {
         store,
         bus,
-        secrets,
+        source_credentials,
         state,
         key,
         agent_id,
@@ -789,11 +973,15 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
     let client = connection.client();
     while let Some(request) = connection.next_request().await {
         let request_id = request.id.clone();
+        let method = request.method.clone();
         let request_deadline = deadline();
-        let result = if request.method != "events.put" {
+        let result = if !matches!(
+            method.as_str(),
+            "events.put" | "source.gap" | "source.state"
+        ) {
             Err(Error::new(
                 "unsupported",
-                "plugin host only accepts events.put in the L1 harness",
+                "plugin host only accepts events.put, source.gap, and source.state",
             ))
         } else {
             let mut params = request.params;
@@ -805,67 +993,150 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
                 .as_deref()
                 .is_some_and(|credential| secure_eq(credential, &expected_credential))
             {
-                Err(late_batch_error(
-                    &state,
-                    &agent_id,
-                    generation,
-                    "plugin_credential_invalid",
-                ))
+                if method == "events.put" {
+                    Err(late_batch_error(
+                        &state,
+                        &agent_id,
+                        generation,
+                        "plugin_credential_invalid",
+                    ))
+                } else {
+                    Err(Error::new("not_allowed", "plugin credential is invalid"))
+                }
             } else {
-                match serde_json::from_value::<SourceBatch>(params) {
-                    Ok(batch) if batch.agent_id == agent_id && batch.generation == generation => {
-                        let contains_secret = serde_json::to_value(&batch)
-                            .ok()
-                            .is_some_and(|value| contains_known_secret(&value, &secrets));
-                        if contains_secret {
-                            Err(Error::new(
-                                "secret_in_payload",
-                                "durable plugin event contains a known credential",
-                            ))
-                        } else {
-                            match timeout_at(request_deadline, store.lock()).await {
-                                Ok(mut store) => match store.put_batch(batch, now_ms()) {
-                                    Ok(commit) => {
-                                        bus.publish(&commit.events);
-                                        drop(store);
-                                        serde_json::to_value(commit.ack).map_err(|_| {
-                                            late_batch_error(
-                                                &state,
-                                                &agent_id,
-                                                generation,
-                                                "ack_encoding_failed",
-                                            )
-                                        })
-                                    }
-                                    Err(error) => {
-                                        let cause = if store.is_write_faulted() {
-                                            "store_write_faulted".to_owned()
-                                        } else {
-                                            format!("store_{}", safe_cause_code(&error.code))
-                                        };
-                                        Err(late_batch_error(&state, &agent_id, generation, &cause))
-                                    }
+                match method.as_str() {
+                    "events.put" => match serde_json::from_value::<SourceBatch>(params) {
+                        Ok(mut batch)
+                            if batch.agent_id == agent_id && batch.generation == generation =>
+                        {
+                            match redact_source_batch(&mut batch, &source_credentials) {
+                                Err(error) => Err(error),
+                                Ok(()) => match timeout_at(request_deadline, store.lock()).await {
+                                    Ok(mut store) => match store.put_batch(batch, now_ms()) {
+                                        Ok(commit) => {
+                                            bus.publish(&commit.events);
+                                            drop(store);
+                                            serde_json::to_value(commit.ack).map_err(|_| {
+                                                late_batch_error(
+                                                    &state,
+                                                    &agent_id,
+                                                    generation,
+                                                    "ack_encoding_failed",
+                                                )
+                                            })
+                                        }
+                                        Err(error) => {
+                                            let cause = if store.is_write_faulted() {
+                                                "store_write_faulted".to_owned()
+                                            } else {
+                                                format!("store_{}", safe_cause_code(&error.code))
+                                            };
+                                            Err(late_batch_error(
+                                                &state, &agent_id, generation, &cause,
+                                            ))
+                                        }
+                                    },
+                                    Err(_) => Err(late_batch_error(
+                                        &state,
+                                        &agent_id,
+                                        generation,
+                                        "store_lock_deadline",
+                                    )),
                                 },
-                                Err(_) => Err(late_batch_error(
-                                    &state,
-                                    &agent_id,
-                                    generation,
-                                    "store_lock_deadline",
+                            }
+                        }
+                        Ok(_) => Err(late_batch_error(
+                            &state,
+                            &agent_id,
+                            generation,
+                            "source_generation_mismatch",
+                        )),
+                        Err(_) => Err(late_batch_error(
+                            &state,
+                            &agent_id,
+                            generation,
+                            "events_put_malformed",
+                        )),
+                    },
+                    "source.gap" => match serde_json::from_value::<SourceGap>(params) {
+                        Ok(mut gap) if gap.agent_id == agent_id && gap.generation == generation => {
+                            match redact_source_gap(&mut gap, &source_credentials) {
+                                Err(error) => Err(error),
+                                Ok(())
+                                    if gap.agent_id == agent_id && gap.generation == generation =>
+                                {
+                                    match timeout_at(request_deadline, store.lock()).await {
+                                        Ok(mut store) => {
+                                            match store.record_source_gap(gap, now_ms()) {
+                                                Ok(change) => {
+                                                    bus.publish(&change.events);
+                                                    drop(store);
+                                                    let ack: SourceGapAck = change.value;
+                                                    serde_json::to_value(ack).map_err(
+                                                        |_| {
+                                                            Error::new(
+                                                                "internal",
+                                                                "source.gap acknowledgement could not be encoded",
+                                                            )
+                                                        },
+                                                    )
+                                                }
+                                                Err(_) if store.is_write_faulted() => {
+                                                    Err(Error::new(
+                                                        "unknown",
+                                                        "source.gap outcome is unknown; settle with source.state",
+                                                    ))
+                                                }
+                                                Err(error) => Err(redact_native_error(
+                                                    error,
+                                                    &source_credentials,
+                                                )),
+                                            }
+                                        }
+                                        Err(_) => Err(Error::new(
+                                            "busy",
+                                            "Store lock deadline elapsed for source.gap",
+                                        )),
+                                    }
+                                }
+                                Ok(()) => Err(Error::new(
+                                    "not_allowed",
+                                    "source.gap binding does not match this Agent generation",
                                 )),
                             }
                         }
-                    }
-                    Ok(_) => Err(late_batch_error(
-                        &state,
-                        &agent_id,
-                        generation,
-                        "source_generation_mismatch",
-                    )),
-                    Err(_) => Err(late_batch_error(
-                        &state,
-                        &agent_id,
-                        generation,
-                        "events_put_malformed",
+                        Ok(_) => Err(Error::new(
+                            "not_allowed",
+                            "source.gap binding does not match this Agent generation",
+                        )),
+                        Err(_) => Err(Error::new("invalid", "source.gap params are malformed")),
+                    },
+                    "source.state" => match source_state_binding(&params, &agent_id, generation) {
+                        Ok(source_name) => match timeout_at(request_deadline, store.lock()).await {
+                            Ok(store) => {
+                                match store.read_source_state(&agent_id, generation, &source_name) {
+                                    Ok(mut source_state) => {
+                                        crate::redaction::redact_value(
+                                            &mut source_state,
+                                            &source_credentials,
+                                        );
+                                        Ok(source_state)
+                                    }
+                                    Err(error) => {
+                                        Err(redact_native_error(error, &source_credentials))
+                                    }
+                                }
+                            }
+                            Err(_) => Err(Error::new(
+                                "busy",
+                                "Store lock deadline elapsed for source.state",
+                            )),
+                        },
+                        Err(error) => Err(error),
+                    },
+                    _ => Err(Error::new(
+                        "unsupported",
+                        "plugin request method is not implemented",
                     )),
                 }
             }
@@ -913,25 +1184,123 @@ fn safe_cause_code(code: &str) -> String {
     }
 }
 
-fn contains_known_secret(value: &Value, secrets: &SecretSet) -> bool {
-    let secrets = secrets
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    contains_secret_value(value, &secrets)
+fn redact_source_batch(batch: &mut SourceBatch, credentials: &[String]) -> Result<()> {
+    for event in &mut batch.events {
+        if crate::redaction::redact_value(&mut event.data, credentials) {
+            let Some(data) = event.data.as_object_mut() else {
+                return Err(Error::new(
+                    "invalid",
+                    "redacted native event data must be an object",
+                ));
+            };
+            data.insert("redacted".to_owned(), Value::Bool(true));
+        }
+    }
+    Ok(())
 }
 
-fn contains_secret_value(value: &Value, secrets: &HashSet<String>) -> bool {
-    match value {
-        Value::String(text) => secrets
-            .iter()
-            .any(|secret| !secret.is_empty() && text.contains(secret)),
-        Value::Array(items) => items
-            .iter()
-            .any(|item| contains_secret_value(item, secrets)),
-        Value::Object(object) => object
-            .values()
-            .any(|item| contains_secret_value(item, secrets)),
-        _ => false,
+fn redact_source_gap(gap: &mut SourceGap, credentials: &[String]) -> Result<()> {
+    let mut value = serde_json::to_value(&*gap)
+        .map_err(|_| Error::new("internal", "source.gap could not be encoded"))?;
+    crate::redaction::redact_value(&mut value, credentials);
+    *gap = serde_json::from_value(value)
+        .map_err(|_| Error::new("invalid", "source.gap became invalid after redaction"))?;
+    Ok(())
+}
+
+fn source_state_binding(
+    params: &Value,
+    expected_agent: &str,
+    expected_generation: i64,
+) -> Result<String> {
+    let object = params
+        .as_object()
+        .ok_or_else(|| Error::new("invalid", "source.state params must be an object"))?;
+    if object
+        .keys()
+        .any(|key| !["agent_id", "generation", "source"].contains(&key.as_str()))
+    {
+        return Err(Error::new(
+            "invalid",
+            "source.state contains an unsupported field",
+        ));
+    }
+    let agent = object
+        .get("agent_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::new("invalid", "source.state requires agent_id"))?;
+    if agent != expected_agent {
+        return Err(Error::new(
+            "not_allowed",
+            "source.state is outside this plugin's Agent binding",
+        ));
+    }
+    let generation = object
+        .get("generation")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| Error::new("invalid", "source.state requires generation"))?;
+    if generation != expected_generation {
+        return Err(Error::new(
+            "stale_generation",
+            "source.state generation does not match this plugin instance",
+        ));
+    }
+    object
+        .get("source")
+        .and_then(Value::as_str)
+        .filter(|source| !source.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| Error::new("invalid", "source.state requires source"))
+}
+
+fn redact_native_error(error: Error, credentials: &[String]) -> Error {
+    Error::new(
+        error.code,
+        crate::redaction::redact_text(&error.message, credentials),
+    )
+}
+
+fn plugin_command_args(command: &Command) -> Result<Value> {
+    if !command.args.is_object() {
+        return Err(Error::new(
+            "invalid",
+            "plugin command args must be an object",
+        ));
+    }
+    match command.verb.as_str() {
+        "send" => {}
+        "steer" | "interrupt" => {
+            command.turn_id.as_ref().ok_or_else(|| {
+                Error::new("stale_generation", "turn control has no captured turn id")
+            })?;
+        }
+        "approve" | "deny" | "answer" => {
+            command
+                .turn_id
+                .as_ref()
+                .ok_or_else(|| Error::new("bad_state", "request reply has no captured turn id"))?;
+            command.request_id.as_ref().ok_or_else(|| {
+                Error::new("bad_state", "request reply has no captured request id")
+            })?;
+        }
+        _ => {
+            return Err(Error::new(
+                "unsupported",
+                format!("plugin command verb {} is not implemented", command.verb),
+            ));
+        }
+    }
+    Ok(command.args.clone())
+}
+
+fn validate_agent_command_result(value: Value, verb: &str) -> Result<Value> {
+    match value.get("state").and_then(Value::as_str) {
+        Some("applied") if verb == "send" => validate_send_result(value),
+        Some("applied" | "rejected" | "failed" | "unknown") => Ok(value),
+        _ => Err(Error::new(
+            "unknown",
+            "plugin command response omitted its command outcome",
+        )),
     }
 }
 
@@ -987,18 +1356,195 @@ fn validate_shutdown(value: Value) -> Result<Value> {
     }
 }
 
-fn valid_fake_manifest(manifest: &PluginManifest) -> bool {
-    manifest.name == "fake"
-        && manifest.protocol == "eliot-plugin/1"
-        && manifest.available
-        && manifest.mode == "per_agent"
-        && manifest.verbs.len() == 3
-        && manifest.child_verbs.is_empty()
-        && !manifest.features.start_requires_input
-        && !manifest.features.native_children
-        && ["launch", "send", "stop"]
+fn manifest_source_plan(manifest: &PluginManifest, harness: &str) -> Result<Value> {
+    if manifest.name != harness
+        || manifest.protocol != "eliot-plugin/1"
+        || !manifest.available
+        || manifest.mode != "per_agent"
+        || manifest.version.trim().is_empty()
+        || manifest.harness_version.trim().is_empty()
+    {
+        return Err(unsupported_manifest());
+    }
+
+    let verbs: HashSet<_> = manifest.verbs.iter().map(String::as_str).collect();
+    let implemented_verbs = [
+        "launch",
+        "send",
+        "stop",
+        "resume",
+        "steer",
+        "interrupt",
+        "approve",
+        "deny",
+        "answer",
+    ];
+    if verbs.len() != manifest.verbs.len()
+        || verbs.len() < 3
+        || !["launch", "send", "stop"]
             .iter()
-            .all(|verb| manifest.verbs.iter().any(|actual| actual == verb))
+            .all(|required| verbs.contains(required))
+        || verbs.iter().any(|verb| !implemented_verbs.contains(verb))
+        || !manifest.child_verbs.is_empty()
+        || manifest.features.start_requires_input
+        || manifest.features.native_children
+    {
+        return Err(unsupported_manifest());
+    }
+
+    if !matches!(harness, "fake" | "codex") {
+        return Err(unsupported_manifest());
+    }
+    let expected_families = ["message", "session", "turn"];
+    if manifest.sources.len() != 1 {
+        return Err(unsupported_manifest());
+    }
+    let controlled = manifest
+        .sources
+        .get("controlled")
+        .ok_or_else(unsupported_manifest)?;
+    let tool_expected = harness == "codex";
+    let request_expected = harness == "codex";
+    let expected_count = expected_families.len()
+        + if tool_expected { 1 } else { 0 }
+        + if request_expected { 1 } else { 0 };
+    if controlled.len() != expected_count
+        || controlled.contains_key("tool") != tool_expected
+        || controlled.contains_key("request") != request_expected
+        || controlled.keys().any(|family| {
+            !["message", "request", "session", "tool", "turn"].contains(&family.as_str())
+        })
+        || expected_families
+            .iter()
+            .any(|family| controlled.get(*family).map(String::as_str) != Some("stream"))
+        || (tool_expected && controlled.get("tool").map(String::as_str) != Some("stream"))
+        || (request_expected && controlled.get("request").map(String::as_str) != Some("stream"))
+    {
+        return Err(unsupported_manifest());
+    }
+
+    Ok(Value::Object(
+        controlled
+            .iter()
+            .map(|(family, mechanism)| (family.clone(), Value::String(mechanism.clone())))
+            .collect(),
+    ))
+}
+
+fn unsupported_manifest() -> Error {
+    Error::new(
+        "unsupported",
+        "plugin manifest does not match the implemented per-Agent capabilities",
+    )
+}
+
+#[cfg(windows)]
+const BASE_ENVIRONMENT_NAMES: &[&str] = &[
+    "USERPROFILE",
+    "HOME",
+    "LOCALAPPDATA",
+    "SystemRoot",
+    "PATH",
+    "TEMP",
+];
+
+#[cfg(not(windows))]
+const BASE_ENVIRONMENT_NAMES: &[&str] = &["HOME", "PATH", "TEMP"];
+
+fn minimal_plugin_environment() -> Vec<(OsString, OsString)> {
+    BASE_ENVIRONMENT_NAMES
+        .iter()
+        .filter_map(|name| std::env::var_os(name).map(|value| (OsString::from(*name), value)))
+        .collect()
+}
+
+fn build_target_environment(agent: &Agent, agent_token: &str) -> Result<Value> {
+    let mut environment = Map::new();
+    for name in BASE_ENVIRONMENT_NAMES {
+        if let Some(value) = std::env::var_os(name) {
+            let value = value.into_string().map_err(|_| {
+                Error::new(
+                    "invalid",
+                    format!("base environment variable {name} is not valid Unicode"),
+                )
+            })?;
+            insert_environment(&mut environment, name, value);
+        }
+    }
+
+    let pass_env = match agent.profile_snapshot.get("pass_env") {
+        Some(Value::Array(names)) => Some(names.as_slice()),
+        None if agent.harness != "codex" => None,
+        _ => {
+            return Err(Error::new(
+                "invalid",
+                "frozen profile pass_env must be an array of names",
+            ));
+        }
+    };
+    if let Some(pass_env) = pass_env {
+        for value in pass_env {
+            let name = value
+                .as_str()
+                .filter(|name| valid_environment_name(name))
+                .ok_or_else(|| {
+                    Error::new(
+                        "invalid",
+                        "frozen profile pass_env entries must be environment variable names",
+                    )
+                })?;
+            if name
+                .get(..12)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("ELIOT_AGENT_"))
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "frozen profile pass_env cannot override Eliot Agent identity variables",
+                ));
+            }
+            if let Some(value) = std::env::var_os(name) {
+                let value = value.into_string().map_err(|_| {
+                    Error::new(
+                        "invalid",
+                        format!("pass_env variable {name} is not valid Unicode"),
+                    )
+                })?;
+                insert_environment(&mut environment, name, value);
+            }
+        }
+    }
+
+    insert_environment(&mut environment, "ELIOT_AGENT_ID", agent.id.clone());
+    insert_environment(
+        &mut environment,
+        "ELIOT_AGENT_GENERATION",
+        agent.generation.to_string(),
+    );
+    insert_environment(
+        &mut environment,
+        "ELIOT_AGENT_TOKEN",
+        agent_token.to_owned(),
+    );
+    Ok(Value::Object(environment))
+}
+
+fn insert_environment(environment: &mut Map<String, Value>, name: &str, value: String) {
+    #[cfg(windows)]
+    if let Some(existing) = environment
+        .keys()
+        .find(|existing| existing.eq_ignore_ascii_case(name))
+        .cloned()
+    {
+        environment.insert(existing, Value::String(value));
+        return;
+    }
+    environment.insert(name.to_owned(), Value::String(value));
+}
+
+fn valid_environment_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some('_' | 'A'..='Z' | 'a'..='z'))
+        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
 }
 
 fn deadline() -> Instant {

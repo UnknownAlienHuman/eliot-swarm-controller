@@ -1,8 +1,9 @@
 # Codex app-server
 
-First real harness; see [L2](../roadmap.md#l2--first-useful-harness-codex-with-luna).
+Current harness; see [L2](../roadmap.md#l2--first-useful-harness-codex-with-luna).
 Use `plugins/codex`, Rust/built-in, with one plugin/app-server process per controlled
-Agent generation. This page is an implementation target; no v2 Codex runtime is claimed yet.
+Agent generation. The source exists and the CLI exposes the control path below.
+Live qualification is still pending; [roadmap](../roadmap.md) owns milestone status.
 
 ## Sources
 
@@ -42,7 +43,7 @@ Use that id only if the selected account's catalogue accepts it. This is configu
 not a hardcoded alias in the plugin. No paid probe or alternate billing route is invented
 when the requested model is unavailable.
 
-Example target Eliot config (not an assertion that the CLI exists already):
+Example Eliot config:
 
 ```toml
 [profiles.codex-luna]
@@ -52,13 +53,27 @@ permissions = "workspace-write"
 pass_env = ["CODEX_HOME"]
 ```
 
-```text
-eliot daemon
-eliot launch --profile codex-luna --workspace <disposable-existing-path> --wait "Create hello.txt containing hello."
-eliot result <returned-agent-id>
-eliot send <returned-agent-id> "Read hello.txt and report its contents." --wait
-eliot stop <returned-agent-id>
+```powershell
+& $eliot --data-dir $dataDir launch --profile codex-luna --workspace $workspace "Create hello.txt containing hello." --wait
+$agent = 'AGENT_ID_FROM_OUTPUT'
+& $eliot --data-dir $dataDir result $agent
+& $eliot --data-dir $dataDir send $agent "Read hello.txt and report its contents." --wait
+& $eliot --data-dir $dataDir steer $agent "Adjust course." --generation 1 --turn TURN_ID
+& $eliot --data-dir $dataDir interrupt $agent --generation 1 --turn TURN_ID
+& $eliot --data-dir $dataDir approve $agent --request REQUEST_ID
+& $eliot --data-dir $dataDir deny $agent --request REQUEST_ID
+& $eliot --data-dir $dataDir answer $agent --answers-file answers.json --request REQUEST_ID
+& $eliot --data-dir $dataDir resume $agent "Follow up." --wait
+& $eliot --data-dir $dataDir stop $agent
 ```
+
+Flags map to `command.submit`: `--generation` to `expected_generation`,
+`--turn` to `expected_turn_id`, `--request` to `request_id`.
+A missing request is captured only for a single pending native request.
+`answer --answers-file` submits the parsed bounded body, not a path, and failures
+never echo file contents. `resume --wait` with a prompt follows the new linked
+`<id>/send` in generation N+1, without it follows resume readiness. No old input
+is replayed.
 
 The plugin uses `model/list` internally; a separate model-catalogue product/UI is not
 required. Keep the model choice in the profile, outside core types and tests.
