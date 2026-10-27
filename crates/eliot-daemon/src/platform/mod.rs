@@ -5,6 +5,7 @@
 pub mod custody;
 pub mod data_dir;
 pub mod ipc;
+mod process_observation;
 
 #[cfg(unix)]
 pub(crate) mod unix;
@@ -14,3 +15,4 @@ pub(crate) mod windows;
 pub use custody::{CustodyGuarantee, OwnedChild};
 pub use data_dir::DataDir;
 pub use ipc::{IpcListener, IpcStream};
+pub use process_observation::CustodyObserver;

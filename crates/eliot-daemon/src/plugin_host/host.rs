@@ -1,5 +1,6 @@
 use super::{PluginClient, PluginConnection};
 use crate::bus::Bus;
+use crate::monitor::Monitoring;
 use crate::platform::OwnedChild;
 use eliot_core::{Agent, Command, Error, Result, SourceBatch, SourceGap, SourceGapAck};
 use eliot_plugin::PluginManifest;
@@ -75,6 +76,7 @@ struct HostState {
     owner_token: String,
     store: StoreHandle,
     bus: Bus,
+    monitoring: Monitoring,
     secrets: SecretSet,
     agent_credentials: AgentCredentials,
     unknown_commands: UnknownCommands,
@@ -85,6 +87,7 @@ struct HostState {
 
 struct AgentActorConfig {
     state: Weak<HostState>,
+    monitoring: Monitoring,
     key: AgentKey,
     agent: Agent,
     start_command: Command,
@@ -99,6 +102,7 @@ struct AgentActorConfig {
 struct EventSource {
     store: StoreHandle,
     bus: Bus,
+    monitoring: Monitoring,
     source_credentials: Arc<[String]>,
     state: Weak<HostState>,
     key: AgentKey,
@@ -113,6 +117,7 @@ pub(crate) struct PluginHost {
 }
 
 impl PluginHost {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         options: PluginHostOptions,
         store: StoreHandle,
@@ -121,6 +126,7 @@ impl PluginHost {
         agent_credentials: AgentCredentials,
         unknown_commands: UnknownCommands,
         progress: watch::Sender<u64>,
+        monitoring: Monitoring,
     ) -> Self {
         let PluginHostOptions {
             data_root,
@@ -132,6 +138,7 @@ impl PluginHost {
                 owner_token,
                 store,
                 bus,
+                monitoring,
                 secrets,
                 agent_credentials,
                 unknown_commands,
@@ -259,11 +266,23 @@ impl PluginHost {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(agent_token.clone());
         }
+        self.state.monitoring.prepare_generation(&agent).await?;
         let spawned = self.spawn_plugin(&agent, &instance_dir);
         let mut child = match spawned {
             Ok(child) => child,
             Err(error) => return Err(error),
         };
+        let observer = match child.observer() {
+            Ok(observer) => observer,
+            Err(error) => {
+                terminate_child(child, &self.state.monitoring, &agent).await;
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.state.monitoring.attach(&agent, observer).await {
+            terminate_child(child, &self.state.monitoring, &agent).await;
+            return Err(error);
+        }
         self.state
             .secrets
             .lock()
@@ -273,7 +292,7 @@ impl PluginHost {
         let stdout = child.take_stdout();
         let stderr = child.take_stderr();
         let (Some(stdin), Some(stdout), Some(stderr)) = (stdin, stdout, stderr) else {
-            terminate_child(child).await;
+            terminate_child(child, &self.state.monitoring, &agent).await;
             self.remove_plugin_secret(&credential);
             return Err(Error::new(
                 "process_pipes",
@@ -294,6 +313,7 @@ impl PluginHost {
             EventSource {
                 store: Arc::clone(&self.state.store),
                 bus: self.state.bus.clone(),
+                monitoring: self.state.monitoring.clone(),
                 source_credentials: Arc::clone(&source_credentials),
                 state: Arc::downgrade(&self.state),
                 key: key.clone(),
@@ -324,6 +344,7 @@ impl PluginHost {
         }
         let actor = AgentActorConfig {
             state: Arc::downgrade(&self.state),
+            monitoring: self.state.monitoring.clone(),
             key: actor_key,
             agent: agent.clone(),
             start_command: command.clone(),
@@ -632,6 +653,7 @@ async fn run_agent(
 ) {
     let AgentActorConfig {
         state,
+        monitoring,
         key,
         agent,
         start_command,
@@ -659,7 +681,7 @@ async fn run_agent(
         Ok(value) => value,
         Err(error) => {
             let _ = started.send(Err(redact_native_error(error, &source_credentials)));
-            terminate_child(child).await;
+            terminate_child(child, &monitoring, &agent).await;
             let _ = event_task.await;
             cleanup_actor(&state, &key, &plugin_credential, false).await;
             return;
@@ -672,7 +694,7 @@ async fn run_agent(
                 "unsupported",
                 "Agent plugin returned a malformed manifest",
             )));
-            terminate_child(child).await;
+            terminate_child(child, &monitoring, &agent).await;
             let _ = event_task.await;
             cleanup_actor(&state, &key, &plugin_credential, false).await;
             return;
@@ -682,7 +704,7 @@ async fn run_agent(
         Ok(source_plan) => source_plan,
         Err(error) => {
             let _ = started.send(Err(error));
-            terminate_child(child).await;
+            terminate_child(child, &monitoring, &agent).await;
             let _ = event_task.await;
             cleanup_actor(&state, &key, &plugin_credential, false).await;
             return;
@@ -697,7 +719,7 @@ async fn run_agent(
             "unsupported",
             format!("Agent plugin does not advertise {}", start_command.verb),
         )));
-        terminate_child(child).await;
+        terminate_child(child, &monitoring, &agent).await;
         let _ = event_task.await;
         cleanup_actor(&state, &key, &plugin_credential, false).await;
         return;
@@ -705,7 +727,7 @@ async fn run_agent(
     let verbs: HashSet<String> = manifest.verbs.iter().cloned().collect();
     if let Err(error) = PluginHost::install_runtime_verbs(&state, &key, verbs) {
         let _ = started.send(Err(error));
-        terminate_child(child).await;
+        terminate_child(child, &monitoring, &agent).await;
         let _ = event_task.await;
         cleanup_actor(&state, &key, &plugin_credential, false).await;
         return;
@@ -733,7 +755,7 @@ async fn run_agent(
             let error = Error::new("unknown", "plugin start did not prove session readiness");
             let _ = started.send(Err(error.clone()));
             if error.code != "unknown" {
-                terminate_child(child).await;
+                terminate_child(child, &monitoring, &agent).await;
                 let _ = event_task.await;
                 cleanup_actor(&state, &key, &plugin_credential, false).await;
                 return;
@@ -744,7 +766,7 @@ async fn run_agent(
             let uncertain = error.code == "unknown";
             let _ = started.send(Err(error));
             if !uncertain {
-                terminate_child(child).await;
+                terminate_child(child, &monitoring, &agent).await;
                 let _ = event_task.await;
                 cleanup_actor(&state, &key, &plugin_credential, false).await;
                 return;
@@ -756,22 +778,66 @@ async fn run_agent(
     loop {
         tokio::select! {
             status = child.wait() => {
-                let _ = status;
-                let _ = event_task.await;
-                if !planned_exit {
+                if let Some(state) = state.upgrade() {
+                    fence_command_routing(&state, &key);
+                }
+                if status.is_ok() {
+                    let _ = monitoring.sample_generation(&agent).await;
+                }
+                // Keep source authorization intact throughout the bounded drain.
+                let gap_reason = match timeout_at(
+                    Instant::now() + STOP_GRACE,
+                    &mut event_task,
+                ).await {
+                    Ok(Ok(())) => "root_exit_without_session_terminal",
+                    Ok(Err(_)) => "root_exit_source_failed",
+                    Err(_) => {
+                        event_task.abort();
+                        let _ = timeout_at(
+                            Instant::now() + RPC_GRACE,
+                            &mut event_task,
+                        ).await;
+                        "root_exit_drain_timeout"
+                    }
+                };
+                let source_settled = record_root_exit_gap(&state, &key, gap_reason).await.is_ok();
+                #[cfg(windows)]
+                let control_gone = match child.wait_family_empty(Duration::ZERO).await {
+                    Ok(true) => true,
+                    Ok(false) => {
+                        child.terminate().is_ok()
+                            && matches!(child.wait_family_empty(STOP_GRACE).await, Ok(true))
+                    }
+                    Err(_) => false,
+                };
+                // Unix custody remains degraded: leader exit proves native
+                // control loss, not that every descendant has been contained.
+                #[cfg(not(windows))]
+                let control_gone = status.is_ok();
+                if control_gone {
+                    let _ = monitoring.sample_generation(&agent).await;
+                }
+                if source_settled && control_gone && !planned_exit {
                     mark_lost_state(&state, &key).await;
                 }
                 break;
             }
             event_result = &mut event_task => {
-                let _ = event_result;
-                mark_lost_state(&state, &key).await;
-                if child.terminate().is_ok() && wait_child(&mut child, STOP_GRACE).await {
-                    planned_exit = true;
-                } else {
-                    drop(child);
-                    planned_exit = true;
+                if let Some(state) = state.upgrade() {
+                    fence_command_routing(&state, &key);
                 }
+                let gap_reason = if event_result.is_ok() {
+                    "stream_eof_without_session_terminal"
+                } else {
+                    "stream_task_failed"
+                };
+                let source_settled = record_root_exit_gap(&state, &key, gap_reason).await.is_ok();
+                let control_gone = child.terminate().is_ok()
+                    && wait_child(&mut child, STOP_GRACE, &monitoring, &agent).await;
+                if source_settled && control_gone {
+                    mark_lost_state(&state, &key).await;
+                }
+                planned_exit = true;
                 break;
             }
             message = messages.recv() => {
@@ -833,11 +899,11 @@ async fn run_agent(
                                         .close_input(Instant::now() + STOP_GRACE)
                                         .await;
                                 }
-                                let graceful = wait_child(&mut child, STOP_GRACE).await;
+                                let graceful = wait_child(&mut child, STOP_GRACE, &monitoring, &agent).await;
                                 let mut exited = graceful;
                                 if !exited {
                                     let _ = child.terminate();
-                                    exited = wait_child(&mut child, STOP_GRACE).await;
+                                    exited = wait_child(&mut child, STOP_GRACE, &monitoring, &agent).await;
                                 }
                                 if !exited {
                                     drop(child);
@@ -846,12 +912,10 @@ async fn run_agent(
                                         fence_runtime_generation(&state, &key);
                                     }
                                     planned_exit = true;
-                                    let _ = reply.send(Ok(json!({
-                                        "state": "applied",
-                                        "custody": "unknown",
-                                        "graceful": false,
-                                        "native": result,
-                                    })));
+                                    let _ = reply.send(Err(Error::new(
+                                        "unknown",
+                                        "stop could not confirm owned process-family exit",
+                                    )));
                                     break;
                                 }
                                 let _ = event_task.await;
@@ -880,7 +944,7 @@ async fn run_agent(
                                 ).await.ok();
                                 let guarantee = child.guarantee();
                                 let terminated = child.terminate().is_ok();
-                                let exited = wait_child(&mut child, STOP_GRACE).await;
+                                let exited = wait_child(&mut child, STOP_GRACE, &monitoring, &agent).await;
                                 if !terminated || !exited {
                                     drop(child);
                                     let _ = event_task.await;
@@ -931,7 +995,7 @@ async fn run_agent(
                     RuntimeMessage::DaemonForce { reply } => {
                         let guarantee = child.guarantee();
                         let terminated = child.terminate().is_ok();
-                        let exited = wait_child(&mut child, STOP_GRACE).await;
+                        let exited = wait_child(&mut child, STOP_GRACE, &monitoring, &agent).await;
                         if !terminated || !exited {
                             drop(child);
                             let _ = event_task.await;
@@ -963,6 +1027,7 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
     let EventSource {
         store,
         bus,
+        monitoring,
         source_credentials,
         state,
         key,
@@ -977,11 +1042,11 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
         let request_deadline = deadline();
         let result = if !matches!(
             method.as_str(),
-            "events.put" | "source.gap" | "source.state"
+            "events.put" | "source.gap" | "source.state" | "process.put"
         ) {
             Err(Error::new(
                 "unsupported",
-                "plugin host only accepts events.put, source.gap, and source.state",
+                "plugin host only accepts events.put, source.gap, source.state, and process.put",
             ))
         } else {
             let mut params = request.params;
@@ -1005,6 +1070,54 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
                 }
             } else {
                 match method.as_str() {
+                    "process.put" => {
+                        let current = state.upgrade().is_some_and(|state| {
+                            state
+                                .running
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .contains_key(&key)
+                        });
+                        if !current
+                            || params.get("agent_id").and_then(Value::as_str)
+                                != Some(agent_id.as_str())
+                            || params.get("generation").and_then(Value::as_i64) != Some(generation)
+                        {
+                            Err(Error::new(
+                                "stale_generation",
+                                "process.put does not match the current plugin generation",
+                            ))
+                        } else {
+                            match (
+                                params
+                                    .get("pid")
+                                    .and_then(Value::as_u64)
+                                    .and_then(|pid| u32::try_from(pid).ok())
+                                    .filter(|pid| *pid > 0),
+                                params.get("role").and_then(Value::as_str),
+                            ) {
+                                (Some(pid), Some("harness")) => {
+                                    match timeout_at(
+                                        request_deadline,
+                                        monitoring
+                                            .process_put(&agent_id, generation, pid, "harness"),
+                                    )
+                                    .await
+                                    {
+                                        Ok(result) => result,
+                                        Err(_) => Err(Error::new(
+                                            "unknown",
+                                            "process.put acknowledgement deadline elapsed",
+                                        )),
+                                    }
+                                }
+                                _ => Err(Error::new(
+                                    "invalid",
+                                    "process.put requires a nonzero PID and the harness role",
+                                )),
+                            }
+                        }
+                    }
                     "events.put" => match serde_json::from_value::<SourceBatch>(params) {
                         Ok(mut batch)
                             if batch.agent_id == agent_id && batch.generation == generation =>
@@ -1551,15 +1664,38 @@ fn deadline() -> Instant {
     Instant::now() + RPC_DEADLINE
 }
 
-async fn wait_child(child: &mut OwnedChild, duration: Duration) -> bool {
-    matches!(
+async fn wait_child(
+    child: &mut OwnedChild,
+    duration: Duration,
+    monitoring: &Monitoring,
+    agent: &Agent,
+) -> bool {
+    if !matches!(
         timeout_at(Instant::now() + duration, child.wait()).await,
         Ok(Ok(_))
-    )
+    ) {
+        return false;
+    }
+    let _ = monitoring.sample_generation(agent).await;
+    #[cfg(windows)]
+    {
+        if matches!(child.wait_family_empty(duration).await, Ok(true)) {
+            // Consume the OS observer's verified-empty certificate before the
+            // owning Job is dropped; exited database rows alone are not proof.
+            let _ = monitoring.sample_generation(agent).await;
+            true
+        } else {
+            false
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
 }
 
-async fn terminate_child(mut child: OwnedChild) {
-    if child.terminate().is_ok() && wait_child(&mut child, STOP_GRACE).await {
+async fn terminate_child(mut child: OwnedChild, monitoring: &Monitoring, agent: &Agent) {
+    if child.terminate().is_ok() && wait_child(&mut child, STOP_GRACE, monitoring, agent).await {
         return;
     }
     drop(child);
@@ -1574,6 +1710,53 @@ fn custody_label(guarantee: crate::platform::CustodyGuarantee) -> &'static str {
         #[cfg(not(windows))]
         crate::platform::CustodyGuarantee::Unknown => "unknown",
     }
+}
+
+// The loss transaction preserves terminal projections but does not record gaps.
+// Store serialization lets a terminal fact committed during cancellation win.
+async fn record_root_exit_gap(state: &Weak<HostState>, key: &AgentKey, reason: &str) -> Result<()> {
+    let state = state
+        .upgrade()
+        .ok_or_else(|| Error::new("unavailable", "plugin host is unavailable"))?;
+    let mut store = state.store.lock().await;
+    let agent = store
+        .get_agent(&key.id)?
+        .ok_or_else(|| Error::new("not_found", "exited plugin Agent was not found"))?;
+    if agent.generation != key.generation {
+        return Err(Error::new(
+            "stale_generation",
+            "exited plugin generation is no longer current",
+        ));
+    }
+    if agent.is_terminal() {
+        return Ok(());
+    }
+    let source = store.read_source_state(&key.id, key.generation, "stream")?;
+    let families = serde_json::from_value(
+        source
+            .get("families")
+            .cloned()
+            .ok_or_else(|| Error::new("source_integrity", "stream has no owned families"))?,
+    )
+    .map_err(|_| Error::new("source_integrity", "stream families are malformed"))?;
+    let change = store.record_source_gap(
+        SourceGap {
+            gap_id: format!("host-root-exit:{}:{}", key.id, key.generation),
+            agent_id: key.id.clone(),
+            generation: key.generation,
+            source: "stream".to_owned(),
+            families,
+            reason: reason.to_owned(),
+            from: source
+                .get("cursor")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            to: None,
+        },
+        now_ms(),
+    )?;
+    state.bus.publish(&change.events);
+    Ok(())
 }
 
 async fn mark_lost_state(state: &Weak<HostState>, key: &AgentKey) {
@@ -1646,12 +1829,17 @@ async fn cleanup_actor(
     }
 }
 
-fn fence_runtime_generation(state: &HostState, key: &AgentKey) {
+// Stop new command routing without revoking authorization for buffered source facts.
+fn fence_command_routing(state: &HostState, key: &AgentKey) {
     state
         .running
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(key);
+}
+
+fn fence_runtime_generation(state: &HostState, key: &AgentKey) {
+    fence_command_routing(state, key);
     let credential = state
         .agent_credentials
         .lock()

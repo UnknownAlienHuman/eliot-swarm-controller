@@ -14,7 +14,7 @@ use crate::{
         },
     },
 };
-use eliot_core::{Error, Result};
+use eliot_core::{Error, ProcessRecord, ProcessState, Result};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     MAX_EVENT_BYTES, MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
@@ -400,6 +400,41 @@ impl CodexPlugin {
             control_commands: HashMap::new(),
             stop_command_id: None,
         };
+
+        if let Err(error) = register_native_process(
+            peer,
+            &initialized.credential,
+            &session.agent_id,
+            session.generation,
+            &session.native,
+        )
+        .await
+        {
+            session.events.close().await;
+            if session
+                .native
+                .terminate(true, Instant::now() + RPC_TIMEOUT)
+                .await
+                .is_err()
+            {
+                self.session = Some(session);
+                return Err(Error::new(
+                    "unknown",
+                    format!(
+                        "{}; owned app-server cleanup is unconfirmed; no thread or input was sent",
+                        error.message
+                    ),
+                ));
+            }
+            self.failed_start = Some(FailedStart {
+                agent_id: params.agent_id,
+                generation: params.generation,
+                command_id: params.command_id,
+                code: error.code.clone(),
+                message: error.message.clone(),
+            });
+            return Err(error);
+        }
 
         let (selected_effort, native_scope) = match self
             .initialize_native(
@@ -1468,6 +1503,63 @@ async fn terminate_session(session: &mut AgentSession, force: bool) -> Result<()
         ));
     }
     session.phase = SessionPhase::Stopped;
+    Ok(())
+}
+
+async fn register_native_process(
+    peer: &PeerClient,
+    credential: &str,
+    agent_id: &str,
+    generation: i64,
+    native: &NativeProcess,
+) -> Result<()> {
+    let pid = native.pid().filter(|pid| *pid > 0).ok_or_else(|| {
+        Error::new(
+            "process_registration",
+            "Codex app-server PID is unavailable; no thread or input was sent",
+        )
+    })?;
+    let value = peer
+        .call(
+            "process.put",
+            json!({
+                "credential": credential,
+                "agent_id": agent_id,
+                "generation": generation,
+                "pid": pid,
+                "role": "harness",
+            }),
+            Instant::now() + RPC_TIMEOUT,
+        )
+        .await
+        .map_err(|error| {
+            Error::new(
+                "process_registration",
+                format!(
+                    "Codex app-server process registration failed ({})",
+                    error.code
+                ),
+            )
+        })?;
+    let record: ProcessRecord = serde_json::from_value(value).map_err(|_| {
+        Error::new(
+            "process_registration",
+            "Codex host returned an invalid process.put acknowledgement",
+        )
+    })?;
+    if record.identity.pid != pid
+        || record.identity.host_boot_id.trim().is_empty()
+        || record.identity.start_time == 0
+        || record.owner != format!("agent:{agent_id}#{generation}")
+        || record.role != "harness"
+        || record.state != ProcessState::Running
+        || record.exit_code.is_some()
+    {
+        return Err(Error::new(
+            "process_registration",
+            "Codex host did not verify the running app-server under this Agent generation",
+        ));
+    }
     Ok(())
 }
 

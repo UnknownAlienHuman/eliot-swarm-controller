@@ -1,5 +1,6 @@
 use eliot_core::{Error, Result};
 use std::process::ExitStatus;
+use std::time::Duration;
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
 /// How strongly the operating system contains this child family.
@@ -18,16 +19,94 @@ pub enum CustodyGuarantee {
 
 /// A process started inside the platform's scoped child custody.
 pub struct OwnedChild {
-    // Close the Job first on Windows. Its kill-on-close policy terminates the
-    // process family before Tokio releases its process handle.
+    // Drop the owning Job first: terminate the family and invalidate its shared
+    // query handle before Tokio releases the process handle.
     #[cfg(windows)]
     job: super::windows::Job,
     child: Child,
     #[cfg(unix)]
     identity: Option<super::unix::ProcessGroupIdentity>,
+    observation: std::sync::Mutex<Option<super::CustodyObserver>>,
 }
 
 impl OwnedChild {
+    /// Capture observation authority while the exact leader identity is owned.
+    pub fn observer(&self) -> Result<super::CustodyObserver> {
+        let mut retained = self
+            .observation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(observer) = retained.as_ref() {
+            return Ok(observer.clone());
+        }
+        #[cfg(windows)]
+        {
+            let pid = self.child.id().ok_or_else(|| {
+                Error::new("process_identity", "owned child has no live process id")
+            })?;
+            let observer = super::CustodyObserver::new(self.job.observer(pid)?);
+            *retained = Some(observer.clone());
+            Ok(observer)
+        }
+        #[cfg(unix)]
+        {
+            let identity = self.identity.ok_or_else(|| {
+                #[cfg(target_os = "linux")]
+                {
+                    Error::new(
+                        "process_custody_unknown",
+                        "owned process-group identity is unavailable",
+                    )
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    Error::new(
+                        "unsupported",
+                        "process observation requires Linux boot and birth identity",
+                    )
+                }
+            })?;
+            let observer =
+                super::CustodyObserver::new(super::unix::ProcessObserver::new(identity)?);
+            *retained = Some(observer.clone());
+            Ok(observer)
+        }
+        #[cfg(not(any(windows, unix)))]
+        {
+            Err(Error::new(
+                "unsupported",
+                "process observation is unsupported",
+            ))
+        }
+    }
+
+    /// Separate from leader wait(): only Windows can prove exact family exit.
+    /// `false` means the bounded wait expired, never that the family was killed.
+    pub async fn wait_family_empty(&mut self, timeout: Duration) -> Result<bool> {
+        #[cfg(windows)]
+        {
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                if self.job.is_empty()? {
+                    return Ok(true);
+                }
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return Ok(false);
+                }
+                tokio::time::sleep((deadline - now).min(Duration::from_millis(10))).await;
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = timeout;
+            Err(Error::new(
+                "unsupported",
+                "Unix process-group custody cannot prove exact family exit",
+            ))
+        }
+    }
+
     /// Start the configured command under a Windows Job or a new Unix group.
     /// Configure Tokio's stdin/stdout/stderr as piped before passing the command.
     pub fn spawn(mut command: Command) -> Result<Self> {
@@ -54,7 +133,11 @@ impl OwnedChild {
                 }
             };
             job.assign_then_resume(process)?;
-            Ok(Self { job, child })
+            Ok(Self {
+                job,
+                child,
+                observation: std::sync::Mutex::new(None),
+            })
         }
 
         #[cfg(unix)]
@@ -66,7 +149,11 @@ impl OwnedChild {
             let identity = child
                 .id()
                 .and_then(|pid| super::unix::capture_process_group_identity(pid).ok());
-            Ok(Self { child, identity })
+            Ok(Self {
+                child,
+                identity,
+                observation: std::sync::Mutex::new(None),
+            })
         }
 
         #[cfg(not(any(windows, unix)))]
@@ -129,6 +216,14 @@ impl OwnedChild {
             .wait()
             .await
             .map_err(|error| io_error("wait for owned child", error))?;
+        if let Some(observer) = self
+            .observation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            observer.record_root_exit(status.code());
+        }
         #[cfg(unix)]
         {
             // wait reaps the leader, after which its numeric PID/PGID may be

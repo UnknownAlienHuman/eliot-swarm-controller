@@ -1,13 +1,23 @@
 #![allow(unsafe_code)]
 
-use eliot_core::{Error, Result};
+use super::process_observation::{
+    MAX_PROCESS_SAMPLES, exited_sample, same_identity, unknown_sample,
+};
+use eliot_core::{
+    Error, ProcessIdentity, ProcessRecord, ProcessSample, ProcessSnapshot, ProcessState, Result,
+};
 use std::ffi::c_void;
 use std::fs;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::ptr::{null, null_mut};
 use std::slice;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, INVALID_HANDLE_VALUE};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, DuplicateHandle, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, FILETIME, HANDLE,
+    HLOCAL, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
     GetNamedSecurityInfoW, SE_FILE_OBJECT, SetNamedSecurityInfoW,
@@ -24,17 +34,20 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_FLAG_OVERLAPPED, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
 };
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
     SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::Pipes::{
     CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
     PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
+use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows_sys::Win32::System::SystemInformation::{GetSystemTimeAsFileTime, GetTickCount64};
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetProcessTimes, OpenProcessToken, TerminateProcess,
+    GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, OpenProcess, OpenProcessToken,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, TerminateProcess, WaitForSingleObject,
 };
 
 pub(crate) fn ensure_private_root(path: &Path) -> Result<()> {
@@ -116,19 +129,24 @@ pub(crate) fn replace_file(source: &Path, target: &Path) -> Result<()> {
 }
 
 pub(crate) fn host_boot_id() -> Result<String> {
-    // Windows does not expose a public boot UUID. This is the boot FILETIME
-    // estimated from wall-clock FILETIME minus monotonic uptime.
-    let mut now = std::mem::MaybeUninit::uninit();
-    // SAFETY: GetSystemTimeAsFileTime initializes one FILETIME value.
-    unsafe { GetSystemTimeAsFileTime(now.as_mut_ptr()) };
-    // SAFETY: the call above initialized now.
-    let now = unsafe { now.assume_init() };
-    let now = (u64::from(now.dwHighDateTime) << 32) | u64::from(now.dwLowDateTime);
-    let uptime = unsafe { GetTickCount64() }.saturating_mul(10_000);
-    Ok(format!(
-        "windows-boot-filetime-estimate:{}",
-        now.saturating_sub(uptime)
-    ))
+    static BOOT_MARKER: OnceLock<String> = OnceLock::new();
+    Ok(BOOT_MARKER
+        .get_or_init(|| {
+            // Windows does not expose a public boot UUID. This is the boot FILETIME
+            // estimated from wall-clock FILETIME minus monotonic uptime.
+            let mut now = std::mem::MaybeUninit::uninit();
+            // SAFETY: GetSystemTimeAsFileTime initializes one FILETIME value.
+            unsafe { GetSystemTimeAsFileTime(now.as_mut_ptr()) };
+            // SAFETY: the call above initialized now.
+            let now = unsafe { now.assume_init() };
+            let now = (u64::from(now.dwHighDateTime) << 32) | u64::from(now.dwLowDateTime);
+            let uptime = unsafe { GetTickCount64() }.saturating_mul(10_000);
+            format!(
+                "windows-boot-filetime-estimate:{}",
+                now.saturating_sub(uptime)
+            )
+        })
+        .clone())
 }
 
 pub(crate) fn current_process_birth() -> Result<String> {
@@ -221,6 +239,8 @@ pub(crate) fn create_pipe_server(
 
 pub(crate) struct Job {
     handle: HANDLE,
+    query: Arc<Mutex<Option<QueryHandle>>>,
+    family_empty_confirmed: Arc<AtomicBool>,
 }
 
 // The owned kernel handle may be transferred to another thread; no borrowed
@@ -228,6 +248,68 @@ pub(crate) struct Job {
 unsafe impl Send for Job {}
 
 impl Job {
+    pub(crate) fn observer(&self, pid: u32) -> Result<ProcessObserver> {
+        let mut query = self
+            .query
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if query.is_none() {
+            let mut handle = null_mut();
+            // JOB_OBJECT_QUERY (0x0004) is documented by Job Object Security and
+            // Access Rights but is not exported by windows-sys 0.61.2.
+            // SAFETY: duplicate our private Job with query-only, non-inheritable access.
+            if unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    self.handle,
+                    GetCurrentProcess(),
+                    &mut handle,
+                    0x0004,
+                    0,
+                    0,
+                )
+            } == 0
+            {
+                return Err(io_error(
+                    "duplicate owned Job query handle",
+                    std::io::Error::last_os_error(),
+                ));
+            }
+            *query = Some(QueryHandle(handle));
+        }
+        let handle = query
+            .as_ref()
+            .ok_or_else(|| {
+                Error::new(
+                    "process_custody_unknown",
+                    "owned Job query handle is closed",
+                )
+            })?
+            .0;
+        let boot_id = host_boot_id()?;
+        let (sample, contained) = read_job_process(Some(handle), pid, &boot_id, "", "plugin", 0)?;
+        if !contained || sample.record.state != ProcessState::Running {
+            return Err(Error::new(
+                "process_custody_unknown",
+                "plugin is no longer live in its owned Job",
+            ));
+        }
+        Ok(ProcessObserver {
+            query: Arc::clone(&self.query),
+            family_empty_confirmed: Arc::clone(&self.family_empty_confirmed),
+            root: sample.record.identity,
+            root_exit: None,
+        })
+    }
+
+    pub(crate) fn is_empty(&self) -> Result<bool> {
+        self.family_empty_confirmed.store(false, Ordering::Release);
+        let (pids, complete) = job_members(self.handle)?;
+        let empty = complete && pids.is_empty();
+        self.family_empty_confirmed.store(empty, Ordering::Release);
+        Ok(empty)
+    }
+
     /// Source: v1 donor dc6f70aa, process_group.rs. This uses only its Job
     /// Object lifetime/assignment mechanism; process schemas and wrappers stay local.
     pub(crate) fn new_kill_on_close() -> Result<Self> {
@@ -258,10 +340,15 @@ impl Job {
             unsafe { CloseHandle(handle) };
             return Err(io_error("configure process Job Object", error));
         }
-        Ok(Self { handle })
+        Ok(Self {
+            handle,
+            query: Arc::new(Mutex::new(None)),
+            family_empty_confirmed: Arc::new(AtomicBool::new(false)),
+        })
     }
 
     pub(crate) fn assign_then_resume(&self, process: HANDLE) -> Result<()> {
+        self.family_empty_confirmed.store(false, Ordering::Release);
         // The process was created with CREATE_SUSPENDED, so assignment occurs
         // before any child instruction can execute.
         // SAFETY: both handles are live and owned by this launch operation.
@@ -303,10 +390,326 @@ impl Job {
 
 impl Drop for Job {
     fn drop(&mut self) {
-        // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE contains ordinary descendants.
+        // A retained observer never retains a Job handle beyond this owner.
+        // Explicitly terminate, then close the shared query handle before the
+        // original handle: kill-on-close remains effective even if termination fails.
+        let _ = self.terminate();
+        self.query
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         // SAFETY: this object uniquely owns the handle.
         unsafe { CloseHandle(self.handle) };
     }
+}
+
+struct QueryHandle(HANDLE);
+
+// A query-only kernel handle has no thread-affine state. The observer serializes
+// its operations and this wrapper only closes its own handle.
+unsafe impl Send for QueryHandle {}
+
+impl Drop for QueryHandle {
+    fn drop(&mut self) {
+        // SAFETY: this wrapper owns exactly this query/process handle.
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+pub(crate) struct ProcessObserver {
+    query: Arc<Mutex<Option<QueryHandle>>>,
+    family_empty_confirmed: Arc<AtomicBool>,
+    root: ProcessIdentity,
+    root_exit: Option<Option<i32>>,
+}
+
+impl ProcessObserver {
+    pub(crate) fn record_root_exit(&mut self, code: Option<i32>) {
+        self.root_exit = Some(code);
+    }
+
+    pub(crate) fn snapshot(&self, owner: &str, now: i64) -> Result<ProcessSnapshot> {
+        let query = self
+            .query
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let job = query.as_ref().map(|handle| handle.0);
+        let (pids, mut complete) = match job {
+            Some(job) => job_members(job)?,
+            // Drop alone proves nothing. The owner must have confirmed a
+            // complete empty Job through wait_family_empty before releasing it.
+            // Known identities are still refreshed below and by CustodyObserver.
+            None => (
+                Vec::new(),
+                self.family_empty_confirmed.load(Ordering::Acquire),
+            ),
+        };
+        let root = ProcessSample {
+            record: ProcessRecord {
+                identity: self.root.clone(),
+                owner: owner.to_owned(),
+                role: "plugin".to_owned(),
+                state: ProcessState::Unknown,
+                exit_code: None,
+                updated_at: now,
+            },
+            cpu_time_ns: None,
+            rss_bytes: None,
+        };
+        let mut samples = vec![self.refresh_with_job(job, &root, now)];
+        for pid in pids {
+            if pid == self.root.pid {
+                continue;
+            }
+            if samples.len() >= MAX_PROCESS_SAMPLES {
+                complete = false;
+                break;
+            }
+            match read_job_process(job, pid, &self.root.host_boot_id, owner, "child", now) {
+                Ok((sample, true)) => samples.push(sample),
+                _ => complete = false,
+            }
+        }
+        Ok(ProcessSnapshot { samples, complete })
+    }
+
+    pub(crate) fn register_pid(
+        &self,
+        pid: u32,
+        role: &str,
+        owner: &str,
+        now: i64,
+    ) -> Result<ProcessSample> {
+        let query = self
+            .query
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let job = query
+            .as_ref()
+            .ok_or_else(|| Error::new("not_allowed", "owned Job has been released"))?
+            .0;
+        let (sample, contained) =
+            read_job_process(Some(job), pid, &self.root.host_boot_id, owner, role, now)?;
+        if !contained || sample.record.state != ProcessState::Running {
+            return Err(Error::new(
+                "not_allowed",
+                "registered process is not running in the owned Job",
+            ));
+        }
+        if (role == "plugin") != same_identity(&sample.record.identity, &self.root) {
+            return Err(Error::new(
+                "invalid",
+                "only the owned root has the plugin role",
+            ));
+        }
+        Ok(sample)
+    }
+
+    pub(crate) fn refresh(&self, old: &ProcessSample, now: i64) -> ProcessSample {
+        let query = self
+            .query
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.refresh_with_job(query.as_ref().map(|handle| handle.0), old, now)
+    }
+
+    fn refresh_with_job(
+        &self,
+        job: Option<HANDLE>,
+        old: &ProcessSample,
+        now: i64,
+    ) -> ProcessSample {
+        if same_identity(&old.record.identity, &self.root)
+            && let Some(code) = self.root_exit
+        {
+            let mut sample = exited_sample(old, now);
+            sample.record.exit_code = code;
+            return sample;
+        }
+        match read_job_process(
+            job,
+            old.record.identity.pid,
+            &self.root.host_boot_id,
+            &old.record.owner,
+            &old.record.role,
+            now,
+        ) {
+            Ok((sample, _)) if !same_identity(&sample.record.identity, &old.record.identity) => {
+                exited_sample(old, now)
+            }
+            Ok((sample, true)) => sample,
+            Ok((sample, false)) if sample.record.state == ProcessState::Exited => sample,
+            Err(error) if error.code == "process_gone" => exited_sample(old, now),
+            _ => unknown_sample(old, now),
+        }
+    }
+}
+
+fn job_members(job: HANDLE) -> Result<(Vec<u32>, bool)> {
+    let header = std::mem::offset_of!(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList);
+    let bytes = header + MAX_PROCESS_SAMPLES * std::mem::size_of::<usize>();
+    let mut storage = vec![0usize; bytes.div_ceil(std::mem::size_of::<usize>())];
+    // SAFETY: storage is pointer-aligned and sized for the complete bounded list.
+    let ok = unsafe {
+        QueryInformationJobObject(
+            job,
+            JobObjectBasicProcessIdList,
+            storage.as_mut_ptr().cast(),
+            bytes as u32,
+            null_mut(),
+        )
+    };
+    if ok == 0 && std::io::Error::last_os_error().raw_os_error() != Some(ERROR_MORE_DATA as i32) {
+        return Err(io_error(
+            "enumerate owned Job processes",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: even a truncated list has its two DWORD counts in the initialized buffer.
+    let info = unsafe { &*storage.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() };
+    let count = info.NumberOfProcessIdsInList as usize;
+    if count > MAX_PROCESS_SAMPLES {
+        return Err(Error::new(
+            "process_observation",
+            "Job process list exceeded its buffer",
+        ));
+    }
+    // SAFETY: header is the API layout's pointer-array offset and count was bounded above.
+    let ids = unsafe {
+        slice::from_raw_parts(
+            storage.as_ptr().cast::<u8>().add(header).cast::<usize>(),
+            count,
+        )
+    };
+    let pids = ids
+        .iter()
+        .map(|pid| u32::try_from(*pid))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|_| Error::new("process_identity", "Job returned an invalid process id"))?;
+    Ok((
+        pids,
+        ok != 0 && count == info.NumberOfAssignedProcesses as usize,
+    ))
+}
+
+fn filetime_ticks(time: FILETIME) -> u64 {
+    (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)
+}
+
+fn read_job_process(
+    job: Option<HANDLE>,
+    pid: u32,
+    boot_id: &str,
+    owner: &str,
+    role: &str,
+    now: i64,
+) -> Result<(ProcessSample, bool)> {
+    if pid == 0 {
+        return Err(Error::new("invalid", "process id must be positive"));
+    }
+    // Source: dc6f70aa process_group.rs process_birth_identity. Query/synchronize
+    // only; the opened process handle pins GetProcessTimes across the observation.
+    // SAFETY: no pointer arguments; request only read/synchronization rights.
+    let process = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            0,
+            pid,
+        )
+    };
+    if process.is_null() {
+        let error = std::io::Error::last_os_error();
+        return Err(
+            if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+                Error::new("process_gone", "recorded process no longer exists")
+            } else {
+                io_error("open process for observation", error)
+            },
+        );
+    }
+    let process = QueryHandle(process);
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: the owned handle stays live and all four FILETIME outputs are writable.
+    if unsafe { GetProcessTimes(process.0, &mut creation, &mut exit, &mut kernel, &mut user) } == 0
+    {
+        return Err(io_error(
+            "read process birth and CPU time",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    let mut contained = 0;
+    if let Some(job) = job {
+        // SAFETY: compare against this exact private Job, never NULL/any-job membership.
+        if unsafe { IsProcessInJob(process.0, job, &mut contained) } == 0 {
+            return Err(io_error(
+                "verify owned Job membership",
+                std::io::Error::last_os_error(),
+            ));
+        }
+    }
+    // SAFETY: a zero-time wait only observes this query/synchronize process handle.
+    let state = match unsafe { WaitForSingleObject(process.0, 0) } {
+        WAIT_OBJECT_0 => ProcessState::Exited,
+        WAIT_TIMEOUT => ProcessState::Running,
+        _ => {
+            return Err(io_error(
+                "observe process liveness",
+                std::io::Error::last_os_error(),
+            ));
+        }
+    };
+    let mut exit_code = 0;
+    // SAFETY: read an exit code only after the process object was signalled.
+    let exit_code = if state == ProcessState::Exited
+        && unsafe { GetExitCodeProcess(process.0, &mut exit_code) } != 0
+    {
+        Some(exit_code as i32)
+    } else {
+        None
+    };
+    let mut memory = PROCESS_MEMORY_COUNTERS {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: memory has the exact API size. A denied/unavailable RSS remains None.
+    let rss_bytes = if state == ProcessState::Running
+        && unsafe {
+            GetProcessMemoryInfo(
+                process.0,
+                &mut memory,
+                std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            )
+        } != 0
+    {
+        u64::try_from(memory.WorkingSetSize).ok()
+    } else {
+        None
+    };
+    let cpu_time_ns = filetime_ticks(kernel)
+        .checked_add(filetime_ticks(user))
+        .and_then(|ticks| ticks.checked_mul(100));
+    Ok((
+        ProcessSample {
+            record: ProcessRecord {
+                identity: ProcessIdentity {
+                    host_boot_id: boot_id.to_owned(),
+                    pid,
+                    start_time: filetime_ticks(creation),
+                },
+                owner: owner.to_owned(),
+                role: role.to_owned(),
+                state,
+                exit_code,
+                updated_at: now,
+            },
+            cpu_time_ns,
+            rss_bytes,
+        },
+        contained != 0,
+    ))
 }
 
 fn check_no_reparse_components(path: &Path) -> Result<()> {

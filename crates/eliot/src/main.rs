@@ -143,6 +143,24 @@ enum CliCommand {
     },
     /// Show one Agent.
     Show { agent: String },
+    /// Read one page of an Agent's process records.
+    Processes {
+        #[arg(value_name = "AGENT")]
+        agent: String,
+        #[arg(long, value_name = "GENERATION", value_parser = clap::value_parser!(i64).range(0..))]
+        generation: Option<i64>,
+        #[arg(long, value_name = "CURSOR")]
+        after: Option<String>,
+        #[arg(long, default_value_t = PAGE_SIZE)]
+        limit: usize,
+    },
+    /// Read an Agent's ephemeral process statistics.
+    Stats {
+        #[arg(value_name = "AGENT")]
+        agent: String,
+        #[arg(long, value_name = "GENERATION", value_parser = clap::value_parser!(i64).range(0..))]
+        generation: Option<i64>,
+    },
     /// Follow committed events. With an Agent argument, filter to that Agent.
     Watch { agent: Option<String> },
     /// Read an Agent's retained turn results.
@@ -648,6 +666,33 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
         }
         CliCommand::Show { agent } => {
             let result = read_call(&data_dir, "agent.get", json!({ "id": agent })).await?;
+            print_value(&result, json_output);
+            Ok(0)
+        }
+        CliCommand::Processes {
+            agent,
+            generation,
+            after,
+            limit,
+        } => {
+            validate_limit(limit)?;
+            let mut params = json!({ "id": agent, "limit": limit });
+            if let Some(generation) = generation {
+                params["generation"] = json!(generation);
+            }
+            if let Some(after) = after {
+                params["after"] = Value::String(after);
+            }
+            let result = read_call(&data_dir, "agent.processes", params).await?;
+            print_value(&result, json_output);
+            Ok(0)
+        }
+        CliCommand::Stats { agent, generation } => {
+            let mut params = json!({ "id": agent });
+            if let Some(generation) = generation {
+                params["generation"] = json!(generation);
+            }
+            let result = read_call(&data_dir, "agent.stats", params).await?;
             print_value(&result, json_output);
             Ok(0)
         }

@@ -8,7 +8,8 @@ pub mod error;
 pub use crate::error::{Error, Result};
 use eliot_core::{
     self as core, Agent, AgentState, BatchAck, Command, CommandState, Effect, Event, NativeEvent,
-    PendingRequest, SourceBatch, SourceGap, SourceGapAck, SubmitCommand, Turn, TurnState,
+    PendingRequest, ProcessIdentity, ProcessRecord, ProcessState, SourceBatch, SourceGap,
+    SourceGapAck, SubmitCommand, Turn, TurnState,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::de::DeserializeOwned;
@@ -25,6 +26,7 @@ const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const RETRY_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 const COMMAND_METHOD: &str = "command.submit";
 const INITIAL_SOURCE: &str = "stream";
+const PROCESS_SOURCE: &str = "os";
 
 macro_rules! db {
     ($expression:expr) => {
@@ -117,7 +119,7 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(sql_error)?;
-        if current > 3 {
+        if current > 4 {
             return Err(Error::new(
                 "unsupported",
                 format!("Store schema version {current} is newer than this binary"),
@@ -294,6 +296,30 @@ impl Store {
                      ON pending_requests(agent, generation, turn_id, request_id)
                      WHERE state = 'pending';
                  INSERT INTO schema_migrations(version) VALUES (3);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 4 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE TABLE processes (
+                     host_boot_id TEXT NOT NULL CHECK(length(host_boot_id) > 0),
+                     pid INTEGER NOT NULL CHECK(pid > 0 AND pid <= 4294967295),
+                     start_time INTEGER NOT NULL CHECK(start_time >= 0),
+                     owner TEXT NOT NULL,
+                     role TEXT NOT NULL,
+                     state TEXT NOT NULL CHECK(state IN ('running', 'exited', 'unknown')),
+                     exit_code INTEGER,
+                     updated_at INTEGER NOT NULL,
+                     PRIMARY KEY(host_boot_id, pid, start_time),
+                     CHECK(exit_code IS NULL OR state = 'exited')
+                 );
+                 CREATE INDEX processes_owner ON processes(owner, state);
+                 INSERT INTO schema_migrations(version) VALUES (4);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
@@ -1410,7 +1436,7 @@ impl Store {
                 }
                 db!(tx.execute(
                     "UPDATE source_state SET state = 'closed', updated_at = ?1
-                     WHERE agent = ?2 AND generation = ?3 AND state = 'open'",
+                     WHERE agent = ?2 AND generation = ?3 AND state = 'open' AND source <> 'os'",
                     params![now, agent_num, agent.generation],
                 ));
                 db!(tx.execute(
@@ -2083,6 +2109,16 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
         db!(tx.execute("UPDATE agents SET token = NULL WHERE token IS NOT NULL", []));
+        db!(tx.execute(
+            "UPDATE processes SET state = 'unknown', exit_code = NULL, updated_at = ?1
+             WHERE state = 'running'",
+            [now],
+        ));
+        db!(tx.execute(
+            "UPDATE source_state SET health = 'stale', updated_at = ?1
+             WHERE source = 'os' AND state = 'open'",
+            [now],
+        ));
         let mut dispatched_statement = tx
             .prepare(
                 "SELECT id, target, generation FROM commands
@@ -2188,6 +2224,510 @@ impl Store {
         commit_transaction(tx, &self.write_faulted)?;
         Ok(events)
     }
+}
+
+impl Store {
+    /// Install OS process ownership before the caller spawns this generation.
+    pub fn ensure_process_source(
+        &mut self,
+        agent: &str,
+        generation: i64,
+        now: i64,
+    ) -> Result<Vec<Event>> {
+        self.ensure_writer_healthy()?;
+        let result = self.ensure_process_source_inner(agent, generation, now);
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    fn ensure_process_source_inner(
+        &mut self,
+        agent: &str,
+        generation: i64,
+        now: i64,
+    ) -> Result<Vec<Event>> {
+        let agent_num = parse_agent_id(agent)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let current = load_agent_by_num(&tx, agent_num)?
+            .ok_or_else(|| Error::new("not_found", "process source Agent was not found"))?;
+        if generation <= 0 || current.generation != generation {
+            return Err(Error::new(
+                "stale_generation",
+                "process source generation is not current",
+            ));
+        }
+        let owner: Option<(String, String)> = tx
+            .query_row(
+                "SELECT source, mechanism FROM source_owners
+                 WHERE agent = ?1 AND generation = ?2 AND family = 'process'",
+                params![agent_num, generation],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        let source = load_source_state(&tx, agent_num, generation, PROCESS_SOURCE)?;
+        let mut events = Vec::new();
+        match (owner, source) {
+            (Some((source, mechanism)), Some(_))
+                if source == PROCESS_SOURCE && mechanism == "os" => {}
+            (None, None) if !current.is_terminal() => {
+                db!(tx.execute(
+                    "INSERT INTO source_owners(agent, generation, family, source, mechanism)
+                     VALUES (?1, ?2, 'process', 'os', 'os')",
+                    params![agent_num, generation],
+                ));
+                db!(tx.execute(
+                    "INSERT INTO source_state(agent, generation, source, state, health, updated_at)
+                     VALUES (?1, ?2, 'os', 'open', 'ok', ?3)",
+                    params![agent_num, generation, now],
+                ));
+                events.push(insert_daemon_event(
+                    &tx,
+                    now,
+                    "source.opened",
+                    "source",
+                    Some(agent_num),
+                    Some(generation),
+                    json!({"source": PROCESS_SOURCE, "families": ["process"], "mechanism": "os"}),
+                )?);
+            }
+            _ => {
+                return Err(Error::new(
+                    "source_integrity",
+                    "process source ownership is missing, conflicting, or terminal",
+                ));
+            }
+        }
+        commit_transaction(tx, &self.write_faulted)?;
+        Ok(events)
+    }
+
+    /// Update OS health independently of lifecycle, and close only after exact drain.
+    pub fn set_process_source_status(
+        &mut self,
+        agent: &str,
+        generation: i64,
+        health: &str,
+        closed: bool,
+        now: i64,
+    ) -> Result<Vec<Event>> {
+        self.ensure_writer_healthy()?;
+        let result = self.set_process_source_status_inner(agent, generation, health, closed, now);
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    fn set_process_source_status_inner(
+        &mut self,
+        agent: &str,
+        generation: i64,
+        health: &str,
+        closed: bool,
+        now: i64,
+    ) -> Result<Vec<Event>> {
+        if !matches!(health, "ok" | "slow" | "stale" | "error") {
+            return Err(Error::new(
+                "invalid",
+                "process source health must be ok, slow, stale, or error",
+            ));
+        }
+        let agent_num = parse_agent_id(agent)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let current = load_agent_by_num(&tx, agent_num)?
+            .ok_or_else(|| Error::new("not_found", "process source Agent was not found"))?;
+        if generation <= 0 || generation > current.generation {
+            return Err(Error::new(
+                "stale_generation",
+                "process source generation is not committed",
+            ));
+        }
+        let source = require_process_source(&tx, agent_num, generation)?;
+        if closed {
+            let retained: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM processes
+                 WHERE owner = ?1 AND state IN ('running', 'unknown'))",
+                    [format!("agent:{agent}#{generation}")],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?;
+            if retained {
+                return Err(Error::new(
+                    "bad_state",
+                    "OS source cannot close while a process is running or unknown",
+                ));
+            }
+        }
+        let state = if closed {
+            "closed"
+        } else {
+            source.state.as_str()
+        };
+        let mut events = Vec::new();
+        if state != source.state || health != source.health {
+            db!(tx.execute(
+                "UPDATE source_state SET state = ?1, health = ?2, updated_at = ?3
+                 WHERE agent = ?4 AND generation = ?5 AND source = 'os'",
+                params![state, health, now, agent_num, generation],
+            ));
+            events.push(insert_daemon_event(
+                &tx,
+                now,
+                if state != source.state {
+                    "source.closed"
+                } else {
+                    "source.health"
+                },
+                "source",
+                Some(agent_num),
+                Some(generation),
+                json!({"source": PROCESS_SOURCE, "state": state, "health": health}),
+            )?);
+        }
+        commit_transaction(tx, &self.write_faulted)?;
+        Ok(events)
+    }
+
+    /// Accept only host-authoritative OS observations, including historical exits.
+    /// Missing records are not evidence of departure; this never reduces an Agent.
+    pub fn observe_processes(
+        &mut self,
+        agent: &str,
+        generation: i64,
+        records: &[ProcessRecord],
+        now: i64,
+    ) -> Result<Vec<Event>> {
+        self.ensure_writer_healthy()?;
+        let result = self.observe_processes_inner(agent, generation, records, now);
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    fn observe_processes_inner(
+        &mut self,
+        agent: &str,
+        generation: i64,
+        records: &[ProcessRecord],
+        now: i64,
+    ) -> Result<Vec<Event>> {
+        let agent_num = parse_agent_id(agent)?;
+        let expected_owner = format!("agent:{agent}#{generation}");
+        if records.len() > MAX_PAGE_ENTRIES || encode_json(&records)?.len() > MAX_PAGE_BYTES {
+            return Err(Error::new(
+                "frame_too_large",
+                "process observation exceeds its bound",
+            ));
+        }
+        let mut identities = HashSet::with_capacity(records.len());
+        for record in records {
+            validate_process_identity(&record.identity)?;
+            require_nonempty(&record.role, "process role")?;
+            if record.owner != expected_owner || !identities.insert(&record.identity) {
+                return Err(Error::new(
+                    "source_integrity",
+                    "process observation has another owner or a repeated identity",
+                ));
+            }
+            if record.state != ProcessState::Exited && record.exit_code.is_some() {
+                return Err(Error::new(
+                    "invalid",
+                    "only an exited process can have an exit code",
+                ));
+            }
+            if encode_json(record)?.len() > MAX_EVENT_BYTES {
+                return Err(Error::new(
+                    "frame_too_large",
+                    "process record exceeds 64 KiB",
+                ));
+            }
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let current = load_agent_by_num(&tx, agent_num)?
+            .ok_or_else(|| Error::new("not_found", "process observation Agent was not found"))?;
+        if generation <= 0 || generation > current.generation {
+            return Err(Error::new(
+                "stale_generation",
+                "process observation generation is not committed",
+            ));
+        }
+        let source = require_process_source(&tx, agent_num, generation)?;
+        let mut events = Vec::new();
+        for record in records {
+            let start_time = validate_process_identity(&record.identity)?;
+            let old = tx
+                .query_row(
+                    "SELECT host_boot_id, pid, start_time, owner, role, state, exit_code, updated_at
+                     FROM processes WHERE host_boot_id = ?1 AND pid = ?2 AND start_time = ?3",
+                    params![record.identity.host_boot_id, record.identity.pid, start_time],
+                    process_record_from_row,
+                )
+                .optional()
+                .map_err(sql_error)?;
+            let mut next = record.clone();
+            next.updated_at = now;
+            if let Some(old) = &old {
+                if old.owner != expected_owner {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "process identity already has another owner",
+                    ));
+                }
+                if next.role != old.role {
+                    match (old.role.as_str(), next.role.as_str()) {
+                        ("child", "harness") => {}
+                        (_, "child") => next.role = old.role.clone(),
+                        _ => {
+                            return Err(Error::new(
+                                "source_integrity",
+                                "process role can only be promoted from child to harness",
+                            ));
+                        }
+                    }
+                }
+                // An uncertain later query cannot revoke a known departure or exit code.
+                if old.state == ProcessState::Exited {
+                    if next.state == ProcessState::Running {
+                        return Err(Error::new(
+                            "source_integrity",
+                            "an exited process identity cannot run again",
+                        ));
+                    }
+                    if old.exit_code.is_some()
+                        && next.exit_code.is_some()
+                        && old.exit_code != next.exit_code
+                    {
+                        return Err(Error::new("source_integrity", "process exit code changed"));
+                    }
+                    next.state = ProcessState::Exited;
+                    next.exit_code = next.exit_code.or(old.exit_code);
+                }
+            }
+            if source.state == "closed" && next.state != ProcessState::Exited {
+                return Err(Error::new(
+                    "bad_state",
+                    "a closed OS source cannot admit a non-exited process",
+                ));
+            }
+            db!(tx.execute(
+                "INSERT INTO processes(host_boot_id, pid, start_time, owner, role, state, exit_code, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(host_boot_id, pid, start_time) DO UPDATE
+                 SET role = excluded.role, state = excluded.state,
+                     exit_code = excluded.exit_code, updated_at = excluded.updated_at",
+                params![
+                    next.identity.host_boot_id, next.identity.pid, start_time, next.owner,
+                    next.role, process_state_name(next.state), next.exit_code, now,
+                ],
+            ));
+            if old.is_none() {
+                events.push(insert_process_event(
+                    &tx,
+                    agent_num,
+                    generation,
+                    now,
+                    "process.started",
+                    &next,
+                )?);
+            }
+            let kind = match next.state {
+                ProcessState::Exited
+                    if old
+                        .as_ref()
+                        .is_none_or(|old| old.state != ProcessState::Exited) =>
+                {
+                    Some("process.exited")
+                }
+                ProcessState::Unknown
+                    if old
+                        .as_ref()
+                        .is_some_and(|old| old.state != ProcessState::Unknown) =>
+                {
+                    Some("process.unknown")
+                }
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                events.push(insert_process_event(
+                    &tx, agent_num, generation, now, kind, &next,
+                )?);
+            }
+        }
+        db!(tx.execute(
+            "UPDATE source_state SET last_store_seq = COALESCE(?1, last_store_seq), updated_at = ?2
+             WHERE agent = ?3 AND generation = ?4 AND source = 'os'",
+            params![
+                events.last().map(|event| event.seq),
+                now,
+                agent_num,
+                generation
+            ],
+        ));
+        commit_transaction(tx, &self.write_faulted)?;
+        Ok(events)
+    }
+
+    pub fn list_processes(
+        &self,
+        owner: &str,
+        after: Option<&ProcessIdentity>,
+        limit: usize,
+    ) -> Result<Vec<ProcessRecord>> {
+        require_nonempty(owner, "process owner")?;
+        validate_limit(limit)?;
+        let after_start = after.map(validate_process_identity).transpose()?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT host_boot_id, pid, start_time, owner, role, state, exit_code, updated_at
+             FROM processes WHERE owner = ?1
+               AND (?2 IS NULL OR (host_boot_id, pid, start_time) > (?2, ?3, ?4))
+             ORDER BY host_boot_id, pid, start_time LIMIT ?5",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(
+                params![
+                    owner,
+                    after.map(|id| id.host_boot_id.as_str()),
+                    after.map(|id| id.pid),
+                    after_start,
+                    limit as i64
+                ],
+                process_record_from_row,
+            )
+            .map_err(sql_error)?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.map_err(sql_error)?);
+        }
+        enforce_page_bytes(&mut records)?;
+        Ok(records)
+    }
+
+    /// Only committed native model facts for this exact generation count as progress.
+    pub fn last_model_progress(&self, agent: &str, generation: i64) -> Result<Option<i64>> {
+        let agent_num = parse_agent_id(agent)?;
+        self.connection
+            .query_row(
+                "SELECT MAX(e.ts) FROM events e JOIN source_owners o
+                   ON o.agent = e.agent AND o.generation = e.generation
+                  AND o.family = e.family AND o.source = e.source
+                 WHERE e.agent = ?1 AND e.generation = ?2
+                   AND e.source NOT IN ('os', 'daemon') AND e.native_id IS NOT NULL
+                   AND e.kind IN ('turn.started', 'turn.completed', 'message.completed',
+                                  'tool.started', 'tool.completed',
+                                  'request.opened', 'request.resolved', 'request.closed')",
+                params![agent_num, generation],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)
+    }
+}
+
+fn validate_process_identity(identity: &ProcessIdentity) -> Result<i64> {
+    require_nonempty(&identity.host_boot_id, "host_boot_id")?;
+    if identity.pid == 0 {
+        return Err(Error::new("invalid", "process PID must be positive"));
+    }
+    i64::try_from(identity.start_time).map_err(|_| {
+        Error::new(
+            "invalid",
+            "process start_time exceeds a signed 64-bit integer",
+        )
+    })
+}
+
+fn process_state_name(state: ProcessState) -> &'static str {
+    match state {
+        ProcessState::Running => "running",
+        ProcessState::Exited => "exited",
+        ProcessState::Unknown => "unknown",
+    }
+}
+
+fn process_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProcessRecord> {
+    let state = serde_json::from_value(Value::String(row.get(5)?)).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(ProcessRecord {
+        identity: ProcessIdentity {
+            host_boot_id: row.get(0)?,
+            pid: row.get(1)?,
+            start_time: u64::try_from(row.get::<_, i64>(2)?).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Integer,
+                    Box::new(error),
+                )
+            })?,
+        },
+        owner: row.get(3)?,
+        role: row.get(4)?,
+        state,
+        exit_code: row.get(6)?,
+        updated_at: row.get(7)?,
+    })
+}
+
+fn require_process_source(
+    connection: &Connection,
+    agent: i64,
+    generation: i64,
+) -> Result<SourceStateRecord> {
+    let owned: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+             SELECT 1 FROM source_owners o JOIN source_state s
+               ON s.agent = o.agent AND s.generation = o.generation AND s.source = o.source
+             WHERE o.agent = ?1 AND o.generation = ?2 AND o.family = 'process'
+               AND o.source = 'os' AND o.mechanism = 'os'
+         )",
+            params![agent, generation],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if !owned {
+        return Err(Error::new(
+            "source_integrity",
+            "OS process ownership was not committed before observation",
+        ));
+    }
+    load_source_state(connection, agent, generation, PROCESS_SOURCE)?
+        .ok_or_else(|| Error::new("source_integrity", "OS source state is missing"))
+}
+
+fn insert_process_event(
+    tx: &Transaction<'_>,
+    agent: i64,
+    generation: i64,
+    now: i64,
+    kind: &str,
+    record: &ProcessRecord,
+) -> Result<Event> {
+    insert_event(
+        tx,
+        EventInsert {
+            ts: now,
+            kind,
+            family: Some("process"),
+            agent: Some(agent),
+            generation: Some(generation),
+            source: PROCESS_SOURCE,
+            native_id: None,
+            cursor: None,
+            payload_digest: None,
+            data: json!(record),
+        },
+    )
 }
 
 #[cfg(test)]
@@ -3996,7 +4536,7 @@ fn transition_lost_tx(
     ));
     db!(tx.execute(
         "UPDATE source_state SET state = 'closed', health = 'stale', updated_at = ?1
-         WHERE agent = ?2 AND generation = ?3",
+         WHERE agent = ?2 AND generation = ?3 AND source <> 'os'",
         params![now, agent_num, generation],
     ));
     events.push(insert_daemon_event(
@@ -4059,7 +4599,7 @@ fn fail_start_tx(
     ));
     db!(tx.execute(
         "UPDATE source_state SET state = 'closed', health = 'error', updated_at = ?1
-         WHERE agent = ?2 AND generation = ?3",
+         WHERE agent = ?2 AND generation = ?3 AND source <> 'os'",
         params![now, agent_num, generation],
     ));
     events.push(insert_daemon_event(
@@ -4163,7 +4703,7 @@ fn stop_agent_tx(
     ));
     db!(tx.execute(
         "UPDATE source_state SET state = 'closed', updated_at = ?1
-         WHERE agent = ?2 AND generation = ?3",
+         WHERE agent = ?2 AND generation = ?3 AND source <> 'os'",
         params![now, agent_num, generation],
     ));
     events.push(insert_daemon_event(

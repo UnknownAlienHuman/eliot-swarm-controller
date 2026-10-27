@@ -109,6 +109,17 @@ itself. On degraded Unix, lost session control may coexist with `orphan_possible
 Process stats are ephemeral and do not count as model progress. Unknown exit code stays
 unknown, never zero.
 
+The process view is available through `processes AGENT`, `stats AGENT` and
+`show AGENT.observation`. CPU counters are nanoseconds; RSS is bytes. Samples carry
+their timestamp, completeness and a four-second freshness window. Missing or stale
+values remain null. Liveness reports committed native facts separately from OS samples;
+waiting for an approval/question is not a stall caused by missing model output.
+
+The Windows boot marker is currently an estimate captured once per daemon and retains
+its `windows-boot-filetime-estimate` label. Exact creation FILETIME and verified Job
+membership bind owned processes; the estimate is not used to adopt surviving processes
+across daemon replacement. Observer query handles cannot extend owned execution.
+
 ```sql
 CREATE TABLE processes (
   host_boot_id TEXT NOT NULL,

@@ -1,9 +1,11 @@
 use crate::{
     bus::Bus,
+    monitor::Monitoring,
     plugin_host::{AgentCredentials, PluginHost, PluginHostOptions, SecretSet, UnknownCommands},
 };
 use eliot_core::{
-    Agent, AgentState, Command, CommandState, Error, Event, Result, SubmitCommand, Turn, TurnState,
+    Agent, AgentState, Command, CommandState, Error, Event, ProcessIdentity, Result, SubmitCommand,
+    Turn, TurnState,
 };
 use eliot_plugin::MAX_EVENT_BYTES;
 use futures_util::future::BoxFuture;
@@ -53,6 +55,7 @@ struct RouterInner {
     unknown_commands: UnknownCommands,
     unknown_causes: Mutex<HashMap<String, String>>,
     plugin_host: PluginHost,
+    monitoring: Monitoring,
     mode: AtomicU8,
     shutdown_ready: AtomicBool,
     progress: watch::Sender<u64>,
@@ -81,6 +84,7 @@ impl Router {
         let agent_credentials: AgentCredentials = Arc::new(Mutex::new(Default::default()));
         let unknown_commands: UnknownCommands = Arc::new(Mutex::new(Default::default()));
         let (progress, _) = watch::channel(0_u64);
+        let monitoring = Monitoring::new(Arc::clone(&store), bus.clone());
         let plugin_host = PluginHost::new(
             PluginHostOptions::new(data_root.clone(), owner_token.clone()),
             Arc::clone(&store),
@@ -89,6 +93,7 @@ impl Router {
             Arc::clone(&agent_credentials),
             Arc::clone(&unknown_commands),
             progress.clone(),
+            monitoring.clone(),
         );
         Self {
             inner: Arc::new(RouterInner {
@@ -101,6 +106,7 @@ impl Router {
                 unknown_commands,
                 unknown_causes: Mutex::new(HashMap::new()),
                 plugin_host,
+                monitoring,
                 mode: AtomicU8::new(MODE_OPEN),
                 shutdown_ready: AtomicBool::new(false),
                 progress,
@@ -125,18 +131,24 @@ impl Router {
             "agent.get" => self.agent_get(&params, &principal).await,
             "agent.list" => self.agent_list(&params, &principal).await,
             "agent.result" => self.agent_result(&params, &principal).await,
+            "agent.processes" => self.agent_processes(&params, &principal).await,
+            "agent.stats" => self.agent_stats(&params, &principal).await,
             "turn.get" => self.turn_get(&params, &principal).await,
             "events.read" => self.events_read(&params, &principal).await,
             "events.subscribe" => self.events_subscribe(&params, &principal).await,
             _ => Err(Error::new(
                 "unsupported",
-                format!("daemon method {method} is not implemented in L1"),
+                format!("daemon method {method} is not implemented"),
             )),
         }
     }
 
     pub(crate) fn progress_receiver(&self) -> watch::Receiver<u64> {
         self.inner.progress.subscribe()
+    }
+
+    pub(crate) fn monitoring(&self) -> Monitoring {
+        self.inner.monitoring.clone()
     }
 
     pub(crate) fn response_finished(&self, shutdown_requested: bool) {
@@ -464,8 +476,94 @@ impl Router {
                 "persisted Agent state has no live source owner",
             ));
         }
-        serde_json::to_value(agent)
-            .map_err(|error| Error::new("internal", format!("encode Agent: {error}")))
+        let observation = self.observation_view(&agent).await;
+        let mut value = serde_json::to_value(agent)
+            .map_err(|error| Error::new("internal", format!("encode Agent: {error}")))?;
+        value["observation"] = observation;
+        Ok(value)
+    }
+
+    async fn observation_view(&self, agent: &Agent) -> Value {
+        match self.inner.monitoring.view(agent).await {
+            Ok(value) => value,
+            Err(error) => json!({"available": false, "error_code": error.code}),
+        }
+    }
+
+    async fn agent_processes(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        reject_unknown_keys(
+            params,
+            &["id", "generation", "after", "limit"],
+            "agent.processes",
+        )?;
+        let id = required_text(params, "id")?;
+        let generation = optional_observation_generation(params)?;
+        authorize_agent_read(principal, id, generation)?;
+        let after = optional_text(params, "after")?
+            .map(|cursor| {
+                if cursor.len() > 1_024 {
+                    return Err(Error::new("invalid", "process cursor exceeds its bound"));
+                }
+                let identity: ProcessIdentity = serde_json::from_str(cursor)
+                    .map_err(|_| Error::new("invalid", "invalid process cursor"))?;
+                if identity.pid == 0
+                    || identity.start_time == 0
+                    || identity.host_boot_id.is_empty()
+                    || identity.host_boot_id.len() > 512
+                    || identity.host_boot_id.chars().any(char::is_control)
+                {
+                    return Err(Error::new("invalid", "invalid process cursor identity"));
+                }
+                Ok(identity)
+            })
+            .transpose()?;
+        let limit = page_limit(params)?;
+        let (generation, processes) = {
+            let store = self.inner.store.lock().await;
+            let agent = store
+                .get_agent(id)?
+                .ok_or_else(|| Error::new("not_found", format!("Agent {id} was not found")))?;
+            let generation = generation.unwrap_or(agent.generation);
+            if generation > agent.generation {
+                return Err(Error::new(
+                    "stale_generation",
+                    "process generation does not exist",
+                ));
+            }
+            let owner = format!("agent:{id}#{generation}");
+            (
+                generation,
+                store.list_processes(&owner, after.as_ref(), limit)?,
+            )
+        };
+        let next = processes
+            .last()
+            .map(|process| serde_json::to_string(&process.identity))
+            .transpose()
+            .map_err(|_| Error::new("internal", "cannot encode process cursor"))?;
+        Ok(json!({"agent": id, "generation": generation, "processes": processes, "next": next}))
+    }
+
+    async fn agent_stats(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        reject_unknown_keys(params, &["id", "generation"], "agent.stats")?;
+        let id = required_text(params, "id")?;
+        let expected = optional_observation_generation(params)?;
+        authorize_agent_read(principal, id, expected)?;
+        let agent = {
+            let store = self.inner.store.lock().await;
+            store.get_agent(id)?
+        }
+        .ok_or_else(|| Error::new("not_found", format!("Agent {id} was not found")))?;
+        if expected.is_some_and(|generation| generation != agent.generation) {
+            return Err(Error::new(
+                "stale_generation",
+                "stats require the current Agent generation",
+            ));
+        }
+        let mut value = self.observation_view(&agent).await;
+        value["agent"] = json!(agent.id);
+        value["generation"] = json!(agent.generation);
+        Ok(value)
     }
 
     async fn agent_list(&self, params: &Value, principal: &Principal) -> Result<Value> {
@@ -1964,6 +2062,13 @@ fn required_i64(params: &Value, field: &str) -> Result<i64> {
         .and_then(Value::as_i64)
         .filter(|value| *value >= 0)
         .ok_or_else(|| Error::new("invalid", format!("{field} must be a nonnegative integer")))
+}
+
+fn optional_observation_generation(params: &Value) -> Result<Option<i64>> {
+    match params.get("generation") {
+        None | Some(Value::Null) => Ok(None),
+        Some(_) => required_i64(params, "generation").map(Some),
+    }
 }
 
 fn page_limit(params: &Value) -> Result<usize> {

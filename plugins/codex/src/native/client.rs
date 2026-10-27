@@ -201,6 +201,11 @@ impl NativeProcess {
         })
     }
 
+    /// The actual app-server child PID; birth and custody are verified by the host.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
     pub fn client(&self) -> NativeClient {
         self.client.clone()
     }

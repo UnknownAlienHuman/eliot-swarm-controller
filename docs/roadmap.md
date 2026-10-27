@@ -120,6 +120,8 @@ sections, and [OpenCodex](harnesses/opencodex.md) only for the proxy task.
 
 - [ ] **L3.1 Observation.** Exact process identity, source drain before loss, bounded
       stats, busy-vs-waiting liveness, read-only Git/fs monitor and `agent_edits`.
+      The process/stats/liveness path is implemented and exercised on Windows with
+      fake and native Codex; Git/fs observation and edit attribution remain.
 - [ ] **L3.2 Workspaces.** Existing workspaces remain the default. Add opt-in worktree
       creation with frozen base OID, one preparation row, explicit setup and no replay
       of unknown setup. Exact readback and clean-only removal; preserve the branch.

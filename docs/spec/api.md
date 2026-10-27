@@ -47,6 +47,7 @@ rule actions have bounded derived ids. No general receipt/floor framework.
 | --- | --- |
 | `daemon.status/shutdown` | current state, admission mode and exact drain/force |
 | `agent.list/get/wait/result` | scoped, paginated Agent state and exact results |
+| `agent.processes/stats` | scoped process records and ephemeral OS samples |
 | `command.submit/get/children/resolve` | immutable admission, linked input, fixed selector/action children |
 | `turn.get/resolve` | running/completed/unknown turn; constrained owner assertion |
 | `events.read/subscribe` | persisted replay plus bounded live delivery |
@@ -59,6 +60,31 @@ Filter shape is `{kinds?,agents?,tree?,sources?,ephemeral?}`. Errors include
 `not_found`, `unsupported`, `not_allowed`, `bad_state`, `stale_generation`, `invalid`,
 `busy`, `unavailable`, `capacity_unavailable`, `history_gap`, `source_integrity`,
 `secret_in_payload`, `frame_too_large`, `mailbox_full`, `internal`.
+
+Process reads use the existing daemon and private data directory:
+
+```text
+agent.processes {id, generation?, after?, limit?}
+  -> {agent, generation, processes:[ProcessRecord], next:string|null}
+agent.stats {id, generation?}
+  -> {agent, generation, ...monitorView}
+```
+
+Generation is a nonnegative integer; omission selects the current generation. The
+Router validates scope. Owners may read historical generations with `agent.processes`;
+`agent.stats` accepts only the current generation, with an explicit generation acting
+as an expectation. Process ownership is `agent:<id>#<generation>`. `agent.processes` is
+paginated, with default limit 100 and allowed range 1–1,000. Its `after` cursor is an opaque string
+containing a JSON-serialized `ProcessIdentity` (`host_boot_id`, `pid`, `start_time`);
+pass it back unchanged rather than constructing a PID-only cursor.
+`next` contains the last returned identity even on the last nonempty page; continue
+until `processes` is empty rather than using non-null `next` as proof of another record.
+
+Process identity/state and CPU-time/RSS samples are distinct. Statistics are ephemeral,
+and absent values remain unknown, never zero. Process activity does not establish
+model progress; incomplete observation does not prove custody empty. `agent.get` retains
+the Agent object and may enrich it with `observation`; `show` prints that object unchanged.
+Windows canonical path strings remain opaque to these CLI reads.
 
 ## Command admission
 
@@ -180,6 +206,8 @@ eliot daemon stop [--drain|--force]
 eliot status
 eliot launch --profile P --workspace PATH [PROMPT] [--wait]
 eliot ls | show A | watch [A|SELECTOR] | top
+eliot processes A [--generation N] [--after CURSOR] [--limit N]
+eliot stats A [--generation N]
 eliot send A TEXT [--wait] [--generation N]
 eliot steer|inject A TEXT [--generation N] [--turn ID]
 eliot interrupt|abort A [--generation N] [--turn ID]
@@ -205,3 +233,7 @@ eliot plugin NAME | plugin-test ... | hook ... | mcp
 Only current-layer commands appear in help and Agent guidance. Exit codes: 0 success/
 queued; 1 definite failure; 2 usage; 3 pre-effect rejection; 4 unknown; 5 wait timeout;
 6 still dispatched/pending. A queued/applied input is not successful task completion.
+
+`processes` and `stats` make one read call and print the bounded JSON response. They
+do not start a daemon or submit a mutation. `processes --after` forwards the opaque
+cursor string to the Router for validation.

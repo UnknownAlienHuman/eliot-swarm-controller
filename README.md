@@ -23,6 +23,11 @@ and no workspace files created.
 Full L7 qualification remains pending. File-change approval was not live exercised;
 requests carrying `grantRoot` remain unsupported. [Roadmap](docs/roadmap.md) owns milestone status.
 
+`processes AGENT` pages OS-verified process identities and lifecycle records.
+`stats AGENT` reports ephemeral CPU/RSS samples and model-progress age;
+`show AGENT` includes the same observation view. Missing or stale counters are null,
+and process activity never counts as model progress.
+
 ## Quick start
 
 From the repository root, build the binary and replace the workspace, data-directory, and

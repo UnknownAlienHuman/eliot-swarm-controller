@@ -1,6 +1,11 @@
 #![allow(unsafe_code)]
 
-use eliot_core::{Error, Result};
+use super::process_observation::unknown_sample;
+#[cfg(target_os = "linux")]
+use super::process_observation::{MAX_PROCESS_SAMPLES, exited_sample};
+use eliot_core::{Error, ProcessSample, ProcessSnapshot, Result};
+#[cfg(target_os = "linux")]
+use eliot_core::{ProcessIdentity, ProcessRecord, ProcessState};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
@@ -230,6 +235,21 @@ pub(crate) fn terminate_process_group(identity: &ProcessGroupIdentity) -> Result
 
 #[cfg(target_os = "linux")]
 fn read_linux_process_identity(pid: u32) -> std::io::Result<(i32, u64)> {
+    let stat = read_linux_process_stat(pid)?;
+    Ok((stat.pgid, stat.start_ticks))
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxProcessStat {
+    pgid: i32,
+    start_ticks: u64,
+    state: ProcessState,
+    cpu_time_ns: Option<u64>,
+    rss_bytes: Option<u64>,
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_process_stat(pid: u32) -> std::io::Result<LinuxProcessStat> {
     use std::io::{Error as IoError, ErrorKind};
 
     if pid == 0 {
@@ -268,7 +288,274 @@ fn read_linux_process_identity(pid: u32) -> std::io::Result<(i32, u64)> {
         .get(19)
         .and_then(|value| value.parse::<u64>().ok())
         .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "invalid process start time"))?;
-    Ok((pgid, start_ticks))
+    let state = match fields.first().copied() {
+        Some("Z" | "X" | "x") => ProcessState::Exited,
+        Some(_) => ProcessState::Running,
+        None => {
+            return Err(IoError::new(
+                ErrorKind::InvalidData,
+                "missing process state",
+            ));
+        }
+    };
+    // SAFETY: sysconf only reads the two process-independent numeric limits.
+    let ticks_per_second = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) })
+        .ok()
+        .filter(|n| *n > 0);
+    let page_size = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+        .ok()
+        .filter(|size| *size > 0);
+    let cpu_time_ns = fields
+        .get(11)
+        .and_then(|v| v.parse::<u64>().ok())
+        .zip(fields.get(12).and_then(|v| v.parse::<u64>().ok()))
+        .and_then(|(user, system)| user.checked_add(system))
+        .zip(ticks_per_second)
+        .and_then(|(ticks, frequency)| {
+            u64::try_from(u128::from(ticks) * 1_000_000_000 / u128::from(frequency)).ok()
+        });
+    let rss_bytes = fields
+        .get(21)
+        .and_then(|v| v.parse::<u64>().ok())
+        .zip(page_size)
+        .and_then(|(pages, size)| pages.checked_mul(size));
+    Ok(LinuxProcessStat {
+        pgid,
+        start_ticks,
+        state,
+        cpu_time_ns,
+        rss_bytes,
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct ProcessObserver {
+    group: ProcessGroupIdentity,
+    root: ProcessIdentity,
+    root_exit: Option<Option<i32>>,
+}
+
+#[cfg(target_os = "linux")]
+impl ProcessObserver {
+    pub(crate) fn new(group: ProcessGroupIdentity) -> Result<Self> {
+        let current = read_linux_process_identity(group.pid)
+            .map_err(|error| unknown_process_identity("verify observed group leader", error))?;
+        if current != (group.pgid, group.start_ticks) {
+            return Err(Error::new(
+                "process_custody_unknown",
+                "owned group leader identity changed",
+            ));
+        }
+        Ok(Self {
+            root: ProcessIdentity {
+                host_boot_id: host_boot_id()?,
+                pid: group.pid,
+                start_time: group.start_ticks,
+            },
+            group,
+            root_exit: None,
+        })
+    }
+
+    fn group_is_current(&self) -> bool {
+        read_linux_process_identity(self.group.pid).ok()
+            == Some((self.group.pgid, self.group.start_ticks))
+    }
+
+    pub(crate) fn record_root_exit(&mut self, code: Option<i32>) {
+        self.root_exit = Some(code);
+    }
+
+    pub(crate) fn snapshot(&self, owner: &str, now: i64) -> Result<ProcessSnapshot> {
+        let root = ProcessSample {
+            record: ProcessRecord {
+                identity: self.root.clone(),
+                owner: owner.to_owned(),
+                role: "plugin".to_owned(),
+                state: ProcessState::Unknown,
+                exit_code: None,
+                updated_at: now,
+            },
+            cpu_time_ns: None,
+            rss_bytes: None,
+        };
+        let mut snapshot = ProcessSnapshot {
+            samples: vec![self.refresh(&root, now)],
+            complete: false,
+        };
+        if !self.group_is_current() {
+            return Ok(snapshot);
+        }
+        let entries = fs::read_dir("/proc")
+            .map_err(|error| io_error("enumerate owned process group", error))?;
+        snapshot.complete = true;
+        // /proc is host-wide: both scanned directory entries and returned group
+        // members are bounded. This never limits spawning or signals a process.
+        for (index, entry) in entries.enumerate() {
+            if index >= 65_536 {
+                snapshot.complete = false;
+                break;
+            }
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    snapshot.complete = false;
+                    continue;
+                }
+            };
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if pid == self.root.pid {
+                continue;
+            }
+            match read_linux_process_stat(pid) {
+                Ok(stat) if stat.pgid == self.group.pgid => {
+                    if snapshot.samples.len() >= MAX_PROCESS_SAMPLES {
+                        snapshot.complete = false;
+                        break;
+                    }
+                    snapshot
+                        .samples
+                        .push(self.sample(pid, stat, "child", owner, now));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => snapshot.complete = false,
+            }
+        }
+        if !self.group_is_current() {
+            // The leader is no longer authority for newly discovered members.
+            snapshot.samples.truncate(1);
+            snapshot.complete = false;
+        }
+        Ok(snapshot)
+    }
+
+    pub(crate) fn register_pid(
+        &self,
+        pid: u32,
+        role: &str,
+        owner: &str,
+        now: i64,
+    ) -> Result<ProcessSample> {
+        if !self.group_is_current() {
+            return Err(Error::new(
+                "process_custody_unknown",
+                "owned group leader cannot be verified",
+            ));
+        }
+        let stat = read_linux_process_stat(pid)
+            .map_err(|error| io_error("verify registered process", error))?;
+        if stat.pgid != self.group.pgid
+            || stat.state != ProcessState::Running
+            || !self.group_is_current()
+        {
+            return Err(Error::new(
+                "not_allowed",
+                "registered process is not live in the owned process group",
+            ));
+        }
+        let is_root = pid == self.root.pid && stat.start_ticks == self.root.start_time;
+        if (role == "plugin") != is_root {
+            return Err(Error::new(
+                "invalid",
+                "only the owned root has the plugin role",
+            ));
+        }
+        Ok(self.sample(pid, stat, role, owner, now))
+    }
+
+    pub(crate) fn refresh(&self, old: &ProcessSample, now: i64) -> ProcessSample {
+        if old.record.identity == self.root
+            && let Some(code) = self.root_exit
+        {
+            let mut sample = exited_sample(old, now);
+            sample.record.exit_code = code;
+            return sample;
+        }
+        match read_linux_process_stat(old.record.identity.pid) {
+            Ok(stat) if stat.start_ticks != old.record.identity.start_time => {
+                exited_sample(old, now)
+            }
+            Ok(stat) if stat.pgid == self.group.pgid => self.sample(
+                old.record.identity.pid,
+                stat,
+                &old.record.role,
+                &old.record.owner,
+                now,
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => exited_sample(old, now),
+            _ => unknown_sample(old, now),
+        }
+    }
+
+    fn sample(
+        &self,
+        pid: u32,
+        stat: LinuxProcessStat,
+        role: &str,
+        owner: &str,
+        now: i64,
+    ) -> ProcessSample {
+        ProcessSample {
+            record: ProcessRecord {
+                identity: ProcessIdentity {
+                    host_boot_id: self.root.host_boot_id.clone(),
+                    pid,
+                    start_time: stat.start_ticks,
+                },
+                owner: owner.to_owned(),
+                role: role.to_owned(),
+                state: stat.state,
+                // Only OwnedChild::wait supplies a known Linux leader code.
+                // Missing/filtered proc exit status must not invent a child code.
+                exit_code: None,
+                updated_at: now,
+            },
+            cpu_time_ns: stat.cpu_time_ns,
+            rss_bytes: stat.rss_bytes,
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) struct ProcessObserver;
+
+#[cfg(not(target_os = "linux"))]
+impl ProcessObserver {
+    pub(crate) fn new(_group: ProcessGroupIdentity) -> Result<Self> {
+        Err(Error::new(
+            "unsupported",
+            "process observation requires Linux boot and birth identity",
+        ))
+    }
+    pub(crate) fn snapshot(&self, _owner: &str, _now: i64) -> Result<ProcessSnapshot> {
+        Err(Error::new(
+            "unsupported",
+            "process observation requires Linux boot and birth identity",
+        ))
+    }
+    pub(crate) fn register_pid(
+        &self,
+        _pid: u32,
+        _role: &str,
+        _owner: &str,
+        _now: i64,
+    ) -> Result<ProcessSample> {
+        Err(Error::new(
+            "unsupported",
+            "process observation requires Linux boot and birth identity",
+        ))
+    }
+    pub(crate) fn refresh(&self, old: &ProcessSample, now: i64) -> ProcessSample {
+        unknown_sample(old, now)
+    }
+    pub(crate) fn record_root_exit(&mut self, _code: Option<i32>) {}
 }
 
 #[cfg(target_os = "linux")]

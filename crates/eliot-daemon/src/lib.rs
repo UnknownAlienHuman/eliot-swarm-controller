@@ -3,6 +3,7 @@
 mod bus;
 mod config;
 mod daemon;
+mod monitor;
 mod platform;
 mod plugin_host;
 mod redaction;

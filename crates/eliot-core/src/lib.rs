@@ -8,6 +8,45 @@ fn empty_object() -> Value {
     Value::Object(serde_json::Map::new())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ProcessIdentity {
+    pub host_boot_id: String,
+    pub pid: u32,
+    pub start_time: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessState {
+    Running,
+    Exited,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessRecord {
+    pub identity: ProcessIdentity,
+    pub owner: String,
+    pub role: String,
+    pub state: ProcessState,
+    pub exit_code: Option<i32>,
+    pub updated_at: i64,
+}
+
+/// Ephemeral OS counters; absent values remain unknown and are not model progress.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessSample {
+    pub record: ProcessRecord,
+    pub cpu_time_ns: Option<u64>,
+    pub rss_bytes: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessSnapshot {
+    pub samples: Vec<ProcessSample>,
+    pub complete: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentState {

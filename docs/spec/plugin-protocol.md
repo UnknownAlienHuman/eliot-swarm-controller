@@ -10,6 +10,9 @@ L1/L2 implement `initialize`, `agent.start`, `agent.command`, `agent.stop`,
 `agent.snapshot`, `shutdown` and durable `events.put` for one per-Agent source. Start
 with the actual fake/Codex verbs. The manifest advertises only implemented capabilities.
 
+The first L3 process caller adds private `process.put` for the Codex app-server child.
+It registers a process with the host monitor, without adding a native stream family.
+
 Add discovery, control takeover, transcript handoff, shared services, children and hooks
 with their first roadmap caller. A missing feature returns `unsupported`; do not create
 empty handlers, tables or generic frameworks to anticipate it.
@@ -98,7 +101,7 @@ inventing completion or issuing another start.
 | `source.state` | read-only family owners, cursor, lifecycle, health, latest gap and last-batch acknowledgement |
 | `source.gap` | stable gap id, owned families, reason and optional from/to cursor; commits one gap boundary |
 | `source.handoff` | named families, expected predecessor, successor/mechanism and final cursor or gap; atomic ownership transfer |
-| `process.put` | agent/generation, PID/birth/role; OS-verified registration, not plugin-authoritative process lifecycle |
+| `process.put` | credential, agent_id, generation, pid, role; returns the OS-verified `ProcessRecord`, not plugin-authoritative process lifecycle |
 | `child` | registration id, parent/generation, exact child subject and optional identity request; canonical child row/source plan |
 
 ### Commit acknowledgement
@@ -151,6 +154,18 @@ unproven/mixed state remains unknown. No source epoch, open-id or source sequenc
 
 Register only PIDs verified inside the calling Agent custody; shared server PIDs have
 service custody. OS enumeration and registration upsert one process identity.
+
+The first `process.put` caller sends `{credential,agent_id,generation,pid,role:"harness"}`
+on its private plugin connection, using the actual child PID. It omits claimed birth;
+the host derives and verifies `(host_boot_id,pid,start_time)` and custody, then returns
+one `ProcessRecord` directly with owner `agent:<id>#<generation>`. The caller verifies
+that the returned PID, owner and role match, the birth is present, and state is running
+with no exit code. It registers after arming the reader and before native initialization,
+thread create/resume or input. A registration error or invalid acknowledgement blocks
+those operations and returns `process_registration` after confirmed child cleanup;
+unconfirmed cleanup returns `unknown`. Neither case invents an identity or retries the
+start. Process lifecycle and stats remain daemon-monitor facts; native lifecycle stays
+on the already-owned stream.
 
 Child registration is idempotent for parent generation/registration id/native subject.
 Commit its canonical row and source plan before reply; buffer child facts until then.

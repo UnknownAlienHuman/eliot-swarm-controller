@@ -12,7 +12,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::Mutex,
+    sync::{Mutex, watch},
     task::JoinSet,
     time::{Instant, timeout_at},
 };
@@ -50,11 +50,17 @@ pub async fn run(path: PathBuf) -> Result<()> {
     let mut listener = IpcListener::bind(&data_dir, &daemon_lock).await?;
     data_dir.publish_daemon(&daemon_lock, listener.endpoint(), env!("CARGO_PKG_VERSION"))?;
 
+    let (monitor_stop, monitor_shutdown) = watch::channel(false);
+    let mut background = JoinSet::new();
+    let monitoring = router.monitoring();
+    background.spawn(monitoring.clone().run(monitor_shutdown));
     let mut progress = router.progress_receiver();
     let mut connections = JoinSet::new();
-    loop {
-        if router.should_exit().await? {
-            break;
+    let outcome = loop {
+        match router.should_exit().await {
+            Ok(true) => break Ok(()),
+            Ok(false) => {}
+            Err(error) => break Err(error),
         }
         tokio::select! {
             accepted = listener.accept() => {
@@ -68,35 +74,56 @@ pub async fn run(path: PathBuf) -> Result<()> {
                     Ok(_stream) => {}
                     Err(error) => {
                         if router.is_force_requested() {
-                            break;
+                            break Ok(());
                         }
-                        return Err(error);
+                        break Err(error);
                     }
                 }
             }
             changed = progress.changed() => {
                 if changed.is_err() {
-                    return Err(Error::new("internal", "daemon progress channel closed"));
+                    break Err(Error::new("internal", "daemon progress channel closed"));
+                }
+            }
+            joined = background.join_next(), if !background.is_empty() => {
+                match joined {
+                    Some(Ok(Err(error))) => monitoring.mark_unavailable(&error.code),
+                    Some(Err(_)) => monitoring.mark_unavailable("monitor_task_failed"),
+                    _ => monitoring.mark_unavailable("monitor_task_stopped"),
                 }
             }
             joined = connections.join_next(), if !connections.is_empty() => {
                 let _ = joined;
             }
             signal = tokio::signal::ctrl_c() => {
-                signal.map_err(|error| {
-                    Error::new("platform_io", format!("listen for shutdown signal: {error}"))
-                })?;
+                if let Err(error) = signal {
+                    break Err(Error::new(
+                        "platform_io",
+                        format!("listen for shutdown signal: {error}"),
+                    ));
+                }
                 router.request_force();
             }
         }
-    }
+    };
 
+    if outcome.is_err() {
+        router.request_force();
+    }
     if router.is_force_requested() {
         router.force_owned_processes().await;
     }
     connections.abort_all();
     while connections.join_next().await.is_some() {}
-    Ok(())
+    monitor_stop.send_replace(true);
+    while let Some(joined) = background.join_next().await {
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => monitoring.mark_unavailable(&error.code),
+            Err(_) => monitoring.mark_unavailable("monitor_task_failed"),
+        }
+    }
+    outcome
 }
 
 /// Make one authenticated local JSON-RPC call. Clients open only an existing
