@@ -5,9 +5,10 @@ use crate::{
         types::{
             NativeClientInfo, NativeInitializeParams, NativeInitializeResponse, NativeModelEntry,
             NativeModelListParams, NativeModelListResponse, NativeSandboxMode, NativeTextUserInput,
-            NativeThreadResumeParams, NativeThreadStartParams, NativeTurnInterruptParams,
-            NativeTurnStartParams, NativeTurnStartResponse, NativeTurnSteerParams,
-            NativeTurnSteerResponse, NativeUserInput, ThreadReadback, ThreadStartReadback,
+            NativeThreadConfigOverrides, NativeThreadResumeParams, NativeThreadStartParams,
+            NativeTurnInterruptParams, NativeTurnStartParams, NativeTurnStartResponse,
+            NativeTurnSteerParams, NativeTurnSteerResponse, NativeUserInput, ThreadReadback,
+            ThreadStartReadback,
         },
     },
 };
@@ -259,7 +260,13 @@ impl CodexPlugin {
                     params.generation,
                 )
             })
-            .transpose()?;
+            .transpose()
+            .map_err(|mut error| {
+                if error.code == "unknown" {
+                    error.code = "native_readback".to_owned();
+                }
+                error
+            })?;
         validate_source_plan(params.source_plan.as_ref())?;
         let profile = params
             .profile
@@ -419,26 +426,30 @@ impl CodexPlugin {
                     "Codex resume subject is outside the authenticated native scope",
                 ));
             }
-            if verify_resume_idle(
+            session.thread_id = Some(subject.native_ref.clone());
+            if let Err(error) = verify_resume_preflight(
                 &session.native_client,
                 &subject.native_ref,
                 subject.retained_turn.as_deref(),
             )
             .await
-            .is_err()
             {
+                let error = Error::new(
+                    "native_readback",
+                    format!(
+                        "Codex resume preflight failed before thread/resume dispatch: {}",
+                        error.message
+                    ),
+                );
                 self.failed_start = Some(FailedStart {
                     agent_id: params.agent_id,
                     generation: params.generation,
                     command_id: params.command_id,
-                    code: "unknown".to_owned(),
-                    message: "Codex retained thread has no exact known-idle readback".to_owned(),
+                    code: error.code.clone(),
+                    message: error.message.clone(),
                 });
                 discard_unstarted(&mut session).await;
-                return Err(Error::new(
-                    "unknown",
-                    "Codex retained thread has no exact known-idle readback",
-                ));
+                return Err(error);
             }
         }
 
@@ -451,6 +462,9 @@ impl CodexPlugin {
                 cwd: Some(workspace.to_string_lossy().into_owned()),
                 sandbox: Some(sandbox_mode),
                 approval_policy: Some(json!(approval_policy.clone())),
+                config: Some(NativeThreadConfigOverrides {
+                    model_reasoning_effort: selected_effort.clone(),
+                }),
             };
             (
                 "thread/resume",
@@ -468,6 +482,9 @@ impl CodexPlugin {
                 model_provider: Some("openai".to_owned()),
                 sandbox: Some(sandbox_mode),
                 approval_policy: Some(json!(approval_policy.clone())),
+                config: Some(NativeThreadConfigOverrides {
+                    model_reasoning_effort: selected_effort.clone(),
+                }),
                 service_tier: None,
                 ephemeral: None,
             };
@@ -557,6 +574,21 @@ impl CodexPlugin {
             }
         };
         session.thread_id = Some(readback.thread.id.clone());
+        if resume_subject.is_some()
+            && response_value
+                .get("thread")
+                .is_none_or(|thread| thread_state(thread) != "idle")
+        {
+            self.session = Some(session);
+            return Err(Error::new(
+                "unknown",
+                "Codex thread/resume did not prove the resumed thread idle; no input was sent",
+            ));
+        }
+        let effort_verified = readback
+            .reasoning_effort
+            .as_deref()
+            .is_some_and(|effort| effort == selected_effort);
         let effective = json!({
             "model": readback.model.clone(),
             "model_provider": readback.model_provider.clone(),
@@ -564,12 +596,17 @@ impl CodexPlugin {
             "permissions": readback.sandbox.clone(),
             "approval_policy": readback.approval_policy.clone(),
             "effort": readback.reasoning_effort.clone(),
+            "effort_verified": effort_verified,
         });
         let settings_match = readback.model == requested_model
             && readback.model_provider == "openai"
             && paths_equal(Path::new(&readback.cwd), &workspace)
             && sandbox_matches(&readback.sandbox, &permissions, &workspace)
-            && readback_approval_matches(&readback.approval_policy, &approval_policy);
+            && readback_approval_matches(&readback.approval_policy, &approval_policy)
+            && readback
+                .reasoning_effort
+                .as_deref()
+                .is_none_or(|effort| effort == selected_effort);
         if let Err(error) = session
             .events
             .ready(
@@ -600,7 +637,7 @@ impl CodexPlugin {
             self.session = Some(session);
             return Err(Error::new(
                 "profile_error",
-                "Codex effective model, provider, cwd, permissions, or approval policy did not match the frozen profile",
+                "Codex effective model, provider, cwd, permissions, approval policy, or reasoning effort did not match the frozen profile",
             ));
         }
         session.phase = SessionPhase::Ready;
@@ -1948,104 +1985,90 @@ fn parse_resume_subject(
     })
 }
 
-async fn verify_resume_idle(
+async fn verify_resume_preflight(
     client: &NativeClient,
     thread_id: &str,
     retained_turn: Option<&str>,
 ) -> Result<()> {
     let thread = read_owned_thread(client, thread_id).await?;
-    if thread_state(&thread) != "idle" {
+    let newest_turn = read_latest_native_turn_status(client, thread_id).await?;
+    validate_resume_preflight(
+        thread
+            .get("status")
+            .and_then(|status| status.get("type"))
+            .and_then(Value::as_str),
+        retained_turn,
+        newest_turn
+            .as_ref()
+            .map(|(id, status)| (id.as_str(), status.as_str())),
+    )
+}
+
+fn validate_resume_preflight(
+    native_status: Option<&str>,
+    retained_turn: Option<&str>,
+    newest_turn: Option<(&str, &str)>,
+) -> Result<()> {
+    if !matches!(native_status, Some("idle" | "notLoaded")) {
         return Err(Error::new(
-            "unknown",
-            "Codex retained thread is not proven idle",
+            "native_readback",
+            "Codex retained thread is active or has no resumable runtime status",
         ));
     }
-    let current = read_native_turn_status(client, thread_id, retained_turn).await?;
-    match (retained_turn, current) {
+    match (retained_turn, newest_turn) {
         (Some(expected), Some((actual, status)))
-            if actual == expected && terminal_turn_status(&status) =>
+            if actual == expected && terminal_turn_status(status) =>
         {
             Ok(())
         }
         (None, None) => Ok(()),
         _ => Err(Error::new(
-            "unknown",
-            "Codex retained current turn is active or lacks exact terminal readback",
+            "native_readback",
+            "Codex newest native turn does not match the exact retained terminal turn",
         )),
     }
 }
 
-async fn read_native_turn_status(
+async fn read_latest_native_turn_status(
     client: &NativeClient,
     thread_id: &str,
-    expected_turn_id: Option<&str>,
 ) -> Result<Option<(String, String)>> {
-    let page_limit = if expected_turn_id.is_some() {
-        TURN_PAGE_SIZE
-    } else {
-        1
-    };
-    let max_pages = if expected_turn_id.is_some() {
-        MAX_TURN_PAGES
-    } else {
-        1
-    };
-    let mut cursor: Option<String> = None;
-    let mut seen_cursors = HashSet::new();
-    for _ in 0..max_pages {
-        let mut params = json!({
-            "threadId": thread_id,
-            "limit": page_limit,
-            "sortDirection": "desc",
-            "itemsView": "notLoaded",
-        });
-        if let Some(cursor) = &cursor {
-            params["cursor"] = Value::String(cursor.clone());
-        }
-        let response = client
-            .call("thread/turns/list", params, Instant::now() + RPC_TIMEOUT)
-            .await?;
-        let turns = response
-            .get("data")
-            .and_then(Value::as_array)
-            .ok_or_else(|| Error::new("native_readback", "Codex turn page omitted data"))?;
-        let turn = if let Some(expected) = expected_turn_id {
-            turns
-                .iter()
-                .find(|turn| turn.get("id").and_then(Value::as_str) == Some(expected))
-        } else {
-            turns.first()
+    let response = client
+        .call(
+            "thread/turns/list",
+            json!({
+                "threadId": thread_id,
+                "limit": 1,
+                "sortDirection": "desc",
+                "itemsView": "notLoaded",
+            }),
+            Instant::now() + RPC_TIMEOUT,
+        )
+        .await?;
+    let turns = response
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::new("native_readback", "Codex newest-turn page omitted data"))?;
+    let Some(turn) = turns.first() else {
+        return match response.get("nextCursor") {
+            None | Some(Value::Null) => Ok(None),
+            Some(_) => Err(Error::new(
+                "native_readback",
+                "Codex empty newest-turn page has an unresolved continuation",
+            )),
         };
-        if let Some(turn) = turn {
-            let id = turn
-                .get("id")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| Error::new("native_readback", "Codex turn omitted its exact id"))?;
-            let status = turn
-                .get("status")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| Error::new("native_readback", "Codex turn omitted its status"))?;
-            return Ok(Some((id.to_owned(), status.to_owned())));
-        }
-        match response.get("nextCursor").and_then(Value::as_str) {
-            Some(next) if !next.is_empty() && seen_cursors.insert(next.to_owned()) => {
-                cursor = Some(next.to_owned());
-            }
-            Some(_) => {
-                return Err(Error::new(
-                    "native_readback",
-                    "Codex turn pagination cursor repeated",
-                ));
-            }
-            None => return Ok(None),
-        }
-    }
-    Err(Error::new(
-        "native_readback",
-        "Codex exact turn readback exceeded the bounded page limit",
-    ))
+    };
+    let id = turn
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| Error::new("native_readback", "Codex newest turn omitted its exact id"))?;
+    let status = turn
+        .get("status")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| Error::new("native_readback", "Codex newest turn omitted its status"))?;
+    Ok(Some((id.to_owned(), status.to_owned())))
 }
 
 fn terminal_turn_status(status: &str) -> bool {
@@ -2195,4 +2218,44 @@ fn decode<T: serde::de::DeserializeOwned>(raw: &Value, message: &str) -> Result<
 
 fn not_initialized() -> Error {
     Error::new("bad_state", "Codex plugin has not been initialized")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_resume_preflight;
+
+    #[test]
+    fn unloaded_retained_thread_requires_latest_terminal_turn() {
+        for status in ["completed", "interrupted", "failed"] {
+            assert!(
+                validate_resume_preflight(
+                    Some("notLoaded"),
+                    Some("retained"),
+                    Some(("retained", status)),
+                )
+                .is_ok()
+            );
+        }
+        for native_status in [Some("active"), Some("systemError"), Some("unknown"), None] {
+            let error = validate_resume_preflight(
+                native_status,
+                Some("retained"),
+                Some(("retained", "completed")),
+            )
+            .expect_err("only idle or unloaded native threads can pass preflight");
+            assert_eq!(error.code, "native_readback");
+        }
+        for newest in [
+            None,
+            Some(("newer", "completed")),
+            Some(("retained", "inProgress")),
+            Some(("retained", "unknown")),
+        ] {
+            assert!(
+                validate_resume_preflight(Some("notLoaded"), Some("retained"), newest).is_err()
+            );
+        }
+        let unretained_newest = Some(("unretained", "completed"));
+        assert!(validate_resume_preflight(Some("notLoaded"), None, unretained_newest).is_err());
+    }
 }

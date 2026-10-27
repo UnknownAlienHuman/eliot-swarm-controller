@@ -4,7 +4,7 @@ Build the next useful path in [roadmap](docs/roadmap.md), not the entire final d
 Read [vision](docs/vision.md) and [architecture](docs/architecture.md) once, then only
 that task's owning spec, touched code and donor entry. Later-layer sections are not
 prerequisites. v1 is archived at `dc6f70aa` on `archive/v1-final`; do not restore its
-runtime or tooling. L1 is complete; begin with L2.1 (direct Codex with Luna).
+runtime or tooling. Select the next unchecked increment in the roadmap.
 
 ## Work loop
 

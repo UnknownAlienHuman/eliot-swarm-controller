@@ -2,8 +2,21 @@
 
 Current harness; see [L2](../roadmap.md#l2--first-useful-harness-codex-with-luna).
 Use `plugins/codex`, Rust/built-in, with one plugin/app-server process per controlled
-Agent generation. The source exists and the CLI exposes the control path below.
-Live qualification is still pending; [roadmap](../roadmap.md) owns milestone status.
+Agent generation.
+
+On 2026-10-27, the Windows smoke with Codex 0.161.0 and actual `gpt-6-luna`
+completed three native turns: generation 1 created `hello.txt` containing `hello`
+and appended `world`; after an exact graceful stop, resume kept the same `native_ref`
+in generation 2, which returned exactly `helloworld`. No old turns were replayed.
+Live watch observed all three turn results. Final Agent stop and daemon drain succeeded.
+
+Both generations verified provider `openai`, effort `medium` (`effort_verified=true`),
+sandbox `workspaceWrite`, and approval policy `never`. Persisted events included five
+messages, two tool starts, two tool completions, and three turn completions.
+
+The basic native workflow was checked; full L7 qualification remains pending.
+Steer, interrupt, and approval/question callbacks are compiled and schema mapped
+but were not exercised with native Codex. [Roadmap](../roadmap.md) owns milestone status.
 
 ## Sources
 
@@ -31,7 +44,8 @@ No proxy, native Goal, subagent, worktree creation or transcript handoff is need
 1. Spawn `codex app-server --listen stdio://` inside Agent custody and start its reader.
 2. Send `initialize`, await success, then send `initialized`.
 3. Read paginated `model/list`. Select the explicitly configured Luna model and an
-   effort supported by that response. Do not silently substitute another model/account.
+   effort supported by that response. Apply the frozen profile effort on start and
+   resume. Do not silently substitute another model/account.
 4. `thread/start` without a prompt establishes the thread; commit `session.ready`.
 5. Submit the linked input with `turn/start`; record the exact returned/notified turn
    id. Input application and terminal turn result are separate facts.
@@ -43,28 +57,40 @@ Use that id only if the selected account's catalogue accepts it. This is configu
 not a hardcoded alias in the plugin. No paid probe or alternate billing route is invented
 when the requested model is unavailable.
 
-Example Eliot config:
+Example Eliot config in `<data_dir>/config.toml`, using the smoke's effort and policy:
 
 ```toml
 [profiles.codex-luna]
 harness = "codex"
+cmd = "codex"
 model = "gpt-6-luna"
+effort = "medium"
 permissions = "workspace-write"
+approval_policy = "never"
 pass_env = ["CODEX_HOME"]
 ```
 
+Example lifecycle:
+
 ```powershell
-& $eliot --data-dir $dataDir launch --profile codex-luna --workspace $workspace "Create hello.txt containing hello." --wait
+& $eliot --data-dir $dataDir launch --profile codex-luna --workspace $workspace "Create hello.txt containing exactly hello without a newline." --wait
 $agent = 'AGENT_ID_FROM_OUTPUT'
 & $eliot --data-dir $dataDir result $agent
-& $eliot --data-dir $dataDir send $agent "Read hello.txt and report its contents." --wait
+& $eliot --data-dir $dataDir send $agent "Append world to hello.txt without adding a newline." --wait
+& $eliot --data-dir $dataDir stop $agent
+& $eliot --data-dir $dataDir resume $agent "Read hello.txt and reply with exactly its contents." --wait
+& $eliot --data-dir $dataDir stop $agent
+```
+
+Turn controls require an active turn; request replies require a pending native request.
+These command examples were not exercised with native Codex:
+
+```powershell
 & $eliot --data-dir $dataDir steer $agent "Adjust course." --generation 1 --turn TURN_ID
 & $eliot --data-dir $dataDir interrupt $agent --generation 1 --turn TURN_ID
 & $eliot --data-dir $dataDir approve $agent --request REQUEST_ID
 & $eliot --data-dir $dataDir deny $agent --request REQUEST_ID
 & $eliot --data-dir $dataDir answer $agent --answers-file answers.json --request REQUEST_ID
-& $eliot --data-dir $dataDir resume $agent "Follow up." --wait
-& $eliot --data-dir $dataDir stop $agent
 ```
 
 Flags map to `command.submit`: `--generation` to `expected_generation`,
@@ -101,12 +127,12 @@ write. A lost Eliot event acknowledgement follows the common last-batch rule.
 | launch | `thread/start`; readiness proves a session, not prompt execution |
 | send | `turn/start`; bind command to exact turn, then track completion separately |
 | steer | `turn/steer` with `expectedTurnId`; stale turn rejects |
-| inject | supported exact steer or next-send prepend; report which and when |
+| inject | unsupported in the current slice |
 | interrupt | `turn/interrupt` for the captured turn; no blind retry |
-| stop | end this Agent's session/process; clear a native Goal if one was enabled; never stop another Agent |
+| stop | end this Agent's owned session/process |
 | resume | new Eliot generation/app-server plus `thread/resume` of retained thread; no old input replay |
 | approve/deny/answer | reply to the exact offered native request and choice schema |
-| configure | supported turn/session fields; report application point and effective value |
+| configure | unsupported in the current slice |
 | fork / native Goal / child control | later optional methods verified against installed schema, not advertised until implemented |
 
 Read effective model/provider/cwd/permissions from documented native fields. When an

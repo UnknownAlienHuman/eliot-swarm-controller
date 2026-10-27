@@ -115,6 +115,12 @@ pub enum NativeSandboxMode {
     DangerFullAccess,
 }
 
+/// Per-thread `config` overlay; config keys retain their snake_case names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeThreadConfigOverrides {
+    pub model_reasoning_effort: String,
+}
+
 /// Minimal thread-start params (fresh `v2/ThreadStartParams.json`;
 /// all fields optional). Only the fields Eliot sets are listed; the rest
 /// stays `None` so Eliot never invents approval/sandbox/model values.
@@ -131,6 +137,8 @@ pub struct NativeThreadStartParams {
     pub sandbox: Option<NativeSandboxMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_policy: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<NativeThreadConfigOverrides>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -454,6 +462,8 @@ pub struct NativeThreadResumeParams {
     pub sandbox: Option<NativeSandboxMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_policy: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<NativeThreadConfigOverrides>,
 }
 
 /// Minimal installed-schema v2 `turn/steer` params.

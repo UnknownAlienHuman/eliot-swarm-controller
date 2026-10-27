@@ -4,11 +4,18 @@ Eliot is a local Rust controller for coding-agent harnesses.
 
 ## Current slice
 
-L1 connects the CLI and daemon to the Store, event bus, and the `fake` harness.
-`launch --profile` now takes a named profile. The Codex source exists under
-`plugins/codex` and the CLI exposes hidden `plugin codex` plus exact
-resume/steer/interrupt/approve/deny/answer controls on `command.submit`; live Codex
-qualification is still pending. [Roadmap](docs/roadmap.md) owns the verified milestone status.
+The CLI and daemon connect to the Store, event bus, builtin `fake` harness, and
+Codex app-server through `plugins/codex`.
+
+On Windows on 2026-10-27, Codex 0.161.0 with `gpt-6-luna` completed three native
+turns: create `hello.txt` containing `hello`, append `world`, then return exactly
+`helloworld` after a graceful stop and resume of the same thread in generation 2.
+Old turns were not replayed. Live watch observed all three results; final Agent stop
+and daemon drain succeeded.
+
+The basic native workflow was checked; full L7 qualification remains pending.
+Steer, interrupt, and approval/question callbacks are compiled and schema mapped
+but were not exercised with native Codex. [Roadmap](docs/roadmap.md) owns milestone status.
 
 ## Quick start
 
@@ -36,23 +43,32 @@ $agent = 'AGENT_ID_FROM_OUTPUT'
 On Unix, the built binary is `./target/debug/eliot`; pass the same `--data-dir` to each
 invocation.
 
-`launch` takes a named profile and an existing workspace; `fake` remains the
-default L1 harness. `send --wait` and `launch ... --wait` follow the exact
+`launch` requires a named profile and an existing workspace; `fake` is builtin.
+`send --wait` and `launch ... --wait` follow the exact
 turn to its terminal result. The bounded wait is 30 seconds by default; use
 `--timeout-seconds N` to change it. A timeout does not cancel the admitted command.
 
-Codex Agents use a configured profile such as `codex-luna`
-(`config/controller.example.toml`). Exact controls:
+For Codex, copy [the example profile](config/controller.example.toml) to
+`<data_dir>/config.toml` and pass an existing authenticated `CODEX_HOME`.
+The smoke verified effort `medium` in both generations. Example lifecycle:
 
 ```powershell
-& $eliot --data-dir $dataDir launch --profile codex-luna --workspace $workspace 'hello-one' --wait
-& $eliot --data-dir $dataDir send $agent 'hello-two' --wait
+& $eliot --data-dir $dataDir launch --profile codex-luna --workspace $workspace 'Create hello.txt containing exactly hello without a newline.' --wait
+$agent = 'AGENT_ID_FROM_OUTPUT'
+& $eliot --data-dir $dataDir send $agent 'Append world to hello.txt without adding a newline.' --wait
+& $eliot --data-dir $dataDir stop $agent
+& $eliot --data-dir $dataDir resume $agent 'Read hello.txt and reply with exactly its contents.' --wait
+& $eliot --data-dir $dataDir stop $agent
+```
+
+Turn controls require an active turn; request replies require a pending native request:
+
+```powershell
 & $eliot --data-dir $dataDir steer $agent 'adjust course' --generation 1 --turn TURN_ID
 & $eliot --data-dir $dataDir interrupt $agent --generation 1 --turn TURN_ID
 & $eliot --data-dir $dataDir approve $agent --request REQUEST_ID
 & $eliot --data-dir $dataDir deny $agent --request REQUEST_ID
 & $eliot --data-dir $dataDir answer $agent --answers-file answers.json --request REQUEST_ID
-& $eliot --data-dir $dataDir resume $agent 'follow-up' --wait
 ```
 
 `--generation` maps to `expected_generation`, `--turn` maps to
@@ -60,6 +76,7 @@ Codex Agents use a configured profile such as `codex-luna`
 request is captured by the Store only when exactly one native request is pending.
 `answer --answers-file` submits the bounded parsed `{ question: { answers: [string] } }`
 body, not a path. Secret-question answers stay unsupported before Store persistence.
+`inject` and `configure` are currently unsupported.
 
 Other read commands include `show AGENT` and `cmd show ID`. `watch [AGENT]` streams
 committed events; `events --since SEQ` reads a page of event history.
