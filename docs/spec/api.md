@@ -35,13 +35,30 @@ send. Identity is `(principal, method, canonical semantic payload, id)`.
   external receipt.
 
 Canonicalization excludes JSON-RPC id, output format, pager and wait/client timeout.
+Commands store this identity directly. Non-command writes use one compact table:
+
+```sql
+CREATE TABLE writes (
+  id TEXT PRIMARY KEY,
+  principal TEXT NOT NULL,
+  method TEXT NOT NULL,
+  payload_digest BLOB NOT NULL,
+  result TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+```
+
+The single Store writer checks both `commands.id` and `writes.id` before admitting any
+external mutation. Therefore an id used by one method/principal can never be replayed as
+another method. This is bounded idempotency storage, not a universal receipt/floor
+subsystem.
 
 ## Methods
 
 | Method | Semantics |
 | --- | --- |
 | `daemon.status/shutdown` | version, admission mode, caller, Store/WAL, plugins/services, source owners/gaps, custody and provider holds; exact drain/force |
-| `agent.list/get` | paginated Agent projection including generation, native subject, active turn/input gate, source owners and pending requests |
+| `agent.list/get` | paginated Agent projection including generation, native subject, active turn/input/transition gate, source owners and pending requests |
 | `agent.wait/result` | exact captured generation/turn/Goal result |
 | `command.submit/get/children` | immutable admission, selector snapshot, linked first input and readback |
 | `turn.get/resolve` | running/completed/unknown turn and constrained owner assertion |
@@ -86,15 +103,24 @@ Durable automation always supplies the generation/turn/request from the triggeri
 snapshot. A mismatch is rejected before native I/O.
 
 Launch creates Agent generation 0 and a start command targeting generation 1. Resume,
-control takeover and detach expect current generation and target the next generation.
-Exact transport reconnect to the same current ownership may preserve generation; an
-uncertain/new writer takes a new one.
+control takeover and detach expect current generation and target current + 1. For every
+generation-changing command, the dispatch transaction advances the Agent fence to the
+target generation **before native I/O**, rotates/revokes routing identity as appropriate,
+stales old-generation queued work, releases old-generation claims and pauses Goals.
+The command then owns the only open transition for that Agent.
+
+Exact transport reconnect to the same still-current controller/source ownership may
+preserve generation. Definite no-effect failure never decrements the fence; the Agent
+retains its last proven control projection in the target generation. Unknown transition
+keeps the target generation current and blocks another transition, send, configure and
+Goal continuation until exact readback or explicit owner resolution.
 
 ### Linked first input
 
 Launch/resume with text creates start command plus `<start-id>/send` in one transaction.
-Without `--wait`, CLI waits for session readiness only. With `--wait`, it follows the
-linked input to its exact terminal turn.
+The linked command stores its parent/link identity and appears through
+`command.children`. Without `--wait`, CLI waits for session readiness only. With
+`--wait`, it follows the linked input to its exact terminal turn.
 
 For `start_requires_input`, the plugin receives the linked input inside `agent.start`,
 but session, input association and terminal turn still have separate states/results.
@@ -103,9 +129,9 @@ but session, input association and terminal turn still have separate states/resu
 
 An external selector command is a Store-only parent. Admission resolves and sorts the
 concrete Agent ids, checks `max_selector_targets`, captures each current generation,
-creates derived children and applies the parent with `{count}`. Parent applied means
-only that expansion committed. `command.children` pages the fixed set and each child
-settles independently.
+creates derived children with deterministic ordinals and applies the parent with
+`{count}`. Parent applied means only that expansion committed. `command.children` pages
+the fixed set and each child settles independently.
 
 ## Input, turn and unknown gates
 
@@ -116,7 +142,8 @@ separate.
 One dispatched or unknown input without exact association blocks later `send`,
 `configure` and Eliot Goal continuation in that generation. Exact interrupt, stop,
 approval/answer and readback remain available. An active or unknown turn similarly
-blocks the next turn.
+blocks the next turn. An unknown generation transition blocks all ordinary turn work and
+another transition.
 
 `turn.get` returns:
 
@@ -145,7 +172,7 @@ assertion is owner-only, explicit and releases only its narrow hold.
 
 - `turn` with `after_command`: follow that input's exact turn association/result;
 - `turn` without it: current turn or first turn after the call high-water;
-- `idle`: current generation idle with no open input/unknown turn gate;
+- `idle`: current generation idle with no open input/unknown turn/transition gate;
 - `stopped`: current generation terminal;
 - `goal`: captured Goal revision done/blocked.
 
@@ -159,18 +186,28 @@ metadata; it creates no Agent rows.
 
 `agent.attach` reuses the canonical row when the subject already exists:
 
-- observe attach: new/current generation gets observe source owners and no Agent token;
-- control attach: owner-selected global profile, capacity and native compatibility are
-  validated first; exact success advances generation, rotates token if independent
-  environment is available and installs controlled source owners;
-- unknown takeover leaves the old projection and blocks another takeover until readback;
+- first observe attach targets generation 1; later observe/control takeover targets the
+  next generation;
+- dispatch advances the fence and installs the target generation's source plan before
+  native I/O, while retaining the last proven observe/control projection until outcome;
+- control attach validates owner-selected global profile, capacity and native
+  compatibility before dispatch;
+- exact success commits the new controlled/observe projection, effective facts and a
+  rotated Agent token only when an isolated environment is available;
+- definite no-effect failure leaves the target generation on the last proven projection;
+- unknown takeover leaves the target generation and previous projection visible but
+  blocks another transition/turn until readback;
 - another live controller or unverified replacement is `not_allowed`.
 
-`detach` is valid only for independently living service/external sessions. Exact success
-advances generation, revokes Agent identity, releases claims/queued control work and
-keeps observe sources. It never settles an unknown input and never kills the service.
+`detach` is valid only for independently living service/external sessions. Its dispatch
+advances generation and revokes the old Agent token immediately so old tools cannot
+command replacement work. Exact success changes the target generation to observe-only
+and releases control claims; failure keeps the last proven control projection in the new
+generation; unknown blocks further work. It never settles an unknown input and never
+kills the service.
 
-`resume` starts the same native subject as a new generation. Old input is never resent.
+`resume` targets the next generation and starts the same native subject. Old input is
+never resent.
 
 ## Event replay
 
@@ -187,11 +224,13 @@ silently jumping.
 
 ## Mail acknowledgement
 
-`mail.inbox` returns at most 100 oldest unread deliveries plus their exact ids; it marks
-nothing. CLI writes complete output, then calls `mail.ack {ids:[...]}` with a write id.
-Only those ids are marked read. If the CLI dies or ack reply is lost, messages may be
-shown again but are never lost; new messages arriving between fetch and ack are not
-accidentally acknowledged.
+`mail.inbox` returns at most 100 oldest unread deliveries for the caller's exact Agent
+generation plus their exact delivery ids; it marks nothing. CLI writes complete output,
+then calls `mail.ack {messages:[...]}` with a write id. Only those exact deliveries are
+marked read. If the CLI dies or ack reply is lost, messages may be shown again but are
+never lost; new messages arriving between fetch and ack are not accidentally
+acknowledged. Deliveries captured for an older recipient generation are historical and
+are never silently retargeted to a replacement generation.
 
 ## Drain and shutdown
 
