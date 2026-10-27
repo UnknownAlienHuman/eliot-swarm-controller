@@ -176,16 +176,9 @@ Git identity is injected through environment, never repository config. Shared ch
 cannot attribute every dirty byte; unmatched paths are `unattributed`. `who` queries
 cached/projection data and at most one bounded log; it does not run status itself.
 
-```sql
-CREATE TABLE agent_edits (
-  agent INTEGER NOT NULL,
-  generation INTEGER NOT NULL,
-  workspace TEXT NOT NULL,
-  path TEXT NOT NULL,
-  updated_at INTEGER NOT NULL,
-  PRIMARY KEY(agent,generation,path)
-);
-```
+The durable `agent_edits` projection is owned and defined by the
+[Git/filesystem monitor](monitoring.md#git-and-filesystem-monitor). Coordination only
+reads it; it does not declare or maintain a second table.
 
 When Git proves a path clean, its edit rows are removed. Old-generation rows may remain
 for cleanup provenance but are not reported as current workers.
