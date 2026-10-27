@@ -41,19 +41,26 @@ a native fork is a new subject and Agent.
 - every generation-changing command stores both `expected_generation` and
   `generation` (its target generation);
 - its dispatch transaction advances the Agent to the target generation **before native
-  I/O**, revokes the old plugin/source principal and direct Agent token, stales queued
+  I/O**, revokes the old plugin/source principal and old Agent token, stales queued
   old-generation work, releases old-generation claims, pauses Goals and commits the
-  target generation's source-owner plan;
+  target generation's source-owner/source-state plan;
+- when the target can receive a distinct Eliot environment, that same dispatch
+  transaction creates and commits one random target-generation Agent token before the
+  plugin/native process starts. The complete target environment contains that token;
+  old tools are stale immediately. There is no derived-token/routing-key platform;
 - the old controller is never silently reactivated under the new fence. Exact success
   installs the requested control/observe/profile projection. Definite failure of a
   first start/resume becomes `failed`; definite failure of a takeover/detach becomes
   `lost` from Eliot's perspective even if the native subject may still exist externally;
-- an unknown transition keeps the target generation current, the old controller
+- an unknown transition keeps the target generation current, its target token (if one
+  may have reached a process) bound to that blocked generation, the old controller
   revoked and the last observed projection diagnostic-only. The open transition blocks
   another transition and ordinary turn work until exact readback/owner resolution;
 - exact readback may install the requested target projection or prove no current Eliot
-  controller and settle `lost`. Recovery is an explicit later attach/resume targeting
-  another generation; generation never rolls back;
+  controller and settle `lost`. If it proves no process/session could have received the
+  target environment, the daemon may clear the target token in the same settlement
+  transaction. Recovery is an explicit later attach/resume targeting another
+  generation; generation never rolls back;
 - an exact attach snapshot may move an already-running native turn/request set into the
   target generation in the same success transaction. Without exact readback those items
   remain unknown; they are never guessed complete.
@@ -198,6 +205,8 @@ Event {
   stays native.
 - known credential values are masked from native output. Caller-supplied durable text
   containing a known credential is rejected.
+- `payload_digest` is computed by the daemon from one versioned canonical encoding of
+  the normalized semantic event. A plugin never supplies or chooses the digest.
 
 Normalized **native/plugin-published** families are `session`, `turn`, `message`,
 `tool`, `request`, `child`, `goal`, `usage`, `provider`, and `edit`. Exactly one source
@@ -205,12 +214,18 @@ owns each family for one `(agent,generation)`.
 
 ```text
 SourceOwner { agent, generation, family, source, mechanism }
-SourceCursor { agent, generation, source, value, last_store_seq }
+SourceState {
+  agent, generation, source,
+  state: open | closed | gap,
+  cursor?, last_store_seq?,
+  gap_id?, gap_digest?, gap_from?, gap_to?
+}
 ```
 
-The owner map is committed before a plugin may perform the first native start/input.
-A live stream normally owns lifecycle; transcript owns observe/recovery; a hook owns
-only a family absent from the primary stream or one synchronous decision.
+The owner map and initial source state are committed before a plugin may perform the
+first native start/input. A live stream normally owns lifecycle; transcript owns
+observe/recovery; a hook owns only a family absent from the primary stream or one
+synchronous decision.
 
 Source ownership does **not** let plugins publish daemon-derived state. `agent.*`,
 `session.lost`, `turn.resolved`, command/rule/mail/claim events and process/Git facts are
@@ -219,15 +234,15 @@ emitted only by their owning daemon subsystem. A plugin may report native
 reconciliation combines process/source/readback evidence and emits `session.lost` once.
 
 Handoff is one Store transaction: verify current owner, record its final cursor or an
-explicit gap, install the new owner, then allow publication. There are no source epochs,
-open ids or source sequence numbers.
+explicit gap, install the new owner and successor source state, then allow publication.
+There are no source epochs, open ids or source sequence numbers.
 
 A replayable source must provide an opaque exclusive cursor and resume strictly after
 the committed cursor. A source with no such cursor starts at the live edge after
-reconnect, emits `source.gap`, and never republishes history. `native_id` handles only
-bounded overlap: same `(agent,generation,source,native_id)` and same canonical payload
-returns the original `seq`; another payload is `source_integrity` and does not advance a
-cursor.
+reconnect, records an idempotent `source.gap`, and never republishes history. `native_id`
+handles only bounded overlap: same `(agent,generation,source,native_id)` and same daemon-
+computed canonical payload/cursor returns the original `seq`; another payload/cursor is
+`source_integrity` and does not advance source state.
 
 Every event in a durable batch that the plugin may resend after a lost acknowledgement
 must have a stable normalized `native_id`. Prefer the vendor id; for a cursor-backed
@@ -236,7 +251,9 @@ A source with neither a stable id nor an exclusive cursor must not retry a lost
 acknowledgement: it records a gap and reconciles current state instead.
 
 Plugin records derived from one native record are submitted as one bounded atomic batch;
-the cursor advances with the whole batch, so a crash cannot commit half a record.
+the cursor advances with the whole batch, so a crash cannot commit half a record. A
+retry of that batch must be all-new or an exact duplicate of the complete committed
+batch; a mixed set is integrity failure.
 
 ### Main persisted kinds
 
@@ -297,7 +314,8 @@ state = accepted -> [queued ->] dispatched -> applied | rejected | failed | unkn
   `(parent_command,ordinal)` index; no separate link state machine is needed.
 - every concrete Agent command captures current `expected_generation`. Generation
   mismatch rejects before native I/O. A generation-changing command also stores its
-  target `generation=current+1` and advances the fence in its dispatch transaction.
+  target `generation=current+1` and advances the fence/token/source plan in its dispatch
+  transaction before native I/O.
 - queued sends stay FIFO but leave the ready lane while the Agent is busy; current-turn
   controls and exact request replies may pass them.
 - one dispatched or unknown input with no exact turn association blocks later `send`,
@@ -349,7 +367,8 @@ CREATE TABLE events (
   seq INTEGER PRIMARY KEY, ts INTEGER NOT NULL, kind TEXT NOT NULL, family TEXT,
   agent INTEGER, generation INTEGER, source TEXT NOT NULL,
   native_id TEXT, cursor TEXT, payload_digest BLOB,
-  cause TEXT, subject TEXT, data TEXT NOT NULL
+  cause TEXT, subject TEXT, data TEXT NOT NULL,
+  CHECK(payload_digest IS NULL OR length(payload_digest) = 32)
 );
 CREATE INDEX events_agent ON events(agent,seq);
 CREATE INDEX events_kind ON events(kind,seq);
@@ -361,10 +380,17 @@ CREATE TABLE source_owners (
   family TEXT NOT NULL, source TEXT NOT NULL, mechanism TEXT NOT NULL,
   PRIMARY KEY(agent,generation,family)
 );
-CREATE TABLE source_cursors (
+CREATE TABLE source_state (
   agent INTEGER NOT NULL, generation INTEGER NOT NULL,
-  source TEXT NOT NULL, value TEXT NOT NULL, last_store_seq INTEGER NOT NULL,
-  PRIMARY KEY(agent,generation,source)
+  source TEXT NOT NULL,
+  cursor TEXT, last_store_seq INTEGER,
+  state TEXT NOT NULL,                 -- open|closed|gap
+  gap_id TEXT, gap_digest BLOB, gap_from TEXT, gap_to TEXT,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(agent,generation,source),
+  CHECK(state IN ('open','closed','gap')),
+  CHECK((gap_id IS NULL AND gap_digest IS NULL) OR
+        (gap_id IS NOT NULL AND length(gap_digest) = 32))
 );
 
 CREATE TABLE commands (
@@ -394,12 +420,14 @@ CREATE TABLE turns (
 );
 ```
 
-Current projections (`pending`, Goals, turns, source owners/cursors) survive event
+Current projections (`pending`, Goals, turns, source owners/state) survive event
 retention. A cursor-backed source can no longer replay a record once its committed
 exclusive cursor has advanced past it. A source without a cursor must start at the live
 edge after reconnect and therefore cannot replay pruned history. Native-id rows are kept
 at least through the source's declared bounded-overlap window; they may be pruned only
 when the cursor or explicit closed/gapped boundary makes replay of that fact impossible.
-Linked/selector command sets follow [D-35](../decisions.md): open/unknown children retain
-the parent, terminal children are pruned before it, and the entire paged set disappears
-before `command.children` returns `history_gap`.
+The source-state row retains the latest idempotent gap/readback boundary even after its
+human-facing event is pruned. Linked/selector command sets follow
+[D-35](../decisions.md): open/unknown children retain the parent, terminal children are
+pruned before it, and the entire paged set disappears before `command.children` returns
+`history_gap`.
