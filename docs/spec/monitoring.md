@@ -78,9 +78,14 @@ is implemented, capability is `degraded`:
 ### Adopted/shared services
 
 An owner-run service discovered from its registration is read-only/adopted and is never
-signalled or repaired by Eliot. This copies Waku's ownership rule: stopping one Agent or
-dropping one subscription only detaches that session. Managed service custody is
-separate and stopped only by its service lifecycle.
+signalled or repaired by Eliot. Managed service custody is separate and stopped only by
+its service lifecycle. Stopping one Agent never signals the shared/adopted server.
+
+`stop` requires an isolated native operation that ends that Agent's session and exact
+readback of its terminal state. If the service cannot provide it, return `unsupported`;
+abort-plus-detach or dropping a subscription is not successful stop. `detach` is the
+separate explicit operation that releases Eliot control while leaving the session alive.
+Observe-only attachment cannot issue either native stop or other control operations.
 
 ## Process observation and terminal ordering
 
