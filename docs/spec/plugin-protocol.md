@@ -65,11 +65,12 @@ isolated stop is missing, use one service per Agent or observe-only attachment.
     "controlled": {
       "session": "stream", "turn": "stream", "message": "stream",
       "tool": "stream", "request": "stream", "child": "stream",
-      "goal": "stream", "usage": "stream"
+      "goal": "stream", "usage": "stream", "edit": "stream",
+      "provider": "stream"
     },
     "observe": {
       "session": "transcript", "turn": "transcript", "message": "transcript",
-      "tool": "transcript", "request": "transcript"
+      "tool": "transcript", "request": "transcript", "edit": "transcript"
     }
   },
   "proxy": "config"
@@ -77,8 +78,8 @@ isolated stop is missing, use one service per Agent or observe-only attachment.
 ```
 
 The manifest declares available mechanisms. The daemon chooses and commits one owner for
-each lifecycle family before dispatching start/attach. A hook may replace only a family
-not provided by the primary stream, or provide a synchronous decision without also
+each native family before dispatching start/attach. A hook may replace only a family not
+provided by the primary stream, or provide a synchronous decision without also
 publishing duplicate lifecycle.
 
 Versions are facts, not authority gates.
@@ -147,11 +148,17 @@ admitted or the turn completed. A lost result never causes another start or inpu
 | `process.put` | agent, generation, exact PID/start time/role | committed process identity after custody verification |
 | `child` | stable registration id, parent Agent/generation, exact child subject, name/labels?, request own identity? | canonical child Agent/current generation and optional memory-only token |
 
-An `events.put` batch is atomic and bounded. Each event includes `kind`, derived family,
-`native_id`, canonical payload digest, timestamp and data. One native record that yields
-several normalized events is one batch; each normalized event gets a distinct stable id
-(for example vendor item id + kind/ordinal), and its cursor advances only with the entire
-batch.
+An `events.put` batch is atomic and bounded. Each event includes `kind`, derived native
+family, `native_id`, canonical payload digest, timestamp and data. One native record that
+yields several normalized events is one batch; each normalized event gets a distinct
+stable id (for example vendor item id + kind/ordinal), and its cursor advances only with
+the entire batch.
+
+`events.put` accepts only plugin-owned native families declared in the committed source
+plan. A plugin cannot publish `agent.*`, `session.lost`, `turn.resolved`, command/rule/
+mail/claim events, process lifecycle or Git facts. It supplies native
+`session.ready|ended|error`, exact attach/snapshot facts and process registration;
+daemon subsystems derive the rest.
 
 A durable batch that may be resent after a lost acknowledgement **must** provide a stable
 `native_id` for every event. Prefer a vendor event/item id. For a cursor-backed record,
@@ -237,7 +244,10 @@ request.
 
 ## Event normalization
 
-- `session.ready` precedes the first `turn.started` for the generation.
+- plugin native session facts are `session.ready|ended|error`; `session.lost` is emitted
+  only by daemon reconciliation after source drain/gap plus exact custody/session
+  evidence;
+- `session.ready` precedes the first `turn.started` for the generation;
 - one native turn produces one `turn.started` and one terminal `turn.completed` with
   exact `turn_id`; intermediate statuses are not terminal;
 - final `message.agent` is committed before terminal turn result;
@@ -267,7 +277,8 @@ A hook does not publish tool/request lifecycle already owned by the native strea
   subject; otherwise recovery refuses rather than switching account;
 - a shared/adopted service is never killed for one Agent;
 - process exit races final stdout/native events: drain the authoritative source to EOF or
-  a bounded terminal deadline; timeout records a gap, then session loss may be emitted;
+  a bounded terminal deadline; timeout records a gap, then daemon reconciliation may
+  emit `session.lost` from combined evidence;
 - requests have one absolute deadline; timeout after possible native I/O is unknown;
 - plugin stdout is always drained; persisted events backpressure, ephemeral telemetry may
   be dropped with visible lag.
