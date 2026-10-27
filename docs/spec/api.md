@@ -123,6 +123,11 @@ readback or explicit owner resolution. If readback proves no process/session cou
 received the target environment, settlement may clear that token. Recovery is an
 explicit later attach/resume targeting another generation.
 
+Any exact transition to `stopped`, `failed` or `lost` clears the current Agent token,
+sets `own_identity=false`, releases current-generation claims and rejects later calls
+using that token in the same Store transaction as the terminal projection/event. This
+holds even when degraded Unix custody reports possible escaped descendants.
+
 ### Linked first input
 
 Launch/resume with text creates start command plus `<start-id>/send` in one transaction.
