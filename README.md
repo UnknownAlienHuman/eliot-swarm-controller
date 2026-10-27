@@ -1,56 +1,33 @@
 # Eliot
 
-A small local controller for vendor coding-agent harnesses — Codex, Claude Code, Muse,
-OpenCode, Antigravity and ACP agents. Eliot launches them through explicit profiles and
-provider routes, observes native/process/Git facts, controls them through one semantic
-language, automates bounded reactions and lets agents coordinate directly.
+A local Rust controller for native coding-agent harnesses. One CLI/API launches,
+observes and controls Agents; later layers add automation and direct coordination.
+The vendor harness keeps its own model loop, tools and native history.
 
-Owner CLI calls use explicit owner mode; agents receive their scoped identity:
+## Status and build order
 
-```text
-eliot --owner launch --profile codex-opencodex --worktree feat/routes "Add the /v2 routes"
-eliot --owner watch a12
-eliot --owner steer a12 "keep the v1 handlers, only add new ones"
-eliot --owner who src/api/
-eliot --owner goal set a12 "all checks pass" --check "cargo clippy" --max-turns 15
-```
+**v2 is a specification and implementation roadmap, not a working release yet.**
+The current implementation is v1 until reset task L0.1 lands. Its frozen reference is
+`dc6f70aa08ea5fad3da04624ce50c46d45edd57c`; verify `v1-final` there before deleting v1.
+Do not extend v1 while implementing the new architecture.
 
-## Status
+**Core/Store/bus → direct Codex/Luna → monitoring/workspaces → automation/scripts →
+agent communication → other selected harnesses → final qualification.**
 
-**v2 is being rebuilt from scratch, layer by layer**
-([roadmap](docs/roadmap.md)). v1 grew to about 533k Rust lines and 61k lines of
-process/audit documentation without qualifying its core live paths.
+The first useful path is deliberately small: one installed Codex, an existing login
+and workspace, one native model, one real task and its result. It does not require a
+proxy, workflow engine, additional adapter catalogue or testing platform.
 
-v1's frozen pre-reset commit is
-`dc6f70aa08ea5fad3da04624ce50c46d45edd57c`. L0.1 creates tag `v1-final` at that
-commit before deleting v1 implementation code from `main`:
+## Start here
 
-```text
-git show dc6f70aa:<path>
-```
+Read [vision](docs/vision.md) and [architecture](docs/architecture.md), then the next
+[roadmap](docs/roadmap.md) task and only its owning spec. [AGENTS.md](AGENTS.md) is the
+short implementation instruction. [Donors](docs/reference/donors.md) names exact sources,
+what to reuse, where to put it and what not to import.
 
-The current Rust/Node/Python implementation, migrations, vendor tree and old workflows
-are v1 legacy. Do not extend or repair them. **The v2 documentation validators are not
-legacy and must survive L0.1:**
+During implementation use fmt and changed-package Clippy; briefly exercise the new path
+when available. Full crash/restart/conformance/live/platform/load qualification is L7.
+No runtime guarantee follows from documentation review or compilation alone.
 
-- `.github/workflows/v2-docs.yml`;
-- `tools/ci/validate-v2-docs.py`;
-- `tools/ci/validate-v2-schema.py`.
-
-Read only the narrow v1 donor mechanisms named by v2 documentation.
-
-## Documentation
-
-- [Vision](docs/vision.md) — product intent and owner's original statement.
-- [Architecture](docs/architecture.md) — components, authority and runtime boundaries.
-- [Roadmap](docs/roadmap.md) — implementation order and qualification boundary.
-- [All docs](docs/README.md).
-- [AGENTS.md](AGENTS.md) — worker instructions.
-
-During L0–L6, write the connected implementation first and run formatting plus the
-smallest changed-package Clippy gate. Full deterministic, crash/restart, plugin,
-live-harness, platform and load qualification starts after feature completion in L7.
-
-Third-party material still present in the v1 tree is listed in
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md); L0.1 removes it with v1 code after
-the archive tag exists.
+[Third-party notices](THIRD_PARTY_NOTICES.md) describe material in the current tree.
+When removing v1, preserve attribution for any code actually retained or extracted.

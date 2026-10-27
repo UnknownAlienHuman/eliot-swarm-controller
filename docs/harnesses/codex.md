@@ -1,135 +1,123 @@
 # Codex app-server
 
-Layer L2, first real harness. Rust plugin, default `per_agent`: one plugin + one
-app-server per Eliot generation because tools inherit the app-server environment. A
-future shared service remains one endpoint per Agent unless upstream proves per-thread
-environment, identity and isolated stop.
+First real harness; see [L2](../roadmap.md#l2--first-useful-harness-codex-with-luna).
+Use `plugins/codex`, Rust/built-in, with one plugin/app-server process per controlled
+Agent generation. This page is an implementation target; no v2 runtime is claimed yet.
 
-Facts checked 2026-10-25 against `openai/codex` main/release `rust-v0.164.0` and official
-app-server/config/hook docs. App-server is experimental; generate and commit the schema
-from the owner's installed binary before implementation.
+## Sources
 
-## Transport and custody
+Checked against official documentation on 2026-10-27:
 
-`codex app-server --listen stdio://` uses newline JSON-RPC-shaped messages without a
-`jsonrpc` field. Initialize with generated-schema capabilities and the exact initialized
-notification; do not use a strict JSON-RPC codec requiring `jsonrpc:2.0`.
+- [app-server transport, initialization, methods and schema generation](https://learn.chatgpt.com/docs/app-server);
+- [available model names and rollout caveats](https://learn.chatgpt.com/docs/models);
+- [upstream protocol definitions](https://github.com/openai/codex/tree/main/codex-rs/app-server-protocol/src).
 
-One app-server/thread is bound to one Eliot `(agent,generation)`, frozen binding,
-workspace/account and per-Agent custody. `CODEX_HOME` login is owner-managed; Eliot
-never logs in or silently changes subscription/API/proxy route.
+The installed binary's generated schema controls wire names. Generate it once for the
+version being integrated; update when that version changes, not before every command:
 
-Before `thread/start` or `thread/resume`, the plugin opens source epochs:
+```text
+codex app-server generate-json-schema --out <temporary-schema-directory>
+```
 
-- app-server stream for session/turn/message/tool/request/Goal families;
-- optional verified descendant-registration source;
-- rollout source only for observe-only or explicit recovery after atomic handoff.
+Use typed messages for the implemented methods. Do not import the Codex harness/model
+loop or make its unstable types part of `eliot-core`.
 
-The live stream uses stable per-event native ids where the installed schema supplies
-them. Rollout recovery uses its qualified cursor; if neither identity nor cursor can
-bridge an interval, the replacement source is opened with a gap. Every persisted fact
-is commit-acknowledged with contiguous Eliot source sequence.
+## First useful path
 
-## Start and initial input
+Use an existing authenticated `CODEX_HOME` and a disposable existing workspace.
+No proxy, native Goal, subagent, worktree creation or transcript handoff is needed yet.
 
-Codex supports session start without input:
+1. Spawn `codex app-server --listen stdio://` inside Agent custody and start its reader.
+2. Send `initialize`, await success, then send `initialized`.
+3. Read paginated `model/list`. Select the explicitly configured Luna model and an
+   effort supported by that response. Do not silently substitute another model/account.
+4. `thread/start` without a prompt establishes the thread; commit `session.ready`.
+5. Submit the linked input with `turn/start`; record the exact returned/notified turn
+   id. Input application and terminal turn result are separate facts.
+6. Stream text/tool/request events, answer exact native requests, and commit final text
+   before the terminal turn. Expose the result through the existing CLI.
 
-1. persist/open all initial source epochs;
-2. `agent.start` → `thread/start` only;
-3. validate effective thread id, cwd, model/provider/permissions;
-4. commit-acknowledge `session.ready`;
-5. return session success;
-6. dispatch linked initial `send` separately through `turn/start`.
+Official docs currently name Luna `gpt-6-luna`; availability depends on account/client.
+Use that id only if the selected account's catalogue accepts it. This is configuration,
+not a hardcoded alias in the plugin. No paid probe or alternate billing route is invented
+when the requested model is unavailable.
 
-`start_requires_input=false`. Never combine launch and first turn. A lost
-`thread/start` reply is read back or unknown; no replacement thread. A lost
-`turn/start` reply affects only linked send. Native write acceptance is not applied until
-exact Codex turn association.
+Example target Eliot config (not an assertion that the CLI exists already):
 
-Resume opens new-generation source epochs first, starts a new per-Agent app-server and
-calls `thread/resume` for the retained canonical subject. Old prompt is never resent;
-optional text is a linked send.
+```toml
+[profiles.codex-luna]
+harness = "codex"
+model = "gpt-6-luna"
+permissions = "workspace-write"
+pass_env = ["CODEX_HOME"]
+```
 
-Large immutable system notes arrive by `ArtifactRef`, not inline protocol bytes.
+```text
+eliot daemon
+eliot launch --profile codex-luna --workspace <disposable-existing-path> --wait "Create hello.txt containing hello."
+eliot result <returned-agent-id>
+eliot send <returned-agent-id> "Read hello.txt and report its contents." --wait
+eliot stop <returned-agent-id>
+```
 
-## Verb mapping
+The plugin uses `model/list` internally; a separate model-catalogue product/UI is not
+required. Keep the model choice in the profile, outside core types and tests.
 
-| Eliot | Codex |
+## Identity, transport and ownership
+
+Native subject is `(canonical Codex store/account scope, exact thread id)`. The native
+wire is line-delimited JSON; it does not require a `jsonrpc:"2.0"` field. The Eliot
+plugin envelope is separate and includes Agent/generation.
+
+One app-server can host many threads, but per-Agent processes keep environment, Eliot
+token, Git identity and custody separate. Native child threads share the parent
+process environment and have no independent Eliot CLI principal unless isolation is
+actually supported. They are added after the basic path, not emulated in L2.
+
+Start owns one live stream. It publishes the implemented lifecycle families only; do not
+install hooks or tail rollouts in parallel to duplicate those facts. The reader exists
+before create/resume/input. A lost native write reply is readback/unknown, never a second
+write. A lost Eliot event acknowledgement follows the common last-batch rule.
+
+## Control mapping
+
+| Eliot operation | Native mechanism and result |
 | --- | --- |
-| send | `turn/start`; Eliot command id may correlate where accepted, never vendor idempotency proof |
-| steer | `turn/steer` with exact `expectedTurnId`; page history to the end for readback |
-| inject | exact steer while busy or explicit prepend-next-send while idle |
-| interrupt | `turn/interrupt` exact turn; unknown never retried |
-| stop | exact interrupt if active, clear native Goal, close/end thread if available, then stop per-Agent app-server custody |
-| approve/deny | exact native request id and offered choice |
-| answer | exact `requestUserInput` id |
-| configure | supported turn/session fields, application point + effective readback |
-| Goal | native set/clear/status; generation change pauses Eliot projection |
-| fork | native `thread/fork`; new thread is a new canonical Agent row |
+| launch | `thread/start`; readiness proves a session, not prompt execution |
+| send | `turn/start`; bind command to exact turn, then track completion separately |
+| steer | `turn/steer` with `expectedTurnId`; stale turn rejects |
+| inject | supported exact steer or next-send prepend; report which and when |
+| interrupt | `turn/interrupt` for the captured turn; no blind retry |
+| stop | end this Agent's session/process; clear a native Goal if one was enabled; never stop another Agent |
+| resume | new Eliot generation/app-server plus `thread/resume` of retained thread; no old input replay |
+| approve/deny/answer | reply to the exact offered native request and choice schema |
+| configure | supported turn/session fields; report application point and effective value |
+| fork / native Goal / child control | later optional methods verified against installed schema, not advertised until implemented |
 
-Force is exact only on an exact custody backend. Degraded Unix rejects exact force.
-Stop clears native Goal because v1 observed stopped sessions waking.
+Read effective model/provider/cwd/permissions from documented native fields. When an
+endpoint/billing fact is not exposed, report it as unverified rather than inventing
+readback. An unexpected effective route does not authorize further input.
 
-## Events and readback
+## Recovery and later capabilities
 
-The app-server stream is authoritative while controlled. Map exact thread/turn/item/
-request/update identities. One item producing several normalized kinds needs distinct
-per-event ids; do not reuse a bare item id for repeated updates. Persisted event/final
-text obey the 64 KiB bound and point to rollout/native detail when truncated. Final
-output commits before terminal completion.
+The stdio stream has no assumed replay cursor. If it breaks, mark a gap and use exact
+thread/turn/request readback; do not republish old history as live completions. Owned
+process loss ends that controlled generation after buffered output is drained.
 
-Reconnect reads daemon source watermark and native thread history. A matching
-native-event receipt or qualified rollout cursor suppresses old lifecycle. If the
-installed app-server/rollout cannot bridge a boundary, replace the source atomically with
-`state=gap`; never replay an old completion. Empty active-list without terminal history
-is `not_active_unknown`, not idle/completed.
+At L3, observe-only rollout reading may use file identity plus byte offset as an opaque
+exclusive cursor. Source handoff is explicit. Observation never calls resume, fork,
+Goal or send merely to obtain history. Paged history must be read through its cursor;
+parent idle does not prove children completed.
 
-Observe-only attach reads thread/rollout without resume/send/Goal/fork. Discovery and
-thread/history reads are fully paged below plugin frame limits. Silence is not liveness.
+OpenCodex is added as a named provider route in L3, initially attached to an owner-run
+service. Do not edit owner global Codex config. Keep client/admin credentials separate
+and report only routing facts that native/readback or a real request demonstrates.
 
-## Native children and attribution
+Add native Goals with L4 automation, exact native children with L5 hierarchy, and
+other native controls only when selected. Hook lifecycle
+must not duplicate the already-authoritative stream. Unknown request types receive a
+typed error, never an invented default reply.
 
-Subagent threads register from exact parent/child thread ids using filtered, paginated
-`thread/list` plus notifications. Child scope/ref is canonical; unfiltered list may hide
-children and pagination is not an atomic snapshot, so family coverage can be partial and
-reported as such.
-
-Current app-server process environment is shared by its threads. Until installed
-upstream behavior proves per-thread child environment injection, manifest declares
-`child_environment=false`: a child row may be observable/natively controllable through
-the parent plugin, but `routing_enabled=false`; child shell/CLI/Git activity is
-attributed to parent and no distinct token is minted. A vendor child beyond controller
-depth/tree guards is still recorded with reduced authority/wake.
-
-This per-Agent app-server PID belongs to parent Agent custody. Under future shared mode,
-server PID belongs to `service:<name>`, never to child/session Agents.
-
-## Permissions and proxy
-
-Confirm installed enum fields, then map normalized permissions to Codex sandbox/
-approval policy. Requested/effective values remain separate.
-
-OpenCodex/Responses route uses a named provider with explicit `/v1`, Responses wire API,
-named env key and required headers. Frozen binding never edits owner global config.
-Account/proxy capacity are shared scopes. Main turn proves only that request path, not
-auxiliary/title/compaction/subagent calls.
-
-## L7 cases
-
-- source open committed before `thread/start`/`thread/resume`;
-- lost source-open, thread-start, ready and linked first-turn acknowledgements;
-- effective model/provider/cwd mismatch;
-- long-history/discovery paging and frame bounds;
-- stale expected turn and missing terminal → unknown;
-- exact approvals/questions and Goal clear on stop;
-- event-id replay, rollout cursor handoff and explicit gap;
-- child canonical subject, guard behavior, partial coverage and parent attribution with
-  no child environment;
-- descendant registration vs OS enumeration exactly once;
-- Windows exact and Linux exact/degraded daemon death/force;
-- direct/OpenCodex requested vs effective route and auxiliary calls;
-- installed facts still unverified: initialized notification/settings, `-c` overrides,
-  steer during approval, stdin-close and exact close API.
-
-Useful v1 edge cases:
-`dc6f70aa:crates/swarm-adapter-codex/src/lib.rs`; do not port journals/checkpoints.
+L7 exercises lost-start/input replies, stale generation/turn/request, final-output vs
+exit ordering, requested/effective route, paginated recovery and child limitations.
+Do not make that complete campaign a prerequisite to the first useful file edit.

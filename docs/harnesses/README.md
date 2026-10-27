@@ -1,87 +1,55 @@
 # Harnesses
 
-Order: Codex (L2) → Claude, Muse, OpenCode, Antigravity, ACP (L4) → others only on
-need. Proxies/model servers are separate service routes.
+The [roadmap](../roadmap.md) owns build order: useful direct Codex first; monitoring,
+automation and coordination on Codex next; Claude/OpenCode and selected optional adapters
+in L6. A catalogue entry is not a requirement to build that adapter before L2 works.
 
-✓ qualified/documented native mechanism · ~ explicit weaker/delayed mechanism with
-reported semantics · ✗ rejected · ? verify installed version before support
+Provider services are separate: [OpenCodex](opencodex.md), [local models](local-models.md).
 
-| Feature | Codex | Claude | Muse | OpenCode | Antigravity | ACP |
+## Common plugin contract
+
+The owning [plugin protocol](../spec/plugin-protocol.md) defines generation, source
+acknowledgement, unknown outcomes and custody once. Each implemented adapter supplies only
+its native mapping: exact subject/turn/request ids, process mode, effective settings,
+readback/cursor limitations and child environment. It does not duplicate core machinery.
+
+Declare only implemented capabilities. A vendor's documented method is a candidate,
+not proof of a working Eliot integration. Historical source-check dates on adapter pages
+are not fresh installed-version verification. Update a page while integrating that native
+route, not by conducting a vendor-wide research campaign before every layer.
+
+## Capability matrix
+
+This is a design/reference matrix, **not runtime qualification**. A question mark means
+unresolved until the selected installed protocol is inspected. All operations still pass
+the common exact-identity and authority checks.
+
+| Feature | [Codex](codex.md) | [Claude](claude-code.md) | [Muse](muse.md) | [OpenCode](opencode.md) | [Antigravity](antigravity.md) | [ACP](acp.md) |
 | --- | --- | --- | --- | --- | --- | --- |
-| transport | app-server stdio | Agent SDK/stream-json | MSP stdio | HTTP+SSE service | stream-json stdio | JSON-RPC stdio |
-| default mode | per-Agent | per-Agent | per-Agent | shared only after isolation proof; otherwise per-Agent/observe-only | per-Agent | per-Agent |
-| session start before first input | ✓ thread/start | ? installed SDK recording | ✓ session/start | ✓ session create | ? installed recording | ✓ session/new |
-| send | ✓ | ✓ | ✓ | ✓ async association | ✓ | ✓ |
-| steer | ✓ exact turn | ~ next-tool context, verify | ✓ exact turn | ? exact installed route | ✗ | ✗ |
-| inject | ~ exact steer/prepend | hook safe point | ~ steer/prepend | ?/prepend | prepend next send | prepend next prompt |
-| interrupt | ✓ exact turn | ✓ exact query | ✓ exact turn | exact abort scope verify | ✗ until proven | ✓ active prompt cancel |
-| resume | ✓ thread | ✓ session | ✓ session | exact persisted attach | conversation | advertised load/resume only |
-| approvals/answer | native exact ids | callback exact ids | native exact ids | installed exact ids | policy only | offered ids/capability |
-| native Goal | ✓ | ? | ✓ | ✗ | ✗ | ✗ |
-| native children | thread ids | provenance/hooks | subagent ids | paged native ids | subagent info | capability-dependent |
-| distinct child environment/routing | ✗ until per-thread env proof | ? verify | ? verify MSP host | ? prove child/session tool env | ✗ unless proven | capability-dependent |
-| source/readback | app-server + rollout handoff | stream + JSONL handoff | MSP + page/cursor | SSE + paged reads | stream + limited resume | stream + capability reads |
-| proxy | named provider | explicit base/auth env | none | provider base URL | none | Agent-specific |
+| Transport | app-server stdio | SDK / stream-json | MSP stdio | HTTP/SSE | agy stream-json | ACP stdio |
+| Initial mode | per-Agent | per-Agent | per-Agent | per-Agent server unless shared isolation is demonstrated | per-Agent | per-Agent |
+| Native subject | store + thread | config/project + session | host/store + session | server/store + session | config + conversation | command/store + session |
+| Controlled source | app-server stream | SDK stream | MSP stream | exact-session SSE | stdout | ACP connection |
+| Steer | exact turn | unsupported unless an exact native method is demonstrated | exact turn | ? exact native method | unsupported | unsupported in generic v1 |
+| Inject | steer / next send | next supported hook safe point | steer / next send | ? / next send | next send | next prompt |
+| Interrupt | exact turn | active query | exact turn | verify session/execution scope | ? | active prompt cancel |
+| Requests | native approval/input ids | SDK callbacks | native choice/request ids | installed permission/input ids | no known headless reply channel | negotiated permission/input |
+| Resume | exact thread | exact session | exact session | installed attach/resume | conversation | negotiated load/resume |
+| Native Goal | installed method | ? | installed method | no assumed support | none assumed | none generic |
+| Child identity | shared parent environment | shared parent environment | ? | ? | shared parent environment | agent-specific |
+| Proxy | named provider | base URL/auth env | none assumed | provider base URL | none assumed | agent-specific |
 
-## Mode is a contract
+`additionalContext` delivered by a later Claude hook is **inject**, not steer. A native
+abort that leaves a session reusable is **interrupt**, not stop. There is no silent
+renaming to make the matrix look complete.
 
-**Per-Agent** means one plugin/native custody unit per Eliot generation. Exact force is
-advertised only on a qualified OS backend.
+## Implementing an adapter
 
-**Shared controlling** requires all of:
+Read its native page and the relevant donor-map entry. Connect launch/input/result first;
+add real controls next. Generate/use installed schemas where provided. Retain exact
+unknown outcomes; do not build guessed fallback APIs. Use short manual native runs only
+to establish the current path. Full common conformance/recording/platform runs are L7.
 
-- canonical per-session identity and exact attach/readback;
-- per-session environment/tool attribution where direct Eliot routing/Git identity is
-  claimed;
-- per-session interrupt/stop that cannot affect another session;
-- source events attributable/recoverable without guesswork.
-
-If any is missing, use per-Agent server/process or observe-only attach. A shared server
-PID remains `service:<name>` custody and is never Agent-owned.
-
-## Start and input contract
-
-Before the first native session/input effect, the plugin opens provisional authoritative
-source epochs for every family that can emit during start. Session and optional initial
-prompt are separate Eliot commands/outcomes.
-
-A session-first plugin opens sources, creates the native session, commits ready, then
-receives linked send. A plugin that cannot expose session before first input declares
-`start_requires_input`; it opens sources first, performs one linked start+input and still
-reports session and input outcomes separately. Ready never proves prompt ran.
-Transport/HTTP inbox acceptance never means send applied; exact native turn/execution
-association does. A native input id is optional if exact command→turn mapping exists.
-
-## Source, paging and child contract
-
-- Plugin durably chooses `open_id`; daemon returns source key/family ownership and
-  watermark. Persisted facts use contiguous sequence and one unacknowledged envelope.
-- Source declares `strict_cursor|event_id|none` replay mode. Native-event receipts
-  survive event pruning in `event_id` mode; unbridgeable replay is a visible gap.
-- Planned source replacement is one predecessor-aware atomic handoff. Separate close/
-  open is explicitly gapped.
-- `discover`, snapshots and history are paged: at most 1,000 items and below the plugin
-  frame byte limit.
-- `process.put` is only verified per-Agent descendant registration. OS monitor owns
-  process start/exit/stats; shared-service PIDs remain service-owned.
-- Native child registration carries stable registration id, exact child scope/ref and
-  parent provenance. Existing vendor child is recorded even above controller guard;
-  guard-exceeded child gets reduced authority/routing/wake rather than disappearing.
-- A distinct child routing token is returned only when plugin declares and L7 proves
-  child environment injection before tools run. Otherwise child may still be natively
-  controllable through the parent plugin, but `routing_enabled=false` and CLI/Git
-  attribution remains parent/session.
-
-## Implementing a plugin
-
-1. Read plugin protocol and harness page; inspect installed schema/source first.
-2. Choose per-Agent/shared and exact/degraded custody honestly.
-3. Define native subject, pre-native source opens, family ownership, replay mode,
-   cursor/event ids, paged reads and child-environment capability.
-4. Record only current vertical scenarios; include version/date and remove secrets.
-5. Implement native semantics. Reject weaker substitutions/hidden fallback.
-6. L0–L6: fmt + changed-package Clippy. L7: conformance, replay, live, platform and
-   isolation cases.
-
-All scoped calls/facts carry generation; controls exact turn/request. Unknown native or
-external effects are never retried.
+Future APIs/tables from the complete specification are not first-adapter prerequisites.
+The first plugin needs one per-Agent stream; source handoff, discovery, children and
+shared pools enter only with their actual callers.

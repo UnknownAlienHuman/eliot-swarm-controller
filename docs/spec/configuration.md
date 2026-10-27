@@ -1,115 +1,70 @@
 # Configuration
 
+Implement the single global Codex profile first. Project overlays, external plugins,
+services, mail and automation settings appear only with their owning roadmap layer;
+this page is the final configuration contract, not an L1 checklist.
+
 ## Private data directory
 
-Default `%LOCALAPPDATA%\Eliot` on Windows or `~/.local/share/eliot`; override with
-`--data-dir` / `ELIOT_HOME`. Create current-user-only permissions/ACL and refuse
-symlink/reparse-point roots or unsafe ownership. Logs are private, rotated and bounded.
+Default `%LOCALAPPDATA%\Eliot` or `~/.local/share/eliot`; override with `ELIOT_HOME` or
+`--data-dir`. Root and private files are current-user-only. Do not accept redirected
+symlink/reparse roots or unsafe ownership.
 
 ```text
 <data_dir>/
   config.toml
   owner.token
-  routing.key
   eliot.db, eliot.db-wal, eliot.db-shm
-  daemon.json, daemon.lock
-  client-write-id.state, client-write-id.lock
-  artifacts/<blake3-digest>/...
-  logs/, rules/, plugins/, services/, worktrees/
+  daemon.lock, daemon.json, logs/
+  plugins/                 only instantiated plugins
+  worktrees/               L3 opt-in workspaces
+  services/                managed services, when needed
+  rules/                   L4
+  frozen/                  bounded admitted entry-file copies, when needed
 ```
 
-`owner.token` is a replaceable high-entropy `eliot_ot_<base64url>` local attribution
-credential. `eliot --owner` reads it explicitly. It is never stored in SQLite/logs and
-never inherited by Agent/automation processes. If missing, a local operator may recreate
-it atomically because principal identity remains `owner`; WriteId receipts still prevent
-mutation replay. This token is not hostile same-user isolation.
+The ordinary CLI reads `owner.token` automatically, only outside managed Agent/rule
+environments. A missing managed token rejects, never becomes owner. This is attribution
+within one OS user, not hostile-same-user isolation. Tokens never appear in semantic
+payloads, recordings or logs.
 
-`routing.key` is different: it deterministically re-derives current Agent routing
-tokens. It is atomically created before the first database, never stored in SQLite/logs,
-never symlink-followed and never silently regenerated for a nonempty data directory.
+## First profile
 
-An existing Store with a missing/mismatched routing key enters `routing_key_error`:
-currently presented tokens still verify against hashes and owner readback/stop/query
-remains, but launch, resume, routing reattach and child-token issue block. Restore the
-exact key or explicitly stop/abandon all routed generations before replacement.
+```toml
+[profiles.codex-luna]
+harness = "codex"
+model = "gpt-6-luna"
+permissions = "workspace-write"
+pass_env = ["CODEX_HOME"]
+```
 
-`client-write-id.state` is monotonic ULID state only. CLI locks, re-reads, advances,
-atomically replaces, unlocks and prints the id before sending. Missing state seeds from
-daemon floor plus randomness.
+Use the exact model advertised by the installed account's `model/list`; unavailable Luna
+fails explicitly. [Codex](../harnesses/codex.md#first-useful-path) owns bring-up steps.
+Existing workspace and owner login suffice; no proxy/account registry is mandatory.
 
-`artifacts/` is current-user-only, content-addressed and immutable after publication. It
-contains bounded nonsecret snapshots of rule/setup/check scripts, system notes and
-other immutable implementation inputs. Temporary writes are fsynced/renamed atomically;
-an existing digest is byte-compared before reuse. Store reachability controls pruning.
-
-Project `.eliot/{config.toml,rules/,scripts/}` loads only from a globally registered
-checkout, never an Agent worktree. Invalid reload retains the last valid revision.
-
-## Configuration authority
-
-Global owner config defines daemon/process/Store/Git/protocol limits, projects,
-accounts, plugins, proxies, services, webhooks, executable routes and base profiles.
-
-Project config may only narrow an allowed global profile through a same-name overlay.
-Allowed overlay fields are:
-
-- additional bounded labels;
-- `max_live` no greater than the global profile value;
-- `stall_after`;
-- `notify_parent` / `wake_on_mail`;
-- project-local immutable `system_note`, `setup` and relative `scratch` entries.
-
-Project overlay cannot change or add harness, plugin, model, effort, permissions,
-control, workspace mode, Git identity, args, executable, environment mode/values,
-pass-env/secret-env, account, proxy, service, billing or endpoint. Owner defines another
-global profile variant when one of those must differ. A project cannot create a profile
-with no global base.
-
-Router validates the fully resolved profile at admission and dispatch: profile name is
-in `profiles_allow`, artifacts remain valid and the profile still references only the
-project's allowed owner-defined account/proxy/webhook routes.
-
-## Example
+## Later configuration example
 
 ```toml
 [daemon]
 retention.events_days = 30
-retention.turns_days = 90
 retention.commands_days = 30
-retention.mail_days = 90
-retention.process_days = 14
-retention.automation_history_days = 30
-retention.idempotency_days = 90
-store.write_id_future_skew = "10m"
-store.wal_warn_bytes = 536870912
-store.wal_hard_bytes = 2147483648
+idempotency_window = "24h"
 limits.max_depth = 8
 limits.max_children_per_agent = 20
 limits.max_tree_agents = 100
-limits.max_selector_targets = 10000
-limits.max_artifact_bytes = 1048576
-limits.inline_input_bytes = 524288
-limits.event_data_bytes = 65536
-limits.final_text_bytes = 65536
-protocol.plugin_frame_bytes = 1048576
-protocol.plugin_page_items = 1000
-protocol.plugin_page_bytes = 921600
-protocol.start_env_bytes = 131072
-protocol.start_metadata_bytes = 131072
-automation.max_runs_per_rule_per_minute = 10
+limits.max_selector_targets = 1000
 automation.max_actions_per_minute = 120
 automation.max_parallel_checks = 2
 automation.check_timeout = "10m"
 automation.max_event_backlog = 100000
-automation.script_pass_env_allow = []
-hooks.response_margin = "100ms"
-sources.spool_max_events = 4096
-sources.spool_max_bytes = 16777216
+
+[mail]
+max_unread_bytes_per_agent = 10485760
+max_unread_messages_per_agent = 10000
 
 [process]
 scan_interval = "2s"
-terminal_drain_timeout = "3s"
-linux_exact_custody = "auto"
+terminal_drain_timeout = "10s"
 
 [git]
 poll_interval = "15s"
@@ -119,280 +74,143 @@ fingerprint_max_bytes = 67108864
 
 [projects.app]
 path = "C:/src/app"
-profiles_allow = ["codex", "codex-opencodex", "manager"]
-accounts_allow = ["codex-main", "claude-main"]
-proxies_allow = ["opencodex"]
-webhook_allow = ["ops"]
 
 [accounts.codex-main]
 max_live = 8
-[accounts.claude-main]
-max_live = 4
-
-[plugins.codex]
-[plugins.claude]
-cmd = ["node", "C:/src/eliot/plugins/claude/main.mjs"]
-[plugins.fake]
-instances = 1
 
 [proxies.opencodex]
-max_live = 8
 attach = "http://127.0.0.1:10100"
 health = "/api/system/health"
 api_key_env = "OPENCODEX_API_KEY"
-
-[webhooks.ops]
-url_env = "ELIOT_OPS_WEBHOOK_URL"
-secret_env = ["ELIOT_OPS_WEBHOOK_TOKEN"]
-idempotency_header = "Idempotency-Key"
-
-[profiles.codex]
-harness = "codex"
-plugin = "codex"
-account = "codex-main"
-max_live = 4
-model = "<native model id>"
-effort = "high"
-permissions = "workspace-write"
-env_mode = "minimal"
-pass_env = ["CODEX_HOME"]
-workspace_mode = "shared"
-control = "self"
-labels = { role = "writer" }
+max_live = 8
 
 [profiles.codex-opencodex]
-extends = "codex"
+extends = "codex-luna"
 proxy = "opencodex"
-
-[profiles.manager]
-harness = "claude"
-plugin = "claude"
-account = "claude-main"
-permissions = "workspace-write"
-pass_env = ["CLAUDE_CONFIG_DIR"]
-workspace_mode = "worktree"
-control = "project"
-labels = { role = "manager" }
+account = "codex-main"
 ```
 
-Example project overlay:
+The OpenCodex health path is an installed-version fact to verify, not a version gate.
+Unknown keys are errors with location; plugin-private keys are validated by that plugin.
+`extends` is one level. Missing fields use [core defaults](core.md#profile).
+Command/write retention must cover the supported retry window and allowed clock skew.
 
-```toml
-[profiles.codex]
-max_live = 2
-stall_after = "10m"
-labels = { component = "api" }
-system_note = ".eliot/notes/api.md"
-setup = [[".eliot/scripts/setup-api.ps1"]]
-scratch = ["target/", ".cache/"]
-```
+## Authority and project overlays
 
-`max_selector_targets` is a transaction guard, not a logical fleet limit. Expansion
-over it rejects before any row; caller narrows or batches. Plugin discovery/snapshot
-pages obey both item and encoded-byte limits.
+Load project config/rules only from the owner-registered checkout, never an Agent
+worktree. An overlay may narrow a global profile: lower capacity, choose liveness/wake
+settings, add non-authority labels, reference local notes/setup and relative scratch.
+It cannot replace harness/plugin/executable/args, model/effort, route/account/environment,
+permissions/control, workspace mode or Git identity. Labels used by owner rules as an
+authorization predicate are owner-defined and cannot be overridden by project config.
 
-## Effective profile and binding revisions
+Project automation has project authority, not owner authority. Invalid reload retains
+the last valid configuration. New profiles/routes are an owner config change; no approval
+packet or per-command profile ceremony.
 
-Owner profile plus validated project overlay resolves one bounded canonical nonsecret
-binding payload:
+## Frozen profile and route binding
+
+Admission captures the resolved nonsecret profile once. Running and queued work do not
+follow reload. Resume uses the stored profile unless the owner explicitly selects a new
+one for a generation-changing operation.
 
 ```text
-AgentBindingPayload {
-  mode: launch | resume | control_attach | observe_attach | detach_observe,
-  profile_name, profile_revision,
-  harness, plugin_name,
-  model?, effort?, permissions,
-  args, env_mode, literal_env, pass_env_names, secret_env_names,
-  workspace_mode, control, git_identity,
-  system_note_artifact?, setup_artifacts[], scratch,
-  labels, notify_parent, wake_on_mail,
-  account_scope?, proxy_scope?, service_scope?,
-  requested_endpoint?, billing?, source_config_files
+ProfileSnapshot {
+  profile_name, harness, plugin,
+  model?, effort?, permissions, control, args,
+  literal_env, pass_env_values, secret_env_names, inherit_env,
+  account?, proxy?, billing?, workspace_mode, git_identity,
+  labels, max_live?, stall_after, notify_parent, wake_on_mail,
+  system_note?, setup[], scratch, source_files
 }
+PluginBinding { name, kind: builtin|external, cmd?, private_config,
+                private_config_digest, executable?, referenced_files[] }
+AccountBinding { name, capacity_scope, auth_store_names, requested_billing }
+ProxyBinding { name, mode: adopted|managed, endpoint?, launch_cmd?, health_path,
+               capacity_scope, api_key_env_name?, base_url_for?, config_digest,
+               executable?, referenced_files[] }
+FrozenFile { canonical_path, size, digest, private_copy? }
 ```
 
-The payload is stored as an immutable `(agent,generation,binding_revision)` row. A
-separate current pointer identifies the effective revision for that native incarnation.
-Bindings are not overwritten when control changes.
+Builtin route is the plugin linked in the installed binary. External routes resolve an
+absolute executable plus explicit argv/private config; capture local entry files used
+by that command. Dispatch uses this binding, not a new config lookup. Changed/missing
+captured files fail before execution. Manifest cache keys use binding digest; software
+version itself is diagnostic, not authority.
 
-- launch and resume create revision 1 for their target generation before dispatch;
-- first observe attach creates synthetic `observe:<harness>` revision 1;
-- control attach creates candidate `current+1`, superseding the current observe/detach
-  revision; current pointer moves only after exact native attach/environment/readback;
-- failed/unknown attach keeps the old pointer and immutable candidate linked to its
-  command;
-- detach success creates a new `detach_observe` revision and moves the pointer;
-- control reattach creates another control revision; exact recovery of an already
-  controlled session reuses the current revision.
+Capture entry files and explicit inputs, not a universal hermetic build/runtime graph.
+A script importing mutable dependencies is not fully reproducible merely because its
+entry-file digest matches. Use a normal pinned package environment when that project
+requires dependency reproducibility; do not invent an artifact platform in Eliot.
 
-`Agent.profile` is a projection of the current pointer. The start/attach/detach command
-stores the exact candidate/current revision, so client disconnect or later config edits
-cannot change the native effect being read back.
+Account/store selectors such as `CODEX_HOME` are frozen nonsecret values. Credentials
+are execution-time references. Adopted proxy freezes endpoint/health/base URLs/key name;
+managed proxy also freezes launch argv and referenced files. Service reuse requires
+matching `(name,config_digest)` and exact endpoint/custody. Config reload never mutates
+or kills a service still used by old snapshots; conflicting endpoint reuse fails clearly.
 
-Observe attach has no credentials, account, routing or native mutation beyond read-only
-attach. Control attach requires a real allowed global profile, capacity reservation and
-exact native compatibility. Plugin never rewrites an existing session to pretend it
-matches the requested route/workspace/permissions.
+## Frozen files
 
-At revision creation, every project note/setup/check script is resolved from its allowed
-root, read without following untrusted links, bounded, hashed and copied to immutable
-artifact storage. `profile_revision` includes canonical effective profile plus artifact
-digests and named references, never resolved secrets. A later checkout edit cannot
-change the candidate/revision.
-
-Dispatch revalidates prohibitions without substitution: project allowlist/overlay,
-owner-only inherit, plugin/service capabilities, artifact presence/digest, safe paths,
-capacity, provider hold/probe and routing-key availability where direct routing is
-required. Secrets resolve immediately before native effect. Resume gets a new
-generation/revision sequence; recovery attach reuses current revision.
-
-## Frozen workspace binding
-
-```text
-WorkspaceBinding {
-  project, repo_path, requested_branch,
-  base_ref?, base_oid,
-  worktree_path,
-  setup_artifacts[], setup_revision
-}
-```
-
-Daemon resolves base ref read-only to exact local OID before admission; no implicit
-fetch. Ref is diagnostic, OID authoritative. Missing/ambiguous rejects; later ref
-movement cannot alter queued creation. Existing branch/path must match. Setup revision
-digests frozen argv, immutable artifacts and named env refs. Setup executes artifacts,
-never mutable checkout files.
+Resolve explicit notes/setup/scripts/entry files under allowed roots, reject escapes,
+devices and alternate streams, bound size, capture bytes or canonical path/size/digest.
+Verify path references immediately before dispatch. Small text may use an opaque safe
+private path. Do not derive filesystem names from command ids containing separators.
+Keep a copy while a retained current definition or open/unknown command needs it; reclaim
+it afterward. No global content-addressed store, provenance graph or custom GC service.
 
 ## Environment and secrets
 
-Default baseline is minimal: PATH, home/profile, system root, temp, locale and required
-certificate variables. Additional values are explicit literal nonsecret env, named
-pass-env/secret-env, proxy/account/plugin credentials and current scoped token.
+Build the native environment from OS baseline, admitted nonsecret `pass_env` values,
+literal nonsecret `env`, named secrets resolved in memory, then Eliot identity/Git/PATH.
+`secret_env` is a subset of `pass_env`; those values are never persisted. Missing named
+required values fail clearly. Windows keys compare case-insensitively.
 
-Global scripts use only global script allowlist; project scripts use global∩project.
-Validation occurs before value lookup/start; returned actions cannot add env refs.
+`inherit_env=true` is an owner/global opt-in with a visible warning: unrelated daemon
+secrets then reach the process. It is not default. Route/account selectors still remain
+explicit. Credential rotation may change authentication success but must not silently
+select another account/provider.
 
-`env_mode=inherit` is an owner-defined trusted global profile and visibly warned. A
-project overlay cannot enable it. Too-short unmaskable secret rejects managed injection.
-Tokens are prefixed/high entropy. Persisted source spools are masked with the
-binding revision's frozen secret-name/value set; raw vendor detail stays private.
-Resolved secrets never enter config, Store, rule/action/artifact/log. Durable semantic
-text containing a known secret rejects.
+Mask known secret values in native output and reject them in caller durable text.
+Private routing tokens are handled separately from semantic profile data. Native
+children receive their own identity only where isolated environment injection is possible;
+otherwise their CLI calls remain attributed to the parent, as the plugin reports.
 
-## Capacity reservations and provider holds
+## Accounts, capacity and provider holds
 
-A control binding revision names profile/account/proxy-service scopes. Start or
-control-attach transaction checks all limits and inserts reservations atomically.
+All named profile/account/proxy caps apply. Reserve capacity before native launch/control
+takeover, release on proven no-session failure or terminal observation. Observe-only
+uses no control slot; detaching a still-live session does not pretend provider usage
+vanished. Uncertain starts retain their reservation.
 
-```sql
-CREATE TABLE capacity_reservations (
-  scope TEXT NOT NULL,
-  agent INTEGER NOT NULL,
-  generation INTEGER NOT NULL,
-  command_id TEXT NOT NULL,
-  state TEXT NOT NULL,
-  created_at INTEGER NOT NULL,
-  released_at INTEGER,
-  PRIMARY KEY(scope,agent,generation)
-);
-CREATE INDEX capacity_held ON capacity_reservations(scope,state);
+[Provider holds](monitoring.md#provider-holds) survive restart. Rate/quota may permit one
+explicit eligible probe; unknown probe remains reserved. Auth/model removal requires
+explicit corrective evidence. Reads, approvals, interrupt and stop remain available.
+No automatic provider/model/account fallback.
 
-CREATE TABLE provider_holds (
-  scope TEXT PRIMARY KEY,
-  kind TEXT NOT NULL,
-  coverage TEXT NOT NULL,
-  retry_after INTEGER,
-  probe_command TEXT,
-  state TEXT NOT NULL,
-  updated_at INTEGER NOT NULL
-);
-```
+## Plugins
 
-Queue selects the oldest command whose complete scope set is available; unrelated
-scopes are not head-of-line blocked. Existing reservations count after limit lowering.
-Starting/live/unknown start retains reservation. Exact terminal/no-session failure
-releases. An observe row has no control reservation. A control-attach candidate reserves
-capacity before native I/O; definite failure releases, unknown retains until readback.
-Exact attach success moves binding pointer and converts reservation to live. If capacity
-is unavailable, no candidate/effect is admitted. Detach of a still-live provider
-session does not pretend account capacity was freed until terminal observation.
+`[plugins.<name>] cmd` selects an external executable; omitted means builtin. Extra keys
+are private validated plugin config; secrets use names, never literal stored values.
+Manifest chooses per-Agent/shared mode. Implement only per-Agent mode for the first
+Codex path. Shared mode requires actual session/environment/stop isolation, not merely
+several chats hosted in one process.
 
-A hold blocks provider-backed launch/send/Goal in proven scope, not stop/interrupt,
-request reply, readback or local checks. Unknown coverage holds exact route/profile.
-After retry boundary, only explicit owner/current directly routed Agent `probe=true`
-send or linked launch/resume input may claim one probe. Automation/wake/hidden calls
-cannot.
+Probe/cache a manifest without creating a billed native session. Existing snapshots use
+the matching binding. Recheck availability at dispatch without replacing its route.
 
-Probe state:
+## Proxies and services
 
-- exact successful provider-backed turn clears hold and claim;
-- new provider limitation replaces/extends hold from exact response;
-- unknown after possible provider I/O keeps hold/probe reserved;
-- exact failure before any provider request or owner cancellation before dispatch
-  releases the probe claim but keeps hold;
-- time alone never releases in-flight/unknown probe.
+`attach` adopts an already-running direct endpoint: health/read only, never stop/repair.
+`launch` supervises an explicitly selected service in separate custody. Key fields:
+`health`, `max_live`, managed-only `idle_stop`, `api_key_env`, optional `base_url_for`.
+Agent stop never kills a shared/adopted service. First implement attach, then managed
+launch only when needed. Effective routing may be partly unobservable; report unknown,
+not the requested URL as verified fact.
 
-For launch/resume only linked input is probe. Auth/model-gone requires explicit config/
-recovery evidence rather than timed probe.
+## Paths and platform defaults
 
-## Profiles, setup and paths
-
-One-level `extends` exists only among global owner profiles. Project overlay applies
-after global resolution and can only narrow the listed fields. Unknown keys are errors
-except plugin-private global keys. Values/counts are bounded.
-
-Project setup source is repository-relative `.eliot/scripts/`; global owner may name
-configured executables. Script bytes become immutable artifacts at admission. Setup runs
-with a project read-only automation token, minimal environment and global∩project script
-allowlist. Setup/scratch/scripts/notes reject absolute, `..`, symlink escape,
-alternate-stream/device forms. Rust worktrees use separate target dirs.
-
-Interpreters/executables resolve to full configured paths. A queued binding revision
-stores executable identity/path; incompatible replacement before dispatch fails rather
-than selecting another executable.
-
-## Plugins, sources, services and webhooks
-
-External plugin command is global-only. `instances` is shared-only; per-Agent gets a
-private directory. Custody mode cannot be overridden. Shared control proves per-session
-environment, identity, readback and isolated stop.
-
-Source spool limits are per source key. Plugin backpressures or commits gap; never
-silently drops lifecycle or grows unbounded. `event_id` source receipts live separately
-from event rows; `strict_cursor` requires proven vendor cursor semantics; `none` gaps on
-reconnect.
-
-Attached service is owner-run/never stopped. Managed service has separate custody.
-Agent stop never stops a shared service.
-
-Webhook stores a named endpoint only. Project must allow it. Action id uses configured
-idempotency header when available; otherwise lost response stays unknown/no retry.
-
-## Retention, artifacts, idempotency and WAL limits
-
-`retention.idempotency_days` is minimum eligibility age. Receipt lookup precedes floor
-checks. A terminal receipt may be deleted only when older than the window, no retained
-domain row references it, no open/unknown linked effect needs it and final result is
-outside supported readback. Rows prune in dependency order; floor advances only through
-receipts actually deleted.
-
-A native-event receipt in `event_id` mode outlives its event row. It may be removed only
-after generation supersession/deletion, all source epochs/spools capable of replaying
-that generation are closed and no retained readback depends on it. `strict_cursor`
-watermarks remain until the same boundary. `none` retains the recorded gap boundary.
-
-An artifact may be removed only after no Agent binding revision/workspace/rule
-activation/run/action/check references its digest and no running process has it open.
-Binding revisions referenced by current pointers or retained commands/receipts remain;
-unreferenced failed candidates may prune only after their command history becomes
-prunable. Artifacts are implementation inputs, not an audit-document hierarchy.
-
-Other history may prune only after compact projections/summaries preserve readback.
-Unread mail, open batches, unresolved input/turn/action, held capacity, current source
-watermark, dirty edit attribution and `orphan_possible` custody never age-prune.
-
-Daemon passive-checkpoints, records WAL/database size and tracks readers. Replays
-paginate/release transactions. At hard size, reject new work/long reads while reserving
-short stop/interrupt/request/result commits. Real disk/SQLite failure enters the Store
-error boundary. Never delete evidence, kill an unknown reader or blind-truncate active
-readers.
+Keep Windows paths short; use long-path Git arguments/environment without rewriting
+repository config. Use a separate Cargo target directory per worktree. Executable, argv,
+cwd and env remain separate. Launch/workspace admission never performs an implicit fetch.
+All persisted fields and frames are bounded. The roadmap determines when each section
+becomes implemented; absent later features return `unsupported`, not a hidden substitute.

@@ -1,272 +1,197 @@
 # Roadmap
 
-Build connected vertical layers. L0–L6 are code-first with formatting and the smallest
-changed-package Clippy gate. The complete deterministic/live/platform/load campaign
-starts only after the local product is feature-complete, in L7.
+Build order: **L0 workspace → L1 core/Store/bus → L2 direct Codex → L3 monitoring and
+workspaces → L4 automation/scripts → L5 agent communication → L6 more harnesses →
+L7 qualification**. Codex alone must already be useful at L2; another vendor, proxy,
+rule engine or conformance framework must not delay that path.
 
-One manager owns one worktree/branch/PR. One task lands one useful connected result, not
-scaffolding. This file is the only status tracker.
+The owner's 2026-10-27 clarification puts automation and coordination on the first
+working harness before expanding the adapter catalogue. Requirements are unchanged.
+This page owns stage numbers; harness pages describe capabilities, not another schedule.
+
+Each checkbox is a useful increment, not a mandatory separate PR. One manager owns one
+worktree. Combine closely coupled increments; tick only behavior actually implemented.
+Read the linked spec sections for the current increment, not all future features.
 
 ## Implementation gate
 
 ```text
 cargo fmt --check
-cargo clippy -p <changed-package> --lib --bins -- -D warnings
+cargo clippy -p <changed-package> -- -D warnings
 ```
 
-Add only packages whose changed contracts compile together. No workspace-wide campaign,
-model call or load run before L7. A tiny regression is allowed only when source review
-cannot establish safety.
+Use the same command for library-only and binary-only packages. Run it for changed
+packages, not the entire workspace by default. No model calls in CI. A short manual
+exercise of the newly connected path is development, not a new acceptance ceremony.
+Build the full deterministic/crash/platform/load test campaign at L7; do not postpone
+ordinary compilation or discovering whether the current path runs until then.
 
 ## Code budgets
 
-| Crate | Production Rust budget |
-| --- | ---: |
-| `eliot-core` | 3,300 |
-| `eliot-store` | 3,600 |
-| `eliot-daemon` | 11,800 |
-| `eliot-plugin` | 1,500 |
-| `eliot` | 3,300 |
-| each plugin | 3,000 |
+There is no blocking line-count quota, `budgets.toml` gate or required `just loc` system.
+Review complexity by current callers and responsibility. Do not split crates to satisfy
+an arbitrary line limit. The target architecture is a ceiling on concepts, not a demand
+to create every crate/table immediately.
 
-Increases cover receipts/derived IDs, frozen bindings, source ownership/native replay
-receipts, input/turn/edit/workspace projections, custody, rule activations and recovery—not
-a workflow engine.
+## L0 — Archive and smallest workspace
 
----
+- [ ] **L0.1 Archive/reset.** Verify tag `v1-final` names commit `dc6f70aa` before
+      deleting v1 implementation/tests/workflows/vendor material. Keep v2 docs and
+      repository metadata; preserve notices for any code actually retained. Do not
+      delete an existing different archive tag or overwrite another manager's work.
+- [ ] **L0.2 Build.** Rust 2024 workspace, pinned stable toolchain, `eliot --version`,
+      fmt and scoped Clippy on Windows/Ubuntu. No empty framework crates or test platform.
 
-## L0 — Archive, reset, skeleton
+**Result:** the smallest compiling binary, with v1 available as a source donor.
 
-- [ ] **L0.1 Archive/delete v1.** Create `v1-final` at `dc6f70aa`; delete v1 Rust/Node/
-      Python implementation, migrations, vendor/config, old workflows, old Justfile,
-      notices and old tooling. **Preserve** v2 docs/root metadata plus
-      `.github/workflows/v2-docs.yml`, `tools/ci/validate-v2-docs.py` and
-      `tools/ci/validate-v2-schema.py`.
-- [ ] **L0.2 Minimal workspace.** Rust 2024 resolver 3, pinned stable, only
-      `eliot --version`, budgets and fmt/scoped-clippy/loc plus deferred qualify.
-- [ ] **L0.3 Minimal CI.** Windows + Ubuntu docs/link/schema/whitespace, fmt,
-      changed-package Clippy and loc. Full qualification enabled only at L7.
+## L1 — Core, Store, bus and one fake command path
 
-## L1 — Core, Store, bus and fake vertical path
+Read [core](spec/core.md), [API](spec/api.md) and the minimal profile in
+[plugin protocol](spec/plugin-protocol.md#first-harness-subset).
+Donors: the **L1–L2 implementation map** in [donors](reference/donors.md).
 
-- [ ] **L1.1 Identity/reducer.** Signed-64 ids/counters with pre-mutation exhaustion;
-      external ULID WriteId vs fixed DerivedId; generation 0; canonical native subject;
-      exact turn/request; async-input/unknown-turn gates; `routing_enabled` separate
-      from native control/observe state; pure reducer.
-- [ ] **L1.2 Store/schema.** Atomic root/id allocation; private owner token + routing-key
-      identity; routing hash lifecycle; frozen `agent_bindings`; external receipts with
-      minimum/FK-aware retention and ULID floor; source epochs/family owners/native-event
-      receipts; commands/links/native-input/turn projections; one writer/group commit;
-      query-only paginated readers; commit-failure and WAL-pressure boundary.
-- [ ] **L1.3 Bus/source intake.** Persist-before-broadcast; live-buffer→watermark→paged
-      replay; explicit lag/history gap; source open before native effect; contiguous
-      `event.put` and verified `process.put`; strict-cursor/event-id/no-replay modes;
-      predecessor-aware atomic source handoff; lost-ack/digest/hole/stale handling.
-- [ ] **L1.4 Daemon/IPC.** Private data root, explicit replaceable owner credential,
-      nonreplaceable routing key, client ULID state, lock/boot/process identity,
-      user-only IPC, multiplexed JSON-RPC, missing-credential rejection, admission and
-      exact drain/force/abandon-degraded behavior.
-- [ ] **L1.5 Configuration.** Owner-defined global routes; project overlays only narrow
-      safe fields; immutable launch/attach binding; minimal env and global∩project script
-      refs; accounts/caps/holds/probes; selector/frame/page/event limits; source spool,
-      native-receipt retention and WAL limits; named webhooks/safe paths.
-- [ ] **L1.6 Plugin host/custody.** Framing/deadlines and artifact refs; bounded pages/
-      spool; source open before start; session vs linked initial outcome; atomic handoff;
-      attach unknown-turn/readback; retry-safe child registration with optional direct
-      routing; Windows Job; Linux cgroup+guardian/degraded fallback; service PID isolation.
-- [ ] **L1.7 Router/readiness.** External concrete/fanout parent receipts, derived linked/
-      selector children, atomic bounded selector snapshot + pagination; FIFO inputs
-      without blocking controls; immutable Agent binding; control-attach capacity;
-      stale expiry and exact unknown readback/assertion.
-- [ ] **L1.8 Fake plugin.** Isolated shared sessions; persistent source open/sequence/
-      replay receipts/spool; both start modes; async inbox/turn association with optional
-      native input id; coalesced inputs, unknown turn; paged discovery/snapshot;
-      child guard/routing/token retry; crash/hang/exit.
-- [ ] **L1.9 CLI/API.** Explicit `--owner`; monotonic WriteId generation/reuse/floor;
-      linked command/fanout count-digest + paged children; exact wait/result/turn
-      resolve; paged discover; observe/control attach binding; replay gaps/exit codes.
-- [ ] **L1.10 Secrets/identity.** Owner-token isolation from child environments;
-      deterministic Agent-token derivation/hash-at-rest; terminal/detach/routing-disabled
-      revocation; source-spool masking; secret-bearing durable payload rejection.
-- [ ] **L1.11 Qualification hooks.** Minimal record/replay/plugin-test entrypoints only;
-      full suite remains L7.
+- [ ] **L1.1 State/Store/bus.** Agent, generation, command, turn, event, one pure
+      reducer and one SQLite writer. Commit event and projection before publishing.
+      Allocate non-reused event ids. Implement bounded query/subscription replay.
+- [ ] **L1.2 Daemon/CLI.** Private data directory and local IPC, automatic owner
+      credential, `daemon`, `launch`, `send`, `ls`, `show`, `watch`, `result`, `stop`
+      and command readback. One explicit global profile; no project overlay system yet.
+- [ ] **L1.3 Plugin path.** Per-Agent process, framing/deadlines/custody, one fixed
+      authoritative stream, commit acknowledgement, generation/turn binding and unknown
+      input gate. Add a tiny fake that emits ready, echo turn and terminal result.
+      Stop/restart must not resend an uncertain input.
 
-**Completion:** fake CLI path launches with linked prompt, survives lost replies at every
-Store/plugin boundary, suppresses vendor replay after event pruning, maps inputs with or
-without native input ids to turns, preserves wait/results, paginates fleet operations,
-handles attach/routing/child guards, and rejects stale/duplicate/unauthorized facts.
+**Result:** CLI → router/Store → fake → event bus → CLI works. The fake is a transport
+exercise, not a simulator product. Add its approval/crash/input-created-session features
+only when a real integration needs them.
 
-## L2 — Codex + explicit provider route
+**Not in L1:** shared plugin pools, source handoff, discovery/control takeover, native
+children, hooks, Goals, selectors, mail, rule revisions, scripts, worktree setup, proxy
+supervision, account probes, MCP, recording framework or load tools. Their contracts
+remain documented; their handlers/tables are added with their first caller.
 
-- [ ] **L2.1 Installed schema/recordings.** Commit generated schema from owner's Codex;
-      bounded sanitized record/replay.
-- [ ] **L2.2 Per-Agent session.** One plugin + app-server in exact custody; source epochs
-      open before `thread/start`; thread starts before first turn; effective settings;
-      ready committed before launch success.
-- [ ] **L2.3 Linked input/control.** Separate turn command; exact steer/inject/interrupt;
-      stop + native-goal clear; resume next generation/new binding; configure application
-      point; every lost reply/terminal boundary read back or unknown.
-- [ ] **L2.4 Requests.** Exact approvals/questions and synchronous hook deadline where
-      actually supported.
-- [ ] **L2.5 Native Goal.** Status/budget, durable eligibility sequence and generation
-      pause/rebind.
-- [ ] **L2.6 Children.** Canonical child subject/registration; guard behavior; declare
-      whether distinct child environment exists; parent attribution when absent.
-- [ ] **L2.7 Accounts/proxy.** Permissions, atomic account/proxy reservations, persisted
-      holds/explicit probes, managed/attached OpenCodex and effective route.
-- [ ] **L2.8 Useful manual path.** Compact real work run direct/proxy; retain evidence
-      for L7 without broad campaign.
+## L2 — First useful harness: Codex with Luna
 
-## L3 — Monitoring and workspaces
+Read [Codex bring-up](harnesses/codex.md#first-useful-path) and only the native operations
+it uses. Start with the owner's installed Codex and existing login. Prefer the explicitly
+selected Luna model returned by that account's native `model/list`; never substitute a
+model or billing route silently.
 
-- [ ] **L3.1 Process monitor.** Boot/birth identity; OS-authoritative start/exit/stats;
-      idempotent plugin descendant registration; service vs Agent ownership; exact/
-      degraded backend and guardian health; correct lost vs `orphan_possible`.
-- [ ] **L3.2 Workspace journal.** `workspaces` + `workspace_steps`; generation-0
-      preparing/ready/unknown; deterministic path; frozen local base OID; exact Git
-      readback; non-replayed setup; safe scratch and clean-only removal.
-- [ ] **L3.3 Git/fs/edit projection.** Read-only monitor, slow backoff, frozen-base diff,
-      bounded fingerprint and durable `agent_edits`; current `who` filters live controlled
-      generations while retaining cleanup provenance.
-- [ ] **L3.4 Discovery/source handoff.** Canonical observe/control attach, paged native
-      discovery, strict-cursor/event-id/none recovery and atomic family handoff or gap.
-- [ ] **L3.5 Liveness/restart.** Progress-only stalls; reconcile custody/sources/
-      workspaces/unknown commands-inputs-turns/actions/routing-key health.
-- [ ] **L3.6 Views.** Generation/binding/routing/turn/input gate/open stop/workspace,
-      custody/guardian/orphans, service ownership, source modes/watermarks/gaps, holds,
-      Store/WAL and Git/edit facts.
+- [ ] **L2.1 Session/input/result.** Add the Codex plugin to the existing path:
+      initialize/initialized → model discovery → thread/start → turn/start → events →
+      final result. One app-server per Agent. Preserve requested/effective model and cwd.
+- [ ] **L2.2 Control.** Exact-turn steer/interrupt, exact approval/question replies,
+      stop and explicit resume of the retained thread. Implement the unknown outcome
+      path as part of each verb, not as a later recovery subsystem.
+- [ ] **L2.3 Use it.** In a disposable existing workspace, launch one small file-edit
+      task, watch tool/text events, collect its result, send another turn, stop and
+      resume. Keep this brief; do not build all L7 fixtures before continuing.
 
-## L4 — Other required harnesses
+**Result:** an owner can use Eliot to do real development with Codex/Luna. No worktree
+creation, OpenCodex, second harness, native child support or automation is required for
+this first useful milestone. Unavailable Luna is an explicit profile error, not a reason
+to invent a model alias or silently switch accounts.
 
-Each plugin selects mode from proven capabilities, records installed behavior and
-rejects weaker substitution.
+## L3 — Monitoring, workspaces and the optional proxy route
 
-- [ ] Hook shim only for facts absent from primary source.
-- [ ] Claude Code per-Agent; source open before SDK query/input; record start-before-input,
-      exact request and child-environment facts.
-- [ ] Muse per-Agent MSP; source open before session/start, then linked turn.
-- [ ] OpenCode shared control only after two-session environment/token/Git attribution,
-      attach/readback and isolated stop; source open before session create; shared PID
-      remains service-owned.
-- [ ] Antigravity per-Agent; source open before process/input; record init-before-input
-      and child-environment limitations.
-- [ ] ACP per-Agent; source/open routing before `session/new`, then linked prompt.
-- [ ] Others only on concrete need.
+Read [monitoring](spec/monitoring.md), relevant [configuration](spec/configuration.md)
+sections, and [OpenCodex](harnesses/opencodex.md) only for the proxy task.
 
-## L5 — Coordination
+- [ ] **L3.1 Observation.** Exact process identity, source drain before loss, bounded
+      stats, busy-vs-waiting liveness, read-only Git/fs monitor and `agent_edits`.
+- [ ] **L3.2 Workspaces.** Existing workspaces remain the default. Add opt-in worktree
+      creation with frozen base OID, one preparation row, explicit setup and no replay
+      of unknown setup. Exact readback and clean-only removal; preserve the branch.
+- [ ] **L3.3 Recovery/views.** Paged discovery/observe attachment and transcript
+      handoff only now, with explicit gaps. `show/watch/top` query existing projections.
+- [ ] **L3.4 Proxy/capacity.** First attach to an already-running OpenCodex endpoint.
+      Add managed service launch only when actually needed. Add account/proxy caps and
+      persistent provider holds with that route; no automatic model/account fallback.
 
-- [ ] **Mailbox.** Bounded selector expansion; `wake_on_mail=false` queue-only;
-      routed Agents receive one coalesced notice; routing-disabled native children use
-      routed parent relay or remain queue-only; full content requires explicit
-      inject/send/steer control; immutable bounded batch + ack, restart reconciliation,
-      retention/gaps and secret rejection.
-- [ ] **Variables.** Project/tree/global bounded CAS with exact principal/generation.
-- [ ] **Who/claims.** Live-controlled current edits + Git/history, project-relative
-      generation claims with uniqueness/conflict mail and transactional release.
-- [ ] **Hierarchy.** Canonical native child upsert even above controller guard; reduced
-      authority/routing/wake; parent notices through normal mail policy.
-- [ ] **MCP.** Only if a required harness cannot use CLI; stateless, principal-scoped and
-      same WriteId/readback semantics.
+**Result:** useful Codex work is observable and restart outcomes are explicit. The direct
+route still works without any proxy installation or worktree machinery.
 
-## L6 — Automation
+## L4 — Automation and scripts on Codex
 
-- [ ] **Principals and rule activations.** Global/project scope; persisted compiled
-      definitions; definition digest distinct from activation id; A→B→A fresh
-      activation; event-time subject; first-load high-water and exact old→new handoff.
-- [ ] **Cursors/retention.** Active/retiring/replay interval cursors, restart drain from
-      old definition, deterministic-failure advance, explicit backlog skipped range and
-      bounded retention floor.
-- [ ] **Generic run/action journal.** `(kind,owner activation,trigger)` for event/timer/
-      manual/Goal; frozen targets, derived ids, ordered states, durable rate limits and
-      no unknown replay.
-- [ ] **Timers.** Activation/time boundary, interval/cron/at, DST, latest catch-up and
-      startup reconciliation, including action-only edit/revert.
-- [ ] **Actions.** Scoped commands/mail/vars; exact Git OID/readback; named allowlisted
-      webhooks; secret refs and narrow unknown writer hold.
-- [ ] **Scripts.** Read-only scoped token, project-safe cwd, global∩project env validation
-      before lookup, bounded streams, validate-all + atomic append, no unknown rerun.
-- [ ] **Approvals.** Exact async request actions; deadline-bound non-dispatchable
-      synchronous proposals; safe default on late/failed commit.
-- [ ] **Goals.** Durable eligibility sequence for on-idle, anchored cadence slots,
-      generation/revision, integer micro-USD, journaled check, unknown blocking and
-      startup reconciliation; routing-disabled target rejects unless parent-mediated
-      continuation is qualified.
-- [ ] **Minimal recipes.** Writer/reviewer, fetch, nightly, quota notification and
-      checkpoint/rotation—no DSL.
+Read [automation](spec/automation.md). Reuse the existing router and command storage.
+No second executor, workflow graph or acceptance engine.
 
-**Feature-complete milestone:** freeze features; every crate scoped-Clippy clean; begin
-one complete qualification campaign.
+- [ ] **L4.1 Rules/timers.** Event-time subject, persisted cursor, bounded matching,
+      interval/cron/one-shot and deterministic command admission. Add atomic definition
+      replacement and bounded backlog when enabling hot reload, not before basic firing.
+- [ ] **L4.2 Actions/scripts.** Agent commands first, then bounded explicit scripts.
+      Frozen inputs, scoped principal, exit/output handling and unknown outcomes use
+      normal commands. Add Git fetch/push wrappers only with their concrete recipe;
+      direct harness Git remains harness work, not intercepted by Eliot.
+- [ ] **L4.3 Goals/requests.** Native Goal where installed Codex supports it; Eliot
+      continuation/checks with turn/cost/no-progress limits. No check runs under the
+      Store lock. Neither a failed check nor a missing terminal fact authorizes replay.
+- [ ] **L4.4 Recipes.** One timer, one event action and one bounded Goal using Codex.
+      No second harness is necessary to demonstrate these behaviors.
 
-## L7 — Qualification and repair
+**Result:** the first harness can work unattended under explicit limits. Hook support
+is added only for a native decision not expressible by the already-working stream.
 
-### Core, SQLite and API
+## L5 — Agent communication on the same harness
 
-- [ ] execute every documented DDL with foreign keys; CHECK/FK/UNIQUE rows for Agent
-      binding, routing-enabled/disabled live states, detach/terminal/token lifecycle,
-      nullable native input id and source-family ownership;
-- [ ] external receipt vs derived command; selector links; command retention longer/
-      shorter than receipt window; dependency-order pruning/floor;
-- [ ] native event-id replay after event-row pruning, strict-cursor resume and none-mode
-      gap; receipt mismatch/reclamation boundary;
-- [ ] source open before native effect, lost open reply, predecessor handoff atomicity,
-      sequence stale/hole/vendor duplicate and safe source reclamation;
-- [ ] owner/Agent/automation missing/invalid credential rejection; routing-key restore/
-      mismatch; routed/routing-disabled child and reattach token lifecycle;
-- [ ] linked launch/resume input at every failure point; direct turn association with no
-      native input id; coalesced inputs, unknown terminal and constrained resolution;
-- [ ] selector/discover pages at 0/1/1,000/10,000/overflow and exact frame limits;
-- [ ] observe vs control attach profile/capacity/readback and detach reservation;
-- [ ] Store failure/crash, WAL pinned reader/hard limit and replay history gap;
-- [ ] drain/force/degraded abandon/unknown blockers.
+Read [coordination](spec/coordination.md). Use two Codex Agents initially.
 
-### Recovery, automation and coordination
+- [ ] **L5.1 Mail/variables.** Addressed mail, separate delivery and acknowledgement,
+      bounded coalesced notices, shared variables and CAS. No automatic status chatter.
+- [ ] **L5.2 Work attribution.** `who` reads L3 Git/edit projections; claims are
+      advisory. No second ownership database or file-lock promise.
+- [ ] **L5.3 Hierarchy.** Controller-launched children and tree selectors, then native
+      child discovery/control where supported. An existing child is never hidden by a
+      fanout limit. Parent completion is not child completion.
 
-- [ ] A→B→A event rule while first A drains; unique activations/persisted definitions;
-      exact H boundary has no overlap/gap;
-- [ ] invalid placeholder/action/authority/fanout creates one failed run and next event
-      proceeds; Store failure does not advance;
-- [ ] timer action/trigger edit and A→B→A at due boundary exactly once;
-- [ ] Goal on-idle same eligibility after restart exactly once; next terminal-state
-      change creates next round; cadence slot exactly once;
-- [ ] global/project overlay/account/proxy/script/webhook escape negatives;
-- [ ] timer/Goal/mail/workspace/launch/provider startup reconciliation;
-- [ ] every action/check/script crash phase and no external replay;
-- [ ] routed notice, routing-disabled parent relay/queue-only, explicit full control
-      delivery, lost inbox/ack and one open batch; edits/turn results across retention/
-      restart.
+**Result:** two Agents exchange an actual message, share one variable and identify each
+other's file area without a manager relay. Cross-vendor communication is a later check,
+not a prerequisite for mail.
 
-### Plugins, platform and live paths
+## L6 — Additional harnesses and only demonstrated missing features
 
-- [ ] ready vs initial, source open before native I/O, stable open/replacement, bounded
-      spool/pages/frame, all dedupe modes and unsupported-before-I/O;
-- [ ] child parent conflict, guard-exceeded recording, routing-disabled attribution and
-      memory-only token retry when environment is qualified;
-- [ ] OS enumeration + plugin registration of same PID publishes one start; shared
-      service PID cannot become Agent custody; service stop isolation;
-- [ ] Windows Job no-breakaway/daemon death;
-- [ ] Linux cgroup+guardian failure/restart; degraded fallback rejects exact force and
-      reports possible orphan;
-- [ ] workspace base-ref movement after admission, Git/setup lost replies/readback/remove;
-- [ ] OpenCode two-session environment/token/Git isolation and isolated stop;
-- [ ] compact live run for every required harness/proxy.
+Read the selected [harness page](harnesses/README.md). Integrate one at a time through
+the existing protocol. Start with Claude Code and OpenCode for the product acceptance
+scenarios. Muse, Antigravity, ACP and other adapters are opt-in tasks, not blockers for
+Codex or for unrelated adapters.
 
-### Security, load and retention
+- [ ] **L6.1 Claude Code.** Native SDK/stream, exact callbacks and reported application
+      points. Delayed hook context is inject, not exact-turn steer.
+- [ ] **L6.2 OpenCode.** Select one installed API. Shared mode only if per-session
+      attribution/environment/stop are supported; otherwise per-Agent server.
+- [ ] **L6.3 Cross-harness use.** Reuse L4/L5 rules/mail against the added plugins.
+      Add hooks, shared mode, native children or MCP only when a concrete caller needs
+      the capability. Missing semantics reject; no compatibility executor.
+- [ ] **L6.4 Selected optional adapters.** Add only those explicitly selected for the
+      release; record the selection here. Unselected adapters stay absent.
 
-- [ ] owner token never inherited; missing credential never becomes owner; same-user
-      trust boundary documented honestly;
-- [ ] minimal env/project-overlay negatives; routing key/token hash/pattern; short-secret
-      rejection; source-spool/output masking; private data/symlink/device paths;
-- [ ] 10,000 fake Agents + 2,000 persisted events/s for one hour; bounded source epochs/
-      native receipts/pages/WAL/RSS and responsive reads with no persisted loss;
-- [ ] active/retiring activations, receipts/FKs, source/native receipts, bindings,
-      workspaces, turns/edits/mail under long retention combinations;
-- [ ] drain 1,000 busy fake Agents without new automation or lost results.
+**Feature-complete local scope:** core, Codex, monitoring/workspaces, automation,
+coordination and the selected adapters. Do not hold this milestone for an unused vendor
+or speculative remote/GUI/service feature.
 
-**Exit:** qualification green on Windows and supported Linux paths; compact current live
-runs; every discovered defect repaired in code/spec. Only then is v2 ready.
+## L7 — Qualification, repair and release
 
-## L8/L9
+Now build/run the complete campaign against the connected product. Keep results in the
+PR/CI, not a permanent audit/readiness hierarchy.
 
-Port non-Rust plugins only for measured benefit; delete temporary duplicate routes and
-keep budgets honest. Remote access, multi-host, GUI and Memory OS require new owner
-decisions.
+- [ ] Core/Store/API/reducer and event replay, including retention and non-reused ids.
+- [ ] CLI fake E2E, exact generations/turns/requests, queue ordering and unknown outcomes.
+- [ ] Crash at admission, native effect, event commit, reply and source-drain boundaries;
+      verify no repeated prompt/setup/script/push and no false terminal result.
+- [ ] Common plugin conformance, sanitized recordings and compact live runs for the
+      selected harnesses/routes. Verify effective model/account/permissions.
+- [ ] Rules/timers/hot reload, Goal limits, mail/ack, CAS, hierarchy and Git recovery.
+- [ ] Windows Job/handles/paths; supported Linux behavior and honest degraded custody;
+      private IPC, credentials, resource bounds and adopted-service isolation.
+- [ ] Retention/WAL/backpressure and representative load. The 10,000-fake-Agent,
+      2,000-events/s owner run is a release capacity check, not a prerequisite to L2.
+
+Fix the root cause and keep focused regressions. No runtime readiness claim until the
+relevant real path is exercised. A missing optional harness does not block qualification
+of the explicitly selected release scope.
+
+## Later
+
+Service continuity across daemon replacement, remote/multi-host operation, GUI and
+Memory OS require an actual use case. The current contracts are not instructions to
+build those products in advance.

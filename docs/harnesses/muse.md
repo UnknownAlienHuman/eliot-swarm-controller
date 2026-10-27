@@ -1,100 +1,51 @@
 # Muse Code
 
-Layer L4.3, `plugins/muse`, default `per_agent`. One plugin/host custody unit owns one
-Eliot generation; native subagents are child Agent rows, not extra host owners.
+Optional L6 adapter, implemented when selected. Use the official MSP SDK/transport in
+one per-Agent plugin and Muse host; do not make Muse a dependency of the first Codex path.
 
-Facts checked 2026-10-25 against Muse Code SDK/MSP 1.4 docs/registries. Recheck package,
-license and MSRV at implementation.
+Source: [meta-models/muse-code-sdk](https://github.com/meta-models/muse-code-sdk).
+Inherited 2026-10-25 notes refer to MSP v1 / Muse 1.4. Verify installed host/SDK pairing,
+methods, license and toolchain at integration; these are not current runtime findings.
 
-## Transport and start
+## Native identity and transport
 
-MSP v1 is JSON-RPC 2.0 NDJSON. Use a lower-level/caller-known `commandId`; a helper that
-mints the id after send is insufficient for unknown readback.
+Subject: `(canonical Muse host/store/account scope, exact native session id)`.
+MSP uses JSON-RPC NDJSON over stdio. Resume opens the retained session in a new Eliot
+generation; callbacks carry that generation. Native children need exact provenance and
+remain parent-attributed unless an isolated child environment can actually be installed.
 
-Muse starts a session before the user turn:
+Obtain the native command id before writing: use caller-selected `commandId` or an SDK
+operation exposing its generated id before send. Text/time/list position is not identity.
+Use supported typed APIs, not an inferred method list from a different host version.
 
-1. persist/open authoritative source epochs before native session I/O;
-2. initialize + `session/start`;
-3. validate native subject/effective model/approval mode;
-4. commit-acknowledge `session.ready`;
-5. return session outcome;
-6. dispatch linked initial `turn/start` separately.
+## Native mapping
 
-`start_requires_input=false`. Lost session-start and first-turn replies remain separate
-unknowns. Resume opens new-generation sources first, then calls `session/resume` on the
-retained subject; optional text is a linked send, never implicit replay.
-
-The live MSP source declares the qualified native page/output cursor or stable per-event
-ids. Lost source/event reply resends the identical Eliot source sequence. `view/page`
-and output references are readback/recovery, not concurrent lifecycle producers. An
-unbridgeable cursor transition uses atomic gapped source replacement.
-
-Large system notes/config are ArtifactRefs. Discovery/page/output responses are paged
-below plugin frame limits.
-
-## Verb mapping
-
-| Eliot | MSP |
+| Eliot verb | Installed MSP mechanism to verify |
 | --- | --- |
-| send | `turn/start` with caller-known command id; applied at exact turn association |
-| steer | exact `turn/steer` current turn |
-| inject | steer while busy or explicit prepend-next-send, mechanism reported |
-| interrupt | exact `turn/interrupt`; cancel/unqueue remain distinct |
-| stop | pause/clear Goal, close session/process, exact custody only |
-| approve/deny | exact session/child/request and currently offered choice ids |
-| answer | exact `userInput/answer` |
-| configure | model/reasoning/approval setter + application point/readback |
-| Goal | native set/edit/pause/resume/clear; idle set/resume may start work |
-| compact/fork/background | native method with explicit new subject/result |
+| launch/send | session/start then turn/start; readiness, input association and result separate |
+| steer/interrupt | exact current native turn controls; cancel/unqueue are different semantics |
+| inject | exact supported steer or explicit next-send prepend, mechanism reported |
+| stop/resume | clear/pause native Goal as necessary and close owned host; resume exact session without old input |
+| approve/deny/answer | exact session/child request id and offered choice/requirement |
+| configure | model/reasoning/approval setters followed by effective readback |
+| goal | native set/edit/pause/resume/clear where installed schema supports them |
+| compact/fork/background | native-only, advertised after implementation |
 
-## Observation and readback
+## Observation and recovery
 
-Controlled MSP stream owns lifecycle. Store source watermark plus native cursor/event
-receipts suppress reconnect duplicates after event pruning. If page/output cursor cannot
-bridge an interval, replace the source with a visible gap. `notLoaded` is one host view,
-not terminal. Reconnect with session but no terminal proof produces unknown turn.
+Controlled MSP stream owns native lifecycle; view/page and output reads are bounded
+readback, not a second concurrent producer. Use an exclusive view/revision cursor only
+where the installed API guarantees it. Otherwise record a gap and reconcile current
+state, never replay full history as new turns.
 
-Pending-list snapshot races live updates: capture observation epoch and apply only if no
-live update occurred. Update without original request is a gap, not a new request. Final
-output commits before turn completion and obeys bounded projection rules.
+Guard a pending-request snapshot with a local observation counter so a newer stream
+resolution cannot be overwritten by stale snapshot data. This is an in-memory race guard,
+not another persisted Agent epoch. `notLoaded` alone does not prove session closure.
+Parent completion does not complete children; aggregate usage must be marked explicitly.
 
-## Native children and routing
+## Route and final checks
 
-Subagents register from exact native provenance with stable registration id, child
-scope/ref and parent generation. Parent turn end never finishes a child. Child/page
-queries are bounded and paginated.
-
-Muse SDK/host may multiplex subagents inside one host session. Until an installed
-recording proves child-specific environment injection before tools, declare
-`child_environment=false`: child row and native controls remain first-class, but
-`routing_enabled=false`, child CLI/Git activity is attributed to parent and no separate
-token is minted. A vendor child beyond controller guards is still recorded with reduced
-authority/wake.
-
-A shared host/service PID is never assigned to child ownership. Per-Agent descendant
-registration requires exact custody membership; OS monitor owns process exit/stats.
-
-## Route and custody
-
-Muse owns inference; no qualified proxy override. Max/Go/pay-as-you-go are explicit
-owner-defined account/profile routes and are never substituted. Minimal environment
-passes named Muse config/auth plus parent Eliot identity only when routing is enabled.
-
-Exact force exists only on an exact platform backend. Transport disconnect is not
-session close; exact command/session readback decides outcome.
-
-## L7 cases
-
-- source open committed before initialize/session start/resume;
-- lost source-open/ready/initial-turn acknowledgements;
-- caller-known command id and unknown readback;
-- stale turn/request/choice ids and reconnect missing terminal;
-- strict cursor/event-id replay, atomic gap handoff and paging/frame limits;
-- approval snapshot race;
-- child canonical subject/guard/completion and parent attribution without child env;
-- native Goal wake/stop/generation pause and durable Eliot Goal eligibility;
-- long-session rotation/resource behavior;
-- process registration vs OS enumeration, account isolation and exact/degraded custody.
-
-Read v1 protocol edge cases at the frozen commit only; do not port journals/tombstones/
-receipts.
+Do not assume a generic base-URL override. Use explicit native account/billing profiles
+and report what the host actually exposes. L7 covers lost replies, exact request/turn
+binding, cursor/gaps, stale approval snapshots, child lifetime and long-session behavior.
+No adapter-specific journal, proof receipts or secondary workflow model is imported.

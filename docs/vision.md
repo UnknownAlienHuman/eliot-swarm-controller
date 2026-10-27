@@ -2,8 +2,9 @@
 
 ## Owner statement (source of truth)
 
-Quoted as given by the owner on 2026-10-25. If another document contradicts it, that
-document is a bug.
+Original product statement, given on 2026-10-25, preserved verbatim. The requirements
+remain binding; later explicit owner clarifications determine current implementation
+order. No architecture document may silently remove a requirement.
 
 > 1. Проект модульный, довольно легкий.
 > 2. Он запускает чужие (вендорские) harness и управляет ими.
@@ -19,58 +20,60 @@ document is a bug.
 >
 > Система модульная, должна разрабатываться слоями (логическими контурами). Сначала пишем код и проверяем, что ядро и шина и т.п. работают. Потом подключаем какой-то один harness. Отлаживаем систему, пишем мониторинг. Потом остальные harness. Потом скрипты и т.п.
 
+On 2026-10-27 the owner clarified the immediate sequence: core/bus, one useful harness
+(Codex with Luna), then automation/scripts/agent communication and additional harnesses.
+[Roadmap](roadmap.md) is the single current schedule. A first usable Codex path must not
+wait for the complete adapter catalogue or automation architecture.
+
 ## What Eliot is
 
-Eliot is a small local controller for vendor coding-agent harnesses. It launches,
-observes and controls them through one harness-neutral language, automates bounded
-reactions, and lets agents coordinate directly. Native model loop, tools, context,
-subagents, permissions and detailed history stay native.
+A small local Rust controller that launches vendor coding harnesses, observes native/
+process/Git facts and exposes one CLI/API for control, bounded automation and direct
+agent coordination. Vendor model loops, tools and detailed native transcripts remain
+vendor-owned. Eliot is not another coding harness.
 
 ## Requirements
 
-| ID | Requirement | Owner point | Layer |
+| ID | Requirement | Owner point | Delivery |
 | --- | --- | --- | --- |
-| R1 | Small modular core; harness-specific code in plugins; one `eliot` binary; explicit [code budgets](roadmap.md#code-budgets). | 1 | all |
-| R2 | Launch a supported headless harness with explicit profile/model/permissions/workspace/environment/args. | 2 | L2, L4 |
-| R3 | Launch through explicit OpenCodex/similar provider proxy, attached or managed. | 3 | L2 |
-| R4 | Real-time native/process/Git/filesystem monitoring with source freshness/gaps; unknown never becomes zero. | 4 | L3 |
-| R5 | Semantic send/steer/inject/interrupt/stop/resume/request/configure/goal controls, rejecting unsupported semantics. | 5 | L1–L4 |
-| R6 | The same controls work explicitly and through rules/timers/goals; native and Eliot goals are independent. | 6 | L2, L6 |
-| R7 | Programmable committed-event/time actions, built-in Git/agent actions and scripts. | 7 | L6 |
-| R8 | One bus/command language; plugins translate native protocols. | 8 | L1 |
-| R9 | No logical architecture cap on registered agents/child depth; configurable accident guards and honest live-host limits. | 9 | L1, L5, L7 |
-| R10 | Direct addressed mail/shared variables and Git-backed `who works here`. | 10 | L3, L5 |
-| R11 | Rust core; bring-up plugins/scripts may use other languages and retained ones can be ported later. | 11 | L8 |
+| R1 | Small modular core; vendor code isolated in plugins; one binary. | 1 | all |
+| R2 | Headless launch with explicit profile/model/permissions/workspace. | 2 | L2 Codex, L6 adapters |
+| R3 | Explicit OpenCodex or compatible proxy route; adopted/managed ownership. | 3 | L3 |
+| R4 | Real-time native/process/Git/fs monitoring with honest freshness/gaps. | 4 | L2–L3; hooks only where needed |
+| R5 | Uniform send/steer/inject/interrupt/stop/resume/request/configuration/Goal controls; unsupported semantics reject. | 5 | incremental L2–L6 |
+| R6 | Explicit and automated commands; independent native/Eliot Goals. | 6 | L4 |
+| R7 | Event rules, timers/cron, scripts and useful actions. | 7 | L4 |
+| R8 | One command language and event bus; caller never translates vendor terms. | 8 | L1 |
+| R9 | Indexed logical fleet and hierarchical children, configurable fanout guards rather than arbitrary architecture limits. | 9 | L1, L5, L7 |
+| R10 | Addressed messages, shared variables and Git-backed `who`. | 10 | L3, L5 |
+| R11 | Rust core; other-language plugin/script bring-up allowed. | 11 | all |
 
 ## Non-goals
 
-- No Task/Issue/review/acceptance/publication engine. Such project workflows are
-  composed from the bounded [automation primitives](spec/automation.md), agents and
-  scripts.
-- No multi-user security platform. One local OS user is the trust boundary; tokens
-  fence stale generations and attribution. Remote access requires a later real auth
-  boundary.
-- No GUI in core. CLI/JSON/live table use the same API; later UI is a client.
-- No proof ceremony: no document hashes, proof packets, audit registers or readiness
-  report hierarchy.
-- No promise that documentation alone eliminates runtime defects. Release requires the
-  feature-complete L7 real-path qualification campaign.
+No Task/Issue/review/acceptance/publication engine, GUI, multi-user security platform,
+proof packets, readiness registers or operational document-hash ceremony. Protocol
+acknowledgement and mutation idempotency are ordinary implementation correctness, not
+permission to construct a generic receipt/provenance platform.
+
+One OS user is the local trust boundary. Remote access would require a separate design.
+A large logical fleet does not mean one machine can run a million vendor processes.
 
 ## Product acceptance
 
-The product is ready only when the L7 suite and current owner-machine live runs prove:
+The complete selected local product must demonstrate on the owner's Windows machine:
 
-1. Codex launches through OpenCodex and native/process/Git/child activity is visible.
-2. The same semantic controls work on required harnesses; unsupported verbs reject
-   clearly without hidden fallback.
-3. A manager launches/controls/waits for workers on different harnesses using only
-   Eliot verbs and exact generations.
-4. Event rule push and periodic fetch run 24 hours without missed firing admission,
-   duplicate external writes or blind replay after uncertainty.
-5. Eliot Goal reaches a passing check or bounded budget/no-progress terminal state and
-   recovers correctly across restart.
-6. Two agents exchange one addressed message/CAS variable and `who` identifies current
-   file-area work without false lock claims.
-7. 10,000 fake agents maintain bounded memory/WAL and responsive paginated CLI.
-8. Windows exact custody and Linux exact/degraded behavior match their advertised
-   guarantees; no cross-agent or attached-service kill.
+1. Codex/Luna works directly first, then through the explicitly configured OpenCodex
+   route; watch shows actual turns/tools/results, later process/Git/child facts.
+2. The same command language controls Codex, Claude Code and OpenCode where each has
+   the required native semantics. Unsupported controls fail clearly, never imitate a
+   weaker operation.
+3. A manager launches workers, sends/waits/steers and collects results through Eliot.
+   Two Agents exchange mail, CAS a variable and identify a working area with `who`.
+4. Rules/timers/scripts and bounded Goals operate unattended without replaying uncertain
+   prompts/pushes/setup. Crash recovery exposes unknown outcomes until exact settlement.
+5. Retention and representative 10,000-fake-Agent load remain bounded and responsive;
+   Windows force-stop verifies its owned Job, and Unix reports its actual weaker custody.
+
+These are final qualification goals, not conditions that must all be implemented before
+one useful Codex session runs. [L7](roadmap.md#l7--qualification-repair-and-release)
+qualifies the connected product; compilation or documentation review alone does not.

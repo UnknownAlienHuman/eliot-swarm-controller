@@ -1,48 +1,30 @@
-# Other harnesses (L4.7, only when needed)
+# Other harnesses — only when selected
 
-These are risk notes from v1, not active contracts. None is built until a concrete need
-and fresh installed/official verification. A similar wire format is not permission to
-reuse another plugin without proving the full Eliot contract: source-before-effect,
-identity/readback, pagination, input/turn mapping, environment/routing and isolated stop.
+Optional L6 candidates; none blocks the core/Codex/automation/coordination path.
+The following are inherited v1 notes, not current capability verification.
 
 ## Command Code
 
-- Old docs: [mods](https://commandcode.ai/docs/mods),
-  [headless](https://commandcode.ai/docs/headless),
-  [CLI](https://commandcode.ai/docs/reference/cli),
-  [sessions](https://commandcode.ai/docs/sessions),
-  [goal](https://commandcode.ai/docs/goal); recheck before implementation.
-- Potential routes: its own headless NDJSON plugin or ACP through the generic ACP plugin
-  **only if the installed ACP capabilities satisfy the selected contract**.
-- v1 observations: mod exception could leave CLI running; `queueMessage` steer applied
-  only after a tool batch; Goal did not survive resume; `turn_end` could precede the
-  final Git commit. These become named L7 cases, not assumptions.
-- Before any native process/input, open authoritative source epochs. Determine
-  `start_requires_input`, stable session/input/turn/request ids, replay mode, paging and
-  child-environment capability from a live recording.
+Source entry points: [headless](https://commandcode.ai/docs/headless),
+[CLI](https://commandcode.ai/docs/reference/cli),
+[sessions](https://commandcode.ai/docs/sessions). Inspect the installed native or ACP
+route only when selected. Delayed queued messages are not necessarily exact steer;
+turn end need not coincide with the agent's last Git commit.
 
 ## Kilo Code
 
-- OpenCode-derived CLI may expose HTTP/SSE routes resembling OpenCode. Do not select the
-  OpenCode plugin merely because paths look similar.
-- Implementation must fetch the installed OpenAPI/version and prove one complete API
-  generation, per-session environment/tool attribution, exact input→execution mapping,
-  paged events/readback and isolated stop. Otherwise use a separate per-Agent plugin or
-  observe-only attach.
-- v1 observations: unscoped abort could stop descendants; queued prompts were
-  in-process/lost on restart; titles/summaries/compaction/update checks could reach
-  external services or silently use Kilo Gateway. Disable or explicitly allow every
-  auxiliary route and verify effective billing/endpoint.
-- Shared server PID remains service-owned. One Agent stop never kills it.
+Investigate compatibility with the selected OpenCode API before sharing that adapter;
+do not assume endpoint/stop/queue semantics match merely because the project is derived
+from OpenCode. Inspect auxiliary requests and default provider fallback so the explicit
+route is preserved. Observe without launching an extra billed run.
 
 ## Zed
 
-Zed is an ACP client/editor, not a native Agent server to drive. Its old `eval-cli` was a
-one-shot evaluator, not a control session. No plugin is planned unless a current headless
-server protocol appears and satisfies the same exact contract.
+Treat the editor as an ACP client, not automatically a headless Agent control server.
+No plugin is planned without a concrete native control surface and need.
 
-## Candidates noted in v1
+## Historical candidates
 
-CodeGraff/Harness, Sinew, Pi-Go, OpenChamber, Delta, Agent Teams AI, Vicoa,
-JetBrains Air and SWE-agent remain historical leads at the frozen v1 commit. They are not
-implementation inputs until one concrete missing harness is selected and re-researched.
+The older catalogue remains at `git show dc6f70aa:docs/candidate-notes.md` (or the archive
+tag once created). It is not a backlog of mandatory integrations. Select one adapter,
+read its actual native interface, and connect it to the existing plugin contract.
