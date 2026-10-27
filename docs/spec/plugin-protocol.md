@@ -142,6 +142,7 @@ admitted or the turn completed. A lost result never causes another start or inpu
 | Method | Fields | Result |
 | --- | --- | --- |
 | `events.put` | agent, generation, source, one native-record batch of persisted events, optional exclusive cursor | committed Store `seq` range and saved cursor |
+| `source.state` | agent, generation, optional families | current family owners, mechanisms, committed cursors and latest explicit gap boundary |
 | `source.handoff` | agent, generation, families, expected predecessor source, successor source/mechanism, predecessor final cursor or explicit gap | new owner map after one committed handoff transaction |
 | `process.put` | agent, generation, exact PID/start time/role | committed process identity after custody verification |
 | `child` | stable registration id, parent Agent/generation, exact child subject, name/labels?, request own identity? | canonical child Agent/current generation and optional memory-only token |
@@ -171,11 +172,18 @@ Same native id + same digest returns the original `seq`; another digest is
 `source_integrity` and advances nothing. A lost reply may resend only an identical batch
 whose events all have stable ids.
 
-`source.handoff` is the only dynamic owner-change operation. The daemon verifies the
-expected predecessor for every family and, in one transaction, records the predecessor's
-final exclusive cursor or explicit `source.gap`, then installs the successor. The
-successor must not publish until the reply commits. This is a small compare-and-swap
-boundary, not a source epoch/open-id/sequence protocol.
+`source.handoff` is the only dynamic owner-change operation. All named families in one
+request must currently have the same predecessor; otherwise split the handoff. The
+daemon verifies that predecessor and, in one transaction, records its final exclusive
+cursor or explicit `source.gap`, then installs the successor. The successor must not
+publish until the reply commits. This is a small compare-and-swap boundary, not a source
+epoch/open-id/sequence protocol.
+
+A lost `source.handoff` reply is **not** answered by blindly issuing another handoff. The
+plugin or its replacement calls `source.state`: successor ownership with the supplied
+boundary proves applied; predecessor ownership proves not applied; any mixed/other state
+remains unknown and requires daemon reconciliation. `source.state` is read-only and
+paginated/bounded by the normal frame limits.
 
 `process.put` is valid only for a process inside the calling per-Agent custody. Shared
 service PIDs are service-owned. The OS monitor remains the lifecycle authority; plugin
