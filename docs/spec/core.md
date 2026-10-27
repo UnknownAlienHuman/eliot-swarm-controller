@@ -147,7 +147,7 @@ last observation: ordinary turn work is blocked and no controller is assumed cur
 | `busy|waiting` | exact terminal result of `active_turn` | `idle`, clear turn requests |
 | any live | exact native/session end | `stopped` |
 | any live | fatal session error | `failed` |
-| any live | exact loss of session control | `lost` |
+| any live | daemon-derived exact loss of session control | `lost` |
 
 Entering a terminal state cancels accepted/queued commands of that generation, clears
 active turn/pending requests and pauses Goals. Dispatched/unknown commands stay
@@ -199,9 +199,9 @@ Event {
 - known credential values are masked from native output. Caller-supplied durable text
   containing a known credential is rejected.
 
-Normalized native lifecycle families are `session`, `turn`, `message`, `tool`,
-`request`, `child`, `goal`, and `usage`. Exactly one source owns each family for one
-`(agent,generation)`.
+Normalized **native/plugin-published** families are `session`, `turn`, `message`,
+`tool`, `request`, `child`, `goal`, `usage`, `provider`, and `edit`. Exactly one source
+owns each family for one `(agent,generation)`.
 
 ```text
 SourceOwner { agent, generation, family, source, mechanism }
@@ -211,6 +211,12 @@ SourceCursor { agent, generation, source, value, last_store_seq }
 The owner map is committed before a plugin may perform the first native start/input.
 A live stream normally owns lifecycle; transcript owns observe/recovery; a hook owns
 only a family absent from the primary stream or one synchronous decision.
+
+Source ownership does **not** let plugins publish daemon-derived state. `agent.*`,
+`session.lost`, `turn.resolved`, command/rule/mail/claim events and process/Git facts are
+emitted only by their owning daemon subsystem. A plugin may report native
+`session.ready|ended|error` and exact attach/snapshot/process evidence; daemon
+reconciliation combines process/source/readback evidence and emits `session.lost` once.
 
 Handoff is one Store transaction: verify current owner, record its final cursor or an
 explicit gap, install the new owner, then allow publication. There are no source epochs,
@@ -234,18 +240,14 @@ the cursor advances with the whole batch, so a crash cannot commit half a record
 
 ### Main persisted kinds
 
-- `session.ready|ended|error|lost`
-- `agent.created|starting|idle|busy|waiting|stopped|failed|lost|stalled|unstalled`
-- `input.admitted|dropped`
-- `turn.started|completed|resolved`
-- `message.user|agent`; ephemeral `message.delta`
-- `tool.started|completed`, `file.changed`, `plan.updated`
-- `approval.requested|resolved`, `question.asked|answered`
-- `child.spawned`, `goal.updated`, turn-end `usage.updated`
-- `provider.limited`
-- `process.started|exited`; ephemeral `process.stats`
-- `git.status|commit|ref`; ephemeral `fs.changed`
-- `command.*`, `rule.*`, `mail.*`, `var.changed`, `claim.*`, `source.health|gap`
+- native/plugin: `session.ready|ended|error`, `input.admitted|dropped`,
+  `turn.started|completed`, `message.user|agent`, `tool.started|completed`,
+  `file.changed`, `plan.updated`, request/child/goal/usage/provider facts;
+- daemon-derived: `session.lost`, `turn.resolved`,
+  `agent.created|starting|idle|busy|waiting|stopped|failed|lost|stalled|unstalled`;
+- process/Git: `process.started|exited`, `git.status|commit|ref`;
+- command/rule/mail/var/claim/source health/gap events;
+- ephemeral: `message.delta`, in-turn usage delta, `process.stats`, `fs.changed`.
 
 Plugins may emit `x.<harness>.*`; these never reduce core state unless promoted to a
 documented family.
