@@ -32,7 +32,7 @@ jobs:
       - name: Formatting
         run: cargo fmt --check
       - name: Scoped Clippy and compile
-        run: cargo clippy --locked -p eliot -- -D warnings
+        run: cargo clippy --locked -p eliot -p eliot-core -p eliot-store -p eliot-plugin -p eliot-daemon -- -D warnings
       - name: Version smoke check
         run: cargo run --locked -p eliot -- --version
       - name: Help smoke check

@@ -2,7 +2,7 @@
 
 First real harness; see [L2](../roadmap.md#l2--first-useful-harness-codex-with-luna).
 Use `plugins/codex`, Rust/built-in, with one plugin/app-server process per controlled
-Agent generation. This page is an implementation target; no v2 runtime is claimed yet.
+Agent generation. This page is an implementation target; no v2 Codex runtime is claimed yet.
 
 ## Sources
 

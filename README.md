@@ -1,49 +1,63 @@
 # Eliot
 
-A local Rust controller for native coding-agent harnesses. The implementation is being
-rebuilt in small connected layers: core/Store/bus → Codex/Luna → monitoring → automation
-and scripts → agent communication → selected additional harnesses.
+Eliot is a local Rust controller for coding-agent harnesses.
 
-## Current implementation
+## Current slice
 
-L0 is complete: one dependency-free Rust 2024 binary with `--version` and `--help`.
-The daemon, event bus and harness control are **not implemented yet**. The next task is
-[L1.1 in the roadmap](docs/roadmap.md#l1--core-store-bus-and-one-fake-command-path).
-Do not advertise future commands as working or restore the old controller to fill gaps.
+L1 connects the CLI and daemon to the Store, event bus, and one `fake` plugin. The fake
+uses the plugin JSON-RPC/NDJSON protocol to exercise turn handling; it never calls a
+model. Direct Codex and Luna integrations are the next layer (L2) and are not implemented
+yet.
 
-## Build
+## Quick start
 
-Install Rust through rustup; `rust-toolchain.toml` pins 1.99.1 with rustfmt and Clippy.
-From the repository root on Windows or Linux:
+From the repository root, build the binary and replace the workspace, data-directory, and
+Agent placeholders with your values:
 
-```text
-cargo fmt --check
-cargo clippy --locked -p eliot -- -D warnings
-cargo run --locked -p eliot -- --version
-cargo run --locked -p eliot -- --help
+```powershell
+cargo build --locked -p eliot
+$eliot = '.\target\debug\eliot.exe'
+$workspace = 'PATH_TO_EXISTING_WORKSPACE'
+$dataDir = 'PATH_TO_PRIVATE_ELIOT_DATA_DIR'
+& $eliot --data-dir $dataDir daemon
+& $eliot --data-dir $dataDir status
+& $eliot --data-dir $dataDir launch --profile fake --workspace $workspace 'hello-one' --wait
+& $eliot --data-dir $dataDir ls
+$agent = 'AGENT_ID_FROM_OUTPUT'
+& $eliot --data-dir $dataDir send $agent 'hello-two' --wait
+& $eliot --data-dir $dataDir watch $agent     # Ctrl+C stops watching
+& $eliot --data-dir $dataDir events --since 0
+& $eliot --data-dir $dataDir result $agent
+& $eliot --data-dir $dataDir stop $agent
+& $eliot --data-dir $dataDir daemon stop --drain  # or --force
 ```
 
-No model account, Codex install, Node, Python, database service or `just` is required for
-this skeleton. CI runs the same checks on Windows and Ubuntu. Add dependencies and
-modules only with their first connected caller.
+On Unix, the built binary is `./target/debug/eliot`; pass the same `--data-dir` to each
+invocation.
 
-## Implement next
+`launch` supports the `fake` profile and an existing workspace. `send --wait` and
+`launch ... --wait` follow the exact turn to its terminal result. The bounded wait is
+30 seconds by default; use `--timeout-seconds N` to change it. A timeout does not cancel
+the admitted command.
 
-Read [AGENTS.md](AGENTS.md), [architecture](docs/architecture.md), the current
-[roadmap task](docs/roadmap.md) and its [donor entry](docs/reference/donors.md).
-[All documentation](docs/README.md) describes the target contract; later sections are
-not prerequisites for the first Codex path.
+Other read commands include `show AGENT` and `cmd show ID`. `watch [AGENT]` streams
+committed events; `events --since SEQ` reads a page of event history.
 
-## v1 archive
+## Data and credentials
 
-The old implementation, documentation and third-party notices remain on branch
-`archive/v1-final` at commit `dc6f70aa08ea5fad3da04624ce50c46d45edd57c`.
-For a full clone:
+The default private data directory is `%LOCALAPPDATA%\Eliot` on Windows and
+`$HOME/.local/share/eliot` on Unix. Set `ELIOT_HOME` or pass
+`--data-dir PATH_TO_PRIVATE_DATA_DIR` to choose another directory. The CLI loads the
+local owner credential automatically; no owner token argument is needed.
+
+## Build and check
+
+The repository pins Rust 1.99.1 with rustfmt and Clippy. From the repository root:
 
 ```text
-git show dc6f70aa:crates/swarm-process/src/process_group.rs
+cargo +1.99.1 fmt --check
+cargo +1.99.1 clippy --locked -p eliot -- -D warnings
+cargo +1.99.1 build --locked -p eliot
 ```
 
-A shallow clone may first fetch `archive/v1-final`. Borrow only the narrow helpers in
-the donor map, retaining applicable notices; do not port v1's workflow/proof machinery.
-The new skeleton contains no copied vendor code or third-party dependencies.
+The v1 implementation remains archived on `archive/v1-final`; do not restore its runtime.

@@ -45,8 +45,8 @@ to create every crate/table immediately.
       help/version smoke commands on Windows/Ubuntu. No empty framework crates or
       test platform.
 
-**Next:** L1.1. The current executable is only the build skeleton; it does not advertise
-or pretend to implement daemon/Agent commands. v1 remains available as a source donor.
+**Next:** L2.1. The executable now provides the L1 daemon/Store/bus/fake path.
+Direct Codex remains the next increment; v1 remains available as a source donor.
 
 ## L1 — Core, Store, bus and one fake command path
 
@@ -54,13 +54,13 @@ Read [core](spec/core.md), [API](spec/api.md) and the minimal profile in
 [plugin protocol](spec/plugin-protocol.md#first-harness-subset).
 Donors: the **L1–L2 implementation map** in [donors](reference/donors.md).
 
-- [ ] **L1.1 State/Store/bus.** Agent, generation, command, turn, event, one pure
+- [x] **L1.1 State/Store/bus.** Agent, generation, command, turn, event, one pure
       reducer and one SQLite writer. Commit event and projection before publishing.
       Allocate non-reused event ids. Implement bounded query/subscription replay.
-- [ ] **L1.2 Daemon/CLI.** Private data directory and local IPC, automatic owner
+- [x] **L1.2 Daemon/CLI.** Private data directory and local IPC, automatic owner
       credential, `daemon`, `launch`, `send`, `ls`, `show`, `watch`, `result`, `stop`
       and command readback. One explicit global profile; no project overlay system yet.
-- [ ] **L1.3 Plugin path.** Per-Agent process, framing/deadlines/custody, one fixed
+- [x] **L1.3 Plugin path.** Per-Agent process, framing/deadlines/custody, one fixed
       authoritative stream, commit acknowledgement, generation/turn binding and unknown
       input gate. Add a tiny fake that emits ready, echo turn and terminal result.
       Stop/restart must not resend an uncertain input.
@@ -68,6 +68,13 @@ Donors: the **L1–L2 implementation map** in [donors](reference/donors.md).
 **Result:** CLI → router/Store → fake → event bus → CLI works. The fake is a transport
 exercise, not a simulator product. Add its approval/crash/input-created-session features
 only when a real integration needs them.
+
+Checked on Windows on 2026-10-27 with Rust 1.99.1: formatting, scoped Clippy and a
+debug build; two-Agent echo/control isolation, mutation-id retry/conflict, stale-generation
+rejection, replay/live watch, stop/drain and restart without input replay. A focused
+31 × 30,000-byte echo exercise returned every event across two bounded pages; a refused
+commit acknowledgement retained unknown outcome and blocked the next input. Full L7
+qualification and real Codex execution remain separate increments.
 
 **Not in L1:** shared plugin pools, source handoff, discovery/control takeover, native
 children, hooks, Goals, selectors, mail, rule revisions, scripts, worktree setup, proxy

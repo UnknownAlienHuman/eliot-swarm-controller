@@ -7,3 +7,12 @@ publish = false
 
 [lints]
 workspace = true
+
+[dependencies]
+clap.workspace = true
+eliot-core.workspace = true
+eliot-daemon.workspace = true
+eliot-plugin.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+ulid.workspace = true
