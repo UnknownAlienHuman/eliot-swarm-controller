@@ -1,6 +1,6 @@
 //! Observe-only command lifecycle. Native history stays private to the reader.
 use super::*;
-use eliot_core::ObserverBinding;
+use eliot_core::{ObserverBinding, SecretPolicy};
 
 const SOURCE: &str = "observe";
 
@@ -51,8 +51,8 @@ fn check_keys(value: &Value, allowed: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn check_nonsecret(value: &Value) -> Result<()> {
-    fn secret(value: &Value) -> bool {
+fn check_nonsecret(connection: &Connection, value: &Value) -> Result<()> {
+    fn forbidden_fields(value: &Value) -> bool {
         match value {
             Value::Object(object) => object.iter().any(|(key, value)| {
                 let key = key.to_ascii_uppercase();
@@ -67,13 +67,24 @@ fn check_nonsecret(value: &Value) -> Result<()> {
                         | "TARGET_ENVIRONMENT"
                 ) || key.ends_with("_TOKEN")
                     || key.ends_with("_API_KEY")
-                    || secret(value)
+                    || forbidden_fields(value)
             }),
-            Value::Array(values) => values.iter().any(secret),
+            Value::Array(values) => values.iter().any(forbidden_fields),
             _ => false,
         }
     }
-    if contains_secret_marker(value) || secret(value) {
+    let mut statement = connection
+        .prepare("SELECT token FROM agents WHERE token IS NOT NULL")
+        .map_err(sql_error)?;
+    let secrets = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(sql_error)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(sql_error)?;
+    if contains_secret_marker(value)
+        || forbidden_fields(value)
+        || SecretPolicy::new(secrets).contains_value(value)
+    {
         return Err(Error::new(
             "secret_in_payload",
             "observer metadata must not contain credentials or auth environment",
@@ -195,7 +206,7 @@ pub(super) fn admit(
                 "observer profile exceeds its bound",
             ));
         }
-        check_nonsecret(snapshot)?;
+        check_nonsecret(tx, snapshot)?;
         let project =
             optional_string(&request.args, "project")?.unwrap_or_else(|| "external".to_owned());
         require_nonempty(&project, "observer project")?;
@@ -492,7 +503,13 @@ pub(super) fn dispatch(
     Ok(())
 }
 
-fn check_result(result: &Value, command: &Command, agent: &Agent, state: &str) -> Result<()> {
+fn check_result(
+    connection: &Connection,
+    result: &Value,
+    command: &Command,
+    agent: &Agent,
+    state: &str,
+) -> Result<()> {
     if encode_json(result)?.len() > MAX_EVENT_BYTES {
         return Err(Error::new(
             "frame_too_large",
@@ -536,7 +553,7 @@ fn check_result(result: &Value, command: &Command, agent: &Agent, state: &str) -
             ));
         }
     }
-    check_nonsecret(result)
+    check_nonsecret(connection, result)
 }
 
 fn unavailable_commands(
@@ -695,6 +712,7 @@ impl Store {
                     .ok_or_else(|| Error::new("invalid", "observer generation is missing"))?,
             )?;
             check_result(
+                &tx,
                 &result,
                 &record.command,
                 &agent,

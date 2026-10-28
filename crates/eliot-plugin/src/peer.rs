@@ -1,5 +1,7 @@
 use crate::protocol::{MAX_EVENT_BYTES, MAX_FRAME_BYTES, RpcError, RpcRequest, RpcResponse};
-use eliot_core::{BatchAck, Error, Result, SourceBatch};
+use eliot_core::{
+    BatchAck, Error, MAX_STDERR_DIAGNOSTIC_BYTES, Result, SourceBatch, bound_stderr_diagnostics,
+};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -155,10 +157,11 @@ impl PeerClient {
 
     /// Respond to a host request before its absolute deadline.
     pub async fn respond(&self, id: Value, result: Result<Value>, deadline: Instant) -> Result<()> {
-        let response = match result {
+        let mut response = match result {
             Ok(value) => RpcResponse::success(id, value),
             Err(error) => RpcResponse::failure(id, response_error(error)),
         };
+        bound_response_diagnostics(&mut response);
         self.write_encoded(encode_frame(&response)?, deadline).await
     }
 
@@ -374,7 +377,8 @@ pub(crate) fn preserve_rpc_error(error: RpcError) -> Error {
         .and_then(|data| data.get("code"))
         .and_then(Value::as_str)
         .unwrap_or("rpc_error");
-    Error::new(format!("rpc/{}/{semantic}", error.code), error.message)
+    let code = format!("rpc/{}/{semantic}", error.code);
+    decode_error_diagnostics(Error::new(code, error.message), error.data.as_ref())
 }
 
 async fn writer_loop(
@@ -470,20 +474,26 @@ fn encode_frame<T: Serialize>(message: &T) -> Result<String> {
 }
 
 fn response_error(error: Error) -> RpcError {
-    if let Some(rest) = error.code.strip_prefix("rpc/")
+    let (wire_code, semantic) = if let Some(rest) = error.code.strip_prefix("rpc/")
         && let Some((wire_code, semantic)) = rest.split_once('/')
         && let Ok(wire_code) = wire_code.parse::<i64>()
     {
-        return RpcError {
-            code: wire_code,
-            message: error.message,
-            data: Some(json!({"code": semantic})),
-        };
+        (wire_code, semantic.to_owned())
+    } else {
+        (-32000, error.code.clone())
+    };
+    let mut data = json!({"code": semantic});
+    // Core serializes optional data using its shared encoded budget. A failed
+    // optional conversion must never replace the primary code or message.
+    if let Ok(encoded) = serde_json::to_value(&error)
+        && let Some(diagnostics) = encoded.get("diagnostics")
+    {
+        data["diagnostics"] = diagnostics.clone();
     }
     RpcError {
-        code: -32000,
+        code: wire_code,
         message: error.message,
-        data: Some(json!({"code": error.code})),
+        data: Some(data),
     }
 }
 
@@ -495,7 +505,49 @@ fn call_error(error: RpcError) -> Error {
         .and_then(Value::as_str)
         .map(str::to_owned)
         .unwrap_or_else(|| format!("rpc_{}", error.code));
-    Error::new(code, error.message)
+    decode_error_diagnostics(Error::new(code, error.message), error.data.as_ref())
+}
+
+fn decode_error_diagnostics(primary: Error, data: Option<&Value>) -> Error {
+    let Some(diagnostics) = data.and_then(|data| data.get("diagnostics")) else {
+        return primary;
+    };
+    // Core's deserializer validates sources/counts/shapes and omits malformed
+    // optional data. Mandatory fields here are our already-decoded originals.
+    serde_json::from_value(json!({
+        "code": primary.code,
+        "message": primary.message,
+        "diagnostics": diagnostics,
+    }))
+    .unwrap_or(primary)
+}
+
+fn bound_response_diagnostics(response: &mut RpcResponse) {
+    let Some(error) = response.error.as_mut() else {
+        return;
+    };
+    let primary = call_error(error.clone());
+    let mut diagnostics = primary.diagnostics;
+    let Some(data) = error.data.as_mut().and_then(Value::as_object_mut) else {
+        return;
+    };
+    data.remove("diagnostics");
+    if diagnostics.is_empty() {
+        return;
+    }
+    let base = serde_json::to_vec(&*response).map_or(usize::MAX, |bytes| bytes.len());
+    let budget = MAX_FRAME_BYTES
+        .saturating_sub(1)
+        .saturating_sub(base.saturating_add(",\"diagnostics\":".len()))
+        .min(MAX_STDERR_DIAGNOSTIC_BYTES);
+    bound_stderr_diagnostics(&mut diagnostics, budget);
+    if !diagnostics.is_empty()
+        && let Ok(encoded) = serde_json::to_value(diagnostics)
+        && let Some(error) = response.error.as_mut()
+        && let Some(data) = error.data.as_mut().and_then(Value::as_object_mut)
+    {
+        data.insert("diagnostics".to_owned(), encoded);
+    }
 }
 
 fn protocol_error(code: &str, rpc_code: i64, message: &str) -> RpcError {
@@ -519,4 +571,117 @@ fn unknown_batch_error() -> Error {
 
 fn valid_id(id: &Value) -> bool {
     id.is_null() || id.is_string() || id.is_number()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eliot_core::{SecretPolicy, StderrSnapshot, StderrSource, classify_dispatched_error};
+
+    fn snapshot(text: &str) -> StderrSnapshot {
+        StderrSnapshot {
+            text: text.to_owned(),
+            truncated: false,
+            eof: true,
+            read_error: false,
+        }
+    }
+
+    #[test]
+    fn error_rpc_roundtrip_preserves_both_stderr_sources() {
+        let original = Error::new("unknown", "potential native effect")
+            .with_stderr(StderrSource::Plugin, snapshot("dummy plugin diagnostic"))
+            .with_stderr(StderrSource::Harness, snapshot("dummy harness diagnostic"));
+        let wire = response_error(original.clone());
+        assert_eq!(call_error(wire.clone()), original);
+        let preserved = preserve_rpc_error(wire.clone());
+        let roundtrip = response_error(preserved);
+        assert_eq!(roundtrip.code, wire.code);
+        assert_eq!(roundtrip.message, wire.message);
+        assert_eq!(roundtrip.data, wire.data);
+    }
+
+    #[test]
+    fn malformed_optional_diagnostics_never_replace_the_primary_error() {
+        for diagnostics in [
+            json!(true),
+            json!([{"source": "unknown", "snapshot": {}}]),
+            json!([{"source": "plugin", "snapshot": {"text": 123}}]),
+        ] {
+            let error = call_error(RpcError {
+                code: -32000,
+                message: "original failure".to_owned(),
+                data: Some(json!({"code": "unknown", "diagnostics": diagnostics})),
+            });
+            assert_eq!(error.code, "unknown");
+            assert_eq!(error.message, "original failure");
+            assert!(error.diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn control_bytes_and_short_secret_expansion_preserve_settlement() {
+        let policy = SecretPolicy::new(vec!["a".to_owned()]);
+        let safe = policy.redact_text(&"a\0".repeat(16 * 1024));
+        let original = Error::new("unknown", "original failure");
+        let with_diagnostics = original
+            .clone()
+            .with_stderr(StderrSource::Plugin, snapshot(&safe))
+            .with_stderr(StderrSource::Harness, snapshot(&safe));
+        let mut response = RpcResponse::failure(json!("test"), response_error(with_diagnostics));
+        bound_response_diagnostics(&mut response);
+        let frame = encode_frame(&response).expect("bounded error response");
+        let decoded = call_error(response.error.expect("error branch"));
+        assert_eq!(decoded.code, original.code);
+        assert_eq!(decoded.message, original.message);
+        assert_eq!(
+            classify_dispatched_error(&decoded.code),
+            classify_dispatched_error(&original.code)
+        );
+        assert_eq!(decoded.diagnostics.len(), 2);
+        assert!(
+            decoded
+                .diagnostics
+                .iter()
+                .all(|value| value.snapshot.truncated)
+        );
+        assert!(
+            decoded
+                .diagnostics
+                .iter()
+                .all(|value| !value.snapshot.text.contains('a'))
+        );
+        assert!(
+            serde_json::to_vec(&decoded.diagnostics).unwrap().len() <= MAX_STDERR_DIAGNOSTIC_BYTES
+        );
+        assert!(serde_json::to_vec(&decoded).unwrap().len() <= 64 * 1024);
+        assert!(frame.len() < MAX_FRAME_BYTES);
+    }
+
+    #[test]
+    fn response_budget_accounts_for_the_mandatory_rpc_envelope() {
+        let primary = Error::new("unknown", "original failure");
+        let mut response = RpcResponse::failure(json!(""), response_error(primary.clone()));
+        let base = serde_json::to_vec(&response).unwrap().len();
+        response.id = json!("i".repeat(MAX_FRAME_BYTES - base - 513));
+        response.error = Some(response_error(
+            primary
+                .clone()
+                .with_stderr(StderrSource::Plugin, snapshot(&"\0".repeat(16 * 1024)))
+                .with_stderr(StderrSource::Harness, snapshot(&"\0".repeat(16 * 1024))),
+        ));
+        bound_response_diagnostics(&mut response);
+        let frame = encode_frame(&response).expect("optional tails cannot overflow the frame");
+        let decoded = call_error(response.error.unwrap());
+        assert_eq!(decoded.code, primary.code);
+        assert_eq!(decoded.message, primary.message);
+        assert_eq!(decoded.diagnostics.len(), 2);
+        assert!(
+            decoded
+                .diagnostics
+                .iter()
+                .all(|value| value.snapshot.truncated)
+        );
+        assert!(frame.len() < MAX_FRAME_BYTES);
+    }
 }

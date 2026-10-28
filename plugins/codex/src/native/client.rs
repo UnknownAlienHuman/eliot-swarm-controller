@@ -1,4 +1,5 @@
-use eliot_core::{Error, Result};
+use eliot_core::{Error, Result, SecretPolicy, StderrSnapshot, StderrSource};
+use eliot_plugin::{StderrCapture, StderrView, spawn_stderr};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -14,7 +15,6 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io,
     process::{Child, ChildStdin, Command},
     sync::{Semaphore, mpsc, oneshot, watch},
     time::{Instant, timeout_at},
@@ -63,6 +63,8 @@ pub(crate) struct NativeClient {
     pending: PendingCalls,
     pending_slots: Arc<Semaphore>,
     next_id: Arc<AtomicU64>,
+    stderr: StderrView,
+    policy: SecretPolicy,
 }
 
 pub(crate) struct NativeProcess {
@@ -72,6 +74,7 @@ pub(crate) struct NativeProcess {
     stream: watch::Receiver<StreamState>,
     output_reader: Option<tokio::task::JoinHandle<Result<()>>>,
     output_reader_result: Option<Result<()>>,
+    stderr: Option<StderrCapture>,
 }
 
 #[derive(Serialize)]
@@ -140,7 +143,7 @@ struct PendingGuard {
 }
 
 impl NativeProcess {
-    pub async fn spawn(launch: NativeLaunch) -> Result<Self> {
+    pub async fn spawn(launch: NativeLaunch, policy: SecretPolicy) -> Result<Self> {
         let mut command = Command::new(&launch.program);
         command
             .args(&launch.args)
@@ -154,7 +157,9 @@ impl NativeProcess {
         let mut child = command.spawn().map_err(|error| {
             Error::new(
                 "native_spawn",
-                format!("could not start the configured Codex app-server: {error}"),
+                policy.redact_text(&format!(
+                    "could not start the configured Codex app-server: {error}"
+                )),
             )
         })?;
         let stdin = child
@@ -165,13 +170,11 @@ impl NativeProcess {
             .stdout
             .take()
             .ok_or_else(|| Error::new("native_spawn", "Codex app-server stdout was not piped"))?;
-        let mut stderr = child
+        let stderr = child
             .stderr
             .take()
             .ok_or_else(|| Error::new("native_spawn", "Codex app-server stderr was not piped"))?;
-        tokio::spawn(async move {
-            let _ = io::copy(&mut stderr, &mut io::sink()).await;
-        });
+        let stderr = spawn_stderr(stderr, Arc::new(policy.clone()));
 
         let writer = Arc::new(tokio::sync::Mutex::new(FramedWrite::new(
             stdin,
@@ -183,6 +186,8 @@ impl NativeProcess {
             pending: Arc::clone(&pending),
             pending_slots: Arc::new(Semaphore::new(MAX_PENDING_CALLS)),
             next_id: Arc::new(AtomicU64::new(0)),
+            stderr: stderr.view(),
+            policy,
         };
         let (frame_tx, frame_rx) = mpsc::channel(NATIVE_EVENT_QUEUE);
         let (stream_tx, stream_rx) = watch::channel(StreamState::Open);
@@ -198,6 +203,7 @@ impl NativeProcess {
             stream: stream_rx,
             output_reader: Some(output_reader),
             output_reader_result: None,
+            stderr: Some(stderr),
         })
     }
 
@@ -226,6 +232,14 @@ impl NativeProcess {
     /// Wait for the single stdout reader to finish; a timeout leaves that same
     /// reader running so a later wait can observe its completion without reuse.
     pub async fn await_output_drained(&mut self, deadline: Instant) -> Result<()> {
+        let result = self.await_stdout_drained(deadline).await;
+        if let Some(stderr) = self.stderr.take() {
+            let _ = stderr.finish(deadline).await;
+        }
+        result.map_err(|error| self.client.diagnostic_error(error))
+    }
+
+    async fn await_stdout_drained(&mut self, deadline: Instant) -> Result<()> {
         if let Some(result) = &self.output_reader_result {
             return result.clone();
         }
@@ -323,6 +337,21 @@ impl NativeProcess {
 
 impl NativeClient {
     pub async fn call(&self, method: &str, params: Value, deadline: Instant) -> Result<Value> {
+        self.call_inner(method, params, deadline)
+            .await
+            .map_err(|error| self.diagnostic_error(error))
+    }
+
+    pub(crate) fn stderr_snapshot(&self) -> StderrSnapshot {
+        self.stderr.snapshot()
+    }
+
+    pub(crate) fn diagnostic_error(&self, mut error: Error) -> Error {
+        error.message = self.policy.redact_text(&error.message);
+        error.with_stderr(StderrSource::Harness, self.stderr_snapshot())
+    }
+
+    async fn call_inner(&self, method: &str, params: Value, deadline: Instant) -> Result<Value> {
         if method.trim().is_empty() || !params.is_object() {
             return Err(Error::new(
                 "invalid",
@@ -463,6 +492,12 @@ impl NativeClient {
     }
 
     async fn write_encoded(&self, encoded: String, deadline: Instant) -> Result<()> {
+        self.write_encoded_inner(encoded, deadline)
+            .await
+            .map_err(|error| self.diagnostic_error(error))
+    }
+
+    async fn write_encoded_inner(&self, encoded: String, deadline: Instant) -> Result<()> {
         let mut writer = match timeout_at(deadline, self.writer.lock()).await {
             Ok(writer) => writer,
             Err(_) => {
@@ -726,5 +761,102 @@ impl Drop for PendingGuard {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.id);
+    }
+}
+
+impl Drop for NativeProcess {
+    fn drop(&mut self) {
+        if let Some(reader) = &self.output_reader {
+            reader.abort();
+        }
+        // StderrCapture owns and cancels its reader; client views cannot keep it alive.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn stderr_fixture_child() {
+        if std::env::var_os("ELIOT_NATIVE_STDERR_FIXTURE").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+        {
+            return;
+        }
+        let mut stderr = std::io::stderr().lock();
+        stderr
+            .write_all(&vec![b'x'; 32 * 1024])
+            .expect("fixture stderr");
+        stderr
+            .write_all(b"\nnative-child failure vendor-secret xy\n")
+            .expect("fixture marker");
+        stderr.flush().expect("flush fixture stderr");
+    }
+
+    #[tokio::test]
+    async fn native_stderr_is_owned_redacted_and_keeps_unknown() {
+        let launch = NativeLaunch {
+            program: std::env::current_exe()
+                .expect("test executable")
+                .into_os_string(),
+            args: [
+                "--exact",
+                "native::client::tests::stderr_fixture_child",
+                "--nocapture",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
+            cwd: std::env::current_dir().expect("test cwd"),
+            environment: vec![(
+                OsString::from("ELIOT_NATIVE_STDERR_FIXTURE"),
+                OsString::from("1"),
+            )],
+        };
+        let mut native = NativeProcess::spawn(launch, SecretPolicy::new(["vendor-secret", "xy"]))
+            .await
+            .expect("start synthetic child");
+        let client = native.client();
+        // The test harness's stdout is deliberately not a native protocol frame.
+        let error = client
+            .call(
+                "initialize",
+                serde_json::json!({}),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .expect_err("malformed/closed transport has unknown outcome");
+        let _ = native
+            .terminate(false, Instant::now() + Duration::from_secs(5))
+            .await;
+        let error = client.diagnostic_error(error.with_stderr(
+            StderrSource::Plugin,
+            StderrSnapshot {
+                text: "plugin context".to_owned(),
+                truncated: false,
+                eof: true,
+                read_error: false,
+            },
+        ));
+        assert_eq!(error.code, "unknown");
+        assert!(native.stderr.is_none());
+        let snapshot = client.stderr_snapshot();
+        assert!(snapshot.eof);
+        assert!(!snapshot.read_error);
+        assert!(snapshot.truncated);
+        assert!(snapshot.text.len() <= eliot_core::MAX_STDERR_BYTES);
+        assert!(snapshot.text.contains("native-child failure"));
+        assert!(!snapshot.text.contains("vendor-secret"));
+        assert!(!snapshot.text.contains("xy"));
+        assert_eq!(error.diagnostics.len(), 2);
+        let error = crate::host::contextual_error(error, "unknown", "native cleanup readback");
+        assert_eq!(error.diagnostics.len(), 2);
+        let encoded = serde_json::to_string(&error).expect("bounded error wire");
+        assert!(!encoded.contains("vendor-secret"));
+        assert!(!encoded.contains("xy"));
+        let restored: Error = serde_json::from_str(&encoded).expect("decode error diagnostics");
+        assert_eq!(restored, error);
     }
 }

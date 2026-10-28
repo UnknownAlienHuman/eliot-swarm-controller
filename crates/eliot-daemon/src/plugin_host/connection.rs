@@ -7,7 +7,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -34,6 +34,7 @@ struct ClientInner {
     next_id: AtomicU64,
     closed: Mutex<Option<Error>>,
     closed_signal: watch::Sender<()>,
+    reader_closed: AtomicBool,
 }
 
 struct Outbound {
@@ -70,6 +71,7 @@ impl PluginConnection {
             next_id: AtomicU64::new(0),
             closed: Mutex::new(None),
             closed_signal,
+            reader_closed: AtomicBool::new(false),
         });
         let client = PluginClient {
             inner: Arc::clone(&inner),
@@ -94,6 +96,11 @@ impl PluginConnection {
 }
 
 impl PluginClient {
+    /// Transport EOF/framing failure, never a native session/command outcome.
+    pub(crate) fn reader_closed(&self) -> bool {
+        self.inner.reader_closed.load(Ordering::Acquire)
+    }
+
     /// Send one host request and await its matching plugin response while the
     /// independent reader continues routing plugin requests and other responses.
     pub(crate) async fn call(
@@ -167,25 +174,7 @@ impl PluginClient {
         };
 
         if let Some(error) = response.error {
-            let code = error
-                .data
-                .as_ref()
-                .and_then(|data| data.get("code"))
-                .and_then(Value::as_str)
-                .filter(|code| {
-                    !code.is_empty()
-                        && code.len() <= 64
-                        && code
-                            .bytes()
-                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-                });
-            let Some(code) = code else {
-                return Err(Error::new(
-                    "unknown",
-                    "plugin outcome unknown: plugin_error_reply_missing_code",
-                ));
-            };
-            return Err(Error::new(code, error.message));
+            return Err(error_from_reply(error));
         }
 
         response.result.ok_or_else(|| {
@@ -209,16 +198,24 @@ impl PluginClient {
                 result: Some(result),
                 error: None,
             },
-            Err(error) => RpcResponse {
-                jsonrpc: "2.0".to_owned(),
-                id,
-                result: None,
-                error: Some(RpcError {
-                    code: -32000,
-                    message: error.message,
-                    data: Some(json!({"code": error.code})),
-                }),
-            },
+            Err(error) => {
+                let mut data = json!({"code": error.code});
+                if let Ok(value) = serde_json::to_value(&error)
+                    && let Some(diagnostics) = value.get("diagnostics")
+                {
+                    data["diagnostics"] = diagnostics.clone();
+                }
+                RpcResponse {
+                    jsonrpc: "2.0".to_owned(),
+                    id,
+                    result: None,
+                    error: Some(RpcError {
+                        code: -32000,
+                        message: error.message,
+                        data: Some(data),
+                    }),
+                }
+            }
         };
         self.send_frame(encode_frame(&response)?, deadline).await
     }
@@ -439,6 +436,7 @@ where
             }
         }
     };
+    client.inner.reader_closed.store(true, Ordering::Release);
     fail_connection(&client.inner, failure).await;
 }
 
@@ -457,6 +455,35 @@ async fn fail_pending(inner: &ClientInner, error: Error) {
     for (_, sender) in pending {
         let _ = sender.send(Err(error.clone()));
     }
+}
+
+fn error_from_reply(error: RpcError) -> Error {
+    let code = error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("code"))
+        .and_then(Value::as_str)
+        .filter(|code| {
+            !code.is_empty()
+                && code.len() <= 64
+                && code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        });
+    let (code, message) = match code {
+        Some(code) => (code.to_owned(), error.message),
+        None => (
+            "unknown".to_owned(),
+            "plugin outcome unknown: plugin_error_reply_missing_code".to_owned(),
+        ),
+    };
+    let mut value = json!({"code": code, "message": message});
+    if let Some(diagnostics) = error.data.as_ref().and_then(|data| data.get("diagnostics")) {
+        value["diagnostics"] = diagnostics.clone();
+    }
+    // Core drops/bounds malformed optional diagnostics independently of the
+    // primary error. No tail may change C1 classification or imply success.
+    serde_json::from_value(value).unwrap_or_else(|_| Error::new(code, message))
 }
 
 fn unknown_transport_error(error: Error) -> Error {
@@ -483,10 +510,11 @@ fn unknown_transport_error(error: Error) -> Error {
         .take(40)
         .collect();
     let cause = if cause.is_empty() { "error" } else { &cause };
-    Error::new(
-        "unknown",
-        format!("plugin outcome unknown: plugin_transport_{cause}"),
-    )
+    let message = format!("plugin outcome unknown: plugin_transport_{cause}");
+    let mut error = error;
+    error.code = "unknown".to_owned();
+    error.message = message;
+    error
 }
 
 async fn fail_connection(inner: &ClientInner, error: Error) {

@@ -10,7 +10,7 @@ use crate::{
     workspace_git::WorkspaceGit,
 };
 use eliot_core::{
-    Agent, Command as CoreCommand, CommandState, Error, Result, SubmitCommand,
+    Agent, Command as CoreCommand, CommandState, Error, Result, SecretPolicy, SubmitCommand,
     WorkspaceCancelOutcome, WorkspaceCreationOutcome, WorkspacePhase, WorkspacePreparation,
     WorkspacePreparationInput, WorkspaceRemovalOutcome, WorkspaceSetupOutcome,
 };
@@ -994,7 +994,7 @@ impl WorkspaceManager {
         });
     }
 
-    fn check_nonsecret(&self, mut value: Value) -> Result<()> {
+    fn check_nonsecret(&self, value: Value) -> Result<()> {
         let secrets: Vec<_> = self
             .inner
             .secrets
@@ -1003,7 +1003,7 @@ impl WorkspaceManager {
             .iter()
             .cloned()
             .collect();
-        if crate::redaction::redact_value(&mut value, &secrets) {
+        if SecretPolicy::new(secrets).contains_value(&value) {
             return Err(problem(
                 "secret_in_payload",
                 "workspace preparation contains a known credential",

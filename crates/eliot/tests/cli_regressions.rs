@@ -44,16 +44,50 @@ fn malformed_after_dispatch_remains_unknown_across_restart() {
             "[fake:malformed-after-dispatch]",
         ],
     );
-    let unknown = fixture.json(&["cmd", "show", &fault_id]);
+    let mut unknown = fixture.json(&["cmd", "show", &fault_id]);
     assert_eq!(
         unknown["state"],
         "unknown",
-        "send exit {:?}, stderr: {}; command: {unknown}",
-        fault.status.code(),
-        fault.stderr
+        "send exit {:?}; private diagnostics deliberately omitted",
+        fault.status.code()
     );
     assert_eq!(fault.status.code(), Some(4), "unknown must have CLI exit 4");
     assert!(unknown["turn_id"].is_null());
+    let diagnostic_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !has_masked_plugin_line(&unknown["outcome"]) {
+        assert!(
+            std::time::Instant::now() < diagnostic_deadline,
+            "Unknown outcome omitted its sanitized Plugin stderr line"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        unknown = fixture.json(&["cmd", "show", &fault_id]);
+        assert_eq!(unknown["state"], "unknown");
+    }
+    let owner_token = fs::read_to_string(fixture.data.join("owner.token")).unwrap();
+    let outcome_text = serde_json::to_string(&unknown["outcome"]).unwrap();
+    assert!(
+        !outcome_text.contains(&owner_token),
+        "owner credential entered the outcome"
+    );
+    let log_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let log = fs::read_to_string(fixture.data.join("logs/daemon.log")).unwrap();
+        assert!(log.len() <= 1024 * 1024, "daemon log exceeded its bound");
+        assert!(
+            !log.contains(&owner_token),
+            "owner credential entered the daemon log"
+        );
+        if log.lines().any(|line| {
+            serde_json::from_str::<Value>(line).is_ok_and(|record| has_masked_plugin_line(&record))
+        }) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < log_deadline,
+            "daemon log omitted the sanitized Plugin stderr line"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
     let blocked_before = assert_input_blocked(&fixture, agent, &generation);
     let dispatches_before = fault_dispatches(&fixture.events(), &fault_id);
     assert_eq!(
@@ -68,6 +102,10 @@ fn malformed_after_dispatch_remains_unknown_across_restart() {
     assert_eq!(retained["target"], agent);
     assert_eq!(retained["generation"], unknown["generation"]);
     assert!(retained["turn_id"].is_null());
+    assert!(
+        has_masked_plugin_line(&retained["outcome"]),
+        "restart lost the sanitized diagnostic"
+    );
     let blocked_after = assert_input_blocked(&fixture, agent, &generation);
     let status = fixture.json(&["status"]);
     assert!(
@@ -98,6 +136,19 @@ fn malformed_after_dispatch_remains_unknown_across_restart() {
             .is_empty()
     );
     fixture.stop(true);
+}
+
+fn has_masked_plugin_line(value: &Value) -> bool {
+    value["diagnostics"].as_array().is_some_and(|diagnostics| {
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic["source"] == "plugin"
+                && diagnostic["snapshot"]["text"].as_str().is_some_and(|text| {
+                    text.lines().any(|line| {
+                        line.strip_prefix("fake_stderr_before_malformed=") == Some("[REDACTED]")
+                    })
+                })
+        })
+    })
 }
 
 fn assert_input_blocked(fixture: &Fixture, agent: &str, generation: &str) -> String {

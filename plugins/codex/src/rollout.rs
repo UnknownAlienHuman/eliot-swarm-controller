@@ -1,7 +1,7 @@
 //! Bounded metadata projection of the exact Codex JSONL path returned by thread/read.
 //! This is deliberately not a session executor or a general rollout discovery API.
 
-use eliot_core::{Error, Result};
+use eliot_core::{Error, Result, SecretPolicy};
 use eliot_plugin::{
     FileIdentity, MAX_OBSERVATION_CURSOR_BYTES, MAX_OBSERVATION_PAGE_BYTES,
     MAX_OBSERVATION_PAGE_ENTRIES, ObservationQuery, file_final_path, file_identity,
@@ -758,15 +758,7 @@ fn reject_cursor_secrets(cursor: &RolloutCursor, secrets: &[String]) -> Result<(
 }
 
 fn reject_secret_text(value: &str, secrets: &[String]) -> Result<()> {
-    if secrets.iter().any(|secret| {
-        if secret.is_empty() {
-            false
-        } else if secret.len() < 4 {
-            value == secret.as_str()
-        } else {
-            value.contains(secret.as_str())
-        }
-    }) {
+    if SecretPolicy::new(secrets.iter().cloned()).contains_text(value) {
         return Err(Error::new(
             "secret_in_payload",
             "Codex rollout cursor contains a known secret",

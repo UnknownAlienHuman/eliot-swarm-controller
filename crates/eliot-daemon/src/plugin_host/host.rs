@@ -5,8 +5,10 @@ mod reader;
 use crate::bus::Bus;
 use crate::monitor::Monitoring;
 use crate::platform::OwnedChild;
-use eliot_core::{Agent, Command, Error, Result, SourceBatch, SourceGap, SourceGapAck};
-use eliot_plugin::PluginManifest;
+use eliot_core::{
+    Agent, Command, Error, Result, SecretPolicy, SourceBatch, SourceGap, SourceGapAck, StderrSource,
+};
+use eliot_plugin::{PluginManifest, StderrCapture, StderrView, spawn_stderr};
 use serde_json::{Map, Value, json};
 use std::{
     collections::{HashMap, HashSet},
@@ -17,7 +19,6 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
-    io,
     process::Command as ProcessCommand,
     sync::{Mutex as AsyncMutex, mpsc, oneshot, watch},
     time::{Instant, timeout_at},
@@ -57,6 +58,8 @@ struct AgentKey {
 struct RuntimeEntry {
     sender: mpsc::Sender<RuntimeMessage>,
     verbs: HashSet<String>,
+    stderr: StderrView,
+    source_credentials: Arc<[String]>,
 }
 
 enum RuntimeMessage {
@@ -103,6 +106,13 @@ struct AgentActorConfig {
     source_credentials: Arc<[String]>,
     resume_from: Option<Value>,
     source_state: Option<Value>,
+    stderr: StderrView,
+}
+
+struct PendingFailure {
+    reply: Option<oneshot::Sender<Result<Value>>>,
+    error: Error,
+    command_id: String,
 }
 
 struct EventSource {
@@ -258,17 +268,19 @@ impl PluginHost {
                     )
                 })?
         };
-        let mut source_credentials = vec![
-            self.state.owner_token.clone(),
-            agent_token.clone(),
-            credential.clone(),
-        ];
-        source_credentials.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
-        let source_credentials: Arc<[String]> = source_credentials.into();
+        let target_environment = build_target_environment(&agent, &agent_token)?;
+        let source_credentials = source_secret_snapshot(
+            &agent.profile_snapshot,
+            &target_environment,
+            vec![
+                self.state.owner_token.clone(),
+                agent_token.clone(),
+                credential.clone(),
+            ],
+        );
         if let Some(source_state) = source_state.as_mut() {
             crate::redaction::redact_value(source_state, &source_credentials);
         }
-        let target_environment = build_target_environment(&agent, &agent_token)?;
         {
             let mut credentials = self
                 .state
@@ -316,11 +328,11 @@ impl PluginHost {
             ));
         };
 
-        tokio::spawn(async move {
-            let mut stderr = stderr;
-            let mut sink = io::sink();
-            let _ = io::copy(&mut stderr, &mut sink).await;
-        });
+        let stderr_capture = spawn_stderr(
+            stderr,
+            Arc::new(SecretPolicy::new(source_credentials.iter())),
+        );
+        let stderr_view = stderr_capture.view();
 
         let connection = PluginConnection::new(stdout, stdin);
         let client = connection.client();
@@ -356,6 +368,8 @@ impl PluginHost {
                         .into_iter()
                         .map(str::to_owned)
                         .collect(),
+                    stderr: stderr_view.clone(),
+                    source_credentials: Arc::clone(&source_credentials),
                 },
             );
         }
@@ -368,15 +382,25 @@ impl PluginHost {
             instance_dir: instance_dir.to_string_lossy().into_owned(),
             plugin_credential: credential.clone(),
             target_environment,
-            source_credentials,
+            source_credentials: Arc::clone(&source_credentials),
             resume_from,
             source_state,
+            stderr: stderr_view.clone(),
         };
         tokio::spawn(async move {
-            run_agent(actor, child, client, event_task, message_rx, started_tx).await;
+            run_agent(
+                actor,
+                child,
+                client,
+                event_task,
+                message_rx,
+                started_tx,
+                stderr_capture,
+            )
+            .await;
         });
 
-        match timeout_at(Instant::now() + RPC_DEADLINE + RPC_GRACE, started_rx).await {
+        let result = match timeout_at(Instant::now() + RPC_DEADLINE + RPC_GRACE, started_rx).await {
             Ok(Ok(Ok(result))) => Ok(result),
             Ok(Ok(Err(error))) => Err(error),
             Ok(Err(_)) => Err(Error::new(
@@ -387,7 +411,8 @@ impl PluginHost {
                 "unknown",
                 "Agent plugin start exceeded its absolute deadline",
             )),
-        }
+        };
+        result.map_err(|error| diagnose_error(error, &stderr_view, &source_credentials))
     }
 
     pub(crate) async fn command(&self, agent: &Agent, command: Command) -> Result<Value> {
@@ -420,7 +445,7 @@ impl PluginHost {
             }
             _ => {}
         }
-        let sender = self.sender(&key, &command.verb)?;
+        let (sender, stderr, credentials) = self.sender(&key, &command.verb)?;
         let (reply, response) = oneshot::channel();
         timeout_at(
             Instant::now() + RPC_DEADLINE,
@@ -429,7 +454,7 @@ impl PluginHost {
         .await
         .map_err(|_| Error::new("busy", "Agent plugin command queue is full"))?
         .map_err(|_| Error::new("unknown", "owned Agent plugin is no longer available"))?;
-        match timeout_at(Instant::now() + RPC_DEADLINE + RPC_GRACE, response).await {
+        let result = match timeout_at(Instant::now() + RPC_DEADLINE + RPC_GRACE, response).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(Error::new(
                 "unknown",
@@ -439,7 +464,8 @@ impl PluginHost {
                 "unknown",
                 "Agent plugin command exceeded its absolute deadline",
             )),
-        }
+        };
+        result.map_err(|error| diagnose_error(error, &stderr, &credentials))
     }
 
     pub(crate) async fn stop(&self, agent: &Agent, command: Command, force: bool) -> Result<Value> {
@@ -447,7 +473,7 @@ impl PluginHost {
             id: agent.id.clone(),
             generation: agent.generation,
         };
-        let sender = self.sender(&key, "stop")?;
+        let (sender, stderr, credentials) = self.sender(&key, "stop")?;
         let (reply, response) = oneshot::channel();
         timeout_at(
             Instant::now() + RPC_DEADLINE,
@@ -460,7 +486,7 @@ impl PluginHost {
         .await
         .map_err(|_| Error::new("busy", "Agent plugin command queue is full"))?
         .map_err(|_| Error::new("unknown", "owned Agent plugin is no longer available"))?;
-        match timeout_at(
+        let result = match timeout_at(
             Instant::now() + RPC_DEADLINE + STOP_GRACE + STOP_GRACE + RPC_GRACE,
             response,
         )
@@ -475,7 +501,8 @@ impl PluginHost {
                 "unknown",
                 "Agent plugin stop exceeded its absolute deadline",
             )),
-        }
+        };
+        result.map_err(|error| diagnose_error(error, &stderr, &credentials))
     }
 
     pub(crate) async fn force_all(&self) {
@@ -537,7 +564,11 @@ impl PluginHost {
             })
     }
 
-    fn sender(&self, key: &AgentKey, verb: &str) -> Result<mpsc::Sender<RuntimeMessage>> {
+    fn sender(
+        &self,
+        key: &AgentKey,
+        verb: &str,
+    ) -> Result<(mpsc::Sender<RuntimeMessage>, StderrView, Arc<[String]>)> {
         self.state
             .running
             .lock()
@@ -554,7 +585,11 @@ impl PluginHost {
             })
             .and_then(|entry| {
                 if entry.verbs.contains(verb) {
-                    Ok(entry.sender.clone())
+                    Ok((
+                        entry.sender.clone(),
+                        entry.stderr.clone(),
+                        Arc::clone(&entry.source_credentials),
+                    ))
                 } else {
                     Err(Error::new(
                         "unsupported",
@@ -668,11 +703,55 @@ impl PluginHost {
 
 async fn run_agent(
     actor: AgentActorConfig,
+    child: OwnedChild,
+    client: PluginClient,
+    event_task: tokio::task::JoinHandle<()>,
+    messages: mpsc::Receiver<RuntimeMessage>,
+    started: oneshot::Sender<Result<Value>>,
+    stderr_capture: StderrCapture,
+) {
+    let credentials = Arc::clone(&actor.source_credentials);
+    let key = actor.key.clone();
+    let mut failure = None;
+    run_agent_inner(
+        actor,
+        child,
+        client,
+        event_task,
+        messages,
+        started,
+        &mut failure,
+    )
+    .await;
+    // All existing child/custody cleanup paths have completed or dropped their
+    // owning handle. Finish the sole stderr drain before the final error view.
+    let snapshot = stderr_capture.finish(Instant::now() + STOP_GRACE).await;
+    if let Some(failure) = failure {
+        let error = redact_native_error(
+            failure.error.with_stderr(StderrSource::Plugin, snapshot),
+            &credentials,
+        );
+        record_plugin_error(
+            &error,
+            &key.id,
+            key.generation,
+            &failure.command_id,
+            &credentials,
+        );
+        if let Some(reply) = failure.reply {
+            let _ = reply.send(Err(error));
+        }
+    }
+}
+
+async fn run_agent_inner(
+    actor: AgentActorConfig,
     mut child: OwnedChild,
     client: PluginClient,
     mut event_task: tokio::task::JoinHandle<()>,
     mut messages: mpsc::Receiver<RuntimeMessage>,
     started: oneshot::Sender<Result<Value>>,
+    pending_failure: &mut Option<PendingFailure>,
 ) {
     let AgentActorConfig {
         state,
@@ -686,6 +765,7 @@ async fn run_agent(
         source_credentials,
         resume_from,
         source_state,
+        stderr,
     } = actor;
     let mut last_command_id = start_command.id.clone();
     let init = client
@@ -886,7 +966,7 @@ async fn run_agent(
                                 client.call("agent.command", params, deadline()).await
                                     .map_err(|error| redact_native_error(error, &source_credentials))
                                     .and_then(|mut value| {
-                                        crate::redaction::redact_value(
+                                        crate::redaction::redact_outcome(
                                             &mut value,
                                             &source_credentials,
                                         );
@@ -894,7 +974,23 @@ async fn run_agent(
                                     })
                             }
                         };
-                        let _ = reply.send(result);
+                        match result {
+                            Err(error) if error.code == "unknown" && client.reader_closed() && pending_failure.is_none() => {
+                                // The actual protocol reader ended. Keep this
+                                // exact pending caller through existing loss
+                                // cleanup, then finish stderr before replying.
+                                *pending_failure = Some(PendingFailure {
+                                    reply: Some(reply), error, command_id: command.id,
+                                });
+                            }
+                            result => {
+                                let result = diagnose_result(result, &stderr, &source_credentials);
+                                if let Err(error) = &result {
+                                    record_plugin_error(error, &agent.id, agent.generation, &command.id, &source_credentials);
+                                }
+                                let _ = reply.send(result);
+                            }
+                        }
                     }
                     RuntimeMessage::Stop { command, force, reply } => {
                         let snapshot_command_id = last_command_id.clone();
@@ -1288,6 +1384,7 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
                 }
             }
         };
+        let result = result.map_err(|error| redact_native_error(error, &source_credentials));
         let _ = client.respond(request_id, result, request_deadline).await;
     }
     if let Some(state) = state.upgrade() {
@@ -1403,10 +1500,60 @@ fn source_state_binding(
 }
 
 fn redact_native_error(error: Error, credentials: &[String]) -> Error {
-    Error::new(
-        error.code,
-        crate::redaction::redact_text(&error.message, credentials),
+    crate::redaction::redact_error(error, credentials)
+}
+
+fn diagnose_error(error: Error, stderr: &StderrView, credentials: &[String]) -> Error {
+    redact_native_error(
+        error.with_stderr(StderrSource::Plugin, stderr.snapshot()),
+        credentials,
     )
+}
+
+fn diagnose_result(
+    result: Result<Value>,
+    stderr: &StderrView,
+    credentials: &[String],
+) -> Result<Value> {
+    match result {
+        Err(error) => Err(diagnose_error(error, stderr, credentials)),
+        Ok(mut value) => {
+            if matches!(
+                value.get("state").and_then(Value::as_str),
+                Some("failed" | "rejected" | "unknown")
+            ) {
+                crate::redaction::attach_stderr(
+                    &mut value,
+                    StderrSource::Plugin,
+                    stderr.snapshot(),
+                    credentials,
+                );
+            } else {
+                crate::redaction::redact_outcome(&mut value, credentials);
+            }
+            Ok(value)
+        }
+    }
+}
+
+fn record_plugin_error(
+    error: &Error,
+    agent: &str,
+    generation: i64,
+    command: &str,
+    credentials: &[String],
+) {
+    let generation = generation.to_string();
+    crate::logging::record(
+        &SecretPolicy::new(credentials),
+        &error.code,
+        &[
+            ("agent", agent),
+            ("generation", &generation),
+            ("command", command),
+        ],
+        Some(error),
+    );
 }
 
 fn plugin_command_args(command: &Command) -> Result<Value> {
@@ -1622,6 +1769,33 @@ fn minimal_plugin_environment() -> Vec<(OsString, OsString)> {
         .iter()
         .filter_map(|name| std::env::var_os(name).map(|value| (OsString::from(*name), value)))
         .collect()
+}
+
+/// Freeze known execution values once, from the exact environment sent to this
+/// source. Do not infer secrets from variable names or reread mutable process env.
+fn source_secret_snapshot(
+    profile: &Value,
+    environment: &Value,
+    mut known: Vec<String>,
+) -> Arc<[String]> {
+    if let (Some(names), Some(environment)) = (
+        profile.get("pass_env").and_then(Value::as_array),
+        environment.as_object(),
+    ) {
+        for name in names.iter().filter_map(Value::as_str) {
+            if let Some(value) = environment.iter().find_map(|(key, value)| {
+                let matches = if cfg!(windows) {
+                    key.eq_ignore_ascii_case(name)
+                } else {
+                    key == name
+                };
+                matches.then(|| value.as_str()).flatten()
+            }) {
+                known.push(value.to_owned());
+            }
+        }
+    }
+    known.into()
 }
 
 pub(crate) fn build_process_environment(profile: &Value) -> Result<Map<String, Value>> {

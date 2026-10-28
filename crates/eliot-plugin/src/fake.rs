@@ -680,6 +680,10 @@ async fn handle_command(
     if text == MALFORMED_AFTER_DISPATCH {
         // Exact C1 regression hook: validation passed, but the dispatched call
         // loses its transport without any authoritative response or echo batch.
+        let mut stderr = tokio::io::stderr();
+        let diagnostic = format!("fake_stderr_before_malformed={credential}\n");
+        let _ = stderr.write_all(diagnostic.as_bytes()).await;
+        let _ = stderr.flush().await;
         let mut stdout = tokio::io::stdout();
         let _ = stdout
             .write_all(b"fake malformed frame after dispatch\n")

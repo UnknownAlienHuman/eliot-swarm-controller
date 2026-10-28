@@ -14,7 +14,7 @@ use crate::{
         types::{NativeHistoryItemsResponse, NativeObservedThreadReadResponse},
     },
 };
-use eliot_core::{Error, Result};
+use eliot_core::{Error, Result, SecretPolicy};
 use eliot_plugin::{
     MAX_OBSERVATION_PAGE_BYTES, ObservationPage, ObservationQuery, ObserverAttachParams,
     ObserverDetachParams, ObserverSnapshotParams, protocol::MAX_OBSERVATION_CURSOR_BYTES,
@@ -121,10 +121,8 @@ impl ObserverSession {
             Ok(subject) => subject,
             Err(error) => {
                 drop(client);
-                if finish_reader(&mut reader, Some(drainer)).await.is_err() {
-                    return Err(reader_cleanup_unknown());
-                }
-                return Err(error);
+                finish_reader(&mut reader, Some(drainer)).await?;
+                return Err(reader.client().diagnostic_error(error));
             }
         };
         drop(client);
@@ -142,10 +140,8 @@ impl ObserverSession {
         }) {
             Ok(metadata) => metadata,
             Err(error) => {
-                if finish_reader(&mut reader, Some(drainer)).await.is_err() {
-                    return Err(reader_cleanup_unknown());
-                }
-                return Err(error);
+                finish_reader(&mut reader, Some(drainer)).await?;
+                return Err(reader.client().diagnostic_error(error));
             }
         };
         let attach_result = match bounded(
@@ -164,10 +160,8 @@ impl ObserverSession {
         ) {
             Ok(result) => result,
             Err(error) => {
-                if finish_reader(&mut reader, Some(drainer)).await.is_err() {
-                    return Err(reader_cleanup_unknown());
-                }
-                return Err(error);
+                finish_reader(&mut reader, Some(drainer)).await?;
+                return Err(reader.client().diagnostic_error(error));
             }
         };
 
@@ -212,6 +206,18 @@ impl ObserverSession {
     }
 
     pub(crate) async fn snapshot(
+        &mut self,
+        params: &ObserverSnapshotParams,
+        deadline: Instant,
+    ) -> Result<Value> {
+        let result = self.snapshot_inner(params, deadline).await;
+        result.map_err(|error| match &self.reader {
+            Some(reader) => reader.client().diagnostic_error(error),
+            None => error,
+        })
+    }
+
+    async fn snapshot_inner(
         &mut self,
         params: &ObserverSnapshotParams,
         deadline: Instant,
@@ -781,24 +787,11 @@ fn sanitize_value(value: &mut Value, secrets: &[String], protected: bool) -> Res
 }
 
 fn sanitize_text(value: &mut String, secrets: &[String], protected: bool) -> Result<()> {
-    for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
-        let matches = if secret.len() < 4 {
-            value.as_str() == secret.as_str()
-        } else {
-            value.contains(secret.as_str())
-        };
-        if !matches {
-            continue;
-        }
-        if protected {
-            return Err(secret_in_payload());
-        }
-        if secret.len() < 4 {
-            *value = "[REDACTED]".to_owned();
-        } else {
-            *value = value.replace(secret.as_str(), "[REDACTED]");
-        }
+    let policy = SecretPolicy::new(secrets.iter().cloned());
+    if protected && policy.contains_text(value) {
+        return Err(secret_in_payload());
     }
+    *value = policy.redact_text(value);
     Ok(())
 }
 
@@ -837,15 +830,13 @@ fn history_error(error: Error) -> Error {
     if error.code == "native_rejected"
         && (message.contains("method not found") || message.contains("unknown method"))
     {
-        return Error::new(
-            "unsupported",
-            "Codex native history read is unsupported by this app-server",
-        );
+        return error
+            .with_code("unsupported")
+            .with_message("Codex native history read is unsupported by this app-server");
     }
-    Error::new(
-        "history_gap",
-        "Codex exact persisted readback is unavailable or unsupported",
-    )
+    error
+        .with_code("history_gap")
+        .with_message("Codex exact persisted readback is unavailable or unsupported")
 }
 
 fn invalid() -> Error {
@@ -893,6 +884,25 @@ fn unverified_store() -> Error {
         "Codex observation store identity could not be represented exactly",
     )
 }
-fn reader_cleanup_unknown() -> Error {
-    Error::new("unknown", "Codex observer reader cleanup is unconfirmed")
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_text;
+
+    #[test]
+    fn short_and_overlapping_secrets_reject_routing_ids_without_mutation() {
+        let secrets = vec!["xy".to_owned(), "xy-long".to_owned(), String::new()];
+        let mut identifier = "native-xy-long-id".to_owned();
+        let original = identifier.clone();
+        assert_eq!(
+            sanitize_text(&mut identifier, &secrets, true)
+                .expect_err("protected identity must reject")
+                .code,
+            "secret_in_payload"
+        );
+        assert_eq!(identifier, original);
+        let mut text = "xy-long xy".to_owned();
+        sanitize_text(&mut text, &secrets, false).expect("redact free text");
+        assert_eq!(text, "[REDACTED] [REDACTED]");
+    }
 }

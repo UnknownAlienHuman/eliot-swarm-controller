@@ -3,7 +3,7 @@ use super::{
     AgentKey, PluginHost, RPC_GRACE, STOP_GRACE, build_process_environment, redact_native_error,
     signal_progress,
 };
-use eliot_core::{Error, Result};
+use eliot_core::{Error, Result, SecretPolicy, StderrSource};
 use eliot_plugin::DiscoverPage;
 use serde_json::{Value, json};
 use std::{collections::HashSet, sync::atomic::Ordering, time::Duration};
@@ -170,6 +170,7 @@ impl PluginHost {
                     generation: 0,
                 },
                 harness,
+                &profile,
                 &environment,
                 None,
             )
@@ -210,12 +211,15 @@ impl PluginHost {
             _ = stop.changed() => Err(Error::new("cancelled", "discovery was cancelled")),
         };
         let secrets = reader.secrets.clone();
-        if !reader.close(self, None).await {
-            return Err(Error::new(
+        let closure = reader.close(self, None).await;
+        let result = if !closure.closed {
+            Err(Error::new(
                 "unavailable",
                 "discovery reader cleanup is unconfirmed",
-            ));
-        }
+            ))
+        } else {
+            result
+        };
         match result {
             Ok(mut value) => {
                 if crate::redaction::redact_value(&mut value, &secrets) {
@@ -227,7 +231,19 @@ impl PluginHost {
                     Ok(value)
                 }
             }
-            Err(error) => Err(redact_native_error(error, &secrets)),
+            Err(error) => {
+                let error = redact_native_error(
+                    error.with_stderr(StderrSource::Plugin, closure.stderr),
+                    &secrets,
+                );
+                crate::logging::record(
+                    &SecretPolicy::new(secrets.iter()),
+                    &error.code,
+                    &[("operation", "discover")],
+                    Some(&error),
+                );
+                Err(error)
+            }
         }
     }
 }

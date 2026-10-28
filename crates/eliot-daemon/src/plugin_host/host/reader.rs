@@ -1,20 +1,19 @@
 //! Owned reader transport shared by no-Agent discovery and bound observation.
 use super::{
     AgentKey, EventSource, PluginClient, PluginConnection, PluginHost, RPC_GRACE, STOP_GRACE,
-    deadline, serve_plugin_requests,
+    deadline, serve_plugin_requests, source_secret_snapshot,
 };
 use crate::{
     monitor::Monitoring,
     platform::{CustodyObserver, OwnedChild},
 };
-use eliot_core::{Agent, Error, Result};
-use eliot_plugin::PluginManifest;
+use eliot_core::{Agent, Error, Result, SecretPolicy, StderrSnapshot};
+use eliot_plugin::{PluginManifest, StderrCapture, spawn_stderr};
 use serde_json::{Value, json};
 #[cfg(unix)]
 use std::time::Duration;
 use std::{path::PathBuf, sync::Arc};
 use tokio::{
-    io,
     task::JoinHandle,
     time::{Instant, timeout_at},
 };
@@ -27,7 +26,12 @@ pub(super) struct ReaderTransport {
     instance_dir: PathBuf,
     observer: Option<CustodyObserver>,
     requests: JoinHandle<()>,
-    stderr: JoinHandle<()>,
+    stderr: StderrCapture,
+}
+
+pub(super) struct ReaderClose {
+    pub closed: bool,
+    pub stderr: StderrSnapshot,
 }
 
 impl PluginHost {
@@ -35,32 +39,16 @@ impl PluginHost {
         &self,
         key: &AgentKey,
         harness: &str,
+        profile: &Value,
         environment: &Value,
         observation: Option<&Agent>,
     ) -> Result<ReaderTransport> {
         let (instance_dir, credential) = self.create_instance_dir(key)?;
-        let mut secrets: Vec<_> = self
-            .state
-            .secrets
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .cloned()
-            .collect();
-        secrets.push(credential.clone());
-        if let Some(environment) = environment.as_object() {
-            for (name, value) in environment {
-                let upper = name.to_ascii_uppercase();
-                if ["KEY", "TOKEN", "SECRET", "PASSWORD"]
-                    .iter()
-                    .any(|part| upper.contains(part))
-                    && let Some(value) = value.as_str().filter(|value| value.len() >= 4)
-                {
-                    secrets.push(value.to_owned());
-                }
-            }
-        }
-        secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+        let secrets = source_secret_snapshot(
+            profile,
+            environment,
+            vec![self.state.owner_token.clone(), credential.clone()],
+        );
         let mut child = match self.spawn_plugin_process(harness, &instance_dir) {
             Ok(child) => child,
             Err(error) => {
@@ -69,7 +57,7 @@ impl PluginHost {
             }
         };
         let observer = child.observer().ok();
-        let (Some(stdin), Some(stdout), Some(mut stderr)) =
+        let (Some(stdin), Some(stdout), Some(stderr)) =
             (child.take_stdin(), child.take_stdout(), child.take_stderr())
         else {
             // OwnedChild retains its original Job/group authority on this path.
@@ -84,12 +72,9 @@ impl PluginHost {
                 "reader plugin pipes are unavailable",
             ));
         };
-        let stderr = tokio::spawn(async move {
-            let _ = io::copy(&mut stderr, &mut io::sink()).await;
-        });
+        let stderr = spawn_stderr(stderr, Arc::new(SecretPolicy::new(secrets.iter())));
         let mut connection = PluginConnection::new(stdout, stdin);
         let client = connection.client();
-        let secrets: Arc<[String]> = secrets.into();
         let requests = if let Some(agent) = observation {
             tokio::spawn(serve_plugin_requests(
                 connection,
@@ -142,6 +127,9 @@ impl PluginHost {
 }
 
 impl ReaderTransport {
+    pub(super) fn diagnose(&self, error: Error) -> Error {
+        super::diagnose_error(error, &self.stderr.view(), &self.secrets)
+    }
     pub(super) async fn initialize(
         &mut self,
         harness: &str,
@@ -177,7 +165,7 @@ impl ReaderTransport {
         monitoring.attach(agent, observer).await
     }
 
-    pub(super) async fn close(mut self, host: &PluginHost, agent: Option<&Agent>) -> bool {
+    pub(super) async fn close(mut self, host: &PluginHost, agent: Option<&Agent>) -> ReaderClose {
         let shutdown = Instant::now() + RPC_GRACE;
         let _ = self.client.call("shutdown", json!({}), shutdown).await;
         let _ = self.client.close_input(shutdown).await;
@@ -230,14 +218,16 @@ impl ReaderTransport {
             Ok(Ok(()))
         );
         self.requests.abort();
-        self.stderr.abort();
         if !drained {
             let _ = self.requests.await;
         }
-        let _ = self.stderr.await;
         drop(self.child);
+        let stderr = self.stderr.finish(Instant::now() + RPC_GRACE).await;
         host.remove_plugin_secret(&self.credential);
         let _ = std::fs::remove_dir(&self.instance_dir);
-        reaped && empty && drained
+        ReaderClose {
+            closed: reaped && empty && drained,
+            stderr,
+        }
     }
 }
