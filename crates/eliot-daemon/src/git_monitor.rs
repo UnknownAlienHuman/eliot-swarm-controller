@@ -796,7 +796,7 @@ fn resolve_windows_git(program: PathBuf) -> Result<PathBuf> {
         // Git for Windows cmd/bin entry points may be launchers. Resolve a real
         // installed executable once, before any fenced read; never retry a failed
         // command with a launcher, different executable, or weaker custody.
-        for architecture in ["mingw64", "mingw32", "clangarm64"] {
+        for architecture in ["ucrt64", "mingw64", "mingw32", "clangarm64"] {
             let native = root.join(architecture).join("bin").join("git.exe");
             if fs::metadata(&native).is_ok_and(|metadata| metadata.is_file()) {
                 selected = fs::canonicalize(native)
@@ -1161,4 +1161,53 @@ fn null_device() -> &'static str {
 
 fn unavailable(message: &str) -> Error {
     Error::new("unavailable", message)
+}
+
+#[cfg(all(test, windows))]
+mod windows_selector_tests {
+    use super::*;
+
+    struct SelectorFiles(PathBuf);
+
+    impl Drop for SelectorFiles {
+        fn drop(&mut self) {
+            // Only files and empty directories created by this selector test.
+            for file in ["bin/git.exe", "cmd/git.exe", "ucrt64/bin/git.exe"] {
+                let _ = fs::remove_file(self.0.join(file));
+            }
+            for directory in ["ucrt64/bin", "ucrt64", "cmd", "bin"] {
+                let _ = fs::remove_dir(self.0.join(directory));
+            }
+            let _ = fs::remove_dir(&self.0);
+        }
+    }
+
+    #[test]
+    fn ucrt64_git_selector_handles_launchers_and_direct_native_paths() {
+        let root = env::temp_dir().join(format!("eliot git selector {}", ulid::Ulid::new()));
+        fs::create_dir(&root).expect("create unique selector fixture");
+        let fixture = SelectorFiles(root);
+        for directory in ["bin", "cmd", "ucrt64", "ucrt64/bin"] {
+            fs::create_dir(fixture.0.join(directory)).expect("create installed layout directory");
+        }
+        for file in ["bin/git.exe", "cmd/git.exe", "ucrt64/bin/git.exe"] {
+            // Resolution uses metadata only; no Git/native process is executed.
+            fs::write(fixture.0.join(file), b"selector fixture")
+                .expect("create executable placeholder");
+        }
+        let native = fs::canonicalize(fixture.0.join("ucrt64/bin/git.exe"))
+            .expect("canonical native executable");
+        for launcher in ["bin/git.exe", "cmd/git.exe"] {
+            let launcher =
+                fs::canonicalize(fixture.0.join(launcher)).expect("canonical launcher executable");
+            assert_eq!(
+                resolve_windows_git(launcher).expect("resolve UCRT layout"),
+                native
+            );
+        }
+        assert_eq!(
+            resolve_windows_git(native.clone()).expect("accept direct native path"),
+            native
+        );
+    }
 }

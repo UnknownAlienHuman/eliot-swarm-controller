@@ -148,7 +148,7 @@ impl PluginClient {
             Ok(Ok(Ok(response))) => response,
             Ok(Ok(Err(error))) => {
                 self.inner.pending.lock().await.remove(&key);
-                return Err(error);
+                return Err(unknown_transport_error(error));
             }
             Ok(Err(_)) => {
                 self.inner.pending.lock().await.remove(&key);
@@ -172,13 +172,28 @@ impl PluginClient {
                 .as_ref()
                 .and_then(|data| data.get("code"))
                 .and_then(Value::as_str)
-                .unwrap_or("internal");
+                .filter(|code| {
+                    !code.is_empty()
+                        && code.len() <= 64
+                        && code
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                });
+            let Some(code) = code else {
+                return Err(Error::new(
+                    "unknown",
+                    "plugin outcome unknown: plugin_error_reply_missing_code",
+                ));
+            };
             return Err(Error::new(code, error.message));
         }
 
-        response
-            .result
-            .ok_or_else(|| Error::new("internal", "plugin response omitted its result"))
+        response.result.ok_or_else(|| {
+            Error::new(
+                "unknown",
+                "plugin outcome unknown: plugin_response_missing_result",
+            )
+        })
     }
 
     pub(crate) async fn respond(
@@ -268,7 +283,7 @@ impl PluginClient {
             }
         }
 
-        match timeout_at(deadline, written_rx).await {
+        let result = match timeout_at(deadline, written_rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(Error::new(
                 "unknown",
@@ -278,7 +293,10 @@ impl PluginClient {
                 "unknown",
                 "plugin protocol frame write exceeded its deadline",
             )),
-        }
+        };
+        // Once queued, the writer may have sent any prefix or the whole frame.
+        // A framing/connection failure cannot prove that native I/O did not occur.
+        result.map_err(unknown_transport_error)
     }
 }
 
@@ -434,10 +452,41 @@ async fn route_response(response: RpcResponse, inner: &ClientInner) {
 }
 
 async fn fail_pending(inner: &ClientInner, error: Error) {
+    let error = unknown_transport_error(error);
     let pending = std::mem::take(&mut *inner.pending.lock().await);
     for (_, sender) in pending {
         let _ = sender.send(Err(error.clone()));
     }
+}
+
+fn unknown_transport_error(error: Error) -> Error {
+    if error.code == "unknown"
+        && error
+            .message
+            .strip_prefix("plugin outcome unknown: ")
+            .is_some_and(|cause| {
+                cause.starts_with("plugin_transport_")
+                    && cause.len() <= 64
+                    && cause
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            })
+    {
+        return error;
+    }
+    // Only a bounded cause code crosses this boundary. Never copy a raw frame,
+    // I/O diagnostic, or plugin error body into a persisted unknown cause.
+    let cause: String = error
+        .code
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || *character == '_')
+        .take(40)
+        .collect();
+    let cause = if cause.is_empty() { "error" } else { &cause };
+    Error::new(
+        "unknown",
+        format!("plugin outcome unknown: plugin_transport_{cause}"),
+    )
 }
 
 async fn fail_connection(inner: &ClientInner, error: Error) {
@@ -518,4 +567,107 @@ fn id_key(id: &Value) -> Result<String> {
 
 fn valid_id(id: &Value) -> bool {
     id.is_null() || id.is_string() || id.is_number()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex, split};
+
+    enum PeerFault {
+        InvalidJson,
+        InvalidResponse,
+        OversizedFrame,
+        Eof,
+        ErrorReply(Option<Value>),
+    }
+
+    async fn error_after_written_request(fault: PeerFault) -> Error {
+        let (host, peer) = duplex(64);
+        let (reader, writer) = split(host);
+        let connection = PluginConnection::new(reader, writer);
+        let client = connection.client();
+        let until = Instant::now() + Duration::from_secs(5);
+        let responder =
+            tokio::spawn(async move {
+                let mut peer = BufReader::new(peer);
+                let mut line = String::new();
+                let read = timeout_at(until, peer.read_line(&mut line))
+                    .await
+                    .expect("request deadline")
+                    .expect("read request");
+                assert!(read > 0 && line.ends_with('\n'));
+                let request: RpcRequest =
+                    serde_json::from_str(&line).expect("complete written request");
+                let bytes = match fault {
+                PeerFault::InvalidJson => b"not a protocol frame\n".to_vec(),
+                PeerFault::InvalidResponse => format!("{}\n", json!({
+                    "jsonrpc": "2.0", "id": request.id,
+                })).into_bytes(),
+                PeerFault::OversizedFrame => {
+                    let mut bytes = vec![b'x'; MAX_FRAME_BYTES];
+                    bytes.push(b'\n');
+                    bytes
+                }
+                PeerFault::Eof => return,
+                PeerFault::ErrorReply(data) => format!("{}\n", json!({
+                    "jsonrpc": "2.0", "id": request.id,
+                    "error": {"code": -32000, "message": "untrusted plugin body", "data": data},
+                })).into_bytes(),
+            };
+                // An oversized peer write may meet reader closure at the frame cap.
+                let _ = timeout_at(until, peer.get_mut().write_all(&bytes))
+                    .await
+                    .expect("response deadline");
+            });
+        let error = client
+            .call("agent.command", json!({"verb": "send"}), until)
+            .await
+            .expect_err("fault must not prove a definite outcome");
+        responder.await.expect("peer task");
+        error
+    }
+
+    #[tokio::test]
+    async fn transport_faults_after_written_request_are_unknown() {
+        for fault in [
+            PeerFault::InvalidJson,
+            PeerFault::InvalidResponse,
+            PeerFault::OversizedFrame,
+            PeerFault::Eof,
+        ] {
+            let error = error_after_written_request(fault).await;
+            assert_eq!(error.code, "unknown");
+            assert!(
+                error
+                    .message
+                    .starts_with("plugin outcome unknown: plugin_transport_")
+            );
+            assert!(!error.message.contains("not a protocol frame"));
+        }
+    }
+
+    #[tokio::test]
+    async fn error_reply_without_explicit_code_is_unknown() {
+        for data in [
+            None,
+            Some(json!({})),
+            Some(json!({"code": ""})),
+            Some(json!({"code": "bad\ncode"})),
+        ] {
+            let error = error_after_written_request(PeerFault::ErrorReply(data)).await;
+            assert_eq!(error.code, "unknown");
+            assert!(error.message.contains("plugin_error_reply_missing_code"));
+            assert!(!error.message.contains("untrusted plugin body"));
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_no_io_error_code_is_preserved() {
+        let error = error_after_written_request(PeerFault::ErrorReply(Some(json!({
+            "code": "native_not_dispatched",
+        }))))
+        .await;
+        assert_eq!(error.code, "native_not_dispatched");
+    }
 }

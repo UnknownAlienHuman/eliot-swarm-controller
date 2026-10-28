@@ -7,21 +7,8 @@ Eliot is a local Rust controller for coding-agent harnesses.
 The CLI and daemon connect to the Store, event bus, builtin `fake` harness, and
 Codex app-server through `plugins/codex`.
 
-On Windows on 2026-10-27, Codex 0.161.0 with `gpt-6-luna` completed three native
-turns: create `hello.txt` containing `hello`, append `world`, then return exactly
-`helloworld` after a graceful stop and resume of the same thread in generation 2.
-Old turns were not replayed. Live watch observed all three results; final Agent stop
-and daemon drain succeeded.
-
-Three further native control exercises with Codex 0.161.0, Luna and effort `medium`
-verified steer, approval, a retained same-ID approval retry without a second native
-write, interruption with another callback pending, denial without executing the denied
-command, and plan-mode question validation and answering. All three stopped the Agent
-and exited the daemon, with sources closed/healthy, zero gaps or duplicate native IDs,
-and no workspace files created.
-
-Full L7 qualification remains pending. File-change approval was not live exercised;
-requests carrying `grantRoot` remain unsupported. [Roadmap](docs/roadmap.md) owns milestone status.
+Requests carrying `grantRoot` are unsupported. [Roadmap](docs/roadmap.md) owns milestone
+status.
 
 `processes AGENT` pages OS-verified process identities and lifecycle records.
 `stats AGENT` reports ephemeral CPU/RSS samples and model-progress age;
@@ -58,19 +45,6 @@ Native filesystem invalidation reports `filesystem_invalidation.state`; degraded
 unavailable watching retains polling. Neither a notification nor watcher health
 establishes Git freshness or model progress.
 
-Bounded Windows checks on 2026-10-27 with Git 2.55.0.windows.5 left the trap fixture's
-index, HEAD, refs and objects unchanged, with no trap sentinel. Restart recovered the
-commit made while the daemon was down. One native `note.txt` edit retained its cause
-timestamp and generation-1 attribution through rapid resume to generation 2 with no
-extra turn. A live fake observer then removed that old-generation row after an explicit
-restore proved the path clean. All exercise Agents stopped and owned daemons exited.
-A Windows leaf-process regression also passed 1/1: the fenced parent ran, and an existing
-absolute child executable ran under ordinary custody but was blocked by the leaf Job.
-Two fake Agents sharing a workspace each received the same commit exactly once, without
-edit attribution. A healthy watcher observed an external file change without advancing
-model progress or attributing the write to the fake Agent.
-These checks do not qualify the full L7 or cross-platform behavior.
-
 Managed worktrees are opt-in: `launch --worktree BRANCH [--base REF]` uses a new branch
 and freezes the local commit OID before creation. Explicit profile setup uses verified
 file references and runs before native dispatch; an unknown setup result is never
@@ -79,13 +53,8 @@ commits. `worktree remove AGENT` requires a terminal Agent and no borrowers or r
 source dependencies; it removes only clean worktrees plus permitted scratch and keeps
 the branch. Existing-workspace launches remain the default.
 
-Windows checks on 2026-10-27 exercised native setup and retained-thread resume, crash
-without setup replay, changed-input rejection, dirty/borrowed removal refusal, mixed
-tracked/scratch cleanup and same-ID retry after removal. Prior native-reference/turn
-digests survived schema 5→6. The Linux CI smoke uses the fake; workspace custody on
-supported Linux is explicitly degraded and may leave escaped descendants unobserved.
-`status.workspace_custody` reports the current host capability. Full L7 qualification
-remains pending.
+`status.workspace_custody` reports the current host capability. Supported Linux workspace
+custody is degraded and may leave escaped descendants unobserved.
 
 ## Quick start
 
@@ -120,7 +89,7 @@ turn to its terminal result. The bounded wait is 30 seconds by default; use
 
 For Codex, copy [the example profile](config/controller.example.toml) to
 `<data_dir>/config.toml` and pass an existing authenticated `CODEX_HOME`.
-The smoke verified effort `medium` in both generations. Example lifecycle:
+Example lifecycle:
 
 ```powershell
 & $eliot --data-dir $dataDir launch --profile codex-luna --workspace $workspace 'Create hello.txt containing exactly hello without a newline.' --wait
@@ -180,7 +149,8 @@ The repository pins Rust 1.99.1 with rustfmt and Clippy. From the repository roo
 
 ```text
 cargo +1.99.1 fmt --check
-cargo +1.99.1 clippy --locked -p eliot -- -D warnings
+cargo +1.99.1 test --locked -p eliot --all-targets
+cargo +1.99.1 clippy --locked -p eliot --all-targets -- -D warnings
 cargo +1.99.1 build --locked -p eliot
 ```
 

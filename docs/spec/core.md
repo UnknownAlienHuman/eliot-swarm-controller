@@ -147,7 +147,7 @@ SourceState {
   agent, generation, source, state: open|closed, health: ok|slow|stale|error,
   cursor?, last_store_seq?, last_batch_id?, last_batch_digest?,
   last_batch_first_seq?, last_batch_last_seq?,
-  gap_id?, gap_digest?, gap_from?, gap_to?
+  gap_id?, gap_digest?, gap_from?, gap_to?, gap_seq?
 }
 ```
 
@@ -220,12 +220,23 @@ state = accepted -> [queued ->] dispatched -> applied|rejected|failed|unknown
         accepted|queued -> cancelled
 ```
 
+The pure `command_transition_allowed(from,to) -> bool` predicate governs ordinary
+command transitions. `classify_dispatched_error(code:&str) -> CommandState` returns
+`unknown` by default; only the explicit `native_not_dispatched` code proves no native I/O
+and returns `rejected`.
+Generic transport, Store or RPC errors never become `failed`. A separately validated,
+authoritative plugin result state follows its explicit result path, not this error-code
+classifier.
+
 Workspace preparation is the narrow pre-native exception: an exact command-bound
 workspace marker permits `accepted|queued -> failed|unknown` without advancing the
 Agent generation or creating a native token/source. The general settlement API does
 not acquire this permission. For first launch, preparation failure is `failed` at
 generation 0; uncertainty retains `created` at generation 0 with an unknown command.
 Pre-native resume failure/uncertainty preserves the prior terminal Agent projection.
+After Store proves the exact preparation marker, generation and verb, it uses the
+separate pure `workspace_preparation_transition_allowed(from,to) -> bool` predicate for
+those existing transitions. This does not widen ordinary command settlement.
 
 Preparation binds the start command, target generation, repository/common-directory
 identity, worktree path, branch, base OID and immutable setup entries. Each setup
@@ -289,7 +300,8 @@ re-executed merely because it failed or became unknown.
 
 Use bundled SQLite, WAL, synchronous FULL, one writer and bounded read queries. Commit
 failure blocks new writes/dispatch and never repeats the external cause. The SQL below
-is a target sketch, not a generator or a requirement to create unused L1 subsystems.
+is a compact view of current table shapes, not a migration script or a requirement to
+create unused subsystems. Exact schema evolution lives in numbered migrations.
 
 Public numeric ids use `INTEGER PRIMARY KEY AUTOINCREMENT`. Ordinary `INTEGER PRIMARY
 KEY` can reuse a deleted high rowid and break replay cursors. Never reset sqlite_sequence
@@ -340,19 +352,13 @@ CREATE TABLE source_state (
   last_batch_id TEXT, last_batch_digest BLOB,
   last_batch_first_seq INTEGER, last_batch_last_seq INTEGER,
   state TEXT NOT NULL, health TEXT NOT NULL,
-  gap_id TEXT, gap_digest BLOB, gap_from TEXT, gap_to TEXT,
+  gap_id TEXT, gap_digest BLOB, gap_from TEXT, gap_to TEXT, gap_seq INTEGER,
   updated_at INTEGER NOT NULL,
   PRIMARY KEY(agent,generation,source),
   CHECK(state IN ('open','closed')),
   CHECK(health IN ('ok','slow','stale','error')),
-  CHECK((last_batch_id IS NULL AND last_batch_digest IS NULL
-         AND last_batch_first_seq IS NULL AND last_batch_last_seq IS NULL)
-        OR (last_batch_id IS NOT NULL AND last_batch_digest IS NOT NULL
-         AND length(last_batch_digest)=32 AND last_batch_first_seq IS NOT NULL
-         AND last_batch_last_seq IS NOT NULL
-         AND last_batch_last_seq >= last_batch_first_seq)),
-  CHECK((gap_id IS NULL AND gap_digest IS NULL AND gap_from IS NULL AND gap_to IS NULL)
-        OR (gap_id IS NOT NULL AND gap_digest IS NOT NULL AND length(gap_digest)=32))
+  CHECK(last_batch_digest IS NULL OR length(last_batch_digest)=32),
+  CHECK(gap_digest IS NULL OR length(gap_digest)=32)
 );
 CREATE TABLE commands (
   id TEXT PRIMARY KEY,
@@ -378,7 +384,25 @@ CREATE TABLE turns (
   final_text TEXT, usage TEXT, started_at INTEGER, completed_at INTEGER,
   PRIMARY KEY(agent,generation,turn_id)
 );
+CREATE TABLE pending_requests (
+  agent INTEGER NOT NULL REFERENCES agents(id), generation INTEGER NOT NULL,
+  request_id TEXT NOT NULL, turn_id TEXT NOT NULL, kind TEXT NOT NULL,
+  details TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','resolved','stale')),
+  PRIMARY KEY(agent,generation,request_id)
+);
+CREATE INDEX pending_requests_open
+  ON pending_requests(agent,generation,turn_id,request_id) WHERE state='pending';
+CREATE TABLE git_workspaces (
+  workspace TEXT PRIMARY KEY, head TEXT, updated_at INTEGER NOT NULL
+);
 ```
+
+`agents.pending` is the serialized pending-request projection; `pending_requests` stores
+indexed request lifecycle rows. These are separate current Store structures, not
+interchangeable schemas. `git_workspaces` stores the workspace Git-head cache. The
+`source_state` checks shown here match the current database constraints: Store
+transactions validate complete batch and gap bindings; SQLite does not enforce
+cross-column nullability for those groups.
 
 Current projections and source recovery state outlive ordinary event retention. A new
 batch replaces only its last-batch acknowledgement. Retained event/native-id history is

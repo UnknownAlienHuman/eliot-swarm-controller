@@ -210,14 +210,21 @@ carry exact turn and replies exact request. Report delayed application points.
 Native inbox/HTTP acceptance is intermediate; send applies at exact input-to-turn
 association. A correlated terminal response can establish that association even
 when the vendor emitted no intermediate start notification; it is not a synthetic
-completion inferred from silence. Final text precedes terminal turn; process exit or silence is not a turn
-result. Cumulative usage replaces its prior scope value rather than being summed.
+completion inferred from silence. Persist the durable `command.applied` association
+event in the same transaction as the source batch that proves it. An exact duplicate
+batch/readback does not publish another `command.applied`. The event means the input was
+associated with its exact turn; it is not the turn's terminal result. Final text precedes
+the terminal turn; process exit or silence is not a turn result. Cumulative usage replaces
+its prior scope value rather than being summed.
 Requested route/settings are not proof of effective values; unavailable readback is
 reported as such. The host owns queued-send FIFO and unknown gates.
 
 `failed` means a known unsuccessful completed operation, which may have partial side
 effects; it does not mean rollback. `rejected` proves no native I/O. Missing authoritative
 outcome is `unknown`. None authorizes automatic re-execution of an external effect.
+After dispatch, only explicit `native_not_dispatched` proves no native I/O; any other
+generic error defaults to `unknown`. A validated authoritative plugin result state is
+handled separately from generic error classification.
 
 ## Lifecycle, hooks and qualification
 
