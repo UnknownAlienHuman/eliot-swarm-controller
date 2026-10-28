@@ -189,6 +189,56 @@ caller never sees a partly pruned expansion; after removal return `history_gap`.
 rule actions reuse the same representation with a distinct link kind, not selector
 execution semantics.
 
+## Command, turn, and result reads
+
+These are read-only lookups of existing records. Their IDs are never sent through a
+mutation call and cannot submit or replay work. The current typed request/response
+shapes are:
+
+```text
+command.get {id:string} -> Command
+turn.get {agent:string, generation:i64, turn_id:string} -> Turn
+agent.result {id:string, generation?:i64, turn_id?:string, limit?:usize}
+  -> AgentResultResponse {agent:string, generation:i64, turns:[Turn], agent_metadata:Agent}
+```
+
+`Command` and `Agent` use their Core model fields. The current `Turn` object contains
+`agent`, `generation`, `turn_id`, `state`, `status`, `final_text`, `started_at` and
+`completed_at`; it has no `command_ids`, `usage` or `resolution_source` fields. Those
+remain future turn-result or resolution metadata. `agent.result` decodes `turns` as an
+array of objects and `agent_metadata` as an object.
+
+Required IDs must be strings whose trimmed value is nonempty. Validation does not trim,
+normalize or impose a new length limit on them. `turn.get` requires a nonnegative integer
+generation. For `agent.result`, omitted `generation` selects the current generation;
+omitted `turn_id` requests turns for that generation; omitted `limit` defaults to 100.
+Any supplied generation must be a nonnegative integer, and any supplied `turn_id` must
+be a nonempty string. The limit must be 1–1,000 even when `turn_id` selects one exact
+turn. Optional request members that are absent are omitted during serialization; do not
+send `null`. Explicit `null`, wrong types, invalid values and unknown request fields are
+`invalid`. Unknown RPC methods and command verbs retain their existing `unsupported`
+behavior.
+
+The existing principal checks, generation rules and unknown-state masking apply. An
+explicit generation retains the existing principal-scoped historical read behavior.
+`agent_metadata` is the current Agent object and may have a different generation from
+the result when an explicit historical generation was requested.
+
+Before printing a read response or using it to advance a wait, the client validates its
+binding: `command.get` must return the requested command ID; `turn.get` must match the
+requested Agent, generation and turn ID; and `agent.result` must match the requested
+Agent, its requested generation (or the current metadata generation when omitted), and
+the requested exact turn when present (exactly one matching turn). Every result turn
+must match the response Agent and generation, and the response must respect the requested
+limit. A mismatch yields only the fixed `unknown` error
+`read response does not match the requested binding`, with no response data or
+diagnostics exposed.
+
+`eliot cmd show` and `eliot result` exit 0 after a valid read even if a returned command
+or turn is `unknown`; that state is not a successful task outcome. The `eliot wait`
+flow treats an `unknown` command or turn as exit 4. A binding mismatch is also unknown
+and must not print the mismatched response.
+
 ## Input, turn and unknown gates
 
 Transport/inbox admission is not send applied. Bind input to an exact native turn, then
@@ -202,13 +252,11 @@ effective settings are read back or explicitly resolved. Timeout does not releas
 hold, even when the observed Agent state is idle. This is a predicate over existing
 command rows, not another queue/table. Stop/interrupt/request replies/readback still work.
 
-```text
-turn.get -> {agent,generation,turn_id,state:running|completed|unknown,
-             command_ids,status?,final_text?,usage?,resolution_source?}
-```
-
 Owner turn resolution requires exact readback proving it inactive or the generation
-terminal. It records `resolution_source=owner`, not a synthetic native completion.
+terminal. Future resolution metadata may record `resolution_source=owner`; the current
+`Turn` read object does not expose that field. Resolution remains an owner assertion,
+not a synthetic native completion. Future turn-result metadata retains the planned
+`command_ids` and `usage` fields.
 Owner command resolution is `command.resolve {id, command_id, as: applied|failed,
 reason}`; it records an owner assertion, never a native receipt, and releases only the
 relevant hold. `turn.resolve` likewise takes a mutation id, Agent/generation/turn,

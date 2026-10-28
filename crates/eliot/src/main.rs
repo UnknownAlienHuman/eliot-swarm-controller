@@ -1,9 +1,10 @@
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use eliot_core::{
-    Error as CoreError,
+    Command as CoreCommand, CommandState, Error as CoreError, Turn as CoreTurn, TurnState,
     api::{
-        EventsFilter, EventsReadRequest, EventsReadResponse, EventsSubscribeRequest,
-        EventsSubscribeResponse,
+        AgentResultRequest, AgentResultResponse, CommandGetRequest, EventsFilter,
+        EventsReadRequest, EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse,
+        TurnGetRequest,
     },
 };
 use serde_json::{Value, json};
@@ -390,15 +391,26 @@ impl Failure {
         Self::new(5, "wait timed out; the admitted command was not cancelled")
     }
 
-    fn from_command(exit_code: u8, message: impl Into<String>, command: &Value) -> Self {
+    fn from_command(exit_code: u8, message: impl Into<String>, command: &CoreCommand) -> Self {
         let mut failure = Self::new(exit_code, message);
-        if let Some(value) = command.pointer("/outcome/diagnostics") {
+        if let Some(value) = command
+            .outcome
+            .as_ref()
+            .and_then(|outcome| outcome.get("diagnostics"))
+        {
             failure.diagnostics = serde_json::from_value(value.clone()).unwrap_or_default();
             eliot_core::bound_stderr_diagnostics(
                 &mut failure.diagnostics,
                 eliot_core::MAX_STDERR_DIAGNOSTIC_BYTES,
             );
         }
+        failure
+    }
+
+    fn readback(error: CoreError) -> Self {
+        let mut failure = Self::from_core(error, false);
+        failure.exit_code = 4;
+        failure.message = format!("cannot establish command outcome: {}", failure.message);
         failure
     }
 }
@@ -604,7 +616,7 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 .and_then(Value::as_str)
                 .ok_or_else(|| Failure::new(4, "launch response omitted command_id"))?;
             if !wait {
-                let command = wait_for_command(&data_dir, root_id, deadline).await?;
+                let command = command_value(wait_for_command(&data_dir, root_id, deadline).await?)?;
                 let exit_code = response_exit_code(&command);
                 print_value(&command, json_output);
                 return Ok(exit_code);
@@ -617,11 +629,11 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                     .ok_or_else(|| {
                         Failure::new(4, "launch response omitted its linked input command")
                     })?;
-                let turn = wait_for_turn(&data_dir, linked, &submitted, None, deadline).await?;
+                let turn = wait_for_turn(&data_dir, linked, deadline).await?;
                 let exit_code = turn_exit_code(&turn);
-                (turn, exit_code)
+                (turn_value(turn)?, exit_code)
             } else {
-                let command = wait_for_command(&data_dir, root_id, deadline).await?;
+                let command = command_value(wait_for_command(&data_dir, root_id, deadline).await?)?;
                 let exit_code = response_exit_code(&command);
                 (command, exit_code)
             };
@@ -664,10 +676,10 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 .get("command_id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| Failure::new(4, "send response omitted command_id"))?;
-            let completed =
-                wait_for_turn(&data_dir, command_id, &submitted, generation, deadline).await?;
-            print_value(&completed, json_output);
-            Ok(turn_exit_code(&completed))
+            let completed = wait_for_turn(&data_dir, command_id, deadline).await?;
+            let exit_code = turn_exit_code(&completed);
+            print_value(&turn_value(completed)?, json_output);
+            Ok(exit_code)
         }
         CliCommand::Resume {
             agent,
@@ -709,30 +721,21 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 .get("command_id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| Failure::new(4, "resume response omitted command_id"))?;
-            let completed = if prompt.is_some() {
+            let (completed, exit_code) = if prompt.is_some() {
                 let linked = submitted
                     .get("linked_command")
                     .and_then(Value::as_str)
                     .ok_or_else(|| {
                         Failure::new(4, "resume response omitted its linked input command")
                     })?;
-                let old_generation = submitted
-                    .get("generation")
-                    .and_then(Value::as_i64)
-                    .ok_or_else(|| {
-                        Failure::new(4, "resume response omitted its source generation")
-                    })?;
-                let generation = old_generation
-                    .checked_add(1)
-                    .ok_or_else(|| Failure::new(4, "resume generation could not be incremented"))?;
-                wait_for_turn(&data_dir, linked, &submitted, Some(generation), deadline).await?
+                let turn = wait_for_turn(&data_dir, linked, deadline).await?;
+                let exit_code = turn_exit_code(&turn);
+                (turn_value(turn)?, exit_code)
             } else {
-                wait_for_command(&data_dir, command_id, deadline).await?
-            };
-            let exit_code = if prompt.is_some() {
-                turn_exit_code(&completed)
-            } else {
-                response_exit_code(&completed)
+                let command =
+                    command_value(wait_for_command(&data_dir, command_id, deadline).await?)?;
+                let exit_code = response_exit_code(&command);
+                (command, exit_code)
             };
             print_value(&completed, json_output);
             Ok(exit_code)
@@ -929,14 +932,24 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             limit,
         } => {
             validate_limit(limit)?;
-            let mut params = json!({ "id": agent, "limit": limit });
-            if let Some(generation) = generation {
-                params["generation"] = json!(generation);
-            }
-            if let Some(turn_id) = turn_id {
-                params["turn_id"] = Value::String(turn_id);
-            }
-            let result = read_call(&data_dir, "agent.result", params).await?;
+            let params = AgentResultRequest {
+                id: agent,
+                generation,
+                turn_id,
+                limit,
+            };
+            params
+                .validate()
+                .map_err(|error| Failure::from_core(error, false))?;
+            let response: AgentResultResponse =
+                eliot_daemon::client_call_typed(&data_dir, "agent.result", &params)
+                    .await
+                    .map_err(|error| Failure::from_core(error, false))?;
+            params
+                .validate_response(&response)
+                .map_err(|error| Failure::from_core(error, false))?;
+            let result = serde_json::to_value(response)
+                .map_err(|_| Failure::new(4, "agent.result response is invalid"))?;
             print_value(&result, json_output);
             Ok(0)
         }
@@ -1022,14 +1035,26 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                     .ok_or_else(|| {
                         Failure::new(4, "worktree removal response omitted command_id")
                     })?;
-                let completed = wait_for_command(&data_dir, command_id, deadline).await?;
+                let completed =
+                    command_value(wait_for_command(&data_dir, command_id, deadline).await?)?;
                 print_value(&completed, json_output);
                 Ok(response_exit_code(&completed))
             }
         },
         CliCommand::Cmd { command } => match command {
             CmdCommand::Show { id } => {
-                let result = read_call(&data_dir, "command.get", json!({ "id": id })).await?;
+                let params = CommandGetRequest::new(id);
+                params
+                    .validate()
+                    .map_err(|error| Failure::from_core(error, false))?;
+                let response: CoreCommand =
+                    eliot_daemon::client_call_typed(&data_dir, "command.get", &params)
+                        .await
+                        .map_err(|error| Failure::from_core(error, false))?;
+                params
+                    .validate_response(&response)
+                    .map_err(|error| Failure::from_core(error, false))?;
+                let result = command_value(response)?;
                 print_value(&result, json_output);
                 Ok(0)
             }
@@ -1212,23 +1237,13 @@ fn wait_deadline(seconds: u64) -> Result<Instant, Failure> {
         .ok_or_else(|| Failure::new(2, "--timeout-seconds is too large"))
 }
 
-async fn wait_call(
-    data_dir: &Path,
-    method: &str,
-    params: Value,
+async fn wait_call<T>(
+    call: impl std::future::Future<Output = eliot_core::Result<T>>,
     deadline: Instant,
-) -> Result<Value, Failure> {
-    match timeout_at(
-        deadline,
-        eliot_daemon::client_call(data_dir, method, params),
-    )
-    .await
-    {
+) -> Result<T, Failure> {
+    match timeout_at(deadline, call).await {
         Ok(Ok(value)) => Ok(value),
-        Ok(Err(error)) => Err(Failure::new(
-            4,
-            format!("cannot establish command outcome: {error}"),
-        )),
+        Ok(Err(error)) => Err(Failure::readback(error)),
         Err(_) => Err(Failure::timeout()),
     }
 }
@@ -1237,15 +1252,18 @@ async fn wait_for_command(
     data_dir: &Path,
     command_id: &str,
     deadline: Instant,
-) -> Result<Value, Failure> {
+) -> Result<CoreCommand, Failure> {
+    let params = CommandGetRequest::new(command_id);
+    params.validate().map_err(Failure::readback)?;
     loop {
-        let command = wait_call(
-            data_dir,
-            "command.get",
-            json!({ "id": command_id }),
+        let command: CoreCommand = wait_call(
+            eliot_daemon::client_call_typed(data_dir, "command.get", &params),
             deadline,
         )
         .await?;
+        params
+            .validate_response(&command)
+            .map_err(Failure::readback)?;
         if command_state_result(&command)? {
             return Ok(command);
         }
@@ -1256,97 +1274,67 @@ async fn wait_for_command(
 async fn wait_for_turn(
     data_dir: &Path,
     command_id: &str,
-    submitted: &Value,
-    fallback_generation: Option<i64>,
     deadline: Instant,
-) -> Result<Value, Failure> {
+) -> Result<CoreTurn, Failure> {
+    let command_params = CommandGetRequest::new(command_id);
+    command_params.validate().map_err(Failure::readback)?;
     let (agent, generation, turn_id) = loop {
-        let command = wait_call(
-            data_dir,
-            "command.get",
-            json!({ "id": command_id }),
+        let command: CoreCommand = wait_call(
+            eliot_daemon::client_call_typed(data_dir, "command.get", &command_params),
             deadline,
         )
         .await?;
-        if let Some(turn_id) = command.get("turn_id").and_then(Value::as_str) {
-            let agent = command
-                .get("agent")
-                .and_then(Value::as_str)
-                .or_else(|| command.get("target").and_then(Value::as_str))
-                .or_else(|| submitted.get("agent").and_then(Value::as_str))
-                .ok_or_else(|| Failure::new(4, "command readback omitted its Agent id"))?;
-            let generation = command
-                .get("generation")
-                .and_then(Value::as_i64)
-                .or_else(|| submitted.get("generation").and_then(Value::as_i64))
-                .or(fallback_generation)
-                .ok_or_else(|| Failure::new(4, "command readback omitted its generation"))?;
-            break (agent.to_owned(), generation, turn_id.to_owned());
-        }
+        command_params
+            .validate_response(&command)
+            .map_err(Failure::readback)?;
         command_state_result(&command)?;
+        if let Some(turn_id) = command.turn_id {
+            let agent = command
+                .target
+                .ok_or_else(|| Failure::new(4, "command readback binding is invalid"))?;
+            let generation = command
+                .generation
+                .ok_or_else(|| Failure::new(4, "command readback binding is invalid"))?;
+            break (agent, generation, turn_id);
+        }
         sleep_before_deadline(deadline).await?;
     };
 
+    let params = TurnGetRequest::new(agent, generation, turn_id);
+    params.validate().map_err(Failure::readback)?;
     loop {
-        let turn = wait_call(
-            data_dir,
-            "turn.get",
-            json!({
-                "agent": agent,
-                "generation": generation,
-                "turn_id": turn_id,
-            }),
+        let turn: CoreTurn = wait_call(
+            eliot_daemon::client_call_typed(data_dir, "turn.get", &params),
             deadline,
         )
         .await?;
-        if turn
-            .get("generation")
-            .and_then(Value::as_i64)
-            .is_some_and(|actual| actual != generation)
-        {
-            return Err(Failure::new(
-                4,
-                "turn readback belongs to a different generation",
-            ));
-        }
-        match turn.get("state").and_then(Value::as_str) {
-            Some("completed") => return Ok(turn),
-            Some("unknown") => return Err(Failure::new(4, "turn outcome is unknown")),
-            Some("running") => sleep_before_deadline(deadline).await?,
-            Some(state) => {
-                return Err(Failure::new(
-                    4,
-                    format!("unrecognized turn state {state:?}; outcome is unknown"),
-                ));
-            }
-            None => return Err(Failure::new(4, "turn readback omitted state")),
+        params.validate_response(&turn).map_err(Failure::readback)?;
+        match turn.state {
+            TurnState::Completed => return Ok(turn),
+            TurnState::Unknown => return Err(Failure::new(4, "turn outcome is unknown")),
+            TurnState::Running => sleep_before_deadline(deadline).await?,
         }
     }
 }
 
 /// True means applied; false means still open. Known terminal errors retain their
 /// contract exit code and never imply that the native effect can be retried.
-fn command_state_result(command: &Value) -> Result<bool, Failure> {
-    match command.get("state").and_then(Value::as_str) {
-        Some("applied") => Ok(true),
-        Some("rejected") => Err(Failure::from_command(
+fn command_state_result(command: &CoreCommand) -> Result<bool, Failure> {
+    match command.state {
+        CommandState::Applied => Ok(true),
+        CommandState::Rejected => Err(Failure::from_command(
             3,
             "command was rejected before native I/O",
             command,
         )),
-        Some("failed") => Err(Failure::from_command(1, "command failed", command)),
-        Some("unknown") => Err(Failure::from_command(
+        CommandState::Failed => Err(Failure::from_command(1, "command failed", command)),
+        CommandState::Unknown => Err(Failure::from_command(
             4,
             "command outcome is unknown",
             command,
         )),
-        Some("cancelled") => Err(Failure::from_command(1, "command was cancelled", command)),
-        Some("accepted" | "queued" | "dispatched") => Ok(false),
-        Some(state) => Err(Failure::new(
-            4,
-            format!("unrecognized command state {state:?}; outcome is unknown"),
-        )),
-        None => Err(Failure::new(4, "command readback omitted state")),
+        CommandState::Cancelled => Err(Failure::from_command(1, "command was cancelled", command)),
+        CommandState::Accepted | CommandState::Queued | CommandState::Dispatched => Ok(false),
     }
 }
 
@@ -1367,15 +1355,23 @@ fn response_exit_code(response: &Value) -> u8 {
     }
 }
 
-fn turn_exit_code(turn: &Value) -> u8 {
-    match turn.get("state").and_then(Value::as_str) {
-        Some("completed") => match turn.get("status").and_then(Value::as_str) {
+fn turn_exit_code(turn: &CoreTurn) -> u8 {
+    match turn.state {
+        TurnState::Completed => match turn.status.as_deref() {
             Some("failed" | "error") => 1,
             _ => 0,
         },
-        Some("unknown") => 4,
-        _ => 6,
+        TurnState::Unknown => 4,
+        TurnState::Running => 6,
     }
+}
+
+fn command_value(command: CoreCommand) -> Result<Value, Failure> {
+    serde_json::to_value(command).map_err(|_| Failure::new(4, "command readback is unavailable"))
+}
+
+fn turn_value(turn: CoreTurn) -> Result<Value, Failure> {
+    serde_json::to_value(turn).map_err(|_| Failure::new(4, "turn readback is unavailable"))
 }
 
 async fn watch(data_dir: &Path, agent: Option<&str>, json_output: bool) -> Result<u8, Failure> {

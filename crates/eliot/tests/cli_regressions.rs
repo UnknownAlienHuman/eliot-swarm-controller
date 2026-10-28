@@ -6,9 +6,10 @@ mod support;
 mod windows_process;
 
 use eliot_core::api::{
-    EventsFilter, EventsReadRequest, EventsReadResponse, EventsSubscribeRequest,
-    EventsSubscribeResponse,
+    AgentResultRequest, AgentResultResponse, CommandGetRequest, EventsFilter, EventsReadRequest,
+    EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse, TurnGetRequest,
 };
+use eliot_core::{Command as CoreCommand, CommandState, Turn as CoreTurn, TurnState};
 use serde_json::{Value, json};
 #[cfg(windows)]
 use std::time::Duration;
@@ -17,7 +18,7 @@ use std::{collections::HashSet, fs, path::Path, process::Command};
 use support::Captured;
 use support::{CLI, Fixture, cli, run};
 
-fn public_event_rpc(
+fn public_read_rpc(
     runtime: &tokio::runtime::Runtime,
     fixture: &Fixture,
     method: &str,
@@ -33,18 +34,344 @@ fn public_event_rpc(
     })
 }
 
-fn assert_invalid_event_rpc(
+fn assert_invalid_read_rpc(
     runtime: &tokio::runtime::Runtime,
     fixture: &Fixture,
     method: &str,
     field: &str,
     params: Value,
 ) {
-    let error = match public_event_rpc(runtime, fixture, method, params) {
+    let error = match public_read_rpc(runtime, fixture, method, params) {
         Err(error) => error,
         Ok(_) => panic!("{method} accepted malformed {field}"),
     };
     assert_eq!(error.code, "invalid", "{method} malformed {field}");
+}
+
+#[test]
+fn public_result_queries_reject_bad_shapes_without_mutation() {
+    let mut fixture = Fixture::new("typed result validation");
+    fixture.start();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("public RPC runtime");
+    let before: EventsReadResponse = serde_json::from_value(
+        public_read_rpc(&runtime, &fixture, "events.read", json!({}))
+            .unwrap_or_else(|_| panic!("baseline event read failed")),
+    )
+    .expect("typed event boundary");
+    assert_eq!(before.high_water, 0);
+    let bad_ids = [
+        Value::Null,
+        json!(1),
+        json!(true),
+        json!([]),
+        json!({}),
+        json!(""),
+        json!(" \t\r\n"),
+    ];
+    for method in ["command.get", "agent.result"] {
+        assert_invalid_read_rpc(&runtime, &fixture, method, "missing id", json!({}));
+        for id in &bad_ids {
+            assert_invalid_read_rpc(&runtime, &fixture, method, "id", json!({"id":id}));
+        }
+        assert_invalid_read_rpc(
+            &runtime,
+            &fixture,
+            method,
+            "unknown field",
+            json!({"id":"a1","extra":true}),
+        );
+    }
+    let turn_query = json!({"agent":"a1","generation":0,"turn_id":"turn-1"});
+    for field in ["agent", "turn_id"] {
+        let mut missing = turn_query.clone();
+        missing
+            .as_object_mut()
+            .expect("request object")
+            .remove(field);
+        assert_invalid_read_rpc(
+            &runtime,
+            &fixture,
+            "turn.get",
+            "missing identifier",
+            missing,
+        );
+        for value in &bad_ids {
+            let mut params = turn_query.clone();
+            params[field] = value.clone();
+            assert_invalid_read_rpc(&runtime, &fixture, "turn.get", field, params);
+        }
+    }
+    let mut missing = turn_query.clone();
+    missing
+        .as_object_mut()
+        .expect("request object")
+        .remove("generation");
+    assert_invalid_read_rpc(
+        &runtime,
+        &fixture,
+        "turn.get",
+        "missing generation",
+        missing,
+    );
+    for generation in [
+        Value::Null,
+        json!("0"),
+        json!(true),
+        json!(-1),
+        json!(i64::MIN),
+        json!(u64::MAX),
+        json!(0.5),
+        json!(1.0),
+        json!([]),
+        json!({}),
+    ] {
+        let mut params = turn_query.clone();
+        params["generation"] = generation.clone();
+        assert_invalid_read_rpc(&runtime, &fixture, "turn.get", "generation", params);
+        assert_invalid_read_rpc(
+            &runtime,
+            &fixture,
+            "agent.result",
+            "optional generation",
+            json!({"id":"a1","generation":generation}),
+        );
+    }
+    let mut extra = turn_query.clone();
+    extra["extra"] = json!(true);
+    assert_invalid_read_rpc(&runtime, &fixture, "turn.get", "unknown field", extra);
+    for turn_id in &bad_ids {
+        assert_invalid_read_rpc(
+            &runtime,
+            &fixture,
+            "agent.result",
+            "optional turn_id",
+            json!({"id":"a1","turn_id":turn_id}),
+        );
+    }
+    for limit in [
+        Value::Null,
+        json!(0),
+        json!(-1),
+        json!(1001),
+        json!("1"),
+        json!(true),
+        json!(1.0),
+        json!([]),
+        json!({}),
+        json!(u64::MAX),
+    ] {
+        for exact in [false, true] {
+            let mut params = json!({"id":"a1","limit":limit});
+            if exact {
+                params["turn_id"] = json!("turn-1");
+            }
+            assert_invalid_read_rpc(
+                &runtime,
+                &fixture,
+                "agent.result",
+                "limit including exact turn",
+                params,
+            );
+        }
+    }
+    // Valid grammar reaches record lookup; generation zero and non-ULID command
+    // selectors do not gain another validation rule or arbitrary length cap.
+    for (method, params) in [
+        ("command.get", json!({"id":"missing-command"})),
+        ("command.get", json!({"id":"x".repeat(4097)})),
+        ("turn.get", turn_query),
+        ("agent.result", json!({"id":"a1"})),
+        (
+            "agent.result",
+            json!({"id":"a1","generation":0,"limit":1000}),
+        ),
+    ] {
+        let error = match public_read_rpc(&runtime, &fixture, method, params) {
+            Err(error) => error,
+            Ok(_) => panic!("{method} invented a missing record"),
+        };
+        assert_eq!(
+            error.code, "not_found",
+            "{method} rejected valid read grammar"
+        );
+    }
+    let after: EventsReadResponse = serde_json::from_value(
+        public_read_rpc(&runtime, &fixture, "events.read", json!({}))
+            .unwrap_or_else(|_| panic!("event read after malformed queries failed")),
+    )
+    .expect("typed unchanged event boundary");
+    assert_eq!(after.high_water, before.high_water);
+    assert_eq!(after.next, before.next);
+    assert_eq!(after.events, before.events);
+    fixture.stop(false);
+}
+
+#[test]
+fn public_result_queries_read_one_exact_fake_turn() {
+    let mut fixture = Fixture::new("typed result replay");
+    fixture.start();
+    let launched = fixture.json(&[
+        "launch",
+        "--profile",
+        "fake",
+        "--workspace",
+        fixture.workspace.to_str().unwrap(),
+    ]);
+    let agent = launched["target"].as_str().expect("fake Agent");
+    let generation = launched["generation"].as_i64().expect("fake generation");
+    let send_id = ulid::Ulid::new().to_string();
+    let turn_value = fixture.json(&[
+        "--id",
+        &send_id,
+        "send",
+        agent,
+        "--generation",
+        &generation.to_string(),
+        "--wait",
+        "--timeout-seconds",
+        "10",
+        "--",
+        "typed-result-echo",
+    ]);
+    let turn: CoreTurn = serde_json::from_value(turn_value).expect("typed waited turn");
+    assert_eq!(turn.agent, agent);
+    assert_eq!(turn.generation, generation);
+    assert_eq!(turn.state, TurnState::Completed);
+    assert_eq!(turn.final_text.as_deref(), Some("typed-result-echo"));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("public RPC runtime");
+    let command_request = CommandGetRequest::new(&send_id);
+    let command: CoreCommand = serde_json::from_value(
+        public_read_rpc(
+            &runtime,
+            &fixture,
+            "command.get",
+            serde_json::to_value(&command_request).expect("command request"),
+        )
+        .unwrap_or_else(|_| panic!("exact command query failed")),
+    )
+    .expect("typed command");
+    command_request
+        .validate_response(&command)
+        .expect("matching command response");
+    let literal_id = match public_read_rpc(
+        &runtime,
+        &fixture,
+        "command.get",
+        json!({"id":format!(" {send_id} ")}),
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("read selector was normalized to another literal identifier"),
+    };
+    assert_eq!(literal_id.code, "not_found");
+    assert_eq!(command.state, CommandState::Applied);
+    assert_eq!(command.target.as_deref(), Some(agent));
+    assert_eq!(command.generation, Some(generation));
+    assert_eq!(command.turn_id.as_deref(), Some(turn.turn_id.as_str()));
+    let turn_request = TurnGetRequest::new(agent, generation, &turn.turn_id);
+    let queried: CoreTurn = serde_json::from_value(
+        public_read_rpc(
+            &runtime,
+            &fixture,
+            "turn.get",
+            serde_json::to_value(&turn_request).expect("turn request"),
+        )
+        .unwrap_or_else(|_| panic!("exact turn query failed")),
+    )
+    .expect("typed turn");
+    turn_request
+        .validate_response(&queried)
+        .expect("matching turn response");
+    assert_eq!(queried, turn);
+    let mut request = AgentResultRequest::new(agent);
+    assert_eq!(request.limit, 100);
+    let params = serde_json::to_value(&request).expect("result request");
+    assert!(params.get("generation").is_none());
+    assert!(params.get("turn_id").is_none());
+    let result: AgentResultResponse = serde_json::from_value(
+        public_read_rpc(&runtime, &fixture, "agent.result", params)
+            .unwrap_or_else(|_| panic!("current result query failed")),
+    )
+    .expect("typed current result");
+    request
+        .validate_response(&result)
+        .expect("matching current result");
+    assert_eq!(result.generation, generation);
+    assert_eq!(result.turns, vec![turn.clone()]);
+    request.generation = Some(generation);
+    request.turn_id = Some(turn.turn_id.clone());
+    request.limit = 1;
+    let result: AgentResultResponse = serde_json::from_value(
+        public_read_rpc(
+            &runtime,
+            &fixture,
+            "agent.result",
+            serde_json::to_value(&request).expect("exact result request"),
+        )
+        .unwrap_or_else(|_| panic!("exact result query failed")),
+    )
+    .expect("typed exact result");
+    request
+        .validate_response(&result)
+        .expect("matching exact result");
+    assert_eq!(result.turns, vec![turn.clone()]);
+    for limit in [
+        Value::Null,
+        json!(0),
+        json!(1001),
+        json!("1"),
+        json!(true),
+        json!(1.0),
+    ] {
+        assert_invalid_read_rpc(
+            &runtime,
+            &fixture,
+            "agent.result",
+            "known exact turn limit",
+            json!({"id":agent,"generation":generation,"turn_id":turn.turn_id,"limit":limit}),
+        );
+    }
+    let query = cli(&fixture.data, &["cmd", "show", &send_id]);
+    assert_eq!(query.status.code(), Some(0));
+    assert!(
+        !query.stderr.lines().any(|line| line.starts_with("id=")),
+        "read query used mutation metadata"
+    );
+    let cli_command: CoreCommand = serde_json::from_value(query.json()).expect("typed CLI command");
+    command_request
+        .validate_response(&cli_command)
+        .expect("matching CLI command");
+    let cli_result: AgentResultResponse = serde_json::from_value(fixture.json(&[
+        "result",
+        agent,
+        "--generation",
+        &generation.to_string(),
+        "--turn-id",
+        &turn.turn_id,
+        "--limit",
+        "1",
+    ]))
+    .expect("typed CLI exact result");
+    request
+        .validate_response(&cli_result)
+        .expect("matching CLI result");
+    assert_eq!(cli_result.turns, vec![turn]);
+    assert_eq!(
+        fault_dispatches(&fixture.events(), &send_id),
+        1,
+        "read queries resubmitted input"
+    );
+    let stop = fixture.json(&["stop", agent, "--generation", &generation.to_string()]);
+    fixture.wait_command(
+        stop["command_id"].as_str().expect("stop command"),
+        "applied",
+    );
+    fixture.stop(false);
 }
 
 #[test]
@@ -55,7 +382,7 @@ fn public_event_requests_validate_semantic_values_without_mutation() {
         .enable_all()
         .build()
         .expect("public RPC runtime");
-    let raw = public_event_rpc(&runtime, &fixture, "events.read", json!({}))
+    let raw = public_read_rpc(&runtime, &fixture, "events.read", json!({}))
         .unwrap_or_else(|_| panic!("default events.read failed"));
     let before: EventsReadResponse = serde_json::from_value(raw).expect("typed read response");
     assert_eq!(before.high_water, 0);
@@ -84,7 +411,7 @@ fn public_event_requests_validate_semantic_values_without_mutation() {
             json!([]),
             json!({}),
         ] {
-            assert_invalid_event_rpc(&runtime, &fixture, method, "after", json!({"after": after}));
+            assert_invalid_read_rpc(&runtime, &fixture, method, "after", json!({"after": after}));
         }
         for limit in [
             Value::Null,
@@ -98,7 +425,7 @@ fn public_event_requests_validate_semantic_values_without_mutation() {
             json!({}),
             json!(u64::MAX),
         ] {
-            assert_invalid_event_rpc(&runtime, &fixture, method, "limit", json!({"limit": limit}));
+            assert_invalid_read_rpc(&runtime, &fixture, method, "limit", json!({"limit": limit}));
         }
         for filter in [
             Value::Null,
@@ -110,7 +437,7 @@ fn public_event_requests_validate_semantic_values_without_mutation() {
             json!([[], [], []]),
             json!([["a1"], [], []]),
         ] {
-            assert_invalid_event_rpc(
+            assert_invalid_read_rpc(
                 &runtime,
                 &fixture,
                 method,
@@ -129,7 +456,7 @@ fn public_event_requests_validate_semantic_values_without_mutation() {
             ] {
                 let mut filter = json!({});
                 filter[field] = values;
-                assert_invalid_event_rpc(
+                assert_invalid_read_rpc(
                     &runtime,
                     &fixture,
                     method,
@@ -139,7 +466,7 @@ fn public_event_requests_validate_semantic_values_without_mutation() {
             }
             let mut filter = json!({});
             filter[field] = json!(vec!["repeated"; 1001]);
-            assert_invalid_event_rpc(
+            assert_invalid_read_rpc(
                 &runtime,
                 &fixture,
                 method,
@@ -147,14 +474,14 @@ fn public_event_requests_validate_semantic_values_without_mutation() {
                 json!({"filter": filter}),
             );
         }
-        assert_invalid_event_rpc(
+        assert_invalid_read_rpc(
             &runtime,
             &fixture,
             method,
             "unknown request field",
             json!({"unknown": true}),
         );
-        let raw = public_event_rpc(
+        let raw = public_read_rpc(
             &runtime,
             &fixture,
             method,
@@ -176,7 +503,7 @@ fn public_event_requests_validate_semantic_values_without_mutation() {
         json!({}),
         serde_json::from_str::<Value>("18446744073709551616").expect("overflowing integer JSON"),
     ] {
-        assert_invalid_event_rpc(
+        assert_invalid_read_rpc(
             &runtime,
             &fixture,
             "events.subscribe",
@@ -184,20 +511,19 @@ fn public_event_requests_validate_semantic_values_without_mutation() {
             json!({"wait_ms": wait_ms}),
         );
     }
-    assert_invalid_event_rpc(
+    assert_invalid_read_rpc(
         &runtime,
         &fixture,
         "events.read",
         "subscribe-only field",
         json!({"wait_ms": 0}),
     );
-    let unsupported = match public_event_rpc(&runtime, &fixture, "events.unimplemented", json!({}))
-    {
+    let unsupported = match public_read_rpc(&runtime, &fixture, "events.unimplemented", json!({})) {
         Err(error) => error,
         Ok(_) => panic!("unknown event method unexpectedly succeeded"),
     };
     assert_eq!(unsupported.code, "unsupported");
-    let raw = public_event_rpc(&runtime, &fixture, "events.subscribe", json!({}))
+    let raw = public_read_rpc(&runtime, &fixture, "events.subscribe", json!({}))
         .unwrap_or_else(|_| panic!("default events.subscribe failed"));
     let subscribed: EventsSubscribeResponse =
         serde_json::from_value(raw).expect("typed subscribe response");
@@ -206,7 +532,7 @@ fn public_event_requests_validate_semantic_values_without_mutation() {
     assert_eq!(subscribed.high_water, before.high_water);
     assert!(!subscribed.truncated);
     assert!(!subscribed.lagged);
-    let raw = public_event_rpc(&runtime, &fixture, "events.read", json!({}))
+    let raw = public_read_rpc(&runtime, &fixture, "events.read", json!({}))
         .unwrap_or_else(|_| panic!("read after malformed requests failed"));
     let after: EventsReadResponse = serde_json::from_value(raw).expect("typed unchanged replay");
     assert_eq!(after.high_water, before.high_water);
@@ -239,7 +565,7 @@ fn public_event_replay_has_typed_pages_and_accepts_clamped_wait() {
         .enable_all()
         .build()
         .expect("public RPC runtime");
-    let raw = public_event_rpc(&runtime, &fixture, "events.read", json!({}))
+    let raw = public_read_rpc(&runtime, &fixture, "events.read", json!({}))
         .unwrap_or_else(|_| panic!("default persisted replay failed"));
     let replay: EventsReadResponse = serde_json::from_value(raw).expect("typed persisted events");
     assert!(replay.events.len() > 1);
@@ -251,7 +577,7 @@ fn public_event_replay_has_typed_pages_and_accepts_clamped_wait() {
     );
     assert_eq!(replay.next, replay.high_water);
     assert!(!replay.truncated);
-    let raw = public_event_rpc(
+    let raw = public_read_rpc(
         &runtime,
         &fixture,
         "events.read",
@@ -274,7 +600,7 @@ fn public_event_replay_has_typed_pages_and_accepts_clamped_wait() {
     let decoded: EventsSubscribeRequest =
         serde_json::from_value(params.clone()).expect("clamped request");
     assert_eq!(decoded.wait_ms, 30_000);
-    let raw = public_event_rpc(&runtime, &fixture, "events.subscribe", params)
+    let raw = public_read_rpc(&runtime, &fixture, "events.subscribe", params)
         .unwrap_or_else(|_| panic!("oversized wait was rejected instead of clamped"));
     let subscribed: EventsSubscribeResponse =
         serde_json::from_value(raw).expect("typed available subscribe page");
@@ -286,7 +612,7 @@ fn public_event_replay_has_typed_pages_and_accepts_clamped_wait() {
     for field in ["agents", "kinds", "sources"] {
         let mut filter = json!({});
         filter[field] = json!(vec![" "; 1000]);
-        let raw = public_event_rpc(&runtime, &fixture, "events.read", json!({"filter": filter}))
+        let raw = public_read_rpc(&runtime, &fixture, "events.read", json!({"filter": filter}))
             .unwrap_or_else(|_| panic!("nonempty raw filter entries were tightened"));
         let empty: EventsReadResponse = serde_json::from_value(raw).expect("typed filtered replay");
         assert!(empty.events.is_empty());
@@ -294,7 +620,7 @@ fn public_event_replay_has_typed_pages_and_accepts_clamped_wait() {
         assert_eq!(empty.high_water, replay.high_water);
         assert!(!empty.truncated);
     }
-    let raw = public_event_rpc(
+    let raw = public_read_rpc(
         &runtime,
         &fixture,
         "events.subscribe",
@@ -341,7 +667,23 @@ fn malformed_after_dispatch_remains_unknown_across_restart() {
             "[fake:malformed-after-dispatch]",
         ],
     );
-    let mut unknown = fixture.json(&["cmd", "show", &fault_id]);
+    let query = cli(&fixture.data, &["cmd", "show", &fault_id]);
+    assert_eq!(
+        query.status.code(),
+        Some(0),
+        "successful Unknown read must exit zero"
+    );
+    assert!(
+        !query.stderr.lines().any(|line| line.starts_with("id=")),
+        "read query used mutation metadata"
+    );
+    let mut unknown = query.json();
+    let typed_unknown: CoreCommand =
+        serde_json::from_value(unknown.clone()).expect("typed Unknown command");
+    CommandGetRequest::new(&fault_id)
+        .validate_response(&typed_unknown)
+        .expect("matching Unknown read");
+    assert_eq!(typed_unknown.state, CommandState::Unknown);
     assert_eq!(
         unknown["state"],
         "unknown",
@@ -643,6 +985,30 @@ fn fake_discovery_observation_and_worktree_lifecycle() {
     assert_eq!(view["state"], "unknown");
     assert_eq!(view["observe_only"], true);
     assert_eq!(view["own_identity"], false);
+    let historical_request = AgentResultRequest {
+        id: observer.to_owned(),
+        generation: Some(observed_generation),
+        turn_id: None,
+        limit: 1,
+    };
+    let historical: AgentResultResponse = serde_json::from_value(fixture.json(&[
+        "result",
+        observer,
+        "--generation",
+        &generation_argument,
+        "--limit",
+        "1",
+    ]))
+    .expect("typed historical observer result");
+    historical_request
+        .validate_response(&historical)
+        .expect("historical result permits current Agent metadata");
+    assert_eq!(historical.generation, observed_generation);
+    assert_eq!(
+        historical.agent_metadata.generation,
+        observed_generation + 1
+    );
+    assert!(historical.turns.is_empty());
     assert!(
         fixture
             .events()
