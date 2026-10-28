@@ -5,13 +5,310 @@ mod support;
 #[path = "support/windows_process.rs"]
 mod windows_process;
 
-use serde_json::Value;
+use eliot_core::api::{
+    EventsFilter, EventsReadRequest, EventsReadResponse, EventsSubscribeRequest,
+    EventsSubscribeResponse,
+};
+use serde_json::{Value, json};
 #[cfg(windows)]
 use std::time::Duration;
 use std::{collections::HashSet, fs, path::Path, process::Command};
 #[cfg(windows)]
 use support::Captured;
 use support::{CLI, Fixture, cli, run};
+
+fn public_event_rpc(
+    runtime: &tokio::runtime::Runtime,
+    fixture: &Fixture,
+    method: &str,
+    params: Value,
+) -> eliot_core::Result<Value> {
+    runtime.block_on(async {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            eliot_daemon::client_call(&fixture.data, method, params),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{method} exceeded the bounded public RPC deadline"))
+    })
+}
+
+fn assert_invalid_event_rpc(
+    runtime: &tokio::runtime::Runtime,
+    fixture: &Fixture,
+    method: &str,
+    field: &str,
+    params: Value,
+) {
+    let error = match public_event_rpc(runtime, fixture, method, params) {
+        Err(error) => error,
+        Ok(_) => panic!("{method} accepted malformed {field}"),
+    };
+    assert_eq!(error.code, "invalid", "{method} malformed {field}");
+}
+
+#[test]
+fn public_event_requests_validate_semantic_values_without_mutation() {
+    let mut fixture = Fixture::new("typed event validation");
+    fixture.start();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("public RPC runtime");
+    let raw = public_event_rpc(&runtime, &fixture, "events.read", json!({}))
+        .unwrap_or_else(|_| panic!("default events.read failed"));
+    let before: EventsReadResponse = serde_json::from_value(raw).expect("typed read response");
+    assert_eq!(before.high_water, 0);
+    assert_eq!(before.next, 0);
+    assert!(before.events.is_empty());
+    assert!(!before.truncated);
+    let read_defaults = EventsReadRequest::default();
+    assert_eq!(read_defaults.after, 0);
+    assert_eq!(read_defaults.limit, 100);
+    let subscribe_defaults = EventsSubscribeRequest::default();
+    assert_eq!(subscribe_defaults.after, 0);
+    assert_eq!(subscribe_defaults.limit, 100);
+    assert_eq!(subscribe_defaults.wait_ms, 0);
+
+    for method in ["events.read", "events.subscribe"] {
+        for after in [
+            Value::Null,
+            json!(0.5),
+            json!(1.0),
+            json!("0"),
+            json!(true),
+            json!(false),
+            json!(-1),
+            json!(i64::MIN),
+            json!(u64::MAX),
+            json!([]),
+            json!({}),
+        ] {
+            assert_invalid_event_rpc(&runtime, &fixture, method, "after", json!({"after": after}));
+        }
+        for limit in [
+            Value::Null,
+            json!(0),
+            json!(-1),
+            json!(1001),
+            json!(1.0),
+            json!("1"),
+            json!(true),
+            json!([]),
+            json!({}),
+            json!(u64::MAX),
+        ] {
+            assert_invalid_event_rpc(&runtime, &fixture, method, "limit", json!({"limit": limit}));
+        }
+        for filter in [
+            Value::Null,
+            json!(false),
+            json!(1),
+            json!("all"),
+            json!([]),
+            json!({"extra": []}),
+            json!([[], [], []]),
+            json!([["a1"], [], []]),
+        ] {
+            assert_invalid_event_rpc(
+                &runtime,
+                &fixture,
+                method,
+                "filter",
+                json!({"filter": filter}),
+            );
+        }
+        for field in ["agents", "kinds", "sources"] {
+            for values in [
+                Value::Null,
+                json!("a1"),
+                json!(true),
+                json!([1]),
+                json!([null]),
+                json!([""]),
+            ] {
+                let mut filter = json!({});
+                filter[field] = values;
+                assert_invalid_event_rpc(
+                    &runtime,
+                    &fixture,
+                    method,
+                    "filter list",
+                    json!({"filter": filter}),
+                );
+            }
+            let mut filter = json!({});
+            filter[field] = json!(vec!["repeated"; 1001]);
+            assert_invalid_event_rpc(
+                &runtime,
+                &fixture,
+                method,
+                "raw filter count",
+                json!({"filter": filter}),
+            );
+        }
+        assert_invalid_event_rpc(
+            &runtime,
+            &fixture,
+            method,
+            "unknown request field",
+            json!({"unknown": true}),
+        );
+        let raw = public_event_rpc(
+            &runtime,
+            &fixture,
+            method,
+            json!({"after": 0, "limit": 1000, "filter": {}}),
+        )
+        .unwrap_or_else(|_| panic!("{method} rejected valid empty query"));
+        assert_eq!(raw["next"], 0);
+        assert_eq!(raw["high_water"], before.high_water);
+        assert_eq!(raw["events"].as_array().expect("events").len(), 0);
+    }
+    for wait_ms in [
+        Value::Null,
+        json!(-1),
+        json!(0.5),
+        json!(1.0),
+        json!("0"),
+        json!(true),
+        json!([]),
+        json!({}),
+        serde_json::from_str::<Value>("18446744073709551616").expect("overflowing integer JSON"),
+    ] {
+        assert_invalid_event_rpc(
+            &runtime,
+            &fixture,
+            "events.subscribe",
+            "wait_ms",
+            json!({"wait_ms": wait_ms}),
+        );
+    }
+    assert_invalid_event_rpc(
+        &runtime,
+        &fixture,
+        "events.read",
+        "subscribe-only field",
+        json!({"wait_ms": 0}),
+    );
+    let unsupported = match public_event_rpc(&runtime, &fixture, "events.unimplemented", json!({}))
+    {
+        Err(error) => error,
+        Ok(_) => panic!("unknown event method unexpectedly succeeded"),
+    };
+    assert_eq!(unsupported.code, "unsupported");
+    let raw = public_event_rpc(&runtime, &fixture, "events.subscribe", json!({}))
+        .unwrap_or_else(|_| panic!("default events.subscribe failed"));
+    let subscribed: EventsSubscribeResponse =
+        serde_json::from_value(raw).expect("typed subscribe response");
+    assert!(subscribed.events.is_empty());
+    assert_eq!(subscribed.next, 0);
+    assert_eq!(subscribed.high_water, before.high_water);
+    assert!(!subscribed.truncated);
+    assert!(!subscribed.lagged);
+    let raw = public_event_rpc(&runtime, &fixture, "events.read", json!({}))
+        .unwrap_or_else(|_| panic!("read after malformed requests failed"));
+    let after: EventsReadResponse = serde_json::from_value(raw).expect("typed unchanged replay");
+    assert_eq!(after.high_water, before.high_water);
+    assert_eq!(after.next, before.next);
+    assert_eq!(after.events, before.events);
+    fixture.stop(false);
+}
+
+#[test]
+fn public_event_replay_has_typed_pages_and_accepts_clamped_wait() {
+    let mut fixture = Fixture::new("typed event replay");
+    fixture.start();
+    let launched = fixture.json(&[
+        "launch",
+        "--profile",
+        "fake",
+        "--workspace",
+        fixture.workspace.to_str().unwrap(),
+    ]);
+    let agent = launched["target"].as_str().expect("fake Agent");
+    let stopped = fixture.json(&["stop", agent]);
+    fixture.wait_command(
+        stopped["command_id"].as_str().expect("stop command"),
+        "applied",
+    );
+    // Reopen stopped history with no live publishers during replay assertions.
+    fixture.stop(false);
+    fixture.start();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("public RPC runtime");
+    let raw = public_event_rpc(&runtime, &fixture, "events.read", json!({}))
+        .unwrap_or_else(|_| panic!("default persisted replay failed"));
+    let replay: EventsReadResponse = serde_json::from_value(raw).expect("typed persisted events");
+    assert!(replay.events.len() > 1);
+    assert!(
+        replay
+            .events
+            .windows(2)
+            .all(|events| events[0].seq < events[1].seq)
+    );
+    assert_eq!(replay.next, replay.high_water);
+    assert!(!replay.truncated);
+    let raw = public_event_rpc(
+        &runtime,
+        &fixture,
+        "events.read",
+        json!({"after": 0, "limit": 1}),
+    )
+    .unwrap_or_else(|_| panic!("bounded replay failed"));
+    let first: EventsReadResponse = serde_json::from_value(raw).expect("typed first page");
+    assert_eq!(first.events.len(), 1);
+    assert_eq!(first.events[0], replay.events[0]);
+    assert_eq!(first.next, first.events[0].seq);
+    assert_eq!(first.high_water, replay.high_water);
+    assert!(first.truncated);
+    let request = EventsSubscribeRequest {
+        after: 0,
+        limit: 1,
+        wait_ms: u64::MAX,
+        filter: EventsFilter::default(),
+    };
+    let params = serde_json::to_value(request).expect("request wire");
+    let decoded: EventsSubscribeRequest =
+        serde_json::from_value(params.clone()).expect("clamped request");
+    assert_eq!(decoded.wait_ms, 30_000);
+    let raw = public_event_rpc(&runtime, &fixture, "events.subscribe", params)
+        .unwrap_or_else(|_| panic!("oversized wait was rejected instead of clamped"));
+    let subscribed: EventsSubscribeResponse =
+        serde_json::from_value(raw).expect("typed available subscribe page");
+    assert_eq!(subscribed.events, first.events);
+    assert_eq!(subscribed.next, first.next);
+    assert_eq!(subscribed.high_water, replay.high_water);
+    assert!(subscribed.truncated);
+    assert!(!subscribed.lagged);
+    for field in ["agents", "kinds", "sources"] {
+        let mut filter = json!({});
+        filter[field] = json!(vec![" "; 1000]);
+        let raw = public_event_rpc(&runtime, &fixture, "events.read", json!({"filter": filter}))
+            .unwrap_or_else(|_| panic!("nonempty raw filter entries were tightened"));
+        let empty: EventsReadResponse = serde_json::from_value(raw).expect("typed filtered replay");
+        assert!(empty.events.is_empty());
+        assert_eq!(empty.next, replay.high_water);
+        assert_eq!(empty.high_water, replay.high_water);
+        assert!(!empty.truncated);
+    }
+    let raw = public_event_rpc(
+        &runtime,
+        &fixture,
+        "events.subscribe",
+        json!({"filter": {"agents": ["a01"]}}),
+    )
+    .unwrap_or_else(|_| panic!("noncanonical Agent filter was tightened"));
+    let empty: EventsSubscribeResponse =
+        serde_json::from_value(raw).expect("typed nonmatching filter");
+    assert!(empty.events.is_empty());
+    assert_eq!(empty.next, replay.high_water);
+    assert_eq!(empty.high_water, replay.high_water);
+    assert!(!empty.lagged);
+    fixture.stop(false);
+}
 
 #[test]
 fn malformed_after_dispatch_remains_unknown_across_restart() {

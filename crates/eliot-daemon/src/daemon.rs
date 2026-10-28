@@ -9,6 +9,7 @@ use eliot_core::{
 };
 use eliot_plugin::{RpcError, RpcRequest, RpcResponse};
 use futures_util::{SinkExt, StreamExt};
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
@@ -277,6 +278,32 @@ pub async fn client_call(path: &Path, method: &str, params: Value) -> Result<Val
     })
     .await
     .map_err(|_| Error::new("unknown", "daemon RPC exceeded its absolute deadline"))?
+}
+
+/// Typed caller boundary over the existing authenticated client. Params are
+/// serialized once; transport/domain errors retain their original diagnostics.
+/// Current public RPC results are objects, never positional arrays or scalars.
+pub async fn client_call_typed<P: Serialize + ?Sized, R: DeserializeOwned>(
+    data_dir: &Path,
+    method: &str,
+    params: &P,
+) -> Result<R> {
+    let params = serde_json::to_value(params)
+        .map_err(|_| Error::new("invalid", "daemon RPC parameters could not be serialized"))?;
+    decode_client_result(method, client_call(data_dir, method, params).await)
+}
+
+fn decode_client_result<R: DeserializeOwned>(method: &str, result: Result<Value>) -> Result<R> {
+    let result = result?;
+    let context = match method {
+        "events.read" => "events.read returned a malformed typed result",
+        "events.subscribe" => "events.subscribe returned a malformed typed result",
+        _ => "daemon returned a malformed typed result",
+    };
+    if !result.is_object() {
+        return Err(Error::new("unknown", context));
+    }
+    serde_json::from_value(result).map_err(|_| Error::new("unknown", context))
 }
 
 async fn serve_connection(stream: IpcStream, router: Router, policy: Arc<SecretPolicy>) {
@@ -567,6 +594,97 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use eliot_core::{MAX_STDERR_BYTES, StderrDiagnostic, StderrSnapshot, StderrSource};
+
+    struct UnserializableParams(std::cell::Cell<usize>);
+
+    impl Serialize for UnserializableParams {
+        fn serialize<S: serde::Serializer>(&self, _: S) -> std::result::Result<S::Ok, S::Error> {
+            self.0.set(self.0.get() + 1);
+            Err(serde::ser::Error::custom(
+                "dummy-private-serialization-detail",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_client_rejects_serialization_before_opening_the_daemon() {
+        let params = UnserializableParams(std::cell::Cell::new(0));
+        let result = client_call_typed::<_, Value>(
+            Path::new("unused-typed-client-data-dir"),
+            "events.read",
+            &params,
+        )
+        .await;
+        let error = result.expect_err("invalid params before client I/O");
+        assert_eq!(error.code, "invalid");
+        assert_eq!(
+            error.message,
+            "daemon RPC parameters could not be serialized"
+        );
+        assert!(!error.message.contains("dummy-private"));
+        assert_eq!(params.0.get(), 1);
+    }
+
+    #[test]
+    fn typed_client_result_mismatch_is_unknown_without_raw_details() {
+        for method in ["events.read", "events.subscribe", "dummy-private-method"] {
+            let error = decode_client_result::<u64>(method, Ok(json!("dummy-private-response")))
+                .expect_err("wrong successful result shape");
+            assert_eq!(error.code, "unknown");
+            assert!(!error.message.contains("dummy-private"));
+            assert!(error.diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn typed_client_event_pages_require_objects_not_positional_arrays() {
+        use eliot_core::api::{EventsReadResponse, EventsSubscribeResponse};
+
+        let read =
+            decode_client_result::<EventsReadResponse>("events.read", Ok(json!([[], 0, 0, false])));
+        assert_eq!(read.expect_err("positional read result").code, "unknown");
+        let subscribe = decode_client_result::<EventsSubscribeResponse>(
+            "events.subscribe",
+            Ok(json!([[], 0, 0, false, false])),
+        );
+        assert_eq!(
+            subscribe.expect_err("positional subscribe result").code,
+            "unknown"
+        );
+
+        let read = decode_client_result::<EventsReadResponse>(
+            "events.read",
+            Ok(json!({
+                "events": [], "next": 0, "high_water": 0, "truncated": false,
+            })),
+        )
+        .expect("object read result");
+        assert!(read.events.is_empty());
+        let subscribe = decode_client_result::<EventsSubscribeResponse>(
+            "events.subscribe",
+            Ok(json!({
+                "events": [], "next": 0, "high_water": 0, "truncated": false, "lagged": false,
+            })),
+        )
+        .expect("object subscribe result");
+        assert!(subscribe.events.is_empty());
+    }
+
+    #[test]
+    fn typed_client_preserves_the_original_core_error_and_diagnostics() {
+        let original = Error::new("not_allowed", "original rejection").with_stderr(
+            StderrSource::Plugin,
+            StderrSnapshot {
+                text: "dummy sanitized diagnostic".to_owned(),
+                truncated: false,
+                eof: true,
+                read_error: false,
+            },
+        );
+        let actual = decode_client_result::<u64>("events.read", Err(original.clone()))
+            .expect_err("underlying Core error");
+        assert_eq!(actual, original);
+    }
 
     #[test]
     fn rpc_error_preserves_both_sources_and_primary_code_with_expanding_redaction() {

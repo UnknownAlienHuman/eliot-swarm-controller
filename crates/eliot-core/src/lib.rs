@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod api;
+
 mod command;
 mod diagnostics;
 mod secrets;

@@ -7,6 +7,10 @@ use crate::{
 use eliot_core::{
     Agent, AgentState, Command, CommandState, Error, Event, ProcessIdentity, Result, SecretPolicy,
     SubmitCommand, Turn, TurnState, WorkspacePhase, WorkspacePreparationInput,
+    api::{
+        EventsFilter, EventsReadRequest, EventsReadResponse, EventsSubscribeRequest,
+        EventsSubscribeResponse,
+    },
     classify_dispatched_error,
 };
 use eliot_plugin::{
@@ -1304,52 +1308,41 @@ impl Router {
     }
 
     async fn events_read(&self, params: &Value, principal: &Principal) -> Result<Value> {
-        reject_unknown_keys(params, &["after", "limit", "filter"], "events.read")?;
-        let after = params.get("after").and_then(Value::as_i64).unwrap_or(0);
-        let limit = page_limit(params)?;
-        let filter = parse_filter(params.get("filter"), principal)?;
+        let request: EventsReadRequest = serde_json::from_value(params.clone())
+            .map_err(|_| Error::new("invalid", "events.read params are invalid"))?;
+        request.validate()?;
+        let filter = authorize_event_filter(request.filter, principal)?;
         let (events, next, high_water, truncated, _) = self
             .read_filtered(
-                after,
-                limit,
+                request.after,
+                request.limit,
                 None,
                 EVENT_RESPONSE_ENTRIES_MAX_BYTES,
                 &filter,
             )
             .await?;
-        Ok(json!({
-            "events": events,
-            "next": next,
-            "high_water": high_water,
-            "truncated": truncated,
-        }))
+        serde_json::to_value(EventsReadResponse {
+            events,
+            next,
+            high_water,
+            truncated,
+        })
+        .map_err(|_| Error::new("internal", "events.read response could not be encoded"))
     }
 
     async fn events_subscribe(&self, params: &Value, principal: &Principal) -> Result<Value> {
-        reject_unknown_keys(
-            params,
-            &["after", "limit", "wait_ms", "filter"],
-            "events.subscribe",
-        )?;
-        let after = params.get("after").and_then(Value::as_i64).unwrap_or(0);
-        if after < 0 {
-            return Err(Error::new("invalid", "event cursor must be nonnegative"));
-        }
-        let limit = page_limit(params)?;
-        let wait_ms = match params.get("wait_ms") {
-            None => 0,
-            Some(value) => value
-                .as_u64()
-                .ok_or_else(|| Error::new("invalid", "wait_ms must be a nonnegative integer"))?,
-        }
-        .min(LIVE_WAIT_MAX_MS);
-        let filter = parse_filter(params.get("filter"), principal)?;
+        let request: EventsSubscribeRequest = serde_json::from_value(params.clone())
+            .map_err(|_| Error::new("invalid", "events.subscribe params are invalid"))?;
+        request.validate()?;
+        let limit = request.limit;
+        let wait_ms = request.wait_ms.min(LIVE_WAIT_MAX_MS);
+        let filter = authorize_event_filter(request.filter, principal)?;
 
         // Subscribe before reading high-water so commits are either replayed or buffered.
         let mut receiver = self.inner.bus.subscribe();
         let (mut events, mut cursor, mut high_water, mut truncated, mut encoded_bytes) = self
             .read_filtered(
-                after,
+                request.after,
                 limit,
                 None,
                 EVENT_RESPONSE_ENTRIES_MAX_BYTES,
@@ -1405,13 +1398,14 @@ impl Router {
                 }
             }
         }
-        Ok(json!({
-            "events": events,
-            "next": cursor,
-            "high_water": high_water,
-            "lagged": lagged,
-            "truncated": truncated,
-        }))
+        serde_json::to_value(EventsSubscribeResponse {
+            events,
+            next: cursor,
+            high_water,
+            lagged,
+            truncated,
+        })
+        .map_err(|_| Error::new("internal", "events.subscribe response could not be encoded"))
     }
 
     async fn read_filtered(
@@ -3113,21 +3107,13 @@ fn submit_result(command: &Command, linked: Option<&Command>) -> Value {
     })
 }
 
-fn parse_filter(raw: Option<&Value>, principal: &Principal) -> Result<EventFilter> {
+fn authorize_event_filter(raw: EventsFilter, principal: &Principal) -> Result<EventFilter> {
+    raw.validate()?;
     let mut filter = EventFilter {
-        agents: HashSet::new(),
-        kinds: HashSet::new(),
-        sources: HashSet::new(),
+        agents: raw.agents.into_iter().collect(),
+        kinds: raw.kinds.into_iter().collect(),
+        sources: raw.sources.into_iter().collect(),
     };
-    if let Some(raw) = raw {
-        let object = raw
-            .as_object()
-            .ok_or_else(|| Error::new("invalid", "event filter must be an object"))?;
-        reject_unknown_map_keys(object, &["agents", "kinds", "sources"], "event filter")?;
-        filter.agents = string_set(object.get("agents"), "agents")?;
-        filter.kinds = string_set(object.get("kinds"), "kinds")?;
-        filter.sources = string_set(object.get("sources"), "sources")?;
-    }
     if let Principal::Agent { id, .. } = principal
         && !filter.agents.is_empty()
         && !filter.agents.contains(id)
@@ -3142,35 +3128,6 @@ fn parse_filter(raw: Option<&Value>, principal: &Principal) -> Result<EventFilte
         filter.agents.insert(id.clone());
     }
     Ok(filter)
-}
-
-fn string_set(value: Option<&Value>, field: &str) -> Result<HashSet<String>> {
-    let Some(value) = value else {
-        return Ok(HashSet::new());
-    };
-    let array = value
-        .as_array()
-        .ok_or_else(|| Error::new("invalid", format!("event filter {field} must be an array")))?;
-    let mut result = HashSet::new();
-    if array.len() > PAGE_MAX {
-        return Err(Error::new(
-            "frame_too_large",
-            format!("event filter {field} has too many values"),
-        ));
-    }
-    for item in array {
-        let text = item
-            .as_str()
-            .filter(|text| !text.is_empty())
-            .ok_or_else(|| {
-                Error::new(
-                    "invalid",
-                    format!("event filter {field} values must be non-empty strings"),
-                )
-            })?;
-        result.insert(text.to_owned());
-    }
-    Ok(result)
 }
 
 fn contains_secret_question(value: &Value) -> bool {
@@ -3329,4 +3286,201 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
         .as_millis()
         .min(i64::MAX as u128) as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn router() -> Router {
+        let store = eliot_store::Store::open(std::path::Path::new(":memory:")).unwrap();
+        Router::new(
+            PathBuf::from("synthetic-data-root"),
+            "owner-credential".to_owned(),
+            Arc::new(AsyncMutex::new(store)),
+            Bus::new(16),
+        )
+    }
+
+    fn admit(store: &mut eliot_store::Store) -> Vec<Event> {
+        store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: ulid::Ulid::new().to_string(),
+                    target: None,
+                    verb: "launch".to_owned(),
+                    args: json!({"project":"typed-events", "workspace":"synthetic-workspace"}),
+                    expected_generation: Some(0),
+                    expected_turn_id: None,
+                    request_id: None,
+                },
+                now_ms(),
+            )
+            .unwrap()
+            .events
+    }
+
+    #[tokio::test]
+    async fn typed_event_handlers_reject_malformed_params() {
+        let router = router();
+        let malformed = [
+            json!({"after":null}),
+            json!({"after":1.0}),
+            json!({"after":"0"}),
+            json!({"after":false}),
+            json!({"after":-1}),
+            json!({"after":u64::MAX}),
+            json!({"limit":null}),
+            json!({"limit":1.0}),
+            json!({"limit":false}),
+            json!({"limit":0}),
+            json!({"limit":1001}),
+            json!({"filter":null}),
+            json!({"filter":false}),
+            json!({"filter":{"unknown":[]}}),
+            json!({"filter":{"agents":null}}),
+            json!({"filter":{"agents":"a1"}}),
+            json!({"filter":{"kinds":[false]}}),
+            json!({"filter":{"sources":[""]}}),
+            json!({"filter":{"agents":vec!["a1"; 1001]}}),
+            json!({"unknown":0}),
+        ];
+        for method in ["events.read", "events.subscribe"] {
+            for params in &malformed {
+                let error = router
+                    .handle(
+                        method,
+                        json!({
+                            "_auth":{"kind":"owner", "credential":"owner-credential"},
+                            "_payload":params,
+                        }),
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.code, "invalid", "{method}: {params}");
+            }
+        }
+        for wait_ms in [json!(null), json!(-1), json!(1.0), json!("0"), json!(false)] {
+            let error = router
+                .events_subscribe(&json!({"wait_ms":wait_ms}), &Principal::Owner)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "invalid");
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_events_read_preserves_owner_and_agent_filter_scope() {
+        let router = router();
+        let (first, second) = {
+            let mut store = router.inner.store.lock().await;
+            (admit(&mut store), admit(&mut store))
+        };
+        let agent = first[0].agent.as_ref().unwrap().clone();
+        let other = second[0].agent.as_ref().unwrap().clone();
+        let principal = Principal::Agent {
+            id: agent.clone(),
+            generation: 0,
+        };
+        let all = router
+            .events_read(&json!({}), &Principal::Owner)
+            .await
+            .unwrap();
+        assert_eq!(
+            all["events"].as_array().unwrap().len(),
+            first.len() + second.len()
+        );
+        assert_eq!(all["next"], all["high_water"]);
+        assert_eq!(all["truncated"], json!(false));
+
+        for filter in [json!({}), json!({"agents":[agent, other]})] {
+            let response = router
+                .events_read(&json!({"filter":filter}), &principal)
+                .await
+                .unwrap();
+            let events: Vec<Event> = serde_json::from_value(response["events"].clone()).unwrap();
+            assert_eq!(events, first);
+            assert_eq!(response["next"], all["high_water"]);
+        }
+        let error = router
+            .events_read(&json!({"filter":{"agents":[other]}}), &principal)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "not_allowed");
+
+        // Noncanonical nonempty Agent filter strings keep their old no-match behavior.
+        let response = router
+            .events_read(
+                &json!({"filter":{"agents":["not-a-canonical-agent"]}}),
+                &Principal::Owner,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response["events"], json!([]));
+        assert_eq!(response["next"], all["high_water"]);
+
+        let response = router
+            .events_subscribe(&json!({"limit":1, "wait_ms":u64::MAX}), &Principal::Owner)
+            .await
+            .unwrap();
+        assert_eq!(response["events"].as_array().unwrap().len(), 1);
+        assert_eq!(response["lagged"], json!(false));
+    }
+
+    #[test]
+    fn typed_event_filter_checks_raw_bounds_before_deduplication() {
+        let error = authorize_event_filter(
+            EventsFilter {
+                agents: vec!["a1".to_owned(); 1001],
+                kinds: Vec::new(),
+                sources: Vec::new(),
+            },
+            &Principal::Owner,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.code, "invalid");
+    }
+
+    #[tokio::test]
+    async fn typed_events_subscribe_replays_and_buffers_late_commits_once() {
+        let router = router();
+        let params = json!({"limit":2, "wait_ms":1000, "filter":{"kinds":["command.accepted"]}});
+        let mut store = router.inner.store.lock().await;
+        let subscription = router.events_subscribe(&params, &Principal::Owner);
+        tokio::pin!(subscription);
+        // Registration happens before the initial Store/high-water read can proceed.
+        assert!(futures_util::poll!(&mut subscription).is_pending());
+        let first = admit(&mut store);
+        router.inner.bus.publish(&first);
+        drop(store);
+        // Replay consumes this commit; the buffered copy must not duplicate it.
+        assert!(futures_util::poll!(&mut subscription).is_pending());
+        // A waiting subscription must release the Store lock for the next commit.
+        let mut store = timeout_at(
+            Instant::now() + Duration::from_secs(1),
+            router.inner.store.lock(),
+        )
+        .await
+        .unwrap();
+        let second = admit(&mut store);
+        drop(store);
+        router.inner.bus.publish(&second);
+        let response = timeout_at(Instant::now() + Duration::from_secs(1), subscription)
+            .await
+            .unwrap()
+            .unwrap();
+        let expected: Vec<_> = first
+            .into_iter()
+            .chain(second)
+            .filter(|event| event.kind == "command.accepted")
+            .collect();
+        let events: Vec<Event> = serde_json::from_value(response["events"].clone()).unwrap();
+        assert_eq!(events, expected);
+        assert_eq!(response["next"], json!(expected.last().unwrap().seq));
+        assert_eq!(response["high_water"], response["next"]);
+        assert_eq!(response["lagged"], json!(false));
+        assert_eq!(response["truncated"], json!(false));
+    }
 }

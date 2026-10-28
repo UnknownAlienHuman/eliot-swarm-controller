@@ -297,14 +297,58 @@ resends previous input.
 
 ## Event replay
 
-Register a bounded live buffer, capture persisted high-water, replay pages through it,
-then release buffered persisted events above it in order. Ephemeral delivery is best
-effort. Overflow reports lag; pruned history reports `history_gap`, never silent skipping.
-Committed event sequence values are never reused after retention.
+```text
+events.read {
+  after?: i64, limit?: usize, filter?: EventsFilter
+} -> EventsReadResponse {
+  events: Vec<Event>, next: i64, high_water: i64, truncated: bool
+}
 
-`events.subscribe` accepts optional nonnegative `wait_ms`, capped at 30,000, and waits
-for matching persisted events up to that duration when the page is not yet full. This is
-event-delivery wait, not command or turn settlement.
+events.subscribe {
+  after?: i64, limit?: usize, wait_ms?: u64, filter?: EventsFilter
+} -> EventsSubscribeResponse {
+  events: Vec<Event>, next: i64, high_water: i64, truncated: bool, lagged: bool
+}
+
+EventsFilter {
+  agents?: Vec<String>, kinds?: Vec<String>, sources?: Vec<String>
+}
+```
+
+The shared Rust DTO surface for these two methods is
+`core::api::{EventsFilter,EventsReadRequest,EventsSubscribeRequest,EventsReadResponse,EventsSubscribeResponse}`.
+
+Before printing events or advancing a cursor, validate each response page against the
+effective request cursor: `0 <= after <= next <= high_water`. Event `seq` values must be
+strictly increasing, greater than `after`, and no greater than `next`. A malformed page
+returns a constant `unknown` error. Do not clamp the response, default a bad cursor,
+replay from another cursor, or skip forward.
+
+`after` defaults to 0 only when omitted. If supplied, it must be a nonnegative `i64`;
+`null`, negative, fractional, string, boolean and overflowing values are `invalid`.
+`limit` defaults to 100 and must be an integer from 1 through 1,000. For both methods,
+an omitted `filter` means an empty filter. Explicit `null`, an unknown request or filter
+field, or any wrong field type is `invalid`. Each `agents`, `kinds` or `sources` array
+may contain at most 1,000 raw entries; every entry must be a nonempty string. Agent filter
+strings are compared verbatim rather than canonicalized, so a noncanonical value may
+simply match no events. An Agent principal remains scoped to itself; an explicit nonempty
+agent filter that excludes it returns `not_allowed`.
+
+Only `events.subscribe` accepts `wait_ms`. It defaults to 0, must be a nonnegative `u64`
+when supplied, and values above 30,000 are clamped to 30,000. Bad types, negative values
+and overflow are `invalid`; `events.read` rejects `wait_ms` as an unknown field. This wait
+fills an event page and does not wait for command or turn settlement.
+
+Subscribe before reading the persisted high-water mark, replay through that mark, then
+release buffered persisted events above it in order. `next` is the exclusive replay
+cursor; `high_water` reports the persisted high-water observed by the read. A buffer lag
+sets `lagged` and triggers persisted replay from the current cursor. `truncated` reports
+page count/encoded-size limits. Ephemeral delivery is best effort; pruned history returns
+`history_gap`, never silent skipping. Committed event sequence values are never reused.
+
+For these known methods, malformed params, wrong types and unknown fields return
+`invalid`. Unknown methods and unsupported command verbs remain `unsupported`; this keeps
+request grammar errors distinct from feature availability.
 
 ## Mail acknowledgement
 
