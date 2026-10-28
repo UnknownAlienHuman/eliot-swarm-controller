@@ -1,9 +1,17 @@
 //! Public event-read DTOs. Authorization, high-water and live-buffer behavior
 //! remain in the Router; this module only validates the implemented wire shape.
 
+mod native_pages;
+mod native_requests;
 mod read_validation;
 mod reads;
 
+pub use native_pages::{
+    DiscoverCoverage, DiscoverPage, DiscoverSubject, MAX_DISCOVER_PAGE_BYTES,
+    MAX_DISCOVER_PAGE_ENTRIES, MAX_OBSERVATION_CURSOR_BYTES, MAX_OBSERVATION_PAGE_BYTES,
+    MAX_OBSERVATION_PAGE_ENTRIES, ObservationPage, ObservationQuery,
+};
+pub use native_requests::{AgentDiscoverRequest, AgentHistoryRequest};
 pub use reads::{AgentResultRequest, AgentResultResponse, CommandGetRequest, TurnGetRequest};
 
 use crate::{Error, Event, Result};

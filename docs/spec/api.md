@@ -278,24 +278,41 @@ legitimately share one turn result.
 
 ## Discover, attach, detach and resume
 
-Discovery is read-only/paged and creates no Agent rows. Attachment uses one canonical
-native subject row. First attach targets generation 1; a later ownership takeover gets
-the next generation. Validate before dispatch, commit identity fence before native I/O,
-and install exact readback on success. Failure never restores revoked control; unknown
-blocks another takeover.
+Discovery is owner-only, read-only/paged and creates no Agent rows. It resolves the
+required profile from current daemon configuration and derives its target environment;
+a supplied harness must match that profile. It performs no native control operation.
+Attachment uses one canonical native subject row. First attach targets generation 1; a
+later ownership takeover gets the next generation. Validate before dispatch, commit
+identity fence before native I/O, and install exact readback on success. Failure never
+restores revoked control; unknown blocks another takeover.
 
 The first discovery caller requires an explicit existing profile:
 
 ```text
-agent.discover {profile, harness?, native_scope?, cursor?, limit?}
+agent.discover {profile:string, harness?:string, native_scope?:string,
+  cursor?:string, limit?:usize}
   -> {harness, native_scope, subjects:[{native_ref,workspace,state,
        created_at,updated_at,source,ephemeral}], next_cursor,
        coverage:{kind,complete}}
+agent.history {id:string, generation?:i64, source:string,
+  view:string, turn_id?:string, cursor?:string, limit?:usize}
+  -> {agent_id, generation, native_scope, native_ref, source, view,
+      entries:[Value], next_cursor, coverage:object}
 ```
 
-Limits default to 100 and range from 1 to 1,000, with a 900 KiB encoded page bound.
-Pass the opaque cursor unchanged; it is bound to the selected profile, target environment,
-verified native store, method, ordering and source filters. Changed store selection
+The shared Core request DTOs are `core::api::{AgentDiscoverRequest,AgentHistoryRequest}`.
+`profile` and `id` are required nonempty strings. Present strings are checked for
+nonemptiness after trimming but are preserved as supplied. For `agent.discover`, optional
+`harness`, `native_scope` and `cursor` may be omitted or `null` to mean absent. For
+`agent.history`, the same applies to optional `generation`, `turn_id` and `cursor`.
+Wrong types are `invalid`. `limit` defaults to 100 only when omitted and must be an
+integer from 1 through 1,000; explicit `null`, wrong types and out-of-range values are
+`invalid`. Unknown request fields are `invalid`.
+
+Discovery scope is limited to 512 bytes and rejects control characters. Its cursor is
+limited to 16 KiB and rejects control characters. Pass that opaque cursor unchanged; it
+is bound to the selected profile, target environment, verified native store, scope,
+method, fixed native-list filters, ordering and page size. Changed store selection
 rejects before listing subjects. Unverified selection is an explicit error.
 `coverage.complete` means this paged enumeration
 has reached its native end, not that it is a consistent snapshot or a live subscription.
@@ -303,8 +320,8 @@ Codex coverage is `state_db_only`; it never scans/repairs rollout storage to fil
 list. The current Codex query selects nonarchived threads and fixes the page size in
 its cursor binding. Subject timestamps are milliseconds since the Unix epoch; native
 seconds are converted before projection. Session previews, prompts and transcripts are
-excluded. Native `notLoaded` is
-reported as unknown: a separate reader cannot prove another process's session stopped.
+excluded. Native `notLoaded` is reported as unknown: a separate reader cannot prove
+another process's session stopped.
 Discovery installs no Agent identity and invokes no native start/resume/input operation.
 Owned readers finish cleanup after a client disconnect; drain waits for them and force
 cancels their own custody. New discovery rejects during shutdown.
@@ -315,8 +332,6 @@ The first observation mutations use the existing command pipeline:
 command.submit {id, verb:"attach", expected_generation?,
   args:{profile,harness,native_scope,native_ref,mode:"observe",project?}}
 command.submit {id, target:AGENT, verb:"detach", expected_generation?, args:{}}
-agent.history {id:AGENT, generation?, source?:"native"|"rollout",
-  view:"subject"|"turns"|"items", turn_id?, cursor?, limit?}
 ```
 
 Require an explicit profile. Resolve the same mutation id before rereading mutable
@@ -328,12 +343,35 @@ All native control verbs reject observe-only targets, including owner-issued sto
 `mode:"control"` is unsupported. The vendor plugin method is `agent.attach`; it is not
 a second public mutation method.
 
+`agent.history` is a separate owner-only read. `source` is required and must be
+`native` or `rollout`; `view` is required and must be `subject`, `turns` or `items`.
+Omitting either required field, supplying `null`, or using a wrong type is `invalid`;
+other source/view values are `invalid`, while unsupported source capabilities retain
+their existing explicit error behavior. Optional `generation`, `turn_id` and `cursor`
+may be omitted or `null` to mean absent; other wrong types are `invalid`. A supplied
+generation must be a nonnegative integer (`invalid` otherwise) and equal the current
+observer generation (`stale_generation` otherwise). `items` requires a nonempty `turn_id`;
+`subject` and `turns` forbid it. The read targets an existing observe-only Agent with no
+control identity and is bound to its current generation. The CLI defaults `--source` to
+`native` and sends that value explicitly. Absent optional request members are omitted
+when serialized, never sent as `null`.
+
 Successful reader attachment can leave the Agent `unknown`. History pages are private
 views: they neither replay lifecycle into the event bus nor acknowledge input, command
-or request delivery. Bind every page/cursor to Agent/generation, exact native subject,
-source/view, turn filter, ordering and selected store. Items require an exact turn id.
-Limits are 1–1,000 entries, a 16 KiB cursor and a 900 KiB encoded page. Unsupported
-source/paging stays explicit; observation never resumes a thread to obtain history.
+or request delivery, or write observation pages to Store. Bind every page/cursor to
+Agent/generation, exact native subject, source/view, turn filter, ordering and selected
+store. Items require an exact turn id. A supplied history `turn_id` is limited to 16 KiB
+and rejects control characters. The `ObservationQuery` cursor bound is nonempty and at
+most 16 KiB; it has no additional control-character rule. Pages contain at most 1,000
+entries and are at most 900 KiB encoded. `entries` and `coverage` are opaque JSON values;
+the wrapper does not reinterpret native/vendor records or coverage fields.
+
+The Router rejects a non-null `next_cursor` equal to the request cursor, regardless of
+source coverage. An absent cursor does not let a wrapper infer complete history: preserve
+the opaque coverage object and do not synthesize completeness.
+Unsupported source/paging stays explicit. Observation never resumes a thread to obtain
+history. See the neutral
+`ObservationPage` bounds in [plugin protocol](plugin-protocol.md#host-requests).
 Observe detach fences new reads, closes only its reader and records source closure
 after cleanup. It retains unknown native state and never reports native session end.
 

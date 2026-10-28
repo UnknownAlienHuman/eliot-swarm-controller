@@ -123,6 +123,22 @@ entries, next cursor and explicit coverage. They are private historical views, n
 `events.put` batches or command reconciliation. Detach returns `state:"detached"`
 after closing its own reader. Observe reader loss never emits native session end.
 
+Discovery and observation pages use the shared harness-neutral `DiscoverPage` and
+`ObservationPage` DTOs, not vendor SDK records. Core exports `DiscoverSubject`,
+`DiscoverCoverage`, `DiscoverPage`, `ObservationQuery` and `ObservationPage` from its
+API module, along with `MAX_DISCOVER_PAGE_ENTRIES`, `MAX_DISCOVER_PAGE_BYTES`,
+`MAX_OBSERVATION_PAGE_ENTRIES`, `MAX_OBSERVATION_PAGE_BYTES` and
+`MAX_OBSERVATION_CURSOR_BYTES`. The plugin crate retains its existing public re-exports
+for compatibility.
+
+`ObservationPage.entries` remains a list of opaque JSON values and `coverage` an opaque
+JSON object; shared layers enforce page bindings, bounds and existing secret redaction
+without assigning vendor-specific entry schemas. Limits remain 1–1,000 entries, 16 KiB
+per cursor and 900 KiB per encoded page. The public host rejects a non-null `next_cursor`
+equal to the request cursor. It does not interpret coverage or infer complete history
+from an absent cursor; preserve source-specific coverage shape without rewriting its
+semantics.
+
 ## Start ordering
 
 Arm the reader/subscription before native create/resume/input. For a session-first
