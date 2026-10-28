@@ -541,18 +541,17 @@ impl PluginHost {
         let (sender, stderr, credentials) = self.sender(&key, "stop")?;
         let (reply, response) = oneshot::channel();
         let deadlines = StopDeadlines::new(Instant::now());
-        timeout_at(
-            deadlines.queued_until,
-            sender.send(RuntimeMessage::Stop {
+        enqueue_stop(
+            &sender,
+            RuntimeMessage::Stop {
                 command,
                 force,
                 deadlines,
                 reply,
-            }),
+            },
+            deadlines.queued_until,
         )
-        .await
-        .map_err(|_| Error::new("busy", "Agent plugin command queue is full"))?
-        .map_err(|_| Error::new("unknown", "owned Agent plugin is no longer available"))?;
+        .await?;
         let result = match timeout_at(deadlines.reply_until, response).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(Error::new(
@@ -1165,20 +1164,22 @@ async fn run_agent_inner(
                         }
                     }
                     RuntimeMessage::Stop { command, force, deadlines, reply } => {
-                        if Instant::now() >= deadlines.queued_until {
-                            let _ = reply.send(Err(Error::new("unknown", "stop queue deadline elapsed before native dispatch")));
-                            continue;
-                        }
-                        let snapshot_command_id = last_command_id.clone();
-                        last_command_id = command.id.clone();
                         let params = json!({
                             "agent_id": agent.id,
                             "generation": agent.generation,
                             "command_id": command.id,
                             "force": force,
                         });
-                        let cooperative = client
-                            .call("agent.stop", params, deadlines.rpc_deadline(RPC_DEADLINE))
+                        let stop_call = match prepare_queued_stop_call(&client, params, deadlines) {
+                            Ok(call) => call,
+                            Err(error) => {
+                                let _ = reply.send(Err(error));
+                                continue;
+                            }
+                        };
+                        let snapshot_command_id = last_command_id.clone();
+                        last_command_id = command.id.clone();
+                        let cooperative = stop_call
                             .await
                             .map_err(|error| redact_native_error(error, &source_credentials))
                             .and_then(validate_applied);
@@ -2188,6 +2189,43 @@ fn insert_environment(environment: &mut Map<String, Value>, name: &str, value: S
 
 fn deadline() -> Instant {
     Instant::now() + RPC_DEADLINE
+}
+
+async fn enqueue_stop(
+    sender: &mpsc::Sender<RuntimeMessage>,
+    message: RuntimeMessage,
+    until: Instant,
+) -> Result<()> {
+    // Cancelling pending mpsc::send cannot enqueue its value. SendError likewise
+    // returns an unreceived value; neither path can have reached native I/O.
+    timeout_at(until, sender.send(message))
+        .await
+        .map_err(|_| {
+            Error::new(
+                "native_not_dispatched",
+                "stop was not enqueued before its queue deadline",
+            )
+        })?
+        .map_err(|_| {
+            Error::new(
+                "native_not_dispatched",
+                "stop queue closed before admission",
+            )
+        })
+}
+
+fn prepare_queued_stop_call(
+    client: &PluginClient,
+    params: Value,
+    deadlines: StopDeadlines,
+) -> Result<impl std::future::Future<Output = Result<Value>> + '_> {
+    if Instant::now() >= deadlines.queued_until {
+        return Err(Error::new(
+            "native_not_dispatched",
+            "stop queue deadline elapsed before native dispatch",
+        ));
+    }
+    Ok(client.call("agent.stop", params, deadlines.rpc_deadline(RPC_DEADLINE)))
 }
 
 async fn wait_child(
@@ -3359,5 +3397,138 @@ mod tests {
             deadlines.queued_until < deadlines.rpc_until
                 && deadlines.rpc_until < deadlines.custody_until
         );
+    }
+
+    #[tokio::test]
+    async fn stop_pre_io_full_and_closed_queues_are_rejected_without_admission() {
+        let (host, key, start_id) = source_exit_fixture("fake");
+        let command = {
+            let mut store = host.state.store.lock().await;
+            store
+                .put_batch(
+                    SourceBatch {
+                        batch_id: "queue-test-ready".to_owned(),
+                        agent_id: key.id.clone(),
+                        generation: 1,
+                        source: "stream".to_owned(),
+                        cursor: None,
+                        events: vec![NativeEvent {
+                            kind: "session.ready".to_owned(),
+                            native_id: "queue-test-ready".to_owned(),
+                            data: json!({"command_id":start_id}),
+                        }],
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            store
+                .settle(&start_id, eliot_core::CommandState::Applied, None, now_ms())
+                .unwrap();
+            let id = Ulid::new().to_string();
+            store
+                .submit(
+                    "owner",
+                    SubmitCommand {
+                        id: id.clone(),
+                        target: Some(key.id.clone()),
+                        verb: "stop".to_owned(),
+                        args: json!({}),
+                        expected_generation: Some(1),
+                        expected_turn_id: None,
+                        request_id: None,
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            store.dispatch(&id, now_ms()).unwrap().value
+        };
+        let (sender, mut receiver) = mpsc::channel(1);
+        let (blocker, _blocked_reply) = oneshot::channel();
+        sender
+            .send(RuntimeMessage::DaemonForce { reply: blocker })
+            .await
+            .unwrap_or_else(|_| panic!("queue fixture closed"));
+        let deadlines =
+            StopDeadlines::new(Instant::now() - RPC_DEADLINE - Duration::from_millis(1));
+        let (reply, response) = oneshot::channel();
+        let error = enqueue_stop(
+            &sender,
+            RuntimeMessage::Stop {
+                command: command.clone(),
+                force: true,
+                deadlines,
+                reply,
+            },
+            deadlines.queued_until,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "native_not_dispatched");
+        assert_eq!(
+            eliot_core::classify_dispatched_error(&error.code),
+            eliot_core::CommandState::Rejected
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(RuntimeMessage::DaemonForce { .. })
+        ));
+        // The rejected stop never reached the actor, so no native work can follow it.
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(response.await.is_err());
+
+        drop(receiver);
+        let (reply, _response) = oneshot::channel();
+        let error = enqueue_stop(
+            &sender,
+            RuntimeMessage::Stop {
+                command,
+                force: true,
+                deadlines,
+                reply,
+            },
+            Instant::now() + RPC_DEADLINE,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "native_not_dispatched");
+        assert_eq!(
+            eliot_core::classify_dispatched_error(&error.code),
+            eliot_core::CommandState::Rejected
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_pre_io_expired_actor_deadline_is_rejected_without_rpc_bytes() {
+        use tokio::io::AsyncReadExt;
+
+        let (host_io, mut native_io) = tokio::io::duplex(256);
+        let (reader, writer) = tokio::io::split(host_io);
+        let connection = PluginConnection::new(reader, writer);
+        let client = connection.client();
+        let deadlines =
+            StopDeadlines::new(Instant::now() - RPC_DEADLINE - Duration::from_millis(1));
+        let error = match prepare_queued_stop_call(
+            &client,
+            json!({
+                "agent_id":"a1", "generation":1, "command_id":Ulid::new().to_string(), "force":true,
+            }),
+            deadlines,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("expired actor must reject before constructing native RPC"),
+        };
+        assert_eq!(error.code, "native_not_dispatched");
+        assert_eq!(
+            eliot_core::classify_dispatched_error(&error.code),
+            eliot_core::CommandState::Rejected
+        );
+        tokio::task::yield_now().await;
+        let mut bytes = [0_u8; 1];
+        let native_read = native_io.read(&mut bytes);
+        tokio::pin!(native_read);
+        assert!(futures_util::poll!(&mut native_read).is_pending());
     }
 }
