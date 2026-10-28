@@ -50,6 +50,90 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $cli = Join-Path $env:GITHUB_WORKSPACE 'target/debug/eliot.exe'
+          # Probe foreground startup first, without precreating either data root.
+          $foregroundTag = [guid]::NewGuid().ToString('N')
+          $foregroundData = Join-Path $env:RUNNER_TEMP ('eliot foreground Проба ' + $foregroundTag)
+          $foregroundInfo = [Diagnostics.ProcessStartInfo]::new($cli)
+          $foregroundInfo.UseShellExecute = $false
+          $foregroundInfo.CreateNoWindow = $true
+          $foregroundInfo.RedirectStandardOutput = $true
+          $foregroundInfo.RedirectStandardError = $true
+          foreach ($word in @('--data-dir', ($foregroundData + '\'), '--json', 'daemon', '--foreground')) {
+            $foregroundInfo.ArgumentList.Add($word)
+          }
+          $foreground = [Diagnostics.Process]::new()
+          $foreground.StartInfo = $foregroundInfo
+          $foregroundStarted = $false
+          $foregroundExitCode = $null
+          $foregroundCleanupError = $null
+          try {
+            $foregroundStarted = $foreground.Start()
+            if (!$foregroundStarted) { throw 'Could not start owned foreground daemon' }
+            $null = $foreground.Handle
+            $foregroundOutput = $foreground.StandardOutput.ReadToEndAsync()
+            $foregroundErrors = $foreground.StandardError.ReadToEndAsync()
+            $foregroundDeadline = [DateTime]::UtcNow.AddSeconds(15)
+            do {
+              if ((Test-Path -LiteralPath (Join-Path $foregroundData 'daemon.json')) -or $foreground.HasExited) { break }
+              Start-Sleep -Milliseconds 100
+            } while ([DateTime]::UtcNow -lt $foregroundDeadline)
+            if ($foreground.HasExited -or !(Test-Path -LiteralPath (Join-Path $foregroundData 'daemon.json'))) {
+              throw 'Fresh foreground daemon exited or did not publish daemon.json'
+            }
+            $foregroundMetadata = Get-Content -LiteralPath (Join-Path $foregroundData 'daemon.json') -Raw | ConvertFrom-Json
+            if ($foregroundMetadata.pid -ne $foreground.Id) { throw 'Foreground metadata names another process' }
+            $foregroundStatus = & $cli --data-dir $foregroundData --json status | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0 -or $foregroundStatus.state -ne 'running') { throw 'Fresh foreground daemon is unavailable' }
+          } finally {
+            try {
+              if ($foregroundStarted -and !$foreground.HasExited) {
+                try {
+                  if (Test-Path -LiteralPath (Join-Path $foregroundData 'daemon.json')) {
+                    $foregroundMetadata = Get-Content -LiteralPath (Join-Path $foregroundData 'daemon.json') -Raw | ConvertFrom-Json
+                    if ($foregroundMetadata.pid -eq $foreground.Id) {
+                      $foregroundStopExitCode = & {
+                        $PSNativeCommandUseErrorActionPreference = $false
+                        $null = & $cli --data-dir $foregroundData --json daemon stop --force
+                        $LASTEXITCODE
+                      }
+                      if ($foregroundStopExitCode -notin @(0, 6)) { $foregroundCleanupError = 'Owned foreground IPC stop failed' }
+                    }
+                  }
+                } catch {
+                  $foregroundCleanupError = 'Owned foreground metadata/IPC cleanup failed'
+                }
+                try {
+                  if (!$foreground.WaitForExit(15000)) {
+                    # Cleanup authority is the process handle held since Start,
+                    # even when metadata was never written. Never adopt a PID.
+                    $foregroundCleanupError = 'Owned foreground daemon required process termination'
+                    $foreground.Kill()
+                    if (!$foreground.WaitForExit(5000)) { $foregroundCleanupError = 'Owned foreground daemon did not exit' }
+                  }
+                } catch {
+                  $foregroundCleanupError = 'Owned foreground process cleanup failed'
+                }
+              }
+            } finally {
+              if ($foregroundStarted -and $foreground.HasExited) {
+                $foregroundExitCode = $foreground.ExitCode
+                Write-Output ('Fresh foreground daemon exit code: ' + $foregroundExitCode)
+                if ($foregroundErrors.Wait(2000)) {
+                  $tail = $foregroundErrors.Result
+                  $tail = $tail.Substring([Math]::Max(0, $tail.Length - 4096))
+                  $foregroundLog = Join-Path $env:RUNNER_TEMP ('eliot-foreground-' + $foregroundTag + '-stderr-tail.txt')
+                  [IO.File]::WriteAllText($foregroundLog, $tail)
+                  Write-Output ('Fresh foreground stderr tail: ' + $tail)
+                }
+              }
+              if ($null -ne $foregroundCleanupError) { Write-Output $foregroundCleanupError }
+              $foreground.Dispose()
+            }
+          }
+          if ($null -ne $foregroundCleanupError) { throw $foregroundCleanupError }
+          if ($foregroundExitCode -ne 0) { throw 'Fresh foreground daemon exited unsuccessfully' }
+          Write-Output 'Fresh foreground daemon startup passed'
+
           $data = Join-Path $env:RUNNER_TEMP ('eliot capture Проба ' + [guid]::NewGuid().ToString('N'))
           $start = [Diagnostics.ProcessStartInfo]::new($cli)
           $start.UseShellExecute = $false
@@ -85,6 +169,20 @@ jobs:
             if ($LASTEXITCODE -ne 0 -or $status.state -ne 'running') {
               throw 'Background daemon is unavailable'
             }
+          } catch {
+            $startupFailure = $_
+            try {
+              if ($errors.IsCompletedSuccessfully) {
+                $tail = $errors.Result
+                $tail = $tail.Substring([Math]::Max(0, $tail.Length - 4096))
+                $starterLog = Join-Path $env:RUNNER_TEMP ('eliot-starter-' + [guid]::NewGuid().ToString('N') + '-stderr-tail.txt')
+                [IO.File]::WriteAllText($starterLog, $tail)
+                Write-Output ('Background starter stderr tail: ' + $tail)
+              }
+            } catch {
+              Write-Output ('Startup diagnostic unavailable; HResult=' + $_.Exception.HResult)
+            }
+            throw $startupFailure
           } finally {
             if ($null -eq $daemon -and (Test-Path -LiteralPath (Join-Path $data 'daemon.json'))) {
               $info = Get-Content -LiteralPath (Join-Path $data 'daemon.json') -Raw | ConvertFrom-Json
@@ -112,6 +210,8 @@ jobs:
           hooks="$smoke_root/hooks"
           mkdir "$repo" "$data" "$hooks"
           daemon_job=
+          attach_command=
+          detach_command=
 
           fixture_git() {
             GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
@@ -140,9 +240,31 @@ jobs:
             daemon_job=
             return "$status"
           }
+          failure_diagnostics() {
+            local command_id
+            for command_id in "$attach_command" "$detach_command"; do
+              if [[ -n "$command_id" ]]; then
+                client cmd show "$command_id" 2>/dev/null \
+                  | jq -c '{id,verb,state,target,generation,expected_generation}' \
+                  || printf 'Command state unavailable: %s\n' "$command_id"
+              fi
+            done
+            client status 2>/dev/null | jq -c '{state,admission,agents,owned_plugins,
+              discovery_readers,observer_readers,store_write_faulted,
+              blockers:[.blockers[]? | {kind,agent,generation,state,command_id,count}]}' \
+              || printf 'Read-only daemon status unavailable\n'
+            if [[ -f "$smoke_root/daemon.stderr" ]]; then
+              printf 'Daemon stderr (last 4096 bytes; fake-only smoke):\n'
+              tail -c 4096 "$smoke_root/daemon.stderr"
+              printf '\n'
+            fi
+          }
           cleanup() {
             local status=$?
             trap - EXIT
+            if (( status != 0 )); then
+              failure_diagnostics || printf 'Failure diagnostics unavailable\n'
+            fi
             if [[ -n "$daemon_job" ]]; then
               if daemon_active; then client daemon stop --force >/dev/null 2>&1 || true; fi
               if ! wait_owned_daemon; then status=1; fi
@@ -158,7 +280,7 @@ jobs:
           fixture_git commit -m 'Local worktree smoke fixture'
           base=$(fixture_git rev-parse --verify HEAD)
           "$cli" --data-dir "$data" daemon --foreground \
-            </dev/null >"$smoke_root/daemon.log" 2>&1 &
+            </dev/null >"$smoke_root/daemon.stdout" 2>"$smoke_root/daemon.stderr" &
           daemon_job=$!
           ready_deadline=$((SECONDS + 15))
           until timeout --foreground 2s "$cli" --data-dir "$data" --json status >/dev/null 2>&1; do
@@ -213,7 +335,12 @@ jobs:
             sleep 0.1
           done
           detached_view=$(client show "$observer")
-          jq -e '.state == "unknown" and .observe_only == true and .own_identity == false and any(.source_states[]; .source == "observe" and .state == "closed")' <<<"$detached_view" >/dev/null
+          jq -e --argjson generation "$((observed_generation + 1))" \
+            '.generation == $generation and .state == "unknown" and .observe_only == true and .own_identity == false' <<<"$detached_view" >/dev/null
+          detach_events=$(client events --since 0 --limit 1000)
+          jq -e --arg observer "$observer" --argjson generation "$observed_generation" \
+            '.truncated == false and any(.events[]; .kind == "source.closed" and .agent == $observer and .generation == $generation and .data.source == "observe")' <<<"$detach_events" >/dev/null
+          client status | jq -e '.observer_readers == 0' >/dev/null
 
           turn=$(client launch --profile fake --workspace "$repo" \
             --worktree codex/ci-smoke --base "$base" \
