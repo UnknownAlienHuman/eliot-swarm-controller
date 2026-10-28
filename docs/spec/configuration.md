@@ -57,6 +57,52 @@ uses the installed experimental `turn/start.collaborationMode` field, so only pr
 that explicitly select a mode opt into `initialize.capabilities.experimentalApi`.
 No global Codex configuration is changed.
 
+## Owner workspace setup
+
+Global profiles accept ordered setup entries only for an explicit `launch --worktree`.
+The router rejects nonempty setup on a shared/existing workspace; profile loading never
+runs a command. The raw owner format is:
+
+```toml
+[[profiles.codex-luna.setup]]
+program = 'C:\Program Files\PowerShell\7\pwsh.exe'
+args = ["-NoProfile", "-NonInteractive", "-File", { file = "scripts/setup.ps1" }]
+timeout_ms = 120000
+```
+
+`program` is one explicit absolute executable. Arguments are literal strings or exactly
+`{file="path"}`. There is no implicit shell, interpolation, per-entry cwd or environment.
+An explicitly selected interpreter receives exactly the supplied argv. Unknown fields
+are rejected. Limits are 16 entries, 64 arguments per entry, 4096 bytes per string,
+128 KiB of raw/frozen setup metadata, and `timeout_ms` from 1 to 3600000 inclusive.
+
+Admission freezes the selected executable and explicit files as
+`{canonical_path,size,sha256}` using bounded streaming reads (128 MiB per file,
+256 MiB total per plan). File references resolve against the admitted owner repository;
+absolute file references must remain inside that same root. Selecting an executable
+outside the repository does not extend the allowed root for `{file=...}` references.
+Parent traversal, symlinks/reparse points, devices and alternate streams are rejected.
+
+Before each spawn, verify the same canonical references, sizes and SHA-256 digests.
+Missing or changed references fail before execution. Do not copy or substitute scripts
+from the new checkout: file arguments become the admitted absolute paths, while cwd
+is the verified worktree. These checks cover explicit entry files, not imported code or
+an executable-provenance graph. The workspace coordinator owns the committed running
+marker, process custody, deadlines and unknown/no-replay behavior.
+
+Setup uses the same minimal baseline and `pass_env` name handling as the native process.
+Execution-time values remain in memory. It adds `ELIOT_AGENT_ID` and target
+`ELIOT_AGENT_GENERATION`, without an Agent token. Managed identity names cannot be supplied
+through `pass_env`; nested Eliot calls therefore see incomplete Agent credentials and
+cannot silently fall back to owner authority. Stdin is closed and stdout/stderr piped.
+
+Profiles also accept `scratch = ["target/", "node_modules/"]`, the defaults shared by
+the builtin fake profile. `scratch = []` disables all scratch deletion. Up to 64 bounded
+relative directory entries are normalized to `/` separators and a trailing `/`; absolute
+paths, dot traversal and alternate streams are rejected lexically. Execution must
+recheck containment and symlink/reparse safety. Removal may delete only untracked or
+ignored content within these frozen directories, never tracked dirt.
+
 ## Later configuration example
 
 ```toml

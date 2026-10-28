@@ -35,7 +35,7 @@ random token in this transaction, before native tools can run.
 
 Success installs the requested projection. Definite first-start/resume failure is failed;
 definite takeover/detach failure is lost from Eliot's perspective because the previous
-controller was revoked. Unknown keeps the target fence/token and blocks another
+controller was revoked. After native dispatch, unknown keeps the target fence/token and blocks another
 transition and ordinary input until exact readback/resolution. Never roll generation
 back or rotate another token merely because a reply disappeared.
 
@@ -75,6 +75,10 @@ Snapshots contain bounded nonsecret values and admitted file references, not res
 secrets. External Agents are observe-only until exact control attach. Native children
 remain visible above controller fanout guards; limited children have no widened control
 or independent identity. `own_identity=false` is never owner authority.
+
+The optional public `workspace_phase`, `branch`, `base_ref` and `base_oid` are read from
+the sole managed workspace row, including when another Agent shares its path. They are
+not duplicated Agent columns. No managed row means these projections are absent.
 
 ### States and reducer
 
@@ -201,6 +205,50 @@ Command {
 state = accepted -> [queued ->] dispatched -> applied|rejected|failed|unknown
         accepted|queued -> cancelled
 ```
+
+Workspace preparation is the narrow pre-native exception: an exact command-bound
+workspace marker permits `accepted|queued -> failed|unknown` without advancing the
+Agent generation or creating a native token/source. The general settlement API does
+not acquire this permission. For first launch, preparation failure is `failed` at
+generation 0; uncertainty retains `created` at generation 0 with an unknown command.
+Pre-native resume failure/uncertainty preserves the prior terminal Agent projection.
+
+Preparation binds the start command, target generation, repository/common-directory
+identity, worktree path, branch, base OID and immutable setup entries. Each setup
+program and explicit file argument carries its original canonical owner-side path,
+size and SHA-256. Literal and file arguments are distinct tagged values. These
+references are not implicitly copied or redirected into the prepared checkout.
+Store checks shape/bounds; the daemon verifies the frozen files before execution.
+
+Native dispatch requires the exact ready preparation and command, with target
+generation equal to current + 1, in the same transaction that advances the fence.
+Unknown creation accepts exact fully initialized worktree readback and may return the
+still-undispatched command to accepted. Absent/partial/conflicting readback stays
+unknown. This never authorizes repeating `worktree add`. Unknown setup retains its
+index and cannot authorize another spawn. Restart leaves setup-ready/completed entries
+intact; a resumed ready worktree retains its completed setup index and only revalidates
+its retained identity before native dispatch.
+
+A pre-native stop is bound to an admitted stop command as well as the start command
+and target generation. Its dispatch latches cancellation before custody cleanup and
+blocks setup/native dispatch. Exact stopped custody settles that stop applied, the
+start cancelled, and first-launch Agent stopped at generation 0. Uncertain cleanup
+settles both commands unknown and keeps the first-launch Agent created at generation
+0. Resume cancellation preserves the prior terminal projection. No native request
+answer is treated as permission to acknowledge this cleanup.
+
+`worktree.remove` is a normal command for a terminal owner, including failed/stopped
+generation-0 Agents. Its dispatch also verifies that no other nonterminal Agent
+references the path, then commits removing before Git I/O. Managed-path launch/resume
+admission and dispatch require ready, so concurrent use cannot pass this marker.
+Restart/lost removal results become unknown and permit exact readback only, never a
+second removal effect. Exact absence plus retained branch settles removed; the row
+remains to prevent resume/shared-path fallback into a deleted workspace. No branch is
+implicitly deleted. Native Agent state/generation are unchanged by removal.
+An intact checkout refused before destructive effects restores the validated prior
+preparation phase and setup index while failing only the removal command. Partial,
+uncertain or cleanup-unconfirmed removal remains unknown; it cannot claim this
+no-effect restoration.
 
 Launch/resume text creates a linked `<id>/send`. Selector expansion creates a Store-only
 parent plus deterministically ordered concrete children; parent applied means expansion,

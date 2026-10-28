@@ -9,6 +9,127 @@ fn empty_object() -> Value {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenSetupFile {
+    pub canonical_path: String,
+    pub size: u64,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum WorkspaceSetupArg {
+    Literal(String),
+    File(FrozenSetupFile),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceSetup {
+    pub program: FrozenSetupFile,
+    pub args: Vec<WorkspaceSetupArg>,
+    pub timeout_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspacePreparationInput {
+    pub project: String,
+    pub repo_path: String,
+    pub repo_common_dir: String,
+    pub requested_branch: String,
+    pub base_ref: Option<String>,
+    pub base_oid: String,
+    pub worktree_path: String,
+    pub frozen_setup: Vec<WorkspaceSetup>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspacePhase {
+    Creating,
+    SetupReady,
+    SetupRunning,
+    Ready,
+    Unknown,
+    Failed,
+    Removing,
+    Removed,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkspacePreparation {
+    pub agent: String,
+    pub target_generation: i64,
+    pub start_command_id: String,
+    pub project: String,
+    pub repo_path: String,
+    pub repo_common_dir: String,
+    pub requested_branch: String,
+    pub base_ref: Option<String>,
+    pub base_oid: String,
+    pub worktree_path: String,
+    pub frozen_setup: Vec<WorkspaceSetup>,
+    pub phase: WorkspacePhase,
+    pub setup_index: usize,
+    pub outcome: Option<Value>,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum WorkspaceCreationOutcome {
+    Verified {
+        repo_path: String,
+        repo_common_dir: String,
+        worktree_path: String,
+        branch: String,
+        head: String,
+    },
+    Failed {
+        code: String,
+        message: String,
+    },
+    Unknown {
+        code: String,
+        message: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum WorkspaceSetupOutcome {
+    Succeeded,
+    Failed { exit_code: i32 },
+    NotStarted { code: String, message: String },
+    Unknown { code: String, message: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum WorkspaceCancelOutcome {
+    Stopped,
+    Unknown { code: String, message: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum WorkspaceRemovalOutcome {
+    Removed {
+        repo_common_dir: String,
+        worktree_path: String,
+        branch: String,
+        branch_retained: bool,
+    },
+    /// Proven no destructive effect: the registered checkout remains intact.
+    Failed {
+        code: String,
+        message: String,
+    },
+    Unknown {
+        code: String,
+        message: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitPathStatus {
     pub path: String,
     pub status: String,
@@ -39,6 +160,12 @@ pub struct GitSnapshot {
     pub complete: bool,
     pub history_complete: bool,
     pub history_gap: bool,
+    #[serde(default)]
+    pub base_oid: Option<String>,
+    #[serde(default)]
+    pub committed_paths: Vec<String>,
+    #[serde(default)]
+    pub base_complete: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,6 +273,14 @@ pub struct Agent {
     pub native_ref: Option<String>,
     pub workspace: Option<String>,
     #[serde(default)]
+    pub workspace_phase: Option<WorkspacePhase>,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub base_ref: Option<String>,
+    #[serde(default)]
+    pub base_oid: Option<String>,
+    #[serde(default)]
     pub effective: Option<Value>,
     pub state: AgentState,
     pub active_turn: Option<String>,
@@ -174,6 +309,10 @@ impl Agent {
             native_scope: None,
             native_ref: None,
             workspace: None,
+            workspace_phase: None,
+            branch: None,
+            base_ref: None,
+            base_oid: None,
             effective: None,
             state: AgentState::Created,
             active_turn: None,

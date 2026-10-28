@@ -10,5 +10,8 @@ mod platform;
 mod plugin_host;
 mod redaction;
 mod router;
+mod setup;
+mod workspace_git;
+mod workspaces;
 
 pub use daemon::{client_call, run};

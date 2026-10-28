@@ -34,6 +34,12 @@ File-change approval was not live exercised; file-change requests carrying `gran
 remain unsupported. Full L7 qualification remains pending.
 [Roadmap](../roadmap.md) owns milestone status.
 
+In the installed 0.161.0 runtime, a stopped test thread with no turns returned
+`thread not loaded` from `thread/read` and `thread/turns/list`; a retained thread with
+a completed turn remained readable as `notLoaded`. Resume requires that exact native
+readback. An unavailable empty subject fails without creating a replacement thread;
+the managed-worktree resume exercise uses a completed turn before stopping.
+
 ## Sources
 
 Checked against official documentation on 2026-10-27:

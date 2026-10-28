@@ -54,6 +54,9 @@ pub async fn run(path: PathBuf) -> Result<()> {
     let mut background = JoinSet::new();
     let monitoring = router.monitoring();
     background.spawn(monitoring.clone().run(monitor_shutdown));
+    let mut recovery = JoinSet::new();
+    let recovery_router = router.clone();
+    recovery.spawn(async move { recovery_router.recover_workspaces().await });
     let mut progress = router.progress_receiver();
     let mut connections = JoinSet::new();
     let outcome = loop {
@@ -92,6 +95,13 @@ pub async fn run(path: PathBuf) -> Result<()> {
                     _ => monitoring.mark_unavailable("monitor_task_stopped"),
                 }
             }
+            joined = recovery.join_next(), if !recovery.is_empty() => {
+                match joined {
+                    Some(Ok(Ok(()))) => {}
+                    Some(Ok(Err(error))) => router.note_workspace_recovery_failure(&error.code),
+                    _ => router.note_workspace_recovery_failure("workspace_recovery_task_failed"),
+                }
+            }
             joined = connections.join_next(), if !connections.is_empty() => {
                 let _ = joined;
             }
@@ -113,6 +123,8 @@ pub async fn run(path: PathBuf) -> Result<()> {
     if router.is_force_requested() {
         router.force_owned_processes().await;
     }
+    recovery.abort_all();
+    while recovery.join_next().await.is_some() {}
     connections.abort_all();
     while connections.join_next().await.is_some() {}
     monitor_stop.send_replace(true);

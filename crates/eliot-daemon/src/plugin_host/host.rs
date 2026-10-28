@@ -1571,7 +1571,7 @@ fn minimal_plugin_environment() -> Vec<(OsString, OsString)> {
         .collect()
 }
 
-fn build_target_environment(agent: &Agent, agent_token: &str) -> Result<Value> {
+pub(crate) fn build_process_environment(profile: &Value) -> Result<Map<String, Value>> {
     let mut environment = Map::new();
     for name in BASE_ENVIRONMENT_NAMES {
         if let Some(value) = std::env::var_os(name) {
@@ -1585,9 +1585,9 @@ fn build_target_environment(agent: &Agent, agent_token: &str) -> Result<Value> {
         }
     }
 
-    let pass_env = match agent.profile_snapshot.get("pass_env") {
+    let pass_env = match profile.get("pass_env") {
         Some(Value::Array(names)) => Some(names.as_slice()),
-        None if agent.harness != "codex" => None,
+        None => None,
         _ => {
             return Err(Error::new(
                 "invalid",
@@ -1627,6 +1627,22 @@ fn build_target_environment(agent: &Agent, agent_token: &str) -> Result<Value> {
         }
     }
 
+    Ok(environment)
+}
+
+fn build_target_environment(agent: &Agent, agent_token: &str) -> Result<Value> {
+    if agent.harness == "codex"
+        && !agent
+            .profile_snapshot
+            .get("pass_env")
+            .is_some_and(Value::is_array)
+    {
+        return Err(Error::new(
+            "invalid",
+            "frozen profile pass_env must be an array of names",
+        ));
+    }
+    let mut environment = build_process_environment(&agent.profile_snapshot)?;
     insert_environment(&mut environment, "ELIOT_AGENT_ID", agent.id.clone());
     insert_environment(
         &mut environment,

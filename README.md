@@ -56,6 +56,22 @@ edit attribution. A healthy watcher observed an external file change without adv
 model progress or attributing the write to the fake Agent.
 These checks do not qualify the full L7 or cross-platform behavior.
 
+Managed worktrees are opt-in: `launch --worktree BRANCH [--base REF]` uses a new branch
+and freezes the local commit OID before creation. Explicit profile setup uses verified
+file references and runs before native dispatch; an unknown setup result is never
+repeated automatically. Resume retains the checkout, completed setup and legitimate
+commits. `worktree remove AGENT` requires a terminal Agent and no borrowers or retained
+source dependencies; it removes only clean worktrees plus permitted scratch and keeps
+the branch. Existing-workspace launches remain the default.
+
+Windows checks on 2026-10-27 exercised native setup and retained-thread resume, crash
+without setup replay, changed-input rejection, dirty/borrowed removal refusal, mixed
+tracked/scratch cleanup and same-ID retry after removal. Prior native-reference/turn
+digests survived schema 5→6. The Linux CI smoke uses the fake; workspace custody on
+supported Linux is explicitly degraded and may leave escaped descendants unobserved.
+`status.workspace_custody` reports the current host capability. Full L7 qualification
+remains pending.
+
 ## Quick start
 
 From the repository root, build the binary and replace the workspace, data-directory, and
@@ -120,6 +136,18 @@ set optional `collaboration_mode = "plan"`; the question exercise used
 `permissions = "read-only"`. Clearing pending requests during interrupt/stop or closing
 a source proves cleanup, not acknowledgement of an answer.
 `inject` and `configure` are currently unsupported.
+
+An optional managed checkout uses the source repository as `--workspace`:
+
+```powershell
+& $eliot --data-dir $dataDir launch --profile codex-luna --workspace $workspace --worktree codex/worker-demo --base HEAD 'Inspect the project without changing files.' --wait
+$agent = 'AGENT_ID_FROM_OUTPUT'
+& $eliot --data-dir $dataDir stop $agent
+& $eliot --data-dir $dataDir worktree remove $agent
+```
+
+Use an unused branch name. Setup file-argument syntax and scratch policy are documented
+in [configuration](docs/spec/configuration.md#owner-workspace-setup).
 
 Other read commands include `show AGENT` and `cmd show ID`. `watch [AGENT]` streams
 committed events; `events --since SEQ` reads a page of event history.

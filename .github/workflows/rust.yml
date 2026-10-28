@@ -37,3 +37,103 @@ jobs:
         run: cargo run --locked -p eliot -- --version
       - name: Help smoke check
         run: cargo run --locked -p eliot -- --help
+      - name: Linux fake worktree smoke
+        if: runner.os == 'Linux'
+        shell: bash
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          umask 077
+          cli="$GITHUB_WORKSPACE/target/debug/eliot"
+          smoke_root=$(mktemp -d "$RUNNER_TEMP/eliot-ci.XXXXXX")
+          repo="$smoke_root/repo"
+          data="$smoke_root/data"
+          hooks="$smoke_root/hooks"
+          mkdir "$repo" "$data" "$hooks"
+          daemon_job=
+
+          fixture_git() {
+            GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+              timeout --foreground 10s git -C "$repo" \
+              -c core.hooksPath="$hooks" -c core.fsmonitor=false \
+              -c user.name=EliotCI -c user.email=ci@example.invalid \
+              -c commit.gpgSign=false "$@"
+          }
+          client() {
+            timeout --foreground 30s "$cli" --data-dir "$data" --json "$@"
+          }
+          daemon_active() {
+            local owned_job
+            for owned_job in $(jobs -pr) $(jobs -ps); do
+              if [[ "$owned_job" == "$daemon_job" ]]; then return 0; fi
+            done
+            return 1
+          }
+          wait_owned_daemon() {
+            local deadline=$((SECONDS + 20)) status=0
+            while daemon_active; do
+              if (( SECONDS >= deadline )); then return 1; fi
+              sleep 0.2
+            done
+            wait "$daemon_job" || status=$?
+            daemon_job=
+            return "$status"
+          }
+          cleanup() {
+            local status=$?
+            trap - EXIT
+            if [[ -n "$daemon_job" ]]; then
+              if daemon_active; then client daemon stop --force >/dev/null 2>&1 || true; fi
+              if ! wait_owned_daemon; then status=1; fi
+            fi
+            exit "$status"
+          }
+          trap cleanup EXIT
+
+          fixture_git --version
+          fixture_git init --initial-branch=main
+          printf 'baseline\n' > "$repo/note.txt"
+          fixture_git add -- note.txt
+          fixture_git commit -m 'Local worktree smoke fixture'
+          base=$(fixture_git rev-parse --verify HEAD)
+          "$cli" --data-dir "$data" daemon --foreground \
+            </dev/null >"$smoke_root/daemon.log" 2>&1 &
+          daemon_job=$!
+          ready_deadline=$((SECONDS + 15))
+          until timeout --foreground 2s "$cli" --data-dir "$data" --json status >/dev/null 2>&1; do
+            daemon_active
+            (( SECONDS < ready_deadline ))
+            sleep 0.2
+          done
+          status=$(client status)
+          jq -e '.workspace_custody | .scope == "current_host" and .capability == "unix_process_group_degraded" and .exact == false and .orphan_possible == true' <<<"$status" >/dev/null
+
+          turn=$(client launch --profile fake --workspace "$repo" \
+            --worktree codex/ci-smoke --base "$base" \
+            --timeout-seconds 20 --wait -- ci-worktree-echo)
+          jq -e '.state == "completed" and .status == "completed" and .final_text == "ci-worktree-echo"' <<<"$turn" >/dev/null
+          agent=$(jq -er '.agent' <<<"$turn")
+          generation=$(jq -er '.generation | select(. > 0)' <<<"$turn")
+          turn_id=$(jq -er '.turn_id' <<<"$turn")
+          result=$(client result "$agent" --generation "$generation" --turn-id "$turn_id" --limit 1)
+          jq -e '(.turns | length) == 1 and .turns[0].state == "completed" and .turns[0].final_text == "ci-worktree-echo"' <<<"$result" >/dev/null
+          view=$(client show "$agent")
+          jq -e '.workspace_phase == "ready" and .branch == "codex/ci-smoke"' <<<"$view" >/dev/null
+          worktree=$(jq -er '.workspace' <<<"$view")
+          [[ "$worktree" == "$data/worktrees/"* ]]
+
+          client stop "$agent" --generation "$generation" >/dev/null
+          stop_deadline=$((SECONDS + 20))
+          while true; do
+            view=$(timeout --foreground 3s "$cli" --data-dir "$data" --json show "$agent")
+            if jq -e --argjson generation "$generation" '.state == "stopped" and .generation == $generation' <<<"$view" >/dev/null; then break; fi
+            (( SECONDS < stop_deadline ))
+            sleep 0.2
+          done
+          removed=$(client worktree remove "$agent" --generation "$generation")
+          jq -e '.state == "applied"' <<<"$removed" >/dev/null
+          [[ ! -e "$worktree" && ! -L "$worktree" ]]
+          fixture_git show-ref --verify --quiet refs/heads/codex/ci-smoke
+          client daemon stop --drain >/dev/null
+          wait_owned_daemon
+          printf 'Linux fake worktree smoke passed\n'

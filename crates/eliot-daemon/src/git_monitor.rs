@@ -1,7 +1,8 @@
 //! Local, bounded Git readback. Wire formats follow the official Git 2.55
 //! git-status (porcelain v2/-z), git-ls-files, git-log and git-check-ignore docs.
 //! No donor application code, shell, index/ref/object writes, or network reads.
-//! Every command requires leaf custody; config overrides are not the execution fence.
+//! Reads require leaf custody. Workspace writes are only prepared here; their
+//! manager owns ordinary scoped execution and cancellation serialization.
 
 use crate::platform::OwnedChild;
 use eliot_core::{Error, GitBaseline, GitCommit, GitPathStatus, GitSnapshot, Result};
@@ -45,9 +46,15 @@ pub(crate) struct GitProbe {
     program: PathBuf,
 }
 
-struct Captured {
-    code: i32,
-    stdout: Vec<u8>,
+pub(crate) struct Captured {
+    pub code: i32,
+    pub stdout: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct GitBinding<'a> {
+    pub git_dir: &'a Path,
+    pub common_dir: &'a Path,
 }
 
 struct Status {
@@ -91,6 +98,7 @@ impl GitProbe {
         &self,
         workspace: &str,
         baseline: Option<&GitBaseline>,
+        base_oid: Option<&str>,
         edited_paths: &[String],
         now: i64,
     ) -> Result<GitSnapshot> {
@@ -232,6 +240,15 @@ impl GitProbe {
                 deadline,
             )
             .await?;
+        let (committed_paths, base_complete) = self
+            .committed_paths(
+                &root,
+                base_oid,
+                status.head.as_deref(),
+                &overrides,
+                deadline,
+            )
+            .await?;
         // Do not clear attribution from a poll that crossed a checkout/index/status
         // change. The history commands themselves use immutable object IDs.
         let final_index = self
@@ -243,8 +260,14 @@ impl GitProbe {
         if index_bytes != final_index || status_bytes != final_status {
             return Err(unavailable("Git worktree changed during observation"));
         }
-        if !complete {
+        if !complete || !base_complete {
             clean_paths.clear();
+        } else {
+            clean_paths.retain(|path| {
+                !committed_paths
+                    .iter()
+                    .any(|changed| related_path(changed, path))
+            });
         }
         Ok(GitSnapshot {
             workspace: root_text.to_owned(),
@@ -257,6 +280,9 @@ impl GitProbe {
             complete,
             history_complete,
             history_gap,
+            base_oid: base_oid.map(str::to_owned),
+            committed_paths,
+            base_complete,
         })
     }
 
@@ -265,9 +291,18 @@ impl GitProbe {
         root: &Path,
         deadline: Instant,
     ) -> Result<Vec<(String, String)>> {
+        self.safe_overrides_for(root, deadline, None).await
+    }
+
+    async fn safe_overrides_for(
+        &self,
+        root: &Path,
+        deadline: Instant,
+        binding: Option<GitBinding<'_>>,
+    ) -> Result<Vec<(String, String)>> {
         // Read keys only: filter/alias command values may contain credentials.
         let output = self
-            .run(
+            .run_scoped(
                 root,
                 &[
                     "config",
@@ -279,6 +314,7 @@ impl GitProbe {
                 &[],
                 &[],
                 deadline,
+                binding,
             )
             .await?;
         if !matches!(output.code, 0 | 1) {
@@ -451,6 +487,90 @@ impl GitProbe {
         Ok((commits, complete && !gap, gap))
     }
 
+    async fn committed_paths(
+        &self,
+        root: &Path,
+        base: Option<&str>,
+        head: Option<&str>,
+        overrides: &[(String, String)],
+        deadline: Instant,
+    ) -> Result<(Vec<String>, bool)> {
+        let (Some(base), Some(head)) = (base, head) else {
+            return Ok((Vec::new(), false));
+        };
+        if !is_oid(base) || !is_oid(head) {
+            return Err(unavailable(
+                "committed-path comparison requires exact object ids",
+            ));
+        }
+        let read_deadline = deadline
+            .checked_sub(Duration::from_secs(2))
+            .unwrap_or(deadline);
+        let output = match self
+            .run(
+                root,
+                &[
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--name-only",
+                    "--no-renames",
+                    "-z",
+                    base,
+                    head,
+                    "--",
+                ],
+                overrides,
+                &[],
+                read_deadline,
+            )
+            .await
+        {
+            Ok(output) if output.code == 0 => output,
+            Err(error) if error.code == "git_leaf_fence_unavailable" => return Err(error),
+            _ => return Ok((Vec::new(), false)),
+        };
+        let paths = parse_paths(&output.stdout)?;
+        Ok((
+            paths
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            true,
+        ))
+    }
+
+    /// Read actual workspace identity without masking it with frozen bindings.
+    pub(crate) async fn workspace_command(
+        &self,
+        root: &Path,
+        args: &[&str],
+        deadline: Instant,
+    ) -> Result<Captured> {
+        let overrides = self.safe_overrides(root, deadline).await?;
+        self.run(root, args, &overrides, &[], deadline).await
+    }
+
+    /// Build, but never execute, an explicitly authorized workspace mutation.
+    pub(crate) async fn prepare_workspace_command(
+        &self,
+        root: &Path,
+        args: &[&str],
+        binding: GitBinding<'_>,
+        deadline: Instant,
+    ) -> Result<Command> {
+        let overrides = self
+            .safe_overrides_for(root, deadline, Some(binding))
+            .await?;
+        if Instant::now() >= deadline {
+            return Err(unavailable(
+                "workspace command preparation deadline elapsed",
+            ));
+        }
+        self.build_command(root, args, &overrides, Some(binding))
+    }
+
     async fn checked(
         &self,
         root: &Path,
@@ -474,17 +594,31 @@ impl GitProbe {
         input: &[u8],
         deadline: Instant,
     ) -> Result<Captured> {
-        if Instant::now() >= deadline {
-            return Err(unavailable("Git observation deadline elapsed"));
-        }
+        self.run_scoped(root, args, overrides, input, deadline, None)
+            .await
+    }
+
+    fn build_command(
+        &self,
+        root: &Path,
+        args: &[&str],
+        overrides: &[(String, String)],
+        binding: Option<GitBinding<'_>>,
+    ) -> Result<Command> {
         let mut command = Command::new(&self.program);
         command.current_dir(root).env_clear();
+        if let Some(binding) = binding {
+            command
+                .env("GIT_DIR", git_path_argument(binding.git_dir)?)
+                .env("GIT_COMMON_DIR", git_path_argument(binding.common_dir)?)
+                .env("GIT_WORK_TREE", git_path_argument(root)?);
+        }
         // Only the executable's trusted directory is searched by Git's own helpers.
         let executable_dir = self
             .program
             .parent()
             .ok_or_else(|| unavailable("Git executable has no absolute parent"))?;
-        command.env("PATH", executable_dir);
+        command.env("PATH", git_path_argument(executable_dir)?);
         // Preserve normal ignore/normalization configuration, but never inherit
         // GIT_* routing, execution, trace, index, or configuration overrides.
         for name in [
@@ -538,6 +672,7 @@ impl GitProbe {
             ("core.fsmonitor", "false"),
             ("core.preloadIndex", "false"),
             ("index.threads", "1"),
+            ("checkout.workers", "1"),
             ("core.hooksPath", null_device()),
             ("core.untrackedCache", "false"),
             ("submodule.recurse", "false"),
@@ -555,6 +690,22 @@ impl GitProbe {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        Ok(command)
+    }
+
+    async fn run_scoped(
+        &self,
+        root: &Path,
+        args: &[&str],
+        overrides: &[(String, String)],
+        input: &[u8],
+        deadline: Instant,
+        binding: Option<GitBinding<'_>>,
+    ) -> Result<Captured> {
+        if Instant::now() >= deadline {
+            return Err(unavailable("Git observation deadline elapsed"));
+        }
+        let command = self.build_command(root, args, overrides, binding)?;
         let mut child = OwnedChild::spawn_leaf(command).map_err(|error| {
             if error.code == "unavailable" {
                 Error::new("git_leaf_fence_unavailable", error.message)
@@ -837,7 +988,7 @@ fn parse_filter_attributes(bytes: &[u8], expected: &BTreeSet<String>) -> Result<
     Ok(affected)
 }
 
-fn is_oid(oid: &str) -> bool {
+pub(crate) fn is_oid(oid: &str) -> bool {
     matches!(oid.len(), 40 | 64) && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
@@ -943,7 +1094,27 @@ pub(crate) fn normalize_hint(workspace: &str, path: &str) -> Result<String> {
     git_path(&parts.join("/"))
 }
 
-fn canonical_root(workspace: &str) -> Result<PathBuf> {
+/// Git's path parser does not accept Windows verbatim prefixes in its own
+/// routing values. Keep OS paths opaque and convert only at the Git boundary.
+pub(crate) fn git_path_argument(path: &Path) -> Result<String> {
+    let text = path
+        .to_str()
+        .ok_or_else(|| unavailable("Git-facing path is not UTF-8"))?;
+    #[cfg(windows)]
+    {
+        let text = text.replace('\\', "/");
+        if let Some(share) = text.strip_prefix("//?/UNC/") {
+            return Ok(format!("//{share}"));
+        }
+        Ok(text.strip_prefix("//?/").unwrap_or(&text).to_owned())
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(text.to_owned())
+    }
+}
+
+pub(crate) fn canonical_root(workspace: &str) -> Result<PathBuf> {
     let path = Path::new(workspace);
     if !path.is_absolute() {
         return Err(unavailable("workspace must be absolute"));
@@ -956,7 +1127,7 @@ fn canonical_root(workspace: &str) -> Result<PathBuf> {
     Ok(root)
 }
 
-fn reject_links(path: &Path) -> Result<()> {
+pub(crate) fn reject_links(path: &Path) -> Result<()> {
     for prefix in path.ancestors() {
         match fs::symlink_metadata(prefix) {
             Ok(metadata) => {

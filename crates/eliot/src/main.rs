@@ -53,6 +53,10 @@ enum CliCommand {
         profile: String,
         #[arg(long, value_name = "PATH")]
         workspace: PathBuf,
+        #[arg(long, value_name = "BRANCH")]
+        worktree: Option<String>,
+        #[arg(long, value_name = "REF", requires = "worktree")]
+        base: Option<String>,
         #[arg(value_name = "PROMPT")]
         prompt: Option<String>,
         #[arg(long)]
@@ -199,6 +203,11 @@ enum CliCommand {
         #[arg(long, value_name = "GENERATION")]
         generation: Option<i64>,
     },
+    /// Manage an Agent's retained worktree.
+    Worktree {
+        #[command(subcommand)]
+        command: WorktreeCommand,
+    },
     /// Inspect a command.
     Cmd {
         #[command(subcommand)]
@@ -244,6 +253,17 @@ struct ShutdownArgs {
 #[derive(Subcommand)]
 enum CmdCommand {
     Show { id: String },
+}
+
+#[derive(Subcommand)]
+enum WorktreeCommand {
+    /// Remove a terminal Agent's clean worktree while retaining its branch.
+    Remove {
+        #[arg(value_name = "AGENT")]
+        agent: String,
+        #[arg(long, value_name = "GENERATION", value_parser = clap::value_parser!(i64).range(0..))]
+        generation: Option<i64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -401,6 +421,8 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
         CliCommand::Launch {
             profile,
             workspace,
+            worktree,
+            base,
             prompt,
             wait,
             timeout_seconds,
@@ -414,6 +436,12 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 "profile": profile,
                 "workspace": workspace.to_string_lossy(),
             });
+            if let Some(worktree) = worktree {
+                args["worktree"] = Value::String(worktree);
+            }
+            if let Some(base) = base {
+                args["base"] = Value::String(base);
+            }
             if let Some(prompt) = &prompt {
                 args["text"] = Value::String(prompt.clone());
             }
@@ -777,6 +805,34 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             print_value(&result, json_output);
             Ok(response_exit_code(&result))
         }
+        CliCommand::Worktree { command } => match command {
+            WorktreeCommand::Remove { agent, generation } => {
+                let deadline = wait_deadline(DEFAULT_WAIT_SECONDS)?;
+                let mut params = json!({
+                    "target": agent,
+                    "verb": "worktree.remove",
+                    "args": {},
+                });
+                if let Some(generation) = generation {
+                    params["expected_generation"] = json!(generation);
+                }
+                let submitted = mutation_call(&data_dir, "command.submit", params, id).await?;
+                let submit_exit = response_exit_code(&submitted);
+                if matches!(submit_exit, 1 | 3 | 4) {
+                    print_value(&submitted, json_output);
+                    return Ok(submit_exit);
+                }
+                let command_id = submitted
+                    .get("command_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        Failure::new(4, "worktree removal response omitted command_id")
+                    })?;
+                let completed = wait_for_command(&data_dir, command_id, deadline).await?;
+                print_value(&completed, json_output);
+                Ok(response_exit_code(&completed))
+            }
+        },
         CliCommand::Cmd { command } => match command {
             CmdCommand::Show { id } => {
                 let result = read_call(&data_dir, "command.get", json!({ "id": id })).await?;

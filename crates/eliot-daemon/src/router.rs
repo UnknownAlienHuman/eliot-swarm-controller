@@ -2,10 +2,11 @@ use crate::{
     bus::Bus,
     monitor::Monitoring,
     plugin_host::{AgentCredentials, PluginHost, PluginHostOptions, SecretSet, UnknownCommands},
+    workspaces::WorkspaceManager,
 };
 use eliot_core::{
     Agent, AgentState, Command, CommandState, Error, Event, ProcessIdentity, Result, SubmitCommand,
-    Turn, TurnState,
+    Turn, TurnState, WorkspacePhase, WorkspacePreparationInput,
 };
 use eliot_plugin::MAX_EVENT_BYTES;
 use futures_util::future::BoxFuture;
@@ -56,6 +57,8 @@ struct RouterInner {
     unknown_causes: Mutex<HashMap<String, String>>,
     plugin_host: PluginHost,
     monitoring: Monitoring,
+    workspaces: WorkspaceManager,
+    workspace_recovery_error: Mutex<Option<String>>,
     mode: AtomicU8,
     shutdown_ready: AtomicBool,
     progress: watch::Sender<u64>,
@@ -85,6 +88,13 @@ impl Router {
         let unknown_commands: UnknownCommands = Arc::new(Mutex::new(Default::default()));
         let (progress, _) = watch::channel(0_u64);
         let monitoring = Monitoring::new(Arc::clone(&store), bus.clone(), Arc::clone(&secrets));
+        let workspaces = WorkspaceManager::new(
+            data_root.clone(),
+            Arc::clone(&store),
+            bus.clone(),
+            Arc::clone(&secrets),
+            progress.clone(),
+        );
         let plugin_host = PluginHost::new(
             PluginHostOptions::new(data_root.clone(), owner_token.clone()),
             Arc::clone(&store),
@@ -107,6 +117,8 @@ impl Router {
                 unknown_causes: Mutex::new(HashMap::new()),
                 plugin_host,
                 monitoring,
+                workspaces,
+                workspace_recovery_error: Mutex::new(None),
                 mode: AtomicU8::new(MODE_OPEN),
                 shutdown_ready: AtomicBool::new(false),
                 progress,
@@ -182,7 +194,57 @@ impl Router {
     }
 
     pub(crate) async fn force_owned_processes(&self) {
+        self.inner.workspaces.stop_all(true).await;
         self.inner.plugin_host.force_all().await;
+    }
+
+    pub(crate) async fn recover_workspaces(&self) -> Result<()> {
+        for id in self.inner.workspaces.recover().await? {
+            let linked = {
+                let store = self.inner.store.lock().await;
+                let Some(command) = store.get_command(&id)? else {
+                    continue;
+                };
+                if command.state != CommandState::Accepted
+                    || !matches!(command.verb.as_str(), "launch" | "resume")
+                {
+                    continue;
+                }
+                let Some(target) = command.target.as_deref() else {
+                    continue;
+                };
+                let Some(preparation) = store.get_workspace(target)? else {
+                    continue;
+                };
+                if preparation.start_command_id != id
+                    || !matches!(
+                        preparation.phase,
+                        WorkspacePhase::Ready | WorkspacePhase::SetupReady
+                    )
+                {
+                    continue;
+                }
+                store
+                    .get_command(&format!("{id}/send"))?
+                    .filter(|linked| {
+                        linked.target.as_deref() == Some(target)
+                            && linked.generation == Some(preparation.target_generation)
+                    })
+                    .map(|linked| linked.id)
+            };
+            tokio::spawn(self.clone().process_command(id, linked));
+        }
+        self.signal_progress();
+        Ok(())
+    }
+
+    pub(crate) fn note_workspace_recovery_failure(&self, code: &str) {
+        *self
+            .inner
+            .workspace_recovery_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(code.to_owned());
+        self.signal_progress();
     }
 
     pub(crate) fn note_events(&self, events: &[Event]) {
@@ -320,6 +382,9 @@ impl Router {
         let mut request: SubmitCommand = serde_json::from_value(params.clone())
             .map_err(|_| Error::new("invalid", "command.submit params are malformed"))?;
         authorize_command(principal, &mut request)?;
+        if request.verb == "worktree.remove" {
+            require_owner(principal)?;
+        }
         let mode = self.inner.mode.load(Ordering::SeqCst);
         if mode == MODE_FORCE {
             return Err(Error::new("unavailable", "daemon is forcing shutdown"));
@@ -330,9 +395,30 @@ impl Router {
                 "daemon is draining and rejects new launch, resume, or send commands",
             ));
         }
+        let mut preparation = None;
         if request.verb == "launch" {
-            normalize_launch(&mut request)?;
-            self.freeze_launch_profile(&mut request).await?;
+            reject_launch_derived_keys(&request.args)?;
+            if self.hydrate_retained_launch(&mut request).await? {
+                preparation = retained_preparation(&request.args)?;
+            } else {
+                let frozen = async {
+                    normalize_launch(&mut request)?;
+                    self.freeze_launch_admission(&mut request).await
+                }
+                .await;
+                preparation = match frozen {
+                    Ok(input) => input,
+                    Err(error) => {
+                        // Another identical admission can win while config/Git
+                        // readback is in flight. Reuse its original frozen input.
+                        if self.hydrate_retained_launch(&mut request).await? {
+                            retained_preparation(&request.args)?
+                        } else {
+                            return Err(error);
+                        }
+                    }
+                };
+            }
         } else if request.verb == "resume" {
             normalize_resume(&mut request)?;
         } else if matches!(
@@ -346,6 +432,16 @@ impl Router {
                 "secret_in_payload",
                 "durable command text contains a known credential",
             ));
+        }
+        if let Some(input) = &preparation {
+            let metadata = serde_json::to_value(input)
+                .map_err(|_| Error::new("internal", "workspace input could not be encoded"))?;
+            if contains_known_secret(&metadata, &self.inner.secrets) {
+                return Err(Error::new(
+                    "secret_in_payload",
+                    "workspace input contains a known credential",
+                ));
+            }
         }
         if request.request_id.as_deref().is_some_and(|value| {
             contains_known_secret(&Value::String(value.to_owned()), &self.inner.secrets)
@@ -377,7 +473,11 @@ impl Router {
             }
             let principal = principal_name(principal);
             let now = now_ms();
-            let admission = match store.submit(&principal, request.clone(), now) {
+            let submitted = match preparation.take() {
+                Some(input) => store.submit_with_workspace(&principal, request.clone(), input, now),
+                None => store.submit(&principal, request.clone(), now),
+            };
+            let admission = match submitted {
                 Ok(admission) => admission,
                 Err(error) if error.code == "id_conflict" && request.verb == "launch" => {
                     if let Some(retained) = retained_launch_profile(&store, &request)? {
@@ -417,12 +517,71 @@ impl Router {
         ))
     }
 
-    async fn freeze_launch_profile(&self, request: &mut SubmitCommand) -> Result<()> {
+    async fn hydrate_retained_launch(&self, request: &mut SubmitCommand) -> Result<bool> {
         if let Some(retained) = {
             let store = self.inner.store.lock().await;
             retained_launch_profile(&store, request)?
         } {
-            return install_retained_profile(request, retained);
+            install_retained_profile(request, retained)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn freeze_launch_admission(
+        &self,
+        request: &mut SubmitCommand,
+    ) -> Result<Option<WorkspacePreparationInput>> {
+        if self.freeze_launch_profile(request).await? {
+            return retained_preparation(&request.args);
+        }
+        let Some(branch) = request.args.get("worktree").and_then(Value::as_str) else {
+            if request
+                .args
+                .get("profile_snapshot")
+                .and_then(|profile| profile.get("setup"))
+                .and_then(Value::as_array)
+                .is_some_and(|setup| !setup.is_empty())
+            {
+                return Err(Error::new(
+                    "unsupported",
+                    "profile setup requires --worktree",
+                ));
+            }
+            return Ok(None);
+        };
+        if contains_known_secret(&request.args, &self.inner.secrets) {
+            return Err(Error::new(
+                "secret_in_payload",
+                "durable launch contains a known credential",
+            ));
+        }
+        let input = self
+            .inner
+            .workspaces
+            .freeze_launch(
+                required_text(&request.args, "workspace")?,
+                branch,
+                request.args.get("base").and_then(Value::as_str),
+                request
+                    .args
+                    .get("profile_snapshot")
+                    .ok_or_else(|| Error::new("internal", "launch profile was not frozen"))?,
+            )
+            .await?;
+        let metadata = serde_json::to_value(&input)
+            .map_err(|_| Error::new("internal", "workspace input could not be encoded"))?;
+        request
+            .args
+            .as_object_mut()
+            .ok_or_else(|| Error::new("invalid", "launch args must be an object"))?
+            .insert("workspace_preparation".to_owned(), metadata);
+        Ok(Some(input))
+    }
+
+    async fn freeze_launch_profile(&self, request: &mut SubmitCommand) -> Result<bool> {
+        if self.hydrate_retained_launch(request).await? {
+            return Ok(true);
         }
 
         let profile_name = required_text(&request.args, "profile")?;
@@ -433,7 +592,8 @@ impl Router {
             .filter(|harness| !harness.trim().is_empty())
             .ok_or_else(|| Error::new("invalid", "resolved profile must name its harness"))?
             .to_owned();
-        install_frozen_profile(request, &harness, snapshot, true)
+        install_frozen_profile(request, &harness, snapshot, true)?;
+        Ok(false)
     }
 
     async fn command_get(&self, params: &Value, principal: &Principal) -> Result<Value> {
@@ -919,6 +1079,9 @@ impl Router {
             "agents": agent_count,
             "store_write_faulted": write_faulted,
             "owned_plugins": self.inner.plugin_host.live_count(),
+            "workspace_custody": crate::workspaces::custody_capability(),
+            "workspace_recovery_error": self.inner.workspace_recovery_error.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
             "unknown_commands_count": unknown_commands_count,
             "unknown_commands": unknown_commands,
             "unknown_commands_truncated": unknown_commands_truncated,
@@ -939,6 +1102,9 @@ impl Router {
             )
         };
         let mut blockers = Vec::new();
+        if self.inner.workspaces.has_owned_processes() {
+            blockers.push(json!({"kind": "workspace_processes"}));
+        }
         for agent in agents {
             blockers.push(json!({
                 "kind": "agent_live",
@@ -1037,6 +1203,20 @@ impl Router {
 
     async fn process_command_inner(self, id: String, linked_id: Option<String>) {
         let mut receiver = self.inner.bus.subscribe();
+        let command = {
+            let store = self.inner.store.lock().await;
+            match store.get_command(&id) {
+                Ok(Some(command)) => command,
+                _ => return,
+            }
+        };
+        if matches!(command.verb.as_str(), "launch" | "resume")
+            && let Err(error) = self.inner.workspaces.prepare(&id).await
+        {
+            self.settle_plugin_error(&id, &error).await;
+            self.signal_progress();
+            return;
+        }
         let resume_source_state = match self.capture_resume_source_state(&id).await {
             Ok(source_state) => source_state,
             Err(error) => {
@@ -1109,6 +1289,13 @@ impl Router {
         };
 
         let _result = match dispatched.verb.as_str() {
+            "worktree.remove" => match self.inner.workspaces.remove(&dispatched).await {
+                Ok(value) => Ok(value),
+                Err(error) => {
+                    self.settle_plugin_error(&id, &error).await;
+                    Err(error)
+                }
+            },
             "launch" | "resume" => {
                 let start = self
                     .inner
@@ -1247,6 +1434,20 @@ impl Router {
                 }
             }
             "stop" => {
+                // Store dispatch atomically latches a preparation cancel before
+                // the manager signals its custody. Otherwise this is native stop.
+                match self.inner.workspaces.cancel(&id).await {
+                    Ok(true) => {
+                        self.signal_progress();
+                        return;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        self.settle_plugin_error(&id, &error).await;
+                        self.signal_progress();
+                        return;
+                    }
+                }
                 let force = dispatched
                     .args
                     .get("force")
@@ -1584,6 +1785,24 @@ fn normalize_launch(request: &mut SubmitCommand) -> Result<()> {
     if request.verb != "launch" {
         return Ok(());
     }
+    reject_launch_derived_keys(&request.args)?;
+    if let Some(worktree) = request.args.get("worktree") {
+        if worktree
+            .as_str()
+            .is_none_or(|branch| branch.trim().is_empty())
+        {
+            return Err(Error::new("invalid", "worktree must name a new branch"));
+        }
+    } else if request.args.get("base").is_some() {
+        return Err(Error::new("invalid", "base requires worktree"));
+    }
+    if request
+        .args
+        .get("base")
+        .is_some_and(|base| base.as_str().is_none_or(|base| base.trim().is_empty()))
+    {
+        return Err(Error::new("invalid", "base must be a nonempty local ref"));
+    }
     let workspace = request
         .args
         .get("workspace")
@@ -1606,19 +1825,6 @@ fn normalize_launch(request: &mut SubmitCommand) -> Result<()> {
         .args
         .as_object_mut()
         .ok_or_else(|| Error::new("invalid", "launch args must be an object"))?;
-    for reserved in [
-        "harness",
-        "profile_snapshot",
-        "source_plan",
-        "target_environment",
-    ] {
-        if args.contains_key(reserved) {
-            return Err(Error::new(
-                "invalid",
-                format!("launch field {reserved} is resolved by the daemon"),
-            ));
-        }
-    }
     if !args
         .get("profile")
         .and_then(Value::as_str)
@@ -1648,6 +1854,15 @@ fn normalize_resume(request: &mut SubmitCommand) -> Result<()> {
         "native_scope",
         "native_ref",
         "prompt",
+        "worktree",
+        "base",
+        "workspace_preparation",
+        "repo_common_dir",
+        "base_oid",
+        "worktree_path",
+        "frozen_setup",
+        "setup",
+        "target_generation",
     ] {
         if args.contains_key(reserved) {
             return Err(Error::new(
@@ -1733,6 +1948,9 @@ struct RetainedLaunchProfile {
     snapshot: Value,
     command_has_harness: bool,
     command_has_snapshot: bool,
+    workspace: Option<Value>,
+    project: Option<Value>,
+    preparation: Option<Value>,
 }
 
 fn retained_launch_profile(
@@ -1743,11 +1961,17 @@ fn retained_launch_profile(
         return Ok(None);
     };
     if command.verb != "launch" {
-        return Ok(None);
+        return Err(Error::new(
+            "id_conflict",
+            "mutation id is bound to another command",
+        ));
     }
 
     let command_has_harness = command.args.get("harness").is_some();
     let command_has_snapshot = command.args.get("profile_snapshot").is_some();
+    let workspace = command.args.get("workspace").cloned();
+    let project = command.args.get("project").cloned();
+    let preparation = command.args.get("workspace_preparation").cloned();
     let stored_snapshot = command
         .args
         .get("profile_snapshot")
@@ -1764,6 +1988,9 @@ fn retained_launch_profile(
             snapshot,
             command_has_harness,
             command_has_snapshot,
+            workspace,
+            project,
+            preparation,
         }));
     }
 
@@ -1778,6 +2005,9 @@ fn retained_launch_profile(
             snapshot: agent.profile_snapshot,
             command_has_harness,
             command_has_snapshot,
+            workspace,
+            project,
+            preparation,
         }));
     }
 
@@ -1839,7 +2069,17 @@ fn install_retained_profile(
         snapshot,
         command_has_harness,
         command_has_snapshot,
+        workspace,
+        project,
+        preparation,
     } = retained;
+    let same_workspace = match (
+        request.args.get("workspace").and_then(Value::as_str),
+        workspace.as_ref().and_then(Value::as_str),
+    ) {
+        (Some(requested), Some(stored)) => same_retained_workspace(requested, stored),
+        _ => false,
+    };
     // Match the exact payload shape that Store admitted. This keeps retries of
     // pre-snapshot L1 commands bound to their original caller arguments.
     let args = request
@@ -1855,6 +2095,84 @@ fn install_retained_profile(
         args.insert("profile_snapshot".to_owned(), snapshot);
     } else {
         args.remove("profile_snapshot");
+    }
+    if let Some(preparation) = preparation {
+        args.insert("workspace_preparation".to_owned(), preparation);
+    } else {
+        args.remove("workspace_preparation");
+    }
+    // Normalize only the same caller workspace without touching the filesystem.
+    // A changed path/branch/base/text stays in the payload for Store's id_conflict.
+    if same_workspace {
+        if let Some(workspace) = workspace {
+            args.insert("workspace".to_owned(), workspace);
+        }
+        if let Some(project) = project {
+            args.insert("project".to_owned(), project);
+        }
+    }
+    Ok(())
+}
+
+fn retained_preparation(args: &Value) -> Result<Option<WorkspacePreparationInput>> {
+    args.get("workspace_preparation")
+        .map(|input| {
+            serde_json::from_value(input.clone())
+                .map_err(|_| Error::new("internal", "retained workspace input is invalid"))
+        })
+        .transpose()
+}
+
+fn same_retained_workspace(requested: &str, stored: &str) -> bool {
+    if requested.trim().is_empty() || stored.is_empty() {
+        return false;
+    }
+    let (Ok(requested), Ok(stored)) = (std::path::absolute(requested), std::path::absolute(stored))
+    else {
+        return false;
+    };
+    #[cfg(windows)]
+    {
+        let normalized = |path: &std::path::Path| {
+            let path = path.to_string_lossy().replace('\\', "/");
+            match path.strip_prefix("//?/UNC/") {
+                Some(rest) => format!("//{rest}"),
+                None => path.strip_prefix("//?/").unwrap_or(&path).to_owned(),
+            }
+            .trim_end_matches('/')
+            .to_owned()
+        };
+        normalized(&requested).eq_ignore_ascii_case(&normalized(&stored))
+    }
+    #[cfg(not(windows))]
+    {
+        requested == stored
+    }
+}
+
+fn reject_launch_derived_keys(args: &Value) -> Result<()> {
+    let args = args
+        .as_object()
+        .ok_or_else(|| Error::new("invalid", "launch args must be an object"))?;
+    for reserved in [
+        "harness",
+        "profile_snapshot",
+        "source_plan",
+        "target_environment",
+        "workspace_preparation",
+        "repo_common_dir",
+        "base_oid",
+        "worktree_path",
+        "frozen_setup",
+        "setup",
+        "target_generation",
+    ] {
+        if args.contains_key(reserved) {
+            return Err(Error::new(
+                "invalid",
+                format!("launch field {reserved} is resolved by the daemon"),
+            ));
+        }
     }
     Ok(())
 }

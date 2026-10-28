@@ -477,6 +477,39 @@ impl ProcessObserver {
         self.root_exit = Some(code);
     }
 
+    pub(crate) fn known_process_group_empty(&self) -> Result<bool> {
+        if self.root_exit.is_none() {
+            return Err(Error::new(
+                "process_custody_unknown",
+                "known process-group emptiness requires recorded root exit",
+            ));
+        }
+        // kill(-1, 0) is a broadcast probe, not a process-group probe.
+        // https://pubs.opengroup.org/onlinepubs/9799919799/functions/kill.html
+        if self.group.pgid <= 1 {
+            return Err(Error::new(
+                "process_custody_unknown",
+                "known process-group emptiness requires captured PGID greater than one",
+            ));
+        }
+        // Only observe the captured group after reaping its leader. A reused
+        // PGID conservatively reports nonempty; escaped descendants remain
+        // possible, so this is not exact family containment.
+        // SAFETY: the captured PGID exceeds one and signal zero sends no signal.
+        if unsafe { libc::kill(-self.group.pgid, 0) } == 0 {
+            return Ok(false);
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ESRCH) => Ok(true),
+            Some(libc::EPERM) => Ok(false),
+            _ => Err(unknown_process_identity(
+                "observe known process-group emptiness",
+                error,
+            )),
+        }
+    }
+
     pub(crate) fn snapshot(&self, owner: &str, now: i64) -> Result<ProcessSnapshot> {
         let root = ProcessSample {
             record: ProcessRecord {
@@ -667,6 +700,13 @@ impl ProcessObserver {
         unknown_sample(old, now)
     }
     pub(crate) fn record_root_exit(&mut self, _code: Option<i32>) {}
+
+    pub(crate) fn known_process_group_empty(&self) -> Result<bool> {
+        Err(Error::new(
+            "unsupported",
+            "known process-group emptiness observation requires Linux",
+        ))
+    }
 }
 
 #[cfg(target_os = "linux")]

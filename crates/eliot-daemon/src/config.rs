@@ -7,7 +7,8 @@
 //! overlays) are rejected with unsupported, never silently substituted.
 //!
 //! Returns a bounded nonsecret snapshot object with the keys harness, cmd,
-//! model, effort, collaboration_mode, permissions, approval_policy and pass_env.
+//! model, effort, collaboration_mode, permissions, approval_policy, pass_env,
+//! raw setup and normalized relative scratch directories.
 //! pass_env carries admitted environment variable names only; secret values are never
 //! resolved or copied into the snapshot. The parent daemon calls resolve_profile
 //! before Store admission.
@@ -55,6 +56,10 @@ struct ProfileEntry {
     approval_policy: Option<String>,
     #[serde(default)]
     pass_env: Option<Vec<String>>,
+    #[serde(default)]
+    setup: Vec<crate::setup::SetupEntry>,
+    #[serde(default = "default_scratch")]
+    scratch: Vec<String>,
 }
 pub(crate) fn resolve_profile(data_root: &Path, name: &str) -> core::Result<Value> {
     validate_profile_name(name)?;
@@ -142,6 +147,7 @@ fn fake_snapshot() -> Value {
         "permissions": PERMISSION_WORKSPACE_WRITE,
         "approval_policy": APPROVAL_POLICY_NEVER,
         "pass_env": [],
+        "scratch": default_scratch(),
     })
 }
 fn snapshot_from_entry(
@@ -250,6 +256,26 @@ fn snapshot_from_entry(
         Some(cmd) => Some(validate_cmd(name, cmd, source, table_offset)?),
         None => None,
     };
+    crate::setup::validate_entries(&entry.setup).map_err(|error| {
+        profile_field_error(
+            source,
+            table_offset,
+            name,
+            "setup",
+            &error.message,
+            "profile_error",
+        )
+    })?;
+    let scratch = normalize_scratch(&entry.scratch).map_err(|error| {
+        profile_field_error(
+            source,
+            table_offset,
+            name,
+            "scratch",
+            &error.message,
+            "profile_error",
+        )
+    })?;
     let mut snapshot = serde_json::Map::new();
     snapshot.insert("harness".to_owned(), Value::String("codex".to_owned()));
     if let Some(cmd) = cmd {
@@ -277,8 +303,64 @@ fn snapshot_from_entry(
         "pass_env".to_owned(),
         Value::Array(pass_env.into_iter().map(Value::String).collect()),
     );
+    snapshot.insert("scratch".to_owned(), json!(scratch));
+    if !entry.setup.is_empty() {
+        snapshot.insert(
+            "setup".to_owned(),
+            serde_json::to_value(&entry.setup)
+                .map_err(|_| core::Error::new("profile_error", "setup could not be encoded"))?,
+        );
+    }
     Ok(Value::Object(snapshot))
 }
+fn default_scratch() -> Vec<String> {
+    vec!["target/".to_owned(), "node_modules/".to_owned()]
+}
+
+fn normalize_scratch(paths: &[String]) -> core::Result<Vec<String>> {
+    if paths.len() > 64 {
+        return Err(core::Error::new(
+            "profile_error",
+            "scratch exceeds 64 directories",
+        ));
+    }
+    let mut normalized = Vec::new();
+    let mut seen = HashSet::new();
+    for path in paths {
+        let portable = path.replace('\\', "/");
+        if portable.is_empty()
+            || portable.len() > 4096
+            || portable.starts_with('/')
+            || portable.contains(':')
+            || portable.chars().any(char::is_control)
+        {
+            return Err(core::Error::new(
+                "profile_error",
+                "scratch entries must be bounded relative directories",
+            ));
+        }
+        let parts: Vec<_> = portable
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect();
+        if parts.is_empty() || parts.iter().any(|part| matches!(*part, "." | "..")) {
+            return Err(core::Error::new(
+                "profile_error",
+                "scratch entries cannot name the root or contain dot traversal",
+            ));
+        }
+        let directory = format!("{}/", parts.join("/"));
+        #[cfg(windows)]
+        let key = directory.to_ascii_lowercase();
+        #[cfg(not(windows))]
+        let key = directory.clone();
+        if seen.insert(key) {
+            normalized.push(directory);
+        }
+    }
+    Ok(normalized)
+}
+
 fn validate_profile_name(name: &str) -> core::Result<()> {
     if name.is_empty() || name.len() > MAX_PROFILE_NAME_LEN {
         return Err(core::Error::new(
@@ -352,6 +434,16 @@ fn validate_pass_env(
                 profile,
                 "pass_env",
                 "names must use letters, digits and underscore",
+                "profile_error",
+            ));
+        }
+        if name.to_ascii_uppercase().starts_with("ELIOT_AGENT_") {
+            return Err(profile_field_error(
+                source,
+                offset,
+                profile,
+                "pass_env",
+                "cannot override Eliot identity variables",
                 "profile_error",
             ));
         }

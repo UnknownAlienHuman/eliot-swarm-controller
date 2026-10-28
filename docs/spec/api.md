@@ -129,6 +129,37 @@ Launch/resume with explicit text creates a start plus linked `<id>/send`. Withou
 `--wait`, return session readiness; with it, follow the linked input to its exact terminal
 turn. An input-created native session still reports these distinct outcomes.
 
+Worktree creation is opt-in on the same launch command:
+
+```text
+command.submit {id, verb:"launch",
+  args:{profile, workspace, worktree?:BRANCH, base?:REF, text?}}
+```
+
+Without `worktree`, `workspace` remains the existing execution directory. With it,
+`workspace` names the source repository; the daemon chooses the managed destination.
+`base` requires `worktree`. Omitted `base` means local `HEAD`, resolved and frozen to a
+commit OID by daemon admission without fetching. The CLI forwards branch/ref strings
+unchanged and does not resolve refs, create directories or run Git. Same-ID retries reuse
+the retained preparation and frozen base instead of resolving a moved ref or replaying
+uncertain work. Native launch waits for preparation ready in the exact target generation;
+the existing readiness/linked-input wait semantics above are unchanged.
+
+Removal uses the same command admission and readback path:
+
+```text
+command.submit {id, target:AGENT, verb:"worktree.remove",
+  args:{}, expected_generation?:N}
+```
+
+The Router/Store enforce owner authority, the captured generation and terminal-only,
+clean removal under the admitted scratch policy. The daemon selects the retained
+managed worktree, preserves its branch and never removes a caller-supplied path. The
+CLI offers no force/path argument and uses its normal ULID binding and exit codes.
+It reads the exact command to settlement with a bounded 30-second wait; timeout does
+not cancel or retry removal. Same-ID retries return the retained outcome even after
+the directory has gone.
+
 A selector parent snapshots/sorts concrete ids and generations in a bounded transaction;
 children settle independently. Parent applied means expansion only. `command.children`
 pages that fixed set. Retain/prune parent sets transactionally so a caller never sees a
@@ -224,7 +255,8 @@ Generation/turn/request flags are optional for immediate calls, explicit for del
 eliot daemon [--foreground]
 eliot daemon stop [--drain|--force]
 eliot status
-eliot launch --profile P --workspace PATH [PROMPT] [--wait]
+eliot launch --profile P --workspace PATH [--worktree BRANCH [--base REF]] [PROMPT] [--wait]
+eliot worktree remove AGENT [--generation N]
 eliot ls | show A | watch [A|SELECTOR] | top
 eliot processes A [--generation N] [--after CURSOR] [--limit N]
 eliot stats A [--generation N]
@@ -248,7 +280,7 @@ eliot rule ... | rules pause|resume | timer list|run
 eliot discover [--harness H] [--cursor C] [--limit N]
 eliot attach --harness H --scope S --ref R [--control --profile P]
 eliot detach A
-eliot service list|stop | hold list|clear | worktree remove | doctor
+eliot service list|stop | hold list|clear | doctor
 eliot plugin NAME | plugin-test ... | hook ... | mcp
 ```
 

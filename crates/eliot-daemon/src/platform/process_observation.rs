@@ -25,6 +25,17 @@ struct ObservationState {
 }
 
 impl CustodyObserver {
+    /// Observes known process-group emptiness after recorded root exit on Linux.
+    /// Escaped descendants may survive; this is not exact family containment.
+    #[cfg(unix)]
+    pub fn known_process_group_empty(&self) -> Result<bool> {
+        self.inner
+            .lock()
+            .map_err(|_| Error::new("process_observation", "process observer lock was poisoned"))?
+            .platform
+            .known_process_group_empty()
+    }
+
     pub(crate) fn record_root_exit(&self, code: Option<i32>) {
         #[cfg(any(unix, windows))]
         self.inner

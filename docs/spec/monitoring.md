@@ -160,15 +160,17 @@ These rules apply to plugins, services, hooks, scripts, checks, Git and workspac
 ```sql
 CREATE TABLE workspaces (
   agent INTEGER PRIMARY KEY REFERENCES agents(id),
+  start_command_id TEXT NOT NULL,
   target_generation INTEGER NOT NULL,
   project TEXT NOT NULL,
   repo_path TEXT NOT NULL,
+  repo_common_dir TEXT NOT NULL,
   requested_branch TEXT NOT NULL,
   base_ref TEXT,
   base_oid TEXT NOT NULL,
   worktree_path TEXT NOT NULL UNIQUE,
   frozen_setup TEXT NOT NULL,
-  phase TEXT NOT NULL,       -- creating|setup_ready|setup_running|ready|unknown|failed
+  phase TEXT NOT NULL,       -- creating|setup_ready|setup_running|ready|unknown|failed|removing|removed
   setup_index INTEGER NOT NULL DEFAULT 0,
   outcome TEXT,
   updated_at INTEGER NOT NULL
@@ -180,6 +182,10 @@ the Agent itself may still be generation 0 or the previous terminal generation.
 Admission resolves `REF^{commit}` locally, without fetch, and freezes the resulting OID.
 It also freezes each note/setup file as bounded bytes or canonical allowed
 `path+size+digest`; dispatch verifies the digest before executing.
+The current opt-in creates a new branch; an existing branch is rejected rather than
+reset or renamed. Omitted `--base` means local `HEAD`. The destination is an opaque
+directory below `<data_dir>/worktrees`, independent of caller command-id syntax.
+Repository common-directory identity is frozen alongside the source checkout.
 
 Flow:
 
@@ -204,6 +210,29 @@ row and one running marker, not a `workspace_steps` journal or artifact service.
 Cancellation stops the current custody. Native start never begins from a non-ready or
 wrong-target-generation workspace. Removal is explicit, terminal-Agent only and
 clean-only except allowed relative scratch paths; the branch is retained.
+Cancellation is committed before signalling custody and serializes with process spawn.
+Preparation failure before first native dispatch can fail the generation-0 Agent;
+uncertainty leaves it created with an unknown start command. Neither path installs
+native authority or advances the generation. A resume preparation failure retains the
+previous terminal generation.
+On Windows, step completion waits for the owned Job to empty. On supported Linux,
+successful leader completion and an empty observed process group permit degraded
+completion; escaped descendants remain possible. A signal-zero group query is
+observation only and never grants permission to signal a stale numeric PGID.
+`daemon.status.workspace_custody` describes the current host's capability, not a
+retrospective assertion about historical commands. Unknown prior Unix custody after
+daemon replacement cannot be promoted to an exact stopped result.
+
+`worktree.remove` uses normal command admission. No other live Agent may use that
+checkout; the `removing` marker blocks concurrent launch into it. Cleanup may remove
+only untracked/ignored entries under frozen scratch paths, never tracked changes or
+escaping symlinks/reparse points. Ordinary Git removal performs its final clean check;
+there is no force removal. Exact path/registration absence and retained branch settle
+`removed`. Keep the row so a later resume cannot treat the deleted checkout as an
+ordinary shared workspace. Unknown removal permits readback, never blind repetition.
+Before filesystem changes, wait for the checkout's terminal Git sources to drain and
+close, including subdirectory borrowers. This orders final hint attribution before
+removal cleanup and prevents a stale observation from recreating removed provenance.
 
 ## Git and filesystem monitor
 
@@ -304,6 +333,8 @@ Rows, including terminal/older generations, are removed only by explicit clean-p
 proofs from a complete scan; ignored, skip-worktree or otherwise unproven paths do not
 authorize cleanup. Git polling and `git.changed` / `git.committed` alone do not advance
 OS samples or model progress. Validated `file.changed` retains its native cause's timestamp.
+Exact managed-worktree removal also clears attribution for that absent path, in the
+same transaction as the `removed` result. Failed or uncertain removal clears nothing.
 
 On 2026-10-27, bounded Windows checks with Git 2.55.0.Windows.5 observed partial trap
 status without authorship or trap execution; SHA-256 inventories of `.git/index`, `HEAD`,

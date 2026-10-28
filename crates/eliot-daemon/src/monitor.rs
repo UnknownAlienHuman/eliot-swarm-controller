@@ -136,6 +136,7 @@ struct GitBindingInput {
 
 struct GitGroup {
     baseline: Option<GitBaseline>,
+    base_oid: Option<String>,
     inputs: Vec<GitBindingInput>,
     edited_paths: Vec<String>,
     paths_complete: bool,
@@ -472,6 +473,9 @@ impl Monitoring {
             "complete": snapshot.map(|snapshot| snapshot.complete),
             "history_complete": snapshot.map(|snapshot| snapshot.history_complete),
             "history_gap": snapshot.map(|snapshot| snapshot.history_gap),
+            "base_oid": snapshot.and_then(|snapshot| snapshot.base_oid.as_deref()),
+            "committed_paths": snapshot.map(|snapshot| &snapshot.committed_paths),
+            "base_complete": snapshot.map(|snapshot| snapshot.base_complete),
             "baseline": baseline,
             "edits_truncated": edits.len() == PAGE_LIMIT,
             "edits": edits,
@@ -616,6 +620,9 @@ impl Monitoring {
                             store.git_edit_paths(&workspace, PAGE_LIMIT)?;
                         entry.insert(GitGroup {
                             baseline: store.git_baseline(&workspace)?,
+                            base_oid: store
+                                .get_workspace_by_path(&workspace)?
+                                .map(|row| row.base_oid),
                             inputs: Vec::new(),
                             edited_paths,
                             paths_complete,
@@ -877,7 +884,13 @@ impl Monitoring {
                 let mut snapshot = probe
                     .as_ref()
                     .expect("initialized Git probe")
-                    .probe(&workspace, group.baseline.as_ref(), &edited_paths, now_ms())
+                    .probe(
+                        &workspace,
+                        group.baseline.as_ref(),
+                        group.base_oid.as_deref(),
+                        &edited_paths,
+                        now_ms(),
+                    )
                     .await?;
                 if !paths_complete {
                     snapshot.complete = false;
@@ -937,7 +950,13 @@ impl Monitoring {
                 Err(error) => {
                     for input in group.inputs {
                         if (input.terminal || final_flush) && input.native_closed {
-                            let _ = self.commit_unavailable_git(&workspace, input).await;
+                            let _ = self
+                                .commit_unavailable_git(
+                                    &workspace,
+                                    group.base_oid.as_deref(),
+                                    input,
+                                )
+                                .await;
                         } else {
                             let _ = self.git_source_status(&input.key, "error", false).await;
                         }
@@ -1040,6 +1059,7 @@ impl Monitoring {
     async fn commit_unavailable_git(
         &self,
         workspace: &str,
+        base_oid: Option<&str>,
         mut input: GitBindingInput,
     ) -> Result<()> {
         // This is an explicit unknown readback: no paths, clean proofs, or HEAD
@@ -1055,6 +1075,9 @@ impl Monitoring {
             complete: false,
             history_complete: false,
             history_gap: true,
+            base_oid: base_oid.map(ToOwned::to_owned),
+            committed_paths: Vec::new(),
+            base_complete: false,
         };
         loop {
             let mut store = self.inner.store.lock().await;
@@ -1130,7 +1153,13 @@ impl Monitoring {
                 for (workspace, group) in groups {
                     for input in group.inputs {
                         if input.native_closed {
-                            let _ = self.commit_unavailable_git(&workspace, input).await;
+                            let _ = self
+                                .commit_unavailable_git(
+                                    &workspace,
+                                    group.base_oid.as_deref(),
+                                    input,
+                                )
+                                .await;
                         } else {
                             let _ = self.git_source_status(&input.key, "stale", false).await;
                         }
