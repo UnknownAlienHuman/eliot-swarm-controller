@@ -379,91 +379,128 @@ impl Store {
             commit_transaction(tx, &self.write_faulted)?;
             return Ok(Vec::new());
         }
-        let supported = source_families_for_harness(&current.harness)?;
-        let mut groups = std::collections::BTreeMap::<String, Vec<String>>::new();
-        for owner in owner_bindings(&tx, agent_num, generation)? {
-            if supported.contains(&owner.family.as_str()) {
-                if reserved_source(&owner.source) {
-                    return Err(Error::new(
-                        "source_integrity",
-                        "native family has a daemon source owner",
-                    ));
-                }
-                groups.entry(owner.source).or_default().push(owner.family);
-            }
+        let events = native_exit_gaps_tx(&tx, &current, reason, now)?;
+        commit_transaction(tx, &self.write_faulted)?;
+        Ok(events)
+    }
+
+    /// The Host has confirmed reader unavailability, independently of custody.
+    /// A closed reader is a separate fact: false retains open/stale sources;
+    /// true closes their transport lifetime. Neither case settles native work.
+    pub fn record_native_reader_unavailable(
+        &mut self,
+        agent: &str,
+        generation: i64,
+        reason: &str,
+        reader_closed: bool,
+        now: i64,
+    ) -> Result<Vec<Event>> {
+        self.ensure_writer_healthy()?;
+        let result = self.record_native_reader_unavailable_inner(
+            agent,
+            generation,
+            reason,
+            reader_closed,
+            now,
+        );
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    fn record_native_reader_unavailable_inner(
+        &mut self,
+        agent: &str,
+        generation: i64,
+        reason: &str,
+        reader_closed: bool,
+        now: i64,
+    ) -> Result<Vec<Event>> {
+        require_nonempty(reason, "native reader unavailable reason")?;
+        let agent_num = parse_agent_id(agent)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let current = load_agent_by_num(&tx, agent_num)?
+            .ok_or_else(|| Error::new("not_found", "unavailable reader Agent was not found"))?;
+        if generation <= 0 || generation > current.generation {
+            return Err(Error::new(
+                "stale_generation",
+                "native reader generation does not exist",
+            ));
         }
-        let mut events = Vec::new();
-        for (source, families) in groups {
-            let state =
-                load_source_state(&tx, agent_num, generation, &source)?.ok_or_else(|| {
-                    Error::new(
-                        "source_integrity",
-                        "native owner has no committed source state",
-                    )
-                })?;
-            let gap_id = format!("host-root-exit:{agent}:{generation}:{source}");
-            let data = json!({
-                "gap_id":gap_id, "agent_id":agent, "generation":generation,
-                "source":source, "families":families, "reason":reason,
-                "from":state.cursor, "to":null,
-            });
-            if encode_json(&data)?.len() > MAX_EVENT_BYTES {
-                return Err(Error::new(
-                    "frame_too_large",
-                    "native exit gap exceeds its event bound",
-                ));
-            }
-            let digest = canonical::digest(&data)?;
-            if state.gap_id.as_deref() == Some(gap_id.as_str()) {
-                if state.gap_digest.as_deref() != Some(digest.as_slice())
-                    || state.gap_seq.is_none_or(|seq| seq <= 0)
-                {
-                    return Err(Error::new(
-                        "source_integrity",
-                        "native exit gap conflicts with its retained boundary",
-                    ));
-                }
+        observer::require_controlled(&current)?;
+        let mut events = if generation == current.generation && !current.is_terminal() {
+            native_exit_gaps_tx(&tx, &current, reason, now)?
+        } else {
+            Vec::new()
+        };
+        let mut statement = tx.prepare(
+            "SELECT source, state, health FROM source_state WHERE agent = ?1 AND generation = ?2
+             AND source NOT IN ('daemon','os','git','workspace_process') ORDER BY source LIMIT ?3",
+        ).map_err(sql_error)?;
+        let sources = statement
+            .query_map(
+                params![agent_num, generation, MAX_PAGE_ENTRIES as i64 + 1],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .map_err(sql_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql_error)?;
+        drop(statement);
+        if sources.len() > MAX_PAGE_ENTRIES {
+            return Err(Error::new(
+                "frame_too_large",
+                "native reader unavailability exceeds its row bound",
+            ));
+        }
+        for (source, state, health) in sources {
+            let close = reader_closed && state == "open";
+            if health == "stale" && !close {
                 continue;
             }
-            if state.state != "open" {
-                return Err(Error::new(
-                    "source_integrity",
-                    "native owner source is already closed",
-                ));
-            }
-            let event = insert_daemon_event(
-                &tx,
-                now,
-                "source.gap",
-                "source",
-                Some(agent_num),
-                Some(generation),
-                data,
-            )?;
+            let next_state = if close { "closed" } else { state.as_str() };
             let changed = tx
                 .execute(
-                    "UPDATE source_state SET gap_id = ?1, gap_digest = ?2, gap_from = ?3,
-                 gap_to = NULL, gap_seq = ?4, updated_at = ?5
-                 WHERE agent = ?6 AND generation = ?7 AND source = ?8 AND state = 'open'",
-                    params![
-                        gap_id,
-                        digest,
-                        state.cursor,
-                        event.seq,
-                        now,
-                        agent_num,
-                        generation,
-                        source
-                    ],
+                    "UPDATE source_state SET health = 'stale', state = ?1, updated_at = ?2
+                 WHERE agent = ?3 AND generation = ?4 AND source = ?5",
+                    params![next_state, now, agent_num, generation, source],
                 )
                 .map_err(sql_error)?;
             if changed != 1 {
                 return Err(Error::new(
                     "source_integrity",
-                    "native source changed before exit gap commit",
+                    "native source changed before unavailable commit",
                 ));
             }
-            events.push(event);
+            if health != "stale" {
+                events.push(insert_daemon_event(
+                    &tx,
+                    now,
+                    "source.health",
+                    "source",
+                    Some(agent_num),
+                    Some(generation),
+                    json!({"source":source,"state":next_state,"health":"stale"}),
+                )?);
+            }
+            if close {
+                events.push(insert_daemon_event(
+                    &tx,
+                    now,
+                    "source.closed",
+                    "source",
+                    Some(agent_num),
+                    Some(generation),
+                    json!({"source":source}),
+                )?);
+            }
         }
         commit_transaction(tx, &self.write_faulted)?;
         Ok(events)
@@ -547,6 +584,103 @@ impl Store {
     }
 }
 
+fn native_exit_gaps_tx(
+    tx: &Transaction<'_>,
+    current: &Agent,
+    reason: &str,
+    now: i64,
+) -> Result<Vec<Event>> {
+    let agent = current.id.as_str();
+    let agent_num = parse_agent_id(agent)?;
+    let generation = current.generation;
+    let supported = source_families_for_harness(&current.harness)?;
+    let mut groups = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for owner in owner_bindings(tx, agent_num, generation)? {
+        if supported.contains(&owner.family.as_str()) {
+            if reserved_source(&owner.source) {
+                return Err(Error::new(
+                    "source_integrity",
+                    "native family has a daemon source owner",
+                ));
+            }
+            groups.entry(owner.source).or_default().push(owner.family);
+        }
+    }
+    let mut events = Vec::new();
+    for (source, families) in groups {
+        let state = load_source_state(tx, agent_num, generation, &source)?.ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "native owner has no committed source state",
+            )
+        })?;
+        let gap_id = format!("host-root-exit:{agent}:{generation}:{source}");
+        let data = json!({
+            "gap_id":gap_id, "agent_id":agent, "generation":generation,
+            "source":source, "families":families, "reason":reason,
+            "from":state.cursor, "to":null,
+        });
+        if encode_json(&data)?.len() > MAX_EVENT_BYTES {
+            return Err(Error::new(
+                "frame_too_large",
+                "native exit gap exceeds its event bound",
+            ));
+        }
+        let digest = canonical::digest(&data)?;
+        if state.gap_id.as_deref() == Some(gap_id.as_str()) {
+            if state.gap_digest.as_deref() != Some(digest.as_slice())
+                || state.gap_seq.is_none_or(|seq| seq <= 0)
+            {
+                return Err(Error::new(
+                    "source_integrity",
+                    "native exit gap conflicts with its retained boundary",
+                ));
+            }
+            continue;
+        }
+        if state.state != "open" {
+            return Err(Error::new(
+                "source_integrity",
+                "native owner source is already closed",
+            ));
+        }
+        let event = insert_daemon_event(
+            tx,
+            now,
+            "source.gap",
+            "source",
+            Some(agent_num),
+            Some(generation),
+            data,
+        )?;
+        let changed = tx
+            .execute(
+                "UPDATE source_state SET gap_id = ?1, gap_digest = ?2, gap_from = ?3,
+             gap_to = NULL, gap_seq = ?4, updated_at = ?5
+             WHERE agent = ?6 AND generation = ?7 AND source = ?8 AND state = 'open'",
+                params![
+                    gap_id,
+                    digest,
+                    state.cursor,
+                    event.seq,
+                    now,
+                    agent_num,
+                    generation,
+                    source
+                ],
+            )
+            .map_err(sql_error)?;
+        if changed != 1 {
+            return Err(Error::new(
+                "source_integrity",
+                "native source changed before exit gap commit",
+            ));
+        }
+        events.push(event);
+    }
+    Ok(events)
+}
+
 fn retained_mismatch() -> Error {
     Error::new(
         "source_integrity",
@@ -586,7 +720,7 @@ mod tests {
                     events: vec![NativeEvent {
                         kind: "session.ready".to_owned(),
                         native_id: "ready".to_owned(),
-                        data: json!({"command_id":command_id}),
+                        data: json!({"command_id":command_id,"native_scope":"synthetic:scope","native_ref":"synthetic:subject"}),
                     }],
                     cursor: Some("native:ready".to_owned()),
                 },
@@ -1153,5 +1287,248 @@ mod tests {
             );
             assert_eq!(store.high_water().unwrap(), before);
         }
+    }
+
+    #[test]
+    fn reader_unavailability_gaps_and_stales_without_claiming_reader_or_session_exit() {
+        let (mut store, agent, now) = fixture("fake");
+        store.ensure_process_source(&agent, 1, now).unwrap();
+        store
+            .record_source_handoff(
+                with_gap(handoff(&agent, &["session", "turn", "message"])),
+                now + 1,
+            )
+            .unwrap();
+        let command = admit_send(&mut store, &agent, now + 2);
+        store
+            .put_batch(turn_batch(&agent, "transcript", &command), now + 3)
+            .unwrap();
+        let before = store.get_agent(&agent).unwrap().unwrap();
+        let command_before = store.get_command(&command).unwrap();
+        let token_before: Option<String> = store
+            .connection
+            .query_row(
+                "SELECT token FROM agents WHERE id = ?1",
+                [parse_agent_id(&agent).unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let predecessor = store.read_source_state(&agent, 1, "stream").unwrap();
+        let progress_before = store.last_model_progress(&agent, 1).unwrap();
+        let events = store
+            .record_native_reader_unavailable(&agent, 1, "reader_lost", false, now + 4)
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "source.gap")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "source.health")
+                .count(),
+            2
+        );
+        assert!(!events.iter().any(|event| event.kind == "source.closed"
+            || event.kind.starts_with("command.")
+            || event.kind.starts_with("agent.")
+            || event.kind.starts_with("session.")));
+        for source in ["stream", "transcript"] {
+            let state = store.read_source_state(&agent, 1, source).unwrap();
+            assert_eq!(state["state"], "open");
+            assert_eq!(state["health"], "stale");
+        }
+        let after = store.read_source_state(&agent, 1, "stream").unwrap();
+        for field in [
+            "cursor",
+            "gap_id",
+            "gap_from",
+            "gap_to",
+            "gap_seq",
+            "gap_digest",
+            "last_handoff",
+            "last_handoff_digest",
+        ] {
+            assert_eq!(after[field], predecessor[field]);
+        }
+        assert_eq!(
+            store.read_source_state(&agent, 1, "os").unwrap()["health"],
+            "ok"
+        );
+        assert_eq!(
+            store.read_source_state(&agent, 1, "os").unwrap()["state"],
+            "open"
+        );
+        assert_eq!(store.get_agent(&agent).unwrap().unwrap(), before);
+        assert_eq!(store.get_command(&command).unwrap(), command_before);
+        let token_after: Option<String> = store
+            .connection
+            .query_row(
+                "SELECT token FROM agents WHERE id = ?1",
+                [parse_agent_id(&agent).unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(token_after, token_before);
+        assert_eq!(
+            store.last_model_progress(&agent, 1).unwrap(),
+            progress_before
+        );
+        let high_water = store.high_water().unwrap();
+        assert!(
+            store
+                .record_native_reader_unavailable(&agent, 1, "reader_lost", false, now + 5)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.high_water().unwrap(), high_water);
+        let closed = store
+            .record_native_reader_unavailable(&agent, 1, "reader_lost", true, now + 6)
+            .unwrap();
+        assert_eq!(closed.len(), 2);
+        assert!(closed.iter().all(|event| event.kind == "source.closed"));
+        for source in ["stream", "transcript"] {
+            let state = store.read_source_state(&agent, 1, source).unwrap();
+            assert_eq!(state["state"], "closed");
+            assert_eq!(state["health"], "stale");
+        }
+        assert_eq!(store.get_agent(&agent).unwrap().unwrap(), before);
+        assert_eq!(store.get_command(&command).unwrap(), command_before);
+    }
+
+    #[test]
+    fn confirmed_terminal_fact_suppresses_gap_but_not_unavailable_source_metadata() {
+        let (mut store, agent, now) = fixture("fake");
+        store
+            .record_source_handoff(handoff(&agent, &["session", "turn", "message"]), now + 1)
+            .unwrap();
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: "ended".to_owned(),
+                    agent_id: agent.clone(),
+                    generation: 1,
+                    source: "transcript".to_owned(),
+                    events: vec![NativeEvent {
+                        kind: "session.ended".to_owned(),
+                        native_id: "ended".to_owned(),
+                        data: json!({}),
+                    }],
+                    cursor: Some("native:ended".to_owned()),
+                },
+                now + 2,
+            )
+            .unwrap();
+        let before = store.get_agent(&agent).unwrap().unwrap();
+        assert_eq!(before.state, AgentState::Stopped);
+        let events = store
+            .record_native_reader_unavailable(&agent, 1, "reader_lost", true, now + 3)
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .all(|event| matches!(event.kind.as_str(), "source.health" | "source.closed"))
+        );
+        assert_eq!(store.get_agent(&agent).unwrap().unwrap(), before);
+        for source in ["stream", "transcript"] {
+            let row = store.read_source_state(&agent, 1, source).unwrap();
+            assert_eq!(row["state"], "closed");
+            assert_eq!(row["health"], "stale");
+            assert!(row["gap_id"].is_null());
+        }
+    }
+
+    #[test]
+    fn retiring_reader_metadata_never_changes_the_new_agent_or_creates_a_gap() {
+        let (mut store, agent, now) = fixture("codex");
+        store
+            .record_source_handoff(handoff(&agent, &["session", "turn", "message"]), now + 1)
+            .unwrap();
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: "ended".to_owned(),
+                    agent_id: agent.clone(),
+                    generation: 1,
+                    source: "transcript".to_owned(),
+                    events: vec![NativeEvent {
+                        kind: "session.ended".to_owned(),
+                        native_id: "ended".to_owned(),
+                        data: json!({}),
+                    }],
+                    cursor: Some("native:ended".to_owned()),
+                },
+                now + 2,
+            )
+            .unwrap();
+        let resume_id = Ulid::new().to_string();
+        store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: resume_id.clone(),
+                    target: Some(agent.clone()),
+                    verb: "resume".to_owned(),
+                    args: json!({}),
+                    expected_generation: Some(1),
+                    expected_turn_id: None,
+                    request_id: None,
+                },
+                now + 3,
+            )
+            .unwrap();
+        store.dispatch(&resume_id, now + 3).unwrap();
+        let before = store.get_agent(&agent).unwrap().unwrap();
+        assert_eq!(before.generation, 2);
+        let current_sources = store.list_source_states(&agent, 2).unwrap();
+        let command_before = store.get_command(&resume_id).unwrap();
+        let events = store
+            .record_native_reader_unavailable(&agent, 1, "reader_lost", true, now + 4)
+            .unwrap();
+        assert!(events.iter().all(|event| event.generation == Some(1)
+            && matches!(event.kind.as_str(), "source.health" | "source.closed")));
+        assert!(events.iter().any(|event| event.kind == "source.health"));
+        assert_eq!(store.get_agent(&agent).unwrap().unwrap(), before);
+        assert_eq!(store.get_command(&resume_id).unwrap(), command_before);
+        assert_eq!(
+            store.list_source_states(&agent, 2).unwrap(),
+            current_sources
+        );
+        for row in store.list_source_states(&agent, 1).unwrap() {
+            assert_eq!(row["state"], "closed");
+            assert_eq!(row["health"], "stale");
+            assert!(row["gap_id"].is_null());
+        }
+    }
+
+    #[test]
+    fn unavailable_metadata_failure_rolls_back_gap_health_and_lifecycle_together() {
+        let (mut store, agent, now) = fixture("fake");
+        store
+            .record_source_handoff(handoff(&agent, &["message"]), now + 1)
+            .unwrap();
+        let before = store.list_source_states(&agent, 1).unwrap();
+        let high_water = store.high_water().unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER reject_reader_health BEFORE INSERT ON events
+             WHEN NEW.kind = 'source.health' AND json_extract(NEW.data, '$.source') = 'transcript'
+             BEGIN SELECT RAISE(ABORT, 'synthetic reader metadata failure'); END;",
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .record_native_reader_unavailable(&agent, 1, "reader_lost", true, now + 2)
+                .unwrap_err()
+                .code,
+            "internal"
+        );
+        assert!(store.is_write_faulted());
+        assert_eq!(store.list_source_states(&agent, 1).unwrap(), before);
+        assert_eq!(store.high_water().unwrap(), high_water);
     }
 }

@@ -10,7 +10,8 @@ use crate::{
     },
 };
 use eliot_core::{
-    BatchAck, Error as CoreError, NativeEvent, SourceBatch, SourceHandoff, SourceHandoffGap,
+    BatchAck, Error as CoreError, NativeEvent, SecretPolicy, SourceBatch, SourceHandoff,
+    SourceHandoffGap,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -593,6 +594,7 @@ async fn handle_start(
     let credential = state.credential.clone().ok_or_else(not_initialized)?;
     let batch = session_ready_batch(&params.agent_id, params.generation);
 
+    state.source_policy = source_secret_policy(&params, &credential);
     state.binding = Some(Binding {
         agent_id: params.agent_id.clone(),
         generation: params.generation,
@@ -949,13 +951,44 @@ struct BatchFailure {
     uncertain: bool,
 }
 
+fn source_secret_policy(params: &AgentStartParams, credential: &str) -> SecretPolicy {
+    let mut known = vec![credential.to_owned()];
+    if let Some(environment) = params
+        .target_environment
+        .as_ref()
+        .and_then(Value::as_object)
+    {
+        let names = params
+            .profile
+            .as_ref()
+            .and_then(|profile| profile.get("pass_env"))
+            .and_then(Value::as_array);
+        for (name, value) in environment {
+            let matches = |expected: &str| {
+                if cfg!(windows) {
+                    name.eq_ignore_ascii_case(expected)
+                } else {
+                    name == expected
+                }
+            };
+            if (matches("ELIOT_AGENT_TOKEN")
+                || names.is_some_and(|names| names.iter().filter_map(Value::as_str).any(matches)))
+                && let Some(value) = value.as_str()
+            {
+                known.push(value.to_owned());
+            }
+        }
+    }
+    SecretPolicy::new(known)
+}
+
 async fn exercise_source_handoff(
     state: &mut FakeState,
     command: &AgentCommandParams,
     credential: &str,
     client: &PeerClient,
 ) -> Result<(), RpcError> {
-    let handoff = SourceHandoff {
+    let mut handoff = SourceHandoff {
         agent_id: command.agent_id.clone(),
         generation: command.generation,
         source: "stream".to_owned(),
@@ -972,11 +1005,15 @@ async fn exercise_source_handoff(
                 "fake:{}:{}:{}:handoff-gap",
                 command.agent_id, command.generation, command.command_id
             ),
-            reason: "fake_source_handoff_fixture".to_owned(),
+            reason: format!("fake_source_handoff_fixture {credential}"),
             from: None,
             to: None,
         }),
     };
+    handoff
+        .prepare(&state.source_policy)
+        .map_err(core_error_to_rpc)?;
+    // Retain this exact prepared request for both the wire and full-digest proof.
     let mut request = serde_json::to_value(&handoff)
         .map_err(|_| domain_error("internal", -32603, "cannot encode fake handoff"))?;
     request["credential"] = json!(credential);
@@ -1137,6 +1174,7 @@ fn domain_error(code: &str, rpc_code: i64, message: &str) -> RpcError {
 #[derive(Default)]
 struct FakeState {
     credential: Option<String>,
+    source_policy: SecretPolicy,
     binding: Option<Binding>,
     observer: Option<FakeObserver>,
     publish_source: Option<String>,

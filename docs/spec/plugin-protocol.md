@@ -245,8 +245,14 @@ without control identity, private-history publication or input/command acknowled
 The private authenticated `source.state` readback includes paired nullable
 `last_handoff_digest` (32-byte array) and `last_handoff` (ACK) fields, null before the
 first handoff, and all current generation owner/mechanism rows.
-The retained digest binds the canonical request, including the sorted family set and
-gap reason. After a lost reply, accept only a matching digest/ACK, current successor
+`SourceHandoff::prepare(&mut self, policy:&SecretPolicy)->CoreResult<()>` is the shared,
+idempotent normalization step. It rejects known secrets in immutable fields before
+mutation and redacts only `gap.reason`; the canonical digest includes the full prepared
+request, including the redacted reason. Each caller prepares before sending, freezes that
+value, and reuses it for `source.state` proof. Host uses the same prepare path; Fake uses
+its scoped known-secret policy before first send. Callers must not assume Host-only secret
+knowledge: if normalized request/digest agreement cannot be proven, the result is
+`unknown`. After a lost reply, accept only a matching digest/ACK, current successor
 owners and the same cursor or gap boundary. If any owner or boundary advanced, or the
 state is mixed/stale, the result is unknown; do not blindly retry. Retain only the latest
 handoff proof on the predecessor row. The public Agent `source_states` projection remains

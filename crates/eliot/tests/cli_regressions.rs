@@ -2142,7 +2142,12 @@ fn assert_fake_source_handoff(
     let gap = gaps[0];
     assert_eq!(gap["data"]["source"], "stream");
     assert_eq!(gap["data"]["families"], json!(families));
-    assert_eq!(gap["data"]["reason"], "fake_source_handoff_fixture");
+    for reason in [&gap["data"]["reason"], &handoff["data"]["gap"]["reason"]] {
+        assert!(
+            reason.as_str() == Some("fake_source_handoff_fixture [REDACTED]"),
+            "handoff gap reason was not sanitized; actual text deliberately omitted"
+        );
+    }
     assert_eq!(
         predecessor.gap_id.as_deref(),
         gap["data"]["gap_id"].as_str()

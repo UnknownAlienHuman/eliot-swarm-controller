@@ -1,7 +1,7 @@
 //! Native-family handoff wire data and pure acknowledgement/readback checks.
 //! Store remains authoritative for the transaction and successor publication.
 
-use crate::{Error, Result, api::SourceOwner, canonical_json_sha256, parse_agent_id};
+use crate::{Error, Result, SecretPolicy, api::SourceOwner, canonical_json_sha256, parse_agent_id};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 
@@ -102,6 +102,47 @@ impl<'de> Deserialize<'de> for SourceHandoffAck {
 }
 
 impl SourceHandoff {
+    /// Prepare once with the complete scoped policy before submission, and retain
+    /// this same value for acknowledgement/readback. The Host repeats this check
+    /// with its policy; an unknown additional Host secret remains an unproven
+    /// digest rather than permission to guess a different request.
+    pub fn prepare(&mut self, policy: &SecretPolicy) -> Result<()> {
+        let immutable_secret = [
+            self.agent_id.as_str(),
+            self.source.as_str(),
+            self.successor.as_str(),
+            self.mechanism.as_str(),
+        ]
+        .into_iter()
+        .any(|value| policy.contains_text(value))
+            || self
+                .families
+                .iter()
+                .any(|family| policy.contains_text(family))
+            || self
+                .cursor
+                .as_deref()
+                .is_some_and(|cursor| policy.contains_text(cursor))
+            || self.gap.as_ref().is_some_and(|gap| {
+                policy.contains_text(&gap.gap_id)
+                    || [&gap.from, &gap.to]
+                        .into_iter()
+                        .flatten()
+                        .any(|cursor| policy.contains_text(cursor))
+            });
+        // Check every immutable field before redacting even the mutable reason.
+        if immutable_secret {
+            return Err(Error::new(
+                "secret_in_payload",
+                "source.handoff contains a known secret in immutable metadata",
+            ));
+        }
+        if let Some(gap) = self.gap.as_mut() {
+            gap.reason = policy.redact_text(&gap.reason);
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<()> {
         parse_agent_id(&self.agent_id)?;
         if self.generation < 0
@@ -342,6 +383,95 @@ mod tests {
             "source handoff acknowledgement or current ownership is unproven"
         );
         assert!(error.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn prepared_reason_matches_stored_full_digest_but_raw_reason_stays_unproven() {
+        let policy = SecretPolicy::new(["dummy-private-credential"]);
+        let mut raw = request(true);
+        raw.gap.as_mut().unwrap().reason = "lost dummy-private-credential transport".to_owned();
+        let mut prepared = raw.clone();
+        prepared.prepare(&policy).unwrap();
+        assert_eq!(
+            prepared.gap.as_ref().unwrap().reason,
+            "lost [REDACTED] transport"
+        );
+        prepared.validate().unwrap();
+        let submitted = serde_json::to_value(&prepared).unwrap();
+        let stored_request: SourceHandoff = serde_json::from_value(submitted.clone()).unwrap();
+        let stored = state(&stored_request);
+        assert_eq!(prepared.ack_from_state(&stored).unwrap(), ack(&prepared));
+        assert_unknown(raw.ack_from_state(&stored));
+        assert_eq!(serde_json::to_value(&prepared).unwrap(), submitted);
+    }
+
+    #[test]
+    fn immutable_secret_rejection_leaves_every_request_field_unchanged() {
+        let policy = SecretPolicy::new(["dummy-private-credential"]);
+        for pointer in [
+            "/agent_id",
+            "/source",
+            "/successor",
+            "/mechanism",
+            "/families/0",
+            "/cursor",
+            "/gap/gap_id",
+            "/gap/from",
+            "/gap/to",
+        ] {
+            let mut original = request(true);
+            original.gap.as_mut().unwrap().reason =
+                "redact dummy-private-credential only after checks".to_owned();
+            let mut wire = serde_json::to_value(original).unwrap();
+            *wire.pointer_mut(pointer).unwrap() = json!("prefix-dummy-private-credential-suffix");
+            let mut request: SourceHandoff = serde_json::from_value(wire).unwrap();
+            let before = request.clone();
+            let error = request.prepare(&policy).unwrap_err();
+            assert_eq!(error.code, "secret_in_payload");
+            assert_eq!(
+                error.message,
+                "source.handoff contains a known secret in immutable metadata"
+            );
+            assert!(error.diagnostics.is_empty());
+            assert_eq!(request, before);
+        }
+    }
+
+    #[test]
+    fn repeated_preparation_preserves_markers_and_the_frozen_request_digest() {
+        let policy = SecretPolicy::new(["dummy-private-credential", "REDACTED"]);
+        let mut request = request(true);
+        request.gap.as_mut().unwrap().reason =
+            "dummy-private-credential REDACTED [REDACTED]".to_owned();
+        request.prepare(&policy).unwrap();
+        assert_eq!(
+            request.gap.as_ref().unwrap().reason,
+            "[REDACTED] [REDACTED] [REDACTED]"
+        );
+        let before = request.clone();
+        let stored = state(&request);
+        request.prepare(&policy).unwrap();
+        assert_eq!(request, before);
+        assert_eq!(request.ack_from_state(&stored).unwrap(), ack(&request));
+    }
+
+    #[test]
+    fn an_additional_host_only_secret_does_not_enable_readback_repair() {
+        let caller_policy = SecretPolicy::new(["dummy-caller-credential"]);
+        let host_policy =
+            SecretPolicy::new(["dummy-caller-credential", "dummy-host-only-credential"]);
+        let mut caller_request = request(true);
+        caller_request.gap.as_mut().unwrap().reason =
+            "dummy-caller-credential dummy-host-only-credential".to_owned();
+        caller_request.prepare(&caller_policy).unwrap();
+        let mut stored_request = caller_request.clone();
+        stored_request.prepare(&host_policy).unwrap();
+        let stored = state(&stored_request);
+        assert_unknown(caller_request.ack_from_state(&stored));
+        assert_eq!(
+            stored_request.ack_from_state(&stored).unwrap(),
+            ack(&stored_request)
+        );
     }
 
     #[test]

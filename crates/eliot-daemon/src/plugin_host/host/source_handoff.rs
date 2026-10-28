@@ -65,42 +65,7 @@ fn decode_handoff(params: Value) -> CoreResult<SourceHandoff> {
 }
 
 fn sanitize_handoff(handoff: &mut SourceHandoff, secrets: &[String]) -> CoreResult<()> {
-    let policy = SecretPolicy::new(secrets);
-    let immutable_secret = [
-        handoff.agent_id.as_str(),
-        handoff.source.as_str(),
-        handoff.successor.as_str(),
-        handoff.mechanism.as_str(),
-    ]
-    .into_iter()
-    .any(|value| policy.contains_text(value))
-        || handoff
-            .families
-            .iter()
-            .any(|family| policy.contains_text(family))
-        || handoff
-            .cursor
-            .as_deref()
-            .is_some_and(|cursor| policy.contains_text(cursor))
-        || handoff.gap.as_ref().is_some_and(|gap| {
-            policy.contains_text(&gap.gap_id)
-                || [&gap.from, &gap.to]
-                    .into_iter()
-                    .flatten()
-                    .any(|cursor| policy.contains_text(cursor))
-        });
-
-    if immutable_secret {
-        return Err(CoreError::new(
-            "secret_in_payload",
-            "source.handoff contains a known secret in immutable metadata",
-        ));
-    }
-
-    if let Some(gap) = handoff.gap.as_mut() {
-        gap.reason = policy.redact_text(&gap.reason);
-    }
-    Ok(())
+    handoff.prepare(&SecretPolicy::new(secrets))
 }
 
 #[cfg(test)]

@@ -31,6 +31,43 @@ const RPC_DEADLINE: Duration = Duration::from_secs(30);
 const RPC_GRACE: Duration = Duration::from_secs(2);
 const STOP_GRACE: Duration = Duration::from_secs(5);
 
+#[derive(Clone, Copy)]
+struct StopDeadlines {
+    queued_until: Instant,
+    rpc_until: Instant,
+    custody_until: Instant,
+    source_until: Instant,
+    reply_until: Instant,
+}
+
+impl StopDeadlines {
+    fn new(now: Instant) -> Self {
+        let queued_until = now + RPC_DEADLINE;
+        // agent.stop + shutdown; the force snapshot fits the second RPC window.
+        let rpc_until = queued_until + RPC_DEADLINE + RPC_DEADLINE;
+        // close_input, then two attempts, each with leader and family waits.
+        let custody_until = rpc_until + STOP_GRACE + (STOP_GRACE + STOP_GRACE) * 2;
+        // Callback drain/abort-join and one bounded Store settlement.
+        let source_until = custody_until + STOP_GRACE + RPC_GRACE + RPC_DEADLINE;
+        let reply_until = source_until + RPC_GRACE;
+        Self {
+            queued_until,
+            rpc_until,
+            custody_until,
+            source_until,
+            reply_until,
+        }
+    }
+
+    fn rpc_deadline(self, budget: Duration) -> Instant {
+        self.rpc_deadline_at(Instant::now(), budget)
+    }
+
+    fn rpc_deadline_at(self, now: Instant, budget: Duration) -> Instant {
+        (now + budget).min(self.rpc_until)
+    }
+}
+
 pub(crate) type SecretSet = Arc<Mutex<HashSet<String>>>;
 pub(crate) type AgentCredentials = Arc<Mutex<HashMap<(String, i64), String>>>;
 pub(crate) type UnknownCommands = Arc<Mutex<HashSet<String>>>;
@@ -72,6 +109,7 @@ enum RuntimeMessage {
     Stop {
         command: Command,
         force: bool,
+        deadlines: StopDeadlines,
         reply: oneshot::Sender<Result<Value>>,
     },
     DaemonForce {
@@ -502,23 +540,20 @@ impl PluginHost {
         };
         let (sender, stderr, credentials) = self.sender(&key, "stop")?;
         let (reply, response) = oneshot::channel();
+        let deadlines = StopDeadlines::new(Instant::now());
         timeout_at(
-            Instant::now() + RPC_DEADLINE,
+            deadlines.queued_until,
             sender.send(RuntimeMessage::Stop {
                 command,
                 force,
+                deadlines,
                 reply,
             }),
         )
         .await
         .map_err(|_| Error::new("busy", "Agent plugin command queue is full"))?
         .map_err(|_| Error::new("unknown", "owned Agent plugin is no longer available"))?;
-        let result = match timeout_at(
-            Instant::now() + RPC_DEADLINE + STOP_GRACE + STOP_GRACE + RPC_GRACE,
-            response,
-        )
-        .await
-        {
+        let result = match timeout_at(deadlines.reply_until, response).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(Error::new(
                 "unknown",
@@ -556,7 +591,7 @@ impl PluginHost {
                 )
                 .await;
             } else {
-                self.mark_lost(&key).await;
+                self.mark_reader_unavailable(&key).await;
             }
         }
     }
@@ -714,16 +749,16 @@ impl PluginHost {
             .remove(credential);
     }
 
-    async fn mark_lost(&self, key: &AgentKey) {
+    async fn mark_reader_unavailable(&self, key: &AgentKey) {
+        let _ = settle_drained_source_exit(
+            &Arc::downgrade(&self.state),
+            key,
+            false,
+            false,
+            "daemon_force_actor_unavailable",
+        )
+        .await;
         fence_runtime_generation(&self.state, key);
-        {
-            let mut store = self.state.store.lock().await;
-            if let Ok(events) = store.mark_lost(&key.id, key.generation, now_ms()) {
-                self.state.bus.publish(&events);
-                note_unknown_commands(&self.state, &events);
-            }
-        }
-        forget_if_revoked(&self.state, key).await;
         signal_progress(&self.state);
     }
 }
@@ -1044,8 +1079,8 @@ async fn run_agent_inner(
                 if control_gone {
                     let _ = monitoring.sample_generation(&agent).await;
                 }
-                let source_settled = drained && settle_owned_source_exit(
-                    &state, &key, None, control_gone, gap_reason,
+                let source_settled = settle_drained_source_exit(
+                    &state, &key, drained, control_gone, gap_reason,
                 ).await.is_ok();
                 if source_settled && control_gone && !planned_exit {
                     mark_lost_state(&state, &key).await;
@@ -1063,8 +1098,8 @@ async fn run_agent_inner(
                 };
                 let control_gone = child.terminate().is_ok()
                     && wait_child(&mut child, STOP_GRACE, &monitoring, &agent).await;
-                let source_settled = settle_owned_source_exit(
-                    &state, &key, None, control_gone, gap_reason,
+                let source_settled = settle_drained_source_exit(
+                    &state, &key, true, control_gone, gap_reason,
                 ).await.is_ok();
                 if source_settled && control_gone {
                     mark_lost_state(&state, &key).await;
@@ -1129,7 +1164,11 @@ async fn run_agent_inner(
                             }
                         }
                     }
-                    RuntimeMessage::Stop { command, force, reply } => {
+                    RuntimeMessage::Stop { command, force, deadlines, reply } => {
+                        if Instant::now() >= deadlines.queued_until {
+                            let _ = reply.send(Err(Error::new("unknown", "stop queue deadline elapsed before native dispatch")));
+                            continue;
+                        }
                         let snapshot_command_id = last_command_id.clone();
                         last_command_id = command.id.clone();
                         let params = json!({
@@ -1139,27 +1178,29 @@ async fn run_agent_inner(
                             "force": force,
                         });
                         let cooperative = client
-                            .call("agent.stop", params, deadline())
+                            .call("agent.stop", params, deadlines.rpc_deadline(RPC_DEADLINE))
                             .await
                             .map_err(|error| redact_native_error(error, &source_credentials))
                             .and_then(validate_applied);
                         match cooperative {
                             Ok(result) => {
                                 let guarantee = child.guarantee();
-                                let shutdown = client
-                                    .call("shutdown", json!({}), deadline())
-                                    .await
-                                    .and_then(validate_shutdown);
+                                let shutdown = if Instant::now() < deadlines.rpc_until {
+                                    client.call("shutdown", json!({}), deadlines.rpc_deadline(RPC_DEADLINE))
+                                        .await.and_then(validate_shutdown)
+                                } else {
+                                    Err(Error::new("unknown", "stop RPC deadline elapsed before shutdown"))
+                                };
                                 if shutdown.is_ok() {
                                     let _ = client
-                                        .close_input(Instant::now() + STOP_GRACE)
+                                        .close_input((Instant::now() + STOP_GRACE).min(deadlines.custody_until))
                                         .await;
                                 }
-                                let graceful = wait_child(&mut child, STOP_GRACE, &monitoring, &agent).await;
+                                let graceful = wait_stop_child(&mut child, &monitoring, &agent, deadlines.custody_until).await;
                                 let mut exited = graceful;
                                 if !exited {
                                     let _ = child.terminate();
-                                    exited = wait_child(&mut child, STOP_GRACE, &monitoring, &agent).await;
+                                    exited = wait_stop_child(&mut child, &monitoring, &agent, deadlines.custody_until).await;
                                 }
                                 if !exited {
                                     drop(child);
@@ -1189,6 +1230,10 @@ async fn run_agent_inner(
                                     let _ = reply.send(Err(error));
                                     break;
                                 }
+                                if Instant::now() > deadlines.source_until {
+                                    let _ = reply.send(Err(Error::new("unknown", "stop source settlement exceeded its absolute deadline")));
+                                    break;
+                                }
                                 let _ = reply.send(Ok(json!({
                                     "state": "applied",
                                     "custody": custody_label(guarantee),
@@ -1199,18 +1244,18 @@ async fn run_agent_inner(
                             }
                             Err(_) if force => {
                                 let snapshot_command = snapshot_command_id.clone();
-                                let snapshot = client.call(
+                                let snapshot = if Instant::now() < deadlines.rpc_until { client.call(
                                     "agent.snapshot",
                                     json!({
                                         "agent_id": agent.id,
                                         "generation": agent.generation,
                                         "command_id": snapshot_command,
                                     }),
-                                    Instant::now() + Duration::from_secs(5),
-                                ).await.ok();
+                                    deadlines.rpc_deadline(STOP_GRACE),
+                                ).await.ok() } else { None };
                                 let guarantee = child.guarantee();
                                 let terminated = child.terminate().is_ok();
-                                let exited = wait_child(&mut child, STOP_GRACE, &monitoring, &agent).await;
+                                let exited = wait_stop_child(&mut child, &monitoring, &agent, deadlines.custody_until).await;
                                 if !terminated || !exited {
                                     drop(child);
                                     let _ = settle_owned_source_exit(
@@ -1242,6 +1287,10 @@ async fn run_agent_inner(
                                     let _ = reply.send(Err(error));
                                     break;
                                 }
+                                if Instant::now() > deadlines.source_until {
+                                    let _ = reply.send(Err(Error::new("unknown", "stop source settlement exceeded its absolute deadline")));
+                                    break;
+                                }
                                 let mut response = json!({
                                     "state": "applied",
                                     "custody": custody_label(guarantee),
@@ -1255,7 +1304,7 @@ async fn run_agent_inner(
                                 break;
                             }
                             Err(error) => {
-                                if error.code == "unknown" {
+                                if error.code == "unknown" && Instant::now() < deadlines.rpc_until {
                                     let _ = client.call(
                                         "agent.snapshot",
                                         json!({
@@ -1263,7 +1312,7 @@ async fn run_agent_inner(
                                             "generation": agent.generation,
                                             "command_id": snapshot_command_id,
                                         }),
-                                        Instant::now() + Duration::from_secs(5),
+                                        deadlines.rpc_deadline(STOP_GRACE),
                                     ).await;
                                 }
                                 let _ = reply.send(Err(error));
@@ -2171,6 +2220,17 @@ async fn wait_child(
     }
 }
 
+async fn wait_stop_child(
+    child: &mut OwnedChild,
+    monitoring: &Monitoring,
+    agent: &Agent,
+    until: Instant,
+) -> bool {
+    timeout_at(until, wait_child(child, STOP_GRACE, monitoring, agent))
+        .await
+        .unwrap_or(false)
+}
+
 async fn terminate_child(mut child: OwnedChild, monitoring: &Monitoring, agent: &Agent) -> bool {
     let exited =
         child.terminate().is_ok() && wait_child(&mut child, STOP_GRACE, monitoring, agent).await;
@@ -2189,8 +2249,8 @@ fn custody_label(guarantee: crate::platform::CustodyGuarantee) -> &'static str {
     }
 }
 
-// Drain callbacks only after custody cleanup, then settle the captured generation.
-// No source closure or loss claim follows an unconfirmed custody result.
+// Reader availability is independent of custody. Finishing or abandoning this
+// reader must be recorded even when native control loss remains unconfirmed.
 async fn settle_owned_source_exit(
     state: &Weak<HostState>,
     key: &AgentKey,
@@ -2198,34 +2258,74 @@ async fn settle_owned_source_exit(
     exited: bool,
     reason: &'static str,
 ) -> Result<()> {
-    let reason = if let Some(task) = event_task {
+    let (reason, reader_closed) = if let Some(task) = event_task {
         match timeout_at(Instant::now() + STOP_GRACE, &mut *task).await {
-            Ok(Ok(())) => reason,
-            Ok(Err(_)) => "owned_exit_source_failed",
+            Ok(Ok(())) => (reason, true),
+            Ok(Err(_)) => ("owned_exit_source_failed", true),
             Err(_) => {
                 task.abort();
-                if timeout_at(Instant::now() + RPC_GRACE, task).await.is_err() {
-                    return Err(Error::new(
-                        "unknown",
-                        "owned source task cleanup is unconfirmed",
-                    ));
-                }
-                "owned_exit_drain_timeout"
+                let joined = timeout_at(Instant::now() + RPC_GRACE, task).await.is_ok();
+                ("owned_exit_drain_timeout", joined)
             }
         }
     } else {
-        reason
+        // The startup caller has not armed a reader; confirmed custody exit
+        // proves its pipes cannot later acquire publication authority.
+        (reason, exited)
     };
+    settle_drained_source_exit(state, key, reader_closed, exited, reason).await
+}
+
+async fn settle_drained_source_exit(
+    state: &Weak<HostState>,
+    key: &AgentKey,
+    reader_closed: bool,
+    exited: bool,
+    reason: &'static str,
+) -> Result<()> {
+    let settlement = async {
+        if reader_closed && exited {
+            return record_root_exit_gap(state, key, reason).await;
+        }
+        let state = state
+            .upgrade()
+            .ok_or_else(|| Error::new("unavailable", "plugin host is unavailable"))?;
+        let events = {
+            let mut store = timeout_at(deadline(), state.store.lock())
+                .await
+                .map_err(|_| {
+                    Error::new(
+                        "unknown",
+                        "native reader availability persistence timed out",
+                    )
+                })?;
+            store.record_native_reader_unavailable(
+                &key.id,
+                key.generation,
+                reason,
+                reader_closed,
+                now_ms(),
+            )?
+        };
+        state.bus.publish(&events);
+        Ok(())
+    }
+    .await;
+    settlement.map_err(|mut error: Error| {
+        error.code = "unknown".to_owned();
+        error.message = "owned exit native source settlement is unconfirmed".to_owned();
+        error
+    })?;
+    if !reader_closed {
+        return Err(Error::new(
+            "unknown",
+            "owned source task cleanup is unconfirmed",
+        ));
+    }
     if !exited {
         return Err(Error::new("unknown", "owned custody exit is unconfirmed"));
     }
-    record_root_exit_gap(state, key, reason)
-        .await
-        .map_err(|mut error| {
-            error.code = "unknown".to_owned();
-            error.message = "owned exit native source settlement is unconfirmed".to_owned();
-            error
-        })
+    Ok(())
 }
 
 // Drain terminal facts first. Retiring generations close only their own rows;
@@ -2234,7 +2334,9 @@ async fn record_root_exit_gap(state: &Weak<HostState>, key: &AgentKey, reason: &
     let state = state
         .upgrade()
         .ok_or_else(|| Error::new("unavailable", "plugin host is unavailable"))?;
-    let mut store = state.store.lock().await;
+    let mut store = timeout_at(deadline(), state.store.lock())
+        .await
+        .map_err(|_| Error::new("unknown", "native source exit persistence timed out"))?;
     let agent = store
         .get_agent(&key.id)?
         .ok_or_else(|| Error::new("not_found", "exited plugin Agent was not found"))?;
@@ -3035,9 +3137,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owned_source_exit_requires_confirmed_custody_before_closure() {
-        let (host, key, _) = source_exit_fixture("fake");
+    async fn owned_source_exit_tracks_reader_independently_of_custody() {
+        let (host, key, start_id) = source_exit_fixture("fake");
         let before = host.state.store.lock().await.high_water().unwrap();
+        let error = settle_drained_source_exit(
+            &Arc::downgrade(&host.state),
+            &key,
+            false,
+            false,
+            "test_exit",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "unknown");
+        {
+            let store = host.state.store.lock().await;
+            let source = store.read_source_state(&key.id, 1, "stream").unwrap();
+            assert_eq!(source["state"], json!("open"));
+            assert_eq!(source["health"], json!("stale"));
+        }
         let mut drained = tokio::spawn(async {});
         let error = settle_owned_source_exit(
             &Arc::downgrade(&host.state),
@@ -3051,11 +3169,41 @@ mod tests {
         assert_eq!(error.code, "unknown");
         {
             let store = host.state.store.lock().await;
-            assert_eq!(store.high_water().unwrap(), before);
+            let source = store.read_source_state(&key.id, 1, "stream").unwrap();
+            assert_eq!(source["state"], json!("closed"));
+            assert_eq!(source["health"], json!("stale"));
             assert_eq!(
-                store.read_source_state(&key.id, 1, "stream").unwrap()["state"],
-                json!("open")
+                store.get_agent(&key.id).unwrap().unwrap().state,
+                eliot_core::AgentState::Starting
             );
+            assert_eq!(
+                store.get_command(&start_id).unwrap().unwrap().state,
+                eliot_core::CommandState::Dispatched
+            );
+            assert!(
+                store
+                    .read_events(before, 1000, None)
+                    .unwrap()
+                    .iter()
+                    .all(|event| !matches!(
+                        event.kind.as_str(),
+                        "agent.lost" | "session.lost" | "session.ended" | "command.applied"
+                    ))
+            );
+        }
+        let agent = host
+            .state
+            .store
+            .lock()
+            .await
+            .get_agent(&key.id)
+            .unwrap()
+            .unwrap();
+        match host.state.monitoring.view(&agent).await.unwrap() {
+            eliot_core::api::ObservationView::Data(view) => {
+                assert_eq!(view.liveness.source_healthy, Some(false));
+            }
+            _ => panic!("expected the ordinary observation view"),
         }
         let mut drained = tokio::spawn(async {});
         settle_owned_source_exit(
@@ -3153,5 +3301,63 @@ mod tests {
         assert_eq!(store.list_source_states(&key.id, 2).unwrap(), sources);
         assert_eq!(store.get_agent_token(&key.id, 2).unwrap(), token);
         assert_eq!(store.high_water().unwrap(), before);
+        drop(store);
+        assert_eq!(
+            settle_drained_source_exit(
+                &Arc::downgrade(&host.state),
+                &key,
+                false,
+                false,
+                "retiring_reader_unavailable",
+            )
+            .await
+            .unwrap_err()
+            .code,
+            "unknown"
+        );
+        let store = host.state.store.lock().await;
+        assert_eq!(store.get_agent(&key.id).unwrap().unwrap(), current);
+        assert_eq!(store.list_source_states(&key.id, 2).unwrap(), sources);
+        assert_eq!(store.get_agent_token(&key.id, 2).unwrap(), token);
+        assert!(
+            store
+                .list_source_states(&key.id, 1)
+                .unwrap()
+                .iter()
+                .all(|source| source["health"] == "stale")
+        );
+        assert!(
+            store
+                .read_events(before, 1000, None)
+                .unwrap()
+                .iter()
+                .all(|event| event.generation == Some(1))
+        );
+    }
+
+    #[test]
+    fn owned_source_exit_stop_deadlines_cover_queue_two_rpcs_custody_drain_and_store() {
+        let now = Instant::now();
+        let deadlines = StopDeadlines::new(now);
+        assert_eq!(deadlines.queued_until - now, RPC_DEADLINE);
+        let second_rpc_starts = deadlines.queued_until + RPC_DEADLINE;
+        assert_eq!(
+            deadlines.rpc_deadline_at(second_rpc_starts, RPC_DEADLINE),
+            deadlines.rpc_until
+        );
+        assert_eq!(
+            deadlines.custody_until - deadlines.rpc_until,
+            STOP_GRACE + (STOP_GRACE + STOP_GRACE) * 2
+        );
+        assert_eq!(
+            deadlines.source_until - deadlines.custody_until,
+            STOP_GRACE + RPC_GRACE + RPC_DEADLINE
+        );
+        assert_eq!(deadlines.reply_until - deadlines.source_until, RPC_GRACE);
+        assert!(deadlines.reply_until > now + RPC_DEADLINE + STOP_GRACE + STOP_GRACE + RPC_GRACE);
+        assert!(
+            deadlines.queued_until < deadlines.rpc_until
+                && deadlines.rpc_until < deadlines.custody_until
+        );
     }
 }
