@@ -15,7 +15,7 @@ mod setup;
 mod workspace_git;
 mod workspaces;
 
-pub use daemon::{client_call, run};
+pub use daemon::{client_call, client_call_typed, run};
 
 /// Start this executable's background daemon without inheriting caller handles.
 #[cfg(windows)]

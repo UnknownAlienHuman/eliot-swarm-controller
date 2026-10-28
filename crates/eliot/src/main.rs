@@ -1,5 +1,11 @@
 use clap::{Args, CommandFactory, Parser, Subcommand};
-use eliot_core::Error as CoreError;
+use eliot_core::{
+    Error as CoreError,
+    api::{
+        EventsFilter, EventsReadRequest, EventsReadResponse, EventsSubscribeRequest,
+        EventsSubscribeResponse,
+    },
+};
 use serde_json::{Value, json};
 #[cfg(not(windows))]
 use std::process::{Command as ProcessCommand, Stdio};
@@ -1030,12 +1036,21 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
         },
         CliCommand::Events { since, limit } => {
             validate_limit(limit)?;
-            let result = read_call(
-                &data_dir,
-                "events.read",
-                json!({ "after": since.unwrap_or(0), "limit": limit }),
-            )
-            .await?;
+            let params = EventsReadRequest {
+                after: since.unwrap_or(0),
+                limit,
+                filter: EventsFilter::default(),
+            };
+            params
+                .validate()
+                .map_err(|error| Failure::from_core(error, false))?;
+            let response: EventsReadResponse =
+                eliot_daemon::client_call_typed(&data_dir, "events.read", &params)
+                    .await
+                    .map_err(|error| Failure::from_core(error, false))?;
+            let result = serde_json::to_value(response).map_err(|_| {
+                Failure::new(1, "unavailable: cannot render typed events.read response")
+            })?;
             print_value(&result, json_output);
             Ok(0)
         }
@@ -1363,16 +1378,20 @@ fn turn_exit_code(turn: &Value) -> u8 {
 async fn watch(data_dir: &Path, agent: Option<&str>, json_output: bool) -> Result<u8, Failure> {
     let mut after = 0_i64;
     loop {
-        let mut params = json!({
-            "after": after,
-            "limit": PAGE_SIZE,
-            "wait_ms": 1_000,
-        });
-        if let Some(agent) = agent {
-            params["filter"] = json!({ "agents": [agent] });
-        }
-        let response = tokio::select! {
-            result = eliot_daemon::client_call(data_dir, "events.subscribe", params) => {
+        let params = EventsSubscribeRequest {
+            after,
+            limit: PAGE_SIZE,
+            wait_ms: 1_000,
+            filter: EventsFilter {
+                agents: agent.into_iter().map(str::to_owned).collect(),
+                ..EventsFilter::default()
+            },
+        };
+        params
+            .validate()
+            .map_err(|error| Failure::from_core(error, false))?;
+        let response: EventsSubscribeResponse = tokio::select! {
+            result = eliot_daemon::client_call_typed(data_dir, "events.subscribe", &params) => {
                 result.map_err(|error| Failure::from_core(error, false))?
             }
             signal = tokio::signal::ctrl_c() => {
@@ -1380,24 +1399,14 @@ async fn watch(data_dir: &Path, agent: Option<&str>, json_output: bool) -> Resul
                 return Ok(0);
             }
         };
-        let events = response
-            .get("events")
-            .and_then(Value::as_array)
-            .ok_or_else(|| Failure::new(1, "events.subscribe response omitted events"))?;
-        for event in events {
-            print_value(event, json_output);
+        for event in &response.events {
+            let value = serde_json::to_value(event).map_err(|_| {
+                Failure::new(1, "unavailable: cannot render typed events.subscribe event")
+            })?;
+            print_value(&value, json_output);
         }
-        let last_event = events
-            .last()
-            .and_then(|event| event.get("seq"))
-            .and_then(Value::as_i64);
-        after = response
-            .get("next")
-            .and_then(Value::as_i64)
-            .or(last_event)
-            .or_else(|| response.get("high_water").and_then(Value::as_i64))
-            .unwrap_or(after)
-            .max(after);
+        // The server's scan cursor includes filtered-out records as well.
+        after = response.next.max(after);
     }
 }
 
