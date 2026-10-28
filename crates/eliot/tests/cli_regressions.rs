@@ -6,8 +6,10 @@ mod support;
 mod windows_process;
 
 use eliot_core::api::{
-    AgentResultRequest, AgentResultResponse, CommandGetRequest, EventsFilter, EventsReadRequest,
-    EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse, TurnGetRequest,
+    AgentDiscoverRequest, AgentHistoryRequest, AgentResultRequest, AgentResultResponse,
+    CommandGetRequest, DiscoverPage, EventsFilter, EventsReadRequest, EventsReadResponse,
+    EventsSubscribeRequest, EventsSubscribeResponse, MAX_OBSERVATION_CURSOR_BYTES, ObservationPage,
+    TurnGetRequest,
 };
 use eliot_core::{Command as CoreCommand, CommandState, Turn as CoreTurn, TurnState};
 use serde_json::{Value, json};
@@ -46,6 +48,271 @@ fn assert_invalid_read_rpc(
         Ok(_) => panic!("{method} accepted malformed {field}"),
     };
     assert_eq!(error.code, "invalid", "{method} malformed {field}");
+}
+
+#[test]
+fn public_native_metadata_queries_validate_without_admitting_agents() {
+    let mut fixture = Fixture::new("typed native metadata validation");
+    fixture.start();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("public RPC runtime");
+    let before: EventsReadResponse = serde_json::from_value(
+        public_read_rpc(&runtime, &fixture, "events.read", json!({}))
+            .unwrap_or_else(|_| panic!("baseline metadata event read failed")),
+    )
+    .expect("typed event boundary");
+    assert_eq!(before.high_water, 0);
+    let bad_strings = [
+        Value::Null,
+        json!(1),
+        json!(true),
+        json!([]),
+        json!({}),
+        json!(""),
+        json!(" \t\n"),
+    ];
+    assert_invalid_read_rpc(
+        &runtime,
+        &fixture,
+        "agent.discover",
+        "missing profile",
+        json!({}),
+    );
+    for value in &bad_strings {
+        assert_invalid_read_rpc(
+            &runtime,
+            &fixture,
+            "agent.discover",
+            "profile",
+            json!({"profile":value}),
+        );
+    }
+    for field in ["harness", "native_scope", "cursor"] {
+        for value in &bad_strings[1..] {
+            let mut params = json!({"profile":"fake"});
+            params[field] = value.clone();
+            assert_invalid_read_rpc(&runtime, &fixture, "agent.discover", field, params);
+        }
+    }
+    assert_invalid_read_rpc(
+        &runtime,
+        &fixture,
+        "agent.discover",
+        "scope byte bound",
+        json!({"profile":"fake","native_scope":"é".repeat(257)}),
+    );
+    for field in ["native_scope", "cursor"] {
+        for control in ['\0', '\n', '\u{7f}'] {
+            let mut params = json!({"profile":"fake"});
+            params[field] = json!(format!("nonempty{control}value"));
+            assert_invalid_read_rpc(
+                &runtime,
+                &fixture,
+                "agent.discover",
+                "scope/cursor controls",
+                params,
+            );
+        }
+    }
+    assert_invalid_read_rpc(
+        &runtime,
+        &fixture,
+        "agent.discover",
+        "cursor byte bound",
+        json!({"profile":"fake","cursor":"é".repeat(MAX_OBSERVATION_CURSOR_BYTES / 2 + 1)}),
+    );
+    assert_invalid_read_rpc(
+        &runtime,
+        &fixture,
+        "agent.discover",
+        "unknown field",
+        json!({"profile":"fake","extra":true}),
+    );
+
+    let history = json!({"id":"a1","source":"native","view":"turns"});
+    for field in ["id", "source", "view"] {
+        let mut missing = history.clone();
+        missing
+            .as_object_mut()
+            .expect("request object")
+            .remove(field);
+        assert_invalid_read_rpc(
+            &runtime,
+            &fixture,
+            "agent.history",
+            "missing required string",
+            missing,
+        );
+        for value in &bad_strings {
+            let mut params = history.clone();
+            params[field] = value.clone();
+            assert_invalid_read_rpc(&runtime, &fixture, "agent.history", field, params);
+        }
+    }
+    for generation in [
+        json!(-1),
+        json!(u64::MAX),
+        json!("0"),
+        json!(true),
+        json!(1.0),
+        json!([]),
+        json!({}),
+    ] {
+        let mut params = history.clone();
+        params["generation"] = generation;
+        assert_invalid_read_rpc(
+            &runtime,
+            &fixture,
+            "agent.history",
+            "optional generation",
+            params,
+        );
+    }
+    for field in ["turn_id", "cursor"] {
+        for value in &bad_strings[1..] {
+            let mut params = history.clone();
+            if field == "turn_id" {
+                params["view"] = json!("items");
+            }
+            params[field] = value.clone();
+            assert_invalid_read_rpc(&runtime, &fixture, "agent.history", field, params);
+        }
+    }
+    for source in ["unsupported", "native "] {
+        let mut params = history.clone();
+        params["source"] = json!(source);
+        assert_invalid_read_rpc(&runtime, &fixture, "agent.history", "source domain", params);
+    }
+    for view in ["unsupported", "turns "] {
+        let mut params = history.clone();
+        params["view"] = json!(view);
+        assert_invalid_read_rpc(&runtime, &fixture, "agent.history", "view domain", params);
+    }
+    for turn_id in [None, Some(Value::Null)] {
+        let mut params = json!({"id":"a1","source":"native","view":"items"});
+        if let Some(value) = turn_id {
+            params["turn_id"] = value;
+        }
+        assert_invalid_read_rpc(
+            &runtime,
+            &fixture,
+            "agent.history",
+            "items requires turn",
+            params,
+        );
+    }
+    for view in ["subject", "turns"] {
+        assert_invalid_read_rpc(
+            &runtime,
+            &fixture,
+            "agent.history",
+            "other views forbid turn",
+            json!({"id":"a1","source":"native","view":view,"turn_id":"turn-1"}),
+        );
+    }
+    for turn_id in [
+        "turn\0id".to_owned(),
+        "turn\nid".to_owned(),
+        "é".repeat(MAX_OBSERVATION_CURSOR_BYTES / 2 + 1),
+    ] {
+        assert_invalid_read_rpc(
+            &runtime,
+            &fixture,
+            "agent.history",
+            "turn byte/control bound",
+            json!({"id":"a1","source":"native","view":"items","turn_id":turn_id}),
+        );
+    }
+    let mut oversized_cursor = history.clone();
+    oversized_cursor["cursor"] = json!("é".repeat(MAX_OBSERVATION_CURSOR_BYTES / 2 + 1));
+    assert_invalid_read_rpc(
+        &runtime,
+        &fixture,
+        "agent.history",
+        "cursor byte bound",
+        oversized_cursor,
+    );
+    let mut extra = history.clone();
+    extra["extra"] = json!(true);
+    assert_invalid_read_rpc(&runtime, &fixture, "agent.history", "unknown field", extra);
+    for limit in [
+        Value::Null,
+        json!(0),
+        json!(1001),
+        json!(-1),
+        json!(true),
+        json!("1"),
+        json!(1.0),
+        json!(u64::MAX),
+    ] {
+        for (method, mut params) in [
+            ("agent.discover", json!({"profile":"fake"})),
+            ("agent.history", history.clone()),
+        ] {
+            params["limit"] = limit.clone();
+            assert_invalid_read_rpc(&runtime, &fixture, method, "limit", params);
+        }
+    }
+    // Null optionals and cursor controls permitted by the private query grammar
+    // reach Agent lookup. No Agent exists, so these must not fail as bad shapes.
+    for params in [
+        json!({"id":"a1","source":"native","view":"turns","generation":null,"turn_id":null,"cursor":null}),
+        json!({"id":"a1","source":"native","view":"turns","cursor":"\0nonempty"}),
+        json!({"id":"a1","source":"native","view":"turns","cursor":"é".repeat(MAX_OBSERVATION_CURSOR_BYTES / 2)}),
+        json!({"id":"a1","source":"rollout","view":"subject","generation":0}),
+        json!({"id":"a1","source":"native","view":"items","turn_id":"é".repeat(MAX_OBSERVATION_CURSOR_BYTES / 2)}),
+    ] {
+        let error = match public_read_rpc(&runtime, &fixture, "agent.history", params) {
+            Err(error) => error,
+            Ok(_) => panic!("history invented an observer"),
+        };
+        assert_eq!(
+            error.code, "not_found",
+            "valid history grammar was tightened"
+        );
+    }
+    let scope_error = match public_read_rpc(
+        &runtime,
+        &fixture,
+        "agent.discover",
+        json!({"profile":"fake","native_scope":"é".repeat(256)}),
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("fake discovery accepted another scope"),
+    };
+    assert_eq!(
+        scope_error.code, "not_found",
+        "512-byte scope was rejected before fixture selection"
+    );
+    let raw = public_read_rpc(
+        &runtime,
+        &fixture,
+        "agent.discover",
+        json!({"profile":"fake","harness":null,"native_scope":null,"cursor":null}),
+    )
+    .unwrap_or_else(|_| panic!("null discovery optionals did not act as absent"));
+    let page: DiscoverPage = serde_json::from_value(raw).expect("typed discovery page");
+    assert_eq!(page.harness, "fake");
+    assert_eq!(page.subjects.len(), 3);
+    let status = fixture.json(&["status"]);
+    for field in [
+        "agents",
+        "owned_plugins",
+        "discovery_readers",
+        "observer_readers",
+    ] {
+        assert_eq!(status[field], 0);
+    }
+    let after: EventsReadResponse = serde_json::from_value(
+        public_read_rpc(&runtime, &fixture, "events.read", json!({}))
+            .unwrap_or_else(|_| panic!("event read after metadata queries failed")),
+    )
+    .expect("typed unchanged event boundary");
+    assert_eq!(after.high_water, before.high_water);
+    assert_eq!(after.events, before.events);
+    fixture.stop(false);
 }
 
 #[test]
@@ -851,6 +1118,15 @@ fn fake_discovery_observation_and_worktree_lifecycle() {
     assert!(head.status.success());
     let base = head.stdout.trim();
     fixture.start();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("public metadata RPC runtime");
+    let discovery_before: EventsReadResponse = serde_json::from_value(
+        public_read_rpc(&runtime, &fixture, "events.read", json!({}))
+            .unwrap_or_else(|_| panic!("discovery baseline event read failed")),
+    )
+    .expect("typed discovery boundary");
     let status = fixture.json(&["status"]);
     let custody = &status["workspace_custody"];
     assert_eq!(custody["scope"], "current_host");
@@ -866,6 +1142,8 @@ fn fake_discovery_observation_and_worktree_lifecycle() {
     assert_eq!(custody["orphan_possible"], !cfg!(windows));
 
     let first = fixture.json(&["discover", "--profile", "fake", "--limit", "1"]);
+    let typed_first: DiscoverPage =
+        serde_json::from_value(first.clone()).expect("typed CLI discovery page");
     assert_eq!(first["harness"], "fake");
     assert_eq!(first["subjects"].as_array().unwrap().len(), 1);
     assert_eq!(first["coverage"]["complete"], false);
@@ -885,6 +1163,53 @@ fn fake_discovery_observation_and_worktree_lifecycle() {
     assert_eq!(rest["subjects"].as_array().unwrap().len(), 2);
     assert!(rest["next_cursor"].is_null());
     assert_eq!(rest["coverage"]["complete"], true);
+    let discovery_request = AgentDiscoverRequest {
+        profile: "fake".to_owned(),
+        harness: None,
+        native_scope: None,
+        cursor: None,
+        limit: 1,
+    };
+    let wire = serde_json::to_value(&discovery_request).expect("discovery request wire");
+    for field in ["harness", "native_scope", "cursor"] {
+        assert!(wire.get(field).is_none());
+    }
+    let null_page: DiscoverPage = serde_json::from_value(
+        public_read_rpc(
+            &runtime,
+            &fixture,
+            "agent.discover",
+            json!({
+                "profile":"fake","harness":null,"native_scope":null,"cursor":null,"limit":1,
+            }),
+        )
+        .unwrap_or_else(|_| panic!("null discovery optionals did not act as absent")),
+    )
+    .expect("typed null-option discovery page");
+    assert_eq!(
+        serde_json::to_value(null_page).expect("neutral page"),
+        first
+    );
+    let continuation = AgentDiscoverRequest {
+        native_scope: Some(typed_first.native_scope),
+        cursor: typed_first.next_cursor,
+        limit: 2,
+        ..discovery_request
+    };
+    let replay: DiscoverPage = serde_json::from_value(
+        public_read_rpc(
+            &runtime,
+            &fixture,
+            "agent.discover",
+            serde_json::to_value(continuation).expect("opaque continuation"),
+        )
+        .unwrap_or_else(|_| panic!("unchanged discovery cursor failed")),
+    )
+    .expect("typed continued discovery page");
+    assert_eq!(
+        serde_json::to_value(replay).expect("neutral continued page"),
+        rest
+    );
     let references: HashSet<_> = [
         first["subjects"].as_array().unwrap(),
         rest["subjects"].as_array().unwrap(),
@@ -898,6 +1223,12 @@ fn fake_discovery_observation_and_worktree_lifecycle() {
     for field in ["agents", "owned_plugins", "discovery_readers"] {
         assert_eq!(status[field], 0);
     }
+    let discovery_after: EventsReadResponse = serde_json::from_value(
+        public_read_rpc(&runtime, &fixture, "events.read", json!({}))
+            .unwrap_or_else(|_| panic!("discovery event readback failed")),
+    )
+    .expect("typed discovery readback boundary");
+    assert_eq!(discovery_after.high_water, discovery_before.high_water);
 
     let attached = fixture.json(&[
         "attach",
@@ -911,7 +1242,7 @@ fn fake_discovery_observation_and_worktree_lifecycle() {
         "fake-discovered-1",
     ]);
     let observer = attached["agent"].as_str().unwrap();
-    fixture.wait_command(attached["command_id"].as_str().unwrap(), "applied");
+    let attach_command = fixture.wait_command(attached["command_id"].as_str().unwrap(), "applied");
     let view = fixture.json(&["show", observer]);
     assert_eq!(view["state"], "unknown");
     assert_eq!(view["origin"], "external");
@@ -920,13 +1251,16 @@ fn fake_discovery_observation_and_worktree_lifecycle() {
     assert!(view["active_turn"].is_null());
     let observed_generation = view["generation"].as_i64().unwrap();
     let generation_argument = observed_generation.to_string();
+    let history_before: EventsReadResponse = serde_json::from_value(
+        public_read_rpc(&runtime, &fixture, "events.read", json!({}))
+            .unwrap_or_else(|_| panic!("private history baseline failed")),
+    )
+    .expect("typed private-history boundary");
     let first_history = fixture.json(&[
         "history",
         observer,
         "--generation",
         &generation_argument,
-        "--source",
-        "native",
         "--view",
         "turns",
         "--limit",
@@ -956,6 +1290,115 @@ fn fake_discovery_observation_and_worktree_lifecycle() {
     .collect();
     assert_eq!(turns.len(), 2);
     assert!(rest_history["next_cursor"].is_null());
+    let typed_history: ObservationPage =
+        serde_json::from_value(first_history.clone()).expect("typed CLI private page");
+    let null_history: ObservationPage = serde_json::from_value(
+        public_read_rpc(
+            &runtime,
+            &fixture,
+            "agent.history",
+            json!({
+                "id":observer,"generation":null,"source":"native","view":"turns",
+                "turn_id":null,"cursor":null,"limit":1,
+            }),
+        )
+        .unwrap_or_else(|_| panic!("null history optionals did not act as absent")),
+    )
+    .expect("typed null-option private page");
+    assert_eq!(
+        serde_json::to_value(null_history).expect("neutral private page"),
+        first_history
+    );
+    let history_request = AgentHistoryRequest {
+        id: observer.to_owned(),
+        generation: None,
+        source: "native".to_owned(),
+        view: "turns".to_owned(),
+        turn_id: None,
+        cursor: None,
+        limit: 1,
+    };
+    let wire = serde_json::to_value(&history_request).expect("history request wire");
+    for field in ["generation", "turn_id", "cursor"] {
+        assert!(wire.get(field).is_none());
+    }
+    assert_eq!(wire["source"], "native");
+    let continuation = AgentHistoryRequest {
+        generation: Some(observed_generation),
+        cursor: typed_history.next_cursor,
+        ..history_request
+    };
+    let private_rest: ObservationPage = serde_json::from_value(
+        public_read_rpc(
+            &runtime,
+            &fixture,
+            "agent.history",
+            serde_json::to_value(continuation).expect("opaque private cursor"),
+        )
+        .unwrap_or_else(|_| panic!("unchanged history cursor failed")),
+    )
+    .expect("typed continued private page");
+    assert_eq!(
+        serde_json::to_value(private_rest).expect("neutral continued private page"),
+        rest_history
+    );
+    for (source, view, turn_id) in [
+        ("native", "subject", None),
+        ("rollout", "items", Some("fake-observed-turn-1")),
+    ] {
+        let request = AgentHistoryRequest {
+            id: observer.to_owned(),
+            generation: Some(observed_generation),
+            source: source.to_owned(),
+            view: view.to_owned(),
+            turn_id: turn_id.map(str::to_owned),
+            cursor: None,
+            limit: 1,
+        };
+        let page: ObservationPage = serde_json::from_value(
+            public_read_rpc(
+                &runtime,
+                &fixture,
+                "agent.history",
+                serde_json::to_value(request).expect("private query"),
+            )
+            .unwrap_or_else(|_| panic!("valid subject/items private query failed")),
+        )
+        .expect("typed subject/items private page");
+        assert_eq!(page.agent_id, observer);
+        assert_eq!(page.generation, observed_generation);
+        assert_eq!(page.source, source);
+        assert_eq!(page.view, view);
+        assert_eq!(page.entries.len(), 1);
+    }
+    let stale = match public_read_rpc(
+        &runtime,
+        &fixture,
+        "agent.history",
+        json!({
+            "id":observer,"generation":observed_generation + 1,"source":"native","view":"turns",
+        }),
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("history crossed the current observer generation"),
+    };
+    assert_eq!(stale.code, "stale_generation");
+    let history_after: EventsReadResponse = serde_json::from_value(
+        public_read_rpc(&runtime, &fixture, "events.read", json!({}))
+            .unwrap_or_else(|_| panic!("private history event readback failed")),
+    )
+    .expect("typed private-history readback boundary");
+    assert_eq!(
+        history_after.high_water, history_before.high_water,
+        "private pages published durable events"
+    );
+    assert_eq!(
+        fixture.json(&["cmd", "show", attached["command_id"].as_str().unwrap()]),
+        attach_command,
+        "private pages changed command acknowledgement"
+    );
+    assert_eq!(fixture.json(&["status"])["agents"], 1);
+    assert_eq!(fixture.json(&["status"])["owned_plugins"], 0);
     assert!(
         fixture.json(&[
             "result",

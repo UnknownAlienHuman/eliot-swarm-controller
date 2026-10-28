@@ -8,16 +8,14 @@ use eliot_core::{
     Agent, AgentState, Command, CommandState, Error, Event, ProcessIdentity, Result, SecretPolicy,
     SubmitCommand, Turn, TurnState, WorkspacePhase, WorkspacePreparationInput,
     api::{
-        AgentResultRequest, AgentResultResponse, CommandGetRequest, EventsFilter,
-        EventsReadRequest, EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse,
-        TurnGetRequest,
+        AgentDiscoverRequest, AgentHistoryRequest, AgentResultRequest, AgentResultResponse,
+        CommandGetRequest, DiscoverPage, EventsFilter, EventsReadRequest, EventsReadResponse,
+        EventsSubscribeRequest, EventsSubscribeResponse, MAX_OBSERVATION_PAGE_BYTES,
+        ObservationPage, ObservationQuery, TurnGetRequest,
     },
     classify_dispatched_error,
 };
-use eliot_plugin::{
-    MAX_EVENT_BYTES, MAX_OBSERVATION_CURSOR_BYTES, MAX_OBSERVATION_PAGE_BYTES, ObservationPage,
-    ObservationQuery,
-};
+use eliot_plugin::MAX_EVENT_BYTES;
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 use std::{
@@ -755,24 +753,19 @@ impl Router {
 
     async fn agent_discover(&self, params: &Value, principal: &Principal) -> Result<Value> {
         require_owner(principal)?;
-        reject_unknown_keys(
-            params,
-            &["profile", "harness", "native_scope", "cursor", "limit"],
-            "agent.discover",
-        )?;
+        let request: AgentDiscoverRequest = serde_json::from_value(params.clone())
+            .map_err(|_| Error::new("invalid", "agent.discover params are invalid"))?;
+        request.validate()?;
         if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
             return Err(Error::new(
                 "unavailable",
                 "daemon is shutting down and rejects new discovery",
             ));
         }
-        let name = required_text(params, "profile")?;
-        let harness = optional_text(params, "harness")?;
-        let native_scope = optional_text(params, "native_scope")?.map(str::to_owned);
-        let cursor = optional_text(params, "cursor")?.map(str::to_owned);
-        let limit = page_limit(params)?;
-        let profile = crate::config::resolve_profile(&self.inner.data_root, name)?;
-        if harness
+        let profile = crate::config::resolve_profile(&self.inner.data_root, &request.profile)?;
+        if request
+            .harness
+            .as_deref()
             .is_some_and(|harness| profile.get("harness").and_then(Value::as_str) != Some(harness))
         {
             return Err(Error::new(
@@ -786,55 +779,34 @@ impl Router {
                 "daemon is shutting down and rejects new discovery",
             ));
         }
-        self.inner
+        let raw = self
+            .inner
             .plugin_host
-            .discover(profile, native_scope, cursor, limit)
-            .await
+            .discover(profile, request.native_scope, request.cursor, request.limit)
+            .await?;
+        let page: DiscoverPage = serde_json::from_value(raw).map_err(|_| {
+            Error::new(
+                "source_integrity",
+                "plugin returned an invalid discovery page",
+            )
+        })?;
+        serde_json::to_value(page)
+            .map_err(|_| Error::new("internal", "discovery page could not be encoded"))
     }
 
     async fn agent_history(&self, params: &Value, principal: &Principal) -> Result<Value> {
         require_owner(principal)?;
-        reject_unknown_keys(
-            params,
-            &[
-                "id",
-                "generation",
-                "source",
-                "view",
-                "turn_id",
-                "cursor",
-                "limit",
-            ],
-            "agent.history",
-        )?;
-        let id = required_text(params, "id")?;
-        let generation = optional_observation_generation(params)?;
-        let source = required_text(params, "source")?;
-        if !matches!(source, "native" | "rollout") {
-            return Err(Error::new(
-                "invalid",
-                "history source must be native or rollout",
-            ));
-        }
-        let view = required_text(params, "view")?;
-        let turn_id = optional_text(params, "turn_id")?.map(str::to_owned);
-        if turn_id.as_ref().is_some_and(|turn_id| {
-            turn_id.len() > MAX_OBSERVATION_CURSOR_BYTES || turn_id.chars().any(char::is_control)
-        }) {
-            return Err(Error::new("invalid", "history turn_id exceeds its bound"));
-        }
-        if (view == "items") != turn_id.is_some() {
-            return Err(Error::new(
-                "invalid",
-                "history items require a turn_id and other views forbid it",
-            ));
-        }
+        let request: AgentHistoryRequest = serde_json::from_value(params.clone())
+            .map_err(|_| Error::new("invalid", "agent.history params are invalid"))?;
+        request.validate()?;
+        let id = request.id.as_str();
+        let generation = request.generation;
         let query = ObservationQuery {
-            source: source.to_owned(),
-            view: view.to_owned(),
-            turn_id,
-            cursor: optional_text(params, "cursor")?.map(str::to_owned),
-            limit: page_limit(params)?,
+            source: request.source,
+            view: request.view,
+            turn_id: request.turn_id,
+            cursor: request.cursor,
+            limit: request.limit,
         };
         query.validate()?;
 
@@ -3316,6 +3288,202 @@ mod tests {
             )
             .unwrap()
             .events
+    }
+
+    #[tokio::test]
+    async fn typed_native_metadata_owner_first_and_malformed_params() {
+        let router = router();
+        let principal = Principal::Agent {
+            id: "a1".to_owned(),
+            generation: 1,
+        };
+        assert_eq!(
+            router
+                .agent_discover(&Value::Null, &principal)
+                .await
+                .unwrap_err()
+                .code,
+            "not_allowed"
+        );
+        assert_eq!(
+            router
+                .agent_history(&Value::Null, &principal)
+                .await
+                .unwrap_err()
+                .code,
+            "not_allowed"
+        );
+        for params in [
+            json!({}),
+            json!({"profile":null}),
+            json!({"profile":" \t"}),
+            json!({"profile":"fake", "extra":0}),
+            json!({"profile":"fake", "harness":false}),
+            json!({"profile":"fake", "native_scope":512}),
+            json!({"profile":"fake", "native_scope":"x\ny"}),
+            json!({"profile":"fake", "native_scope":"x".repeat(513)}),
+            json!({"profile":"fake", "cursor":false}),
+            json!({"profile":"fake", "cursor":"x\ny"}),
+            json!({"profile":"fake", "cursor":"x".repeat(16 * 1024 + 1)}),
+            json!({"profile":"fake", "limit":0}),
+        ] {
+            assert_eq!(
+                router
+                    .agent_discover(&params, &Principal::Owner)
+                    .await
+                    .unwrap_err()
+                    .code,
+                "invalid",
+                "{params}"
+            );
+        }
+        let base = json!({"id":"a1", "source":"native", "view":"turns"});
+        for (field, value) in [
+            ("id", json!(false)),
+            ("source", json!(null)),
+            ("source", json!("other")),
+            ("view", json!("other")),
+            ("view", json!(null)),
+            ("view", json!("items")),
+            ("generation", json!(-1)),
+            ("generation", json!(1.0)),
+            ("generation", json!("1")),
+            ("turn_id", json!("turn-1")),
+            ("turn_id", json!(false)),
+            ("cursor", json!(false)),
+            ("cursor", json!("x".repeat(16 * 1024 + 1))),
+            ("limit", json!(null)),
+            ("limit", json!(1001)),
+            ("extra", json!(0)),
+        ] {
+            let mut params = base.clone();
+            params[field] = value;
+            assert_eq!(
+                router
+                    .agent_history(&params, &Principal::Owner)
+                    .await
+                    .unwrap_err()
+                    .code,
+                "invalid",
+                "{field}"
+            );
+        }
+        let mut missing_source = base;
+        missing_source.as_object_mut().unwrap().remove("source");
+        assert_eq!(
+            router
+                .agent_history(&missing_source, &Principal::Owner)
+                .await
+                .unwrap_err()
+                .code,
+            "invalid"
+        );
+        for turn_id in ["x\ny".to_owned(), "x".repeat(16 * 1024 + 1)] {
+            assert_eq!(
+                router
+                    .agent_history(
+                        &json!({"id":"a1", "source":"native", "view":"items", "turn_id":turn_id}),
+                        &Principal::Owner,
+                    )
+                    .await
+                    .unwrap_err()
+                    .code,
+                "invalid"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_native_metadata_optional_nulls_keep_absent_semantics() {
+        let router = router();
+        router.inner.mode.store(MODE_DRAIN, Ordering::SeqCst);
+        for params in [
+            json!({"profile":"fake"}),
+            json!({"profile":"fake", "harness":null, "native_scope":null, "cursor":null}),
+        ] {
+            // Valid grammar reaches the existing shutdown fence before profile or reader I/O.
+            assert_eq!(
+                router
+                    .agent_discover(&params, &Principal::Owner)
+                    .await
+                    .unwrap_err()
+                    .code,
+                "unavailable"
+            );
+        }
+        for params in [
+            json!({"id":"a1", "source":"native", "view":"turns"}),
+            json!({"id":"a1", "source":"native", "view":"turns", "generation":null, "turn_id":null, "cursor":null}),
+            // The private history cursor has no discovery-style control-character ban.
+            json!({"id":"a1", "source":"native", "view":"turns", "cursor":"opaque\nvalue"}),
+        ] {
+            assert_eq!(
+                router
+                    .agent_history(&params, &Principal::Owner)
+                    .await
+                    .unwrap_err()
+                    .code,
+                "not_found"
+            );
+        }
+        let store = router.inner.store.lock().await;
+        assert_eq!(store.agent_count().unwrap(), 0);
+        assert_eq!(store.high_water().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn typed_native_history_current_generation_fence_has_no_durable_effects() {
+        let router = router();
+        let attach_id = ulid::Ulid::new().to_string();
+        let (agent, before_events, before_source, before_command) = {
+            let mut store = router.inner.store.lock().await;
+            let agent = store.submit("owner", SubmitCommand {
+                id:attach_id.clone(), target:None, verb:"attach".to_owned(),
+                args:json!({"profile":"fixture", "harness":"fake", "mode":"observe",
+                    "native_scope":"fixture-scope", "native_ref":"fixture-ref", "profile_snapshot":{}}),
+                expected_generation:Some(0), expected_turn_id:None, request_id:None,
+            }, now_ms()).unwrap().command.target.unwrap();
+            // Commit only the source fence; no PluginHost actor or process is started.
+            store.dispatch(&attach_id, now_ms()).unwrap();
+            let events = store.read_events(0, 1000, None).unwrap();
+            let source = store.read_source_state(&agent, 1, "observe").unwrap();
+            let command = store.get_command(&attach_id).unwrap().unwrap();
+            (agent, events, source, command)
+        };
+        let mut receiver = router.inner.bus.subscribe();
+        assert_eq!(
+            router
+                .agent_history(
+                    &json!({"id":agent, "generation":0, "source":"native", "view":"turns"}),
+                    &Principal::Owner,
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "stale_generation"
+        );
+        for generation in [Value::Null, json!(1)] {
+            assert_eq!(router.agent_history(
+                &json!({"id":agent, "generation":generation, "source":"native", "view":"turns"}),
+                &Principal::Owner,
+            ).await.unwrap_err().code, "unavailable");
+        }
+        let store = router.inner.store.lock().await;
+        assert_eq!(store.read_events(0, 1000, None).unwrap(), before_events);
+        assert_eq!(
+            store.read_source_state(&agent, 1, "observe").unwrap(),
+            before_source
+        );
+        assert_eq!(
+            store.get_command(&attach_id).unwrap().unwrap(),
+            before_command
+        );
+        assert_eq!(store.last_model_progress(&agent, 1).unwrap(), None);
+        assert_eq!(store.agent_count().unwrap(), 1);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     fn read_fixture_event(store: &mut eliot_store::Store, agent: &str, kind: &str, data: Value) {

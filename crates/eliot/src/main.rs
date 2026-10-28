@@ -2,9 +2,9 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use eliot_core::{
     Command as CoreCommand, CommandState, Error as CoreError, Turn as CoreTurn, TurnState,
     api::{
-        AgentResultRequest, AgentResultResponse, CommandGetRequest, EventsFilter,
-        EventsReadRequest, EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse,
-        TurnGetRequest,
+        AgentDiscoverRequest, AgentHistoryRequest, AgentResultRequest, AgentResultResponse,
+        CommandGetRequest, DiscoverPage, EventsFilter, EventsReadRequest, EventsReadResponse,
+        EventsSubscribeRequest, EventsSubscribeResponse, ObservationPage, TurnGetRequest,
     },
 };
 use serde_json::{Value, json};
@@ -530,17 +530,25 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             limit,
         } => {
             validate_limit(limit)?;
-            let mut params = json!({ "profile": profile, "limit": limit });
-            if let Some(harness) = harness {
-                params["harness"] = Value::String(harness);
-            }
-            if let Some(scope) = scope {
-                params["native_scope"] = Value::String(scope);
-            }
-            if let Some(cursor) = cursor {
-                params["cursor"] = Value::String(cursor);
-            }
-            let result = read_call(&data_dir, "agent.discover", params).await?;
+            let params = AgentDiscoverRequest {
+                profile,
+                harness,
+                native_scope: scope,
+                cursor,
+                limit,
+            };
+            params
+                .validate()
+                .map_err(|error| Failure::from_core(error, false))?;
+            let response: DiscoverPage =
+                eliot_daemon::client_call_typed(&data_dir, "agent.discover", &params)
+                    .await
+                    .map_err(|error| Failure::from_core(error, false))?;
+            params
+                .validate_response(&response)
+                .map_err(|error| Failure::from_core(error, false))?;
+            let result = serde_json::to_value(response)
+                .map_err(|_| Failure::new(4, "agent.discover response is invalid"))?;
             print_value(&result, json_output);
             Ok(0)
         }
@@ -963,22 +971,27 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             limit,
         } => {
             validate_limit(limit)?;
-            let mut params = json!({
-                "id": agent,
-                "source": source,
-                "view": view,
-                "limit": limit,
-            });
-            if let Some(generation) = generation {
-                params["generation"] = json!(generation);
-            }
-            if let Some(turn_id) = turn_id {
-                params["turn_id"] = Value::String(turn_id);
-            }
-            if let Some(cursor) = cursor {
-                params["cursor"] = Value::String(cursor);
-            }
-            let result = read_call(&data_dir, "agent.history", params).await?;
+            let params = AgentHistoryRequest {
+                id: agent,
+                generation,
+                source,
+                view,
+                turn_id,
+                cursor,
+                limit,
+            };
+            params
+                .validate()
+                .map_err(|error| Failure::from_core(error, false))?;
+            let response: ObservationPage =
+                eliot_daemon::client_call_typed(&data_dir, "agent.history", &params)
+                    .await
+                    .map_err(|error| Failure::from_core(error, false))?;
+            params
+                .validate_response(&response)
+                .map_err(|error| Failure::from_core(error, false))?;
+            let result = serde_json::to_value(response)
+                .map_err(|_| Failure::new(4, "agent.history response is invalid"))?;
             print_value(&result, json_output);
             Ok(0)
         }
