@@ -1431,8 +1431,50 @@ fn safe_cause_code(code: &str) -> String {
 }
 
 fn redact_source_batch(batch: &mut SourceBatch, credentials: &[String]) -> Result<()> {
+    fn protected_data(value: &Value, policy: &SecretPolicy) -> bool {
+        match value {
+            Value::Object(values) => values.iter().any(|(key, value)| {
+                policy.contains_text(key)
+                    || (matches!(
+                        key.as_str(),
+                        "agent_id"
+                            | "command_id"
+                            | "turn_id"
+                            | "request_id"
+                            | "item_id"
+                            | "native_scope"
+                            | "native_ref"
+                    ) && policy.contains_value(value))
+                    || protected_data(value, policy)
+            }),
+            Value::Array(values) => values.iter().any(|value| protected_data(value, policy)),
+            _ => false,
+        }
+    }
+
+    let policy = SecretPolicy::new(credentials);
+    // Validate the whole batch before changing text: dedup/correlation identities
+    // and object keys must never be rewritten into a different durable payload.
+    if [&batch.batch_id, &batch.agent_id, &batch.source]
+        .into_iter()
+        .any(|value| policy.contains_text(value))
+        || batch
+            .cursor
+            .as_deref()
+            .is_some_and(|value| policy.contains_text(value))
+        || batch.events.iter().any(|event| {
+            policy.contains_text(&event.native_id)
+                || policy.contains_text(&event.kind)
+                || protected_data(&event.data, &policy)
+        })
+    {
+        return Err(Error::new(
+            "secret_in_payload",
+            "native source payload contains a known secret in immutable metadata",
+        ));
+    }
     for event in &mut batch.events {
-        if crate::redaction::redact_value(&mut event.data, credentials) {
+        if policy.redact_values(&mut event.data) {
             let Some(data) = event.data.as_object_mut() else {
                 return Err(Error::new(
                     "invalid",
@@ -1446,11 +1488,22 @@ fn redact_source_batch(batch: &mut SourceBatch, credentials: &[String]) -> Resul
 }
 
 fn redact_source_gap(gap: &mut SourceGap, credentials: &[String]) -> Result<()> {
-    let mut value = serde_json::to_value(&*gap)
-        .map_err(|_| Error::new("internal", "source.gap could not be encoded"))?;
-    crate::redaction::redact_value(&mut value, credentials);
-    *gap = serde_json::from_value(value)
-        .map_err(|_| Error::new("invalid", "source.gap became invalid after redaction"))?;
+    let policy = SecretPolicy::new(credentials);
+    if [&gap.gap_id, &gap.agent_id, &gap.source]
+        .into_iter()
+        .chain(gap.families.iter())
+        .any(|value| policy.contains_text(value))
+        || [&gap.from, &gap.to]
+            .into_iter()
+            .flatten()
+            .any(|value| policy.contains_text(value))
+    {
+        return Err(Error::new(
+            "secret_in_payload",
+            "native source payload contains a known secret in immutable metadata",
+        ));
+    }
+    gap.reason = policy.redact_text(&gap.reason);
     Ok(())
 }
 
@@ -2133,4 +2186,263 @@ pub(crate) fn now_ms() -> i64 {
         .unwrap_or_default()
         .as_millis()
         .min(i64::MAX as u128) as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eliot_core::{NativeEvent, SubmitCommand};
+
+    const SECRET: &str = "__payload_guard_secret__";
+    const SECRET_ERROR: &str =
+        "native source payload contains a known secret in immutable metadata";
+
+    fn batch() -> SourceBatch {
+        SourceBatch {
+            batch_id: "batch-1".to_owned(),
+            agent_id: "a1".to_owned(),
+            generation: 1,
+            source: "stream".to_owned(),
+            cursor: Some("cursor-1".to_owned()),
+            events: vec![NativeEvent {
+                kind: "session.ready".to_owned(),
+                native_id: "ready-1".to_owned(),
+                data: json!({"command_id":"launch-command", "text":SECRET}),
+            }],
+        }
+    }
+
+    fn gap() -> SourceGap {
+        SourceGap {
+            gap_id: "gap-1".to_owned(),
+            agent_id: "a1".to_owned(),
+            generation: 1,
+            source: "stream".to_owned(),
+            families: vec!["session".to_owned()],
+            reason: format!("reader lost {SECRET}"),
+            from: Some("cursor-1".to_owned()),
+            to: Some("cursor-2".to_owned()),
+        }
+    }
+
+    fn assert_secret_error(error: Error) {
+        assert_eq!(error.code, "secret_in_payload");
+        assert_eq!(error.message, SECRET_ERROR);
+        assert!(!serde_json::to_string(&error).unwrap().contains(SECRET));
+    }
+
+    #[test]
+    fn source_batch_rejects_secret_identifiers_without_mutation() {
+        for path in [
+            "/batch_id",
+            "/agent_id",
+            "/source",
+            "/cursor",
+            "/events/0/native_id",
+            "/events/0/kind",
+        ] {
+            let mut value = serde_json::to_value(batch()).unwrap();
+            *value.pointer_mut(path).unwrap() = json!(format!("prefix-{SECRET}"));
+            let mut batch: SourceBatch = serde_json::from_value(value).unwrap();
+            let original = batch.clone();
+            assert_secret_error(redact_source_batch(&mut batch, &[SECRET.to_owned()]).unwrap_err());
+            assert_eq!(batch, original, "immutable field {path}");
+        }
+    }
+
+    #[test]
+    fn source_batch_rejects_nested_keys_and_correlations_before_text_redaction() {
+        let mut cases = vec![json!({"nested":[{"deeper":{(SECRET):"safe"}}]})];
+        for field in [
+            "agent_id",
+            "command_id",
+            "turn_id",
+            "request_id",
+            "item_id",
+            "native_scope",
+            "native_ref",
+        ] {
+            cases.push(json!({"nested":[{(field):SECRET}]}));
+        }
+        for data in cases {
+            let mut batch = batch();
+            // A later invalid event must not leave earlier mutable text changed.
+            batch.events.push(NativeEvent {
+                kind: "message.completed".to_owned(),
+                native_id: "message-1".to_owned(),
+                data,
+            });
+            let original = batch.clone();
+            assert_secret_error(redact_source_batch(&mut batch, &[SECRET.to_owned()]).unwrap_err());
+            assert_eq!(batch, original);
+        }
+    }
+
+    #[test]
+    fn source_batch_redacts_only_mutable_values() {
+        let mut batch = batch();
+        batch.events[0].data["nested"] = json!([{"body":format!("text {SECRET}")}]);
+        let mut expected = batch.clone();
+        expected.events[0].data["text"] = json!("[REDACTED]");
+        expected.events[0].data["nested"][0]["body"] = json!("text [REDACTED]");
+        expected.events[0].data["redacted"] = json!(true);
+        redact_source_batch(&mut batch, &[SECRET.to_owned()]).unwrap();
+        assert_eq!(batch, expected);
+    }
+
+    #[test]
+    fn source_gap_rejects_secret_metadata_and_redacts_only_reason() {
+        for path in [
+            "/gap_id",
+            "/agent_id",
+            "/source",
+            "/families/0",
+            "/from",
+            "/to",
+        ] {
+            let mut value = serde_json::to_value(gap()).unwrap();
+            *value.pointer_mut(path).unwrap() = json!(SECRET);
+            let mut gap: SourceGap = serde_json::from_value(value).unwrap();
+            let original = gap.clone();
+            assert_secret_error(redact_source_gap(&mut gap, &[SECRET.to_owned()]).unwrap_err());
+            assert_eq!(gap, original, "immutable field {path}");
+        }
+        let mut gap = gap();
+        let mut expected = gap.clone();
+        expected.reason = "reader lost [REDACTED]".to_owned();
+        redact_source_gap(&mut gap, &[SECRET.to_owned()]).unwrap();
+        assert_eq!(gap, expected);
+    }
+
+    #[tokio::test]
+    async fn source_payload_guards_precede_store_commit_and_bus_publish() {
+        let mut store = eliot_store::Store::open(Path::new(":memory:")).unwrap();
+        let command_id = Ulid::new().to_string();
+        let now = now_ms();
+        let admission = store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: command_id.clone(),
+                    target: None,
+                    verb: "launch".to_owned(),
+                    args: json!({"project":"payload-guard", "workspace":"synthetic-workspace"}),
+                    expected_generation: Some(0),
+                    expected_turn_id: None,
+                    request_id: None,
+                },
+                now,
+            )
+            .unwrap();
+        let agent_id = admission.command.target.unwrap();
+        store.dispatch(&command_id, now).unwrap();
+        let before_events = store.read_events(0, 1000, None).unwrap();
+        let before_source = store.read_source_state(&agent_id, 1, "stream").unwrap();
+        let store = Arc::new(AsyncMutex::new(store));
+        let bus = Bus::new(16);
+        let mut published = bus.subscribe();
+        let credential = "private-payload-guard";
+        let (host_io, peer_io) = tokio::io::duplex(16 * 1024);
+        let (host_read, host_write) = tokio::io::split(host_io);
+        let (peer_read, peer_write) = tokio::io::split(peer_io);
+        let host = PluginConnection::new(host_read, host_write);
+        let peer = PluginConnection::new(peer_read, peer_write);
+        let client = peer.client();
+        let task = tokio::spawn(serve_plugin_requests(
+            host,
+            EventSource {
+                store: store.clone(),
+                bus: bus.clone(),
+                monitoring: Monitoring::new(
+                    store.clone(),
+                    bus,
+                    Arc::new(Mutex::new(HashSet::new())),
+                ),
+                source_credentials: Arc::from([credential.to_owned(), SECRET.to_owned()]),
+                state: Weak::new(),
+                key: AgentKey {
+                    id: agent_id.clone(),
+                    generation: 1,
+                },
+                agent_id: agent_id.clone(),
+                generation: 1,
+                expected_credential: credential.to_owned(),
+                observation: None,
+            },
+        ));
+        let mut batch = batch();
+        batch.agent_id = agent_id.clone();
+        batch.events[0].data["command_id"] = json!(command_id);
+        for path in ["/batch_id", "/cursor", "/events/0/native_id"] {
+            let mut params = serde_json::to_value(&batch).unwrap();
+            *params.pointer_mut(path).unwrap() = json!(SECRET);
+            params["credential"] = json!(credential);
+            assert_secret_error(
+                client
+                    .call("events.put", params, deadline())
+                    .await
+                    .unwrap_err(),
+            );
+        }
+        let mut params = serde_json::to_value(&batch).unwrap();
+        params["events"][0]["data"]["nested"] = json!([{"deeper":{(SECRET):"safe"}}]);
+        params["credential"] = json!(credential);
+        assert_secret_error(
+            client
+                .call("events.put", params, deadline())
+                .await
+                .unwrap_err(),
+        );
+
+        let mut gap = gap();
+        gap.agent_id = agent_id.clone();
+        for path in ["/gap_id", "/source", "/families/0", "/from", "/to"] {
+            let mut params = serde_json::to_value(&gap).unwrap();
+            *params.pointer_mut(path).unwrap() = json!(SECRET);
+            params["credential"] = json!(credential);
+            assert_secret_error(
+                client
+                    .call("source.gap", params, deadline())
+                    .await
+                    .unwrap_err(),
+            );
+        }
+        {
+            let store = store.lock().await;
+            assert_eq!(store.read_events(0, 1000, None).unwrap(), before_events);
+            assert_eq!(
+                store.read_source_state(&agent_id, 1, "stream").unwrap(),
+                before_source
+            );
+        }
+        assert!(matches!(
+            published.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        // The same live boundary accepts valid payloads and commits safe text
+        // without changing the IDs/cursors acknowledged to the producer.
+        let mut params = serde_json::to_value(&batch).unwrap();
+        params["credential"] = json!(credential);
+        let ack = client.call("events.put", params, deadline()).await.unwrap();
+        assert_eq!(ack["cursor"], json!("cursor-1"));
+        let event = published.try_recv().unwrap();
+        assert_eq!(event.native_id.as_deref(), Some("ready-1"));
+        assert_eq!(event.data["text"], json!("[REDACTED]"));
+        assert_eq!(event.data["redacted"], json!(true));
+        let mut params = serde_json::to_value(&gap).unwrap();
+        params["credential"] = json!(credential);
+        let ack = client.call("source.gap", params, deadline()).await.unwrap();
+        assert_eq!(ack["gap_id"], json!("gap-1"));
+        let events = store.lock().await.read_events(0, 1000, None).unwrap();
+        let gap_event = events
+            .iter()
+            .find(|event| event.kind == "source.gap")
+            .unwrap();
+        assert_eq!(gap_event.data["reason"], json!("reader lost [REDACTED]"));
+        assert!(!serde_json::to_string(&events).unwrap().contains(SECRET));
+
+        client.close_input(deadline()).await.unwrap();
+        timeout_at(deadline(), task).await.unwrap().unwrap();
+    }
 }
