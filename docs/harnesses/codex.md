@@ -195,10 +195,36 @@ The stdio stream has no assumed replay cursor. If it breaks, mark a gap and use 
 thread/turn/request readback; do not republish old history as live completions. Owned
 process loss ends that controlled generation after buffered output is drained.
 
-At L3, observe-only rollout reading may use file identity plus byte offset as an opaque
-exclusive cursor. Source handoff is explicit. Observation never calls resume, fork,
-Goal or send merely to obtain history. Paged history must be read through its cursor;
-parent idle does not prove children completed.
+Observe-only live reading is separate from private `agent.history` pages. It opens only
+the exact rollout path returned for the attached `native_ref`, verifies its held-file
+identity and `session_meta` header under the selected Codex home's `sessions` or
+`archived_sessions` root, and captures a bounded
+live-edge baseline. Only after private `source.state` proves settled `observer_ready`
+does it commit a gap-backed `observe` to `transcript` handoff (`rollout_tail`). Store
+rechecks readiness, subject and ownership before accepting each observed batch. History
+pages never publish events or settle commands.
+
+The live cursor binds the exact Agent generation, native scope/ref and held file identity
+to an exclusive byte offset. It advances only past complete newline-terminated records;
+a partial tail does not advance and is not a complete/EOF page. Replacement, truncation,
+header mismatch or unsupported normalization yields an explicit gap/unavailable result,
+not an empty-complete page or a newly selected path. Each page requests at most one
+normalized record, with bounded byte scanning and the observation page/cursor limits; it
+does not scan the whole file in one call.
+
+For the pinned Codex 0.161.0 rollout format at upstream commit
+`979011409de0a60b52f179721948e65531d26144`, task/turn lifecycle uses canonical
+`TaskStartedEventMsg`, `TaskComplete` and `TurnAbortedEventMsg` records. Only legacy
+message/tool echoes are suppressed; `FinalAnswer` and EOF are not terminal evidence.
+The outer JSONL record timestamp is retained as epoch milliseconds in `NativeEvent.ts`.
+Optional lifecycle `data.started_at` and `data.completed_at` are integer epoch seconds
+from the native payload, converted with checked multiplication to epoch milliseconds;
+`data.duration_ms` is already milliseconds. Missing values remain absent, never filled
+from row time or ingestion time. `TaskComplete.last_agent_message` supplies canonical
+turn `final_text`; a present error or explicit abort is nonsuccess. Only a
+`message.completed` with phase `final_answer` may fill turn `final_text`; commentary or
+missing phase leaves it unknown. Observation never calls resume, fork, Goal or send to
+obtain visibility. Parent idle does not prove children completed.
 
 OpenCodex is added as a named provider route in L3, initially attached to an owner-run
 service. Do not edit owner global Codex config. Keep client/admin credentials separate

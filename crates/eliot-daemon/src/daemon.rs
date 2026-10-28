@@ -240,7 +240,7 @@ pub async fn client_call(path: &Path, method: &str, params: Value) -> Result<Val
     let timeout = call_timeout(method, &params);
     let deadline = Instant::now() + timeout;
     timeout_at(deadline, async move {
-        let stream = IpcStream::connect(&info.endpoint).await?;
+        let stream = IpcStream::connect(&info.endpoint, deadline).await?;
         let mut framed = Framed::new(
             stream,
             LinesCodec::new_with_max_length(MAX_RPC_FRAME_BYTES.saturating_sub(1)),

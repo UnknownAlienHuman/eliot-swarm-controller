@@ -155,11 +155,25 @@ inventing completion or issuing another start.
 | Method | Fields / result |
 | --- | --- |
 | `events.put` | stable batch id, agent/generation/source, complete bounded normalized native-record batch, optional exclusive cursor; returns committed seq range/cursor |
-| `source.state` | private readback of source state, all current family owners, latest gap, batch acknowledgement, and latest handoff digest/ack |
+| `source.state` | private readback of source state, derived `observer_ready`, all current family owners, latest gap, batch acknowledgement, and latest handoff digest/ack |
+| `source.health` | `SourceHealthUpdate {agent_id,generation,source,health}`; returns the same four-field update after commit |
 | `source.gap` | stable gap id, owned families, reason and optional from/to cursor; commits one gap boundary |
 | `source.handoff` | `SourceHandoff` request; atomically returns `SourceHandoffAck` after commit |
 | `process.put` | credential, agent_id, generation, pid, role; returns the OS-verified `ProcessRecord`, not plugin-authoritative process lifecycle |
 | `child` | registration id, parent/generation, exact child subject and optional identity request; canonical child row/source plan |
+
+For an observe-only caller, an open `observe` row created during attach dispatch does
+not grant publication. Private `source.state` derives `observer_ready` only from an
+applied attach for the current generation and exact native scope/ref, the unknown
+observe-only Agent without a control token, an open observe source and no detach fence.
+`observer_active` or source-open alone is insufficient. Store recomputes this proof and
+the captured subject inside each handoff, observed-batch and health transaction; callers
+wait for settled readiness before handoff or health updates.
+
+An observed `events.put` is restricted to the granted live families and current
+transcript owner. Its records cannot contain `command_id`, `cause` or `request_id`, and
+do not enter controlled command/input settlement. Private `agent.history` pages never
+become `events.put` records.
 
 ### Commit acknowledgement
 
@@ -191,6 +205,15 @@ notifications.
 
 A source row's `open|closed` lifecycle, health and latest historical gap are independent.
 A gap neither closes the source nor changes its owner or health automatically.
+`source.health` changes only health and `updated_at` on an already-open current-generation
+native source; an unchanged value is a no-op with no event. It does not clear a gap,
+move a cursor, change ownership or reopen a closed row. The committed health event and
+`source.state` readback carry lifecycle `state:"open"`; the four-field ACK does not.
+The event is published before the response. After an uncertain reply, settle through
+`source.state`, matching agent/generation/source and verifying open state plus requested
+health before proceeding; otherwise the outcome remains unknown. Do not infer health
+from a successful private-history read. Report `ok` only after verified live-edge
+recovery; keep the historical gap visible.
 
 The typed handoff contract is:
 
@@ -227,8 +250,10 @@ only the latest gap metadata; the previous gap event remains in retained history
 At most one unacknowledged gap/handoff operation is allowed per source. Settle a lost
 reply with `source.state` before issuing the next operation.
 
-Handoff is a single Store compare-and-swap. It verifies the current generation, a
-controlled Agent, an open predecessor and predecessor ownership of every named family.
+Handoff is a single Store compare-and-swap. It verifies the current generation, an
+open predecessor and predecessor ownership of every named family. A controlled caller
+must have a controlled Agent; an observe-only caller must have the exact settled
+`observer_ready` subject proof.
 An absent successor row is created open in the same transaction; an existing successor
 must already be open. Closed rows never reopen. Transfer only the named family-owner
 rows. The predecessor lifecycle is unchanged, including when it owns zero families.
@@ -238,9 +263,11 @@ and predecessor `last_handoff_digest`/`last_handoff` acknowledgement in that tra
 Publish the committed events and return `SourceHandoffAck` only after commit. Stage A's
 connected caller is the controlled Fake source; it verifies the handoff through
 `source.state` before switching to successor facts. Private history cannot be handed
-off or published by this caller. This scoped rule is not a permanent observer ban: a
-separate live-recovery caller requires an explicit grant for normalized live facts,
-without control identity, private-history publication or input/command acknowledgement.
+off or published by this caller. The separate Codex observe-only live grant is limited
+to `turn`, `message` and `tool`, with `observe` to `transcript` and mechanism
+`rollout_tail`. It reads the exact subject's rollout file from its captured live edge,
+commits an explicit gap-backed handoff before publishing complete normalized records,
+and never publishes private history, control identity or input/command acknowledgement.
 
 The private authenticated `source.state` readback includes paired nullable
 `last_handoff_digest` (32-byte array) and `last_handoff` (ACK) fields, null before the

@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::ReadBuf;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::time::Instant;
 
 /// Common async byte stream returned by either local IPC transport.
 pub trait IpcStreamIo: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -180,9 +181,10 @@ impl Drop for IpcListener {
 }
 
 impl IpcStream {
-    pub async fn connect(endpoint: &str) -> Result<Self> {
+    pub async fn connect(endpoint: &str, until: Instant) -> Result<Self> {
         #[cfg(unix)]
         {
+            let _ = until;
             let stream = tokio::net::UnixStream::connect(endpoint)
                 .await
                 .map_err(|error| io_error("connect Unix daemon socket", error))?;
@@ -191,16 +193,33 @@ impl IpcStream {
 
         #[cfg(windows)]
         {
+            use std::time::Duration;
             use tokio::net::windows::named_pipe::ClientOptions;
-            let client = ClientOptions::new()
-                .open(endpoint)
-                .map_err(|error| io_error("connect daemon named pipe", error))?;
-            Ok(IpcStream(Box::new(client)))
+            use tokio::time::sleep_until;
+            use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
+
+            loop {
+                if Instant::now() >= until {
+                    return Err(Error::new(
+                        "unknown",
+                        "daemon RPC exceeded its absolute deadline",
+                    ));
+                }
+                match ClientOptions::new().open(endpoint) {
+                    Ok(client) => return Ok(IpcStream(Box::new(client))),
+                    Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
+                        // Tokio's documented connect pattern: wait for the next
+                        // listener instance. No request bytes have been written.
+                        sleep_until((Instant::now() + Duration::from_millis(50)).min(until)).await;
+                    }
+                    Err(error) => return Err(io_error("connect daemon named pipe", error)),
+                }
+            }
         }
 
         #[cfg(not(any(unix, windows)))]
         {
-            let _ = endpoint;
+            let _ = (endpoint, until);
             Err(Error::new(
                 "platform_unsupported",
                 "local IPC is implemented for Windows and Unix",
@@ -245,4 +264,119 @@ async fn prepare_socket_path(path: &std::path::Path) -> Result<()> {
 
 fn io_error(action: &str, error: std::io::Error) -> Error {
     Error::new("platform_io", format!("{action}: {error}"))
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use futures_util::{StreamExt, stream::FuturesUnordered};
+    use std::{collections::HashSet, time::Duration};
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+        net::windows::named_pipe::ClientOptions,
+        time::timeout_at,
+    };
+    use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
+
+    fn listener() -> IpcListener {
+        let endpoint = format!(r"\\.\pipe\eliot-ipc-test-{}", ulid::Ulid::new());
+        let next_server = Some(super::super::windows::create_pipe_server(&endpoint, true).unwrap());
+        IpcListener {
+            endpoint,
+            next_server,
+        }
+    }
+
+    #[tokio::test]
+    async fn busy_pipe_concurrent_clients_connect_then_write_each_rpc_once() {
+        let mut listener = listener();
+        let endpoint = listener.endpoint.clone();
+        // Occupy the sole instance before clients begin. Every manually-polled
+        // connect must encounter PIPE_BUSY before accept can replace it.
+        let blocker = ClientOptions::new().open(&endpoint).unwrap();
+        match ClientOptions::new().open(&endpoint) {
+            Err(error) => assert_eq!(error.raw_os_error(), Some(ERROR_PIPE_BUSY as i32)),
+            Ok(_) => panic!("expected the occupied pipe instance to be busy"),
+        }
+        let until = Instant::now() + Duration::from_secs(5);
+        let mut pending = Vec::new();
+        for id in 0..8_u64 {
+            let mut connect = Box::pin(IpcStream::connect(&endpoint, until));
+            assert!(futures_util::poll!(&mut connect).is_pending());
+            pending.push((id, connect));
+        }
+        let clients = async {
+            let mut calls = FuturesUnordered::new();
+            for (id, connect) in pending {
+                calls.push(async move {
+                    let stream = connect.await.unwrap();
+                    let mut io = BufReader::new(stream);
+                    let frame = format!("{}\n", serde_json::json!({"jsonrpc":"2.0", "id":id, "method":"test.read", "params":{}}));
+                    io.get_mut().write_all(frame.as_bytes()).await.unwrap();
+                    let mut response = String::new();
+                    assert!(io.read_line(&mut response).await.unwrap() > 0);
+                    assert_eq!(serde_json::from_str::<serde_json::Value>(&response).unwrap()["id"], id);
+                });
+            }
+            while let Some(()) = calls.next().await {}
+        };
+        let server = async {
+            let occupied = listener.accept().await.unwrap();
+            drop(blocker);
+            drop(occupied);
+            let mut seen = HashSet::new();
+            for _ in 0..8 {
+                let mut io = BufReader::new(listener.accept().await.unwrap());
+                let mut frame = String::new();
+                assert!(io.read_line(&mut frame).await.unwrap() > 0);
+                let request: serde_json::Value = serde_json::from_str(&frame).unwrap();
+                let id = request["id"].as_u64().unwrap();
+                assert!(seen.insert(id), "an RPC request was replayed");
+                io.get_mut()
+                    .write_all(format!("{{\"id\":{id}}}\n").as_bytes())
+                    .await
+                    .unwrap();
+                let mut extra = String::new();
+                assert_eq!(
+                    io.read_line(&mut extra).await.unwrap(),
+                    0,
+                    "extra RPC bytes after the single request"
+                );
+            }
+            assert_eq!(seen.len(), 8);
+        };
+        timeout_at(until, async {
+            tokio::join!(clients, server);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn busy_pipe_connect_stops_at_original_deadline_without_writing() {
+        let listener = listener();
+        let _occupied = ClientOptions::new().open(listener.endpoint()).unwrap();
+        let error = match IpcStream::connect(
+            listener.endpoint(),
+            Instant::now() + Duration::from_millis(5),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("occupied pipe cannot accept the timed-out connection"),
+        };
+        assert_eq!(error.code, "unknown");
+        assert_eq!(error.message, "daemon RPC exceeded its absolute deadline");
+    }
+
+    #[tokio::test]
+    async fn missing_pipe_is_not_retried_as_busy() {
+        let endpoint = format!(r"\\.\pipe\eliot-ipc-missing-{}", ulid::Ulid::new());
+        let error =
+            match IpcStream::connect(&endpoint, Instant::now() + Duration::from_secs(5)).await {
+                Err(error) => error,
+                Ok(_) => panic!("missing pipe unexpectedly connected"),
+            };
+        assert_eq!(error.code, "platform_io");
+    }
 }

@@ -3,6 +3,7 @@
 mod discovery;
 mod events;
 mod host;
+mod live_recovery;
 mod native;
 mod observe;
 

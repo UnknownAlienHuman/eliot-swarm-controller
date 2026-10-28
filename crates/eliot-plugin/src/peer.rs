@@ -67,7 +67,7 @@ struct PendingGuard {
 pub struct CommitSink {
     client: PeerClient,
     credential: String,
-    unknown: bool,
+    unknown_batch: Option<SourceBatch>,
 }
 
 impl Peer {
@@ -278,13 +278,13 @@ impl CommitSink {
         Self {
             client,
             credential: credential.into(),
-            unknown: false,
+            unknown_batch: None,
         }
     }
 
     /// Commit one complete event batch and validate its acknowledgement.
     pub async fn commit(&mut self, batch: SourceBatch, deadline: Instant) -> Result<BatchAck> {
-        if self.unknown {
+        if self.unknown_batch.is_some() {
             return Err(unknown_batch_error());
         }
         if self.credential.len() > crate::protocol::MAX_CREDENTIAL_BYTES {
@@ -303,10 +303,17 @@ impl CommitSink {
                 ));
             }
         }
+        if batch.events.is_empty() {
+            return Err(Error::new(
+                "invalid",
+                "native event batch must contain at least one event",
+            ));
+        }
 
         let expected_count = i64::try_from(batch.events.len())
             .map_err(|_| Error::new("frame_too_large", "event batch is too large"))?;
-        self.unknown = true;
+        let expected_cursor = batch.cursor.clone();
+        self.unknown_batch = Some(batch.clone());
         let permit = match self.client.acquire_pending(deadline).await {
             Ok(permit) => permit,
             Err(_) => return Err(unknown_batch_error()),
@@ -314,12 +321,12 @@ impl CommitSink {
         let mut params = match serde_json::to_value(batch) {
             Ok(params) => params,
             Err(_) => {
-                self.unknown = false;
+                self.unknown_batch = None;
                 return Err(Error::new("internal", "event batch could not be encoded"));
             }
         };
         let Some(params) = params.as_object_mut() else {
-            self.unknown = false;
+            self.unknown_batch = None;
             return Err(Error::new(
                 "internal",
                 "event batch encoding was not an object",
@@ -337,7 +344,7 @@ impl CommitSink {
         {
             Ok(prepared) => prepared,
             Err(error) => {
-                self.unknown = false;
+                self.unknown_batch = None;
                 return Err(error);
             }
         };
@@ -354,17 +361,65 @@ impl CommitSink {
             .last_seq
             .checked_sub(ack.first_seq)
             .and_then(|count| count.checked_add(1));
-        if ack.first_seq <= 0 || actual_count != Some(expected_count) {
+        if ack.first_seq <= 0
+            || actual_count != Some(expected_count)
+            || ack.cursor != expected_cursor
+        {
             return Err(unknown_batch_error());
         }
 
-        self.unknown = false;
+        self.unknown_batch = None;
+        Ok(ack)
+    }
+
+    /// Settle an uncertain commit only when private source-state readback proves
+    /// this exact frozen batch and its complete acknowledgement.
+    pub fn settle_from_state(&mut self, batch: &SourceBatch, state: &Value) -> Result<BatchAck> {
+        if self.unknown_batch.as_ref() != Some(batch) {
+            return Err(unknown_batch_error());
+        }
+
+        let digest = batch.semantic_digest().map_err(|_| unknown_batch_error())?;
+        let first_seq = state
+            .get("last_batch_first_seq")
+            .and_then(Value::as_i64)
+            .ok_or_else(unknown_batch_error)?;
+        let last_seq = state
+            .get("last_batch_last_seq")
+            .and_then(Value::as_i64)
+            .ok_or_else(unknown_batch_error)?;
+        let count = last_seq
+            .checked_sub(first_seq)
+            .and_then(|value| value.checked_add(1));
+        let expected_count = i64::try_from(batch.events.len()).ok();
+        let expected_digest = serde_json::to_value(digest).map_err(|_| unknown_batch_error())?;
+
+        if batch.events.is_empty()
+            || first_seq <= 0
+            || last_seq < first_seq
+            || count != expected_count
+            || state.get("agent_id").and_then(Value::as_str) != Some(batch.agent_id.as_str())
+            || state.get("generation").and_then(Value::as_i64) != Some(batch.generation)
+            || state.get("source").and_then(Value::as_str) != Some(batch.source.as_str())
+            || state.get("last_batch_id").and_then(Value::as_str) != Some(batch.batch_id.as_str())
+            || state.get("last_batch_digest") != Some(&expected_digest)
+            || state.get("cursor") != Some(&serde_json::json!(batch.cursor))
+        {
+            return Err(unknown_batch_error());
+        }
+
+        let ack = BatchAck {
+            first_seq,
+            last_seq,
+            cursor: batch.cursor.clone(),
+        };
+        self.unknown_batch = None;
         Ok(ack)
     }
 
     /// Whether a commit was sent without a valid acknowledgement.
     pub fn is_unknown(&self) -> bool {
-        self.unknown
+        self.unknown_batch.is_some()
     }
 }
 
@@ -589,6 +644,89 @@ mod tests {
             truncated: false,
             eof: true,
             read_error: false,
+        }
+    }
+
+    fn test_client() -> PeerClient {
+        let (writes, _receiver) = mpsc::channel(1);
+        PeerClient {
+            writes,
+            pending: Arc::new(StdMutex::new(HashMap::new())),
+            pending_slots: Arc::new(Semaphore::new(MAX_PENDING_CALLS)),
+            next_id: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn batch_readback(batch: &SourceBatch) -> Value {
+        json!({
+            "agent_id": batch.agent_id,
+            "generation": batch.generation,
+            "source": batch.source,
+            "state": "open",
+            "cursor": batch.cursor,
+            "last_batch_id": batch.batch_id,
+            "last_batch_digest": batch.semantic_digest().unwrap(),
+            "last_batch_first_seq": 7,
+            "last_batch_last_seq": 7,
+        })
+    }
+
+    #[test]
+    fn uncertain_batch_settlement_requires_exact_scope_digest_cursor_and_range() {
+        let batch = SourceBatch {
+            batch_id: "batch-1".to_owned(),
+            agent_id: "a1".to_owned(),
+            generation: 3,
+            source: "transcript".to_owned(),
+            events: vec![eliot_core::NativeEvent {
+                kind: "message.completed".to_owned(),
+                native_id: "native-1".to_owned(),
+                data: json!({"text":"complete"}),
+                ts: Some(123),
+            }],
+            cursor: Some("opaque-edge".to_owned()),
+        };
+        let mut sink = CommitSink::new(test_client(), "credential");
+        sink.unknown_batch = Some(batch.clone());
+
+        let ack = sink
+            .settle_from_state(&batch, &batch_readback(&batch))
+            .expect("exact retained batch proof");
+        assert_eq!(ack.first_seq, 7);
+        assert_eq!(ack.last_seq, 7);
+        assert_eq!(ack.cursor, batch.cursor);
+        assert!(!sink.is_unknown());
+
+        let mut different_payload = batch.clone();
+        different_payload.events[0].data["text"] = json!("changed");
+        sink.unknown_batch = Some(batch.clone());
+        assert!(
+            sink.settle_from_state(&different_payload, &batch_readback(&batch))
+                .is_err()
+        );
+        assert!(sink.is_unknown());
+
+        for (field, value) in [
+            ("agent_id", json!("a2")),
+            ("generation", json!(4)),
+            ("source", json!("other")),
+            ("last_batch_id", json!("other-batch")),
+            (
+                "last_batch_digest",
+                serde_json::to_value([0u8; 32]).unwrap(),
+            ),
+            ("cursor", json!("other-edge")),
+            ("last_batch_first_seq", json!(0)),
+            ("last_batch_last_seq", json!(8)),
+        ] {
+            let mut proof = batch_readback(&batch);
+            proof[field] = value;
+            sink.unknown_batch = Some(batch.clone());
+            assert!(
+                sink.settle_from_state(&batch, &proof).is_err(),
+                "field={field}"
+            );
+            assert!(sink.is_unknown(), "field={field}");
         }
     }
 

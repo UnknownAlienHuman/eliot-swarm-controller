@@ -37,6 +37,7 @@ fn ready_agent(store: &mut Store, project: &str, now: i64) -> String {
                 generation: 1,
                 source: "stream".to_owned(),
                 events: vec![NativeEvent {
+                    ts: None,
                     kind: "session.ready".to_owned(),
                     native_id: format!("{project}:ready"),
                     data: json!({"command_id":launch_id}),
@@ -83,6 +84,7 @@ fn session_end_keeps_dispatched_stop_pending_until_exact_reply() {
                 generation: 1,
                 source: "stream".to_owned(),
                 events: vec![NativeEvent {
+                    ts: None,
                     kind: "session.ended".to_owned(),
                     native_id: "stop-session-ended:session-ended".to_owned(),
                     data: json!({}),
@@ -379,6 +381,7 @@ fn send_association_emits_applied_once_with_native_batch_ack() {
                 generation: 1,
                 source: "stream".to_owned(),
                 events: vec![NativeEvent {
+                    ts: None,
                     kind: "session.ready".to_owned(),
                     native_id: "ready".to_owned(),
                     data: json!({"command_id":launch_id}),
@@ -416,16 +419,19 @@ fn send_association_emits_applied_once_with_native_batch_ack() {
         source: "stream".to_owned(),
         events: vec![
             NativeEvent {
+                ts: None,
                 kind: "turn.started".to_owned(),
                 native_id: "turn-start".to_owned(),
                 data: json!({"command_id":send_id, "turn_id":"turn-1"}),
             },
             NativeEvent {
+                ts: None,
                 kind: "message.completed".to_owned(),
                 native_id: "message".to_owned(),
                 data: json!({"command_id":send_id, "turn_id":"turn-1", "text":"hello"}),
             },
             NativeEvent {
+                ts: None,
                 kind: "turn.completed".to_owned(),
                 native_id: "turn-end".to_owned(),
                 data: json!({"command_id":send_id, "turn_id":"turn-1", "status":"completed"}),
@@ -552,6 +558,7 @@ fn secret_question_answer_is_rejected_before_command_persistence() {
                 generation: 1,
                 source: "stream".to_owned(),
                 events: vec![NativeEvent {
+                    ts: None,
                     kind: "session.ready".to_owned(),
                     native_id: "ready-1".to_owned(),
                     data: json!({
@@ -599,6 +606,7 @@ fn secret_question_answer_is_rejected_before_command_persistence() {
                 generation: 1,
                 source: "stream".to_owned(),
                 events: vec![NativeEvent {
+                    ts: None,
                     kind: "turn.started".to_owned(),
                     native_id: "turn-started-1".to_owned(),
                     data: json!({"command_id": send_id, "turn_id": "turn-1"}),
@@ -616,6 +624,7 @@ fn secret_question_answer_is_rejected_before_command_persistence() {
                 generation: 1,
                 source: "stream".to_owned(),
                 events: vec![NativeEvent {
+                    ts: None,
                     kind: "request.opened".to_owned(),
                     native_id: "request-opened-1".to_owned(),
                     data: json!({
@@ -704,6 +713,7 @@ fn native_request_cleanup_does_not_acknowledge_reply() {
         generation: 1,
         source: "stream".to_owned(),
         events: vec![NativeEvent {
+            ts: None,
             kind: kind.to_owned(),
             native_id: Ulid::new().to_string(),
             data,

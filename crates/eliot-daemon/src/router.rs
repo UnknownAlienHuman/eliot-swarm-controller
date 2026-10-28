@@ -4055,6 +4055,7 @@ mod tests {
                     generation: 1,
                     source: "stream".to_owned(),
                     events: vec![eliot_core::NativeEvent {
+                        ts: None,
                         kind: kind.to_owned(),
                         native_id: ulid::Ulid::new().to_string(),
                         data,

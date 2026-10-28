@@ -15,16 +15,18 @@ The design follows Waku and Paseo:
 The current `(agent,generation,family) -> source` map lives in
 [`source_owners`](core.md#events-and-authoritative-sources). Typical assignment:
 
-| Family | Controlled Agent | Observe/recovery Agent |
+| Family | Controlled Agent | Observe-only live source |
 | --- | --- | --- |
-| session/turn/message/tool/request/child/goal/usage | native stream | transcript or native paged history |
+| session/turn/message/tool/request/child/goal/usage | native stream | transcript after explicit handoff for granted live families; native paged history stays private |
 | synchronous hook decision | hook only | hook only |
 | process | OS monitor | OS monitor |
 | Git/filesystem | Git/fs monitor | Git/fs monitor |
 
 A hook may own a fact absent from the primary stream; it does not mirror lifecycle the
-stream already owns. Transcript/history may privately track its cursor while the stream
-owns lifecycle, but it publishes only after an explicit handoff.
+stream already owns. Codex native history pages are private queries, not source owners.
+The observe-only rollout reader is separate: after settled exact-subject readiness it
+captures the live edge and commits an explicit `observe` to `transcript` handoff with
+mechanism `rollout_tail` and a gap before publishing normalized live records.
 
 Initial ownership is committed before native I/O. Dynamic handoff uses the plugin
 protocol's single compare-and-swap request: verify predecessor, record final cursor or
@@ -34,6 +36,14 @@ source epochs or independent lifecycle projections.
 Health states are `ok|slow|stale|error`. Event-stream silence is not stale by itself; a
 lost transport is stale until reconnect. Stale authoritative lifecycle means current
 turn progress is unknown, never idle/done.
+
+`observer_ready` is a private attach/fence proof, independent of source-open and health:
+it requires the current generation, exact native scope/ref, an applied attach, an
+unknown observe-only Agent, an open observe source and no detach fence. Source health
+updates do not grant readiness. A changed health value updates only health and its
+timestamp; unchanged health emits no event. Health cannot clear a gap, move a cursor,
+transfer ownership or reopen a closed source. Return to `ok` only after verified
+live-edge recovery, retaining the historical gap.
 
 Source lifecycle (`open|closed`), health and the latest committed gap boundary are
 independent fields in the same `source_state` row. Recording a gap does not close the
@@ -102,6 +112,11 @@ and final native events:
 4. if EOF/deadline provides no terminal fact, commit `source.gap` for the uncovered
    tail;
 5. only then emit `session.lost` when exact/shared readback proves control is gone.
+
+Closing or losing the Codex observer's held rollout reader is not native thread-terminal
+evidence and does not emit `session.ended` or `session.lost`. Controlled owned-process
+loss still drains its captured generation and finalizes it through the controlled path;
+observer attachment or reader health cannot suppress or manufacture that lifecycle.
 
 A timer such as “three seconds without `session.ended`” is never terminal evidence by
 itself. On degraded Unix, lost session control may coexist with `orphan_possible`.

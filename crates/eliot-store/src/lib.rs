@@ -39,6 +39,7 @@ macro_rules! db {
 }
 
 mod observer;
+mod observer_live;
 mod source_handoff;
 
 fn sql_error(error: rusqlite::Error) -> Error {
@@ -2319,7 +2320,7 @@ impl Store {
                    AND NOT (state = 'unknown' AND verb IN ('attach','detach')
                      AND EXISTS(SELECT 1 FROM agents a WHERE a.id = commands.target AND a.observe_only = 1)
                      AND NOT EXISTS(SELECT 1 FROM source_state s WHERE s.agent = commands.target
-                         AND s.source = 'observe' AND s.state = 'open'))
+                         AND s.source NOT IN ('daemon','os','git','workspace_process') AND s.state = 'open'))
                  ORDER BY created_at, rowid LIMIT ?1",
             )
             .map_err(sql_error)?;
@@ -3073,7 +3074,7 @@ impl Store {
             .query_row(
                 "SELECT MAX(e.ts) FROM events e
                  WHERE e.agent = ?1 AND e.generation = ?2
-                   AND EXISTS(SELECT 1 FROM agents a WHERE a.id = e.agent AND a.observe_only = 0)
+                   AND EXISTS(SELECT 1 FROM agents a WHERE a.id = e.agent)
                    AND ((e.source NOT IN ('os', 'daemon', 'git', 'workspace_process') AND e.native_id IS NOT NULL
                    AND e.kind IN ('turn.started', 'turn.completed', 'message.completed',
                                   'tool.started', 'tool.completed',
@@ -7711,6 +7712,10 @@ impl Store {
         }
         let state = load_source_state(&self.connection, agent_num, generation, source)?
             .ok_or_else(|| Error::new("source_integrity", "source has no committed state"))?;
+        let observer_ready = match load_agent_by_num(&self.connection, agent_num)? {
+            Some(agent) => observer::live_ready(&self.connection, &agent, generation)?,
+            None => false,
+        };
         let mut statement = self
             .connection
             .prepare(
@@ -7750,6 +7755,7 @@ impl Store {
             "last_handoff_digest": state.last_handoff_digest,
             "last_handoff": state.last_handoff.as_deref().map(decode_json).transpose()?,
             "owners": source_handoff::owner_bindings(&self.connection, agent_num, generation)?,
+            "observer_ready": observer_ready,
         });
         if encode_json(&state)?.len() > MAX_PAGE_BYTES {
             return Err(Error::new(
@@ -7763,7 +7769,19 @@ impl Store {
     /// Commit one source-loss boundary and its retained acknowledgement.
     pub fn record_source_gap(&mut self, gap: SourceGap, now: i64) -> Result<Change<SourceGapAck>> {
         self.ensure_writer_healthy()?;
-        let result = self.record_source_gap_inner(gap, now);
+        let result = self.record_source_gap_inner(gap, None, now);
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    pub fn record_observed_source_gap(
+        &mut self,
+        gap: SourceGap,
+        expected_subject: (&str, &str),
+        now: i64,
+    ) -> Result<Change<SourceGapAck>> {
+        self.ensure_writer_healthy()?;
+        let result = self.record_source_gap_inner(gap, Some(expected_subject), now);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -7771,6 +7789,7 @@ impl Store {
     fn record_source_gap_inner(
         &mut self,
         gap: SourceGap,
+        expected_subject: Option<(&str, &str)>,
         now: i64,
     ) -> Result<Change<SourceGapAck>> {
         require_nonempty(&gap.gap_id, "gap_id")?;
@@ -7826,6 +7845,15 @@ impl Store {
             .map_err(sql_error)?;
         let agent = load_agent_by_num(&tx, agent_num)?
             .ok_or_else(|| Error::new("not_found", "source gap Agent was not found"))?;
+        if let Some(subject) = expected_subject {
+            observer::require_live_subject(&tx, &agent, gap.generation, subject)?;
+            observer_live::require_transcript_families(&tx, &agent, &gap.source, &families)?;
+        } else if !matches!(
+            gap.source.as_str(),
+            "daemon" | "os" | "git" | "workspace_process"
+        ) {
+            observer::require_controlled(&agent)?;
+        }
         let historical_git = gap.source == GIT_SOURCE
             && gap.generation > 0
             && gap.generation < agent.generation
@@ -7935,12 +7963,29 @@ impl Store {
     /// command/turn facts, source cursor, and last-batch acknowledgement.
     pub fn put_batch(&mut self, batch: SourceBatch, now: i64) -> Result<BatchCommit> {
         self.ensure_writer_healthy()?;
-        let result = self.put_batch_inner(batch, now);
+        let result = self.put_batch_inner(batch, None, now);
         self.fault_on_persistence_error(&result);
         result
     }
 
-    fn put_batch_inner(&mut self, batch: SourceBatch, now: i64) -> Result<BatchCommit> {
+    pub fn put_observed_batch(
+        &mut self,
+        batch: SourceBatch,
+        expected_subject: (&str, &str),
+        now: i64,
+    ) -> Result<BatchCommit> {
+        self.ensure_writer_healthy()?;
+        let result = self.put_batch_inner(batch, Some(expected_subject), now);
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    fn put_batch_inner(
+        &mut self,
+        batch: SourceBatch,
+        expected_subject: Option<(&str, &str)>,
+        now: i64,
+    ) -> Result<BatchCommit> {
         require_nonempty(&batch.batch_id, "batch_id")?;
         require_nonempty(&batch.source, "source")?;
         if batch.events.is_empty() {
@@ -7960,7 +8005,6 @@ impl Store {
         }
         let agent_num = parse_agent_id(&batch.agent_id)?;
         let mut native_ids = HashSet::with_capacity(batch.events.len());
-        let mut semantic_events = Vec::with_capacity(batch.events.len());
         for event in &batch.events {
             require_nonempty(&event.kind, "event kind")?;
             require_nonempty(&event.native_id, "native_id")?;
@@ -7979,13 +8023,11 @@ impl Store {
                     format!("event {} data exceeds 64 KiB", event.native_id),
                 ));
             }
-            semantic_events.push(json!({
-                "kind": event.kind,
-                "native_id": event.native_id,
-                "data": event.data,
-            }));
         }
-        let batch_digest = canonical::digest(&Value::Array(semantic_events))?;
+        let batch_digest = batch
+            .semantic_digest()
+            .map_err(|error| Error::new("invalid", error.to_string()))?
+            .to_vec();
 
         let tx = self
             .connection
@@ -7997,7 +8039,29 @@ impl Store {
                 format!("Agent {} was not found", batch.agent_id),
             )
         })?;
-        observer::require_controlled(&projection)?;
+        if let Some(subject) = expected_subject {
+            observer::require_live_subject(&tx, &projection, batch.generation, subject)?;
+            let families = batch
+                .events
+                .iter()
+                .map(|event| family_for_kind(&event.kind).map(str::to_owned))
+                .collect::<Result<Vec<_>>>()?;
+            observer_live::require_transcript_families(&tx, &projection, &batch.source, &families)?;
+            for event in &batch.events {
+                if !event.data.is_object()
+                    || ["command_id", "cause", "request_id"]
+                        .iter()
+                        .any(|field| event.data.get(*field).is_some())
+                {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "observed facts cannot carry local command or request settlement",
+                    ));
+                }
+            }
+        } else {
+            observer::require_controlled(&projection)?;
+        }
         if projection.generation != batch.generation {
             return Err(Error::new(
                 "stale_generation",
@@ -8093,13 +8157,14 @@ impl Store {
                     ),
                 ));
             }
-            let (next, effects) = core::apply(&projection, &native_event, now)?;
+            let (next, effects) = if expected_subject.is_some() {
+                observer_live::persist_turn_fact(&tx, &projection, &native_event)?;
+                (projection.clone(), Vec::new())
+            } else {
+                core::apply(&projection, &native_event, now)?
+            };
             let family = family_for_kind(&native_event.kind)?;
-            let event_digest = canonical::digest(&json!({
-                "kind": native_event.kind,
-                "native_id": native_event.native_id,
-                "data": native_event.data,
-            }))?;
+            let event_digest = canonical::digest(&native_event.semantic_value())?;
             let cursor = if index + 1 == batch.events.len() {
                 batch.cursor.as_deref()
             } else {
@@ -8108,7 +8173,7 @@ impl Store {
             let stored = insert_native_event(
                 &tx,
                 NativeEventInsert {
-                    ts: now,
+                    ts: native_event.ts.unwrap_or(now),
                     native_event: &native_event,
                     family,
                     agent: agent_num,
@@ -8142,7 +8207,9 @@ impl Store {
                     params![agent_num, batch.generation],
                 ));
             }
-            update_agent_projection(&tx, &next)?;
+            if expected_subject.is_none() {
+                update_agent_projection(&tx, &next)?;
+            }
             projection = next;
             committed_events.push(stored);
         }

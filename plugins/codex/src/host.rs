@@ -29,9 +29,14 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-use tokio::{sync::mpsc, time::Instant};
+use tokio::{
+    sync::mpsc,
+    time::{Instant, MissedTickBehavior, interval, timeout_at},
+};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+const LIVE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const LIVE_POLL_DEADLINE: Duration = Duration::from_secs(2);
 const MODEL_PAGE_SIZE: u32 = 100;
 const MAX_MODEL_PAGES: usize = 100;
 const TURN_PAGE_SIZE: u32 = 1000;
@@ -131,7 +136,31 @@ pub(crate) async fn run() -> Result<()> {
 
     let mut plugin = CodexPlugin::default();
     let mut completed_shutdown = false;
-    while let Some(request) = requests.recv().await {
+    let mut live_ticks = interval(LIVE_POLL_INTERVAL);
+    live_ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        let request = tokio::select! {
+            biased;
+            request = requests.recv() => request,
+            _ = live_ticks.tick(), if plugin.observer.as_ref().is_some_and(ObserverSession::live_poll_enabled) => {
+                let initialized = plugin.initialized.as_ref().ok_or_else(not_initialized)?;
+                let observer = plugin.observer.as_mut().ok_or_else(not_initialized)?;
+                let until = Instant::now() + LIVE_POLL_DEADLINE;
+                // Cancelling this future leaves owned file I/O and pending
+                // publication in the observer/publisher for settlement or close.
+                tokio::select! {
+                    biased;
+                    request = requests.recv() => request,
+                    result = timeout_at(until, observer.poll_live(&client, &initialized.credential, until)) => {
+                        if result.is_err() {
+                            observer.live_poll_timed_out();
+                        }
+                        continue;
+                    }
+                }
+            }
+        };
+        let Some(request) = request else { break };
         let is_shutdown = request.method == "shutdown";
         let result = plugin.dispatch(&request, &client).await;
         let response = client

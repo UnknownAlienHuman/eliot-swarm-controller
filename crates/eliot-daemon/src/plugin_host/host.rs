@@ -1380,6 +1380,11 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
         expected_credential,
         observation,
     } = source;
+    let binding = source_handoff::SourceBinding {
+        agent_id: &agent_id,
+        generation,
+        observation: observation.as_ref(),
+    };
     let client = connection.client();
     while let Some(request) = connection.next_request().await {
         let request_id = request.id.clone();
@@ -1387,11 +1392,16 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
         let request_deadline = deadline();
         let result = if !matches!(
             method.as_str(),
-            "events.put" | "source.gap" | "source.handoff" | "source.state" | "process.put"
+            "events.put"
+                | "source.gap"
+                | "source.handoff"
+                | "source.health"
+                | "source.state"
+                | "process.put"
         ) {
             Err(Error::new(
                 "unsupported",
-                "plugin host only accepts events.put, source.gap, source.handoff, source.state, and process.put",
+                "plugin host only accepts events.put, source.gap, source.handoff, source.health, source.state, and process.put",
             ))
         } else {
             let mut params = request.params;
@@ -1479,37 +1489,55 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
                         {
                             match redact_source_batch(&mut batch, &source_credentials) {
                                 Err(error) => Err(error),
-                                Ok(()) => match timeout_at(request_deadline, store.lock()).await {
-                                    Ok(mut store) => match store.put_batch(batch, now_ms()) {
-                                        Ok(commit) => {
-                                            bus.publish(&commit.events);
-                                            drop(store);
-                                            serde_json::to_value(commit.ack).map_err(|_| {
-                                                late_batch_error(
-                                                    &state,
-                                                    &agent_id,
-                                                    generation,
-                                                    "ack_encoding_failed",
-                                                )
-                                            })
-                                        }
-                                        Err(error) => {
-                                            let cause = if store.is_write_faulted() {
-                                                "store_write_faulted".to_owned()
-                                            } else {
-                                                format!("store_{}", safe_cause_code(&error.code))
+                                Ok(()) => match binding.expected_subject() {
+                                    Err(error) => Err(error),
+                                    Ok(subject) => match timeout_at(request_deadline, store.lock())
+                                        .await
+                                    {
+                                        Ok(mut store) => {
+                                            let result = match subject {
+                                                Some(subject) => store.put_observed_batch(
+                                                    batch,
+                                                    subject,
+                                                    now_ms(),
+                                                ),
+                                                None => store.put_batch(batch, now_ms()),
                                             };
-                                            Err(late_batch_error(
-                                                &state, &agent_id, generation, &cause,
-                                            ))
+                                            match result {
+                                                Ok(commit) => {
+                                                    bus.publish(&commit.events);
+                                                    drop(store);
+                                                    serde_json::to_value(commit.ack).map_err(|_| {
+                                                        late_batch_error(
+                                                            &state,
+                                                            &agent_id,
+                                                            generation,
+                                                            "ack_encoding_failed",
+                                                        )
+                                                    })
+                                                }
+                                                Err(error) => {
+                                                    let cause = if store.is_write_faulted() {
+                                                        "store_write_faulted".to_owned()
+                                                    } else {
+                                                        format!(
+                                                            "store_{}",
+                                                            safe_cause_code(&error.code)
+                                                        )
+                                                    };
+                                                    Err(late_batch_error(
+                                                        &state, &agent_id, generation, &cause,
+                                                    ))
+                                                }
+                                            }
                                         }
+                                        Err(_) => Err(late_batch_error(
+                                            &state,
+                                            &agent_id,
+                                            generation,
+                                            "store_lock_deadline",
+                                        )),
                                     },
-                                    Err(_) => Err(late_batch_error(
-                                        &state,
-                                        &agent_id,
-                                        generation,
-                                        "store_lock_deadline",
-                                    )),
                                 },
                             }
                         }
@@ -1533,14 +1561,28 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
                                 Ok(())
                                     if gap.agent_id == agent_id && gap.generation == generation =>
                                 {
-                                    match timeout_at(request_deadline, store.lock()).await {
-                                        Ok(mut store) => {
-                                            match store.record_source_gap(gap, now_ms()) {
-                                                Ok(change) => {
-                                                    bus.publish(&change.events);
-                                                    drop(store);
-                                                    let ack: SourceGapAck = change.value;
-                                                    serde_json::to_value(ack).map_err(
+                                    match binding.expected_subject() {
+                                        Err(error) => Err(error),
+                                        Ok(subject) => {
+                                            match timeout_at(request_deadline, store.lock()).await {
+                                                Ok(mut store) => {
+                                                    let result = match subject {
+                                                        Some(subject) => store
+                                                            .record_observed_source_gap(
+                                                                gap,
+                                                                subject,
+                                                                now_ms(),
+                                                            ),
+                                                        None => {
+                                                            store.record_source_gap(gap, now_ms())
+                                                        }
+                                                    };
+                                                    match result {
+                                                        Ok(change) => {
+                                                            bus.publish(&change.events);
+                                                            drop(store);
+                                                            let ack: SourceGapAck = change.value;
+                                                            serde_json::to_value(ack).map_err(
                                                         |_| {
                                                             Error::new(
                                                                 "internal",
@@ -1548,23 +1590,25 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
                                                             )
                                                         },
                                                     )
+                                                        }
+                                                        Err(_) if store.is_write_faulted() => {
+                                                            Err(Error::new(
+                                                                "unknown",
+                                                                "source.gap outcome is unknown; settle with source.state",
+                                                            ))
+                                                        }
+                                                        Err(error) => Err(redact_native_error(
+                                                            error,
+                                                            &source_credentials,
+                                                        )),
+                                                    }
                                                 }
-                                                Err(_) if store.is_write_faulted() => {
-                                                    Err(Error::new(
-                                                        "unknown",
-                                                        "source.gap outcome is unknown; settle with source.state",
-                                                    ))
-                                                }
-                                                Err(error) => Err(redact_native_error(
-                                                    error,
-                                                    &source_credentials,
+                                                Err(_) => Err(Error::new(
+                                                    "busy",
+                                                    "Store lock deadline elapsed for source.gap",
                                                 )),
                                             }
                                         }
-                                        Err(_) => Err(Error::new(
-                                            "busy",
-                                            "Store lock deadline elapsed for source.gap",
-                                        )),
                                     }
                                 }
                                 Ok(()) => Err(Error::new(
@@ -1584,8 +1628,18 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
                             &store,
                             &bus,
                             params,
-                            &agent_id,
-                            generation,
+                            binding,
+                            &source_credentials,
+                            request_deadline,
+                        )
+                        .await
+                    }
+                    "source.health" => {
+                        source_handoff::record_source_health(
+                            &store,
+                            &bus,
+                            params,
+                            binding,
                             &source_credentials,
                             request_deadline,
                         )
@@ -2526,6 +2580,7 @@ mod tests {
             source: "stream".to_owned(),
             cursor: Some("cursor-1".to_owned()),
             events: vec![NativeEvent {
+                ts: None,
                 kind: "session.ready".to_owned(),
                 native_id: "ready-1".to_owned(),
                 data: json!({"command_id":"launch-command", "text":SECRET}),
@@ -2589,6 +2644,7 @@ mod tests {
             let mut batch = batch();
             // A later invalid event must not leave earlier mutable text changed.
             batch.events.push(NativeEvent {
+                ts: None,
                 kind: "message.completed".to_owned(),
                 native_id: "message-1".to_owned(),
                 data,
@@ -2799,6 +2855,7 @@ mod tests {
                     source: "stream".to_owned(),
                     cursor: Some("edge-1".to_owned()),
                     events: vec![NativeEvent {
+                        ts: None,
                         kind: "session.ready".to_owned(),
                         native_id: "initial-ready".to_owned(),
                         data: json!({"command_id":command_id}),
@@ -3122,6 +3179,302 @@ mod tests {
         assert_eq!(store.lock().await.high_water().unwrap(), before);
     }
 
+    #[tokio::test]
+    async fn observer_live_callbacks_use_settled_subject_and_committed_grant() {
+        let mut store = eliot_store::Store::open(Path::new(":memory:")).unwrap();
+        let attach_id = Ulid::new().to_string();
+        let agent_id = store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: attach_id.clone(),
+                    target: None,
+                    verb: "attach".to_owned(),
+                    args: json!({"profile":"observer-fixture", "harness":"codex", "mode":"observe",
+                "native_scope":"fixture-scope", "native_ref":"fixture-ref", "profile_snapshot":{}}),
+                    expected_generation: Some(0),
+                    expected_turn_id: None,
+                    request_id: None,
+                },
+                now_ms(),
+            )
+            .unwrap()
+            .command
+            .target
+            .unwrap();
+        store.dispatch(&attach_id, now_ms()).unwrap();
+        let agent = store.get_agent(&agent_id).unwrap().unwrap();
+        let store = Arc::new(AsyncMutex::new(store));
+        let bus = Bus::new(64);
+        let monitoring = Monitoring::new(
+            store.clone(),
+            bus.clone(),
+            Arc::new(Mutex::new(HashSet::new())),
+        );
+        let credential = "observer-private-peer";
+        let (host_io, peer_io) = tokio::io::duplex(16 * 1024);
+        let (host_read, host_write) = tokio::io::split(host_io);
+        let (peer_read, peer_write) = tokio::io::split(peer_io);
+        let peer = PluginConnection::new(peer_read, peer_write);
+        let client = peer.client();
+        let task = tokio::spawn(serve_plugin_requests(
+            PluginConnection::new(host_read, host_write),
+            EventSource {
+                store: store.clone(),
+                bus: bus.clone(),
+                monitoring,
+                source_credentials: Arc::from([credential.to_owned(), SECRET.to_owned()]),
+                state: Weak::new(),
+                key: AgentKey {
+                    id: agent_id.clone(),
+                    generation: 1,
+                },
+                agent_id: agent_id.clone(),
+                generation: 1,
+                expected_credential: credential.to_owned(),
+                observation: Some(agent.clone()),
+            },
+        ));
+        let readback = json!({"credential":credential, "agent_id":agent_id, "generation":1, "source":"observe"});
+        assert_eq!(
+            client
+                .call("source.state", readback.clone(), deadline())
+                .await
+                .unwrap()["observer_ready"],
+            json!(false)
+        );
+        // The producer waits for this existing attach settlement, never probing CAS readiness.
+        store
+            .lock()
+            .await
+            .settle_observe_attach(
+                &attach_id,
+                json!({
+                    "agent_id":agent_id, "generation":1, "command_id":attach_id,
+                    "native_scope":"fixture-scope", "native_ref":"fixture-ref", "state":"attached",
+                    "observation_state":"unknown", "metadata":{}, "coverage":{},
+                }),
+                now_ms(),
+            )
+            .unwrap();
+        assert_eq!(
+            client
+                .call("source.state", readback.clone(), deadline())
+                .await
+                .unwrap()["observer_ready"],
+            json!(true)
+        );
+
+        let handoff = json!({"credential":credential, "agent_id":agent_id, "generation":1,
+            "source":"observe", "families":["message","tool","turn"], "successor":"transcript", "mechanism":"rollout_tail",
+            "gap":{"gap_id":"live-edge", "reason":"history excluded", "from":null, "to":"baseline-0"}});
+        let before = store.lock().await.high_water().unwrap();
+        for (field, value) in [
+            ("successor", json!("git")),
+            ("families", json!(["process"])),
+            ("families", json!(["session"])),
+            ("mechanism", json!("native_stream")),
+        ] {
+            let mut params = handoff.clone();
+            params[field] = value;
+            assert_eq!(
+                client
+                    .call("source.handoff", params, deadline())
+                    .await
+                    .unwrap_err()
+                    .code,
+                "not_allowed"
+            );
+        }
+        assert_eq!(
+            client
+                .call("process.put", json!({"credential":credential}), deadline())
+                .await
+                .unwrap_err()
+                .code,
+            "not_allowed"
+        );
+        // A private ObservationPage is never interpreted as normalized live records.
+        assert_eq!(
+            client
+                .call(
+                    "events.put",
+                    json!({"credential":credential, "agent_id":agent_id, "generation":1,
+            "source":"rollout", "view":"turns", "entries":[{"state":"completed"}], "coverage":{}}),
+                    deadline()
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "not_allowed"
+        );
+        assert_eq!(store.lock().await.high_water().unwrap(), before);
+
+        let mut wrong_agent = agent.clone();
+        wrong_agent.native_scope = Some("wrong-scope".to_owned());
+        let mut params = handoff.clone();
+        params.as_object_mut().unwrap().remove("credential");
+        let error = source_handoff::record_source_handoff(
+            &store,
+            &bus,
+            params,
+            source_handoff::SourceBinding {
+                agent_id: &agent_id,
+                generation: 1,
+                observation: Some(&wrong_agent),
+            },
+            &[credential.to_owned()],
+            deadline(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "source_integrity");
+        assert_eq!(store.lock().await.high_water().unwrap(), before);
+        let ack = client
+            .call("source.handoff", handoff, deadline())
+            .await
+            .unwrap();
+        let state = client
+            .call("source.state", readback, deadline())
+            .await
+            .unwrap();
+        assert_eq!(state["last_handoff"], ack);
+        assert_eq!(state["state"], json!("open"));
+        assert_eq!(state["observer_ready"], json!(true));
+
+        let before_facts = store.lock().await.high_water().unwrap();
+        let original_ts = 1_700_000_000_123_i64;
+        client.call("events.put", json!({"credential":credential, "agent_id":agent_id, "generation":1,
+            "batch_id":"observed-live", "source":"transcript", "cursor":"tail-1", "events":[
+                {"kind":"turn.started", "native_id":"live-start", "ts":original_ts, "data":{"turn_id":"native-turn"}},
+                {"kind":"message.completed", "native_id":"live-message", "ts":original_ts+1, "data":{"turn_id":"native-turn", "text":"live result"}},
+                {"kind":"turn.completed", "native_id":"live-end", "ts":original_ts+2, "data":{"turn_id":"native-turn", "status":"completed"}}
+            ]}), deadline()).await.unwrap();
+        let progress = {
+            let store = store.lock().await;
+            let current = store.get_agent(&agent_id).unwrap().unwrap();
+            assert_eq!(current.state, eliot_core::AgentState::Unknown);
+            assert!(!current.own_identity);
+            assert!(current.active_turn.is_none());
+            assert_eq!(store.get_agent_token(&agent_id, 1).unwrap(), None);
+            assert_eq!(
+                store.get_command(&attach_id).unwrap().unwrap().state,
+                eliot_core::CommandState::Applied
+            );
+            let events = store.read_events(before_facts, 1000, None).unwrap();
+            assert!(
+                events
+                    .iter()
+                    .all(|event| !event.kind.starts_with("command."))
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .find(|event| event.native_id.as_deref() == Some("live-start"))
+                    .unwrap()
+                    .ts,
+                original_ts
+            );
+            assert_eq!(
+                store
+                    .get_turn(&agent_id, 1, "native-turn")
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                eliot_core::TurnState::Completed
+            );
+            store.last_model_progress(&agent_id, 1).unwrap()
+        };
+        let gap_ack = client.call("source.gap", json!({"credential":credential, "agent_id":agent_id,
+            "generation":1, "source":"transcript", "families":["message","tool","turn"],
+            "gap_id":"append-gap", "reason":"append coverage changed", "from":"tail-1", "to":"tail-2"}), deadline()).await.unwrap();
+        assert_eq!(gap_ack["gap_id"], json!("append-gap"));
+        let source = store
+            .lock()
+            .await
+            .read_source_state(&agent_id, 1, "transcript")
+            .unwrap();
+        assert_eq!(source["health"], json!("ok"));
+        assert_eq!(source["gap_id"], json!("append-gap"));
+        assert_eq!(
+            store
+                .lock()
+                .await
+                .last_model_progress(&agent_id, 1)
+                .unwrap(),
+            progress
+        );
+        let before_health = store.lock().await.high_water().unwrap();
+        let binding = source_handoff::SourceBinding {
+            agent_id: &agent_id,
+            generation: 1,
+            observation: Some(&agent),
+        };
+        let error = source_handoff::record_source_health(
+            &store,
+            &bus,
+            json!({"agent_id":agent_id, "generation":1, "source":"transcript", "health":"stale"}),
+            binding,
+            &["transcript".to_owned()],
+            deadline(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "secret_in_payload");
+        assert_eq!(store.lock().await.high_water().unwrap(), before_health);
+        let error = source_handoff::record_source_health(
+            &store,
+            &bus,
+            json!({}),
+            source_handoff::SourceBinding {
+                observation: None,
+                ..binding
+            },
+            &[],
+            deadline(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "unsupported");
+        assert_eq!(store.lock().await.high_water().unwrap(), before_health);
+        let health = json!({"credential":credential, "agent_id":agent_id, "generation":1, "source":"transcript", "health":"stale"});
+        let health_ack = client
+            .call("source.health", health.clone(), deadline())
+            .await
+            .unwrap();
+        assert_eq!(
+            health_ack,
+            json!({"agent_id":agent_id, "generation":1, "source":"transcript", "health":"stale"})
+        );
+        let after_health = store.lock().await.high_water().unwrap();
+        assert_eq!(
+            client
+                .call("source.health", health, deadline())
+                .await
+                .unwrap(),
+            health_ack
+        );
+        assert_eq!(store.lock().await.high_water().unwrap(), after_health);
+        assert_eq!(
+            store
+                .lock()
+                .await
+                .last_model_progress(&agent_id, 1)
+                .unwrap(),
+            progress
+        );
+        assert_eq!(
+            store
+                .lock()
+                .await
+                .read_source_state(&agent_id, 1, "transcript")
+                .unwrap()["cursor"],
+            json!("tail-1")
+        );
+        client.close_input(deadline()).await.unwrap();
+        timeout_at(deadline(), task).await.unwrap().unwrap();
+    }
+
     fn source_exit_fixture(harness: &str) -> (PluginHost, AgentKey, String) {
         let mut store = eliot_store::Store::open(Path::new(":memory:")).unwrap();
         let start_id = Ulid::new().to_string();
@@ -3285,6 +3638,7 @@ mod tests {
                             source: "stream".to_owned(),
                             cursor: None,
                             events: vec![NativeEvent {
+                                ts: None,
                                 kind: kind.to_owned(),
                                 native_id: Ulid::new().to_string(),
                                 data,
@@ -3413,6 +3767,7 @@ mod tests {
                         source: "stream".to_owned(),
                         cursor: None,
                         events: vec![NativeEvent {
+                            ts: None,
                             kind: "session.ready".to_owned(),
                             native_id: "queue-test-ready".to_owned(),
                             data: json!({"command_id":start_id}),
