@@ -447,6 +447,7 @@ pub struct Turn {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubmitCommand {
     pub id: String,
     pub target: Option<String>,

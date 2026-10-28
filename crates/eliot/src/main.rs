@@ -1,13 +1,15 @@
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use eliot_core::{
-    Command as CoreCommand, CommandState, Error as CoreError, Turn as CoreTurn, TurnState,
+    Command as CoreCommand, CommandState, Error as CoreError, SubmitCommand, Turn as CoreTurn,
+    TurnState,
     api::{
         AgentDiscoverRequest, AgentEditsRequest, AgentEditsResponse, AgentGetRequest,
         AgentGetResponse, AgentGitRequest, AgentGitResponse, AgentHistoryRequest, AgentListRequest,
         AgentListResponse, AgentProcessesRequest, AgentProcessesResponse, AgentResultRequest,
         AgentResultResponse, AgentStatsRequest, AgentStatsResponse, CommandGetRequest,
-        DaemonStatusRequest, DaemonStatusResponse, DiscoverPage, EventsFilter, EventsReadRequest,
-        EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse, ObservationPage,
+        CommandSubmitResponse, DaemonShutdownRequest, DaemonShutdownResponse, DaemonStatusRequest,
+        DaemonStatusResponse, DiscoverPage, EventsFilter, EventsReadRequest, EventsReadResponse,
+        EventsSubscribeRequest, EventsSubscribeResponse, ObservationPage, ShutdownMode,
         TurnGetRequest,
     },
 };
@@ -502,12 +504,20 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                             "--foreground is only valid when starting the daemon",
                         ));
                     }
-                    let mode = if args.drain { "drain" } else { "force" };
-                    let result =
-                        mutation_call(&data_dir, "daemon.shutdown", json!({ "mode": mode }), id)
-                            .await?;
-                    print_value(&result, json_output);
-                    Ok(response_exit_code(&result))
+                    let mode = if args.drain {
+                        ShutdownMode::Drain
+                    } else {
+                        ShutdownMode::Force
+                    };
+                    let result = shutdown_daemon(
+                        &data_dir,
+                        &DaemonShutdownRequest::new(mutation_id(id)?, mode),
+                    )
+                    .await?;
+                    let value = serde_json::to_value(&result)
+                        .map_err(|_| Failure::new(4, "daemon.shutdown response is invalid"))?;
+                    print_value(&value, json_output);
+                    Ok(response_exit_code(result.state))
                 }
                 None if foreground => {
                     eliot_daemon::run(data_dir)
@@ -585,15 +595,10 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             if let Some(project) = project {
                 args["project"] = Value::String(project);
             }
-            let result = mutation_call(
-                &data_dir,
-                "command.submit",
-                json!({ "verb": "attach", "args": args }),
-                id,
-            )
-            .await?;
-            print_value(&result, json_output);
-            Ok(response_exit_code(&result))
+            let params = submit_request(id, None, "attach", args)?;
+            let result = submit_command(&data_dir, &params).await?;
+            print_value(&submit_value(&result)?, json_output);
+            Ok(response_exit_code(result.state))
         }
         CliCommand::Launch {
             profile,
@@ -622,44 +627,33 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             if let Some(prompt) = &prompt {
                 args["text"] = Value::String(prompt.clone());
             }
-            let submitted = mutation_call(
-                &data_dir,
-                "command.submit",
-                json!({ "verb": "launch", "args": args }),
-                id,
-            )
-            .await?;
-            let submit_exit = response_exit_code(&submitted);
+            let params = submit_request(id, None, "launch", args)?;
+            let submitted = submit_command(&data_dir, &params).await?;
+            let submit_exit = response_exit_code(submitted.state);
             if matches!(submit_exit, 1 | 3 | 4) {
-                print_value(&submitted, json_output);
+                print_value(&submit_value(&submitted)?, json_output);
                 return Ok(submit_exit);
             }
 
-            let root_id = submitted
-                .get("command_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| Failure::new(4, "launch response omitted command_id"))?;
+            let root_id = &submitted.command_id;
             if !wait {
-                let command = command_value(wait_for_command(&data_dir, root_id, deadline).await?)?;
-                let exit_code = response_exit_code(&command);
-                print_value(&command, json_output);
+                let command = wait_for_command(&data_dir, root_id, deadline).await?;
+                let exit_code = response_exit_code(command.state);
+                print_value(&command_value(command)?, json_output);
                 return Ok(exit_code);
             }
 
             let (completed, exit_code) = if prompt.is_some() {
-                let linked = submitted
-                    .get("linked_command")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        Failure::new(4, "launch response omitted its linked input command")
-                    })?;
+                let linked = submitted.linked_command.as_deref().ok_or_else(|| {
+                    Failure::new(4, "launch response omitted its linked input command")
+                })?;
                 let turn = wait_for_turn(&data_dir, linked, deadline).await?;
                 let exit_code = turn_exit_code(&turn);
                 (turn_value(turn)?, exit_code)
             } else {
-                let command = command_value(wait_for_command(&data_dir, root_id, deadline).await?)?;
-                let exit_code = response_exit_code(&command);
-                (command, exit_code)
+                let command = wait_for_command(&data_dir, root_id, deadline).await?;
+                let exit_code = response_exit_code(command.state);
+                (command_value(command)?, exit_code)
             };
             print_value(&completed, json_output);
             Ok(exit_code)
@@ -677,30 +671,20 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             } else {
                 None
             };
-            let mut params = json!({
-                "target": agent,
-                "verb": "send",
-                "args": { "text": text },
-            });
-            if let Some(generation) = generation {
-                params["expected_generation"] = json!(generation);
-            }
-            let submitted = mutation_call(&data_dir, "command.submit", params, id).await?;
-            let submit_exit = response_exit_code(&submitted);
+            let mut params = submit_request(id, Some(agent), "send", json!({ "text": text }))?;
+            params.expected_generation = generation;
+            let submitted = submit_command(&data_dir, &params).await?;
+            let submit_exit = response_exit_code(submitted.state);
             if matches!(submit_exit, 1 | 3 | 4) {
-                print_value(&submitted, json_output);
+                print_value(&submit_value(&submitted)?, json_output);
                 return Ok(submit_exit);
             }
             if !wait {
-                print_value(&submitted, json_output);
+                print_value(&submit_value(&submitted)?, json_output);
                 return Ok(submit_exit);
             }
             let deadline = deadline.ok_or_else(|| Failure::new(2, "missing wait deadline"))?;
-            let command_id = submitted
-                .get("command_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| Failure::new(4, "send response omitted command_id"))?;
-            let completed = wait_for_turn(&data_dir, command_id, deadline).await?;
+            let completed = wait_for_turn(&data_dir, &submitted.command_id, deadline).await?;
             let exit_code = turn_exit_code(&completed);
             print_value(&turn_value(completed)?, json_output);
             Ok(exit_code)
@@ -721,45 +705,31 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             if let Some(prompt) = &prompt {
                 args["text"] = Value::String(prompt.clone());
             }
-            let mut params = json!({
-                "target": agent,
-                "verb": "resume",
-                "args": args,
-            });
-            if let Some(generation) = generation {
-                params["expected_generation"] = json!(generation);
-            }
-            let submitted = mutation_call(&data_dir, "command.submit", params, id).await?;
-            let submit_exit = response_exit_code(&submitted);
+            let mut params = submit_request(id, Some(agent), "resume", args)?;
+            params.expected_generation = generation;
+            let submitted = submit_command(&data_dir, &params).await?;
+            let submit_exit = response_exit_code(submitted.state);
             if matches!(submit_exit, 1 | 3 | 4) {
-                print_value(&submitted, json_output);
+                print_value(&submit_value(&submitted)?, json_output);
                 return Ok(submit_exit);
             }
             if !wait {
-                print_value(&submitted, json_output);
+                print_value(&submit_value(&submitted)?, json_output);
                 return Ok(submit_exit);
             }
 
             let deadline = deadline.ok_or_else(|| Failure::new(2, "missing wait deadline"))?;
-            let command_id = submitted
-                .get("command_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| Failure::new(4, "resume response omitted command_id"))?;
             let (completed, exit_code) = if prompt.is_some() {
-                let linked = submitted
-                    .get("linked_command")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        Failure::new(4, "resume response omitted its linked input command")
-                    })?;
+                let linked = submitted.linked_command.as_deref().ok_or_else(|| {
+                    Failure::new(4, "resume response omitted its linked input command")
+                })?;
                 let turn = wait_for_turn(&data_dir, linked, deadline).await?;
                 let exit_code = turn_exit_code(&turn);
                 (turn_value(turn)?, exit_code)
             } else {
-                let command =
-                    command_value(wait_for_command(&data_dir, command_id, deadline).await?)?;
-                let exit_code = response_exit_code(&command);
-                (command, exit_code)
+                let command = wait_for_command(&data_dir, &submitted.command_id, deadline).await?;
+                let exit_code = response_exit_code(command.state);
+                (command_value(command)?, exit_code)
             };
             print_value(&completed, json_output);
             Ok(exit_code)
@@ -771,80 +741,48 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             turn,
         } => {
             validate_text(Some(&text))?;
-            let mut params = json!({
-                "target": agent,
-                "verb": "steer",
-                "args": { "text": text },
-            });
-            if let Some(generation) = generation {
-                params["expected_generation"] = json!(generation);
-            }
-            if let Some(turn) = turn {
-                params["expected_turn_id"] = Value::String(turn);
-            }
-            let result = mutation_call(&data_dir, "command.submit", params, id).await?;
-            print_value(&result, json_output);
-            Ok(response_exit_code(&result))
+            let mut params = submit_request(id, Some(agent), "steer", json!({ "text": text }))?;
+            params.expected_generation = generation;
+            params.expected_turn_id = turn;
+            let result = submit_command(&data_dir, &params).await?;
+            print_value(&submit_value(&result)?, json_output);
+            Ok(response_exit_code(result.state))
         }
         CliCommand::Interrupt {
             agent,
             generation,
             turn,
         } => {
-            let mut params = json!({
-                "target": agent,
-                "verb": "interrupt",
-                "args": {},
-            });
-            if let Some(generation) = generation {
-                params["expected_generation"] = json!(generation);
-            }
-            if let Some(turn) = turn {
-                params["expected_turn_id"] = Value::String(turn);
-            }
-            let result = mutation_call(&data_dir, "command.submit", params, id).await?;
-            print_value(&result, json_output);
-            Ok(response_exit_code(&result))
+            let mut params = submit_request(id, Some(agent), "interrupt", json!({}))?;
+            params.expected_generation = generation;
+            params.expected_turn_id = turn;
+            let result = submit_command(&data_dir, &params).await?;
+            print_value(&submit_value(&result)?, json_output);
+            Ok(response_exit_code(result.state))
         }
         CliCommand::Approve {
             agent,
             generation,
             request,
         } => {
-            let mut params = json!({
-                "target": agent,
-                "verb": "approve",
-                "args": {},
-            });
-            if let Some(generation) = generation {
-                params["expected_generation"] = json!(generation);
-            }
-            if let Some(request) = request {
-                params["request_id"] = Value::String(request);
-            }
-            let result = mutation_call(&data_dir, "command.submit", params, id).await?;
-            print_value(&result, json_output);
-            Ok(response_exit_code(&result))
+            let mut params = submit_request(id, Some(agent), "approve", json!({}))?;
+            params.expected_generation = generation;
+            params.request_id = request;
+            let result = submit_command(&data_dir, &params).await?;
+            print_value(&submit_value(&result)?, json_output);
+            Ok(response_exit_code(result.state))
         }
         CliCommand::Deny {
             agent,
             generation,
             request,
         } => {
-            let mut params = json!({
-                "target": agent,
-                "verb": "deny",
-                "args": {},
-            });
-            if let Some(generation) = generation {
-                params["expected_generation"] = json!(generation);
-            }
-            if let Some(request) = request {
-                params["request_id"] = Value::String(request);
-            }
-            let result = mutation_call(&data_dir, "command.submit", params, id).await?;
-            print_value(&result, json_output);
-            Ok(response_exit_code(&result))
+            let mut params = submit_request(id, Some(agent), "deny", json!({}))?;
+            params.expected_generation = generation;
+            params.request_id = request;
+            let result = submit_command(&data_dir, &params).await?;
+            print_value(&submit_value(&result)?, json_output);
+            Ok(response_exit_code(result.state))
         }
         CliCommand::Answer {
             agent,
@@ -853,20 +791,13 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             request,
         } => {
             let answers = read_answers_file(&answers_file)?;
-            let mut params = json!({
-                "target": agent,
-                "verb": "answer",
-                "args": { "answers": answers },
-            });
-            if let Some(generation) = generation {
-                params["expected_generation"] = json!(generation);
-            }
-            if let Some(request) = request {
-                params["request_id"] = Value::String(request);
-            }
-            let result = mutation_call(&data_dir, "command.submit", params, id).await?;
-            print_value(&result, json_output);
-            Ok(response_exit_code(&result))
+            let mut params =
+                submit_request(id, Some(agent), "answer", json!({ "answers": answers }))?;
+            params.expected_generation = generation;
+            params.request_id = request;
+            let result = submit_command(&data_dir, &params).await?;
+            print_value(&submit_value(&result)?, json_output);
+            Ok(response_exit_code(result.state))
         }
         CliCommand::Ls { after, limit } => {
             validate_limit(limit)?;
@@ -1091,62 +1022,39 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             Ok(0)
         }
         CliCommand::Detach { agent, generation } => {
-            let mut params = json!({
-                "target": agent,
-                "verb": "detach",
-                "args": {},
-            });
-            if let Some(generation) = generation {
-                params["expected_generation"] = json!(generation);
-            }
-            let result = mutation_call(&data_dir, "command.submit", params, id).await?;
-            print_value(&result, json_output);
-            Ok(response_exit_code(&result))
+            let mut params = submit_request(id, Some(agent), "detach", json!({}))?;
+            params.expected_generation = generation;
+            let result = submit_command(&data_dir, &params).await?;
+            print_value(&submit_value(&result)?, json_output);
+            Ok(response_exit_code(result.state))
         }
         CliCommand::Stop {
             agent,
             force,
             generation,
         } => {
-            let mut params = json!({
-                "target": agent,
-                "verb": "stop",
-                "args": { "force": force },
-            });
-            if let Some(generation) = generation {
-                params["expected_generation"] = json!(generation);
-            }
-            let result = mutation_call(&data_dir, "command.submit", params, id).await?;
-            print_value(&result, json_output);
-            Ok(response_exit_code(&result))
+            let mut params = submit_request(id, Some(agent), "stop", json!({ "force": force }))?;
+            params.expected_generation = generation;
+            let result = submit_command(&data_dir, &params).await?;
+            print_value(&submit_value(&result)?, json_output);
+            Ok(response_exit_code(result.state))
         }
         CliCommand::Worktree { command } => match command {
             WorktreeCommand::Remove { agent, generation } => {
                 let deadline = wait_deadline(DEFAULT_WAIT_SECONDS)?;
-                let mut params = json!({
-                    "target": agent,
-                    "verb": "worktree.remove",
-                    "args": {},
-                });
-                if let Some(generation) = generation {
-                    params["expected_generation"] = json!(generation);
-                }
-                let submitted = mutation_call(&data_dir, "command.submit", params, id).await?;
-                let submit_exit = response_exit_code(&submitted);
+                let mut params = submit_request(id, Some(agent), "worktree.remove", json!({}))?;
+                params.expected_generation = generation;
+                let submitted = submit_command(&data_dir, &params).await?;
+                let submit_exit = response_exit_code(submitted.state);
                 if matches!(submit_exit, 1 | 3 | 4) {
-                    print_value(&submitted, json_output);
+                    print_value(&submit_value(&submitted)?, json_output);
                     return Ok(submit_exit);
                 }
-                let command_id = submitted
-                    .get("command_id")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        Failure::new(4, "worktree removal response omitted command_id")
-                    })?;
                 let completed =
-                    command_value(wait_for_command(&data_dir, command_id, deadline).await?)?;
-                print_value(&completed, json_output);
-                Ok(response_exit_code(&completed))
+                    wait_for_command(&data_dir, &submitted.command_id, deadline).await?;
+                let exit_code = response_exit_code(completed.state);
+                print_value(&command_value(completed)?, json_output);
+                Ok(exit_code)
             }
         },
         CliCommand::Cmd { command } => match command {
@@ -1242,12 +1150,7 @@ fn start_daemon(data_dir: &Path, json_output: bool) -> Result<(), Failure> {
     Ok(())
 }
 
-async fn mutation_call(
-    data_dir: &Path,
-    method: &str,
-    mut params: Value,
-    supplied_id: Option<String>,
-) -> Result<Value, Failure> {
+fn mutation_id(supplied_id: Option<String>) -> Result<String, Failure> {
     let id = match supplied_id {
         Some(id) => {
             Ulid::from_string(&id).map_err(|_| Failure::new(2, "--id must be a valid ULID"))?;
@@ -1255,14 +1158,59 @@ async fn mutation_call(
         }
         None => Ulid::new().to_string(),
     };
-    let object = params
-        .as_object_mut()
-        .ok_or_else(|| Failure::new(2, "internal CLI error: mutation params must be an object"))?;
-    object.insert("id".to_owned(), Value::String(id.clone()));
     eprintln!("id={id}");
-    eliot_daemon::client_call(data_dir, method, params)
-        .await
-        .map_err(|error| Failure::from_core(error, true))
+    Ok(id)
+}
+
+fn submit_request(
+    supplied_id: Option<String>,
+    target: Option<String>,
+    verb: &str,
+    args: Value,
+) -> Result<SubmitCommand, Failure> {
+    let mut request = SubmitCommand::new(mutation_id(supplied_id)?, verb);
+    request.target = target;
+    request.args = args;
+    Ok(request)
+}
+
+async fn submit_command(
+    data_dir: &Path,
+    params: &SubmitCommand,
+) -> Result<CommandSubmitResponse, Failure> {
+    params
+        .validate()
+        .map_err(|error| Failure::from_core(error, true))?;
+    let response: CommandSubmitResponse =
+        eliot_daemon::client_call_typed(data_dir, "command.submit", params)
+            .await
+            .map_err(|error| Failure::from_core(error, true))?;
+    params
+        .validate_response(&response)
+        .map_err(|_| Failure::new(4, "command.submit response is invalid"))?;
+    Ok(response)
+}
+
+async fn shutdown_daemon(
+    data_dir: &Path,
+    params: &DaemonShutdownRequest,
+) -> Result<DaemonShutdownResponse, Failure> {
+    params
+        .validate()
+        .map_err(|error| Failure::from_core(error, true))?;
+    let response: DaemonShutdownResponse =
+        eliot_daemon::client_call_typed(data_dir, "daemon.shutdown", params)
+            .await
+            .map_err(|error| Failure::from_core(error, true))?;
+    params
+        .validate_response(&response)
+        .map_err(|_| Failure::new(4, "daemon.shutdown response is invalid"))?;
+    Ok(response)
+}
+
+fn submit_value(response: &CommandSubmitResponse) -> Result<Value, Failure> {
+    serde_json::to_value(response)
+        .map_err(|_| Failure::new(4, "command.submit response is invalid"))
 }
 
 fn read_answers_file(path: &Path) -> Result<Value, Failure> {
@@ -1446,14 +1394,13 @@ async fn sleep_before_deadline(deadline: Instant) -> Result<(), Failure> {
         .map_err(|_| Failure::timeout())
 }
 
-fn response_exit_code(response: &Value) -> u8 {
-    match response.get("state").and_then(Value::as_str) {
-        None | Some("accepted" | "queued" | "applied") => 0,
-        Some("rejected") => 3,
-        Some("failed" | "cancelled") => 1,
-        Some("unknown") => 4,
-        Some("dispatched") => 6,
-        Some(_) => 6,
+fn response_exit_code(state: CommandState) -> u8 {
+    match state {
+        CommandState::Accepted | CommandState::Queued | CommandState::Applied => 0,
+        CommandState::Rejected => 3,
+        CommandState::Failed | CommandState::Cancelled => 1,
+        CommandState::Unknown => 4,
+        CommandState::Dispatched => 6,
     }
 }
 

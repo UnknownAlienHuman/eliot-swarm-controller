@@ -1,8 +1,10 @@
-//! Public event-read DTOs. Authorization, high-water and live-buffer behavior
-//! remain in the Router; this module only validates the implemented wire shape.
+//! Shared public API DTOs for events, views, reads and mutations. Authorization,
+//! admission and effect handling remain in the Router and Store.
 
 mod agent_views;
 mod monitor_views;
+mod mutation_validation;
+mod mutations;
 mod native_pages;
 mod native_requests;
 mod read_validation;
@@ -19,6 +21,10 @@ pub use monitor_views::{
     FilesystemInvalidationState, FilesystemInvalidationView, GitObservation, GitView,
     LivenessBasis, LivenessView, MonitoringSourceState, ObservationData, ObservationView,
     ProcessStatsView, StatsCoverage, WorkspaceObservation, WorkspaceView,
+};
+pub use mutations::{
+    CommandSubmitRequest, CommandSubmitResponse, DaemonShutdownRequest, DaemonShutdownResponse,
+    ShutdownMode,
 };
 pub use native_pages::{
     DiscoverCoverage, DiscoverPage, DiscoverSubject, MAX_DISCOVER_PAGE_BYTES,

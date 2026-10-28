@@ -34,6 +34,16 @@ wait timeout. Same binding returns the retained result; different binding is
 `id_conflict`; absent expired id is `id_expired`. Retry a lost client reply with the
 same id, never a new native effect.
 
+The CLI validates supplied ULIDs and sends them in uppercase. A direct RPC ID is used
+literally by Router and Store as the mutation key; retry that same spelling.
+
+Before printing either mutation reply or using it for exit/wait decisions, the CLI
+validates the exact `command_id`, a nonempty response Agent, any explicit target, and a
+nonnegative response generation without requiring universal equality to
+`expected_generation`. Launch/resume with nonblank input requires the exact
+`<id>/send` link. Shutdown validates the retained mode and reply shape; a mismatch is
+`unknown` (exit 4), and even `applied` does not prove the daemon exited.
+
 Commands store the binding directly; other writes use:
 
 ```sql
@@ -181,19 +191,32 @@ process statistics nor model progress.
 
 ```text
 command.submit {
-  id, target?, verb, args,
-  expected_generation?, expected_turn_id?, request_id?
+  id:ULID, target?:string, verb:string, args?:object,
+  expected_generation?:i64, expected_turn_id?:string, request_id?:string
 }
--> {command_id, agent?, generation?, state, outcome?, linked_command?, fanout?:{count}}
+-> CommandSubmitResponse {command_id:string, agent:string|null, generation:i64|null,
+    state:CommandState, outcome:Value|null, linked_command:string|null}
 ```
 
-In one transaction resolve the target, validate principal/capability/state, compare
-supplied expectations, capture exact generation/turn/request, then persist immutable
-rows/events. Interactive calls may omit expectations; delayed automation supplies its
-captured expectations. Mismatch rejects before native I/O.
+The shared request type is `core::api::CommandSubmitRequest`, an alias of Core
+`SubmitCommand`. `id` and `verb` are required; unknown fields and wrong types are
+`invalid`. Optional `target`, `expected_generation`, `expected_turn_id` and `request_id`
+may be omitted or `null` to mean absent. `args` defaults to `{}` only when omitted and
+must be a JSON object; explicit `null` or another type is `invalid`. Absent expectations
+remain absent. The response has these six members; `fanout` is not part of the current
+response.
 
-The current request does not accept `selector` or `probe`; the Router rejects either
-field. These remain deferred `command.submit` extensions (`selector?`, `probe? [false]`),
+Resolve the target and validate principal/capability/state before persisting the command
+binding and events. Each verb checks `expected_generation` at its defined admission or
+dispatch fence; it is not a universal equality check against the current generation at
+the RPC boundary. The applicable expected-generation/turn mismatch rejects before that
+verb's native effect. A generation-changing verb can establish or update its command
+generation at dispatch, so the response generation is not universally equal to
+`expected_generation`. Interactive calls may omit expectations; delayed automation
+supplies its captured expectations.
+
+The current request does not accept `selector` or `probe`; unknown request fields are
+`invalid`. These remain deferred `command.submit` extensions (`selector?`, `probe? [false]`),
 not fields to send to the current API. The future selector contract is below; probe
 semantics remain with its future owning feature and are not inferred here.
 
@@ -514,6 +537,25 @@ A lost response may redisplay mail, not lose it or acknowledge newly arrived mes
 See [coordination](coordination.md#mailbox) for bounds and presentation policy.
 
 ## Drain and shutdown
+
+```text
+daemon.shutdown {id:ULID, mode:"drain"|"force"}
+  -> DaemonShutdownResponse {state, mode, blockers?:[StatusBlocker], store_write_faulted?:bool}
+```
+
+This owner-only request requires exactly an `id` and the `ShutdownMode` value `drain` or
+`force`; unknown fields, missing fields, wrong types and nulls are `invalid`. Its first
+reply is retained under the literal mutation ID. An exact retry returns that same reply,
+including the original drain blocker snapshot; use owner-only `daemon.status` for current
+state. Reusing the ID with another mode returns `id_conflict`.
+Force admission is monotonic; a later, in-flight, or replayed drain cannot downgrade it.
+
+Drain returns `state:"applied"` with an empty typed blocker list when no blockers were
+observed, otherwise `state:"dispatched"` with the captured `StatusBlocker` list. Force
+normally returns `state:"dispatched"` and no blocker list. If a Store write fault
+prevents retaining the force reply, the fallback still dispatches force and returns
+`store_write_faulted:true` with the dispatched state; that fallback is not a retained
+write result. When present, `store_write_faulted` is true.
 
 Drain rejects new turn-producing work and new automation, while continuing pre-admitted
 work and allowing exact stop/interrupt/request replies/cancel/detach/readback. Unknown
