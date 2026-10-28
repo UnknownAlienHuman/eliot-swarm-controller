@@ -2151,12 +2151,10 @@ impl Store {
                 events: Vec::new(),
             });
         }
-        if matches!(record.state, CommandState::Accepted | CommandState::Queued)
-            && state != CommandState::Rejected
-        {
+        if !core::command_transition_allowed(record.state, state) {
             return Err(Error::new(
                 "bad_state",
-                "an undispatched command can only be rejected before native I/O",
+                "command state transition is not allowed for ordinary settlement",
             ));
         }
         if state == CommandState::Applied
@@ -4741,14 +4739,17 @@ fn settle_preparation_command(
     if !matches!(
         command.state,
         CommandState::Accepted | CommandState::Queued | CommandState::Unknown
-    ) {
+    ) || !core::workspace_preparation_transition_allowed(command.state, state)
+    {
         return Err(Error::new(
             "bad_state",
             "workspace start is already settled or dispatched",
         ));
     }
     let outcome = json!({"stage": "workspace", "native_dispatched": false, "target_generation": workspace.target_generation, "detail": workspace.outcome});
-    update_command_state(tx, &command.command.id, state, Some(&outcome), None, now)?;
+    // preparation_command plus the typed workspace caller prove the pre-native
+    // marker/verb/generation exception; ordinary settlement cannot use it.
+    write_command_state(tx, &command.command.id, state, Some(&outcome), None, now)?;
     if command.command.verb == "launch" {
         let next = match state {
             CommandState::Failed => AgentState::Failed,
@@ -5136,7 +5137,16 @@ impl Store {
                             WorkspacePhase::SetupReady
                         };
                         if command.state == CommandState::Unknown {
-                            update_command_state(
+                            if !core::workspace_preparation_transition_allowed(
+                                command.state,
+                                CommandState::Accepted,
+                            ) {
+                                return Err(Error::new(
+                                    "bad_state",
+                                    "workspace creation readback transition is not allowed",
+                                ));
+                            }
+                            write_command_state(
                                 &tx,
                                 command_id,
                                 CommandState::Accepted,
@@ -5695,425 +5705,6 @@ fn validate_process_generation(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{Store, contains_secret_marker};
-    use eliot_core::{
-        AgentState, CommandState, NativeEvent, SourceBatch, SourceGap, SubmitCommand,
-    };
-    use serde_json::json;
-    use std::{
-        path::Path,
-        time::{SystemTime, UNIX_EPOCH},
-    };
-    use ulid::Ulid;
-
-    #[test]
-    fn secret_question_answer_is_rejected_before_command_persistence() {
-        assert!(contains_secret_marker(
-            &json!({"questions": [{"is_secret": true}]})
-        ));
-        assert!(contains_secret_marker(
-            &json!({"native": {"question": {"isSecret": true}}})
-        ));
-        assert!(!contains_secret_marker(
-            &json!({"questions": [{"is_secret": false}]})
-        ));
-
-        let launch_id = Ulid::new().to_string();
-        let send_id = Ulid::new().to_string();
-        let answer_id = Ulid::new().to_string();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time is after the Unix epoch")
-            .as_millis()
-            .try_into()
-            .expect("system time in milliseconds fits in i64");
-        let mut store = Store::open(Path::new(":memory:")).expect("open in-memory Store");
-        let admission = store
-            .submit(
-                "owner",
-                SubmitCommand {
-                    id: launch_id.clone(),
-                    target: None,
-                    verb: "launch".to_owned(),
-                    args: json!({
-                        "project": "secret-answer-regression",
-                        "workspace": "synthetic-workspace",
-                        "harness": "codex",
-                        "profile": "synthetic-codex",
-                        "profile_snapshot": {}
-                    }),
-                    expected_generation: Some(0),
-                    expected_turn_id: None,
-                    request_id: None,
-                },
-                now,
-            )
-            .expect("admit Codex launch");
-        let started = store
-            .dispatch(&launch_id, now)
-            .expect("dispatch Codex launch");
-        let agent_id = admission
-            .command
-            .target
-            .expect("launch admission returns its Agent");
-        assert_eq!(started.value.generation, Some(1));
-        store
-            .put_batch(
-                SourceBatch {
-                    batch_id: Ulid::new().to_string(),
-                    agent_id: agent_id.clone(),
-                    generation: 1,
-                    source: "stream".to_owned(),
-                    events: vec![NativeEvent {
-                        kind: "session.ready".to_owned(),
-                        native_id: "ready-1".to_owned(),
-                        data: json!({
-                            "native_scope": "synthetic-codex-home",
-                            "native_ref": "synthetic-thread",
-                            "effective": {}
-                        }),
-                    }],
-                    cursor: None,
-                },
-                now,
-            )
-            .expect("commit synthetic session readiness");
-        store
-            .settle(
-                &launch_id,
-                CommandState::Applied,
-                Some(json!({"state": "ready"})),
-                now,
-            )
-            .expect("settle launch");
-        store
-            .submit(
-                "owner",
-                SubmitCommand {
-                    id: send_id.clone(),
-                    target: Some(agent_id.clone()),
-                    verb: "send".to_owned(),
-                    args: json!({"text": "trigger synthetic request"}),
-                    expected_generation: Some(1),
-                    expected_turn_id: None,
-                    request_id: None,
-                },
-                now,
-            )
-            .expect("admit synthetic input");
-        store
-            .dispatch(&send_id, now)
-            .expect("dispatch synthetic input");
-        store
-            .put_batch(
-                SourceBatch {
-                    batch_id: Ulid::new().to_string(),
-                    agent_id: agent_id.clone(),
-                    generation: 1,
-                    source: "stream".to_owned(),
-                    events: vec![NativeEvent {
-                        kind: "turn.started".to_owned(),
-                        native_id: "turn-started-1".to_owned(),
-                        data: json!({"command_id": send_id, "turn_id": "turn-1"}),
-                    }],
-                    cursor: None,
-                },
-                now,
-            )
-            .expect("commit synthetic turn start");
-        store
-            .put_batch(
-                SourceBatch {
-                    batch_id: Ulid::new().to_string(),
-                    agent_id: agent_id.clone(),
-                    generation: 1,
-                    source: "stream".to_owned(),
-                    events: vec![NativeEvent {
-                        kind: "request.opened".to_owned(),
-                        native_id: "request-opened-1".to_owned(),
-                        data: json!({
-                            "command_id": send_id,
-                            "request_id": "public-request-1",
-                            "turn_id": "turn-1",
-                            "kind": "question",
-                            "details": {
-                                "questions": [{"id": "q1", "is_secret": true}]
-                            }
-                        }),
-                    }],
-                    cursor: None,
-                },
-                now,
-            )
-            .expect("commit synthetic secret question");
-
-        let marker = "synthetic-answer-secret-marker";
-        let error = store
-            .submit(
-                "owner",
-                SubmitCommand {
-                    id: answer_id.clone(),
-                    target: Some(agent_id),
-                    verb: "answer".to_owned(),
-                    args: json!({"text": marker}),
-                    expected_generation: None,
-                    expected_turn_id: None,
-                    request_id: None,
-                },
-                now,
-            )
-            .expect_err("secret question answers must be rejected");
-        assert_eq!(error.code, "secret_in_payload");
-        assert!(
-            store
-                .get_command(&answer_id)
-                .expect("read rejected answer command")
-                .is_none(),
-            "rejected answer args must not be persisted"
-        );
-    }
-
-    #[test]
-    fn native_request_cleanup_does_not_acknowledge_reply() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time is after the Unix epoch")
-            .as_millis()
-            .try_into()
-            .expect("system time in milliseconds fits in i64");
-        let mut store = Store::open(Path::new(":memory:")).expect("open in-memory Store");
-        let command = |verb: &str, target, args, request_id| SubmitCommand {
-            id: Ulid::new().to_string(),
-            target,
-            verb: verb.to_owned(),
-            args,
-            expected_generation: None,
-            expected_turn_id: None,
-            request_id,
-        };
-        let launch = command(
-            "launch",
-            None,
-            json!({
-                "project": "native-request-cleanup",
-                "workspace": "synthetic-workspace",
-                "harness": "codex",
-                "profile": "synthetic-codex",
-                "profile_snapshot": {}
-            }),
-            None,
-        );
-        let launch_id = launch.id.clone();
-        let agent_id = store
-            .submit("owner", launch, now)
-            .expect("admit launch")
-            .command
-            .target
-            .expect("launch returns an Agent");
-        store.dispatch(&launch_id, now).expect("dispatch launch");
-        let batch = |kind: &str, data| SourceBatch {
-            batch_id: Ulid::new().to_string(),
-            agent_id: agent_id.clone(),
-            generation: 1,
-            source: "stream".to_owned(),
-            events: vec![NativeEvent {
-                kind: kind.to_owned(),
-                native_id: Ulid::new().to_string(),
-                data,
-            }],
-            cursor: None,
-        };
-        store
-            .put_batch(batch("session.ready", json!({})), now)
-            .expect("commit session readiness");
-        store
-            .settle(&launch_id, CommandState::Applied, None, now)
-            .expect("settle launch");
-        let send = command(
-            "send",
-            Some(agent_id.clone()),
-            json!({"text": "open native requests"}),
-            None,
-        );
-        let send_id = send.id.clone();
-        store.submit("owner", send, now).expect("admit input");
-        store.dispatch(&send_id, now).expect("dispatch input");
-        store
-            .put_batch(
-                batch(
-                    "turn.started",
-                    json!({"command_id": send_id, "turn_id": "turn-1"}),
-                ),
-                now,
-            )
-            .expect("commit exact turn association");
-        for request_id in ["cleanup-only", "uncertain-reply"] {
-            store
-                .put_batch(
-                    batch(
-                        "request.opened",
-                        json!({
-                            "command_id": send_id,
-                            "request_id": request_id,
-                            "turn_id": "turn-1",
-                            "kind": "approval",
-                            "details": {}
-                        }),
-                    ),
-                    now,
-                )
-                .expect("commit pending request");
-        }
-        let reply = command(
-            "approve",
-            Some(agent_id.clone()),
-            json!({}),
-            Some("uncertain-reply".to_owned()),
-        );
-        let reply_id = reply.id.clone();
-        store.submit("owner", reply, now).expect("admit reply");
-        store.dispatch(&reply_id, now).expect("dispatch reply");
-        let unknown_reply = store
-            .settle(
-                &reply_id,
-                CommandState::Unknown,
-                Some(json!({"reason": "native reply outcome unknown"})),
-                now,
-            )
-            .expect("retain unknown reply outcome")
-            .value;
-
-        let close_data = json!({"request_id": "cleanup-only", "turn_id": "turn-1"});
-        let mut wrong_source = batch("request.closed", close_data.clone());
-        wrong_source.source = "unowned".to_owned();
-        let mut wrong_generation = batch("request.closed", close_data.clone());
-        wrong_generation.generation = 2;
-        let before_rejections = store.high_water().expect("read event high water");
-        for (invalid, code) in [
-            (wrong_source, "source_integrity"),
-            (wrong_generation, "stale_generation"),
-            (
-                batch(
-                    "request.closed",
-                    json!({"request_id": "missing", "turn_id": "turn-1"}),
-                ),
-                "source_integrity",
-            ),
-            (
-                batch(
-                    "request.closed",
-                    json!({"request_id": "cleanup-only", "turn_id": "other-turn"}),
-                ),
-                "source_integrity",
-            ),
-            (batch("request.resolved", close_data.clone()), "invalid"),
-            (
-                batch(
-                    "request.resolved",
-                    json!({
-                        "request_id": "cleanup-only", "turn_id": "turn-1",
-                        "command_id": send_id
-                    }),
-                ),
-                "source_integrity",
-            ),
-            (
-                batch(
-                    "request.closed",
-                    json!({
-                        "request_id": "cleanup-only", "turn_id": "turn-1",
-                        "command_id": reply_id
-                    }),
-                ),
-                "invalid",
-            ),
-        ] {
-            let error = store
-                .put_batch(invalid, now)
-                .expect_err("reject wrong binding");
-            assert_eq!(error.code, code);
-        }
-        assert_eq!(
-            store.high_water().expect("read event high water"),
-            before_rejections
-        );
-
-        store
-            .record_source_gap(
-                SourceGap {
-                    gap_id: "independent-gap".to_owned(),
-                    agent_id: agent_id.clone(),
-                    generation: 1,
-                    source: "stream".to_owned(),
-                    families: vec!["request".to_owned()],
-                    reason: "synthetic source gap".to_owned(),
-                    from: None,
-                    to: None,
-                },
-                now,
-            )
-            .expect("record independent source gap");
-        let source_before = store
-            .read_source_state(&agent_id, 1, "stream")
-            .expect("read source gap before cleanup");
-        for (request_id, expected_state, remaining) in [
-            ("cleanup-only", AgentState::Waiting, 1),
-            ("uncertain-reply", AgentState::Busy, 0),
-        ] {
-            let cleanup = store
-                .put_batch(
-                    batch(
-                        "request.closed",
-                        json!({"request_id": request_id, "turn_id": "turn-1"}),
-                    ),
-                    now,
-                )
-                .expect("commit native request cleanup without a reply acknowledgement");
-            assert_eq!(cleanup.events.len(), 1);
-            assert_eq!(cleanup.events[0].kind, "request.closed");
-            assert!(cleanup.events[0].data.get("command_id").is_none());
-            let agent = store
-                .get_agent(&agent_id)
-                .expect("read Agent")
-                .expect("Agent exists");
-            assert_eq!(agent.state, expected_state);
-            assert_eq!(agent.pending.len(), remaining);
-            assert!(!agent.pending.iter().any(|pending| pending.id == request_id));
-            assert_eq!(agent.active_turn.as_deref(), Some("turn-1"));
-            assert_eq!(
-                store.get_command(&reply_id).expect("read reply"),
-                Some(unknown_reply.clone())
-            );
-
-            let late_reply = command(
-                "approve",
-                Some(agent_id.clone()),
-                json!({}),
-                Some(request_id.to_owned()),
-            );
-            let late_reply_id = late_reply.id.clone();
-            let error = store
-                .submit("owner", late_reply, now)
-                .expect_err("durable pending row must already be resolved");
-            assert_eq!(error.code, "source_integrity");
-            assert!(
-                store
-                    .get_command(&late_reply_id)
-                    .expect("read late reply")
-                    .is_none()
-            );
-        }
-        let source_after = store
-            .read_source_state(&agent_id, 1, "stream")
-            .expect("read source gap after cleanup");
-        for field in ["gap_id", "gap_digest", "gap_seq", "health"] {
-            assert_eq!(source_after[field], source_before[field]);
-        }
-    }
-}
-
 struct AgentRecord {
     id: i64,
     generation: i64,
@@ -6516,6 +6107,31 @@ fn insert_command(tx: &Transaction<'_>, command: &CommandInsert<'_>) -> Result<(
 }
 
 fn update_command_state(
+    tx: &Transaction<'_>,
+    id: &str,
+    state: CommandState,
+    outcome: Option<&Value>,
+    generation: Option<i64>,
+    now: i64,
+) -> Result<()> {
+    let previous: String = tx
+        .query_row("SELECT state FROM commands WHERE id = ?1", [id], |row| {
+            row.get(0)
+        })
+        .optional()
+        .map_err(sql_error)?
+        .ok_or_else(|| Error::new("not_found", "command state row was not found"))?;
+    let previous: CommandState = parse_enum(&previous, "command state")?;
+    if !core::command_transition_allowed(previous, state) {
+        return Err(Error::new(
+            "bad_state",
+            "command state transition is not allowed",
+        ));
+    }
+    write_command_state(tx, id, state, outcome, generation, now)
+}
+
+fn write_command_state(
     tx: &Transaction<'_>,
     id: &str,
     state: CommandState,
@@ -6947,7 +6563,8 @@ fn persist_effects(
     now: i64,
     native_event: &NativeEvent,
     next_agent: &Agent,
-) -> Result<()> {
+) -> Result<Vec<Value>> {
+    let mut command_events = Vec::new();
     for effect in effects {
         match effect {
             Effect::CommandTurnAssociated {
@@ -6964,7 +6581,8 @@ fn persist_effects(
                 if !matches!(
                     command.command.state,
                     CommandState::Dispatched | CommandState::Unknown
-                ) || command.command.turn_id.is_some()
+                ) || !core::command_transition_allowed(command.state, CommandState::Applied)
+                    || command.command.turn_id.is_some()
                     || command
                         .expected_turn_id
                         .as_deref()
@@ -7000,6 +6618,9 @@ fn persist_effects(
                                          updated_at = ?3 WHERE id = ?4",
                     params![turn_id, encode_json(&outcome)?, now, command_id],
                 ));
+                command_events.push(json!({
+                    "command_id": command_id, "state": "applied", "outcome": outcome,
+                }));
             }
             Effect::RequestPending {
                 request_id,
@@ -7314,7 +6935,7 @@ fn persist_effects(
             }
         }
     }
-    Ok(())
+    Ok(command_events)
 }
 
 fn require_effect_command(
@@ -7768,8 +7389,34 @@ fn terminalize_generation_commands(
     generation: i64,
     now: i64,
     reason: &str,
+    preserve_dispatched_stop: bool,
 ) -> Result<()> {
-    for id in command_ids_in_state(tx, agent, generation, "dispatched")? {
+    let mut statement = tx
+        .prepare(
+            "SELECT id, verb FROM commands
+             WHERE target = ?1 AND generation = ?2 AND state = 'dispatched'
+             ORDER BY created_at, rowid",
+        )
+        .map_err(sql_error)?;
+    let rows = statement
+        .query_map(params![agent, generation], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(sql_error)?;
+    let mut dispatched = Vec::new();
+    for row in rows {
+        dispatched.push(row.map_err(sql_error)?);
+    }
+    drop(statement);
+    for (id, verb) in dispatched {
+        // A committed session.ended boundary proves the session stopped, but it
+        // does not bind that end to an in-flight stop RPC. Keep a dispatched
+        // stop pending for its exact agent.stop reply. Generic loss/restart
+        // paths do not set this flag and continue to settle dispatched stops
+        // as unknown.
+        if preserve_dispatched_stop && verb == "stop" {
+            continue;
+        }
         let outcome = json!({"reason": reason});
         update_command_state(tx, &id, CommandState::Unknown, Some(&outcome), None, now)?;
     }
@@ -8431,6 +8078,7 @@ impl Store {
         }
 
         let mut committed_events = Vec::with_capacity(batch.events.len());
+        let mut command_events = Vec::new();
         for (index, raw_event) in batch.events.iter().enumerate() {
             let native_event = raw_event.clone();
             let event_data = encode_json(&native_event.data)?;
@@ -8468,7 +8116,7 @@ impl Store {
                     payload_digest: &event_digest,
                 },
             )?;
-            persist_effects(
+            command_events.extend(persist_effects(
                 &tx,
                 &effects,
                 agent_num,
@@ -8476,7 +8124,7 @@ impl Store {
                 now,
                 &native_event,
                 &next,
-            )?;
+            )?);
             if next.is_terminal() {
                 terminalize_generation_commands(
                     &tx,
@@ -8484,6 +8132,7 @@ impl Store {
                     batch.generation,
                     now,
                     "session_ended",
+                    native_event.kind == "session.ended",
                 )?;
                 db!(tx.execute(
                     "UPDATE pending_requests SET state = 'stale'
@@ -8504,6 +8153,19 @@ impl Store {
             .last()
             .map(|event| event.seq)
             .ok_or_else(|| Error::new("internal", "non-empty batch stored no events"))?;
+        // Keep native batch ACKs scoped to native rows; the associated command
+        // event follows those rows but commits in the same transaction.
+        for data in command_events {
+            committed_events.push(insert_daemon_event(
+                &tx,
+                now,
+                "command.applied",
+                "command",
+                Some(agent_num),
+                Some(batch.generation),
+                data,
+            )?);
+        }
         let source_state = if projection.is_terminal() {
             "closed"
         } else {
@@ -8540,3 +8202,6 @@ impl Store {
         })
     }
 }
+
+#[cfg(test)]
+mod tests;

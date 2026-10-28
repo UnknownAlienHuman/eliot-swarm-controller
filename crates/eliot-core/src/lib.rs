@@ -1,5 +1,11 @@
 #![forbid(unsafe_code)]
 
+mod command;
+
+pub use command::{
+    classify_dispatched_error, command_transition_allowed, workspace_preparation_transition_allowed,
+};
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt::{self, Display, Formatter};

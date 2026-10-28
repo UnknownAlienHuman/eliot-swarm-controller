@@ -36,10 +36,14 @@ platform to build first.
 | `plugins/codex` | app-server translation and native readback | plugin protocol; no daemon/Store dependency |
 | `eliot` | CLI and composition/entry points | application crates and built-in plugin entry points |
 
-Inside `eliot-daemon`, add `monitoring/`, `workspaces/`, `automation/` and
-`coordination/` when their roadmap layer starts. Each owns its feature logic; its SQL queries and
-migrations live in Store. Every module calls the same router for effects. No automation-to-vendor or coordination-to-vendor
-shortcut. Only Store code issues SQL. Plugins never receive a database connection.
+Inside `eliot-daemon`, keep monitoring, workspaces, automation and coordination as clear
+logical modules when their roadmap layer starts. A module need not have a matching
+directory: the current implementation may keep cohesive modules in flat files such as
+`monitor.rs` and `workspaces.rs`. Split files when a real ownership boundary needs it,
+not to satisfy a path convention. Each feature owns its logic; SQL queries and migrations
+live in Store. Effects use the same router. No automation-to-vendor or
+coordination-to-vendor shortcut. Only Store code issues SQL; plugins never receive a
+database connection.
 
 The fake uses the same protocol as Codex. It is initially an echo/turn process, not a
 large simulator. Create crates as their callers arrive; this table is the eventual map,
@@ -57,10 +61,12 @@ mail nor timers require a second vendor. Unimplemented features are not advertis
 
 ## State and effects
 
-Compute the next projection with the pure reducer without mutating published state.
-In one Store transaction write the event, projection and any accepted commands; only
-after commit publish the result and acknowledge it. Native I/O runs outside that
-transaction and only after command dispatch is recorded.
+Core owns the pure Agent reducer and pure command-transition/error-classification
+predicates; Store proves command-specific context and persists their results. Compute
+the next projection without mutating published state. In one Store transaction write the
+event, projection and any derived command facts; only after commit publish and
+acknowledge. Native I/O runs outside that transaction and only after command dispatch
+is recorded.
 
 Store failure stops new writes and external dispatch. It does not rerun an external
 effect to reconstruct a missing result. Restart reconciles the durable current objects

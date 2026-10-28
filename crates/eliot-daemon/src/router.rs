@@ -6,7 +6,7 @@ use crate::{
 };
 use eliot_core::{
     Agent, AgentState, Command, CommandState, Error, Event, ProcessIdentity, Result, SubmitCommand,
-    Turn, TurnState, WorkspacePhase, WorkspacePreparationInput,
+    Turn, TurnState, WorkspacePhase, WorkspacePreparationInput, classify_dispatched_error,
 };
 use eliot_plugin::{
     MAX_EVENT_BYTES, MAX_OBSERVATION_CURSOR_BYTES, MAX_OBSERVATION_PAGE_BYTES, ObservationPage,
@@ -2164,30 +2164,18 @@ impl Router {
                 crate::redaction::redact_text(&error.message, &secrets),
             )
         };
-        let state = match error.code.as_str() {
-            "unknown" => CommandState::Unknown,
-            "invalid"
-            | "unsupported"
-            | "not_allowed"
-            | "not_found"
-            | "bad_state"
-            | "stale_generation"
-            | "source_integrity"
-            | "frame_too_large"
-            | "secret_in_payload"
-            | "native_not_dispatched" => CommandState::Rejected,
-            _ => CommandState::Failed,
-        };
+        let state = classify_dispatched_error(&error.code);
         let cause = if state == CommandState::Unknown {
             late_batch_cause.unwrap_or_else(|| unknown_cause(&error))
         } else {
             String::new()
         };
-        let outcome = if state == CommandState::Unknown {
+        let mut outcome = if state == CommandState::Unknown {
             json!({"code": error.code, "cause": cause})
         } else {
             json!({"code": error.code})
         };
+        self.redact_native_value(&mut outcome);
         let _ = self.settle(id, state, Some(outcome)).await;
     }
 
@@ -2205,7 +2193,16 @@ impl Router {
             .to_owned();
         let (result, write_faulted) = {
             let mut store = self.inner.store.lock().await;
-            let result = store.settle(id, state, outcome, now_ms());
+            // A source batch may have settled this command after the error
+            // handler's initial read. Retain that outcome under the writer lock.
+            let result = match store.get_command(id) {
+                Ok(Some(command)) if command.state.is_terminal() => Ok(eliot_store::Change {
+                    value: command,
+                    events: Vec::new(),
+                }),
+                Ok(_) => store.settle(id, state, outcome, now_ms()),
+                Err(error) => Err(error),
+            };
             if let Ok(change) = &result {
                 self.publish_locked(&change.events);
             }
@@ -3254,7 +3251,7 @@ fn reject_unknown_map_keys(
     if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
         Err(Error::new(
             "unsupported",
-            format!("{method} field {key} is not implemented in L1"),
+            format!("{method} field {key} is unsupported"),
         ))
     } else {
         Ok(())
@@ -3274,7 +3271,10 @@ fn secure_eq(left: &str, right: &str) -> bool {
 }
 
 fn unknown_cause(error: &Error) -> String {
-    if let Some(cause) = error.message.strip_prefix("events.put outcome unknown: ")
+    if let Some(cause) = error
+        .message
+        .strip_prefix("events.put outcome unknown: ")
+        .or_else(|| error.message.strip_prefix("plugin outcome unknown: "))
         && !cause.is_empty()
         && cause
             .bytes()

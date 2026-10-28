@@ -51,10 +51,10 @@ rule actions have bounded derived ids. No general receipt/floor framework.
 | Method | Purpose |
 | --- | --- |
 | `daemon.status/shutdown` | current state, admission mode and exact drain/force |
-| `agent.list/get/wait/result` | scoped, paginated Agent state and exact results |
+| `agent.list/get/result` | scoped, paginated Agent state and exact results |
 | `agent.processes/stats` | scoped process records and ephemeral OS samples |
 | `agent.git/edits` | current Git snapshot and paginated native-attributed edits |
-| `command.submit/get/children/resolve` | immutable admission, linked input, fixed selector/action children |
+| `command.submit/get/children/resolve` | immutable admission, linked commands, child readback and constrained resolution |
 | `turn.get/resolve` | running/completed/unknown turn; constrained owner assertion |
 | `events.read/subscribe` | persisted replay plus bounded live delivery |
 | `agent.discover` | owner-only native metadata discovery, without creating Agents |
@@ -122,16 +122,26 @@ Agent authorship. Git polling alone updates neither process statistics nor model
 
 ```text
 command.submit {
-  id, target?, selector?, verb, args,
-  expected_generation?, expected_turn_id?, request_id?, probe? [false], wait_ms?
+  id, target?, verb, args,
+  expected_generation?, expected_turn_id?, request_id?
 }
 -> {command_id, agent?, generation?, state, outcome?, linked_command?, fanout?:{count}}
 ```
 
-In one transaction resolve target/selector, validate principal/capability/state, compare
+In one transaction resolve the target, validate principal/capability/state, compare
 supplied expectations, capture exact generation/turn/request, then persist immutable
 rows/events. Interactive calls may omit expectations; delayed automation supplies its
 captured expectations. Mismatch rejects before native I/O.
+
+The current request does not accept `selector` or `probe`; the Router rejects either
+field. These remain deferred `command.submit` extensions (`selector?`, `probe? [false]`),
+not fields to send to the current API. The future selector contract is below; probe
+semantics remain with its future owning feature and are not inferred here.
+
+The current `command.submit` request has no `wait_ms`, and the daemon does not expose an
+`agent.wait` method. CLI `--wait` follows command and turn readbacks with a bounded client
+deadline; timeout does not cancel the admitted command. Server-side wait semantics below
+are retained for a future API layer, not part of the current request shape.
 
 Generation-changing dispatch follows [core](core.md#generation-fence): advance and
 revoke before native I/O, no rollback, no replay after unknown. Terminal settlement
@@ -172,11 +182,12 @@ It reads the exact command to settlement with a bounded 30-second wait; timeout 
 not cancel or retry removal. Same-ID retries return the retained outcome even after
 the directory has gone.
 
-A selector parent snapshots/sorts concrete ids and generations in a bounded transaction;
-children settle independently. Parent applied means expansion only. `command.children`
-pages that fixed set. Retain/prune parent sets transactionally so a caller never sees a
-partly pruned expansion; after removal return `history_gap`. Ordered rule actions reuse
-the same representation with a distinct link kind, not selector execution semantics.
+When selector support is added, a parent snapshots/sorts concrete ids and generations in
+a bounded transaction; children settle independently. Parent applied means expansion only.
+`command.children` pages that fixed set. Retain/prune parent sets transactionally so a
+caller never sees a partly pruned expansion; after removal return `history_gap`. Ordered
+rule actions reuse the same representation with a distinct link kind, not selector
+execution semantics.
 
 ## Input, turn and unknown gates
 
@@ -205,6 +216,10 @@ terminal status and reason; it cannot bypass the inactive/terminal precondition.
 Known failure can include partial effects; it never implies rollback or automatic retry.
 
 ## Waiting
+
+The following server-side wait semantics are a future API contract; they do not add
+`agent.wait` to the current method set. Current CLI `--wait` behavior is described under
+Command admission.
 
 Capture generation at call start. `turn --after-command ID` follows that input's exact
 association/result; without an id, capture the current turn or the first after the call
@@ -286,6 +301,10 @@ Register a bounded live buffer, capture persisted high-water, replay pages throu
 then release buffered persisted events above it in order. Ephemeral delivery is best
 effort. Overflow reports lag; pruned history reports `history_gap`, never silent skipping.
 Committed event sequence values are never reused after retention.
+
+`events.subscribe` accepts optional nonnegative `wait_ms`, capped at 30,000, and waits
+for matching persisted events up to that duration when the page is not yet full. This is
+event-delivery wait, not command or turn settlement.
 
 ## Mail acknowledgement
 

@@ -19,14 +19,18 @@ use std::{
     hash::{Hash, Hasher},
     time::Duration,
 };
-use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
+use tokio::{
+    io::AsyncWriteExt,
+    sync::{mpsc, oneshot},
+};
 
 const HOST_REQUEST_QUEUE: usize = 16;
 const EVENTS_PUT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const HOST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const DISCOVERY_SCOPE: &str = "fake:discovery";
 const DISCOVERY_SUBJECTS: usize = 3;
+const MALFORMED_AFTER_DISPATCH: &str = "[fake:malformed-after-dispatch]";
 
 #[derive(Debug)]
 pub struct PluginError {
@@ -673,6 +677,16 @@ async fn handle_command(
     }
 
     let credential = state.credential.clone().ok_or_else(not_initialized)?;
+    if text == MALFORMED_AFTER_DISPATCH {
+        // Exact C1 regression hook: validation passed, but the dispatched call
+        // loses its transport without any authoritative response or echo batch.
+        let mut stdout = tokio::io::stdout();
+        let _ = stdout
+            .write_all(b"fake malformed frame after dispatch\n")
+            .await;
+        let _ = stdout.flush().await;
+        std::process::exit(1);
+    }
     let turn_id = format!(
         "fake-{}-{}-{}",
         params.agent_id, params.generation, params.command_id

@@ -8,19 +8,27 @@ runtime or tooling. Select the next unchecked increment in the roadmap.
 
 ## Work loop
 
-1. One manager owns one worktree/branch/PR. Delegate disjoint work; integrate it there.
+1. One manager owns each coherent increment, its branch/worktree and pull request. One
+   PR may cover several tightly coupled roadmap checkboxes. Never push directly to `main`.
+   The manager integrates and merges only after scoped checks and independent review;
+   delegate disjoint work and keep integration with that manager.
 2. Select the next unchecked task. Read its donor entry: **dependency**, **extract** or
    **pattern**. Use existing code where it fits; do not import the donor's application.
 3. Implement a connected caller-to-result path. Add only the schema, commands and
    modules used by that path. Unsupported later features return `unsupported`.
-4. Run `cargo fmt --check` and
-   `cargo clippy -p <changed-package> -- -D warnings`. Repeat for other changed packages
-   only. This works for library-only and binary-only packages; no unconditional `--lib`.
-5. Exercise the changed path briefly when its runtime is available. Full test suites,
-   conformance infrastructure, load campaigns and routine paid-model runs wait for L7.
-   A focused regression is permitted for a concrete defect; no framework-building detour.
-6. Tick completed work and state the actual checks in the PR. Do not claim a runtime
-   property from compilation or source review alone.
+4. Run `cargo fmt --check`, `cargo test -p <changed-package> --all-targets`, and
+   `cargo clippy -p <changed-package> --all-targets -- -D warnings`. Repeat for other
+   changed packages only. This works for library-only and binary-only packages; no
+   unconditional `--lib`.
+5. Every completed connected increment needs deterministic Cargo test coverage for its
+   caller-to-result path; use the fake for fake-suitable behavior. Exercise the changed
+   path briefly when its runtime is available. Full crash, load, vendor and platform
+   qualification belongs to L7. CI does not call a model, and paid-model runs are not
+   routine tests. Add a focused regression for a concrete defect; do not build a test
+   framework as a detour.
+6. Tick completed work and record the actual tests and checks in the PR/CI. Roadmap
+   checkboxes are the only project status list; do not add permanent test/readiness
+   reports. Do not claim a runtime property from compilation or source review alone.
 
 ## Keep the implementation small
 
