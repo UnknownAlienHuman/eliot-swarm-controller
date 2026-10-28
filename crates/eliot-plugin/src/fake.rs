@@ -2,16 +2,21 @@ use crate::{
     peer::{CommitSink, Peer, PeerClient, preserve_rpc_error},
     protocol::{
         AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams,
-        InitializeParams, MAX_COMMAND_ID_BYTES, MAX_CREDENTIAL_BYTES, MAX_EVENT_BYTES,
-        MAX_TEXT_BYTES, RpcError, RpcRequest, empty_object, fake_manifest,
+        DiscoverCoverage, DiscoverPage, DiscoverParams, DiscoverSubject, InitializeParams,
+        MAX_COMMAND_ID_BYTES, MAX_CREDENTIAL_BYTES, MAX_DISCOVER_PAGE_BYTES,
+        MAX_DISCOVER_PAGE_ENTRIES, MAX_EVENT_BYTES, MAX_TEXT_BYTES, ObservationPage,
+        ObservationQuery, ObserverAttachParams, ObserverDetachParams, ObserverSnapshotParams,
+        RpcError, RpcRequest, empty_object, fake_manifest,
     },
 };
 use eliot_core::{BatchAck, Error as CoreError, NativeEvent, SourceBatch};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::{
+    collections::hash_map::DefaultHasher,
     error::Error,
     fmt::{self, Display, Formatter},
+    hash::{Hash, Hasher},
     time::Duration,
 };
 use tokio::sync::{mpsc, oneshot};
@@ -20,6 +25,8 @@ use tokio::time::Instant;
 const HOST_REQUEST_QUEUE: usize = 16;
 const EVENTS_PUT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const HOST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+const DISCOVERY_SCOPE: &str = "fake:discovery";
+const DISCOVERY_SUBJECTS: usize = 3;
 
 #[derive(Debug)]
 pub struct PluginError {
@@ -137,9 +144,15 @@ async fn dispatch(
 ) -> Result<Value, RpcError> {
     match request.method.as_str() {
         "initialize" => handle_initialize(&request.params, state),
+        "discover" => handle_discover(&request.params, state),
+        "agent.attach" => handle_observer_attach(&request.params, state),
+        "agent.detach" => handle_observer_detach(&request.params, state),
         "agent.start" => handle_start(&request.params, state, client).await,
         "agent.command" => handle_command(&request.params, state, client).await,
         "agent.stop" => handle_stop(&request.params, state, client).await,
+        "agent.snapshot" if request.params.get("observation").is_some() => {
+            handle_observer_snapshot(&request.params, state)
+        }
         "agent.snapshot" => handle_snapshot(&request.params, state),
         "shutdown" => handle_shutdown(state),
         _ => Err(domain_error(
@@ -148,6 +161,336 @@ async fn dispatch(
             "plugin method is not implemented",
         )),
     }
+}
+
+fn handle_discover(raw_params: &Value, state: &FakeState) -> Result<Value, RpcError> {
+    require_initialized(state)?;
+    let params: DiscoverParams = decode_params(raw_params)?;
+    if !(1..=MAX_DISCOVER_PAGE_ENTRIES).contains(&params.limit) {
+        return Err(invalid_params("discovery limit must be between 1 and 1000"));
+    }
+    if params
+        .native_scope
+        .as_deref()
+        .is_some_and(|scope| scope != DISCOVERY_SCOPE)
+    {
+        return Err(domain_error(
+            "not_found",
+            -32034,
+            "fake discovery scope was not found",
+        ));
+    }
+    let start = match params.cursor.as_deref() {
+        None => 0,
+        Some(cursor) => (1..DISCOVERY_SUBJECTS)
+            .find(|offset| cursor == discovery_cursor(&params, *offset))
+            .ok_or_else(|| {
+                invalid_params("fake discovery cursor does not match its scope and profile context")
+            })?,
+    };
+    let end = (start + params.limit).min(DISCOVERY_SUBJECTS);
+    let page = DiscoverPage {
+        harness: "fake".to_owned(),
+        native_scope: DISCOVERY_SCOPE.to_owned(),
+        subjects: (start + 1..=end)
+            .map(|index| DiscoverSubject {
+                native_ref: format!("fake-discovered-{index}"),
+                workspace: None,
+                state: "idle".to_owned(),
+                created_at: None,
+                updated_at: None,
+                source: Some("fake".to_owned()),
+                ephemeral: Some(false),
+            })
+            .collect(),
+        next_cursor: (end < DISCOVERY_SUBJECTS).then(|| discovery_cursor(&params, end)),
+        coverage: DiscoverCoverage {
+            kind: "fixture".to_owned(),
+            complete: end == DISCOVERY_SUBJECTS,
+        },
+    };
+    let encoded = serde_json::to_vec(&page).map_err(|_| {
+        domain_error(
+            "internal",
+            -32603,
+            "fake discovery page could not be encoded",
+        )
+    })?;
+    if encoded.len() > MAX_DISCOVER_PAGE_BYTES {
+        return Err(frame_too_large("fake discovery page exceeds 900 KiB"));
+    }
+    serde_json::to_value(page).map_err(|_| {
+        domain_error(
+            "internal",
+            -32603,
+            "fake discovery page could not be encoded",
+        )
+    })
+}
+
+fn discovery_cursor(params: &DiscoverParams, offset: usize) -> String {
+    // Fake-only deterministic context binding, not an authorization token.
+    // Value hashing ignores object-key insertion order and keeps profile/env
+    // plaintext out of the cursor. No per-session cursor state is required.
+    let mut binding = DefaultHasher::new();
+    DISCOVERY_SCOPE.hash(&mut binding);
+    params.profile.hash(&mut binding);
+    params.target_environment.hash(&mut binding);
+    format!("fake-discovery-v1:{:016x}:{offset}", binding.finish())
+}
+
+fn handle_observer_attach(raw: &Value, state: &mut FakeState) -> Result<Value, RpcError> {
+    require_initialized(state)?;
+    let params: ObserverAttachParams = decode_params(raw)?;
+    validate_agent_identity(&params.agent_id, params.generation, &params.command_id)?;
+    if params.mode != "observe" {
+        return Err(domain_error(
+            "unsupported",
+            -32601,
+            "fake attach is observe-only",
+        ));
+    }
+    if state.binding.is_some() {
+        return Err(domain_error(
+            "busy",
+            -32020,
+            "fake plugin already controls a session",
+        ));
+    }
+    if params.native_scope != DISCOVERY_SCOPE
+        || !(1..=DISCOVERY_SUBJECTS)
+            .any(|index| params.native_ref == format!("fake-discovered-{index}"))
+    {
+        return Err(domain_error(
+            "not_found",
+            -32034,
+            "fake observation subject was not found",
+        ));
+    }
+    if params.profile.get("harness").and_then(Value::as_str) != Some("fake")
+        || !params.target_environment.is_object()
+    {
+        return Err(invalid_params(
+            "fake observation requires a fake profile and environment object",
+        ));
+    }
+    let mut context = DefaultHasher::new();
+    params.profile.hash(&mut context);
+    params.target_environment.hash(&mut context);
+    params.source_plan.hash(&mut context);
+    params.source_state.hash(&mut context);
+    let context = context.finish();
+    if let Some(observer) = &state.observer {
+        validate_observer_binding(
+            state,
+            &params.agent_id,
+            params.generation,
+            &params.native_scope,
+            &params.native_ref,
+        )?;
+        if observer.attach_command_id != params.command_id {
+            return Err(domain_error(
+                "busy",
+                -32020,
+                "fake observer is already bound",
+            ));
+        }
+        if observer.context != context {
+            return Err(domain_error(
+                "source_integrity",
+                -32025,
+                "fake observation binding changed",
+            ));
+        }
+        if observer.detach_command_id.is_some() {
+            return Err(domain_error(
+                "bad_state",
+                -32024,
+                "fake observer is detached",
+            ));
+        }
+    } else {
+        state.observer = Some(FakeObserver {
+            agent_id: params.agent_id.clone(),
+            generation: params.generation,
+            native_scope: params.native_scope.clone(),
+            native_ref: params.native_ref.clone(),
+            attach_command_id: params.command_id.clone(),
+            context,
+            detach_command_id: None,
+        });
+    }
+    Ok(json!({
+        "agent_id": params.agent_id, "generation": params.generation,
+        "command_id": params.command_id,
+        "native_scope": params.native_scope, "native_ref": params.native_ref,
+        "state": "attached", "observation_state": "unknown",
+        "metadata": {"workspace": null, "source": "fake", "ephemeral": false},
+        "coverage": {"kind": "fixture", "complete": false},
+    }))
+}
+
+fn handle_observer_snapshot(raw: &Value, state: &FakeState) -> Result<Value, RpcError> {
+    require_initialized(state)?;
+    let params: ObserverSnapshotParams = decode_params(raw)?;
+    let observer = validate_observer_binding(
+        state,
+        &params.agent_id,
+        params.generation,
+        &params.native_scope,
+        &params.native_ref,
+    )?;
+    if observer.detach_command_id.is_some() {
+        return Err(domain_error(
+            "bad_state",
+            -32024,
+            "fake observer is detached",
+        ));
+    }
+    let query = params.observation;
+    query.validate().map_err(core_error_to_rpc)?;
+    if !matches!(query.source.as_str(), "native" | "rollout") {
+        return Err(domain_error(
+            "unsupported",
+            -32601,
+            "fake observation source is unsupported",
+        ));
+    }
+    let entries = match query.view.as_str() {
+        "subject" if query.turn_id.is_none() => vec![json!({
+            "native_ref": observer.native_ref, "workspace": null,
+            "state": "unknown", "source": "fake", "ephemeral": false,
+        })],
+        "turns" if query.turn_id.is_none() => (1..=2)
+            .map(|index| {
+                json!({
+                    "turn_id": format!("fake-observed-turn-{index}"), "status": "completed",
+                })
+            })
+            .collect(),
+        "items" => {
+            let turn = query
+                .turn_id
+                .as_deref()
+                .filter(|turn| matches!(*turn, "fake-observed-turn-1" | "fake-observed-turn-2"))
+                .ok_or_else(|| invalid_params("items requires an exact fixture turn_id"))?;
+            vec![
+                json!({"turn_id": turn, "kind": "message", "role": "assistant",
+                "text": "fake observation history fixture"}),
+            ]
+        }
+        _ => return Err(invalid_params("invalid observation view or turn binding")),
+    };
+    let start = match query.cursor.as_deref() {
+        None => 0,
+        Some(cursor) => (1..entries.len())
+            .find(|offset| cursor == observer_cursor(observer, &query, *offset))
+            .ok_or_else(|| invalid_params("fake observation cursor binding is invalid"))?,
+    };
+    let end = (start + query.limit).min(entries.len());
+    let page = ObservationPage {
+        agent_id: params.agent_id,
+        generation: params.generation,
+        native_scope: params.native_scope,
+        native_ref: params.native_ref,
+        next_cursor: (end < entries.len()).then(|| observer_cursor(observer, &query, end)),
+        source: query.source,
+        view: query.view,
+        entries: entries[start..end].to_vec(),
+        coverage: json!({"kind": "fixture", "complete": end == entries.len()}),
+    };
+    page.validate().map_err(core_error_to_rpc)?;
+    serde_json::to_value(page)
+        .map_err(|_| domain_error("internal", -32603, "cannot encode fake observation page"))
+}
+
+fn observer_cursor(observer: &FakeObserver, query: &ObservationQuery, offset: usize) -> String {
+    // Fake-only context binding, never an authority token or production file ID.
+    let mut binding = DefaultHasher::new();
+    observer.agent_id.hash(&mut binding);
+    observer.generation.hash(&mut binding);
+    observer.native_scope.hash(&mut binding);
+    observer.native_ref.hash(&mut binding);
+    observer.context.hash(&mut binding);
+    query.source.hash(&mut binding);
+    query.view.hash(&mut binding);
+    query.turn_id.hash(&mut binding);
+    query.limit.hash(&mut binding);
+    format!("fake-observation-v1:{:016x}:{offset}", binding.finish())
+}
+
+fn handle_observer_detach(raw: &Value, state: &mut FakeState) -> Result<Value, RpcError> {
+    require_initialized(state)?;
+    let params: ObserverDetachParams = decode_params(raw)?;
+    validate_agent_identity(&params.agent_id, params.generation, &params.command_id)?;
+    validate_observer_binding(
+        state,
+        &params.agent_id,
+        params.generation,
+        &params.native_scope,
+        &params.native_ref,
+    )?;
+    let observer = state
+        .observer
+        .as_mut()
+        .ok_or_else(|| domain_error("not_found", -32034, "fake observer is not attached"))?;
+    if observer
+        .detach_command_id
+        .as_deref()
+        .is_some_and(|id| id != params.command_id)
+    {
+        return Err(domain_error(
+            "source_integrity",
+            -32025,
+            "fake detach command binding changed",
+        ));
+    }
+    observer.detach_command_id = Some(params.command_id.clone());
+    Ok(json!({
+        "agent_id": params.agent_id, "generation": params.generation,
+        "command_id": params.command_id,
+        "native_scope": params.native_scope, "native_ref": params.native_ref,
+        "state": "detached", "observation_state": "unknown",
+    }))
+}
+
+fn validate_observer_binding<'a>(
+    state: &'a FakeState,
+    agent_id: &str,
+    generation: i64,
+    native_scope: &str,
+    native_ref: &str,
+) -> Result<&'a FakeObserver, RpcError> {
+    let observer = state
+        .observer
+        .as_ref()
+        .ok_or_else(|| domain_error("not_found", -32034, "fake observer is not attached"))?;
+    if observer.agent_id != agent_id || observer.generation != generation {
+        return Err(domain_error(
+            "stale_generation",
+            -32033,
+            "fake observer generation does not match",
+        ));
+    }
+    if observer.native_scope != native_scope || observer.native_ref != native_ref {
+        return Err(domain_error(
+            "source_integrity",
+            -32025,
+            "fake observation subject does not match",
+        ));
+    }
+    Ok(observer)
+}
+
+fn reject_observer_control(state: &FakeState) -> Result<(), RpcError> {
+    if state.observer.is_some() {
+        return Err(domain_error(
+            "not_allowed",
+            -32030,
+            "observation grants no session control",
+        ));
+    }
+    Ok(())
 }
 
 fn handle_initialize(params: &Value, state: &mut FakeState) -> Result<Value, RpcError> {
@@ -190,6 +533,7 @@ async fn handle_start(
     client: &PeerClient,
 ) -> Result<Value, RpcError> {
     require_initialized(state)?;
+    reject_observer_control(state)?;
     let params: AgentStartParams = decode_params(raw_params)?;
     validate_agent_identity(&params.agent_id, params.generation, &params.command_id)?;
     if params.initial.is_some() || params.resume_from.is_some() {
@@ -276,6 +620,7 @@ async fn handle_command(
     client: &PeerClient,
 ) -> Result<Value, RpcError> {
     require_initialized(state)?;
+    reject_observer_control(state)?;
     let params: AgentCommandParams = decode_params(raw_params)?;
     validate_agent_identity(&params.agent_id, params.generation, &params.command_id)?;
     validate_existing_binding(state, &params.agent_id, params.generation)?;
@@ -379,6 +724,7 @@ async fn handle_stop(
     client: &PeerClient,
 ) -> Result<Value, RpcError> {
     require_initialized(state)?;
+    reject_observer_control(state)?;
     let params: AgentStopParams = decode_params(raw_params)?;
     validate_agent_identity(&params.agent_id, params.generation, &params.command_id)?;
     validate_existing_binding(state, &params.agent_id, params.generation)?;
@@ -682,6 +1028,7 @@ fn domain_error(code: &str, rpc_code: i64, message: &str) -> RpcError {
 struct FakeState {
     credential: Option<String>,
     binding: Option<Binding>,
+    observer: Option<FakeObserver>,
     start_command_id: Option<String>,
     stop_command_id: Option<String>,
     phase: SessionPhase,
@@ -690,6 +1037,16 @@ struct FakeState {
     last_turn: Option<LastTurn>,
     last_batch_ack: Option<BatchAck>,
     batch_unknown: bool,
+}
+
+struct FakeObserver {
+    agent_id: String,
+    generation: i64,
+    native_scope: String,
+    native_ref: String,
+    attach_command_id: String,
+    context: u64,
+    detach_command_id: Option<String>,
 }
 
 struct Binding {

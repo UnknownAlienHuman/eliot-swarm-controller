@@ -8,7 +8,7 @@ use crate::{
 };
 use eliot_core::{
     Agent, Error, FileChangeHint, GitBaseline, GitHintPage, GitSnapshot, ProcessRecord,
-    ProcessSnapshot, ProcessState, Result, SourceGap,
+    ProcessSnapshot, ProcessState, Result, SourceGap, WorkspacePreparation,
 };
 use serde_json::{Value, json};
 use std::{
@@ -31,6 +31,43 @@ const WATCH_RETRY: Duration = Duration::from_secs(30);
 
 type Key = (String, i64);
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct WorkspaceProcessContext {
+    pub agent: String,
+    pub target_generation: i64,
+    pub command_id: String,
+    pub role: &'static str,
+    pub setup_index: Option<usize>,
+}
+
+impl WorkspaceProcessContext {
+    pub(crate) fn new(
+        preparation: &WorkspacePreparation,
+        command_id: &str,
+        role: &'static str,
+        setup_index: Option<usize>,
+    ) -> Self {
+        Self {
+            agent: preparation.agent.clone(),
+            target_generation: preparation.target_generation,
+            command_id: command_id.to_owned(),
+            role,
+            setup_index,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum ProcessKey {
+    Agent(String, i64),
+    Workspace(WorkspaceProcessContext),
+}
+
+#[derive(Clone)]
+pub(crate) struct WorkspaceProcessHandle {
+    target: Arc<Target>,
+}
+
 #[derive(Clone)]
 pub(crate) struct Monitoring {
     inner: Arc<State>,
@@ -40,7 +77,7 @@ struct State {
     store: Arc<AsyncMutex<eliot_store::Store>>,
     bus: Bus,
     secrets: SecretSet,
-    targets: Mutex<HashMap<Key, Arc<Target>>>,
+    targets: Mutex<HashMap<ProcessKey, Arc<Target>>>,
     unavailable: Mutex<Option<String>>,
     git_bindings: Mutex<HashMap<Key, String>>,
     git_workspaces: Mutex<HashMap<String, Arc<GitWorkspace>>>,
@@ -48,12 +85,14 @@ struct State {
 }
 
 struct Target {
+    key: ProcessKey,
     agent: String,
     generation: i64,
     owner: String,
     observer: CustodyObserver,
     sampling: AsyncMutex<()>,
     cache: Mutex<Cache>,
+    workspace: Option<WorkspaceProcessContext>,
 }
 
 #[derive(Clone, Default)]
@@ -171,6 +210,15 @@ impl Monitoring {
         self.mark_git_unavailable(code);
     }
 
+    /// An owned observer reader has OS custody but no native control token or
+    /// admitted workspace. Do not install Git observation for its external subject.
+    pub(crate) async fn prepare_observer_generation(&self, agent: &Agent) -> Result<()> {
+        let mut store = self.inner.store.lock().await;
+        let events = store.ensure_process_source(&agent.id, agent.generation, now_ms())?;
+        self.inner.bus.publish(&events);
+        Ok(())
+    }
+
     pub(crate) async fn prepare_generation(&self, agent: &Agent) -> Result<()> {
         // Router admission already binds the canonical workspace, including on resume.
         let workspace = agent.workspace.as_deref().ok_or_else(|| {
@@ -197,14 +245,16 @@ impl Monitoring {
     }
 
     pub(crate) async fn attach(&self, agent: &Agent, observer: CustodyObserver) -> Result<()> {
-        let key = (agent.id.clone(), agent.generation);
+        let key = ProcessKey::Agent(agent.id.clone(), agent.generation);
         let target = Arc::new(Target {
+            key: key.clone(),
             agent: agent.id.clone(),
             generation: agent.generation,
             owner: owner(&agent.id, agent.generation),
             observer,
             sampling: AsyncMutex::new(()),
             cache: Mutex::new(Cache::default()),
+            workspace: None,
         });
         {
             let mut targets = self
@@ -223,6 +273,102 @@ impl Monitoring {
         // A failed read-only probe leaves unknown observation; it does not fail native startup.
         let _ = self.sample_target(&target).await;
         Ok(())
+    }
+
+    /// Bind the frozen target before its mutator spawns, without creating an Agent
+    /// generation/token or installing a native lifecycle source.
+    pub(crate) async fn prepare_workspace_process(
+        &self,
+        context: &WorkspaceProcessContext,
+    ) -> Result<()> {
+        let mut store = self.inner.store.lock().await;
+        let events = store.ensure_workspace_process_source(
+            &context.agent,
+            context.target_generation,
+            now_ms(),
+        )?;
+        self.inner.bus.publish(&events);
+        Ok(())
+    }
+
+    pub(crate) async fn workspace_process_unavailable(
+        &self,
+        context: &WorkspaceProcessContext,
+    ) -> Result<()> {
+        let mut store = self.inner.store.lock().await;
+        let events = store.set_workspace_process_source_status(
+            &context.agent,
+            context.target_generation,
+            "error",
+            false,
+            now_ms(),
+        )?;
+        self.inner.bus.publish(&events);
+        Ok(())
+    }
+
+    pub(crate) async fn attach_workspace_process(
+        &self,
+        context: WorkspaceProcessContext,
+        observer: CustodyObserver,
+    ) -> Result<WorkspaceProcessHandle> {
+        let key = ProcessKey::Workspace(context.clone());
+        let target = Arc::new(Target {
+            key: key.clone(),
+            agent: context.agent.clone(),
+            generation: context.target_generation,
+            owner: workspace_owner(&context.agent, context.target_generation),
+            observer,
+            sampling: AsyncMutex::new(()),
+            cache: Mutex::new(Cache::default()),
+            workspace: Some(context),
+        });
+        {
+            let mut targets = self
+                .inner
+                .targets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if targets.contains_key(&key) {
+                return Err(Error::new(
+                    "bad_state",
+                    "workspace process invocation is already observed",
+                ));
+            }
+            targets.insert(key, Arc::clone(&target));
+        }
+        // Initial sampling is an edge, not just a timer: short setup processes
+        // must remain visible even if they exit before the next periodic tick.
+        let _ = self.sample_target(&target).await;
+        Ok(WorkspaceProcessHandle { target })
+    }
+
+    pub(crate) async fn finish_workspace_process(
+        &self,
+        handle: &WorkspaceProcessHandle,
+    ) -> Result<()> {
+        {
+            let mut targets = self
+                .inner
+                .targets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match targets.get(&handle.target.key) {
+                Some(current) if !Arc::ptr_eq(current, &handle.target) => {
+                    return Err(Error::new(
+                        "bad_state",
+                        "workspace observer invocation changed",
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    // A timer may have seen departure before wait() supplied its
+                    // exact leader exit code. Preserve that final same-identity update.
+                    targets.insert(handle.target.key.clone(), Arc::clone(&handle.target));
+                }
+            }
+        }
+        self.sample_target(&handle.target).await
     }
 
     pub(crate) async fn process_put(
@@ -333,58 +479,11 @@ impl Monitoring {
             (processes, progress, healthy)
         };
         let now = now_ms();
-        let sample_age_ms = cache.sampled_at.and_then(|at| age_ms(now, at));
-        let sample_clock_regressed = cache.sampled_at.is_some_and(|at| at > now);
         let model_clock_regressed = last_model_progress.is_some_and(|at| at > now);
-        let stale = unavailable.is_some()
-            || cache.error.is_some()
-            || sample_clock_regressed
-            || sample_age_ms.is_some_and(|age| age > SAMPLE_TTL_MS);
-        let available = cache.snapshot.is_some() && !stale;
-        let coverage = match cache.snapshot.as_ref() {
-            None => "unknown",
-            Some(_) if stale => "stale",
-            Some(snapshot) if snapshot.complete => "complete",
-            Some(_) => "partial",
-        };
-        let samples = cache
-            .snapshot
-            .as_ref()
-            .filter(|_| available)
-            .map(|snapshot| &snapshot.samples);
-        let total_samples = samples.filter(|_| cache.snapshot.as_ref().is_some_and(|s| s.complete));
-        let cpu_time_ns = total_samples.and_then(|samples| {
-            if samples.is_empty() {
-                return None;
-            }
-            samples.iter().try_fold(0_u64, |total, sample| {
-                total.checked_add(sample.cpu_time_ns?)
-            })
-        });
-        let rss_bytes = total_samples.and_then(|samples| {
-            if samples.is_empty() {
-                return None;
-            }
-            samples
-                .iter()
-                .try_fold(0_u64, |total, sample| total.checked_add(sample.rss_bytes?))
-        });
         let mut view = json!({
             "processes_truncated": processes.len() == PAGE_LIMIT,
             "processes": processes,
-            "stats": {
-                "available": available,
-                "sampled_at": cache.sampled_at,
-                "age_ms": sample_age_ms,
-                "ttl_ms": SAMPLE_TTL_MS,
-                "clock_regressed": sample_clock_regressed,
-                "coverage": coverage,
-                "complete": cache.snapshot.as_ref().map(|snapshot| snapshot.complete),
-                "cpu_time_ns": cpu_time_ns,
-                "rss_bytes": rss_bytes,
-                "samples": samples,
-                "error": unavailable.or(cache.error),
-            },
+            "stats": stats_view(&cache, unavailable, now),
             "liveness": {
                 "state": agent.state,
                 "last_model_progress": last_model_progress,
@@ -394,11 +493,108 @@ impl Monitoring {
                 "source_healthy": source_healthy,
             },
         });
+        view["workspace"] = match self.workspace_view(agent).await {
+            Ok(workspace) => workspace,
+            Err(error) => json!({"available": false, "error": error.code}),
+        };
         view["git"] = match self.git_view(agent).await {
             Ok(git) => git,
             Err(error) => json!({"available": false, "error": error.code}),
         };
         Ok(view)
+    }
+
+    /// Agent.generation remains native/control state. Workspace observation is
+    /// explicitly named by its retained target, including target 1 while Agent is 0.
+    pub(crate) async fn workspace_view(&self, agent: &Agent) -> Result<Value> {
+        let (preparation, processes, source) = {
+            let store = self.inner.store.lock().await;
+            let Some(preparation) = store.get_workspace(&agent.id)? else {
+                return Ok(Value::Null);
+            };
+            let process_owner = workspace_owner(&agent.id, preparation.target_generation);
+            let processes = store.list_processes(&process_owner, None, PAGE_LIMIT)?;
+            let source = store
+                .list_source_states(&agent.id, preparation.target_generation)?
+                .into_iter()
+                .find(|state| {
+                    state.get("source").and_then(Value::as_str) == Some("workspace_process")
+                });
+            (preparation, processes, source)
+        };
+        let cache = self.workspace_cache(&agent.id, preparation.target_generation);
+        let unavailable = self
+            .inner
+            .unavailable
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        Ok(json!({
+            "owner": workspace_owner(&agent.id, preparation.target_generation),
+            "target_generation": preparation.target_generation,
+            "phase": preparation.phase,
+            "setup_index": preparation.setup_index,
+            "processes_truncated": processes.len() == PAGE_LIMIT,
+            "processes": processes,
+            "stats": stats_view(&cache, unavailable, now_ms()),
+            "source": source,
+        }))
+    }
+
+    fn workspace_cache(&self, agent: &str, generation: i64) -> Cache {
+        let targets: Vec<_> = self
+            .inner
+            .targets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .filter(|target| {
+                target.workspace.is_some()
+                    && target.agent == agent
+                    && target.generation == generation
+            })
+            .cloned()
+            .collect();
+        if targets.is_empty() {
+            return Cache::default();
+        }
+        let mut snapshot = ProcessSnapshot {
+            samples: Vec::new(),
+            complete: true,
+        };
+        let mut sampled_at: Option<i64> = None;
+        let mut error = None;
+        let mut identities = HashSet::new();
+        for target in targets {
+            let cache = target
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(at) = cache.sampled_at {
+                sampled_at = Some(sampled_at.map_or(at, |previous| previous.min(at)));
+            }
+            error = error.or_else(|| cache.error.clone());
+            if let Some(current) = &cache.snapshot {
+                snapshot.complete &= current.complete;
+                for sample in &current.samples {
+                    if identities.insert(sample.record.identity.clone())
+                        && snapshot.samples.len() < PAGE_LIMIT
+                    {
+                        snapshot.samples.push(sample.clone());
+                    } else {
+                        snapshot.complete = false;
+                    }
+                }
+            } else {
+                snapshot.complete = false;
+                error.get_or_insert_with(|| "workspace_process_unsampled".to_owned());
+            }
+        }
+        Cache {
+            snapshot: Some(snapshot),
+            sampled_at,
+            error,
+        }
     }
 
     pub(crate) async fn git_view(&self, agent: &Agent) -> Result<Value> {
@@ -1193,7 +1389,7 @@ impl Monitoring {
             .targets
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&(agent.to_owned(), generation))
+            .get(&ProcessKey::Agent(agent.to_owned(), generation))
             .cloned()
     }
 
@@ -1221,7 +1417,7 @@ impl Monitoring {
                 .await
                 .map_err(|_| Error::new("process_observation", "process sampling task failed"))
                 .and_then(|result| result);
-        let snapshot = match result {
+        let mut snapshot = match result {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 target
@@ -1233,11 +1429,14 @@ impl Monitoring {
                 return Err(error);
             }
         };
-        let records: Vec<ProcessRecord> = snapshot
-            .samples
-            .iter()
-            .map(|sample| sample.record.clone())
-            .collect();
+        if let Some(context) = &target.workspace {
+            for sample in &mut snapshot.samples {
+                // The platform's verified root role is presentation, not authority.
+                if sample.record.role == "plugin" {
+                    sample.record.role = context.role.to_owned();
+                }
+            }
+        }
         let final_exit = snapshot.complete
             && snapshot
                 .samples
@@ -1246,8 +1445,23 @@ impl Monitoring {
         let observed = {
             let mut store = self.inner.store.lock().await;
             let mut result = Ok(());
-            for page in records.chunks(PAGE_LIMIT) {
-                match store.observe_processes(&target.agent, target.generation, page, now_ms()) {
+            for samples in snapshot.samples.chunks(PAGE_LIMIT) {
+                let events = if target.workspace.is_some() {
+                    store.observe_workspace_processes(
+                        &target.agent,
+                        target.generation,
+                        &ProcessSnapshot {
+                            samples: samples.to_vec(),
+                            complete: snapshot.complete,
+                        },
+                        sampled_at,
+                    )
+                } else {
+                    let records: Vec<ProcessRecord> =
+                        samples.iter().map(|sample| sample.record.clone()).collect();
+                    store.observe_processes(&target.agent, target.generation, &records, sampled_at)
+                };
+                match events {
                     Ok(events) => self.inner.bus.publish(&events),
                     Err(error) => {
                         result = Err(error);
@@ -1266,7 +1480,14 @@ impl Monitoring {
             let _ = self.set_source_status(target, "error", false).await;
             return Err(error);
         }
-        if let Err(error) = self.set_source_status(target, "ok", final_exit).await {
+        let health = if target.workspace.is_some() && !snapshot.complete {
+            "slow"
+        } else {
+            "ok"
+        };
+        // Workspace source lifetime includes subsequent setup steps/removal;
+        // set_source_status keeps it open even after this owned scope exits.
+        if let Err(error) = self.set_source_status(target, health, final_exit).await {
             target
                 .cache
                 .lock()
@@ -1283,7 +1504,7 @@ impl Monitoring {
             error: None,
         };
         if final_exit {
-            let key = (target.agent.clone(), target.generation);
+            let key = target.key.clone();
             let mut targets = self
                 .inner
                 .targets
@@ -1301,13 +1522,23 @@ impl Monitoring {
 
     async fn set_source_status(&self, target: &Target, health: &str, closed: bool) -> Result<()> {
         let mut store = self.inner.store.lock().await;
-        let events = store.set_process_source_status(
-            &target.agent,
-            target.generation,
-            health,
-            closed,
-            now_ms(),
-        )?;
+        let events = if target.workspace.is_some() {
+            store.set_workspace_process_source_status(
+                &target.agent,
+                target.generation,
+                health,
+                false,
+                now_ms(),
+            )?
+        } else {
+            store.set_process_source_status(
+                &target.agent,
+                target.generation,
+                health,
+                closed,
+                now_ms(),
+            )?
+        };
         self.inner.bus.publish(&events);
         Ok(())
     }
@@ -1372,6 +1603,61 @@ fn verified_file_hints(workspace: &str, input: &GitBindingInput) -> (Vec<FileCha
 
 fn age_ms(now: i64, timestamp: i64) -> Option<i64> {
     now.checked_sub(timestamp).filter(|age| *age >= 0)
+}
+
+fn stats_view(cache: &Cache, unavailable: Option<String>, now: i64) -> Value {
+    let sample_age_ms = cache.sampled_at.and_then(|at| age_ms(now, at));
+    let clock_regressed = cache.sampled_at.is_some_and(|at| at > now);
+    let stale = unavailable.is_some()
+        || cache.error.is_some()
+        || clock_regressed
+        || sample_age_ms.is_some_and(|age| age > SAMPLE_TTL_MS);
+    let available = cache.snapshot.is_some() && !stale;
+    let coverage = match cache.snapshot.as_ref() {
+        None => "unknown",
+        Some(_) if stale => "stale",
+        Some(snapshot) if snapshot.complete => "complete",
+        Some(_) => "partial",
+    };
+    let samples = cache
+        .snapshot
+        .as_ref()
+        .filter(|_| available)
+        .map(|snapshot| &snapshot.samples);
+    let total_samples = samples.filter(|_| cache.snapshot.as_ref().is_some_and(|s| s.complete));
+    let cpu_time_ns = total_samples.and_then(|samples| {
+        if samples.is_empty() {
+            return None;
+        }
+        samples.iter().try_fold(0_u64, |total, sample| {
+            total.checked_add(sample.cpu_time_ns?)
+        })
+    });
+    let rss_bytes = total_samples.and_then(|samples| {
+        if samples.is_empty() {
+            return None;
+        }
+        samples
+            .iter()
+            .try_fold(0_u64, |total, sample| total.checked_add(sample.rss_bytes?))
+    });
+    json!({
+        "available": available,
+        "sampled_at": cache.sampled_at,
+        "age_ms": sample_age_ms,
+        "ttl_ms": SAMPLE_TTL_MS,
+        "clock_regressed": clock_regressed,
+        "coverage": coverage,
+        "complete": cache.snapshot.as_ref().map(|snapshot| snapshot.complete),
+        "cpu_time_ns": cpu_time_ns,
+        "rss_bytes": rss_bytes,
+        "samples": samples,
+        "error": unavailable.or_else(|| cache.error.clone()),
+    })
+}
+
+pub(crate) fn workspace_owner(agent: &str, target_generation: i64) -> String {
+    format!("workspace:{agent}#{target_generation}")
 }
 
 fn owner(agent: &str, generation: i64) -> String {

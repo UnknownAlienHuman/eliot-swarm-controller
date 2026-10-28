@@ -9,10 +9,10 @@ pub use crate::error::{Error, Result};
 use eliot_core::{
     self as core, Agent, AgentEdit, AgentState, BatchAck, Command, CommandState, Effect, Event,
     FileChangeHint, FrozenSetupFile, GitBaseline, GitHintPage, GitSnapshot, NativeEvent,
-    PendingRequest, ProcessIdentity, ProcessRecord, ProcessState, SourceBatch, SourceGap,
-    SourceGapAck, SubmitCommand, Turn, TurnState, WorkspaceCancelOutcome, WorkspaceCreationOutcome,
-    WorkspacePhase, WorkspacePreparation, WorkspacePreparationInput, WorkspaceRemovalOutcome,
-    WorkspaceSetupArg, WorkspaceSetupOutcome,
+    PendingRequest, ProcessIdentity, ProcessRecord, ProcessSnapshot, ProcessState, SourceBatch,
+    SourceGap, SourceGapAck, SubmitCommand, Turn, TurnState, WorkspaceCancelOutcome,
+    WorkspaceCreationOutcome, WorkspacePhase, WorkspacePreparation, WorkspacePreparationInput,
+    WorkspaceRemovalOutcome, WorkspaceSetupArg, WorkspaceSetupOutcome,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::de::DeserializeOwned;
@@ -30,6 +30,7 @@ const RETRY_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 const COMMAND_METHOD: &str = "command.submit";
 const INITIAL_SOURCE: &str = "stream";
 const PROCESS_SOURCE: &str = "os";
+const WORKSPACE_PROCESS_SOURCE: &str = "workspace_process";
 const GIT_SOURCE: &str = "git";
 
 macro_rules! db {
@@ -37,6 +38,8 @@ macro_rules! db {
         $expression.map_err(sql_error)?
     };
 }
+
+mod observer;
 
 fn sql_error(error: rusqlite::Error) -> Error {
     Error::new("internal", error.to_string())
@@ -123,7 +126,7 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(sql_error)?;
-        if current > 6 {
+        if current > 7 {
             return Err(Error::new(
                 "unsupported",
                 format!("Store schema version {current} is newer than this binary"),
@@ -374,6 +377,19 @@ impl Store {
             ).map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
+        if current < 7 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE agents ADD COLUMN origin TEXT NOT NULL DEFAULT 'eliot' CHECK(origin IN ('eliot','native','external'));
+                 ALTER TABLE agents ADD COLUMN observe_only INTEGER NOT NULL DEFAULT 0
+                     CHECK(observe_only IN (0,1) AND (state <> 'unknown' OR observe_only = 1) AND (observe_only = 0 OR token IS NULL));
+                 INSERT INTO schema_migrations(version) VALUES (7);",
+            ).map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
         Ok(())
     }
 
@@ -438,17 +454,24 @@ impl Store {
         if !request.args.is_object() {
             return Err(Error::new("invalid", "command args must be a JSON object"));
         }
-        if encode_json(&request)?.len() > MAX_FRAME_BYTES {
+        if request.verb != "attach" && encode_json(&request)?.len() > MAX_FRAME_BYTES {
             return Err(Error::new(
                 "frame_too_large",
                 "command request exceeds 1 MiB",
             ));
         }
         validate_ulid(&request.id)?;
+        let mut semantic_args = request.args.clone();
+        if request.verb == "attach" {
+            semantic_args
+                .as_object_mut()
+                .ok_or_else(|| Error::new("invalid", "attach args must be an object"))?
+                .remove("profile_snapshot");
+        }
         let mut semantic_payload = json!({
             "target": request.target,
             "verb": request.verb,
-            "args": request.args,
+            "args": semantic_args,
             "expected_generation": request.expected_generation,
             "expected_turn_id": request.expected_turn_id,
         });
@@ -460,6 +483,12 @@ impl Store {
                 "request_id".to_owned(),
                 Value::String(request_id.to_owned()),
             );
+        }
+        if encode_json(&semantic_payload)?.len() > MAX_FRAME_BYTES {
+            return Err(Error::new(
+                "frame_too_large",
+                "command semantic request exceeds its bound",
+            ));
         }
         let payload_digest = canonical::digest(&semantic_payload)?;
         let tx = self
@@ -496,6 +525,12 @@ impl Store {
             ));
         }
         validate_id_age(&request.id, now)?;
+        if !matches!(request.verb.as_str(), "attach" | "detach")
+            && let Some(target) = request.target.as_deref()
+            && let Some(agent) = load_agent_by_num(&tx, parse_agent_id(target)?)?
+        {
+            observer::require_controlled(&agent)?;
+        }
         if let Some(input) = &preparation {
             if !matches!(request.verb.as_str(), "launch" | "resume") {
                 return Err(Error::new(
@@ -518,6 +553,10 @@ impl Store {
 
         let mut events = Vec::new();
         let linked = match request.verb.as_str() {
+            "attach" | "detach" => {
+                observer::admit(&tx, principal, &request, &payload_digest, now, &mut events)?;
+                None
+            }
             "launch" => {
                 if request.target.is_some() {
                     return Err(Error::new("invalid", "launch does not take a target"));
@@ -1482,8 +1521,12 @@ impl Store {
         let agent = load_agent_by_num(&tx, agent_num)?
             .ok_or_else(|| Error::new("not_found", "command target Agent was not found"))?;
         let command_generation = command.command.generation.unwrap_or(agent.generation);
+        if !matches!(command.command.verb.as_str(), "attach" | "detach") {
+            observer::require_controlled(&agent)?;
+        }
 
         match command.command.verb.as_str() {
+            "attach" | "detach" => observer::dispatch(&tx, &command, &agent, now, &mut events)?,
             "launch" => {
                 if command.state != CommandState::Accepted
                     || agent.generation != 0
@@ -1624,7 +1667,7 @@ impl Store {
                 }
                 db!(tx.execute(
                     "UPDATE source_state SET state = 'closed', updated_at = ?1
-                     WHERE agent = ?2 AND generation = ?3 AND state = 'open' AND source NOT IN ('os', 'git')",
+                     WHERE agent = ?2 AND generation = ?3 AND state = 'open' AND source NOT IN ('os', 'git', 'workspace_process')",
                     params![now, agent_num, agent.generation],
                 ));
                 db!(tx.execute(
@@ -2010,6 +2053,14 @@ impl Store {
             .map_err(sql_error)?;
         let mut record = load_command_record(&tx, id)?
             .ok_or_else(|| Error::new("not_found", format!("command {id} was not found")))?;
+        if matches!(record.command.verb.as_str(), "attach" | "detach")
+            && state == CommandState::Applied
+        {
+            return Err(Error::new(
+                "not_allowed",
+                "observer commands require exact observer settlement",
+            ));
+        }
         if record.command.verb == "worktree.remove" {
             return Err(Error::new(
                 "bad_state",
@@ -2136,6 +2187,10 @@ impl Store {
             json!({"command_id": id, "state": state_name, "outcome": outcome}),
         )?);
 
+        if matches!(record.command.verb.as_str(), "attach" | "detach") {
+            observer::settle_failure(&tx, &record.command, now, &mut events)?;
+        }
+
         if matches!(record.command.verb.as_str(), "launch" | "resume")
             && matches!(state, CommandState::Rejected | CommandState::Failed)
         {
@@ -2174,7 +2229,7 @@ impl Store {
         let token: Option<Option<String>> = self
             .connection
             .query_row(
-                "SELECT token FROM agents WHERE id = ?1 AND generation = ?2",
+                "SELECT token FROM agents WHERE id = ?1 AND generation = ?2 AND observe_only = 0",
                 params![agent_num, generation],
                 |row| row.get(0),
             )
@@ -2191,7 +2246,7 @@ impl Store {
             .prepare(
                 "SELECT id, generation, name, project, harness, profile,
                         profile_snapshot, native_scope, native_ref, workspace, effective,
-                        pending, state, active_turn, created_at, updated_at
+                        pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0)
                  FROM agents WHERE id > ?1 ORDER BY id LIMIT ?2",
             )
             .map_err(sql_error)?;
@@ -2217,9 +2272,9 @@ impl Store {
             .prepare(
                 "SELECT id, generation, name, project, harness, profile,
                         profile_snapshot, native_scope, native_ref, workspace, effective,
-                        pending, state, active_turn, created_at, updated_at
+                        pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0)
                  FROM agents
-                 WHERE state IN ('created', 'starting', 'idle', 'busy', 'waiting')
+                 WHERE observe_only = 0 AND state IN ('created', 'starting', 'idle', 'busy', 'waiting')
                  ORDER BY id LIMIT ?1",
             )
             .map_err(sql_error)?;
@@ -2248,6 +2303,10 @@ impl Store {
                         created_at, updated_at
                  FROM commands
                  WHERE state IN ('accepted', 'queued', 'dispatched', 'unknown')
+                   AND NOT (state = 'unknown' AND verb IN ('attach','detach')
+                     AND EXISTS(SELECT 1 FROM agents a WHERE a.id = commands.target AND a.observe_only = 1)
+                     AND NOT EXISTS(SELECT 1 FROM source_state s WHERE s.agent = commands.target
+                         AND s.source = 'observe' AND s.state = 'open'))
                  ORDER BY created_at, rowid LIMIT ?1",
             )
             .map_err(sql_error)?;
@@ -2369,6 +2428,11 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
         db!(tx.execute("UPDATE agents SET token = NULL WHERE token IS NOT NULL", []));
+        db!(tx.execute("UPDATE agents SET state = 'unknown', active_turn = NULL, pending = '[]', updated_at = ?1 WHERE observe_only = 1", [now]));
+        db!(tx.execute(
+            "UPDATE source_state SET health = 'stale', updated_at = ?1 WHERE state = 'open'
+             AND EXISTS(SELECT 1 FROM agents a WHERE a.id = source_state.agent AND a.observe_only = 1)", [now],
+        ));
         db!(tx.execute(
             "UPDATE processes SET state = 'unknown', exit_code = NULL, updated_at = ?1
              WHERE state = 'running'",
@@ -2376,7 +2440,7 @@ impl Store {
         ));
         db!(tx.execute(
             "UPDATE source_state SET health = 'stale', updated_at = ?1
-             WHERE source IN ('os', 'git') AND state = 'open'",
+             WHERE source IN ('os', 'git', 'workspace_process') AND state = 'open'",
             [now],
         ));
         let mut dispatched_statement = tx
@@ -2426,7 +2490,7 @@ impl Store {
         let mut statement = tx
             .prepare(
                 "SELECT id, generation FROM agents
-                 WHERE state IN ('starting', 'idle', 'busy', 'waiting') ORDER BY id",
+                 WHERE observe_only = 0 AND state IN ('starting', 'idle', 'busy', 'waiting') ORDER BY id",
             )
             .map_err(sql_error)?;
         let rows = statement
@@ -2487,7 +2551,104 @@ impl Store {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ProcessSourceKind {
+    Agent,
+    Workspace,
+}
+
+impl ProcessSourceKind {
+    fn source(self) -> &'static str {
+        match self {
+            Self::Agent => PROCESS_SOURCE,
+            Self::Workspace => WORKSPACE_PROCESS_SOURCE,
+        }
+    }
+    fn family(self) -> &'static str {
+        match self {
+            Self::Agent => "process",
+            Self::Workspace => "workspace_process",
+        }
+    }
+    fn owner(self, agent: &str, generation: i64) -> String {
+        match self {
+            Self::Agent => format!("agent:{agent}#{generation}"),
+            Self::Workspace => format!("workspace:{agent}#{generation}"),
+        }
+    }
+}
+
 impl Store {
+    pub fn ensure_workspace_process_source(
+        &mut self,
+        agent: &str,
+        target_generation: i64,
+        now: i64,
+    ) -> Result<Vec<Event>> {
+        self.ensure_writer_healthy()?;
+        let result = self.ensure_process_source_inner(
+            agent,
+            target_generation,
+            now,
+            ProcessSourceKind::Workspace,
+        );
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    pub fn observe_workspace_processes(
+        &mut self,
+        agent: &str,
+        target_generation: i64,
+        snapshot: &ProcessSnapshot,
+        now: i64,
+    ) -> Result<Vec<Event>> {
+        self.ensure_writer_healthy()?;
+        if encode_json(snapshot)?.len() > MAX_FRAME_BYTES {
+            return Err(Error::new(
+                "frame_too_large",
+                "workspace process snapshot exceeds frame bound",
+            ));
+        }
+        let records: Vec<ProcessRecord> = snapshot
+            .samples
+            .iter()
+            .map(|sample| sample.record.clone())
+            .collect();
+        // Completeness describes only this custody snapshot. It never proves
+        // departure of a missing row from a different/prior runner's Job.
+        let result = self.observe_processes_inner(
+            agent,
+            target_generation,
+            &records,
+            now,
+            ProcessSourceKind::Workspace,
+        );
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    pub fn set_workspace_process_source_status(
+        &mut self,
+        agent: &str,
+        target_generation: i64,
+        health: &str,
+        closed: bool,
+        now: i64,
+    ) -> Result<Vec<Event>> {
+        self.ensure_writer_healthy()?;
+        let result = self.set_process_source_status_inner(
+            agent,
+            target_generation,
+            health,
+            closed,
+            now,
+            ProcessSourceKind::Workspace,
+        );
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
     /// Install OS process ownership before the caller spawns this generation.
     pub fn ensure_process_source(
         &mut self,
@@ -2496,7 +2657,8 @@ impl Store {
         now: i64,
     ) -> Result<Vec<Event>> {
         self.ensure_writer_healthy()?;
-        let result = self.ensure_process_source_inner(agent, generation, now);
+        let result =
+            self.ensure_process_source_inner(agent, generation, now, ProcessSourceKind::Agent);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -2506,6 +2668,7 @@ impl Store {
         agent: &str,
         generation: i64,
         now: i64,
+        scope: ProcessSourceKind,
     ) -> Result<Vec<Event>> {
         let agent_num = parse_agent_id(agent)?;
         let tx = self
@@ -2514,36 +2677,33 @@ impl Store {
             .map_err(sql_error)?;
         let current = load_agent_by_num(&tx, agent_num)?
             .ok_or_else(|| Error::new("not_found", "process source Agent was not found"))?;
-        if generation <= 0 || current.generation != generation {
-            return Err(Error::new(
-                "stale_generation",
-                "process source generation is not current",
-            ));
-        }
+        validate_process_generation(&tx, &current, generation, scope, true)?;
         let owner: Option<(String, String)> = tx
             .query_row(
                 "SELECT source, mechanism FROM source_owners
-                 WHERE agent = ?1 AND generation = ?2 AND family = 'process'",
-                params![agent_num, generation],
+                 WHERE agent = ?1 AND generation = ?2 AND family = ?3",
+                params![agent_num, generation, scope.family()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(sql_error)?;
-        let source = load_source_state(&tx, agent_num, generation, PROCESS_SOURCE)?;
+        let source = load_source_state(&tx, agent_num, generation, scope.source())?;
         let mut events = Vec::new();
         match (owner, source) {
             (Some((source, mechanism)), Some(_))
-                if source == PROCESS_SOURCE && mechanism == "os" => {}
-            (None, None) if !current.is_terminal() => {
+                if source == scope.source() && mechanism == "os" => {}
+            (None, None)
+                if matches!(scope, ProcessSourceKind::Workspace) || !current.is_terminal() =>
+            {
                 db!(tx.execute(
                     "INSERT INTO source_owners(agent, generation, family, source, mechanism)
-                     VALUES (?1, ?2, 'process', 'os', 'os')",
-                    params![agent_num, generation],
+                     VALUES (?1, ?2, ?3, ?4, 'os')",
+                    params![agent_num, generation, scope.family(), scope.source()],
                 ));
                 db!(tx.execute(
                     "INSERT INTO source_state(agent, generation, source, state, health, updated_at)
-                     VALUES (?1, ?2, 'os', 'open', 'ok', ?3)",
-                    params![agent_num, generation, now],
+                     VALUES (?1, ?2, ?3, 'open', 'ok', ?4)",
+                    params![agent_num, generation, scope.source(), now],
                 ));
                 events.push(insert_daemon_event(
                     &tx,
@@ -2552,7 +2712,7 @@ impl Store {
                     "source",
                     Some(agent_num),
                     Some(generation),
-                    json!({"source": PROCESS_SOURCE, "families": ["process"], "mechanism": "os"}),
+                    json!({"source": scope.source(), "families": [scope.family()], "mechanism": "os", "owner": scope.owner(agent, generation)}),
                 )?);
             }
             _ => {
@@ -2576,7 +2736,14 @@ impl Store {
         now: i64,
     ) -> Result<Vec<Event>> {
         self.ensure_writer_healthy()?;
-        let result = self.set_process_source_status_inner(agent, generation, health, closed, now);
+        let result = self.set_process_source_status_inner(
+            agent,
+            generation,
+            health,
+            closed,
+            now,
+            ProcessSourceKind::Agent,
+        );
         self.fault_on_persistence_error(&result);
         result
     }
@@ -2588,6 +2755,7 @@ impl Store {
         health: &str,
         closed: bool,
         now: i64,
+        scope: ProcessSourceKind,
     ) -> Result<Vec<Event>> {
         if !matches!(health, "ok" | "slow" | "stale" | "error") {
             return Err(Error::new(
@@ -2602,19 +2770,26 @@ impl Store {
             .map_err(sql_error)?;
         let current = load_agent_by_num(&tx, agent_num)?
             .ok_or_else(|| Error::new("not_found", "process source Agent was not found"))?;
-        if generation <= 0 || generation > current.generation {
-            return Err(Error::new(
-                "stale_generation",
-                "process source generation is not committed",
-            ));
-        }
-        let source = require_process_source(&tx, agent_num, generation)?;
+        validate_process_generation(&tx, &current, generation, scope, false)?;
+        let source = require_process_source(&tx, agent_num, generation, scope)?;
         if closed {
+            if matches!(scope, ProcessSourceKind::Workspace) {
+                let workspace = load_workspace(&tx, agent_num)?
+                    .ok_or_else(|| Error::new("not_found", "managed preparation was not found"))?;
+                if workspace.target_generation == generation
+                    && workspace.phase != WorkspacePhase::Removed
+                {
+                    return Err(Error::new(
+                        "bad_state",
+                        "workspace process source remains open for later preparation or removal work",
+                    ));
+                }
+            }
             let retained: bool = tx
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM processes
                  WHERE owner = ?1 AND state IN ('running', 'unknown'))",
-                    [format!("agent:{agent}#{generation}")],
+                    [scope.owner(agent, generation)],
                     |row| row.get(0),
                 )
                 .map_err(sql_error)?;
@@ -2634,8 +2809,8 @@ impl Store {
         if state != source.state || health != source.health {
             db!(tx.execute(
                 "UPDATE source_state SET state = ?1, health = ?2, updated_at = ?3
-                 WHERE agent = ?4 AND generation = ?5 AND source = 'os'",
-                params![state, health, now, agent_num, generation],
+                 WHERE agent = ?4 AND generation = ?5 AND source = ?6",
+                params![state, health, now, agent_num, generation, scope.source()],
             ));
             events.push(insert_daemon_event(
                 &tx,
@@ -2648,7 +2823,7 @@ impl Store {
                 "source",
                 Some(agent_num),
                 Some(generation),
-                json!({"source": PROCESS_SOURCE, "state": state, "health": health}),
+                json!({"source": scope.source(), "state": state, "health": health}),
             )?);
         }
         commit_transaction(tx, &self.write_faulted)?;
@@ -2665,7 +2840,8 @@ impl Store {
         now: i64,
     ) -> Result<Vec<Event>> {
         self.ensure_writer_healthy()?;
-        let result = self.observe_processes_inner(agent, generation, records, now);
+        let result =
+            self.observe_processes_inner(agent, generation, records, now, ProcessSourceKind::Agent);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -2676,9 +2852,10 @@ impl Store {
         generation: i64,
         records: &[ProcessRecord],
         now: i64,
+        scope: ProcessSourceKind,
     ) -> Result<Vec<Event>> {
         let agent_num = parse_agent_id(agent)?;
-        let expected_owner = format!("agent:{agent}#{generation}");
+        let expected_owner = scope.owner(agent, generation);
         if records.len() > MAX_PAGE_ENTRIES || encode_json(&records)?.len() > MAX_PAGE_BYTES {
             return Err(Error::new(
                 "frame_too_large",
@@ -2714,13 +2891,8 @@ impl Store {
             .map_err(sql_error)?;
         let current = load_agent_by_num(&tx, agent_num)?
             .ok_or_else(|| Error::new("not_found", "process observation Agent was not found"))?;
-        if generation <= 0 || generation > current.generation {
-            return Err(Error::new(
-                "stale_generation",
-                "process observation generation is not committed",
-            ));
-        }
-        let source = require_process_source(&tx, agent_num, generation)?;
+        validate_process_generation(&tx, &current, generation, scope, false)?;
+        let source = require_process_source(&tx, agent_num, generation, scope)?;
         let mut events = Vec::new();
         for record in records {
             let start_time = validate_process_identity(&record.identity)?;
@@ -2745,6 +2917,7 @@ impl Store {
                 if next.role != old.role {
                     match (old.role.as_str(), next.role.as_str()) {
                         ("child", "harness") => {}
+                        ("child", _) if matches!(scope, ProcessSourceKind::Workspace) => {}
                         (_, "child") => next.role = old.role.clone(),
                         _ => {
                             return Err(Error::new(
@@ -2797,6 +2970,7 @@ impl Store {
                     now,
                     "process.started",
                     &next,
+                    scope,
                 )?);
             }
             let kind = match next.state {
@@ -2818,20 +2992,24 @@ impl Store {
             };
             if let Some(kind) = kind {
                 events.push(insert_process_event(
-                    &tx, agent_num, generation, now, kind, &next,
+                    &tx, agent_num, generation, now, kind, &next, scope,
                 )?);
             }
         }
         db!(tx.execute(
             "UPDATE source_state SET last_store_seq = COALESCE(?1, last_store_seq), updated_at = ?2
-             WHERE agent = ?3 AND generation = ?4 AND source = 'os'",
+             WHERE agent = ?3 AND generation = ?4 AND source = ?5",
             params![
                 events.last().map(|event| event.seq),
                 now,
                 agent_num,
-                generation
+                generation,
+                scope.source()
             ],
         ));
+        if matches!(scope, ProcessSourceKind::Workspace) {
+            close_finished_workspace_process_source(&tx, agent_num, generation, now, &mut events)?;
+        }
         commit_transaction(tx, &self.write_faulted)?;
         Ok(events)
     }
@@ -2883,7 +3061,8 @@ impl Store {
                    ON o.agent = e.agent AND o.generation = e.generation
                   AND o.family = e.family AND o.source = e.source
                  WHERE e.agent = ?1 AND e.generation = ?2
-                   AND ((e.source NOT IN ('os', 'daemon', 'git') AND e.native_id IS NOT NULL
+                   AND EXISTS(SELECT 1 FROM agents a WHERE a.id = e.agent AND a.observe_only = 0)
+                   AND ((e.source NOT IN ('os', 'daemon', 'git', 'workspace_process') AND e.native_id IS NOT NULL
                    AND e.kind IN ('turn.started', 'turn.completed', 'message.completed',
                                   'tool.started', 'tool.completed',
                                   'request.opened', 'request.resolved', 'request.closed'))
@@ -3533,6 +3712,7 @@ fn current_git_agent(
 ) -> Result<Agent> {
     let current = load_agent_by_num(connection, parse_agent_id(agent)?)?
         .ok_or_else(|| Error::new("not_found", "Git observation Agent was not found"))?;
+    observer::require_controlled(&current)?;
     if generation <= 0 || generation != current.generation {
         return Err(Error::new(
             "stale_generation",
@@ -4254,7 +4434,7 @@ fn require_workspace_removable(
     let mut statement = connection
         .prepare(
             "SELECT workspace FROM agents WHERE id <> ?1 AND workspace IS NOT NULL
-         AND state IN ('created','starting','idle','busy','waiting')",
+         AND state IN ('created','starting','idle','busy','waiting','unknown')",
         )
         .map_err(sql_error)?;
     let borrowers = statement
@@ -4480,6 +4660,7 @@ fn admit_workspace_preparation(
         workspace.updated_at = now;
         persist_workspace(tx, &old, &workspace)?;
         events.push(workspace_event(tx, &workspace, now)?);
+        close_finished_workspace_process_source(tx, agent_num, old.target_generation, now, events)?;
     } else if input.is_some() {
         return Err(Error::new(
             "unsupported",
@@ -4836,10 +5017,14 @@ impl Store {
                 WorkspaceAction::Begin(_) | WorkspaceAction::CancelRequest(_)
             )
         {
+            let mut events = Vec::new();
+            if removal && workspace.phase == WorkspacePhase::Removed {
+                close_finished_workspace_process_source(&tx, agent_num, target, now, &mut events)?;
+            }
             commit_transaction(tx, &self.write_faulted)?;
             return Ok(Change {
                 value: workspace,
-                events: Vec::new(),
+                events,
             });
         }
         let mut events = Vec::new();
@@ -5167,6 +5352,9 @@ impl Store {
         }
         persist_workspace(&tx, &old, &workspace)?;
         events.push(workspace_event(&tx, &workspace, now)?);
+        if removal && workspace.phase == WorkspacePhase::Removed {
+            close_finished_workspace_process_source(&tx, agent_num, target, now, &mut events)?;
+        }
         commit_transaction(tx, &self.write_faulted)?;
         Ok(Change {
             value: workspace,
@@ -5350,16 +5538,17 @@ fn require_process_source(
     connection: &Connection,
     agent: i64,
     generation: i64,
+    scope: ProcessSourceKind,
 ) -> Result<SourceStateRecord> {
     let owned: bool = connection
         .query_row(
             "SELECT EXISTS(
              SELECT 1 FROM source_owners o JOIN source_state s
                ON s.agent = o.agent AND s.generation = o.generation AND s.source = o.source
-             WHERE o.agent = ?1 AND o.generation = ?2 AND o.family = 'process'
-               AND o.source = 'os' AND o.mechanism = 'os'
+             WHERE o.agent = ?1 AND o.generation = ?2 AND o.family = ?3
+               AND o.source = ?4 AND o.mechanism = 'os'
          )",
-            params![agent, generation],
+            params![agent, generation, scope.family(), scope.source()],
             |row| row.get(0),
         )
         .map_err(sql_error)?;
@@ -5369,7 +5558,7 @@ fn require_process_source(
             "OS process ownership was not committed before observation",
         ));
     }
-    load_source_state(connection, agent, generation, PROCESS_SOURCE)?
+    load_source_state(connection, agent, generation, scope.source())?
         .ok_or_else(|| Error::new("source_integrity", "OS source state is missing"))
 }
 
@@ -5380,22 +5569,130 @@ fn insert_process_event(
     now: i64,
     kind: &str,
     record: &ProcessRecord,
+    scope: ProcessSourceKind,
 ) -> Result<Event> {
     insert_event(
         tx,
         EventInsert {
             ts: now,
             kind,
-            family: Some("process"),
+            family: Some(scope.family()),
             agent: Some(agent),
             generation: Some(generation),
-            source: PROCESS_SOURCE,
+            source: scope.source(),
             native_id: None,
             cursor: None,
             payload_digest: None,
             data: json!(record),
         },
     )
+}
+
+fn close_finished_workspace_process_source(
+    tx: &Transaction<'_>,
+    agent: i64,
+    generation: i64,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    let workspace = load_workspace(tx, agent)?
+        .ok_or_else(|| Error::new("not_found", "workspace process lifetime has no preparation"))?;
+    if workspace.target_generation < generation
+        || workspace.target_generation == generation && workspace.phase != WorkspacePhase::Removed
+    {
+        return Ok(());
+    }
+    let Some(source) = load_source_state(tx, agent, generation, WORKSPACE_PROCESS_SOURCE)? else {
+        return Ok(());
+    };
+    if source.state != "open" {
+        return Ok(());
+    }
+    let retained: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM processes WHERE owner = ?1 AND state IN ('running','unknown'))",
+        [format!("workspace:{}#{generation}", format_agent_id(agent))], |row| row.get(0),
+    ).map_err(sql_error)?;
+    let state = if retained { "open" } else { "closed" };
+    let health = if retained {
+        "stale"
+    } else {
+        source.health.as_str()
+    };
+    if state == source.state && health == source.health {
+        return Ok(());
+    }
+    db!(tx.execute(
+        "UPDATE source_state SET state = ?1, health = ?2, updated_at = ?3
+         WHERE agent = ?4 AND generation = ?5 AND source = 'workspace_process' AND state = 'open'",
+        params![state, health, now, agent, generation],
+    ));
+    events.push(insert_daemon_event(
+        tx,
+        now,
+        if retained {
+            "source.health"
+        } else {
+            "source.closed"
+        },
+        "source",
+        Some(agent),
+        Some(generation),
+        json!({"source": WORKSPACE_PROCESS_SOURCE, "state": state, "health": health}),
+    )?);
+    Ok(())
+}
+
+fn validate_process_generation(
+    connection: &Connection,
+    agent: &Agent,
+    generation: i64,
+    scope: ProcessSourceKind,
+    installing: bool,
+) -> Result<()> {
+    if agent.observe_only && installing {
+        observer::require_reader_source(connection, agent, generation)?;
+    }
+    if generation <= 0 {
+        return Err(Error::new(
+            "stale_generation",
+            "process generation must be positive",
+        ));
+    }
+    match scope {
+        ProcessSourceKind::Agent
+            if generation > agent.generation || installing && generation != agent.generation =>
+        {
+            return Err(Error::new(
+                "stale_generation",
+                "process generation is not the admitted Agent generation",
+            ));
+        }
+        ProcessSourceKind::Workspace => {
+            let workspace =
+                load_workspace(connection, parse_agent_id(&agent.id)?)?.ok_or_else(|| {
+                    Error::new(
+                        "not_found",
+                        "workspace process source requires a managed preparation",
+                    )
+                })?;
+            if installing
+                && (workspace.target_generation != generation
+                    || workspace.phase == WorkspacePhase::Removed)
+                || !installing
+                    && workspace.target_generation != generation
+                    && generation > agent.generation
+            {
+                return Err(Error::new(
+                    "stale_generation",
+                    "process generation is not the exact managed preparation target",
+                ));
+            }
+            // Late exits/status for a retired target also require its already
+            // committed workspace_process binding; this never creates a past owner.
+        }
+        ProcessSourceKind::Agent => {}
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -5834,6 +6131,9 @@ struct AgentRecord {
     active_turn: Option<String>,
     created_at: i64,
     updated_at: i64,
+    origin: String,
+    observe_only: bool,
+    own_identity: bool,
 }
 
 struct CommandRecord {
@@ -5956,6 +6256,9 @@ fn agent_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecor
         active_turn: row.get(13)?,
         created_at: row.get(14)?,
         updated_at: row.get(15)?,
+        origin: row.get(16)?,
+        observe_only: row.get(17)?,
+        own_identity: row.get(18)?,
     })
 }
 
@@ -5973,6 +6276,9 @@ fn agent_from_record(connection: &Connection, record: AgentRecord) -> Result<Age
     Ok(Agent {
         id: format_agent_id(record.id),
         generation: record.generation,
+        origin: parse_enum(&record.origin, "Agent origin")?,
+        observe_only: record.observe_only,
+        own_identity: record.own_identity,
         name: record.name,
         project: record.project,
         harness: record.harness,
@@ -6008,7 +6314,7 @@ fn load_agent_by_num(connection: &Connection, id: i64) -> Result<Option<Agent>> 
         .query_row(
             "SELECT id, generation, name, project, harness, profile,
                     profile_snapshot, native_scope, native_ref, workspace, effective,
-                    pending, state, active_turn, created_at, updated_at
+                    pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0)
              FROM agents WHERE id = ?1",
             [id],
             agent_record_from_row,
@@ -7075,6 +7381,7 @@ fn validate_control_applied_outcome(
 }
 
 fn update_agent_projection(tx: &Transaction<'_>, agent: &Agent) -> Result<()> {
+    observer::require_controlled(agent)?;
     let agent_num = parse_agent_id(&agent.id)?;
     let effective = agent.effective.as_ref().map(encode_json).transpose()?;
     let pending = encode_json(&agent.pending)?;
@@ -7125,6 +7432,7 @@ fn transition_lost_tx(
     let Some(agent) = load_agent_by_num(tx, agent_num)? else {
         return Err(Error::new("not_found", "Agent was not found"));
     };
+    observer::require_controlled(&agent)?;
     if agent.generation != generation {
         return Err(Error::new(
             "stale_generation",
@@ -7225,7 +7533,7 @@ fn transition_lost_tx(
     ));
     db!(tx.execute(
         "UPDATE source_state SET state = 'closed', health = 'stale', updated_at = ?1
-         WHERE agent = ?2 AND generation = ?3 AND source NOT IN ('os', 'git')",
+         WHERE agent = ?2 AND generation = ?3 AND source NOT IN ('os', 'git', 'workspace_process')",
         params![now, agent_num, generation],
     ));
     events.push(insert_daemon_event(
@@ -7252,6 +7560,7 @@ fn fail_start_tx(
     let Some(agent) = load_agent_by_num(tx, agent_num)? else {
         return Err(Error::new("not_found", "launch target Agent was not found"));
     };
+    observer::require_controlled(&agent)?;
     if agent.generation != generation || agent.state != AgentState::Starting {
         return Ok(());
     }
@@ -7288,7 +7597,7 @@ fn fail_start_tx(
     ));
     db!(tx.execute(
         "UPDATE source_state SET state = 'closed', health = 'error', updated_at = ?1
-         WHERE agent = ?2 AND generation = ?3 AND source NOT IN ('os', 'git')",
+         WHERE agent = ?2 AND generation = ?3 AND source NOT IN ('os', 'git', 'workspace_process')",
         params![now, agent_num, generation],
     ));
     events.push(insert_daemon_event(
@@ -7314,6 +7623,7 @@ fn stop_agent_tx(
     let Some(agent) = load_agent_by_num(tx, agent_num)? else {
         return Err(Error::new("not_found", "stop target Agent was not found"));
     };
+    observer::require_controlled(&agent)?;
     if agent.generation != generation || agent.is_terminal() {
         return Ok(());
     }
@@ -7392,7 +7702,7 @@ fn stop_agent_tx(
     ));
     db!(tx.execute(
         "UPDATE source_state SET state = 'closed', updated_at = ?1
-         WHERE agent = ?2 AND generation = ?3 AND source NOT IN ('os', 'git')",
+         WHERE agent = ?2 AND generation = ?3 AND source NOT IN ('os', 'git', 'workspace_process')",
         params![now, agent_num, generation],
     ));
     events.push(insert_daemon_event(
@@ -7608,6 +7918,7 @@ fn validate_id_age(id: &str, now: i64) -> Result<()> {
 
 fn agent_state_name(state: AgentState) -> &'static str {
     match state {
+        AgentState::Unknown => "unknown",
         AgentState::Created => "created",
         AgentState::Starting => "starting",
         AgentState::Idle => "idle",
@@ -7641,6 +7952,92 @@ fn turn_state_name(state: TurnState) -> &'static str {
 }
 
 impl Store {
+    /// Safe diagnostic source views; controlled plugin acknowledgements retain
+    /// their separate current-generation authorization in read_source_state.
+    pub fn list_source_states(&self, agent: &str, generation: i64) -> Result<Vec<Value>> {
+        let agent_num = parse_agent_id(agent)?;
+        let current = load_agent_by_num(&self.connection, agent_num)?
+            .ok_or_else(|| Error::new("not_found", "source-state Agent was not found"))?;
+        let pending = generation > current.generation;
+        if generation < 0
+            || pending
+                && load_workspace(&self.connection, agent_num)?
+                    .is_none_or(|workspace| workspace.target_generation != generation)
+        {
+            return Err(Error::new(
+                "stale_generation",
+                "source-state generation is neither retained nor the exact preparation target",
+            ));
+        }
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT source FROM source_state WHERE agent = ?1 AND generation = ?2
+             AND (?3 = 0 OR source = 'workspace_process') ORDER BY source LIMIT ?4",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(
+                params![agent_num, generation, pending, MAX_PAGE_ENTRIES as i64 + 1],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(sql_error)?;
+        let names = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql_error)?;
+        if names.len() > MAX_PAGE_ENTRIES {
+            return Err(Error::new(
+                "frame_too_large",
+                "source-state view exceeds row bound",
+            ));
+        }
+        let mut views = Vec::with_capacity(names.len());
+        for source in names {
+            let state = load_source_state(&self.connection, agent_num, generation, &source)?
+                .ok_or_else(|| Error::new("source_integrity", "source state disappeared"))?;
+            let mut owners = self
+                .connection
+                .prepare(
+                    "SELECT family, mechanism FROM source_owners
+                 WHERE agent = ?1 AND generation = ?2 AND source = ?3 ORDER BY family LIMIT ?4",
+                )
+                .map_err(sql_error)?;
+            let rows = owners
+                .query_map(
+                    params![agent_num, generation, source, MAX_PAGE_ENTRIES as i64 + 1],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .map_err(sql_error)?;
+            let owners = rows
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(sql_error)?;
+            if owners.len() > MAX_PAGE_ENTRIES {
+                return Err(Error::new(
+                    "frame_too_large",
+                    "source owner view exceeds row bound",
+                ));
+            }
+            let families: Vec<&str> = owners.iter().map(|(family, _)| family.as_str()).collect();
+            let owners: Vec<Value> = owners.iter().map(|(family, mechanism)|
+                json!({"family": family, "source": source, "mechanism": mechanism})).collect();
+            views.push(json!({
+                "agent_id": agent, "generation": generation, "source": source,
+                "families": families, "owners": owners, "state": state.state, "health": state.health,
+                "cursor": state.cursor, "last_store_seq": state.last_store_seq,
+                "last_batch_id": state.last_batch_id, "last_batch_first_seq": state.last_batch_first_seq,
+                "last_batch_last_seq": state.last_batch_last_seq,
+                "gap_id": state.gap_id, "gap_from": state.gap_from, "gap_to": state.gap_to, "gap_seq": state.gap_seq,
+            }));
+        }
+        if encode_json(&views)?.len() > MAX_PAGE_BYTES {
+            return Err(Error::new(
+                "frame_too_large",
+                "source-state view exceeds byte bound",
+            ));
+        }
+        Ok(views)
+    }
+
     /// Read the bounded source projection and its latest durable acknowledgements.
     pub fn read_source_state(
         &self,
@@ -7951,6 +8348,7 @@ impl Store {
                 format!("Agent {} was not found", batch.agent_id),
             )
         })?;
+        observer::require_controlled(&projection)?;
         if projection.generation != batch.generation {
             return Err(Error::new(
                 "stale_generation",

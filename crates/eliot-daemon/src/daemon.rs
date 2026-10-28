@@ -443,7 +443,10 @@ fn valid_id(id: &Value) -> bool {
 }
 
 fn call_timeout(method: &str, params: &Value) -> Duration {
-    if method == "events.subscribe" {
+    if method == "agent.discover" {
+        // Includes bounded reader shutdown/reaping after the read deadline.
+        Duration::from_secs(45)
+    } else if method == "events.subscribe" {
         let wait_ms = params
             .get("wait_ms")
             .and_then(Value::as_u64)

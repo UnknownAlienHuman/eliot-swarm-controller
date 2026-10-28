@@ -15,3 +15,9 @@ mod workspace_git;
 mod workspaces;
 
 pub use daemon::{client_call, run};
+
+/// Start this executable's background daemon without inheriting caller handles.
+#[cfg(windows)]
+pub fn start_background_daemon(data_dir: &std::path::Path) -> eliot_core::Result<()> {
+    platform::windows::start_background_daemon(data_dir)
+}

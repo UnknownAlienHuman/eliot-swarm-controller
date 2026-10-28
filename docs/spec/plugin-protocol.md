@@ -68,19 +68,46 @@ normalized native family. Hooks never mirror lifecycle already supplied by the s
 | `agent.start` | agent/generation, profile, workspace, target environment, note, source plan/state, optional resume subject/linked initial input | establish session; input/result settle separately |
 | `agent.command` | agent/generation, command id, verb/args, exact turn/request where required | applied/rejected/failed/unknown, native mechanism and application point |
 | `agent.stop` | agent/generation, command id, force | success means the bound controlled session/generation ended, not merely that observation detached |
-| `agent.snapshot` | agent/generation, exact command/turn ids, page cursor | bounded exact native readback; missing proof remains unknown |
+| `agent.snapshot` | controlled command/turn binding, or exact subject plus `observation` page query | bounded readback; private history never acknowledges controlled effects |
 | `agent.attach` | exact subject, generation, observe/control, profile/environment, source plan/cursors | attach only to that subject; otherwise not found/unsupported |
-| `discover` | cursor, bounded limit | read-only native-subject page |
+| `agent.detach` | exact observed subject/generation and command id | close only its reader; never end the native session |
+| `discover` | frozen profile, target environment without Agent identity, optional exact scope/cursor, bounded limit | read-only native-subject metadata page |
 | `shutdown` | none | close owned paths, drain, exit; never kill an adopted service |
 
 `resume_from={native_scope,native_ref}` is an `agent.start` option, not replay of the
 old input. `initial={command_id,text}` is supplied only for a harness that requires
 input to create a session. Explicit new text remains a separate linked command.
 
+`features.discover` defaults to false. A discovery instance initializes independently
+of an Agent and has no authority to call `events.put`, `process.put` or other durable
+Agent requests. Its result is `{harness,native_scope,subjects,next_cursor,coverage}`
+using the bounded metadata shape in [API](api.md#discover-attach-detach-and-resume).
+It owns only its reader process tree. Profile/scope/filter cursor mismatches reject;
+an oversized entry or malformed/nonadvancing page is an explicit error, not a skipped
+subject or a synthetic complete page. Plugin shutdown closes the reader without
+controlling any discovered subject.
+Unix reader custody retains the documented process-group degradation; it does not
+prove that escaped descendants exited.
+
 The dispatch transaction already advanced the Agent generation, revoked old identity
-and installed the target token/source plan before native I/O. A plugin rejects stale
+and installed the source plan before native I/O. Controlled dispatch also installs its
+target token; observation installs none. A plugin rejects stale
 generation/turn/request before sending bytes. Unknown never rolls generation back or
 rebinds a failed call to another process.
+
+`features.observe` defaults to false. A supported observed manifest uses
+`sources.observed` and the `native_read` mechanism. Attach requests carry
+`agent_id,generation,command_id,mode:"observe",native_scope,native_ref,profile,
+target_environment,source_plan,source_state`; the environment has no Agent identity.
+Its response binds the same identifiers with `state:"attached"`,
+`observation_state:"unknown"`, bounded metadata and coverage. This acknowledges reader
+attachment, not native idle/readiness or prompt execution.
+
+Observation snapshots carry the exact Agent/generation/scope/reference and
+`observation:{source,view,turn_id?,cursor?,limit}`. Responses preserve those bindings,
+entries, next cursor and explicit coverage. They are private historical views, not
+`events.put` batches or command reconciliation. Detach returns `state:"detached"`
+after closing its own reader. Observe reader loss never emits native session end.
 
 ## Start ordering
 

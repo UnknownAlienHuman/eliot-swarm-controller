@@ -115,6 +115,17 @@ their timestamp, completeness and a four-second freshness window. Missing or sta
 values remain null. Liveness reports committed native facts separately from OS samples;
 waiting for an approval/question is not a stall caused by missing model output.
 
+Managed preparation uses the same process registry with owner
+`workspace:<agent>#<target_generation>` and source/family `workspace_process`.
+`show` and `top` include it under `observation.workspace`; `processes --scope workspace`
+pages the exact owner, including target generation 1 while the Agent remains 0.
+Each Git/setup runner supplies initial and final OS samples from its captured custody.
+An empty or complete snapshot for one runner never proves an absent historical process
+exited. Persist only supplied verified records; restart retains unresolved rows as
+unknown. The workspace source remains open across steps and later removal. Exact
+removed/retired lifetime closes it only when no running/unknown rows remain; otherwise
+the retained source is stale. Neither PID discovery nor preparation grants native control.
+
 The Windows boot marker is currently an estimate captured once per daemon and retains
 its `windows-boot-filetime-estimate` label. Exact creation FILETIME and verified Job
 membership bind owned processes; the estimate is not used to adopt surviving processes

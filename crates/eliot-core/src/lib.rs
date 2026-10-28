@@ -232,6 +232,7 @@ pub struct ProcessSnapshot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentState {
+    Unknown,
     Created,
     Starting,
     Idle,
@@ -240,6 +241,27 @@ pub enum AgentState {
     Stopped,
     Failed,
     Lost,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentOrigin {
+    #[default]
+    Eliot,
+    Native,
+    External,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ObserverBinding {
+    pub agent: String,
+    pub generation: i64,
+    pub harness: String,
+    pub native_scope: String,
+    pub native_ref: String,
+    pub profile_snapshot: Value,
+    pub source: String,
+    pub checkpoint: Option<String>,
 }
 
 impl AgentState {
@@ -261,6 +283,12 @@ pub struct PendingRequest {
 pub struct Agent {
     pub id: String,
     pub generation: i64,
+    #[serde(default)]
+    pub origin: AgentOrigin,
+    #[serde(default)]
+    pub observe_only: bool,
+    #[serde(default)]
+    pub own_identity: bool,
     pub name: Option<String>,
     pub project: String,
     pub harness: String,
@@ -301,6 +329,9 @@ impl Agent {
         Self {
             id: id.into(),
             generation: 0,
+            origin: AgentOrigin::Eliot,
+            observe_only: false,
+            own_identity: false,
             name: None,
             project: project.into(),
             harness: harness.into(),
@@ -524,6 +555,18 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Reduce one already-fenced native fact. Generation and source ownership are
 /// checked by the Store before this function is called.
 pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec<Effect>)> {
+    if agent.observe_only {
+        return Err(Error::new(
+            "not_allowed",
+            "observer metadata/history cannot reduce controlled native state",
+        ));
+    }
+    if agent.state == AgentState::Unknown {
+        return Err(Error::new(
+            "invalid",
+            "unknown Agent state requires observe_only",
+        ));
+    }
     if agent.is_terminal() {
         return Err(Error::new(
             "bad_state",

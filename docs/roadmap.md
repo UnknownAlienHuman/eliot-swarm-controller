@@ -45,7 +45,7 @@ to create every crate/table immediately.
       help/version smoke commands on Windows/Ubuntu. No empty framework crates or
       test platform.
 
-**Next:** L3.3 recovery/views. The direct Codex/Luna and Windows workspace paths have
+**Next:** L3.3c live recovery. The direct Codex/Luna and Windows workspace paths have
 been exercised; v1 remains available as a source donor.
 
 ## L1 — Core, Store, bus and one fake command path
@@ -126,9 +126,15 @@ sections, and [OpenCodex](harnesses/opencodex.md) only for the proxy task.
 - [x] **L3.2 Workspaces.** Existing workspaces remain the default. Add opt-in worktree
       creation with frozen base OID, one preparation row, explicit setup and no replay
       of unknown setup. Exact readback and clean-only removal; preserve the branch.
-- [ ] **L3.3 Recovery/views.** Paged discovery/observe attachment and transcript
-      handoff only now, with explicit gaps. `show/watch/top` query existing projections,
-      including workspace/setup process ownership alongside harness processes.
+- [x] **L3.3a Discovery/views.** Paged metadata discovery without Agent creation or
+      native session control. `show/watch/top` query existing projections, including
+      workspace/setup process ownership alongside harness processes.
+- [x] **L3.3b Observation/history.** Exact-subject observe attachment, private native
+      and rollout history pages, and reader-only detach. Preserve unknown native state
+      and keep observation separate from controlled identity and effects.
+- [ ] **L3.3c Live recovery.** Transcript source handoff with explicit gaps and
+      reconciliation. Commit family ownership and cursor boundaries before successor
+      publication; never replay an uncertain external effect.
 - [ ] **L3.4 Proxy/capacity.** First attach to an already-running OpenCodex endpoint.
       Add managed service launch only when actually needed. Add account/proxy caps and
       persistent provider holds with that route; freeze admitted nonsecret route/store
@@ -156,6 +162,42 @@ path/registration absence. Same-ID retry after removal ignored a moved source re
 did not recreate the checkout. Schema 5→6 preserved existing native-reference/turn
 digests. All owned test processes exited. Linux fake worktree lifecycle runs in CI;
 full crash/platform/vendor qualification remains L7.
+
+L3.3a Windows checks on 2026-10-28, with Rust 1.99.1 and Codex 0.161.0: formatting,
+scoped Clippy and debug build; fake enumeration returned three subjects over two pages,
+and native enumeration returned two distinct references with bound cursors. Unloaded
+native status stayed unknown, timestamps used milliseconds, and discovery left both
+Agent count and durable event high-water unchanged. Focused cursor regressions cover
+changed environment/store selection before native history can be enumerated.
+During setup, `show/top/processes` exposed target generation 1 and real OS samples while
+the Agent remained generation 0 with no native stream. Cross-scope/generation process
+cursors rejected; cancellation retained generation 0 and explicit process exits.
+Clean removal closed the workspace source, retained branches, and process-record hashes
+survived daemon restart. The normal fake worktree echo/stop/remove path also passed.
+Active-reader drain/force stopped their owned paths and rejected new discovery.
+Windows background startup no longer retains caller capture pipes; a live check covered
+spaces, Unicode and a trailing slash. All exercise daemons exited; no model input was
+sent for this increment. Observe attachment/history and live source handoff remain
+separate L3.3b/L3.3c increments.
+
+L3.3b Windows native-read checks on 2026-10-28: integrated formatting, scoped Clippy,
+focused discovery/store-policy/opened-file regressions and debug build passed.
+The fake observe lifecycle passed with two history pages. A retained Codex 0.161.0
+subject attached in generation 1 without native session control; its single persisted
+turn was reported complete and items were read across two bounded pages. Four control
+verbs rejected, same-ID attach retry kept one reader, and history added no observation
+or native lifecycle events. Detach advanced the fence to generation 2, retained unknown
+state across restart, and explicit attach used generation 3. Retrying the old detach
+ID did not close the new reader. No native session-control invocation or session-end
+event was observed; global config was unchanged and owned daemons exited.
+An isolated schema-6 copy migrated to 7 with native-reference, Agent, turn, command,
+process, unique-index and allocated-id digests unchanged; the source database was
+unchanged. A separate rollout run returned one verified subject, one turn followed
+by an empty page at the current end, and ten items for that exact native turn.
+It reported no partial tail, detached, and drained with daemon exit 0. The config
+copy matched its source; no model/session-control invocation or source edit occurred.
+This private-history evidence does not establish live source handoff, which remains
+the separate unchecked L3.3c increment.
 
 **Result:** useful Codex work is observable and restart outcomes are explicit. The direct
 route still works without any proxy installation or worktree machinery.

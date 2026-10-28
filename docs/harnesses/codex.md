@@ -174,6 +174,23 @@ readback. An unexpected effective route does not authorize further input.
 
 ## Recovery and later capabilities
 
+Installed Codex 0.161.0 discovery uses `initialize`/`initialized` followed by bounded
+`thread/list` with `useStateDbOnly=true`, explicit source kinds and updated-time ordering.
+Before listing, a probe reads effective configuration and requirements for its actual
+cwd, then closes. Configuration takes precedence over `CODEX_SQLITE_HOME`, then the
+Codex home default. A second reader starts with the selected canonical SQLite directory
+pinned in process-local argv; readback verifies its home/root and session-flags origin
+before listing. Global configuration is unchanged. Unavailable or ambiguous selection,
+exact SQLite requirements and higher-precedence legacy managed layers reject explicitly.
+This readback does not lock external management policy against transient changes.
+The verified default retains its Codex-home scope; another store gets a distinct scope.
+It returns metadata without the thread preview. Cursors bind the verified store,
+profile, environment and filters; state-DB-only enumeration does not claim complete rollout coverage.
+The reader never calls `thread/resume` or `thread/start` to obtain visibility.
+The installed stable and experimental schemas expose no passive subscription operation.
+`thread/read`, `thread/turns/list` and `thread/items/list` are separate bounded historical
+reads; metadata-only empty `turns` and reader-local `notLoaded` are not terminal evidence.
+
 The stdio stream has no assumed replay cursor. If it breaks, mark a gap and use exact
 thread/turn/request readback; do not republish old history as live completions. Owned
 process loss ends that controlled generation after buffered output is drained.

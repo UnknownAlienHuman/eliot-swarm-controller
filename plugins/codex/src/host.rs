@@ -13,11 +13,13 @@ use crate::{
             ThreadStartReadback,
         },
     },
+    observe::ObserverSession,
 };
 use eliot_core::{Error, ProcessRecord, ProcessState, Result};
 use eliot_plugin::{
-    AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
-    MAX_EVENT_BYTES, MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
+    AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, DiscoverParams,
+    InitializeParams, MAX_EVENT_BYTES, MAX_TEXT_BYTES, ObserverAttachParams, ObserverDetachParams,
+    ObserverSnapshotParams, Peer, PeerClient, PluginManifest, RpcRequest,
     protocol::{MAX_COMMAND_ID_BYTES, MAX_CREDENTIAL_BYTES},
 };
 use serde_json::{Value, json};
@@ -44,6 +46,7 @@ struct CodexPlugin {
     initialized: Option<Initialized>,
     session: Option<AgentSession>,
     failed_start: Option<FailedStart>,
+    observer: Option<ObserverSession>,
 }
 
 struct Initialized {
@@ -163,6 +166,9 @@ impl CodexPlugin {
     async fn dispatch(&mut self, request: &RpcRequest, client: &PeerClient) -> Result<Value> {
         match request.method.as_str() {
             "initialize" => self.initialize(&request.params),
+            "discover" => self.discover(&request.params).await,
+            "agent.attach" => self.attach(&request.params).await,
+            "agent.detach" => self.detach(&request.params).await,
             "agent.start" => self.start(&request.params, client).await,
             "agent.command" => self.command(&request.params).await,
             "agent.snapshot" => self.snapshot(&request.params).await,
@@ -206,7 +212,122 @@ impl CodexPlugin {
             .map_err(|_| Error::new("internal", "Codex plugin manifest could not be encoded"))
     }
 
+    async fn discover(&self, raw: &Value) -> Result<Value> {
+        if self.session.is_some() || self.failed_start.is_some() || self.observer.is_some() {
+            return Err(Error::new(
+                "bad_state",
+                "Codex discovery requires a dedicated reader plugin instance",
+            ));
+        }
+        let params: DiscoverParams = decode(raw, "Codex discover params are invalid")?;
+        let (launch, secrets) = self.reader_launch(&params.profile, &params.target_environment)?;
+        crate::discovery::discover(params, launch, secrets).await
+    }
+
+    fn reader_launch(
+        &self,
+        profile: &Value,
+        environment: &Value,
+    ) -> Result<(NativeLaunch, Vec<String>)> {
+        let initialized = self.initialized.as_ref().ok_or_else(not_initialized)?;
+        let profile = profile.as_object().ok_or_else(|| {
+            Error::new(
+                "profile_error",
+                "Codex discovery requires a frozen profile object",
+            )
+        })?;
+        if profile.get("harness").and_then(Value::as_str) != Some("codex") {
+            return Err(Error::new(
+                "profile_error",
+                "Codex discovery received another harness",
+            ));
+        }
+        let program = match profile.get("cmd") {
+            Some(Value::String(program)) if !program.trim().is_empty() => OsString::from(program),
+            None => OsString::from("codex"),
+            _ => {
+                return Err(Error::new(
+                    "profile_error",
+                    "Codex discovery cmd must name one executable",
+                ));
+            }
+        };
+        let TargetEnvironment {
+            variables,
+            mut secrets,
+        } = target_environment(Some(environment))?;
+        if variables.iter().any(|(name, _)| {
+            name.to_string_lossy()
+                .to_ascii_uppercase()
+                .starts_with("ELIOT_AGENT_")
+        }) {
+            return Err(Error::new(
+                "not_allowed",
+                "discovery cannot receive Agent identity or tokens",
+            ));
+        }
+        if let Some(environment) = environment.as_object() {
+            for (name, value) in environment {
+                if is_secret_name(name)
+                    && let Some(value) = value.as_str().filter(|value| !value.is_empty())
+                {
+                    secrets.push(value.to_owned());
+                }
+            }
+        }
+        secrets.push(initialized.credential.clone());
+        let launch = NativeLaunch {
+            program,
+            args: ["app-server", "--listen", "stdio://"]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+            cwd: PathBuf::from(&initialized.instance_dir),
+            environment: variables,
+        };
+        Ok((launch, secrets))
+    }
+
+    async fn attach(&mut self, raw: &Value) -> Result<Value> {
+        let params: ObserverAttachParams = decode(raw, "Codex observer attach params are invalid")?;
+        validate_identity(&params.agent_id, params.generation, &params.command_id)?;
+        if self.session.is_some() || self.failed_start.is_some() {
+            return Err(Error::new(
+                "bad_state",
+                "Codex observation requires a dedicated plugin instance",
+            ));
+        }
+        if let Some(observer) = &self.observer {
+            return observer.repeat_attach(&params);
+        }
+        let (launch, secrets) = self.reader_launch(&params.profile, &params.target_environment)?;
+        let (observer, result) = ObserverSession::attach(
+            params,
+            launch,
+            secrets,
+            Instant::now() + crate::discovery::READ_TIMEOUT,
+        )
+        .await?;
+        self.observer = Some(observer);
+        Ok(result)
+    }
+
+    async fn detach(&mut self, raw: &Value) -> Result<Value> {
+        let params: ObserverDetachParams = decode(raw, "Codex observer detach params are invalid")?;
+        self.observer
+            .as_mut()
+            .ok_or_else(|| Error::new("unsupported", "Codex plugin has no observation attachment"))?
+            .detach(&params, Instant::now() + crate::discovery::READ_TIMEOUT)
+            .await
+    }
+
     async fn start(&mut self, raw: &Value, peer: &PeerClient) -> Result<Value> {
+        if self.observer.is_some() {
+            return Err(Error::new(
+                "unsupported",
+                "an observer cannot start a controlled session",
+            ));
+        }
         let params: AgentStartParams = decode(raw, "Codex agent.start params are invalid")?;
         validate_identity(&params.agent_id, params.generation, &params.command_id)?;
         if let Some(session) = &self.session {
@@ -866,6 +987,12 @@ impl CodexPlugin {
     }
 
     async fn command(&mut self, raw: &Value) -> Result<Value> {
+        if self.observer.is_some() {
+            return Err(Error::new(
+                "unsupported",
+                "an observer cannot issue native control commands",
+            ));
+        }
         let params: AgentCommandParams = decode(raw, "Codex agent.command params are invalid")?;
         validate_identity(&params.agent_id, params.generation, &params.command_id)?;
         match params.verb.as_str() {
@@ -1317,6 +1444,19 @@ impl CodexPlugin {
     }
 
     async fn snapshot(&mut self, raw: &Value) -> Result<Value> {
+        if let Some(observer) = self.observer.as_mut() {
+            let params: ObserverSnapshotParams =
+                decode(raw, "Codex observer snapshot params are invalid")?;
+            return observer
+                .snapshot(&params, Instant::now() + crate::discovery::READ_TIMEOUT)
+                .await;
+        }
+        if raw.get("observation").is_some() {
+            return Err(Error::new(
+                "not_allowed",
+                "an observation snapshot requires the exact retained observer attachment",
+            ));
+        }
         let params: AgentSnapshotParams = decode(raw, "Codex agent.snapshot params are invalid")?;
         validate_identity(&params.agent_id, params.generation, &params.command_id)?;
         let session = self
@@ -1435,6 +1575,12 @@ impl CodexPlugin {
     }
 
     async fn stop(&mut self, raw: &Value) -> Result<Value> {
+        if self.observer.is_some() {
+            return Err(Error::new(
+                "unsupported",
+                "an observer cannot stop the native subject",
+            ));
+        }
         let params: AgentStopParams = decode(raw, "Codex agent.stop params are invalid")?;
         validate_identity(&params.agent_id, params.generation, &params.command_id)?;
         let session = self
@@ -1465,6 +1611,12 @@ impl CodexPlugin {
     }
 
     async fn shutdown(&mut self) -> Result<Value> {
+        if let Some(observer) = self.observer.as_mut() {
+            observer
+                .shutdown(Instant::now() + crate::discovery::READ_TIMEOUT)
+                .await?;
+        }
+        self.observer = None;
         if let Some(session) = self.session.as_mut() {
             if session.phase != SessionPhase::Stopped {
                 terminate_session(session, true).await?;
@@ -1475,6 +1627,12 @@ impl CodexPlugin {
     }
 
     async fn shutdown_owned(&mut self) {
+        if let Some(observer) = self.observer.as_mut() {
+            let _ = observer
+                .shutdown(Instant::now() + crate::discovery::READ_TIMEOUT)
+                .await;
+        }
+        self.observer = None;
         if let Some(session) = self.session.as_mut() {
             if session.phase != SessionPhase::Stopped {
                 let _ = terminate_session(session, true).await;
@@ -2287,7 +2445,7 @@ fn app_server_args() -> Vec<OsString> {
     .collect()
 }
 
-fn native_scope(codex_home: &str) -> String {
+pub(crate) fn native_scope(codex_home: &str) -> String {
     let mut hash = 0xcbf29ce484222325u64;
     let canonical_home = if cfg!(windows) {
         codex_home.to_lowercase()
@@ -2309,6 +2467,12 @@ fn codex_manifest() -> PluginManifest {
         ("tool".to_owned(), "stream".to_owned()),
         ("turn".to_owned(), "stream".to_owned()),
     ]);
+    let observed = BTreeMap::from([
+        ("message".to_owned(), "native_read".to_owned()),
+        ("session".to_owned(), "native_read".to_owned()),
+        ("tool".to_owned(), "native_read".to_owned()),
+        ("turn".to_owned(), "native_read".to_owned()),
+    ]);
     PluginManifest {
         name: "codex".to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -2329,10 +2493,15 @@ fn codex_manifest() -> PluginManifest {
         ],
         child_verbs: Vec::new(),
         features: eliot_plugin::protocol::ManifestFeatures {
+            discover: true,
+            observe: true,
             start_requires_input: false,
             native_children: false,
         },
-        sources: BTreeMap::from([("controlled".to_owned(), controlled)]),
+        sources: BTreeMap::from([
+            ("controlled".to_owned(), controlled),
+            ("observed".to_owned(), observed),
+        ]),
         proxy: "none".to_owned(),
     }
 }

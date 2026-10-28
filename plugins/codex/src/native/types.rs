@@ -57,6 +57,14 @@ pub struct NativeInitializeResponse {
     pub user_agent: String,
 }
 
+/// Minimal v2 `config/read` response. Config's additional fields include
+/// nullable `sqlite_home`; the caller projects only that selector and its origin.
+#[derive(Deserialize)]
+pub(crate) struct NativeDiscoveryConfigReadResponse {
+    pub config: serde_json::Value,
+    pub origins: BTreeMap<String, serde_json::Value>,
+}
+
 // ---------------------------------------------------------------------------
 // model/list
 // ---------------------------------------------------------------------------
@@ -180,6 +188,106 @@ pub(crate) struct ThreadIdentity {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ThreadReadback {
     pub thread: serde_json::Value,
+}
+
+/// Installed 0.161 ThreadSourceKind filter, including noninteractive sources.
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum NativeDiscoverySourceKind {
+    Cli,
+    Vscode,
+    Exec,
+    AppServer,
+    SubAgent,
+    SubAgentReview,
+    SubAgentCompact,
+    SubAgentThreadSpawn,
+    SubAgentOther,
+    Unknown,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NativeThreadListParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    pub limit: u32,
+    pub sort_key: String,
+    pub sort_direction: String,
+    pub source_kinds: Vec<NativeDiscoverySourceKind>,
+    pub model_providers: Vec<String>,
+    pub archived: bool,
+    pub use_state_db_only: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NativeThreadListResponse {
+    pub data: Vec<NativeDiscoveryThread>,
+    pub next_cursor: Option<String>,
+}
+
+/// Deliberately excludes preview, name and turns, even when the native response has them.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NativeDiscoveryThread {
+    pub id: String,
+    pub cwd: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub source: serde_json::Value,
+    pub ephemeral: bool,
+    pub status: NativeDiscoveryStatus,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct NativeObservedThreadReadResponse {
+    pub thread: NativeObservedThread,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct NativeObservedThread {
+    #[serde(flatten)]
+    pub metadata: NativeDiscoveryThread,
+    pub path: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NativeHistoryItemsResponse {
+    pub data: Vec<NativeHistoryItemEntry>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NativeHistoryItemEntry {
+    pub turn_id: String,
+    pub item: NativeHistoryItem,
+    pub started_at_ms: Option<i64>,
+    pub completed_at_ms: Option<i64>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct NativeHistoryItem {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub status: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub(crate) enum NativeDiscoveryStatus {
+    NotLoaded,
+    Idle,
+    SystemError,
+    Active {
+        #[serde(rename = "activeFlags")]
+        active_flags: Vec<String>,
+    },
+    #[serde(other)]
+    Unknown,
 }
 
 // ---------------------------------------------------------------------------

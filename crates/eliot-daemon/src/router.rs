@@ -8,7 +8,10 @@ use eliot_core::{
     Agent, AgentState, Command, CommandState, Error, Event, ProcessIdentity, Result, SubmitCommand,
     Turn, TurnState, WorkspacePhase, WorkspacePreparationInput,
 };
-use eliot_plugin::MAX_EVENT_BYTES;
+use eliot_plugin::{
+    MAX_EVENT_BYTES, MAX_OBSERVATION_CURSOR_BYTES, MAX_OBSERVATION_PAGE_BYTES, ObservationPage,
+    ObservationQuery,
+};
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 use std::{
@@ -26,6 +29,7 @@ use tokio::{
 };
 
 const PAGE_MAX: usize = 1_000;
+const PROCESS_CURSOR_MAX_BYTES: usize = 2_048;
 const EVENT_SCAN_MAX: usize = 1_000;
 const EVENT_RESPONSE_MAX_BYTES: usize = 900 * 1024;
 const EVENT_RESPONSE_WRAPPER_RESERVE_BYTES: usize = 4 * 1024;
@@ -76,6 +80,52 @@ struct EventFilter {
     sources: HashSet<String>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessPageCursor {
+    agent: String,
+    generation: i64,
+    scope: String,
+    #[serde(deserialize_with = "deserialize_cursor_identity")]
+    identity: ProcessIdentity,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObserverCommandResult {
+    agent_id: String,
+    generation: i64,
+    command_id: String,
+    native_scope: String,
+    native_ref: String,
+    state: String,
+    observation_state: String,
+    #[serde(default)]
+    metadata: Option<Value>,
+    #[serde(default)]
+    coverage: Option<Value>,
+    #[serde(default)]
+    reader_closed: Option<bool>,
+}
+
+fn deserialize_cursor_identity<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<ProcessIdentity, D::Error> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Identity {
+        host_boot_id: String,
+        pid: u32,
+        start_time: u64,
+    }
+    let identity = <Identity as serde::Deserialize<'de>>::deserialize(deserializer)?;
+    Ok(ProcessIdentity {
+        host_boot_id: identity.host_boot_id,
+        pid: identity.pid,
+        start_time: identity.start_time,
+    })
+}
+
 impl Router {
     pub(crate) fn new(
         data_root: std::path::PathBuf,
@@ -94,6 +144,7 @@ impl Router {
             bus.clone(),
             Arc::clone(&secrets),
             progress.clone(),
+            monitoring.clone(),
         );
         let plugin_host = PluginHost::new(
             PluginHostOptions::new(data_root.clone(), owner_token.clone()),
@@ -141,6 +192,8 @@ impl Router {
             "command.submit" => self.submit(&params, &principal).await,
             "command.get" => self.command_get(&params, &principal).await,
             "agent.get" => self.agent_get(&params, &principal).await,
+            "agent.discover" => self.agent_discover(&params, &principal).await,
+            "agent.history" => self.agent_history(&params, &principal).await,
             "agent.list" => self.agent_list(&params, &principal).await,
             "agent.result" => self.agent_result(&params, &principal).await,
             "agent.processes" => self.agent_processes(&params, &principal).await,
@@ -173,6 +226,7 @@ impl Router {
     }
 
     pub(crate) fn request_force(&self) {
+        self.inner.plugin_host.close_discovery_admission();
         self.inner.mode.store(MODE_FORCE, Ordering::SeqCst);
         self.inner.shutdown_ready.store(true, Ordering::SeqCst);
         self.signal_progress();
@@ -382,17 +436,45 @@ impl Router {
         let mut request: SubmitCommand = serde_json::from_value(params.clone())
             .map_err(|_| Error::new("invalid", "command.submit params are malformed"))?;
         authorize_command(principal, &mut request)?;
+        if matches!(request.verb.as_str(), "attach" | "detach") {
+            require_owner(principal)?;
+        }
         if request.verb == "worktree.remove" {
             require_owner(principal)?;
+        }
+        if is_native_control_verb(&request.verb)
+            && let Some(target) = request.target.as_deref()
+        {
+            let store = self.inner.store.lock().await;
+            // Preserve idempotent command retries; Store checks new controls
+            // transactionally after resolving an existing command binding.
+            if store.get_command(&request.id)?.is_none() {
+                let agent = store.get_agent(target)?.ok_or_else(|| {
+                    Error::new("not_found", format!("Agent {target} was not found"))
+                })?;
+                if agent.observe_only {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "native control is unavailable for an observe-only Agent",
+                    ));
+                }
+            }
         }
         let mode = self.inner.mode.load(Ordering::SeqCst);
         if mode == MODE_FORCE {
             return Err(Error::new("unavailable", "daemon is forcing shutdown"));
         }
-        if matches!(request.verb.as_str(), "launch" | "resume" | "send") && mode != MODE_OPEN {
+        if request.verb == "detach" {
+            self.hydrate_detach_generation(&mut request).await?;
+        }
+        if matches!(
+            request.verb.as_str(),
+            "launch" | "resume" | "send" | "attach"
+        ) && mode != MODE_OPEN
+        {
             return Err(Error::new(
                 "unavailable",
-                "daemon is draining and rejects new launch, resume, or send commands",
+                "daemon is draining and rejects new launch, resume, send, or attach commands",
             ));
         }
         let mut preparation = None;
@@ -418,6 +500,14 @@ impl Router {
                         }
                     }
                 };
+            }
+        } else if request.verb == "attach" {
+            normalize_attach(&request)?;
+            if !self.hydrate_retained_attach(&mut request).await?
+                && let Err(error) = freeze_attach_profile(&self.inner.data_root, &mut request)
+                && !self.hydrate_retained_attach(&mut request).await?
+            {
+                return Err(error);
             }
         } else if request.verb == "resume" {
             normalize_resume(&mut request)?;
@@ -487,6 +577,13 @@ impl Router {
                         return Err(error);
                     }
                 }
+                Err(error) if error.code == "id_conflict" && request.verb == "attach" => {
+                    if install_retained_attach_profile(&store, &mut request)? {
+                        store.submit(&principal, request, now)?
+                    } else {
+                        return Err(error);
+                    }
+                }
                 Err(error) => return Err(error),
             };
             self.publish_locked(&admission.events);
@@ -526,6 +623,38 @@ impl Router {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    async fn hydrate_retained_attach(&self, request: &mut SubmitCommand) -> Result<bool> {
+        let store = self.inner.store.lock().await;
+        install_retained_attach_profile(&store, request)
+    }
+
+    async fn hydrate_detach_generation(&self, request: &mut SubmitCommand) -> Result<()> {
+        let store = self.inner.store.lock().await;
+        if let Some(command) = store.get_command(&request.id)? {
+            if command.verb != "detach" {
+                return Err(Error::new(
+                    "id_conflict",
+                    "mutation id is already bound to another command",
+                ));
+            }
+            if request.expected_generation.is_none() {
+                request.expected_generation = command.expected_generation;
+            }
+            return Ok(());
+        }
+        if request.expected_generation.is_none() {
+            let target = request
+                .target
+                .as_deref()
+                .ok_or_else(|| Error::new("invalid", "detach requires an Agent target"))?;
+            let agent = store
+                .get_agent(target)?
+                .ok_or_else(|| Error::new("not_found", format!("Agent {target} was not found")))?;
+            request.expected_generation = Some(agent.generation);
+        }
+        Ok(())
     }
 
     async fn freeze_launch_admission(
@@ -616,23 +745,230 @@ impl Router {
             .map_err(|error| Error::new("internal", format!("encode command: {error}")))
     }
 
+    async fn agent_discover(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        require_owner(principal)?;
+        reject_unknown_keys(
+            params,
+            &["profile", "harness", "native_scope", "cursor", "limit"],
+            "agent.discover",
+        )?;
+        if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
+            return Err(Error::new(
+                "unavailable",
+                "daemon is shutting down and rejects new discovery",
+            ));
+        }
+        let name = required_text(params, "profile")?;
+        let harness = optional_text(params, "harness")?;
+        let native_scope = optional_text(params, "native_scope")?.map(str::to_owned);
+        let cursor = optional_text(params, "cursor")?.map(str::to_owned);
+        let limit = page_limit(params)?;
+        let profile = crate::config::resolve_profile(&self.inner.data_root, name)?;
+        if harness
+            .is_some_and(|harness| profile.get("harness").and_then(Value::as_str) != Some(harness))
+        {
+            return Err(Error::new(
+                "invalid",
+                "harness does not match the selected profile",
+            ));
+        }
+        if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
+            return Err(Error::new(
+                "unavailable",
+                "daemon is shutting down and rejects new discovery",
+            ));
+        }
+        self.inner
+            .plugin_host
+            .discover(profile, native_scope, cursor, limit)
+            .await
+    }
+
+    async fn agent_history(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        require_owner(principal)?;
+        reject_unknown_keys(
+            params,
+            &[
+                "id",
+                "generation",
+                "source",
+                "view",
+                "turn_id",
+                "cursor",
+                "limit",
+            ],
+            "agent.history",
+        )?;
+        let id = required_text(params, "id")?;
+        let generation = optional_observation_generation(params)?;
+        let source = required_text(params, "source")?;
+        if !matches!(source, "native" | "rollout") {
+            return Err(Error::new(
+                "invalid",
+                "history source must be native or rollout",
+            ));
+        }
+        let view = required_text(params, "view")?;
+        let turn_id = optional_text(params, "turn_id")?.map(str::to_owned);
+        if turn_id.as_ref().is_some_and(|turn_id| {
+            turn_id.len() > MAX_OBSERVATION_CURSOR_BYTES || turn_id.chars().any(char::is_control)
+        }) {
+            return Err(Error::new("invalid", "history turn_id exceeds its bound"));
+        }
+        if (view == "items") != turn_id.is_some() {
+            return Err(Error::new(
+                "invalid",
+                "history items require a turn_id and other views forbid it",
+            ));
+        }
+        let query = ObservationQuery {
+            source: source.to_owned(),
+            view: view.to_owned(),
+            turn_id,
+            cursor: optional_text(params, "cursor")?.map(str::to_owned),
+            limit: page_limit(params)?,
+        };
+        query.validate()?;
+
+        let agent = {
+            let store = self.inner.store.lock().await;
+            store
+                .get_agent(id)?
+                .ok_or_else(|| Error::new("not_found", format!("Agent {id} was not found")))?
+        };
+        if generation.is_some_and(|generation| generation != agent.generation) {
+            return Err(Error::new(
+                "stale_generation",
+                "native history is bound to the current observer generation",
+            ));
+        }
+        if !agent.observe_only || agent.own_identity {
+            return Err(Error::new(
+                "not_allowed",
+                "native history requires an external observer without control identity",
+            ));
+        }
+        let native_scope = agent
+            .native_scope
+            .as_deref()
+            .filter(|scope| !scope.is_empty())
+            .ok_or_else(|| Error::new("bad_state", "Agent has no native scope"))?;
+        let native_ref = agent
+            .native_ref
+            .as_deref()
+            .filter(|native_ref| !native_ref.is_empty())
+            .ok_or_else(|| Error::new("bad_state", "Agent has no native reference"))?;
+
+        // This is a private native read. It is deliberately not reduced, stored,
+        // published, or used to settle a command or input acknowledgement.
+        let raw = self
+            .inner
+            .plugin_host
+            .snapshot_observer(
+                &agent,
+                serde_json::to_value(&query).map_err(|_| {
+                    Error::new("internal", "observation query could not be encoded")
+                })?,
+            )
+            .await?;
+        let object = raw
+            .as_object()
+            .ok_or_else(|| Error::new("source_integrity", "observation page is not an object"))?;
+        const PAGE_FIELDS: &[&str] = &[
+            "agent_id",
+            "generation",
+            "native_scope",
+            "native_ref",
+            "source",
+            "view",
+            "entries",
+            "next_cursor",
+            "coverage",
+        ];
+        if object
+            .keys()
+            .any(|key| !PAGE_FIELDS.contains(&key.as_str()))
+        {
+            return Err(Error::new(
+                "source_integrity",
+                "observation page contains unexpected fields",
+            ));
+        }
+        let page: ObservationPage = serde_json::from_value(raw).map_err(|_| {
+            Error::new(
+                "source_integrity",
+                "plugin returned an invalid observation page",
+            )
+        })?;
+        page.validate()?;
+        if page.agent_id != agent.id
+            || page.generation != agent.generation
+            || page.native_scope != native_scope
+            || page.native_ref != native_ref
+            || page.source != query.source
+            || page.view != query.view
+            || page.entries.len() > query.limit
+            || !page.coverage.is_object()
+            || page
+                .next_cursor
+                .as_deref()
+                .is_some_and(|cursor| query.cursor.as_deref() == Some(cursor))
+        {
+            return Err(Error::new(
+                "source_integrity",
+                "observation page does not match its subject or query",
+            ));
+        }
+        if serde_json::to_vec(&page)
+            .map_err(|_| Error::new("internal", "observation page could not be encoded"))?
+            .len()
+            > MAX_OBSERVATION_PAGE_BYTES
+        {
+            return Err(Error::new(
+                "frame_too_large",
+                "observation page exceeds its byte bound",
+            ));
+        }
+        let mut value = serde_json::to_value(page)
+            .map_err(|_| Error::new("internal", "observation page could not be encoded"))?;
+        self.redact_native_value(&mut value);
+        Ok(value)
+    }
+
     async fn agent_get(&self, params: &Value, principal: &Principal) -> Result<Value> {
         reject_unknown_keys(params, &["id"], "agent.get")?;
         let id = required_text(params, "id")?;
         authorize_agent_read(principal, id, None)?;
-        let agent = {
+        let (agent, source_states, observer_active) = {
             let store = self.inner.store.lock().await;
-            store.get_agent(id)?
-        }
-        .ok_or_else(|| Error::new("not_found", format!("Agent {id} was not found")))?;
-        if matches!(
-            agent.state,
-            AgentState::Idle | AgentState::Busy | AgentState::Waiting
-        ) && !self
-            .inner
-            .plugin_host
-            .controls_generation(&agent.id, agent.generation)
-        {
+            let agent = store
+                .get_agent(id)?
+                .ok_or_else(|| Error::new("not_found", format!("Agent {id} was not found")))?;
+            let mut source_states = store.list_source_states(id, agent.generation)?;
+            if let Some(workspace) = store.get_workspace(id)?
+                && workspace.target_generation != agent.generation
+            {
+                source_states.extend(store.list_source_states(id, workspace.target_generation)?);
+            }
+            let observer_active =
+                agent.observe_only && store.observer_active(&agent.id, agent.generation)?;
+            (agent, source_states, observer_active)
+        };
+        let live_presence = if agent.observe_only {
+            self.inner
+                .plugin_host
+                .observes_generation(&agent.id, agent.generation)
+        } else {
+            self.inner
+                .plugin_host
+                .controls_generation(&agent.id, agent.generation)
+        };
+        let state_requires_presence =
+            matches!(
+                agent.state,
+                AgentState::Idle | AgentState::Busy | AgentState::Waiting
+            ) || (agent.observe_only && agent.state == AgentState::Unknown && observer_active);
+        if state_requires_presence && !live_presence {
             return Err(Error::new(
                 "unknown",
                 "persisted Agent state has no live source owner",
@@ -642,6 +978,7 @@ impl Router {
         let mut value = serde_json::to_value(agent)
             .map_err(|error| Error::new("internal", format!("encode Agent: {error}")))?;
         value["observation"] = observation;
+        value["source_states"] = json!(source_states);
         Ok(value)
     }
 
@@ -655,19 +992,27 @@ impl Router {
     async fn agent_processes(&self, params: &Value, principal: &Principal) -> Result<Value> {
         reject_unknown_keys(
             params,
-            &["id", "generation", "after", "limit"],
+            &["id", "generation", "scope", "after", "limit"],
             "agent.processes",
         )?;
         let id = required_text(params, "id")?;
         let generation = optional_observation_generation(params)?;
         authorize_agent_read(principal, id, generation)?;
+        let scope = optional_text(params, "scope")?.unwrap_or("agent");
+        if !matches!(scope, "agent" | "workspace") {
+            return Err(Error::new(
+                "invalid",
+                "process scope must be agent or workspace",
+            ));
+        }
         let after = optional_text(params, "after")?
             .map(|cursor| {
-                if cursor.len() > 1_024 {
+                if cursor.len() > PROCESS_CURSOR_MAX_BYTES {
                     return Err(Error::new("invalid", "process cursor exceeds its bound"));
                 }
-                let identity: ProcessIdentity = serde_json::from_str(cursor)
+                let cursor: ProcessPageCursor = serde_json::from_str(cursor)
                     .map_err(|_| Error::new("invalid", "invalid process cursor"))?;
+                let identity = &cursor.identity;
                 if identity.pid == 0
                     || identity.start_time == 0
                     || identity.host_boot_id.is_empty()
@@ -676,7 +1021,7 @@ impl Router {
                 {
                     return Err(Error::new("invalid", "invalid process cursor identity"));
                 }
-                Ok(identity)
+                Ok(cursor)
             })
             .transpose()?;
         let limit = page_limit(params)?;
@@ -685,25 +1030,76 @@ impl Router {
             let agent = store
                 .get_agent(id)?
                 .ok_or_else(|| Error::new("not_found", format!("Agent {id} was not found")))?;
-            let generation = generation.unwrap_or(agent.generation);
-            if generation > agent.generation {
+            let workspace = if scope == "workspace" {
+                store.get_workspace(id)?
+            } else {
+                None
+            };
+            let generation = match generation {
+                Some(generation) => generation,
+                None if scope == "workspace" => {
+                    workspace
+                        .as_ref()
+                        .ok_or_else(|| Error::new("not_found", "Agent has no managed workspace"))?
+                        .target_generation
+                }
+                None => agent.generation,
+            };
+            if generation > agent.generation
+                && (scope != "workspace"
+                    || workspace.as_ref().map(|row| row.target_generation) != Some(generation))
+            {
                 return Err(Error::new(
                     "stale_generation",
                     "process generation does not exist",
                 ));
             }
-            let owner = format!("agent:{id}#{generation}");
+            if scope == "workspace" {
+                authorize_agent_read(principal, id, Some(generation))?;
+            }
+            if let Some(cursor) = &after
+                && (cursor.agent != id || cursor.generation != generation || cursor.scope != scope)
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "process cursor does not match the Agent, generation, and scope",
+                ));
+            }
+            let owner = format!("{scope}:{id}#{generation}");
             (
                 generation,
-                store.list_processes(&owner, after.as_ref(), limit)?,
+                store.list_processes(
+                    &owner,
+                    after.as_ref().map(|cursor| &cursor.identity),
+                    limit,
+                )?,
             )
         };
         let next = processes
             .last()
-            .map(|process| serde_json::to_string(&process.identity))
-            .transpose()
-            .map_err(|_| Error::new("internal", "cannot encode process cursor"))?;
-        Ok(json!({"agent": id, "generation": generation, "processes": processes, "next": next}))
+            .map(|process| {
+                let cursor = serde_json::to_string(&ProcessPageCursor {
+                    agent: id.to_owned(),
+                    generation,
+                    scope: scope.to_owned(),
+                    identity: process.identity.clone(),
+                })
+                .map_err(|_| Error::new("internal", "cannot encode process cursor"))?;
+                if cursor.len() > PROCESS_CURSOR_MAX_BYTES {
+                    return Err(Error::new(
+                        "frame_too_large",
+                        "encoded process cursor exceeds its bound",
+                    ));
+                }
+                Ok(cursor)
+            })
+            .transpose()?;
+        let mut value =
+            json!({"agent": id, "generation": generation, "processes": processes, "next": next});
+        if scope == "workspace" {
+            value["scope"] = json!(scope);
+        }
+        Ok(value)
     }
 
     async fn agent_git(&self, params: &Value, principal: &Principal) -> Result<Value> {
@@ -794,9 +1190,15 @@ impl Router {
     }
 
     async fn agent_list(&self, params: &Value, principal: &Principal) -> Result<Value> {
-        reject_unknown_keys(params, &["after", "limit"], "agent.list")?;
+        reject_unknown_keys(params, &["after", "limit", "observations"], "agent.list")?;
         let after = optional_text(params, "after")?;
         let limit = page_limit(params)?;
+        let observations = match params.get("observations") {
+            None => false,
+            Some(value) => value
+                .as_bool()
+                .ok_or_else(|| Error::new("invalid", "observations must be a boolean"))?,
+        };
         let agents = {
             let store = self.inner.store.lock().await;
             match principal {
@@ -806,6 +1208,34 @@ impl Router {
                 }
             }
         };
+        if observations {
+            let mut rows = Vec::new();
+            let mut encoded_bytes = 0_usize;
+            for agent in agents {
+                let mut row = serde_json::to_value(&agent)
+                    .map_err(|_| Error::new("internal", "cannot encode Agent projection"))?;
+                row["observation"] = self.observation_view(&agent).await;
+                let row_bytes = serde_json::to_vec(&row)
+                    .map_err(|_| Error::new("internal", "cannot encode Agent observation"))?
+                    .len();
+                if encoded_bytes.saturating_add(row_bytes + 1) > EVENT_RESPONSE_ENTRIES_MAX_BYTES {
+                    if rows.is_empty() {
+                        return Err(Error::new(
+                            "frame_too_large",
+                            "Agent observation exceeds the page byte limit",
+                        ));
+                    }
+                    break;
+                }
+                encoded_bytes += row_bytes + 1;
+                rows.push(row);
+            }
+            let next = match principal {
+                Principal::Owner => rows.last().and_then(|row| row.get("id")).cloned(),
+                Principal::Agent { .. } => None,
+            };
+            return Ok(json!({"agents": rows, "next": next}));
+        }
         let next = match principal {
             Principal::Owner => agents.last().map(|agent| Value::String(agent.id.clone())),
             Principal::Agent { .. } => None,
@@ -1079,6 +1509,8 @@ impl Router {
             "agents": agent_count,
             "store_write_faulted": write_faulted,
             "owned_plugins": self.inner.plugin_host.live_count(),
+            "observer_readers": self.inner.plugin_host.observer_count(),
+            "discovery_readers": self.inner.plugin_host.reader_count(),
             "workspace_custody": crate::workspaces::custody_capability(),
             "workspace_recovery_error": self.inner.workspace_recovery_error.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
@@ -1093,11 +1525,24 @@ impl Router {
     }
 
     async fn status_blockers(&self) -> Result<Vec<Value>> {
-        let (agents, unsettled_commands, write_faulted) = {
+        let (agents, active_observers, unsettled_commands, write_faulted) = {
             let store = self.inner.store.lock().await;
+            let agents = store.list_nonterminal_agents(STATUS_BLOCKER_MAX)?;
+            let active_observers = agents
+                .iter()
+                .map(|agent| {
+                    if agent.observe_only {
+                        store.observer_active(&agent.id, agent.generation)
+                    } else {
+                        Ok(false)
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let unsettled_commands = store.list_unsettled_commands(STATUS_BLOCKER_MAX)?;
             (
-                store.list_nonterminal_agents(STATUS_BLOCKER_MAX)?,
-                store.list_unsettled_commands(STATUS_BLOCKER_MAX)?,
+                agents,
+                active_observers,
+                unsettled_commands,
                 store.is_write_faulted(),
             )
         };
@@ -1105,7 +1550,22 @@ impl Router {
         if self.inner.workspaces.has_owned_processes() {
             blockers.push(json!({"kind": "workspace_processes"}));
         }
-        for agent in agents {
+        let discovery_readers = self.inner.plugin_host.reader_count();
+        if discovery_readers > 0 {
+            blockers.push(json!({"kind": "discovery_readers", "count": discovery_readers}));
+        }
+        for (agent, source_active) in agents.into_iter().zip(active_observers) {
+            let observer_present = self
+                .inner
+                .plugin_host
+                .observes_generation(&agent.id, agent.generation);
+            if agent.observe_only
+                && agent.state == AgentState::Unknown
+                && !source_active
+                && !observer_present
+            {
+                continue;
+            }
             blockers.push(json!({
                 "kind": "agent_live",
                 "agent": agent.id,
@@ -1184,6 +1644,7 @@ impl Router {
                 "store_write_faulted": true,
             })
         });
+        self.inner.plugin_host.close_discovery_admission();
         self.inner.mode.store(
             if mode == "force" {
                 MODE_FORCE
@@ -1289,6 +1750,37 @@ impl Router {
         };
 
         let _result = match dispatched.verb.as_str() {
+            "attach" => {
+                match self
+                    .inner
+                    .plugin_host
+                    .attach_observer(agent.clone(), dispatched.clone(), None)
+                    .await
+                {
+                    Ok(mut value) => {
+                        self.redact_native_value(&mut value);
+                        match validate_observer_command_result(
+                            value,
+                            &agent,
+                            &dispatched,
+                            "attached",
+                        ) {
+                            Ok(snapshot) => {
+                                let _ = self.settle_observe_attach(&id, snapshot.clone()).await;
+                                Ok(snapshot)
+                            }
+                            Err(error) => {
+                                self.settle_plugin_error(&id, &error).await;
+                                Err(error)
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        self.settle_plugin_error(&id, &error).await;
+                        Err(error)
+                    }
+                }
+            }
             "worktree.remove" => match self.inner.workspaces.remove(&dispatched).await {
                 Ok(value) => Ok(value),
                 Err(error) => {
@@ -1474,6 +1966,34 @@ impl Router {
                     }
                 }
             }
+            "detach" => {
+                match self
+                    .inner
+                    .plugin_host
+                    .detach_observer(&agent, dispatched.clone())
+                    .await
+                {
+                    Ok(value) => match validate_observer_command_result(
+                        value,
+                        &agent,
+                        &dispatched,
+                        "detached",
+                    ) {
+                        Ok(outcome) => {
+                            let _ = self.settle_observe_detach(&id, outcome.clone()).await;
+                            Ok(outcome)
+                        }
+                        Err(error) => {
+                            self.settle_plugin_error(&id, &error).await;
+                            Err(error)
+                        }
+                    },
+                    Err(error) => {
+                        self.settle_plugin_error(&id, &error).await;
+                        Err(error)
+                    }
+                }
+            }
             _ => Err(Error::new("unsupported", "command verb is not implemented")),
         };
         self.signal_progress();
@@ -1538,6 +2058,64 @@ impl Router {
     async fn reject_undispatched(&self, id: &str, reason: &str) {
         let outcome = json!({"reason": reason});
         let _ = self.settle(id, CommandState::Rejected, Some(outcome)).await;
+    }
+
+    async fn settle_observe_attach(&self, id: &str, snapshot: Value) -> Option<Command> {
+        let (result, write_faulted) = {
+            let mut store = self.inner.store.lock().await;
+            let result = store.settle_observe_attach(id, snapshot, now_ms());
+            if let Ok(change) = &result {
+                self.publish_locked(&change.events);
+            }
+            (result, store.is_write_faulted())
+        };
+        match result {
+            Ok(change) => {
+                self.note_unknown(&change.events);
+                let command = change.value;
+                self.signal_progress();
+                Some(command)
+            }
+            Err(_) => {
+                let cause = if write_faulted {
+                    "observe_attach_store_faulted"
+                } else {
+                    "observe_attach_settlement_failed"
+                };
+                self.note_unknown_id(id, cause);
+                self.signal_progress();
+                None
+            }
+        }
+    }
+
+    async fn settle_observe_detach(&self, id: &str, outcome: Value) -> Option<Command> {
+        let (result, write_faulted) = {
+            let mut store = self.inner.store.lock().await;
+            let result = store.settle_observe_detach(id, outcome, now_ms());
+            if let Ok(change) = &result {
+                self.publish_locked(&change.events);
+            }
+            (result, store.is_write_faulted())
+        };
+        match result {
+            Ok(change) => {
+                self.note_unknown(&change.events);
+                let command = change.value;
+                self.signal_progress();
+                Some(command)
+            }
+            Err(_) => {
+                let cause = if write_faulted {
+                    "observe_detach_store_faulted"
+                } else {
+                    "observe_detach_settlement_failed"
+                };
+                self.note_unknown_id(id, cause);
+                self.signal_progress();
+                None
+            }
+        }
     }
 
     fn redact_native_value(&self, value: &mut Value) {
@@ -1775,6 +2353,138 @@ impl EventFilter {
     }
 }
 
+fn normalize_attach(request: &SubmitCommand) -> Result<()> {
+    if request.target.is_some() {
+        return Err(Error::new(
+            "invalid",
+            "attach does not take an Agent target",
+        ));
+    }
+    if request.request_id.is_some() || request.expected_turn_id.is_some() {
+        return Err(Error::new(
+            "invalid",
+            "observe attach does not take a native request or turn binding",
+        ));
+    }
+    reject_unknown_keys(
+        &request.args,
+        &[
+            "mode",
+            "profile",
+            "harness",
+            "native_scope",
+            "native_ref",
+            "project",
+        ],
+        "attach args",
+    )?;
+    if required_text(&request.args, "mode")? != "observe" {
+        return Err(Error::new(
+            "unsupported",
+            "attach supports observe mode only",
+        ));
+    }
+    for field in ["profile", "harness", "native_scope", "native_ref"] {
+        let value = required_text(&request.args, field)?;
+        if value.chars().any(char::is_control) {
+            return Err(Error::new(
+                "invalid",
+                format!("attach {field} contains a control character"),
+            ));
+        }
+    }
+    let _ = optional_text(&request.args, "project")?;
+    Ok(())
+}
+
+fn freeze_attach_profile(data_root: &std::path::Path, request: &mut SubmitCommand) -> Result<()> {
+    let profile_name = required_text(&request.args, "profile")?;
+    let harness = required_text(&request.args, "harness")?.to_owned();
+    let snapshot = crate::config::resolve_profile(data_root, profile_name)?;
+    if snapshot.get("harness").and_then(Value::as_str) != Some(harness.as_str()) {
+        return Err(Error::new(
+            "invalid",
+            "attach harness does not match the selected profile",
+        ));
+    }
+    install_frozen_profile(request, &harness, snapshot, true)
+}
+
+fn validate_observer_command_result(
+    mut value: Value,
+    agent: &Agent,
+    command: &Command,
+    expected_state: &str,
+) -> Result<Value> {
+    let result: ObserverCommandResult = serde_json::from_value(value.clone()).map_err(|_| {
+        Error::new(
+            "source_integrity",
+            "plugin returned an invalid observer command result",
+        )
+    })?;
+    let native_scope = agent
+        .native_scope
+        .as_deref()
+        .ok_or_else(|| Error::new("source_integrity", "observer Agent has no native scope"))?;
+    let native_ref = agent
+        .native_ref
+        .as_deref()
+        .ok_or_else(|| Error::new("source_integrity", "observer Agent has no native reference"))?;
+    if result.agent_id != agent.id
+        || result.generation != agent.generation
+        || result.command_id != command.id
+        || command.target.as_deref() != Some(agent.id.as_str())
+        || command.generation != Some(agent.generation)
+        || result.native_scope != native_scope
+        || result.native_ref != native_ref
+        || result.state != expected_state
+        || result.observation_state != "unknown"
+        || result.reader_closed == Some(false)
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "observer result does not match its committed subject, command, or state",
+        ));
+    }
+    if expected_state == "attached"
+        && (!result.metadata.as_ref().is_some_and(Value::is_object)
+            || !result.coverage.as_ref().is_some_and(Value::is_object))
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "observer attach omitted bounded metadata or coverage",
+        ));
+    }
+    if result
+        .metadata
+        .as_ref()
+        .is_some_and(|metadata| !metadata.is_object())
+        || result
+            .coverage
+            .as_ref()
+            .is_some_and(|coverage| !coverage.is_object())
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "observer metadata and coverage must be objects",
+        ));
+    }
+    let encoded = serde_json::to_vec(&value)
+        .map_err(|_| Error::new("internal", "observer result could not be encoded"))?;
+    if encoded.len() > MAX_EVENT_BYTES {
+        return Err(Error::new(
+            "frame_too_large",
+            "observer command result exceeds its byte bound",
+        ));
+    }
+    if let Some(object) = value.as_object_mut() {
+        // Reader custody is an implementation detail; the Store result wire is
+        // the exact subject/command binding plus observation metadata.
+        object.remove("reader_closed");
+    }
+    Ok(value)
+}
+
 fn encoded_event_cost(event: &Event) -> Result<usize> {
     let encoded = serde_json::to_vec(event)
         .map_err(|error| Error::new("internal", format!("encode event page entry: {error}")))?;
@@ -1951,6 +2661,46 @@ struct RetainedLaunchProfile {
     workspace: Option<Value>,
     project: Option<Value>,
     preparation: Option<Value>,
+}
+
+fn install_retained_attach_profile(
+    store: &eliot_store::Store,
+    request: &mut SubmitCommand,
+) -> Result<bool> {
+    let Some(command) = store.get_command(&request.id)? else {
+        return Ok(false);
+    };
+    if command.verb != "attach" {
+        return Err(Error::new(
+            "id_conflict",
+            "mutation id is already bound to another command",
+        ));
+    }
+    let snapshot = command
+        .args
+        .get("profile_snapshot")
+        .filter(|snapshot| snapshot.is_object())
+        .cloned();
+    let snapshot = match snapshot {
+        Some(snapshot) => snapshot,
+        None => command
+            .target
+            .as_deref()
+            .map(|target| store.get_agent(target))
+            .transpose()?
+            .flatten()
+            .map(|agent| agent.profile_snapshot)
+            .filter(Value::is_object)
+            .ok_or_else(|| {
+                Error::new("bad_state", "retained observe attach has no frozen profile")
+            })?,
+    };
+    request
+        .args
+        .as_object_mut()
+        .ok_or_else(|| Error::new("invalid", "attach args must be an object"))?
+        .insert("profile_snapshot".to_owned(), snapshot);
+    Ok(true)
 }
 
 fn retained_launch_profile(
@@ -2220,6 +2970,26 @@ fn valid_environment_name(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some('_' | 'A'..='Z' | 'a'..='z'))
         && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn is_native_control_verb(verb: &str) -> bool {
+    matches!(
+        verb,
+        "send"
+            | "steer"
+            | "inject"
+            | "interrupt"
+            | "abort"
+            | "approve"
+            | "deny"
+            | "answer"
+            | "stop"
+            | "resume"
+            | "configure"
+            | "compact"
+            | "fork"
+            | "background"
+    )
 }
 
 fn authorize_command(principal: &Principal, request: &mut SubmitCommand) -> Result<()> {

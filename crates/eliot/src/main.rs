@@ -1,12 +1,14 @@
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use eliot_core::Error as CoreError;
 use serde_json::{Value, json};
+#[cfg(not(windows))]
+use std::process::{Command as ProcessCommand, Stdio};
 use std::{
     env,
     fs::File,
     io::Read,
     path::{Path, PathBuf},
-    process::{Command as ProcessCommand, ExitCode, Stdio},
+    process::ExitCode,
     time::Duration,
 };
 use tokio::time::{Instant, sleep, timeout_at};
@@ -47,6 +49,32 @@ enum CliCommand {
     Daemon(DaemonArgs),
     /// Read daemon state without starting a daemon.
     Status,
+    /// Discover one page of native sessions through an explicit profile.
+    Discover {
+        #[arg(long, value_name = "PROFILE")]
+        profile: String,
+        #[arg(long, value_name = "HARNESS")]
+        harness: Option<String>,
+        #[arg(long, value_name = "SCOPE")]
+        scope: Option<String>,
+        #[arg(long, value_name = "CURSOR")]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = PAGE_SIZE)]
+        limit: usize,
+    },
+    /// Attach to an exact native subject without taking control of it.
+    Attach {
+        #[arg(long, value_name = "PROFILE")]
+        profile: String,
+        #[arg(long, value_name = "HARNESS")]
+        harness: String,
+        #[arg(long, value_name = "SCOPE")]
+        scope: String,
+        #[arg(long = "ref", value_name = "REF")]
+        native_ref: String,
+        #[arg(long, value_name = "LABEL")]
+        project: Option<String>,
+    },
     /// Start an Agent using the named profile.
     Launch {
         #[arg(long, value_name = "PROFILE")]
@@ -145,6 +173,13 @@ enum CliCommand {
         #[arg(long, default_value_t = PAGE_SIZE)]
         limit: usize,
     },
+    /// Read one page of Agents with their current cached observations.
+    Top {
+        #[arg(long, value_name = "AGENT")]
+        after: Option<String>,
+        #[arg(long, default_value_t = PAGE_SIZE)]
+        limit: usize,
+    },
     /// Show one Agent.
     Show { agent: String },
     /// Read one page of an Agent's process records.
@@ -153,6 +188,8 @@ enum CliCommand {
         agent: String,
         #[arg(long, value_name = "GENERATION", value_parser = clap::value_parser!(i64).range(0..))]
         generation: Option<i64>,
+        #[arg(long, default_value = "agent", value_name = "SCOPE")]
+        scope: String,
         #[arg(long, value_name = "CURSOR")]
         after: Option<String>,
         #[arg(long, default_value_t = PAGE_SIZE)]
@@ -194,6 +231,28 @@ enum CliCommand {
         turn_id: Option<String>,
         #[arg(long, default_value_t = PAGE_SIZE)]
         limit: usize,
+    },
+    /// Read a bounded, private page of native or rollout history.
+    History {
+        agent: String,
+        #[arg(long, value_name = "GENERATION", value_parser = clap::value_parser!(i64).range(0..))]
+        generation: Option<i64>,
+        #[arg(long, default_value = "native", value_name = "SOURCE", value_parser = ["native", "rollout"])]
+        source: String,
+        #[arg(long, value_name = "VIEW", value_parser = ["subject", "turns", "items"])]
+        view: String,
+        #[arg(long, value_name = "TURN")]
+        turn_id: Option<String>,
+        #[arg(long, value_name = "CURSOR")]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = PAGE_SIZE)]
+        limit: usize,
+    },
+    /// Detach Eliot's observer from an Agent generation.
+    Detach {
+        agent: String,
+        #[arg(long, value_name = "GENERATION", value_parser = clap::value_parser!(i64).range(1..))]
+        generation: Option<i64>,
     },
     /// Stop an Agent.
     Stop {
@@ -417,6 +476,55 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             let result = read_call(&data_dir, "daemon.status", json!({})).await?;
             print_value(&result, json_output);
             Ok(0)
+        }
+        CliCommand::Discover {
+            profile,
+            harness,
+            scope,
+            cursor,
+            limit,
+        } => {
+            validate_limit(limit)?;
+            let mut params = json!({ "profile": profile, "limit": limit });
+            if let Some(harness) = harness {
+                params["harness"] = Value::String(harness);
+            }
+            if let Some(scope) = scope {
+                params["native_scope"] = Value::String(scope);
+            }
+            if let Some(cursor) = cursor {
+                params["cursor"] = Value::String(cursor);
+            }
+            let result = read_call(&data_dir, "agent.discover", params).await?;
+            print_value(&result, json_output);
+            Ok(0)
+        }
+        CliCommand::Attach {
+            profile,
+            harness,
+            scope,
+            native_ref,
+            project,
+        } => {
+            let mut args = json!({
+                "mode": "observe",
+                "profile": profile,
+                "harness": harness,
+                "native_scope": scope,
+                "native_ref": native_ref,
+            });
+            if let Some(project) = project {
+                args["project"] = Value::String(project);
+            }
+            let result = mutation_call(
+                &data_dir,
+                "command.submit",
+                json!({ "verb": "attach", "args": args }),
+                id,
+            )
+            .await?;
+            print_value(&result, json_output);
+            Ok(response_exit_code(&result))
         }
         CliCommand::Launch {
             profile,
@@ -710,6 +818,16 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             print_value(&result, json_output);
             Ok(0)
         }
+        CliCommand::Top { after, limit } => {
+            validate_limit(limit)?;
+            let mut params = json!({ "limit": limit, "observations": true });
+            if let Some(after) = after {
+                params["after"] = Value::String(after);
+            }
+            let result = read_call(&data_dir, "agent.list", params).await?;
+            print_value(&result, json_output);
+            Ok(0)
+        }
         CliCommand::Show { agent } => {
             let result = read_call(&data_dir, "agent.get", json!({ "id": agent })).await?;
             print_value(&result, json_output);
@@ -718,11 +836,12 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
         CliCommand::Processes {
             agent,
             generation,
+            scope,
             after,
             limit,
         } => {
             validate_limit(limit)?;
-            let mut params = json!({ "id": agent, "limit": limit });
+            let mut params = json!({ "id": agent, "scope": scope, "limit": limit });
             if let Some(generation) = generation {
                 params["generation"] = json!(generation);
             }
@@ -787,6 +906,48 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             let result = read_call(&data_dir, "agent.result", params).await?;
             print_value(&result, json_output);
             Ok(0)
+        }
+        CliCommand::History {
+            agent,
+            generation,
+            source,
+            view,
+            turn_id,
+            cursor,
+            limit,
+        } => {
+            validate_limit(limit)?;
+            let mut params = json!({
+                "id": agent,
+                "source": source,
+                "view": view,
+                "limit": limit,
+            });
+            if let Some(generation) = generation {
+                params["generation"] = json!(generation);
+            }
+            if let Some(turn_id) = turn_id {
+                params["turn_id"] = Value::String(turn_id);
+            }
+            if let Some(cursor) = cursor {
+                params["cursor"] = Value::String(cursor);
+            }
+            let result = read_call(&data_dir, "agent.history", params).await?;
+            print_value(&result, json_output);
+            Ok(0)
+        }
+        CliCommand::Detach { agent, generation } => {
+            let mut params = json!({
+                "target": agent,
+                "verb": "detach",
+                "args": {},
+            });
+            if let Some(generation) = generation {
+                params["expected_generation"] = json!(generation);
+            }
+            let result = mutation_call(&data_dir, "command.submit", params, id).await?;
+            print_value(&result, json_output);
+            Ok(response_exit_code(&result))
         }
         CliCommand::Stop {
             agent,
@@ -869,25 +1030,26 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
 }
 
 fn start_daemon(data_dir: &Path, json_output: bool) -> Result<(), Failure> {
-    let executable = env::current_exe()
-        .map_err(|error| Failure::new(1, format!("cannot locate Eliot executable: {error}")))?;
-    let mut command = ProcessCommand::new(executable);
-    command
-        .arg("--data-dir")
-        .arg(data_dir)
-        .arg("daemon")
-        .arg("--foreground")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
     #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000);
-    }
-    command
-        .spawn()
+    eliot_daemon::start_background_daemon(data_dir)
         .map_err(|error| Failure::new(1, format!("cannot start daemon: {error}")))?;
+    #[cfg(not(windows))]
+    {
+        let executable = env::current_exe()
+            .map_err(|error| Failure::new(1, format!("cannot locate Eliot executable: {error}")))?;
+        let mut command = ProcessCommand::new(executable);
+        command
+            .arg("--data-dir")
+            .arg(data_dir)
+            .arg("daemon")
+            .arg("--foreground")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command
+            .spawn()
+            .map_err(|error| Failure::new(1, format!("cannot start daemon: {error}")))?;
+    }
     if json_output {
         print_value(&json!({ "state": "starting" }), true);
     } else {

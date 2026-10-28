@@ -1,4 +1,7 @@
 use super::{PluginClient, PluginConnection};
+mod discovery;
+mod observation;
+mod reader;
 use crate::bus::Bus;
 use crate::monitor::Monitoring;
 use crate::platform::OwnedChild;
@@ -10,7 +13,7 @@ use std::{
     ffi::OsString,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Mutex, Weak, atomic::AtomicBool},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -83,6 +86,9 @@ struct HostState {
     progress: watch::Sender<u64>,
     late_batch_causes: Mutex<HashMap<AgentKey, String>>,
     running: Mutex<HashMap<AgentKey, RuntimeEntry>>,
+    observers: Mutex<HashMap<AgentKey, Arc<observation::ObserverEntry>>>,
+    readers: Mutex<HashMap<String, discovery::Reader>>,
+    discovery_closed: AtomicBool,
 }
 
 struct AgentActorConfig {
@@ -109,6 +115,7 @@ struct EventSource {
     agent_id: String,
     generation: i64,
     expected_credential: String,
+    observation: Option<Agent>,
 }
 
 #[derive(Clone)]
@@ -145,6 +152,9 @@ impl PluginHost {
                 progress,
                 late_batch_causes: Mutex::new(HashMap::new()),
                 running: Mutex::new(HashMap::new()),
+                observers: Mutex::new(HashMap::new()),
+                readers: Mutex::new(HashMap::new()),
+                discovery_closed: AtomicBool::new(false),
             }),
         }
     }
@@ -155,6 +165,12 @@ impl PluginHost {
         command: Command,
         mut source_state: Option<Value>,
     ) -> Result<Value> {
+        if agent.observe_only {
+            return Err(Error::new(
+                "not_allowed",
+                "an observed Agent cannot enter controlled startup",
+            ));
+        }
         if !matches!(command.verb.as_str(), "launch" | "resume")
             || command.target.as_deref() != Some(agent.id.as_str())
             || command.generation != Some(agent.generation)
@@ -320,6 +336,7 @@ impl PluginHost {
                 agent_id: key.id.clone(),
                 generation: key.generation,
                 expected_credential: credential.clone(),
+                observation: None,
             },
         ));
         let (message_tx, message_rx) = mpsc::channel(16);
@@ -462,6 +479,8 @@ impl PluginHost {
     }
 
     pub(crate) async fn force_all(&self) {
+        self.cancel_discoveries().await;
+        self.cancel_observers().await;
         let entries: Vec<_> = self
             .state
             .running
@@ -598,19 +617,23 @@ impl PluginHost {
     }
 
     fn spawn_plugin(&self, agent: &Agent, _instance_dir: &Path) -> Result<OwnedChild> {
-        let executable = std::env::current_exe().map_err(|error| {
-            Error::new("platform_io", format!("locate Eliot executable: {error}"))
-        })?;
         let workspace = agent
             .workspace
             .as_deref()
             .ok_or_else(|| Error::new("invalid", "Agent launch requires a workspace"))?;
+        self.spawn_plugin_process(&agent.harness, Path::new(workspace))
+    }
+
+    fn spawn_plugin_process(&self, harness: &str, workspace: &Path) -> Result<OwnedChild> {
+        let executable = std::env::current_exe().map_err(|error| {
+            Error::new("platform_io", format!("locate Eliot executable: {error}"))
+        })?;
         let mut command = ProcessCommand::new(executable);
         command
             .arg("--data-dir")
             .arg(&self.state.data_root)
             .arg("plugin")
-            .arg(&agent.harness)
+            .arg(harness)
             .current_dir(workspace)
             .env_clear()
             .envs(minimal_plugin_environment())
@@ -1034,6 +1057,7 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
         agent_id,
         generation,
         expected_credential,
+        observation,
     } = source;
     let client = connection.client();
     while let Some(request) = connection.next_request().await {
@@ -1068,6 +1092,16 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
                 } else {
                     Err(Error::new("not_allowed", "plugin credential is invalid"))
                 }
+            } else if let Some(error) = observation::callback_error(
+                &store,
+                observation.as_ref(),
+                &method,
+                &params,
+                request_deadline,
+            )
+            .await
+            {
+                Err(error)
             } else {
                 match method.as_str() {
                     "process.put" => {
@@ -1257,7 +1291,9 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
         let _ = client.respond(request_id, result, request_deadline).await;
     }
     if let Some(state) = state.upgrade() {
-        fence_runtime_generation(&state, &key);
+        if observation.is_none() {
+            fence_runtime_generation(&state, &key);
+        }
         signal_progress(&state);
     }
 }
@@ -1491,6 +1527,8 @@ fn manifest_source_plan(manifest: &PluginManifest, harness: &str) -> Result<Valu
         "approve",
         "deny",
         "answer",
+        "attach",
+        "detach",
     ];
     if verbs.len() != manifest.verbs.len()
         || verbs.len() < 3
@@ -1509,8 +1547,23 @@ fn manifest_source_plan(manifest: &PluginManifest, harness: &str) -> Result<Valu
         return Err(unsupported_manifest());
     }
     let expected_families = ["message", "session", "turn"];
-    if manifest.sources.len() != 1 {
+    if manifest
+        .sources
+        .keys()
+        .any(|mode| !matches!(mode.as_str(), "controlled" | "observed"))
+    {
         return Err(unsupported_manifest());
+    }
+    match manifest.sources.get("observed") {
+        Some(observed)
+            if manifest.features.observe
+                && !observed.is_empty()
+                && observed.iter().all(|(family, mechanism)| {
+                    ["message", "request", "session", "tool", "turn"].contains(&family.as_str())
+                        && mechanism == "native_read"
+                }) => {}
+        None if !manifest.features.observe => {}
+        _ => return Err(unsupported_manifest()),
     }
     let controlled = manifest
         .sources

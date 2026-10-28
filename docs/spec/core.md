@@ -85,8 +85,9 @@ not duplicated Agent columns. No managed row means these projections are absent.
 | Input | Result |
 | --- | --- |
 | first launch/attach admission | created, generation 0 |
-| start dispatch | target generation, starting |
-| exact ready/attach snapshot | reported idle/busy/waiting |
+| controlled start dispatch | target generation, starting |
+| exact controlled ready snapshot | reported idle/busy/waiting |
+| observe attach dispatch and exact identity readback | target generation, unknown until current native state is proven |
 | lost start reply | starting, start command unknown |
 | exact turn start | busy with captured active turn |
 | first request / last resolved request | waiting / busy |
@@ -103,6 +104,19 @@ remain historical and are never reissued.
 Stall is a flag only for busy work with a healthy authoritative source. Waiting on a
 request is waiting, not stalled solely through silence. Native progress clears a stall;
 CPU/Git/mail/health noise does not. Stale source means progress unknown.
+
+`unknown` is a nonterminal Agent state for observe-only rows. It is independent of
+whether the reader is attached: successful identity attachment can leave native status
+unknown, and a detached row retains that status. Reader-local `notLoaded` is not native
+idle or stopped evidence. Observation failure and restart retain unknown/stale coverage;
+they do not take the controlled-generation `session.lost` transition.
+
+Observe attachment records `origin=external`, `observe_only=true`, `own_identity=false`
+and no token. The generation/source fence commits before reader I/O. Owner-issued native
+control commands reject as well. Detach closes only owned reader resources and source
+lifecycle; it preserves the canonical native subject, history and unknown native state.
+A detached unknown row with closed sources is not a live controlled-Agent drain blocker.
+Unresolved transitions and owned reader custody still block clean drain as appropriate.
 
 Compute `apply(state,input) -> (next_state,effects)` without I/O or mutating published
 state. Store commits event, next projection and derived facts atomically, then publishes.

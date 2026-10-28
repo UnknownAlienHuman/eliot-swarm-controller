@@ -33,11 +33,72 @@ jobs:
         run: cargo fmt --check
       - name: Scoped Clippy and compile
         run: cargo clippy --locked -p eliot -p eliot-core -p eliot-store -p eliot-plugin -p eliot-daemon -p eliot-plugin-codex -- -D warnings
+      - name: Discovery cursor and store regressions
+        run: cargo test --locked -p eliot-plugin-codex discovery::tests
+      - name: Native store policy regressions
+        run: cargo test --locked -p eliot-plugin-codex native::store_policy::tests
+      - name: Opened-file identity regression
+        run: cargo test --locked -p eliot-plugin held_handle_survives_rename_and_path_replacement
       - name: Version smoke check
         run: cargo run --locked -p eliot -- --version
       - name: Help smoke check
         run: cargo run --locked -p eliot -- --help
-      - name: Linux fake worktree smoke
+      - name: Windows background daemon capture regression
+        if: runner.os == 'Windows'
+        shell: pwsh
+        timeout-minutes: 2
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cli = Join-Path $env:GITHUB_WORKSPACE 'target/debug/eliot.exe'
+          $data = Join-Path $env:RUNNER_TEMP ('eliot capture Проба ' + [guid]::NewGuid().ToString('N'))
+          $start = [Diagnostics.ProcessStartInfo]::new($cli)
+          $start.UseShellExecute = $false
+          $start.CreateNoWindow = $true
+          $start.RedirectStandardOutput = $true
+          $start.RedirectStandardError = $true
+          foreach ($word in @('--data-dir', ($data + '\'), '--json', 'daemon')) {
+            $start.ArgumentList.Add($word)
+          }
+          $starter = [Diagnostics.Process]::new()
+          $starter.StartInfo = $start
+          $daemon = $null
+          try {
+            if (!$starter.Start()) { throw 'Could not start the daemon CLI' }
+            $output = $starter.StandardOutput.ReadToEndAsync()
+            $errors = $starter.StandardError.ReadToEndAsync()
+            if (!$starter.WaitForExit(5000)) { throw 'Daemon CLI did not exit' }
+            if (!$output.Wait(5000) -or !$errors.Wait(5000)) {
+              throw 'Background daemon retained caller capture pipes'
+            }
+            if ($starter.ExitCode -ne 0 -or ($output.Result | ConvertFrom-Json).state -ne 'starting') {
+              throw 'Daemon CLI did not return its startup result'
+            }
+            $deadline = [DateTime]::UtcNow.AddSeconds(15)
+            do {
+              if (Test-Path -LiteralPath (Join-Path $data 'daemon.json')) { break }
+              Start-Sleep -Milliseconds 100
+            } while ([DateTime]::UtcNow -lt $deadline)
+            $info = Get-Content -LiteralPath (Join-Path $data 'daemon.json') -Raw | ConvertFrom-Json
+            $daemon = [Diagnostics.Process]::GetProcessById($info.pid)
+            $null = $daemon.Handle
+            $status = & $cli --data-dir $data --json status | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0 -or $status.state -ne 'running') {
+              throw 'Background daemon is unavailable'
+            }
+          } finally {
+            if ($null -eq $daemon -and (Test-Path -LiteralPath (Join-Path $data 'daemon.json'))) {
+              $info = Get-Content -LiteralPath (Join-Path $data 'daemon.json') -Raw | ConvertFrom-Json
+              $daemon = [Diagnostics.Process]::GetProcessById($info.pid)
+              $null = $daemon.Handle
+            }
+            if ($null -ne $daemon -and !$daemon.HasExited) {
+              $null = & $cli --data-dir $data --json daemon stop --force
+              if (!$daemon.WaitForExit(15000)) { throw 'Owned daemon did not stop' }
+            }
+          }
+          Write-Output 'Windows captured-output daemon startup passed'
+          exit 0
+      - name: Linux fake discovery, observation and worktree smoke
         if: runner.os == 'Linux'
         shell: bash
         timeout-minutes: 3
@@ -107,6 +168,52 @@ jobs:
           done
           status=$(client status)
           jq -e '.workspace_custody | .scope == "current_host" and .capability == "unix_process_group_degraded" and .exact == false and .orphan_possible == true' <<<"$status" >/dev/null
+
+          discovery_first=$(client discover --profile fake --limit 1)
+          jq -e '.harness == "fake" and (.subjects | length) == 1 and .coverage.complete == false' <<<"$discovery_first" >/dev/null
+          discovery_scope=$(jq -er '.native_scope' <<<"$discovery_first")
+          discovery_cursor=$(jq -er '.next_cursor' <<<"$discovery_first")
+          discovery_rest=$(client discover --profile fake --scope "$discovery_scope" --cursor "$discovery_cursor" --limit 2)
+          jq -e '(.subjects | length) == 2 and .next_cursor == null and .coverage.complete == true' <<<"$discovery_rest" >/dev/null
+          jq -es '([.[].subjects[].native_ref] | unique | length) == 3' <<<"$discovery_first $discovery_rest" >/dev/null
+          client status | jq -e '.agents == 0 and .owned_plugins == 0 and .discovery_readers == 0' >/dev/null
+
+          attached=$(client attach --profile fake --harness fake \
+            --scope "$discovery_scope" --ref fake-discovered-1)
+          observer=$(jq -er '.agent' <<<"$attached")
+          attach_command=$(jq -er '.command_id' <<<"$attached")
+          attach_deadline=$((SECONDS + 15))
+          while true; do
+            command=$(client cmd show "$attach_command")
+            if jq -e '.state == "applied"' <<<"$command" >/dev/null; then break; fi
+            jq -e '.state == "accepted" or .state == "queued" or .state == "dispatched"' <<<"$command" >/dev/null
+            (( SECONDS < attach_deadline ))
+            sleep 0.1
+          done
+          observed=$(client show "$observer")
+          jq -e '.state == "unknown" and .origin == "external" and .observe_only == true and .own_identity == false and .active_turn == null' <<<"$observed" >/dev/null
+          observed_generation=$(jq -er '.generation' <<<"$observed")
+          history_first=$(client history "$observer" --generation "$observed_generation" --source native --view turns --limit 1)
+          history_cursor=$(jq -er '.next_cursor' <<<"$history_first")
+          history_rest=$(client history "$observer" --generation "$observed_generation" --source native --view turns --cursor "$history_cursor" --limit 1)
+          jq -es '([.[].entries[].turn_id] | unique | length) == 2 and .[1].next_cursor == null' <<<"$history_first $history_rest" >/dev/null
+          observed_results=$(client result "$observer" --generation "$observed_generation" --limit 1)
+          jq -e '(.turns | length) == 0' <<<"$observed_results" >/dev/null
+          if client send "$observer" forbidden-observe-input >/dev/null 2>&1; then
+            exit 1
+          fi
+          detached=$(client detach "$observer")
+          detach_command=$(jq -er '.command_id' <<<"$detached")
+          detach_deadline=$((SECONDS + 15))
+          while true; do
+            command=$(client cmd show "$detach_command")
+            if jq -e '.state == "applied"' <<<"$command" >/dev/null; then break; fi
+            jq -e '.state == "accepted" or .state == "queued" or .state == "dispatched"' <<<"$command" >/dev/null
+            (( SECONDS < detach_deadline ))
+            sleep 0.1
+          done
+          detached_view=$(client show "$observer")
+          jq -e '.state == "unknown" and .observe_only == true and .own_identity == false and any(.source_states[]; .source == "observe" and .state == "closed")' <<<"$detached_view" >/dev/null
 
           turn=$(client launch --profile fake --workspace "$repo" \
             --worktree codex/ci-smoke --base "$base" \

@@ -28,6 +28,21 @@ requests carrying `grantRoot` remain unsupported. [Roadmap](docs/roadmap.md) own
 `show AGENT` includes the same observation view. Missing or stale counters are null,
 and process activity never counts as model progress.
 
+`discover --profile PROFILE [--scope SCOPE] [--cursor CURSOR] [--limit N]` reads a
+bounded native session metadata page through the selected profile. It creates no
+Agent and sends no prompt. Codex enumeration is state-DB-only; previews and transcripts
+are excluded, and reader-local `notLoaded` remains unknown. Pass `next_cursor` unchanged
+to continue; `coverage.complete` reports enumeration exhaustion, not live coverage.
+`processes AGENT --scope workspace` selects the managed preparation's target generation,
+including setup that runs before the Agent's native generation starts.
+
+`attach --profile PROFILE --harness codex --scope SCOPE --ref REF` binds an
+observe-only Agent to a discovered subject. `history AGENT --view turns|items|subject`
+reads private bounded pages; `--source rollout` explicitly selects verified local
+rollout reading. `detach AGENT` closes its reader. Observation has no Agent identity
+or native control: status can remain `unknown`, and detach does not end the native
+session. Historical pages do not enter the live event bus or acknowledge input.
+
 `git-status AGENT` reads the cached Git view; `edits AGENT` pages durable edit
 attribution. Check freshness (`available`, `age_ms`) separately from `complete` and
 history coverage: stale or partial data does not prove a clean workspace. Attribution

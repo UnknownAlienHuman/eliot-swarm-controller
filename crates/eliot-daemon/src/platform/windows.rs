@@ -6,7 +6,7 @@ use super::process_observation::{
 use eliot_core::{
     Error, ProcessIdentity, ProcessRecord, ProcessSample, ProcessSnapshot, ProcessState, Result,
 };
-use std::ffi::c_void;
+use std::ffi::{OsStr, c_void};
 use std::fs;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
@@ -47,9 +47,102 @@ use windows_sys::Win32::System::Pipes::{
 use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows_sys::Win32::System::SystemInformation::{GetSystemTimeAsFileTime, GetTickCount64};
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, OpenProcess, OpenProcessToken,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, TerminateProcess, WaitForSingleObject,
+    CREATE_NO_WINDOW, CreateProcessW, GetCurrentProcess, GetExitCodeProcess, GetProcessTimes,
+    OpenProcess, OpenProcessToken, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
 };
+
+pub(crate) fn start_background_daemon(data_dir: &Path) -> Result<()> {
+    let executable =
+        std::env::current_exe().map_err(|error| io_error("locate Eliot executable", error))?;
+    let mut command_line = background_daemon_command_line(&executable, data_dir)?;
+    let application = wide_path(&executable);
+    let startup = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        ..STARTUPINFOW::default()
+    };
+    let mut process = PROCESS_INFORMATION::default();
+    // SAFETY: application and the writable command line are NUL-terminated UTF-16.
+    // All structures live through the call. FALSE disables ALL handle inheritance,
+    // including otherwise-unused capture-pipe writers held by the CLI. No standard
+    // handles are supplied; CREATE_NO_WINDOW prevents console inheritance/creation.
+    // Null environment/current-directory pointers preserve the caller's values.
+    if unsafe {
+        CreateProcessW(
+            application.as_ptr(),
+            command_line.as_mut_ptr(),
+            null(),
+            null(),
+            0,
+            CREATE_NO_WINDOW,
+            null(),
+            null(),
+            &startup,
+            &mut process,
+        )
+    } == 0
+    {
+        return Err(io_error(
+            "start background daemon",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: successful CreateProcessW returned these two uniquely owned handles.
+    // Closing them neither waits for nor terminates the independent daemon. No PID
+    // is retained or adopted as later control authority.
+    unsafe {
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+    }
+    Ok(())
+}
+
+fn background_daemon_command_line(executable: &Path, data_dir: &Path) -> Result<Vec<u16>> {
+    let mut command_line = Vec::new();
+    for argument in [
+        executable.as_os_str(),
+        OsStr::new("--data-dir"),
+        data_dir.as_os_str(),
+        OsStr::new("daemon"),
+        OsStr::new("--foreground"),
+    ] {
+        if !command_line.is_empty() {
+            command_line.push(u16::from(b' '));
+        }
+        command_line.push(u16::from(b'"'));
+        let mut backslashes = 0;
+        for unit in argument.encode_wide() {
+            if unit == 0 {
+                return Err(Error::new("invalid", "daemon argument contains NUL"));
+            }
+            if unit == u16::from(b'\\') {
+                backslashes += 1;
+                continue;
+            }
+            // Windows argv parsing doubles backslashes before a quote, then
+            // escapes that quote. Other backslashes are literal.
+            let escapes = if unit == u16::from(b'"') {
+                backslashes * 2 + 1
+            } else {
+                backslashes
+            };
+            command_line.extend(std::iter::repeat_n(u16::from(b'\\'), escapes));
+            command_line.push(unit);
+            backslashes = 0;
+        }
+        // Protect trailing backslashes from consuming the closing quote.
+        command_line.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes * 2));
+        command_line.push(u16::from(b'"'));
+    }
+    if command_line.len() >= 32_767 {
+        return Err(Error::new(
+            "invalid",
+            "daemon command line exceeds the Windows limit",
+        ));
+    }
+    command_line.push(0);
+    Ok(command_line)
+}
 
 pub(crate) fn ensure_private_root(path: &Path) -> Result<()> {
     check_no_reparse_components(path)?;

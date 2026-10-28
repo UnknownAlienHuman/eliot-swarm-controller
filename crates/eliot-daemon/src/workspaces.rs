@@ -3,6 +3,7 @@
 use crate::{
     bus::Bus,
     git_monitor::{canonical_root, reject_links},
+    monitor::{Monitoring, WorkspaceProcessContext},
     platform::{CustodyObserver, OwnedChild},
     plugin_host::SecretSet,
     setup,
@@ -78,6 +79,7 @@ struct State {
     bus: Bus,
     secrets: SecretSet,
     progress: watch::Sender<u64>,
+    monitoring: Monitoring,
     slots: Mutex<HashMap<Key, Arc<Slot>>>,
 }
 
@@ -109,6 +111,7 @@ impl WorkspaceManager {
         bus: Bus,
         secrets: SecretSet,
         progress: watch::Sender<u64>,
+        monitoring: Monitoring,
     ) -> Self {
         Self {
             inner: Arc::new(State {
@@ -117,6 +120,7 @@ impl WorkspaceManager {
                 bus,
                 secrets,
                 progress,
+                monitoring,
                 slots: Mutex::new(HashMap::new()),
             }),
         }
@@ -206,7 +210,18 @@ impl WorkspaceManager {
                                 self.require_current(&current, WorkspacePhase::Creating)
                                     .await?;
                                 let result = self
-                                    .run_owned(&slot, command, Instant::now() + GIT_TIME, gate)
+                                    .run_owned(
+                                        &slot,
+                                        command,
+                                        Instant::now() + GIT_TIME,
+                                        gate,
+                                        WorkspaceProcessContext::new(
+                                            &current,
+                                            command_id,
+                                            "workspace_create",
+                                            None,
+                                        ),
+                                    )
                                     .await;
                                 if !result.quiescent {
                                     creation_unknown(result.code)
@@ -311,6 +326,12 @@ impl WorkspaceManager {
                             command,
                             Instant::now() + Duration::from_millis(entry.timeout_ms),
                             gate,
+                            WorkspaceProcessContext::new(
+                                &current,
+                                command_id,
+                                "setup",
+                                Some(current.setup_index),
+                            ),
                         )
                         .await;
                     let _gate = slot.gate.clone().lock_owned().await;
@@ -499,7 +520,15 @@ impl WorkspaceManager {
         if Instant::now() >= deadline {
             return removal_unknown("workspace_remove_deadline");
         }
-        let result = self.run_owned(slot, mutator, deadline, gate).await;
+        let result = self
+            .run_owned(
+                slot,
+                mutator,
+                deadline,
+                gate,
+                WorkspaceProcessContext::new(preparation, &command.id, "workspace_remove", None),
+            )
+            .await;
         if !result.quiescent {
             return removal_unknown(result.code);
         }
@@ -1114,7 +1143,30 @@ impl WorkspaceManager {
         mut command: Command,
         deadline: Instant,
         gate: OwnedMutexGuard<()>,
+        context: WorkspaceProcessContext,
     ) -> RunResult {
+        // Commit observation ownership before spawning, without advancing the
+        // Agent's native generation or granting any control authority.
+        if self
+            .inner
+            .monitoring
+            .prepare_workspace_process(&context)
+            .await
+            .is_err()
+            || Instant::now() >= deadline
+        {
+            let result = RunResult {
+                state: RunState::Interrupted,
+                quiescent: true,
+                code: "workspace_process_not_started",
+            };
+            *slot
+                .last
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
+            drop(gate);
+            return result;
+        }
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -1123,6 +1175,11 @@ impl WorkspaceManager {
         let mut child = match OwnedChild::spawn(command) {
             Ok(child) => child,
             Err(_) => {
+                let _ = self
+                    .inner
+                    .monitoring
+                    .workspace_process_unavailable(&context)
+                    .await;
                 let result = RunResult {
                     state: RunState::Interrupted,
                     quiescent: false,
@@ -1136,12 +1193,9 @@ impl WorkspaceManager {
                 return result;
             }
         };
-        // wait() reaps the Unix leader and clears signalling authority. Retain
-        // only the read-only observer beforehand; it never authorizes a signal.
-        #[cfg(unix)]
+        // Capture exact birth/Job identity before wait() can reap the leader.
+        // This observer never authorizes a signal, including on Unix.
         let observer = child.observer().ok();
-        #[cfg(not(unix))]
-        let observer: Option<CustodyObserver> = None;
         let stdout = child.take_stdout();
         let stderr = child.take_stderr();
         let (cancel, mut cancellation) = watch::channel(false);
@@ -1154,6 +1208,22 @@ impl WorkspaceManager {
             done: done_rx,
         });
         drop(gate);
+        let observation = match observer.as_ref() {
+            Some(observer) => self
+                .inner
+                .monitoring
+                .attach_workspace_process(context.clone(), observer.clone())
+                .await
+                .ok(),
+            None => None,
+        };
+        if observation.is_none() {
+            let _ = self
+                .inner
+                .monitoring
+                .workspace_process_unavailable(&context)
+                .await;
+        }
         let result = if let (Some(stdout), Some(stderr)) = (stdout, stderr) {
             let capture = async {
                 let (_, _, status) =
@@ -1206,6 +1276,15 @@ impl WorkspaceManager {
                 code: "workspace_pipes_unavailable",
             }
         };
+        // Persist the terminal edge while the exact owned child/observer still
+        // exists; the periodic sampler alone would miss short-lived setup.
+        if let Some(observation) = observation {
+            let _ = self
+                .inner
+                .monitoring
+                .finish_workspace_process(&observation)
+                .await;
+        }
         let _gate = slot.gate.clone().lock_owned().await;
         *slot
             .last

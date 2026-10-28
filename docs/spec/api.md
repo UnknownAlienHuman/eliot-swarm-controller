@@ -21,6 +21,11 @@ Frames are at most 4 MiB, semantic fields smaller. Multiplex requests so one wai
 not block unrelated calls. Bound all lists and histories; never hold a read transaction
 open while waiting for a client or native process.
 
+Background `daemon` startup reports `starting`; use `daemon.status` for readiness.
+Windows starts that independent process without inheriting caller handles, so captured
+CLI stdout/stderr reach EOF while the daemon remains alive. Its own private IPC and
+owned plugin/workspace custody establish subsequent authority.
+
 ## Mutation ids
 
 External writes carry a ULID generated/printed before send. Bind it to principal,
@@ -52,7 +57,8 @@ rule actions have bounded derived ids. No general receipt/floor framework.
 | `command.submit/get/children/resolve` | immutable admission, linked input, fixed selector/action children |
 | `turn.get/resolve` | running/completed/unknown turn; constrained owner assertion |
 | `events.read/subscribe` | persisted replay plus bounded live delivery |
-| `agent.discover/attach`, `detach` | later exact-subject observation/control |
+| `agent.discover` | owner-only native metadata discovery, without creating Agents |
+| `agent.history` | owner-only bounded history of an exact observed subject |
 | `hook.event` | later exact request/deadline decision |
 | `mail.send/inbox/read/ack`, `var.*`, `who`, `claim.*` | later coordination |
 | `rule.*`, `timer.*`, `goal.*` | later automation; effects remain commands |
@@ -65,19 +71,25 @@ Filter shape is `{kinds?,agents?,tree?,sources?,ephemeral?}`. Errors include
 Process reads use the existing daemon and private data directory:
 
 ```text
-agent.processes {id, generation?, after?, limit?}
+agent.processes {id, generation?, scope?:agent|workspace, after?, limit?}
   -> {agent, generation, processes:[ProcessRecord], next:string|null}
 agent.stats {id, generation?}
   -> {agent, generation, ...monitorView}
 ```
 
-Generation is a nonnegative integer; omission selects the current generation. The
-Router validates scope. Owners may read historical generations with `agent.processes`;
+Generation is a nonnegative integer; omission selects the current generation for
+default scope `agent`, or the managed workspace's target generation for scope
+`workspace`. The latter may still be preparing while the Agent is generation 0.
+The Router validates the exact preparation target before allowing a future-generation
+workspace read. Owners may read historical generations with `agent.processes`;
 `agent.stats` accepts only the current generation, with an explicit generation acting
-as an expectation. Process ownership is `agent:<id>#<generation>`. `agent.processes` is
+as an expectation. Process ownership is `agent:<id>#<generation>` or
+`workspace:<id>#<target_generation>`. Each page selects one scope; the cursor stays
+within that query's owner and generation. `agent.processes` is
 paginated, with default limit 100 and allowed range 1–1,000. Its `after` cursor is an opaque string
-containing a JSON-serialized `ProcessIdentity` (`host_boot_id`, `pid`, `start_time`);
-pass it back unchanged rather than constructing a PID-only cursor.
+containing `{agent,generation,scope,identity}`, where `identity` is the OS birth-bound
+`ProcessIdentity` (`host_boot_id`, `pid`, `start_time`). Pass it back unchanged;
+a different Agent, generation or scope rejects before querying process rows.
 `next` contains the last returned identity even on the last nonempty page; continue
 until `processes` is empty rather than using non-null `next` as proof of another record.
 
@@ -209,9 +221,63 @@ the next generation. Validate before dispatch, commit identity fence before nati
 and install exact readback on success. Failure never restores revoked control; unknown
 blocks another takeover.
 
-Detach applies only to independently living sessions/services: revoke control, become
-observe-only on exact success, never kill the shared/adopted service. It does not settle
-an unknown input. Resume reopens the same native subject as a new generation and never
+The first discovery caller requires an explicit existing profile:
+
+```text
+agent.discover {profile, harness?, native_scope?, cursor?, limit?}
+  -> {harness, native_scope, subjects:[{native_ref,workspace,state,
+       created_at,updated_at,source,ephemeral}], next_cursor,
+       coverage:{kind,complete}}
+```
+
+Limits default to 100 and range from 1 to 1,000, with a 900 KiB encoded page bound.
+Pass the opaque cursor unchanged; it is bound to the selected profile, target environment,
+verified native store, method, ordering and source filters. Changed store selection
+rejects before listing subjects. Unverified selection is an explicit error.
+`coverage.complete` means this paged enumeration
+has reached its native end, not that it is a consistent snapshot or a live subscription.
+Codex coverage is `state_db_only`; it never scans/repairs rollout storage to fill the
+list. The current Codex query selects nonarchived threads and fixes the page size in
+its cursor binding. Subject timestamps are milliseconds since the Unix epoch; native
+seconds are converted before projection. Session previews, prompts and transcripts are
+excluded. Native `notLoaded` is
+reported as unknown: a separate reader cannot prove another process's session stopped.
+Discovery installs no Agent identity and invokes no native start/resume/input operation.
+Owned readers finish cleanup after a client disconnect; drain waits for them and force
+cancels their own custody. New discovery rejects during shutdown.
+
+The first observation mutations use the existing command pipeline:
+
+```text
+command.submit {id, verb:"attach", expected_generation?,
+  args:{profile,harness,native_scope,native_ref,mode:"observe",project?}}
+command.submit {id, target:AGENT, verb:"detach", expected_generation?, args:{}}
+agent.history {id:AGENT, generation?, source?:"native"|"rollout",
+  view:"subject"|"turns"|"items", turn_id?, cursor?, limit?}
+```
+
+Require an explicit profile. Resolve the same mutation id before rereading mutable
+configuration; retained retries keep their original subject/profile. Attachment reuses
+the canonical scope/reference row. A controlled row or an active observer returns
+`busy`; this increment does not convert control or grant a second identity. Attach
+commits its generation/source fence before reader I/O and installs no Agent token.
+All native control verbs reject observe-only targets, including owner-issued stop.
+`mode:"control"` is unsupported. The vendor plugin method is `agent.attach`; it is not
+a second public mutation method.
+
+Successful reader attachment can leave the Agent `unknown`. History pages are private
+views: they neither replay lifecycle into the event bus nor acknowledge input, command
+or request delivery. Bind every page/cursor to Agent/generation, exact native subject,
+source/view, turn filter, ordering and selected store. Items require an exact turn id.
+Limits are 1–1,000 entries, a 16 KiB cursor and a 900 KiB encoded page. Unsupported
+source/paging stays explicit; observation never resumes a thread to obtain history.
+Observe detach fences new reads, closes only its reader and records source closure
+after cleanup. It retains unknown native state and never reports native session end.
+
+Controlled detach applies only to independently living sessions/services and remains
+unsupported until that native path exists: revoke control and become observe-only on
+exact success without killing the shared/adopted service. It does not settle an unknown
+input. Controlled resume reopens the same native subject as a new generation and never
 resends previous input.
 
 ## Event replay
@@ -258,7 +324,7 @@ eliot status
 eliot launch --profile P --workspace PATH [--worktree BRANCH [--base REF]] [PROMPT] [--wait]
 eliot worktree remove AGENT [--generation N]
 eliot ls | show A | watch [A|SELECTOR] | top
-eliot processes A [--generation N] [--after CURSOR] [--limit N]
+eliot processes A [--scope agent|workspace] [--generation N] [--after CURSOR] [--limit N]
 eliot stats A [--generation N]
 eliot git-status A [--generation N]
 eliot edits A [--generation N] [--after PATH] [--limit N]
@@ -277,9 +343,10 @@ eliot events [--since SEQ] [--allow-gap]
 eliot msg send ... | inbox [--wait SECS] [--all]
 eliot var ... | who ... | claim ... | release ...
 eliot rule ... | rules pause|resume | timer list|run
-eliot discover [--harness H] [--cursor C] [--limit N]
-eliot attach --harness H --scope S --ref R [--control --profile P]
-eliot detach A
+eliot discover --profile P [--harness H] [--scope S] [--cursor C] [--limit N]
+eliot attach --profile P --harness H --scope S --ref R [--project LABEL]
+eliot history A --view subject|turns|items [--source native|rollout] [--turn-id ID] [--cursor C] [--limit N]
+eliot detach A [--generation N]
 eliot service list|stop | hold list|clear | doctor
 eliot plugin NAME | plugin-test ... | hook ... | mcp
 ```
