@@ -285,6 +285,12 @@ impl Fixture {
             "shutdown reply: {}",
             stop.stderr
         );
+        self.finish_shutdown();
+    }
+
+    /// A shutdown acknowledgement is not exit evidence. Wait on this fixture's
+    /// exact owned process without admitting a second shutdown mutation.
+    pub fn finish_shutdown(&mut self) {
         let daemon = self.daemon.as_mut().unwrap();
         assert!(
             daemon

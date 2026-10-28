@@ -12,11 +12,12 @@ use eliot_core::{
         AgentGetResponse, AgentGitRequest, AgentGitResponse, AgentHistoryRequest, AgentListRequest,
         AgentListResponse, AgentListRow, AgentProcessesRequest, AgentProcessesResponse,
         AgentResultRequest, AgentResultResponse, AgentStatsRequest, AgentStatsResponse,
-        CommandGetRequest, DaemonStatusRequest, DaemonStatusResponse, DiscoverPage, EventsFilter,
-        EventsReadRequest, EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse,
-        GitView, MAX_OBSERVATION_PAGE_BYTES, ObservationPage, ObservationQuery, ObservationView,
-        ProcessPageCursor, SourceState, StatusBlocker, TurnGetRequest, UnsettledCommandSummary,
-        WorkspaceCustodyView,
+        CommandGetRequest, CommandSubmitRequest, CommandSubmitResponse, DaemonShutdownRequest,
+        DaemonShutdownResponse, DaemonStatusRequest, DaemonStatusResponse, DiscoverPage,
+        EventsFilter, EventsReadRequest, EventsReadResponse, EventsSubscribeRequest,
+        EventsSubscribeResponse, GitView, MAX_OBSERVATION_PAGE_BYTES, ObservationPage,
+        ObservationQuery, ObservationView, ProcessPageCursor, ShutdownMode, SourceState,
+        StatusBlocker, TurnGetRequest, UnsettledCommandSummary, WorkspaceCustodyView,
     },
     classify_dispatched_error,
 };
@@ -402,20 +403,7 @@ impl Router {
     }
 
     async fn submit(&self, params: &Value, principal: &Principal) -> Result<Value> {
-        reject_unknown_keys(
-            params,
-            &[
-                "id",
-                "target",
-                "verb",
-                "args",
-                "expected_generation",
-                "expected_turn_id",
-                "request_id",
-            ],
-            "command.submit",
-        )?;
-        let mut request: SubmitCommand = serde_json::from_value(params.clone())
+        let mut request: CommandSubmitRequest = serde_json::from_value(params.clone())
             .map_err(|_| Error::new("invalid", "command.submit params are malformed"))?;
         authorize_command(principal, &mut request)?;
         if matches!(request.verb.as_str(), "attach" | "detach") {
@@ -590,10 +578,11 @@ impl Router {
             tokio::spawn(router.process_command(command_id, linked_id));
         }
         self.signal_progress();
-        Ok(submit_result(
+        serde_json::to_value(submit_result(
             &admission.command,
             admission.linked_command.as_ref(),
         ))
+        .map_err(|_| Error::new("internal", "command admission result could not be encoded"))
     }
 
     async fn hydrate_retained_launch(&self, request: &mut SubmitCommand) -> Result<bool> {
@@ -1540,50 +1529,63 @@ impl Router {
 
     async fn shutdown(&self, params: &Value, principal: &Principal) -> Result<Value> {
         require_owner(principal)?;
-        reject_unknown_keys(params, &["id", "mode"], "daemon.shutdown")?;
-        let mode = required_text(params, "mode")?;
-        if mode != "drain" && mode != "force" {
-            return Err(Error::new(
-                "invalid",
-                "daemon.shutdown mode must be drain or force",
-            ));
-        }
-        let id = required_text(params, "id")?;
-        let result = if mode == "force" {
-            json!({"state": "dispatched", "mode": "force"})
+        let request: DaemonShutdownRequest = serde_json::from_value(params.clone())
+            .map_err(|_| Error::new("invalid", "daemon.shutdown params are malformed"))?;
+        request.validate()?;
+        let mode = request.mode;
+        let id = request.id.as_str();
+        let result = if mode == ShutdownMode::Force {
+            DaemonShutdownResponse {
+                state: CommandState::Dispatched,
+                mode,
+                blockers: None,
+                store_write_faulted: None,
+            }
         } else {
             let blockers = self.status_blockers().await?;
-            json!({
-                "state": if blockers.is_empty() { "applied" } else { "dispatched" },
-                "mode": "drain",
-                "blockers": blockers,
-            })
+            DaemonShutdownResponse {
+                state: if blockers.is_empty() {
+                    CommandState::Applied
+                } else {
+                    CommandState::Dispatched
+                },
+                mode,
+                blockers: Some(blockers),
+                store_write_faulted: None,
+            }
         };
+        let result = serde_json::to_value(result)
+            .map_err(|_| Error::new("internal", "shutdown result could not be encoded"))?;
         let write = {
             let mut store = self.inner.store.lock().await;
             match store.record_write(
                 id,
                 &principal_name(principal),
                 "daemon.shutdown",
-                &json!({"mode": mode}),
+                &json!({"mode": mode.as_str()}),
                 &result,
                 now_ms(),
             ) {
                 Ok(write) => Some(write.result),
-                Err(_error) if mode == "force" && store.is_write_faulted() => None,
+                Err(_error) if mode == ShutdownMode::Force && store.is_write_faulted() => None,
                 Err(error) => return Err(error),
             }
         };
-        let response = write.unwrap_or_else(|| {
-            json!({
-                "state": "dispatched",
-                "mode": "force",
-                "store_write_faulted": true,
-            })
-        });
+        // Decode the retained receipt, never replace it with the newly computed
+        // candidate. A bad receipt must not undo an already admitted shutdown.
+        let response = match write {
+            Some(value) => serde_json::from_value::<DaemonShutdownResponse>(value)
+                .map_err(|_| Error::new("internal", "retained shutdown result is invalid")),
+            None => Ok(DaemonShutdownResponse {
+                state: CommandState::Dispatched,
+                mode: ShutdownMode::Force,
+                blockers: None,
+                store_write_faulted: Some(true),
+            }),
+        };
         self.inner.plugin_host.close_discovery_admission();
         self.inner.mode.store(
-            if mode == "force" {
+            if mode == ShutdownMode::Force {
                 MODE_FORCE
             } else {
                 MODE_DRAIN
@@ -1592,7 +1594,8 @@ impl Router {
         );
         self.inner.shutdown_ready.store(false, Ordering::SeqCst);
         self.signal_progress();
-        Ok(response)
+        serde_json::to_value(response?)
+            .map_err(|_| Error::new("internal", "shutdown result could not be encoded"))
     }
 
     fn process_command(self, id: String, linked_id: Option<String>) -> BoxFuture<'static, ()> {
@@ -3038,15 +3041,15 @@ fn principal_name(principal: &Principal) -> String {
     }
 }
 
-fn submit_result(command: &Command, linked: Option<&Command>) -> Value {
-    json!({
-        "command_id": command.id,
-        "agent": command.target,
-        "generation": command.generation,
-        "state": command.state,
-        "outcome": command.outcome,
-        "linked_command": linked.map(|command| command.id.as_str()),
-    })
+fn submit_result(command: &Command, linked: Option<&Command>) -> CommandSubmitResponse {
+    CommandSubmitResponse {
+        command_id: command.id.clone(),
+        agent: command.target.clone(),
+        generation: command.generation,
+        state: command.state,
+        outcome: command.outcome.clone(),
+        linked_command: linked.map(|command| command.id.clone()),
+    }
 }
 
 fn authorize_event_filter(raw: EventsFilter, principal: &Principal) -> Result<EventFilter> {
@@ -3233,6 +3236,199 @@ mod tests {
             )
             .unwrap()
             .events
+    }
+
+    #[tokio::test]
+    async fn typed_mutation_submit_retains_unknown_without_new_dispatch() {
+        let router = router();
+        let outcome = json!({"code":"unknown", "opaque":{"nested":[false, null, "retained"]},
+            "diagnostics":[{"source":"plugin", "snapshot":{"text":"safe diagnostic", "truncated":false, "eof":true, "read_error":false}}]});
+        let (agent, request, retained, before_events) = {
+            let mut store = router.inner.store.lock().await;
+            let (agent, _) = result_fixture(&mut store);
+            let request = SubmitCommand {
+                id: ulid::Ulid::new().to_string().to_ascii_lowercase(),
+                target: Some(agent.clone()),
+                verb: "interrupt".to_owned(),
+                args: json!({}),
+                expected_generation: Some(1),
+                expected_turn_id: Some("turn-1".to_owned()),
+                request_id: None,
+            };
+            let principal = format!("agent:{agent}:1");
+            store.submit(&principal, request.clone(), now_ms()).unwrap();
+            store.dispatch(&request.id, now_ms()).unwrap();
+            store
+                .settle(
+                    &request.id,
+                    CommandState::Unknown,
+                    Some(outcome.clone()),
+                    now_ms(),
+                )
+                .unwrap();
+            let duplicate = store.submit(&principal, request.clone(), now_ms()).unwrap();
+            assert!(!duplicate.is_new);
+            assert!(duplicate.events.is_empty());
+            let before_events = store.read_events(0, 1000, None).unwrap();
+            (agent, request, duplicate.command, before_events)
+        };
+        let principal = Principal::Agent {
+            id: agent.clone(),
+            generation: 1,
+        };
+        let mut wire = serde_json::to_value(&request).unwrap();
+        // These values must be hydrated from the managed caller before Store id binding.
+        wire.as_object_mut().unwrap().remove("target");
+        wire.as_object_mut().unwrap().remove("expected_generation");
+        let progress = router.progress_receiver();
+        let before_progress = *progress.borrow();
+        let first = router.submit(&wire, &principal).await.unwrap();
+        assert_eq!(first.as_object().unwrap().len(), 6);
+        let typed: CommandSubmitResponse = serde_json::from_value(first.clone()).unwrap();
+        assert_eq!(typed.command_id, request.id);
+        assert_eq!(typed.agent.as_deref(), Some(agent.as_str()));
+        assert_eq!(typed.generation, Some(1));
+        assert_eq!(typed.state, CommandState::Unknown);
+        assert_eq!(typed.outcome, Some(outcome));
+        assert_eq!(typed.linked_command, None);
+        assert_eq!(router.submit(&wire, &principal).await.unwrap(), first);
+        tokio::task::yield_now().await;
+        // Each retained submit signals once; no processing actor signals another dispatch.
+        assert_eq!(*progress.borrow(), before_progress.wrapping_add(2));
+        {
+            let store = router.inner.store.lock().await;
+            assert_eq!(store.get_command(&request.id).unwrap().unwrap(), retained);
+            assert_eq!(store.read_events(0, 1000, None).unwrap(), before_events);
+        }
+        wire["target"] = json!("a999");
+        assert_eq!(
+            router.submit(&wire, &principal).await.unwrap_err().code,
+            "not_allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_mutation_shutdown_returns_first_retained_drain_reply() {
+        let router = router();
+        let id = ulid::Ulid::new().to_string().to_ascii_lowercase();
+        let request = json!({"id":id, "mode":"drain"});
+        let first = router.shutdown(&request, &Principal::Owner).await.unwrap();
+        assert_eq!(
+            first,
+            json!({"state":"applied", "mode":"drain", "blockers":[]})
+        );
+        {
+            let mut store = router.inner.store.lock().await;
+            admit(&mut store);
+        }
+        assert!(!router.status_blockers().await.unwrap().is_empty());
+        router.inner.shutdown_ready.store(true, Ordering::SeqCst);
+        let retained = router.shutdown(&request, &Principal::Owner).await.unwrap();
+        assert_eq!(retained, first);
+        assert_eq!(router.inner.mode.load(Ordering::SeqCst), MODE_DRAIN);
+        assert!(!router.inner.shutdown_ready.load(Ordering::SeqCst));
+        assert_eq!(
+            router
+                .shutdown(&json!({"id":id, "mode":"force"}), &Principal::Owner)
+                .await
+                .unwrap_err()
+                .code,
+            "id_conflict"
+        );
+        assert_eq!(router.inner.mode.load(Ordering::SeqCst), MODE_DRAIN);
+    }
+
+    #[tokio::test]
+    async fn typed_mutation_bad_retained_shutdown_receipt_does_not_withdraw_admission() {
+        let router = router();
+        let id = ulid::Ulid::new().to_string();
+        router
+            .inner
+            .store
+            .lock()
+            .await
+            .record_write(
+                &id,
+                "owner",
+                "daemon.shutdown",
+                &json!({"mode":"drain"}),
+                &json!({"private-receipt-detail":"not a shutdown response"}),
+                now_ms(),
+            )
+            .unwrap();
+        let error = router
+            .shutdown(&json!({"id":id, "mode":"drain"}), &Principal::Owner)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "internal");
+        assert_eq!(error.message, "retained shutdown result is invalid");
+        assert!(
+            !serde_json::to_string(&error)
+                .unwrap()
+                .contains("private-receipt-detail")
+        );
+        assert_eq!(router.inner.mode.load(Ordering::SeqCst), MODE_DRAIN);
+        assert!(!router.inner.shutdown_ready.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn typed_mutation_grammar_keeps_owner_first_and_downstream_validation() {
+        let router = router();
+        let principal = Principal::Agent {
+            id: "a1".to_owned(),
+            generation: 1,
+        };
+        assert_eq!(
+            router
+                .shutdown(&Value::Null, &principal)
+                .await
+                .unwrap_err()
+                .code,
+            "not_allowed"
+        );
+        for method in ["command.submit", "daemon.shutdown"] {
+            let payload = if method == "command.submit" {
+                json!({"id":ulid::Ulid::new().to_string(), "verb":"unknown", "extra":0})
+            } else {
+                json!({"id":ulid::Ulid::new().to_string(), "mode":"force", "extra":0})
+            };
+            assert_eq!(router.handle(method, json!({
+                "_auth":{"kind":"owner", "credential":"owner-credential"}, "_payload":payload
+            })).await.unwrap_err().code, "invalid");
+        }
+        // Grammar does not preempt the managed-principal policy with an args check.
+        assert_eq!(
+            router
+                .submit(
+                    &json!({"id":"literal-id", "verb":"launch", "args":null}),
+                    &principal
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "not_allowed"
+        );
+        // The unchanged Store boundary rejects supplied null args rather than defaulting them.
+        let error = router
+            .submit(
+                &json!({"id":ulid::Ulid::new().to_string(), "verb":"unknown", "args":null}),
+                &Principal::Owner,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "invalid");
+        assert_eq!(error.message, "command args must be a JSON object");
+        assert_eq!(
+            router
+                .submit(
+                    &json!({"id":ulid::Ulid::new().to_string(), "verb":"unknown"}),
+                    &Principal::Owner
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "unsupported"
+        );
     }
 
     #[tokio::test]
