@@ -1048,6 +1048,9 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 eliot_daemon::client_call_typed(&data_dir, "events.read", &params)
                     .await
                     .map_err(|error| Failure::from_core(error, false))?;
+            response
+                .validate(params.after)
+                .map_err(|error| Failure::from_core(error, false))?;
             let result = serde_json::to_value(response).map_err(|_| {
                 Failure::new(1, "unavailable: cannot render typed events.read response")
             })?;
@@ -1399,6 +1402,9 @@ async fn watch(data_dir: &Path, agent: Option<&str>, json_output: bool) -> Resul
                 return Ok(0);
             }
         };
+        response
+            .validate(params.after)
+            .map_err(|error| Failure::from_core(error, false))?;
         for event in &response.events {
             let value = serde_json::to_value(event).map_err(|_| {
                 Failure::new(1, "unavailable: cannot render typed events.subscribe event")
@@ -1406,7 +1412,7 @@ async fn watch(data_dir: &Path, agent: Option<&str>, json_output: bool) -> Resul
             print_value(&value, json_output);
         }
         // The server's scan cursor includes filtered-out records as well.
-        after = response.next.max(after);
+        after = response.next;
     }
 }
 

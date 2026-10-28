@@ -318,6 +318,12 @@ EventsFilter {
 The shared Rust DTO surface for these two methods is
 `core::api::{EventsFilter,EventsReadRequest,EventsSubscribeRequest,EventsReadResponse,EventsSubscribeResponse}`.
 
+Before printing events or advancing a cursor, validate each response page against the
+effective request cursor: `0 <= after <= next <= high_water`. Event `seq` values must be
+strictly increasing, greater than `after`, and no greater than `next`. A malformed page
+returns a constant `unknown` error. Do not clamp the response, default a bad cursor,
+replay from another cursor, or skip forward.
+
 `after` defaults to 0 only when omitted. If supplied, it must be a nonnegative `i64`;
 `null`, negative, fractional, string, boolean and overflowing values are `invalid`.
 `limit` defaults to 100 and must be an integer from 1 through 1,000. For both methods,

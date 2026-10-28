@@ -95,6 +95,12 @@ pub struct EventsReadResponse {
     pub truncated: bool,
 }
 
+impl EventsReadResponse {
+    pub fn validate(&self, after: i64) -> Result<()> {
+        validate_event_response(after, self.next, self.high_water, &self.events)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EventsSubscribeResponse {
     pub events: Vec<Event>,
@@ -102,6 +108,26 @@ pub struct EventsSubscribeResponse {
     pub high_water: i64,
     pub truncated: bool,
     pub lagged: bool,
+}
+
+impl EventsSubscribeResponse {
+    pub fn validate(&self, after: i64) -> Result<()> {
+        validate_event_response(after, self.next, self.high_water, &self.events)
+    }
+}
+
+fn validate_event_response(after: i64, next: i64, high_water: i64, events: &[Event]) -> Result<()> {
+    if after < 0 || next < after || high_water < next {
+        return Err(Error::new("unknown", "event response is invalid"));
+    }
+    let mut previous = after;
+    for event in events {
+        if event.seq <= previous || event.seq > next {
+            return Err(Error::new("unknown", "event response is invalid"));
+        }
+        previous = event.seq;
+    }
+    Ok(())
 }
 
 fn default_limit() -> usize {
@@ -406,6 +432,98 @@ mod tests {
             let mut missing = subscribe.clone();
             missing.as_object_mut().unwrap().remove(field);
             assert!(serde_json::from_value::<EventsSubscribeResponse>(missing).is_err());
+        }
+    }
+
+    fn response_validation(
+        after: i64,
+        next: i64,
+        high_water: i64,
+        sequences: &[i64],
+    ) -> [Result<()>; 2] {
+        let events: Vec<_> = sequences
+            .iter()
+            .map(|&seq| Event {
+                seq,
+                ts: 0,
+                kind: "fixture".to_owned(),
+                agent: None,
+                generation: None,
+                source: "fixture".to_owned(),
+                native_id: None,
+                data: json!({"private_fixture":"must not enter an error"}),
+            })
+            .collect();
+        [
+            EventsReadResponse {
+                events: events.clone(),
+                next,
+                high_water,
+                truncated: next < high_water,
+            }
+            .validate(after),
+            EventsSubscribeResponse {
+                events,
+                next,
+                high_water,
+                truncated: next < high_water,
+                lagged: true,
+            }
+            .validate(after),
+        ]
+    }
+
+    #[test]
+    fn successful_response_bounds_allow_empty_and_filtered_pages() {
+        for (after, next, high_water, sequences) in [
+            (0, 0, 0, vec![]),
+            (5, 5, 5, vec![]),
+            (5, 9, 12, vec![]),
+            (0, 5, 5, vec![1, 4, 5]),
+            (2, 9, 12, vec![3, 7]),
+            (i64::MAX - 1, i64::MAX, i64::MAX, vec![i64::MAX]),
+        ] {
+            for result in response_validation(after, next, high_water, &sequences) {
+                result.unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_response_cursors_are_unknown_without_clamping() {
+        for (after, next, high_water) in [
+            (-1, 0, 0),
+            (0, -1, 0),
+            (0, 0, -1),
+            (5, 4, 9),
+            (5, 6, 4),
+            (0, 6, 5),
+        ] {
+            for result in response_validation(after, next, high_water, &[]) {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, "unknown");
+                assert_eq!(error.message, "event response is invalid");
+                assert!(error.diagnostics.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_response_event_order_never_exposes_payloads() {
+        for sequences in [
+            vec![-1],
+            vec![2],
+            vec![10],
+            vec![3, 3],
+            vec![7, 3],
+            vec![3, 10],
+        ] {
+            for result in response_validation(2, 9, 12, &sequences) {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, "unknown");
+                assert_eq!(error.message, "event response is invalid");
+                assert!(error.diagnostics.is_empty());
+            }
         }
     }
 }
