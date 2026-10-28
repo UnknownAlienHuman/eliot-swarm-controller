@@ -3,17 +3,16 @@
 //! Durable L1 state for Agents, commands, native events, turns, and source acks.
 
 mod canonical;
-pub mod error;
 
-pub use crate::error::{Error, Result};
 use eliot_core::{
     self as core, Agent, AgentEdit, AgentState, BatchAck, Command, CommandState, Effect, Event,
     FileChangeHint, FrozenSetupFile, GitBaseline, GitHintPage, GitSnapshot, NativeEvent,
     PendingRequest, ProcessIdentity, ProcessRecord, ProcessSnapshot, ProcessState, SourceBatch,
     SourceGap, SourceGapAck, SubmitCommand, Turn, TurnState, WorkspaceCancelOutcome,
     WorkspaceCreationOutcome, WorkspacePhase, WorkspacePreparation, WorkspacePreparationInput,
-    WorkspaceRemovalOutcome, WorkspaceSetupArg, WorkspaceSetupOutcome,
+    WorkspaceRemovalOutcome, WorkspaceSetupArg, WorkspaceSetupOutcome, parse_agent_id,
 };
+pub use eliot_core::{Error, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -7529,22 +7528,6 @@ fn parse_enum<T: DeserializeOwned>(value: &str, what: &str) -> Result<T> {
 
 fn format_agent_id(id: i64) -> String {
     format!("a{id}")
-}
-
-fn parse_agent_id(id: &str) -> Result<i64> {
-    let digits = id
-        .strip_prefix('a')
-        .ok_or_else(|| Error::new("invalid", "Agent id must use the a<positive integer> form"))?;
-    let number = digits
-        .parse::<i64>()
-        .map_err(|_| Error::new("invalid", "Agent id is not a signed 64-bit integer"))?;
-    if number <= 0 || format_agent_id(number) != id {
-        return Err(Error::new(
-            "invalid",
-            "Agent id must be canonical and positive",
-        ));
-    }
-    Ok(number)
 }
 
 fn validate_ulid(id: &str) -> Result<Ulid> {

@@ -1,6 +1,6 @@
 //! Observe-only command lifecycle. Native history stays private to the reader.
 use super::*;
-use eliot_core::{ObserverBinding, SecretPolicy};
+use eliot_core::SecretPolicy;
 
 const SOURCE: &str = "observe";
 
@@ -631,28 +631,6 @@ pub(super) fn settle_failure(
 }
 
 impl Store {
-    pub fn observer_binding(&self, agent: &str, generation: i64) -> Result<ObserverBinding> {
-        let id = parse_agent_id(agent)?;
-        let agent = load_agent_by_num(&self.connection, id)?
-            .ok_or_else(|| Error::new("not_found", "observer was not found"))?;
-        require_observer(&agent, generation)?;
-        Ok(ObserverBinding {
-            agent: agent.id,
-            generation,
-            harness: agent.harness,
-            native_scope: agent
-                .native_scope
-                .ok_or_else(|| Error::new("source_integrity", "observer scope is missing"))?,
-            native_ref: agent
-                .native_ref
-                .ok_or_else(|| Error::new("source_integrity", "observer reference is missing"))?,
-            profile_snapshot: agent.profile_snapshot,
-            source: SOURCE.to_owned(),
-            checkpoint: load_source_state(&self.connection, id, generation, SOURCE)?
-                .and_then(|source| source.cursor),
-        })
-    }
-
     pub fn observer_active(&self, agent: &str, generation: i64) -> Result<bool> {
         let id = parse_agent_id(agent)?;
         let current = load_agent_by_num(&self.connection, id)?

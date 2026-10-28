@@ -13,14 +13,13 @@ use crate::{
         },
     },
 };
-use eliot_core::{Error, Result, SecretPolicy};
+use eliot_core::{Error, Result, SecretPolicy, canonical_json_sha256};
 use eliot_plugin::{
     DiscoverCoverage, DiscoverPage, DiscoverParams, DiscoverSubject, MAX_DISCOVER_PAGE_BYTES,
     MAX_DISCOVER_PAGE_ENTRIES, MAX_EVENT_BYTES,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
+use serde_json::{Value, json};
 use std::{
     collections::HashSet,
     ffi::OsString,
@@ -672,29 +671,11 @@ fn request_binding(profile: &Value, target_environment: &Value, limit: usize) ->
 }
 
 pub(crate) fn fingerprint(context: Value) -> Result<String> {
-    let bytes = serde_json::to_vec(&canonical(context)).map_err(|_| invalid_page())?;
-    Ok(Sha256::digest(bytes)
+    Ok(canonical_json_sha256(&context)
+        .map_err(|_| invalid_page())?
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())
-}
-
-fn canonical(value: Value) -> Value {
-    match value {
-        Value::Object(mut object) => {
-            let mut keys: Vec<_> = object.keys().cloned().collect();
-            keys.sort();
-            let mut sorted = Map::new();
-            for key in keys {
-                if let Some(value) = object.remove(&key) {
-                    sorted.insert(key, canonical(value));
-                }
-            }
-            Value::Object(sorted)
-        }
-        Value::Array(values) => Value::Array(values.into_iter().map(canonical).collect()),
-        value => value,
-    }
 }
 
 fn decode_cursor(raw: Option<&str>, binding: &str, scope: Option<&str>) -> Result<Option<Cursor>> {
@@ -843,13 +824,30 @@ fn too_large() -> Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        CURSOR_PREFIX, Cursor, NativeLaunch, StoreContext, decode_cursor, native_scope,
-        pinned_launch, request_binding, select_store, sqlite_environment, store_scope,
-        validate_pin, validate_store,
+        CURSOR_PREFIX, Cursor, NativeLaunch, StoreContext, decode_cursor, fingerprint,
+        native_scope, pinned_launch, request_binding, select_store, sqlite_environment,
+        store_scope, validate_pin, validate_store,
     };
     use crate::native::types::NativeDiscoveryConfigReadResponse;
     use serde_json::json;
     use std::{ffi::OsString, path::Path};
+
+    #[test]
+    fn discovery_fingerprint_retains_compact_json_lowercase_hex() {
+        // Independently hashed literal JSON, not a second canonicalizer. This
+        // is a fingerprint representation fixture; query/domain builders stay
+        // with their existing callers and cursor/environment binding tests.
+        assert_eq!(
+            fingerprint(json!({
+                "target_environment": {"DUMMY": "é", "CODEX_HOME": r"C:\fixture\home"},
+                "sourceKinds": ["cli", "exec"],
+                "profile": {"model": "gpt-6-luna", "effort": "medium"},
+                "method": "thread/list",
+            }))
+            .unwrap(),
+            "40e348a754ff47a2fae7f2daf7339e8c27addab028eb7031c8b636da02e5b88c"
+        );
+    }
 
     #[test]
     fn discovery_cursor_rejects_changed_target_environment_before_io() {

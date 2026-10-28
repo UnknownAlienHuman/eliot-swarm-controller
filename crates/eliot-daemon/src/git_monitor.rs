@@ -4,7 +4,7 @@
 //! Reads require leaf custody. Workspace writes are only prepared here; their
 //! manager owns ordinary scoped execution and cancellation serialization.
 
-use crate::platform::OwnedChild;
+use crate::platform::{OwnedChild, is_reparse_point};
 use eliot_core::{Error, GitBaseline, GitCommit, GitPathStatus, GitSnapshot, Result};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -1131,14 +1131,7 @@ pub(crate) fn reject_links(path: &Path) -> Result<()> {
     for prefix in path.ancestors() {
         match fs::symlink_metadata(prefix) {
             Ok(metadata) => {
-                #[cfg(windows)]
-                let reparse = {
-                    use std::os::windows::fs::MetadataExt;
-                    metadata.file_attributes() & 0x400 != 0
-                };
-                #[cfg(not(windows))]
-                let reparse = false;
-                if metadata.file_type().is_symlink() || reparse {
+                if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
                     return Err(unavailable(
                         "workspace path contains a symlink or reparse point",
                     ));

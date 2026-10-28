@@ -528,11 +528,13 @@ fn source_location(source: &str, offset: Option<usize>) -> String {
     format!("config.toml:{line}:{column}")
 }
 fn map_toml_error(source: &str, error: toml::de::Error) -> core::Error {
-    let message = error.message();
     let span = error.span();
     let location = source_location(source, span.as_ref().map(|range| range.start));
-    if let Some(field) = unknown_field_name(message) {
-        if is_unsupported_field(field) {
+    if let Some(field) = span
+        .as_ref()
+        .and_then(|span| decoded_key_at_span(source, span))
+    {
+        if is_unsupported_field(&field) {
             return core::Error::new(
                 "unsupported",
                 format!("{location}: {field}: unsupported configuration field"),
@@ -552,16 +554,43 @@ fn map_toml_error(source: &str, error: toml::de::Error) -> core::Error {
         format!("{location}: {key}: invalid TOML syntax or value"),
     )
 }
-fn unknown_field_name(message: &str) -> Option<&str> {
-    let tail = message.split_once("unknown field")?.1.trim_start();
-    let quote = tail.chars().next()?;
-    if quote != '\'' && quote != '"' && quote != char::from(96u8) {
-        return None;
+fn decoded_key_at_span(source: &str, span: &std::ops::Range<usize>) -> Option<String> {
+    let parsed = toml::de::DeTable::parse(source).ok()?;
+    decoded_key_at_span_in_table(parsed.get_ref(), span)
+}
+fn decoded_key_at_span_in_table(
+    table: &toml::de::DeTable<'_>,
+    span: &std::ops::Range<usize>,
+) -> Option<String> {
+    for (key, value) in table.iter() {
+        let key_span = key.span();
+        if key_span.start == span.start && key_span.end == span.end {
+            let decoded = key.get_ref().as_ref();
+            return safe_config_key(decoded).then(|| decoded.to_owned());
+        }
+        if let Some(decoded) = decoded_key_at_span_in_value(value.get_ref(), span) {
+            return Some(decoded);
+        }
     }
-    let quoted = tail.get(quote.len_utf8()..)?;
-    let end = quoted.find(quote)?;
-    let field = &quoted[..end];
-    safe_config_key(field).then_some(field)
+    None
+}
+fn decoded_key_at_span_in_value(
+    value: &toml::de::DeValue<'_>,
+    span: &std::ops::Range<usize>,
+) -> Option<String> {
+    if let Some(table) = value.as_table()
+        && let Some(decoded) = decoded_key_at_span_in_table(table, span)
+    {
+        return Some(decoded);
+    }
+    if let Some(array) = value.as_array() {
+        for item in array.as_ref() {
+            if let Some(decoded) = decoded_key_at_span_in_value(item.get_ref(), span) {
+                return Some(decoded);
+            }
+        }
+    }
+    None
 }
 fn key_at_offset(source: &str, offset: usize) -> Option<&str> {
     let prefix = source.get(..offset.min(source.len()))?;
@@ -632,4 +661,69 @@ fn is_unsupported_field(field: &str) -> bool {
     FIELDS
         .iter()
         .any(|candidate| field.eq_ignore_ascii_case(candidate))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_error(source: &str) -> core::Error {
+        let error = match toml::from_str::<FileConfig>(source) {
+            Ok(_) => panic!("test configuration unexpectedly deserialized"),
+            Err(error) => error,
+        };
+        map_toml_error(source, error)
+    }
+
+    #[test]
+    fn deferred_fields_use_decoded_keys_at_the_error_span() {
+        let sources = [
+            "[profiles.codex-luna]\nharness = 'codex'\n\"proxy\" = 'private-value'\n",
+            r#"[profiles.codex-luna]
+harness = 'codex'
+"\u0070roxy" = 'private-value'
+"#,
+            "profiles.codex-luna.harness = 'codex'\nprofiles.codex-luna.proxy = 'private-value'\n",
+            "[profiles.codex-luna]\nharness = 'codex'\n[[profiles.codex-luna.setup]]\nprogram = 'C:/tools/pwsh.exe'\nargs = []\ntimeout_ms = 120000\nextends = 'private-value'\n",
+        ];
+
+        for source in sources {
+            let error = config_error(source);
+            assert_eq!(error.code, "unsupported");
+            assert!(error.message.contains("unsupported configuration field"));
+            assert!(!error.message.contains("private-value"));
+        }
+    }
+
+    #[test]
+    fn ordinary_unknown_fields_remain_profile_errors() {
+        let error = config_error(
+            "[profiles.codex-luna]\nharness = 'codex'\nfuture_option = 'private-value'\n",
+        );
+
+        assert_eq!(error.code, "profile_error");
+        assert!(
+            error
+                .message
+                .contains("future_option: unknown configuration field")
+        );
+        assert!(!error.message.contains("private-value"));
+    }
+
+    #[test]
+    fn missing_fields_and_values_containing_unknown_field_text_remain_profile_errors() {
+        let missing = config_error("[profiles.codex-luna]\nmodel = 'gpt-6-luna'\n");
+        assert_eq!(missing.code, "profile_error");
+
+        let wrong_value = config_error(
+            "[profiles.codex-luna]\nharness = 'codex'\npass_env = 'unknown field `proxy`'\n",
+        );
+        assert_eq!(wrong_value.code, "profile_error");
+        assert!(!wrong_value.message.contains("unknown field `proxy`"));
+        assert!(
+            !wrong_value
+                .message
+                .contains("unsupported configuration field")
+        );
+    }
 }

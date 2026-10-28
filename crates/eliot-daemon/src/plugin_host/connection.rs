@@ -1,4 +1,7 @@
 use eliot_core::{Error, Result};
+use eliot_plugin::protocol::{
+    DecodeErrorKind, PrivateIncoming as Incoming, decode_private_frame, valid_private_id,
+};
 use eliot_plugin::{MAX_FRAME_BYTES, RpcError, RpcRequest, RpcResponse};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
@@ -533,45 +536,23 @@ async fn fail_connection(inner: &ClientInner, error: Error) {
     }
 }
 
-enum Incoming {
-    Request(RpcRequest),
-    Response(RpcResponse),
-}
-
 fn decode_frame(line: &str) -> Result<Incoming> {
-    let value: Value = serde_json::from_str(line)
-        .map_err(|_| Error::new("invalid", "plugin sent invalid JSON"))?;
-    let Some(object) = value.as_object() else {
-        return Err(Error::new(
-            "invalid",
-            "plugin JSON-RPC frame must be an object",
-        ));
-    };
-    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-        return Err(Error::new("invalid", "plugin JSON-RPC version must be 2.0"));
-    }
-
-    if object.contains_key("method") {
-        let request: RpcRequest = serde_json::from_value(value)
-            .map_err(|_| Error::new("invalid", "plugin request is malformed"))?;
-        if !valid_id(&request.id) || !request.params.is_object() {
-            return Err(Error::new(
-                "invalid",
-                "plugin request requires an id and object params",
-            ));
-        }
-        Ok(Incoming::Request(request))
-    } else {
-        let response: RpcResponse = serde_json::from_value(value)
-            .map_err(|_| Error::new("invalid", "plugin response is malformed"))?;
-        if !valid_id(&response.id) || response.error.is_some() == response.result.is_some() {
-            return Err(Error::new(
-                "invalid",
-                "plugin response requires exactly one result or error",
-            ));
-        }
-        Ok(Incoming::Response(response))
-    }
+    decode_private_frame(line).map_err(|kind| {
+        let message = match kind {
+            DecodeErrorKind::InvalidJson => "plugin sent invalid JSON",
+            DecodeErrorKind::NotObject => "plugin JSON-RPC frame must be an object",
+            DecodeErrorKind::InvalidVersion => "plugin JSON-RPC version must be 2.0",
+            DecodeErrorKind::InvalidRequest => "plugin request is malformed",
+            DecodeErrorKind::InvalidRequestParams => {
+                "plugin request requires an id and object params"
+            }
+            DecodeErrorKind::InvalidResponse => "plugin response is malformed",
+            DecodeErrorKind::InvalidResponseShape => {
+                "plugin response requires exactly one result or error"
+            }
+        };
+        Error::new("invalid", message)
+    })
 }
 
 fn encode_frame<T: Serialize>(message: &T) -> Result<String> {
@@ -587,14 +568,10 @@ fn encode_frame<T: Serialize>(message: &T) -> Result<String> {
 }
 
 fn id_key(id: &Value) -> Result<String> {
-    if !valid_id(id) {
+    if !valid_private_id(id) {
         return Err(Error::new("invalid", "JSON-RPC id must be a scalar"));
     }
     serde_json::to_string(id).map_err(|_| Error::new("invalid", "JSON-RPC id could not be encoded"))
-}
-
-fn valid_id(id: &Value) -> bool {
-    id.is_null() || id.is_string() || id.is_number()
 }
 
 #[cfg(test)]

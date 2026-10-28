@@ -65,6 +65,54 @@ pub struct RpcError {
     pub data: Option<Value>,
 }
 
+/// A decoded frame on Eliot's private host/plugin connection.
+pub enum PrivateIncoming {
+    Request(RpcRequest),
+    Response(RpcResponse),
+}
+
+/// Grammar failures, mapped to errors by each end of the private connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodeErrorKind {
+    InvalidJson,
+    NotObject,
+    InvalidVersion,
+    InvalidRequest,
+    InvalidRequestParams,
+    InvalidResponse,
+    InvalidResponseShape,
+}
+
+/// Decode the private protocol grammar, without transport or error policy.
+pub fn decode_private_frame(line: &str) -> Result<PrivateIncoming, DecodeErrorKind> {
+    let value: Value = serde_json::from_str(line).map_err(|_| DecodeErrorKind::InvalidJson)?;
+    let object = value.as_object().ok_or(DecodeErrorKind::NotObject)?;
+    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return Err(DecodeErrorKind::InvalidVersion);
+    }
+
+    if object.contains_key("method") {
+        let request: RpcRequest =
+            serde_json::from_value(value).map_err(|_| DecodeErrorKind::InvalidRequest)?;
+        if !valid_private_id(&request.id) || !request.params.is_object() {
+            return Err(DecodeErrorKind::InvalidRequestParams);
+        }
+        Ok(PrivateIncoming::Request(request))
+    } else {
+        let response: RpcResponse =
+            serde_json::from_value(value).map_err(|_| DecodeErrorKind::InvalidResponse)?;
+        if !valid_private_id(&response.id) || response.error.is_some() == response.result.is_some()
+        {
+            return Err(DecodeErrorKind::InvalidResponseShape);
+        }
+        Ok(PrivateIncoming::Response(response))
+    }
+}
+
+pub fn valid_private_id(id: &Value) -> bool {
+    id.is_null() || id.is_string() || id.is_number()
+}
+
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct PluginManifest {
     pub name: String,
@@ -237,4 +285,125 @@ pub struct ObserverDetachParams {
     pub command_id: String,
     pub native_scope: String,
     pub native_ref: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn private_requests_preserve_scalar_ids_and_object_params() {
+        for id in ["null", "\"\"", "\"request\"", "1", "1.5", "1e3"] {
+            for params in ["", ",\"params\":{\"value\":1}"] {
+                let line = format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"\",\"extra\":true{params}}}"
+                );
+                let PrivateIncoming::Request(request) =
+                    decode_private_frame(&line).expect("request")
+                else {
+                    panic!("request decoded as response");
+                };
+                assert_eq!(request.id, serde_json::from_str::<Value>(id).unwrap());
+                assert_eq!(request.method, "");
+                assert_eq!(
+                    request.params,
+                    if params.is_empty() {
+                        json!({})
+                    } else {
+                        json!({"value": 1})
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn private_responses_require_one_populated_option_branch() {
+        for id in ["null", "\"response\"", "1.5", "1e3"] {
+            for branch in [
+                "\"result\":{}",
+                "\"result\":false,\"error\":null",
+                "\"result\":0",
+                "\"result\":\"\"",
+                "\"error\":{\"code\":-32000,\"message\":\"failure\"}",
+                "\"result\":null,\"error\":{\"code\":-32000,\"message\":\"failure\"}",
+            ] {
+                let line = format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},{branch},\"extra\":true}}");
+                let PrivateIncoming::Response(response) =
+                    decode_private_frame(&line).expect("response")
+                else {
+                    panic!("response decoded as request");
+                };
+                assert_eq!(response.id, serde_json::from_str::<Value>(id).unwrap());
+                assert_ne!(response.result.is_some(), response.error.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn private_decoder_distinguishes_existing_grammar_failures() {
+        use DecodeErrorKind::*;
+
+        for (line, expected) in [
+            ("{", InvalidJson),
+            ("null", NotObject),
+            ("[]", NotObject),
+            (r#"{"id":1,"method":"call"}"#, InvalidVersion),
+            (r#"{"jsonrpc":2,"id":1,"method":"call"}"#, InvalidVersion),
+            (
+                r#"{"jsonrpc":"1.0","id":1,"method":"call"}"#,
+                InvalidVersion,
+            ),
+            (r#"{"jsonrpc":"2.0","id":1,"method":null}"#, InvalidRequest),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"method":"call","params":null}"#,
+                InvalidRequestParams,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"method":"call","params":[]}"#,
+                InvalidRequestParams,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":true,"method":"call"}"#,
+                InvalidRequestParams,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":[],"method":"call"}"#,
+                InvalidRequestParams,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":{},"method":"call"}"#,
+                InvalidRequestParams,
+            ),
+            (r#"{"jsonrpc":"2.0","id":1,"error":true}"#, InvalidResponse),
+            (r#"{"jsonrpc":"2.0","id":1}"#, InvalidResponseShape),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"result":null}"#,
+                InvalidResponseShape,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"result":null,"error":null}"#,
+                InvalidResponseShape,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"result":{},"error":{"code":-1,"message":"failure"}}"#,
+                InvalidResponseShape,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":true,"result":{}}"#,
+                InvalidResponseShape,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":[],"result":{}}"#,
+                InvalidResponseShape,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":{},"result":{}}"#,
+                InvalidResponseShape,
+            ),
+        ] {
+            assert_eq!(decode_private_frame(line).err(), Some(expected), "{line}");
+        }
+    }
 }

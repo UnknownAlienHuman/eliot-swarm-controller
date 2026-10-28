@@ -1,4 +1,7 @@
-use crate::protocol::{MAX_EVENT_BYTES, MAX_FRAME_BYTES, RpcError, RpcRequest, RpcResponse};
+use crate::protocol::{
+    DecodeErrorKind, MAX_EVENT_BYTES, MAX_FRAME_BYTES, PrivateIncoming as Incoming, RpcError,
+    RpcRequest, RpcResponse, decode_private_frame,
+};
 use eliot_core::{
     BatchAck, Error, MAX_STDERR_DIAGNOSTIC_BYTES, Result, SourceBatch, bound_stderr_diagnostics,
 };
@@ -65,11 +68,6 @@ pub struct CommitSink {
     client: PeerClient,
     credential: String,
     unknown: bool,
-}
-
-enum Incoming {
-    Request(RpcRequest),
-    Response(RpcResponse),
 }
 
 impl Peer {
@@ -419,46 +417,23 @@ impl Drop for PendingGuard {
 }
 
 fn decode_frame(line: &str) -> std::result::Result<Incoming, RpcError> {
-    let value: Value = serde_json::from_str(line)
-        .map_err(|_| protocol_error("invalid", -32700, "invalid JSON-RPC frame"))?;
-    let Some(object) = value.as_object() else {
-        return Err(protocol_error(
-            "invalid",
-            -32600,
-            "JSON-RPC frame must be an object",
-        ));
-    };
-    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-        return Err(protocol_error(
-            "invalid",
-            -32600,
-            "JSON-RPC version must be 2.0",
-        ));
-    }
-
-    if object.contains_key("method") {
-        let request: RpcRequest = serde_json::from_value(value)
-            .map_err(|_| protocol_error("invalid", -32600, "invalid JSON-RPC request"))?;
-        if !valid_id(&request.id) || !request.params.is_object() {
-            return Err(protocol_error(
-                "invalid",
-                -32602,
-                "JSON-RPC request requires an id and object params",
-            ));
-        }
-        return Ok(Incoming::Request(request));
-    }
-
-    let response: RpcResponse = serde_json::from_value(value)
-        .map_err(|_| protocol_error("invalid", -32600, "invalid JSON-RPC response"))?;
-    if !valid_id(&response.id) || response.error.is_some() == response.result.is_some() {
-        return Err(protocol_error(
-            "invalid",
-            -32600,
-            "JSON-RPC response must contain exactly one result or error",
-        ));
-    }
-    Ok(Incoming::Response(response))
+    decode_private_frame(line).map_err(|kind| {
+        let (code, message) = match kind {
+            DecodeErrorKind::InvalidJson => (-32700, "invalid JSON-RPC frame"),
+            DecodeErrorKind::NotObject => (-32600, "JSON-RPC frame must be an object"),
+            DecodeErrorKind::InvalidVersion => (-32600, "JSON-RPC version must be 2.0"),
+            DecodeErrorKind::InvalidRequest => (-32600, "invalid JSON-RPC request"),
+            DecodeErrorKind::InvalidRequestParams => {
+                (-32602, "JSON-RPC request requires an id and object params")
+            }
+            DecodeErrorKind::InvalidResponse => (-32600, "invalid JSON-RPC response"),
+            DecodeErrorKind::InvalidResponseShape => (
+                -32600,
+                "JSON-RPC response must contain exactly one result or error",
+            ),
+        };
+        protocol_error("invalid", code, message)
+    })
 }
 
 fn encode_frame<T: Serialize>(message: &T) -> Result<String> {
@@ -569,14 +544,44 @@ fn unknown_batch_error() -> Error {
     )
 }
 
-fn valid_id(id: &Value) -> bool {
-    id.is_null() || id.is_string() || id.is_number()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use eliot_core::{SecretPolicy, StderrSnapshot, StderrSource, classify_dispatched_error};
+
+    #[test]
+    fn private_decoder_preserves_peer_error_codes_and_messages() {
+        for (line, code, message) in [
+            ("{", -32700, "invalid JSON-RPC frame"),
+            ("null", -32600, "JSON-RPC frame must be an object"),
+            ("{}", -32600, "JSON-RPC version must be 2.0"),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"method":null}"#,
+                -32600,
+                "invalid JSON-RPC request",
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"method":"call","params":null}"#,
+                -32602,
+                "JSON-RPC request requires an id and object params",
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"error":true}"#,
+                -32600,
+                "invalid JSON-RPC response",
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"result":null}"#,
+                -32600,
+                "JSON-RPC response must contain exactly one result or error",
+            ),
+        ] {
+            let error = decode_frame(line).err().expect("invalid private frame");
+            assert_eq!(error.code, code);
+            assert_eq!(error.message, message);
+            assert_eq!(error.data, Some(json!({"code": "invalid"})));
+        }
+    }
 
     fn snapshot(text: &str) -> StderrSnapshot {
         StderrSnapshot {

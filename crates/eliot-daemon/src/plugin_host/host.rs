@@ -3,6 +3,7 @@ mod discovery;
 mod observation;
 mod reader;
 use crate::bus::Bus;
+use crate::common::{now_ms, secure_eq, valid_environment_name};
 use crate::monitor::Monitoring;
 use crate::platform::OwnedChild;
 use eliot_core::{
@@ -16,7 +17,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex, Weak, atomic::AtomicBool},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 use tokio::{
     process::Command as ProcessCommand,
@@ -1950,12 +1951,6 @@ fn insert_environment(environment: &mut Map<String, Value>, name: &str, value: S
     environment.insert(name.to_owned(), Value::String(value));
 }
 
-fn valid_environment_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    matches!(chars.next(), Some('_' | 'A'..='Z' | 'a'..='z'))
-        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
-}
-
 fn deadline() -> Instant {
     Instant::now() + RPC_DEADLINE
 }
@@ -2166,26 +2161,6 @@ pub(crate) fn forget_revoked_agent_token(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(&token);
-}
-
-fn secure_eq(left: &str, right: &str) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.bytes()
-        .zip(right.bytes())
-        .fold(0_u8, |difference, (left, right)| {
-            difference | (left ^ right)
-        })
-        == 0
-}
-
-pub(crate) fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(i64::MAX as u128) as i64
 }
 
 #[cfg(test)]

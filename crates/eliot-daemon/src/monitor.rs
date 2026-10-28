@@ -1,6 +1,7 @@
 //! OS facts and ephemeral counters, independent of the native lifecycle source.
 use crate::{
     bus::Bus,
+    common::now_ms,
     fs_invalidation::WorkspaceInvalidation,
     git_monitor::{GitProbe, normalize_hint},
     platform::CustodyObserver,
@@ -19,7 +20,7 @@ use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 use tokio::{
     sync::{Mutex as AsyncMutex, watch},
@@ -1691,14 +1692,6 @@ pub(crate) fn workspace_owner(agent: &str, target_generation: i64) -> String {
 
 fn owner(agent: &str, generation: i64) -> String {
     format!("agent:{agent}#{generation}")
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(i64::MAX as u128) as i64
 }
 
 #[cfg(test)]
