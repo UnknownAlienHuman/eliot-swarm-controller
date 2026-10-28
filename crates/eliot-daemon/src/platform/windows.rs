@@ -9,14 +9,15 @@ use eliot_core::{
 use std::ffi::{OsStr, c_void};
 use std::fs;
 use std::os::windows::ffi::OsStrExt;
-use std::path::Path;
+use std::os::windows::io::FromRawHandle;
+use std::path::{Component, Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use windows_sys::Win32::Foundation::{
     CloseHandle, DuplicateHandle, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, FILETIME, HANDLE,
-    HLOCAL, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    HLOCAL, INVALID_HANDLE_VALUE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -30,8 +31,10 @@ use windows_sys::Win32::Security::{
     SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ALL_ACCESS, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_FIRST_PIPE_INSTANCE,
-    FILE_FLAG_OVERLAPPED, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, MOVEFILE_REPLACE_EXISTING,
+    MOVEFILE_WRITE_THROUGH, MoveFileExW,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
@@ -144,9 +147,156 @@ fn background_daemon_command_line(executable: &Path, data_dir: &Path) -> Result<
     Ok(command_line)
 }
 
+struct LocalSecurityDescriptor(*mut c_void);
+
+impl Drop for LocalSecurityDescriptor {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: this descriptor was allocated by the matching Windows API.
+            unsafe { LocalFree(self.0 as HLOCAL) };
+        }
+    }
+}
+
+fn private_security_descriptor(directory: bool) -> Result<LocalSecurityDescriptor> {
+    let user_sid = current_user_sid()?;
+    let sid = sid_to_string(&user_sid)?;
+    let sddl = if directory {
+        format!("O:{sid}D:P(A;OICI;FA;;;{sid})")
+    } else {
+        format!("O:{sid}D:P(A;;FA;;;{sid})")
+    };
+    let sddl_wide: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+    let mut descriptor = null_mut();
+    // SAFETY: sddl_wide is NUL-terminated and descriptor is writable storage.
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl_wide.as_ptr(),
+            1,
+            &mut descriptor,
+            null_mut(),
+        )
+    } == 0
+    {
+        return Err(io_error(
+            "build current-user owner and ACL",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(LocalSecurityDescriptor(descriptor))
+}
+
+fn create_private_directory(path: &Path) -> Result<bool> {
+    let descriptor = private_security_descriptor(true)?;
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: 0,
+    };
+    let path_wide = wide_path(path);
+    // SAFETY: path and security descriptor remain alive through the call.
+    if unsafe { CreateDirectoryW(path_wide.as_ptr(), &attributes) } != 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::AlreadyExists {
+        Ok(false)
+    } else {
+        Err(io_error("create private data directory", error))
+    }
+}
+
+pub(crate) fn create_private_file_new(path: &Path) -> std::io::Result<fs::File> {
+    let descriptor = private_security_descriptor(false)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: 0,
+    };
+    let path_wide = wide_path(path);
+    // SAFETY: path and security descriptor remain alive through the call. CREATE_NEW
+    // preserves existing-object validation and never opens or truncates an old file.
+    let handle = unsafe {
+        CreateFileW(
+            path_wide.as_ptr(),
+            FILE_ALL_ACCESS,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            &attributes,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: CreateFileW returned a uniquely owned handle for the new file.
+    Ok(unsafe { fs::File::from_raw_handle(handle) })
+}
+
+fn create_private_directories(path: &Path) -> Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if matches!(
+            component,
+            Component::Prefix(_) | Component::RootDir | Component::CurDir
+        ) {
+            continue;
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(Error::new(
+                        "unsafe_data_dir",
+                        "data directory component is not a real directory",
+                    ));
+                }
+                reject_reparse(&current)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let created = create_private_directory(&current)?;
+                let metadata = fs::symlink_metadata(&current)
+                    .map_err(|error| io_error("inspect created data directory", error))?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(Error::new(
+                        "unsafe_data_dir",
+                        "created data directory component is not a real directory",
+                    ));
+                }
+                reject_reparse(&current)?;
+                validate_new_or_raced_directory(&current, created)?;
+            }
+            Err(error) => return Err(io_error("inspect data directory component", error)),
+        }
+    }
+    Ok(())
+}
+
+fn validate_new_or_raced_directory(path: &Path, created: bool) -> Result<()> {
+    let context = if created {
+        "newly created"
+    } else {
+        "concurrently existing"
+    };
+    ensure_current_owner(path).map_err(|error| {
+        Error::new(
+            "unsafe_data_dir",
+            format!("{context} data directory failed owner validation: {error}"),
+        )
+    })?;
+    validate_current_user_acl(path, true).map_err(|error| {
+        Error::new(
+            "unsafe_data_dir",
+            format!("{context} data directory failed ACL validation: {error}"),
+        )
+    })
+}
+
 pub(crate) fn ensure_private_root(path: &Path) -> Result<()> {
     check_no_reparse_components(path)?;
-    fs::create_dir_all(path).map_err(|error| io_error("create data directory", error))?;
+    create_private_directories(path)?;
     check_no_reparse_components(path)?;
 
     let metadata =

@@ -70,11 +70,7 @@ impl DataDir {
     /// Acquire the single-daemon lock. The returned guard releases it on drop.
     pub fn acquire_daemon_lock(&self) -> Result<DaemonLock> {
         let path = self.path.join(DAEMON_LOCK_FILE);
-        let mut options = private_file_options();
-        options.create(true).read(true).write(true);
-        let file = options
-            .open(&path)
-            .map_err(|error| io_error("open daemon lock", error))?;
+        let file = open_or_create_daemon_lock(&path)?;
         ensure_private_file(&path)?;
 
         match file.try_lock() {
@@ -135,12 +131,11 @@ impl DataDir {
             let temporary = self
                 .path
                 .join(format!(".daemon.json.{}.tmp", ulid::Ulid::new()));
+            let mut temporary_created = false;
             let result = (|| {
-                let mut options = private_file_options();
-                options.write(true).create_new(true);
-                let mut file = options
-                    .open(&temporary)
+                let mut file = create_new_private_file(&temporary)
                     .map_err(|error| io_error("create daemon metadata", error))?;
+                temporary_created = true;
                 ensure_private_file(&temporary)?;
                 file.write_all(&bytes)
                     .map_err(|error| io_error("write daemon metadata", error))?;
@@ -153,7 +148,7 @@ impl DataDir {
                 Ok(info.clone())
             })();
 
-            if result.is_err() {
+            if result.is_err() && temporary_created {
                 let _ = fs::remove_file(&temporary);
             }
             result
@@ -219,10 +214,7 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
 fn load_or_create_owner_token(root: &Path) -> Result<String> {
     let path = root.join(OWNER_TOKEN_FILE);
     let token = format!("{}{}", ulid::Ulid::new(), ulid::Ulid::new());
-    let mut options = private_file_options();
-    options.write(true).create_new(true);
-
-    match options.open(&path) {
+    match create_new_private_file(&path) {
         Ok(mut file) => {
             if let Err(error) = ensure_private_file(&path) {
                 let _ = fs::remove_file(&path);
@@ -305,9 +297,61 @@ fn private_file_options() -> OpenOptions {
     options
 }
 
-#[cfg(not(unix))]
-fn private_file_options() -> OpenOptions {
-    OpenOptions::new()
+fn create_new_private_file(path: &Path) -> std::io::Result<File> {
+    #[cfg(windows)]
+    {
+        super::windows::create_private_file_new(path)
+    }
+    #[cfg(unix)]
+    {
+        let mut options = private_file_options();
+        options.write(true).create_new(true);
+        options.open(path)
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = path;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "private files are unsupported on this platform",
+        ))
+    }
+}
+
+fn open_or_create_daemon_lock(path: &Path) -> Result<File> {
+    #[cfg(windows)]
+    {
+        match create_new_private_file(path) {
+            Ok(file) => Ok(file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                ensure_private_file(path)?;
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(path)
+                    .map_err(|error| io_error("open daemon lock", error))?;
+                ensure_private_file(path)?;
+                Ok(file)
+            }
+            Err(error) => Err(io_error("create daemon lock", error)),
+        }
+    }
+    #[cfg(unix)]
+    {
+        let mut options = private_file_options();
+        options.create(true).read(true).write(true);
+        options
+            .open(path)
+            .map_err(|error| io_error("open daemon lock", error))
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = path;
+        Err(Error::new(
+            "platform_unsupported",
+            "daemon locks are unsupported on this platform",
+        ))
+    }
 }
 
 fn ensure_private_root(path: &Path) -> Result<()> {
