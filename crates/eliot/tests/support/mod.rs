@@ -104,13 +104,15 @@ pub struct Reply {
     pub status: ExitStatus,
     pub stdout: String,
     pub stderr: String,
+    context: String,
 }
 
 impl Reply {
     pub fn json(self) -> Value {
         assert!(
             self.status.success(),
-            "CLI exit {:?}: {}",
+            "CLI {} exit {:?}: {}",
+            self.context,
             self.status.code(),
             self.stderr
         );
@@ -119,6 +121,19 @@ impl Reply {
 }
 
 pub fn run(command: Command) -> Reply {
+    // Fake-only fixture argv, bounded and without inherited environment values.
+    let args: Vec<_> = command
+        .get_args()
+        .take(32)
+        .map(|argument| {
+            argument
+                .to_string_lossy()
+                .chars()
+                .take(256)
+                .collect::<String>()
+        })
+        .collect();
+    let context = format!("{:?} {args:?}", command.get_program());
     let mut process = Captured::spawn(command);
     let status = process
         .wait(Duration::from_secs(40))
@@ -128,6 +143,7 @@ pub fn run(command: Command) -> Reply {
         status,
         stdout,
         stderr,
+        context,
     }
 }
 
