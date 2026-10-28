@@ -118,7 +118,7 @@ sections, and [OpenCodex](harnesses/opencodex.md) only for the proxy task.
 - [x] **L3.3b Observation/history.** Exact-subject observe attachment, private native
       and rollout history pages, and reader-only detach. Preserve unknown native state
       and keep observation separate from controlled identity and effects.
-- [ ] **L3.3c Live recovery.** Codex observe-only live rollout facts after settled
+- [x] **L3.3c Live recovery.** Codex observe-only live rollout facts after settled
       exact-subject attach; gap-backed `observe` to `transcript` handoff and bounded
       reconciliation. Commit ownership/cursor boundaries before publication; keep
       private history private and never replay an uncertain external effect.

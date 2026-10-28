@@ -13,7 +13,6 @@ use eliot_plugin::{
     CommitSink, ObserverAttachParams, PeerClient,
     protocol::{MAX_CREDENTIAL_BYTES, MAX_OBSERVATION_CURSOR_BYTES},
 };
-use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
 use tokio::time::{Instant, sleep_until};
@@ -928,24 +927,8 @@ impl PendingOperation {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct HealthAck {
-    agent_id: String,
-    generation: i64,
-    source: String,
-    state: String,
-    health: String,
-}
-
 fn health_ack_matches(update: &SourceHealthUpdate, value: &Value) -> bool {
-    serde_json::from_value::<HealthAck>(value.clone()).is_ok_and(|ack| {
-        ack.agent_id == update.agent_id
-            && ack.generation == update.generation
-            && ack.source == update.source
-            && ack.state == "open"
-            && ack.health == update.health
-    })
+    serde_json::from_value::<SourceHealthUpdate>(value.clone()).is_ok_and(|ack| &ack == update)
 }
 
 fn health_state_proves(update: &SourceHealthUpdate, state: &Value, families: &[String]) -> bool {
@@ -1143,16 +1126,21 @@ mod tests {
     }
 
     #[test]
-    fn health_readback_requires_typed_ack_and_current_source_state() {
+    fn health_ack_matches_landed_core_store_type_and_readback_proves_scope() {
         let update = SourceHealthUpdate::new("a1", 2, TRANSCRIPT_SOURCE, "ok");
-        let ack = json!({
-            "agent_id":"a1", "generation":2, "source":"transcript",
-            "state":"open", "health":"ok"
-        });
+        let ack = serde_json::to_value(&update).unwrap();
         assert!(health_ack_matches(&update, &ack));
-        let mut malformed = ack.clone();
-        malformed["generation"] = json!("2");
-        assert!(!health_ack_matches(&update, &malformed));
+        for (field, value) in [
+            ("agent_id", json!("a2")),
+            ("generation", json!(3)),
+            ("source", json!(OBSERVER_SOURCE)),
+            ("health", json!("stale")),
+            ("state", json!("open")),
+        ] {
+            let mut mismatch = ack.clone();
+            mismatch[field] = value;
+            assert!(!health_ack_matches(&update, &mismatch), "field={field}");
+        }
 
         let state = json!({
             "state":"open", "health":"ok",

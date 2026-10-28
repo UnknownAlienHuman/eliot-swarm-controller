@@ -442,21 +442,11 @@ impl ObserverSession {
         self.resume_live_intent(deadline).await?;
         self.finish_live_pending(deadline).await?;
         if let Some(reason) = self.live_problem {
-            if self.live_started {
-                self.publish_live_intent(
-                    LiveIntent::Gap {
-                        reason: reason.to_owned(),
-                        checkpoint: None,
-                    },
-                    deadline,
-                )
-                .await?;
-            } else {
-                // No transcript row/grant exists before the first handoff.
-                // Retain this unavailability and report only predecessor health.
-                self.publish_live_health("observe", "stale", deadline)
-                    .await?;
-            }
+            self.publish_live_intent(
+                live_problem_intent(reason, self.live_started, self.live_recovery_required),
+                deadline,
+            )
+            .await?;
         }
         if self.live_stale {
             self.publish_live_health(
@@ -624,23 +614,24 @@ impl ObserverSession {
         // Nothing mutates the original intent or the pending record across the
         // await above. Apply its local checkpoint only after its exact proof.
         self.live_intent = None;
+        acknowledge_live_outage(
+            &intent,
+            &mut self.live_problem,
+            &mut self.live_recovery_required,
+        );
         match intent {
             LiveIntent::Begin(edge) => {
                 self.live_cursor = Some(edge);
                 self.live_baseline = None;
                 self.live_started = true;
-                self.live_recovery_required = false;
-                self.live_problem = None;
             }
             LiveIntent::Recover(edge) => {
                 if self.live_baseline.as_deref() == Some(edge.as_str()) {
                     self.live_cursor = Some(edge);
                     self.live_baseline = None;
                 }
-                self.live_recovery_required = false;
             }
             LiveIntent::Gap { reason, checkpoint } => {
-                self.live_recovery_required = true;
                 if let (
                     Some(PendingLive::Gap {
                         reason: pending_reason,
@@ -655,8 +646,6 @@ impl ObserverSession {
                     self.live_reopen |= self.live_cursor.as_deref() == Some(cursor.as_str());
                     self.live_cursor = Some(checkpoint);
                     self.live_pending = None;
-                } else {
-                    self.live_problem = None;
                 }
             }
             LiveIntent::Health { health, .. } => {
@@ -1365,6 +1354,37 @@ fn live_unknown() -> Error {
     )
 }
 
+fn live_problem_intent(reason: &str, started: bool, gap_acknowledged: bool) -> LiveIntent {
+    if started && !gap_acknowledged {
+        LiveIntent::Gap {
+            reason: reason.to_owned(),
+            checkpoint: None,
+        }
+    } else {
+        // Before handoff there is no transcript. After gap acknowledgement,
+        // retain that same uncovered interval until a verified file edge.
+        LiveIntent::Health {
+            source: if started { "transcript" } else { "observe" }.to_owned(),
+            health: "stale".to_owned(),
+        }
+    }
+}
+
+fn acknowledge_live_outage(
+    intent: &LiveIntent,
+    problem: &mut Option<&'static str>,
+    recovery_required: &mut bool,
+) {
+    match intent {
+        LiveIntent::Gap { .. } => *recovery_required = true,
+        LiveIntent::Begin(_) | LiveIntent::Recover(_) => {
+            *problem = None;
+            *recovery_required = false;
+        }
+        LiveIntent::Health { .. } => {}
+    }
+}
+
 fn validate_live_codec(version: &str) -> Result<()> {
     if version != "0.161.0" {
         return Err(Error::new(
@@ -1398,9 +1418,81 @@ fn unverified_store() -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{PendingLive, sanitize_text, settled_record_cursor, validate_live_codec};
+    use super::{
+        LiveIntent, PendingLive, acknowledge_live_outage, live_problem_intent, sanitize_text,
+        settled_record_cursor, validate_live_codec,
+    };
     use eliot_core::{BatchAck, NativeEvent};
     use serde_json::json;
+
+    #[test]
+    fn acknowledged_outage_retains_problem_until_verified_edge() {
+        let mut problem = Some("observer rollout live edge is unavailable");
+        let mut recovery_required = false;
+        let first = live_problem_intent(problem.unwrap(), true, recovery_required);
+        assert!(matches!(
+            first,
+            LiveIntent::Gap {
+                checkpoint: None,
+                ..
+            }
+        ));
+        // Local coordinator decisions only. The runtime calls this transition
+        // after publisher success; transport ACK/nonce proofs live in its tests.
+        acknowledge_live_outage(&first, &mut problem, &mut recovery_required);
+        assert!(problem.is_some());
+        assert!(recovery_required);
+
+        for _ in 0..4 {
+            // The real open/read failure path can assign the same problem again.
+            problem = Some("observer rollout live edge is unavailable");
+            let intent = live_problem_intent(problem.unwrap(), true, recovery_required);
+            assert!(matches!(&intent, LiveIntent::Health { source, health }
+                if source == "transcript" && health == "stale"));
+            acknowledge_live_outage(&intent, &mut problem, &mut recovery_required);
+            assert!(problem.is_some());
+            assert!(recovery_required);
+        }
+
+        acknowledge_live_outage(
+            &LiveIntent::Recover("verified-held-file-edge".to_owned()),
+            &mut problem,
+            &mut recovery_required,
+        );
+        assert!(problem.is_none());
+        assert!(!recovery_required);
+
+        problem = Some("observer rollout live edge is unavailable");
+        let next = live_problem_intent(problem.unwrap(), true, recovery_required);
+        assert!(matches!(
+            next,
+            LiveIntent::Gap {
+                checkpoint: None,
+                ..
+            }
+        ));
+        acknowledge_live_outage(&next, &mut problem, &mut recovery_required);
+        assert!(problem.is_some());
+        assert!(recovery_required);
+    }
+
+    #[test]
+    fn prebaseline_unavailability_stays_on_observe_until_verified_begin() {
+        let mut problem = Some("observer exact subject has no rollout path");
+        let mut recovery_required = false;
+        let intent = live_problem_intent(problem.unwrap(), false, recovery_required);
+        assert!(matches!(&intent, LiveIntent::Health { source, health }
+            if source == "observe" && health == "stale"));
+        acknowledge_live_outage(&intent, &mut problem, &mut recovery_required);
+        assert!(problem.is_some());
+        acknowledge_live_outage(
+            &LiveIntent::Begin("verified-initial-edge".to_owned()),
+            &mut problem,
+            &mut recovery_required,
+        );
+        assert!(problem.is_none());
+        assert!(!recovery_required);
+    }
 
     #[test]
     fn uncertain_record_keeps_frozen_payload_and_cursor_until_exact_ack() {
