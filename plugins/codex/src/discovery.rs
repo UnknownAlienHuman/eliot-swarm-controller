@@ -2,7 +2,7 @@
 //! No controlled thread or lifecycle publication.
 
 use crate::{
-    host::native_scope,
+    host::{contextual_error, native_scope},
     native::{
         NativeClient, NativeFrame, NativeLaunch, NativeProcess,
         store_policy::ensure_store_pin_supported,
@@ -13,7 +13,7 @@ use crate::{
         },
     },
 };
-use eliot_core::{Error, Result};
+use eliot_core::{Error, Result, SecretPolicy};
 use eliot_plugin::{
     DiscoverCoverage, DiscoverPage, DiscoverParams, DiscoverSubject, MAX_DISCOVER_PAGE_BYTES,
     MAX_DISCOVER_PAGE_ENTRIES, MAX_EVENT_BYTES,
@@ -140,7 +140,7 @@ pub(crate) async fn discover(
     )
     .await;
     finish_reader(&mut query, Some(drainer)).await?;
-    result
+    result.map_err(|error| query.client().diagnostic_error(error))
 }
 
 pub(crate) async fn probe_store(
@@ -156,6 +156,7 @@ pub(crate) async fn probe_store(
             cwd: launch.cwd.clone(),
             environment: launch.environment.clone(),
         },
+        secrets,
         deadline,
     )
     .await?;
@@ -173,6 +174,7 @@ pub(crate) async fn probe_store(
     }
     .await;
     finish_reader(&mut probe, Some(drainer)).await?;
+    let probe_result = probe_result.map_err(|error| probe.client().diagnostic_error(error));
     drop(probe);
     probe_result
 }
@@ -187,7 +189,7 @@ pub(crate) async fn open_pinned_reader(
     // thread_store is fixed at process startup (pinned message_processor.rs:301-304).
     // A config/read reload must not relabel one store's page with another root.
     let pinned = pinned_launch(launch, store)?;
-    let (mut query, drainer) = start_reader(pinned, deadline).await?;
+    let (mut query, drainer) = start_reader(pinned, secrets, deadline).await?;
     let result = async {
         let client = query.client();
         let initialized = initialize_reader(&client, secrets, deadline).await?;
@@ -206,13 +208,14 @@ pub(crate) async fn open_pinned_reader(
         Ok(()) => Ok((query, drainer)),
         Err(error) => {
             finish_reader(&mut query, Some(drainer)).await?;
-            Err(error)
+            Err(query.client().diagnostic_error(error))
         }
     }
 }
 
 async fn start_reader(
     launch: NativeLaunch,
+    secrets: &[String],
     deadline: Instant,
 ) -> Result<(NativeProcess, JoinHandle<()>)> {
     if Instant::now() >= deadline {
@@ -221,7 +224,8 @@ async fn start_reader(
             "Codex discovery read deadline elapsed",
         ));
     }
-    let mut native = NativeProcess::spawn(launch).await?;
+    let mut native =
+        NativeProcess::spawn(launch, SecretPolicy::new(secrets.iter().cloned())).await?;
     let client = native.client();
     let mut frames = match native.take_frames() {
         Ok(frames) => frames,
@@ -253,10 +257,10 @@ pub(crate) async fn finish_reader(
     let output_drained = native.await_output_drained(cleanup_deadline).await;
     let notifications_drained = finish_drainer(drainer, cleanup_deadline).await;
     if reaped.is_err() || output_drained.is_err() || !notifications_drained {
-        return Err(Error::new(
+        return Err(native.client().diagnostic_error(Error::new(
             "unknown",
             "Codex discovery reader cleanup is unconfirmed",
-        ));
+        )));
     }
     Ok(())
 }
@@ -281,7 +285,13 @@ async fn initialize_reader(
             deadline,
         )
         .await
-        .map_err(|_| Error::new("native_readback", "Codex discovery initialize failed"))?;
+        .map_err(|error| {
+            contextual_error(
+                error,
+                "native_readback",
+                "Codex discovery initialize failed",
+            )
+        })?;
     reject_secrets(&initialized, secrets)?;
     let initialized: NativeInitializeResponse =
         serde_json::from_value(initialized).map_err(|_| invalid_page())?;
@@ -295,7 +305,13 @@ async fn initialize_reader(
     client
         .notify("initialized", None, deadline)
         .await
-        .map_err(|_| Error::new("native_readback", "Codex discovery initialized failed"))?;
+        .map_err(|error| {
+            contextual_error(
+                error,
+                "native_readback",
+                "Codex discovery initialized failed",
+            )
+        })?;
     Ok(initialized)
 }
 
@@ -317,11 +333,23 @@ async fn read_store(
             deadline,
         )
         .await
-        .map_err(|_| unverified_store())?;
+        .map_err(|error| {
+            contextual_error(
+                error,
+                "native_scope_unverified",
+                "Codex native store selection could not be verified",
+            )
+        })?;
     let requirements = client
         .call("configRequirements/read", json!({}), deadline)
         .await
-        .map_err(|_| unverified_store())?;
+        .map_err(|error| {
+            contextual_error(
+                error,
+                "native_scope_unverified",
+                "Codex native store selection could not be verified",
+            )
+        })?;
     ensure_store_pin_supported(&config, &requirements)?;
     let selection = {
         let config: NativeDiscoveryConfigReadResponse =
@@ -396,7 +424,13 @@ async fn read_page(
             deadline,
         )
         .await
-        .map_err(|_| Error::new("native_readback", "Codex discovery thread/list failed"))?;
+        .map_err(|error| {
+            contextual_error(
+                error,
+                "native_readback",
+                "Codex discovery thread/list failed",
+            )
+        })?;
     reject_secrets(&response, secrets)?;
     let page: NativeThreadListResponse =
         serde_json::from_value(response).map_err(|_| invalid_page())?;
@@ -738,22 +772,7 @@ pub(crate) fn milliseconds(seconds: i64) -> Result<i64> {
 }
 
 pub(crate) fn reject_secrets(value: &Value, secrets: &[String]) -> Result<()> {
-    fn text_contains(text: &str, secrets: &[String]) -> bool {
-        secrets
-            .iter()
-            .any(|secret| !secret.is_empty() && text.contains(secret))
-    }
-    fn contains(value: &Value, secrets: &[String]) -> bool {
-        match value {
-            Value::String(text) => text_contains(text, secrets),
-            Value::Array(values) => values.iter().any(|value| contains(value, secrets)),
-            Value::Object(values) => values
-                .iter()
-                .any(|(key, value)| text_contains(key, secrets) || contains(value, secrets)),
-            _ => false,
-        }
-    }
-    if contains(value, secrets) {
+    if SecretPolicy::new(secrets.iter().cloned()).contains_value(value) {
         return Err(Error::new(
             "secret_in_payload",
             "Codex discovery response contains a known secret",

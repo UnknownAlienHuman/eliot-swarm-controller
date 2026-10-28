@@ -2,6 +2,7 @@ mod fake;
 mod file_identity;
 pub mod peer;
 pub mod protocol;
+mod stderr;
 
 pub use fake::{PluginError, run_fake};
 pub use file_identity::{FileIdentity, file_final_path, file_identity};
@@ -14,3 +15,4 @@ pub use protocol::{
     ObservationQuery, ObserverAttachParams, ObserverDetachParams, ObserverSnapshotParams,
     PluginManifest, RpcError, RpcRequest, RpcResponse, fake_manifest,
 };
+pub use stderr::{StderrCapture, StderrSnapshot, StderrView, spawn_stderr};

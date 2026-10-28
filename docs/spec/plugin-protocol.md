@@ -26,9 +26,23 @@ killed for an Agent. Shared support is not required for the first Codex path.
 
 ## Framing and bounds
 
-JSON-RPC 2.0 over UTF-8 NDJSON, stdout protocol only, bounded stderr. Both directions may
-send requests with direction-local ids. Agent messages carry `agent_id` and `generation`.
+JSON-RPC 2.0 over UTF-8 NDJSON; stdout is protocol only. Both directions may send
+requests with direction-local ids. Agent messages carry `agent_id` and `generation`.
 Wire version is `eliot-plugin/1`. Add fields compatibly; do not change existing meanings.
+
+Drain each owned child stderr pipe continuously. Retain only a 16 KiB tail per child,
+redacted by the shared `SecretPolicy` before retention. The structured snapshot is
+`{text,truncated,eof,read_error}`; reaching the cap never stops drainage. Preserve plugin
+and native-harness tails as separate source-tagged diagnostics. A possible secret prefix
+split across reads remains withheld, including at EOF, cancellation or read failure.
+These diagnostics do not participate in protocol framing or authoritative result state.
+
+`Error` may carry at most two distinct `StderrDiagnostic` sources (`plugin` and
+`harness`), each with a text tail no larger than 16 KiB. Keep the semantic error code
+separate from diagnostics. The encoded diagnostics array is capped at 16 KiB in total,
+including JSON escaping. Error serialization reserves space for its primary code and
+message within the 64 KiB encoded Error bound. Do not serialize free-form error messages,
+request arguments or environment values into the log record.
 
 Maximum encoded frame is 1 MiB. Inline input is at most 512 KiB; persisted event data/final
 text 64 KiB; pages at most 1,000 entries and below 900 KiB. Both semantic and encoded

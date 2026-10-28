@@ -5,6 +5,7 @@ mod config;
 mod daemon;
 mod fs_invalidation;
 mod git_monitor;
+pub(crate) mod logging;
 mod monitor;
 mod platform;
 mod plugin_host;

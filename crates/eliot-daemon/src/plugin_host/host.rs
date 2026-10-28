@@ -5,8 +5,10 @@ mod reader;
 use crate::bus::Bus;
 use crate::monitor::Monitoring;
 use crate::platform::OwnedChild;
-use eliot_core::{Agent, Command, Error, Result, SourceBatch, SourceGap, SourceGapAck};
-use eliot_plugin::PluginManifest;
+use eliot_core::{
+    Agent, Command, Error, Result, SecretPolicy, SourceBatch, SourceGap, SourceGapAck, StderrSource,
+};
+use eliot_plugin::{PluginManifest, StderrCapture, StderrView, spawn_stderr};
 use serde_json::{Map, Value, json};
 use std::{
     collections::{HashMap, HashSet},
@@ -17,7 +19,6 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
-    io,
     process::Command as ProcessCommand,
     sync::{Mutex as AsyncMutex, mpsc, oneshot, watch},
     time::{Instant, timeout_at},
@@ -57,6 +58,8 @@ struct AgentKey {
 struct RuntimeEntry {
     sender: mpsc::Sender<RuntimeMessage>,
     verbs: HashSet<String>,
+    stderr: StderrView,
+    source_credentials: Arc<[String]>,
 }
 
 enum RuntimeMessage {
@@ -103,6 +106,13 @@ struct AgentActorConfig {
     source_credentials: Arc<[String]>,
     resume_from: Option<Value>,
     source_state: Option<Value>,
+    stderr: StderrView,
+}
+
+struct PendingFailure {
+    reply: Option<oneshot::Sender<Result<Value>>>,
+    error: Error,
+    command_id: String,
 }
 
 struct EventSource {
@@ -258,17 +268,19 @@ impl PluginHost {
                     )
                 })?
         };
-        let mut source_credentials = vec![
-            self.state.owner_token.clone(),
-            agent_token.clone(),
-            credential.clone(),
-        ];
-        source_credentials.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
-        let source_credentials: Arc<[String]> = source_credentials.into();
+        let target_environment = build_target_environment(&agent, &agent_token)?;
+        let source_credentials = source_secret_snapshot(
+            &agent.profile_snapshot,
+            &target_environment,
+            vec![
+                self.state.owner_token.clone(),
+                agent_token.clone(),
+                credential.clone(),
+            ],
+        );
         if let Some(source_state) = source_state.as_mut() {
             crate::redaction::redact_value(source_state, &source_credentials);
         }
-        let target_environment = build_target_environment(&agent, &agent_token)?;
         {
             let mut credentials = self
                 .state
@@ -316,11 +328,11 @@ impl PluginHost {
             ));
         };
 
-        tokio::spawn(async move {
-            let mut stderr = stderr;
-            let mut sink = io::sink();
-            let _ = io::copy(&mut stderr, &mut sink).await;
-        });
+        let stderr_capture = spawn_stderr(
+            stderr,
+            Arc::new(SecretPolicy::new(source_credentials.iter())),
+        );
+        let stderr_view = stderr_capture.view();
 
         let connection = PluginConnection::new(stdout, stdin);
         let client = connection.client();
@@ -356,6 +368,8 @@ impl PluginHost {
                         .into_iter()
                         .map(str::to_owned)
                         .collect(),
+                    stderr: stderr_view.clone(),
+                    source_credentials: Arc::clone(&source_credentials),
                 },
             );
         }
@@ -368,15 +382,25 @@ impl PluginHost {
             instance_dir: instance_dir.to_string_lossy().into_owned(),
             plugin_credential: credential.clone(),
             target_environment,
-            source_credentials,
+            source_credentials: Arc::clone(&source_credentials),
             resume_from,
             source_state,
+            stderr: stderr_view.clone(),
         };
         tokio::spawn(async move {
-            run_agent(actor, child, client, event_task, message_rx, started_tx).await;
+            run_agent(
+                actor,
+                child,
+                client,
+                event_task,
+                message_rx,
+                started_tx,
+                stderr_capture,
+            )
+            .await;
         });
 
-        match timeout_at(Instant::now() + RPC_DEADLINE + RPC_GRACE, started_rx).await {
+        let result = match timeout_at(Instant::now() + RPC_DEADLINE + RPC_GRACE, started_rx).await {
             Ok(Ok(Ok(result))) => Ok(result),
             Ok(Ok(Err(error))) => Err(error),
             Ok(Err(_)) => Err(Error::new(
@@ -387,7 +411,8 @@ impl PluginHost {
                 "unknown",
                 "Agent plugin start exceeded its absolute deadline",
             )),
-        }
+        };
+        result.map_err(|error| diagnose_error(error, &stderr_view, &source_credentials))
     }
 
     pub(crate) async fn command(&self, agent: &Agent, command: Command) -> Result<Value> {
@@ -420,7 +445,7 @@ impl PluginHost {
             }
             _ => {}
         }
-        let sender = self.sender(&key, &command.verb)?;
+        let (sender, stderr, credentials) = self.sender(&key, &command.verb)?;
         let (reply, response) = oneshot::channel();
         timeout_at(
             Instant::now() + RPC_DEADLINE,
@@ -429,7 +454,7 @@ impl PluginHost {
         .await
         .map_err(|_| Error::new("busy", "Agent plugin command queue is full"))?
         .map_err(|_| Error::new("unknown", "owned Agent plugin is no longer available"))?;
-        match timeout_at(Instant::now() + RPC_DEADLINE + RPC_GRACE, response).await {
+        let result = match timeout_at(Instant::now() + RPC_DEADLINE + RPC_GRACE, response).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(Error::new(
                 "unknown",
@@ -439,7 +464,8 @@ impl PluginHost {
                 "unknown",
                 "Agent plugin command exceeded its absolute deadline",
             )),
-        }
+        };
+        result.map_err(|error| diagnose_error(error, &stderr, &credentials))
     }
 
     pub(crate) async fn stop(&self, agent: &Agent, command: Command, force: bool) -> Result<Value> {
@@ -447,7 +473,7 @@ impl PluginHost {
             id: agent.id.clone(),
             generation: agent.generation,
         };
-        let sender = self.sender(&key, "stop")?;
+        let (sender, stderr, credentials) = self.sender(&key, "stop")?;
         let (reply, response) = oneshot::channel();
         timeout_at(
             Instant::now() + RPC_DEADLINE,
@@ -460,7 +486,7 @@ impl PluginHost {
         .await
         .map_err(|_| Error::new("busy", "Agent plugin command queue is full"))?
         .map_err(|_| Error::new("unknown", "owned Agent plugin is no longer available"))?;
-        match timeout_at(
+        let result = match timeout_at(
             Instant::now() + RPC_DEADLINE + STOP_GRACE + STOP_GRACE + RPC_GRACE,
             response,
         )
@@ -475,7 +501,8 @@ impl PluginHost {
                 "unknown",
                 "Agent plugin stop exceeded its absolute deadline",
             )),
-        }
+        };
+        result.map_err(|error| diagnose_error(error, &stderr, &credentials))
     }
 
     pub(crate) async fn force_all(&self) {
@@ -537,7 +564,11 @@ impl PluginHost {
             })
     }
 
-    fn sender(&self, key: &AgentKey, verb: &str) -> Result<mpsc::Sender<RuntimeMessage>> {
+    fn sender(
+        &self,
+        key: &AgentKey,
+        verb: &str,
+    ) -> Result<(mpsc::Sender<RuntimeMessage>, StderrView, Arc<[String]>)> {
         self.state
             .running
             .lock()
@@ -554,7 +585,11 @@ impl PluginHost {
             })
             .and_then(|entry| {
                 if entry.verbs.contains(verb) {
-                    Ok(entry.sender.clone())
+                    Ok((
+                        entry.sender.clone(),
+                        entry.stderr.clone(),
+                        Arc::clone(&entry.source_credentials),
+                    ))
                 } else {
                     Err(Error::new(
                         "unsupported",
@@ -668,11 +703,55 @@ impl PluginHost {
 
 async fn run_agent(
     actor: AgentActorConfig,
+    child: OwnedChild,
+    client: PluginClient,
+    event_task: tokio::task::JoinHandle<()>,
+    messages: mpsc::Receiver<RuntimeMessage>,
+    started: oneshot::Sender<Result<Value>>,
+    stderr_capture: StderrCapture,
+) {
+    let credentials = Arc::clone(&actor.source_credentials);
+    let key = actor.key.clone();
+    let mut failure = None;
+    run_agent_inner(
+        actor,
+        child,
+        client,
+        event_task,
+        messages,
+        started,
+        &mut failure,
+    )
+    .await;
+    // All existing child/custody cleanup paths have completed or dropped their
+    // owning handle. Finish the sole stderr drain before the final error view.
+    let snapshot = stderr_capture.finish(Instant::now() + STOP_GRACE).await;
+    if let Some(failure) = failure {
+        let error = redact_native_error(
+            failure.error.with_stderr(StderrSource::Plugin, snapshot),
+            &credentials,
+        );
+        record_plugin_error(
+            &error,
+            &key.id,
+            key.generation,
+            &failure.command_id,
+            &credentials,
+        );
+        if let Some(reply) = failure.reply {
+            let _ = reply.send(Err(error));
+        }
+    }
+}
+
+async fn run_agent_inner(
+    actor: AgentActorConfig,
     mut child: OwnedChild,
     client: PluginClient,
     mut event_task: tokio::task::JoinHandle<()>,
     mut messages: mpsc::Receiver<RuntimeMessage>,
     started: oneshot::Sender<Result<Value>>,
+    pending_failure: &mut Option<PendingFailure>,
 ) {
     let AgentActorConfig {
         state,
@@ -686,6 +765,7 @@ async fn run_agent(
         source_credentials,
         resume_from,
         source_state,
+        stderr,
     } = actor;
     let mut last_command_id = start_command.id.clone();
     let init = client
@@ -886,7 +966,7 @@ async fn run_agent(
                                 client.call("agent.command", params, deadline()).await
                                     .map_err(|error| redact_native_error(error, &source_credentials))
                                     .and_then(|mut value| {
-                                        crate::redaction::redact_value(
+                                        crate::redaction::redact_outcome(
                                             &mut value,
                                             &source_credentials,
                                         );
@@ -894,7 +974,23 @@ async fn run_agent(
                                     })
                             }
                         };
-                        let _ = reply.send(result);
+                        match result {
+                            Err(error) if error.code == "unknown" && client.reader_closed() && pending_failure.is_none() => {
+                                // The actual protocol reader ended. Keep this
+                                // exact pending caller through existing loss
+                                // cleanup, then finish stderr before replying.
+                                *pending_failure = Some(PendingFailure {
+                                    reply: Some(reply), error, command_id: command.id,
+                                });
+                            }
+                            result => {
+                                let result = diagnose_result(result, &stderr, &source_credentials);
+                                if let Err(error) = &result {
+                                    record_plugin_error(error, &agent.id, agent.generation, &command.id, &source_credentials);
+                                }
+                                let _ = reply.send(result);
+                            }
+                        }
                     }
                     RuntimeMessage::Stop { command, force, reply } => {
                         let snapshot_command_id = last_command_id.clone();
@@ -1288,6 +1384,7 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
                 }
             }
         };
+        let result = result.map_err(|error| redact_native_error(error, &source_credentials));
         let _ = client.respond(request_id, result, request_deadline).await;
     }
     if let Some(state) = state.upgrade() {
@@ -1334,8 +1431,50 @@ fn safe_cause_code(code: &str) -> String {
 }
 
 fn redact_source_batch(batch: &mut SourceBatch, credentials: &[String]) -> Result<()> {
+    fn protected_data(value: &Value, policy: &SecretPolicy) -> bool {
+        match value {
+            Value::Object(values) => values.iter().any(|(key, value)| {
+                policy.contains_text(key)
+                    || (matches!(
+                        key.as_str(),
+                        "agent_id"
+                            | "command_id"
+                            | "turn_id"
+                            | "request_id"
+                            | "item_id"
+                            | "native_scope"
+                            | "native_ref"
+                    ) && policy.contains_value(value))
+                    || protected_data(value, policy)
+            }),
+            Value::Array(values) => values.iter().any(|value| protected_data(value, policy)),
+            _ => false,
+        }
+    }
+
+    let policy = SecretPolicy::new(credentials);
+    // Validate the whole batch before changing text: dedup/correlation identities
+    // and object keys must never be rewritten into a different durable payload.
+    if [&batch.batch_id, &batch.agent_id, &batch.source]
+        .into_iter()
+        .any(|value| policy.contains_text(value))
+        || batch
+            .cursor
+            .as_deref()
+            .is_some_and(|value| policy.contains_text(value))
+        || batch.events.iter().any(|event| {
+            policy.contains_text(&event.native_id)
+                || policy.contains_text(&event.kind)
+                || protected_data(&event.data, &policy)
+        })
+    {
+        return Err(Error::new(
+            "secret_in_payload",
+            "native source payload contains a known secret in immutable metadata",
+        ));
+    }
     for event in &mut batch.events {
-        if crate::redaction::redact_value(&mut event.data, credentials) {
+        if policy.redact_values(&mut event.data) {
             let Some(data) = event.data.as_object_mut() else {
                 return Err(Error::new(
                     "invalid",
@@ -1349,11 +1488,22 @@ fn redact_source_batch(batch: &mut SourceBatch, credentials: &[String]) -> Resul
 }
 
 fn redact_source_gap(gap: &mut SourceGap, credentials: &[String]) -> Result<()> {
-    let mut value = serde_json::to_value(&*gap)
-        .map_err(|_| Error::new("internal", "source.gap could not be encoded"))?;
-    crate::redaction::redact_value(&mut value, credentials);
-    *gap = serde_json::from_value(value)
-        .map_err(|_| Error::new("invalid", "source.gap became invalid after redaction"))?;
+    let policy = SecretPolicy::new(credentials);
+    if [&gap.gap_id, &gap.agent_id, &gap.source]
+        .into_iter()
+        .chain(gap.families.iter())
+        .any(|value| policy.contains_text(value))
+        || [&gap.from, &gap.to]
+            .into_iter()
+            .flatten()
+            .any(|value| policy.contains_text(value))
+    {
+        return Err(Error::new(
+            "secret_in_payload",
+            "native source payload contains a known secret in immutable metadata",
+        ));
+    }
+    gap.reason = policy.redact_text(&gap.reason);
     Ok(())
 }
 
@@ -1403,10 +1553,60 @@ fn source_state_binding(
 }
 
 fn redact_native_error(error: Error, credentials: &[String]) -> Error {
-    Error::new(
-        error.code,
-        crate::redaction::redact_text(&error.message, credentials),
+    crate::redaction::redact_error(error, credentials)
+}
+
+fn diagnose_error(error: Error, stderr: &StderrView, credentials: &[String]) -> Error {
+    redact_native_error(
+        error.with_stderr(StderrSource::Plugin, stderr.snapshot()),
+        credentials,
     )
+}
+
+fn diagnose_result(
+    result: Result<Value>,
+    stderr: &StderrView,
+    credentials: &[String],
+) -> Result<Value> {
+    match result {
+        Err(error) => Err(diagnose_error(error, stderr, credentials)),
+        Ok(mut value) => {
+            if matches!(
+                value.get("state").and_then(Value::as_str),
+                Some("failed" | "rejected" | "unknown")
+            ) {
+                crate::redaction::attach_stderr(
+                    &mut value,
+                    StderrSource::Plugin,
+                    stderr.snapshot(),
+                    credentials,
+                );
+            } else {
+                crate::redaction::redact_outcome(&mut value, credentials);
+            }
+            Ok(value)
+        }
+    }
+}
+
+fn record_plugin_error(
+    error: &Error,
+    agent: &str,
+    generation: i64,
+    command: &str,
+    credentials: &[String],
+) {
+    let generation = generation.to_string();
+    crate::logging::record(
+        &SecretPolicy::new(credentials),
+        &error.code,
+        &[
+            ("agent", agent),
+            ("generation", &generation),
+            ("command", command),
+        ],
+        Some(error),
+    );
 }
 
 fn plugin_command_args(command: &Command) -> Result<Value> {
@@ -1622,6 +1822,33 @@ fn minimal_plugin_environment() -> Vec<(OsString, OsString)> {
         .iter()
         .filter_map(|name| std::env::var_os(name).map(|value| (OsString::from(*name), value)))
         .collect()
+}
+
+/// Freeze known execution values once, from the exact environment sent to this
+/// source. Do not infer secrets from variable names or reread mutable process env.
+fn source_secret_snapshot(
+    profile: &Value,
+    environment: &Value,
+    mut known: Vec<String>,
+) -> Arc<[String]> {
+    if let (Some(names), Some(environment)) = (
+        profile.get("pass_env").and_then(Value::as_array),
+        environment.as_object(),
+    ) {
+        for name in names.iter().filter_map(Value::as_str) {
+            if let Some(value) = environment.iter().find_map(|(key, value)| {
+                let matches = if cfg!(windows) {
+                    key.eq_ignore_ascii_case(name)
+                } else {
+                    key == name
+                };
+                matches.then(|| value.as_str()).flatten()
+            }) {
+                known.push(value.to_owned());
+            }
+        }
+    }
+    known.into()
 }
 
 pub(crate) fn build_process_environment(profile: &Value) -> Result<Map<String, Value>> {
@@ -1959,4 +2186,263 @@ pub(crate) fn now_ms() -> i64 {
         .unwrap_or_default()
         .as_millis()
         .min(i64::MAX as u128) as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eliot_core::{NativeEvent, SubmitCommand};
+
+    const SECRET: &str = "__payload_guard_secret__";
+    const SECRET_ERROR: &str =
+        "native source payload contains a known secret in immutable metadata";
+
+    fn batch() -> SourceBatch {
+        SourceBatch {
+            batch_id: "batch-1".to_owned(),
+            agent_id: "a1".to_owned(),
+            generation: 1,
+            source: "stream".to_owned(),
+            cursor: Some("cursor-1".to_owned()),
+            events: vec![NativeEvent {
+                kind: "session.ready".to_owned(),
+                native_id: "ready-1".to_owned(),
+                data: json!({"command_id":"launch-command", "text":SECRET}),
+            }],
+        }
+    }
+
+    fn gap() -> SourceGap {
+        SourceGap {
+            gap_id: "gap-1".to_owned(),
+            agent_id: "a1".to_owned(),
+            generation: 1,
+            source: "stream".to_owned(),
+            families: vec!["session".to_owned()],
+            reason: format!("reader lost {SECRET}"),
+            from: Some("cursor-1".to_owned()),
+            to: Some("cursor-2".to_owned()),
+        }
+    }
+
+    fn assert_secret_error(error: Error) {
+        assert_eq!(error.code, "secret_in_payload");
+        assert_eq!(error.message, SECRET_ERROR);
+        assert!(!serde_json::to_string(&error).unwrap().contains(SECRET));
+    }
+
+    #[test]
+    fn source_batch_rejects_secret_identifiers_without_mutation() {
+        for path in [
+            "/batch_id",
+            "/agent_id",
+            "/source",
+            "/cursor",
+            "/events/0/native_id",
+            "/events/0/kind",
+        ] {
+            let mut value = serde_json::to_value(batch()).unwrap();
+            *value.pointer_mut(path).unwrap() = json!(format!("prefix-{SECRET}"));
+            let mut batch: SourceBatch = serde_json::from_value(value).unwrap();
+            let original = batch.clone();
+            assert_secret_error(redact_source_batch(&mut batch, &[SECRET.to_owned()]).unwrap_err());
+            assert_eq!(batch, original, "immutable field {path}");
+        }
+    }
+
+    #[test]
+    fn source_batch_rejects_nested_keys_and_correlations_before_text_redaction() {
+        let mut cases = vec![json!({"nested":[{"deeper":{(SECRET):"safe"}}]})];
+        for field in [
+            "agent_id",
+            "command_id",
+            "turn_id",
+            "request_id",
+            "item_id",
+            "native_scope",
+            "native_ref",
+        ] {
+            cases.push(json!({"nested":[{(field):SECRET}]}));
+        }
+        for data in cases {
+            let mut batch = batch();
+            // A later invalid event must not leave earlier mutable text changed.
+            batch.events.push(NativeEvent {
+                kind: "message.completed".to_owned(),
+                native_id: "message-1".to_owned(),
+                data,
+            });
+            let original = batch.clone();
+            assert_secret_error(redact_source_batch(&mut batch, &[SECRET.to_owned()]).unwrap_err());
+            assert_eq!(batch, original);
+        }
+    }
+
+    #[test]
+    fn source_batch_redacts_only_mutable_values() {
+        let mut batch = batch();
+        batch.events[0].data["nested"] = json!([{"body":format!("text {SECRET}")}]);
+        let mut expected = batch.clone();
+        expected.events[0].data["text"] = json!("[REDACTED]");
+        expected.events[0].data["nested"][0]["body"] = json!("text [REDACTED]");
+        expected.events[0].data["redacted"] = json!(true);
+        redact_source_batch(&mut batch, &[SECRET.to_owned()]).unwrap();
+        assert_eq!(batch, expected);
+    }
+
+    #[test]
+    fn source_gap_rejects_secret_metadata_and_redacts_only_reason() {
+        for path in [
+            "/gap_id",
+            "/agent_id",
+            "/source",
+            "/families/0",
+            "/from",
+            "/to",
+        ] {
+            let mut value = serde_json::to_value(gap()).unwrap();
+            *value.pointer_mut(path).unwrap() = json!(SECRET);
+            let mut gap: SourceGap = serde_json::from_value(value).unwrap();
+            let original = gap.clone();
+            assert_secret_error(redact_source_gap(&mut gap, &[SECRET.to_owned()]).unwrap_err());
+            assert_eq!(gap, original, "immutable field {path}");
+        }
+        let mut gap = gap();
+        let mut expected = gap.clone();
+        expected.reason = "reader lost [REDACTED]".to_owned();
+        redact_source_gap(&mut gap, &[SECRET.to_owned()]).unwrap();
+        assert_eq!(gap, expected);
+    }
+
+    #[tokio::test]
+    async fn source_payload_guards_precede_store_commit_and_bus_publish() {
+        let mut store = eliot_store::Store::open(Path::new(":memory:")).unwrap();
+        let command_id = Ulid::new().to_string();
+        let now = now_ms();
+        let admission = store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: command_id.clone(),
+                    target: None,
+                    verb: "launch".to_owned(),
+                    args: json!({"project":"payload-guard", "workspace":"synthetic-workspace"}),
+                    expected_generation: Some(0),
+                    expected_turn_id: None,
+                    request_id: None,
+                },
+                now,
+            )
+            .unwrap();
+        let agent_id = admission.command.target.unwrap();
+        store.dispatch(&command_id, now).unwrap();
+        let before_events = store.read_events(0, 1000, None).unwrap();
+        let before_source = store.read_source_state(&agent_id, 1, "stream").unwrap();
+        let store = Arc::new(AsyncMutex::new(store));
+        let bus = Bus::new(16);
+        let mut published = bus.subscribe();
+        let credential = "private-payload-guard";
+        let (host_io, peer_io) = tokio::io::duplex(16 * 1024);
+        let (host_read, host_write) = tokio::io::split(host_io);
+        let (peer_read, peer_write) = tokio::io::split(peer_io);
+        let host = PluginConnection::new(host_read, host_write);
+        let peer = PluginConnection::new(peer_read, peer_write);
+        let client = peer.client();
+        let task = tokio::spawn(serve_plugin_requests(
+            host,
+            EventSource {
+                store: store.clone(),
+                bus: bus.clone(),
+                monitoring: Monitoring::new(
+                    store.clone(),
+                    bus,
+                    Arc::new(Mutex::new(HashSet::new())),
+                ),
+                source_credentials: Arc::from([credential.to_owned(), SECRET.to_owned()]),
+                state: Weak::new(),
+                key: AgentKey {
+                    id: agent_id.clone(),
+                    generation: 1,
+                },
+                agent_id: agent_id.clone(),
+                generation: 1,
+                expected_credential: credential.to_owned(),
+                observation: None,
+            },
+        ));
+        let mut batch = batch();
+        batch.agent_id = agent_id.clone();
+        batch.events[0].data["command_id"] = json!(command_id);
+        for path in ["/batch_id", "/cursor", "/events/0/native_id"] {
+            let mut params = serde_json::to_value(&batch).unwrap();
+            *params.pointer_mut(path).unwrap() = json!(SECRET);
+            params["credential"] = json!(credential);
+            assert_secret_error(
+                client
+                    .call("events.put", params, deadline())
+                    .await
+                    .unwrap_err(),
+            );
+        }
+        let mut params = serde_json::to_value(&batch).unwrap();
+        params["events"][0]["data"]["nested"] = json!([{"deeper":{(SECRET):"safe"}}]);
+        params["credential"] = json!(credential);
+        assert_secret_error(
+            client
+                .call("events.put", params, deadline())
+                .await
+                .unwrap_err(),
+        );
+
+        let mut gap = gap();
+        gap.agent_id = agent_id.clone();
+        for path in ["/gap_id", "/source", "/families/0", "/from", "/to"] {
+            let mut params = serde_json::to_value(&gap).unwrap();
+            *params.pointer_mut(path).unwrap() = json!(SECRET);
+            params["credential"] = json!(credential);
+            assert_secret_error(
+                client
+                    .call("source.gap", params, deadline())
+                    .await
+                    .unwrap_err(),
+            );
+        }
+        {
+            let store = store.lock().await;
+            assert_eq!(store.read_events(0, 1000, None).unwrap(), before_events);
+            assert_eq!(
+                store.read_source_state(&agent_id, 1, "stream").unwrap(),
+                before_source
+            );
+        }
+        assert!(matches!(
+            published.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        // The same live boundary accepts valid payloads and commits safe text
+        // without changing the IDs/cursors acknowledged to the producer.
+        let mut params = serde_json::to_value(&batch).unwrap();
+        params["credential"] = json!(credential);
+        let ack = client.call("events.put", params, deadline()).await.unwrap();
+        assert_eq!(ack["cursor"], json!("cursor-1"));
+        let event = published.try_recv().unwrap();
+        assert_eq!(event.native_id.as_deref(), Some("ready-1"));
+        assert_eq!(event.data["text"], json!("[REDACTED]"));
+        assert_eq!(event.data["redacted"], json!(true));
+        let mut params = serde_json::to_value(&gap).unwrap();
+        params["credential"] = json!(credential);
+        let ack = client.call("source.gap", params, deadline()).await.unwrap();
+        assert_eq!(ack["gap_id"], json!("gap-1"));
+        let events = store.lock().await.read_events(0, 1000, None).unwrap();
+        let gap_event = events
+            .iter()
+            .find(|event| event.kind == "source.gap")
+            .unwrap();
+        assert_eq!(gap_event.data["reason"], json!("reader lost [REDACTED]"));
+        assert!(!serde_json::to_string(&events).unwrap().contains(SECRET));
+
+        client.close_input(deadline()).await.unwrap();
+        timeout_at(deadline(), task).await.unwrap().unwrap();
+    }
 }

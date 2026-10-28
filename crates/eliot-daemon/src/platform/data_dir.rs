@@ -1,7 +1,7 @@
 use eliot_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
 const OWNER_TOKEN_FILE: &str = "owner.token";
@@ -189,6 +189,69 @@ impl DataDir {
             ))
         }
     }
+
+    /// Only the daemon holding this root's lock may create its private log directory.
+    pub(crate) fn daemon_log_directory(&self, lock: &DaemonLock) -> Result<PathBuf> {
+        self.check_lock(lock)?;
+        validate_private_root(&self.path)?;
+        let directory = self.path.join("logs");
+        ensure_private_root(&directory)?;
+        validate_private_root(&directory)?;
+        Ok(directory)
+    }
+}
+
+/// Creation uses the same TokenUser/protected-DACL path as owner.token on Windows.
+/// Existing files must already be private; never take ownership or follow a link.
+pub(crate) fn open_private_log_file(path: &Path) -> Result<File> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::new("invalid_log_path", "log file has no private parent"))?;
+    validate_private_root(parent)?;
+    match create_new_private_file(path) {
+        Ok(file) => drop(file),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(io_error("create private daemon log", error)),
+    }
+    validate_private_file(path)?;
+    #[cfg(unix)]
+    let mut options = private_file_options();
+    #[cfg(not(unix))]
+    let mut options = OpenOptions::new();
+    let mut file = options
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| io_error("open private daemon log", error))?;
+    validate_private_file(path)?;
+    file.seek(SeekFrom::End(0))
+        .map_err(|error| io_error("seek private daemon log", error))?;
+    Ok(file)
+}
+
+/// The caller closes its log handle first, including on Windows. Replacement is
+/// confined to the same validated private directory and an owned regular backup.
+pub(crate) fn rotate_private_log_file(path: &Path, backup: &Path) -> Result<File> {
+    let parent = path
+        .parent()
+        .filter(|parent| Some(*parent) == backup.parent() && path != backup)
+        .ok_or_else(|| {
+            Error::new(
+                "invalid_log_path",
+                "log rotation must stay in one directory",
+            )
+        })?;
+    validate_private_root(parent)?;
+    validate_private_file(path)?;
+    match fs::symlink_metadata(backup) {
+        Ok(_) => validate_private_file(backup)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error("inspect daemon log backup", error)),
+    }
+    replace_file(path, backup)?;
+    let file = open_private_log_file(path)?;
+    sync_directory(parent)?;
+    Ok(file)
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf> {

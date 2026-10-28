@@ -1,10 +1,17 @@
 #![forbid(unsafe_code)]
 
 mod command;
+mod diagnostics;
+mod secrets;
 
 pub use command::{
     classify_dispatched_error, command_transition_allowed, workspace_preparation_transition_allowed,
 };
+pub use diagnostics::{
+    MAX_STDERR_BYTES, MAX_STDERR_DIAGNOSTIC_BYTES, StderrDiagnostic, StderrSnapshot, StderrSource,
+    bound_stderr_diagnostics,
+};
+pub use secrets::SecretPolicy;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -533,10 +540,12 @@ pub enum Effect {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct Error {
     pub code: String,
     pub message: String,
+    #[serde(default, deserialize_with = "diagnostics::deserialize_diagnostics")]
+    pub diagnostics: Vec<StderrDiagnostic>,
 }
 
 impl Error {
@@ -544,7 +553,75 @@ impl Error {
         Self {
             code: code.into(),
             message: message.into(),
+            diagnostics: Vec::new(),
         }
+    }
+
+    /// Attach an already-sanitized tail, retaining the other stderr source.
+    pub fn with_stderr(mut self, source: StderrSource, snapshot: StderrSnapshot) -> Self {
+        let snapshot = snapshot.bounded();
+        if let Some(existing) = self
+            .diagnostics
+            .iter_mut()
+            .find(|tail| tail.source == source)
+        {
+            existing.snapshot = snapshot;
+        } else {
+            self.diagnostics.push(StderrDiagnostic { source, snapshot });
+        }
+        self.bound_diagnostics();
+        self
+    }
+
+    pub fn with_code(mut self, code: impl Into<String>) -> Self {
+        self.code = code.into();
+        self.bound_diagnostics();
+        self
+    }
+
+    pub fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.message = message.into();
+        self.bound_diagnostics();
+        self
+    }
+
+    fn bound_diagnostics(&mut self) {
+        let budget = error_diagnostic_budget(&self.code, &self.message);
+        bound_stderr_diagnostics(&mut self.diagnostics, budget);
+    }
+}
+
+fn error_diagnostic_budget(code: &str, message: &str) -> usize {
+    let base = serde_json::json!({"code": code, "message": message});
+    let base_bytes = serde_json::to_vec(&base).map_or(usize::MAX, |bytes| bytes.len());
+    (64 * 1024_usize)
+        .saturating_sub(base_bytes.saturating_add(",\"diagnostics\":".len()))
+        .min(MAX_STDERR_DIAGNOSTIC_BYTES)
+}
+
+impl Serialize for Error {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct WireError<'a> {
+            code: &'a str,
+            message: &'a str,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            diagnostics: Vec<StderrDiagnostic>,
+        }
+        let mut diagnostics = self.diagnostics.clone();
+        bound_stderr_diagnostics(
+            &mut diagnostics,
+            error_diagnostic_budget(&self.code, &self.message),
+        );
+        WireError {
+            code: &self.code,
+            message: &self.message,
+            diagnostics,
+        }
+        .serialize(serializer)
     }
 }
 

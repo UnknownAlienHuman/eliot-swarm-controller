@@ -3,7 +3,7 @@ use super::{
     AgentKey, PluginHost, RPC_DEADLINE, RPC_GRACE, STOP_GRACE, StoreHandle,
     build_process_environment, now_ms, redact_native_error, signal_progress,
 };
-use eliot_core::{Agent, Command, CommandState, Error, Result};
+use eliot_core::{Agent, Command, CommandState, Error, Result, StderrSource};
 use eliot_plugin::{ObservationPage, ObservationQuery};
 use serde_json::{Value, json};
 use std::sync::{
@@ -357,6 +357,7 @@ impl PluginHost {
                         generation: entry.agent.generation,
                     },
                     &entry.agent.harness,
+                    &entry.agent.profile_snapshot,
                     &environment,
                     Some(&entry.agent),
                 )
@@ -420,9 +421,9 @@ impl PluginHost {
         };
         let started = result.is_ok();
         let _ = ready.send(result.map_err(|error| {
-            transport.as_ref().map_or(error.clone(), |reader| {
-                redact_native_error(error, &reader.secrets)
-            })
+            transport
+                .as_ref()
+                .map_or(error.clone(), |reader| reader.diagnose(error))
         }));
         let mut detach = None;
         let mut reason = "observer_start_failed";
@@ -486,9 +487,12 @@ impl PluginHost {
             }
         }
         entry.detaching.store(true, Ordering::SeqCst);
-        let closed = match transport {
-            Some(reader) => reader.close(self, Some(&entry.agent)).await,
-            None => !spawn_attempted,
+        let (closed, stderr) = match transport {
+            Some(reader) => {
+                let closure = reader.close(self, Some(&entry.agent)).await;
+                (closure.closed, Some(closure.stderr))
+            }
+            None => (!spawn_attempted, None),
         };
         // A committed detach fence can race the next poll. Exact reader cleanup
         // then belongs to Router's detach settlement, not the loss callback that
@@ -516,7 +520,10 @@ impl PluginHost {
         if let Some((agent, command_id, reply, result)) = detach {
             let result = match result {
                 Ok(_) if closed => Ok(detached(&agent, &command_id)),
-                Err(error) => Err(error),
+                Err(error) => Err(match stderr {
+                    Some(stderr) => error.with_stderr(StderrSource::Plugin, stderr),
+                    None => error,
+                }),
                 _ => Err(Error::new(
                     "unknown",
                     "observer reader cleanup is unconfirmed",
@@ -670,12 +677,13 @@ async fn read_snapshot(
     query: ObservationQuery,
     until: Instant,
 ) -> Result<Value> {
-    timeout_at(
+    let result = timeout_at(
         until,
         read_snapshot_until(host, reader, agent, query, until),
     )
     .await
-    .map_err(|_| Error::new("unavailable", "observer snapshot deadline elapsed"))?
+    .map_err(|_| Error::new("unavailable", "observer snapshot deadline elapsed"))?;
+    result.map_err(|error| reader.diagnose(error))
 }
 
 async fn read_snapshot_until(

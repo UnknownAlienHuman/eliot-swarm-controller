@@ -15,7 +15,7 @@ use crate::{
     },
     observe::ObserverSession,
 };
-use eliot_core::{Error, ProcessRecord, ProcessState, Result};
+use eliot_core::{Error, ProcessRecord, ProcessState, Result, SecretPolicy};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, DiscoverParams,
     InitializeParams, MAX_EVENT_BYTES, MAX_TEXT_BYTES, ObserverAttachParams, ObserverDetachParams,
@@ -58,8 +58,7 @@ struct FailedStart {
     agent_id: String,
     generation: i64,
     command_id: String,
-    code: String,
-    message: String,
+    error: Error,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -164,7 +163,7 @@ pub(crate) async fn run() -> Result<()> {
 
 impl CodexPlugin {
     async fn dispatch(&mut self, request: &RpcRequest, client: &PeerClient) -> Result<Value> {
-        match request.method.as_str() {
+        let result = match request.method.as_str() {
             "initialize" => self.initialize(&request.params),
             "discover" => self.discover(&request.params).await,
             "agent.attach" => self.attach(&request.params).await,
@@ -178,6 +177,36 @@ impl CodexPlugin {
                 "unsupported",
                 "Codex plugin method is not implemented",
             )),
+        };
+        let Some(session) = self.session.as_ref() else {
+            return result;
+        };
+        match result {
+            Err(error) => Err(session.native_client.diagnostic_error(error)),
+            Ok(mut value) => {
+                if request.method == "agent.snapshot"
+                    || value
+                        .get("state")
+                        .and_then(Value::as_str)
+                        .is_some_and(|state| matches!(state, "unknown" | "rejected" | "failed"))
+                {
+                    let diagnostics = serde_json::to_value(
+                        session
+                            .native_client
+                            .diagnostic_error(Error::new("unknown", "")),
+                    )
+                    .map_err(|_| {
+                        Error::new("internal", "Codex diagnostics could not be encoded")
+                    })?;
+                    if let Some(tails) = diagnostics
+                        .get("diagnostics")
+                        .filter(|tails| !tails.is_null())
+                    {
+                        value["diagnostics"] = tails.clone();
+                    }
+                }
+                Ok(value)
+            }
         }
     }
 
@@ -359,7 +388,7 @@ impl CodexPlugin {
                 && failed.generation == params.generation
                 && failed.command_id == params.command_id
             {
-                return Err(Error::new(failed.code.clone(), failed.message.clone()));
+                return Err(failed.error.clone());
             }
             return Err(Error::new(
                 "bad_state",
@@ -475,15 +504,17 @@ impl CodexPlugin {
             .unwrap_or_else(|| OsString::from("codex"));
         let TargetEnvironment {
             variables: environment,
-            secrets,
+            mut secrets,
         } = target_environment(params.target_environment.as_ref())?;
+        secrets.push(initialized.credential.clone());
         let launch = NativeLaunch {
             program,
             args: app_server_args(),
             cwd: workspace.clone(),
             environment,
         };
-        let mut native = NativeProcess::spawn(launch).await?;
+        let mut native =
+            NativeProcess::spawn(launch, SecretPolicy::new(secrets.iter().cloned())).await?;
         let frames = native.take_frames()?;
         let stream = native.stream_state();
         let native_client = native.client();
@@ -539,20 +570,18 @@ impl CodexPlugin {
                 .is_err()
             {
                 self.session = Some(session);
-                return Err(Error::new(
-                    "unknown",
-                    format!(
-                        "{}; owned app-server cleanup is unconfirmed; no thread or input was sent",
-                        error.message
-                    ),
-                ));
+                let message = format!(
+                    "{}; owned app-server cleanup is unconfirmed; no thread or input was sent",
+                    error.message
+                );
+                return Err(contextual_error(error, "unknown", message));
             }
+            let error = session.native_client.diagnostic_error(error);
             self.failed_start = Some(FailedStart {
                 agent_id: params.agent_id,
                 generation: params.generation,
                 command_id: params.command_id,
-                code: error.code.clone(),
-                message: error.message.clone(),
+                error: error.clone(),
             });
             return Err(error);
         }
@@ -569,14 +598,13 @@ impl CodexPlugin {
         {
             Ok((effort, scope)) => (effort, scope),
             Err(error) => {
+                let error = discard_failed_start(&mut session, error).await;
                 self.failed_start = Some(FailedStart {
                     agent_id: params.agent_id,
                     generation: params.generation,
                     command_id: params.command_id,
-                    code: error.code.clone(),
-                    message: error.message.clone(),
+                    error: error.clone(),
                 });
-                discard_unstarted(&mut session).await;
                 return Err(error);
             }
         };
@@ -585,19 +613,21 @@ impl CodexPlugin {
 
         if let Some(subject) = &resume_subject {
             if subject.native_scope != session.native_scope {
+                let error = discard_failed_start(
+                    &mut session,
+                    Error::new(
+                        "profile_error",
+                        "Codex resume subject is outside the authenticated native scope",
+                    ),
+                )
+                .await;
                 self.failed_start = Some(FailedStart {
                     agent_id: params.agent_id,
                     generation: params.generation,
                     command_id: params.command_id,
-                    code: "profile_error".to_owned(),
-                    message: "Codex resume subject is outside the authenticated native scope"
-                        .to_owned(),
+                    error: error.clone(),
                 });
-                discard_unstarted(&mut session).await;
-                return Err(Error::new(
-                    "profile_error",
-                    "Codex resume subject is outside the authenticated native scope",
-                ));
+                return Err(error);
             }
             session.thread_id = Some(subject.native_ref.clone());
             if let Err(error) = verify_resume_preflight(
@@ -607,21 +637,18 @@ impl CodexPlugin {
             )
             .await
             {
-                let error = Error::new(
-                    "native_readback",
-                    format!(
-                        "Codex resume preflight failed before thread/resume dispatch: {}",
-                        error.message
-                    ),
+                let message = format!(
+                    "Codex resume preflight failed before thread/resume dispatch: {}",
+                    error.message
                 );
+                let error = contextual_error(error, "native_readback", message);
+                let error = discard_failed_start(&mut session, error).await;
                 self.failed_start = Some(FailedStart {
                     agent_id: params.agent_id,
                     generation: params.generation,
                     command_id: params.command_id,
-                    code: error.code.clone(),
-                    message: error.message.clone(),
+                    error: error.clone(),
                 });
-                discard_unstarted(&mut session).await;
                 return Err(error);
             }
         }
@@ -686,31 +713,33 @@ impl CodexPlugin {
                         "Codex rejected thread/start for the selected profile",
                     )
                 };
+                let error = contextual_error(error, code, message);
+                let error = discard_failed_start(&mut session, error).await;
                 self.failed_start = Some(FailedStart {
                     agent_id: params.agent_id,
                     generation: params.generation,
                     command_id: params.command_id,
-                    code: code.to_owned(),
-                    message: message.to_owned(),
+                    error: error.clone(),
                 });
-                discard_unstarted(&mut session).await;
-                return Err(Error::new(code, message));
+                return Err(error);
             }
             Err(error) if native_no_write(&error.code) => {
                 let message = format!("Codex {thread_method} was not dispatched");
+                let code = error.code.clone();
+                let error = contextual_error(error, code, message);
+                let error = discard_failed_start(&mut session, error).await;
                 self.failed_start = Some(FailedStart {
                     agent_id: params.agent_id,
                     generation: params.generation,
                     command_id: params.command_id,
-                    code: error.code.clone(),
-                    message: message.clone(),
+                    error: error.clone(),
                 });
-                discard_unstarted(&mut session).await;
-                return Err(Error::new(error.code, message));
+                return Err(error);
             }
-            Err(_) => {
+            Err(error) => {
                 self.session = Some(session);
-                return Err(Error::new(
+                return Err(contextual_error(
+                    error,
                     "unknown",
                     format!(
                         "Codex {thread_method} may have changed native state; it will not be repeated"
@@ -862,7 +891,9 @@ impl CodexPlugin {
             client
                 .call("initialize", init_value, Instant::now() + RPC_TIMEOUT)
                 .await
-                .map_err(|_| Error::new("profile_error", "Codex app-server initialize failed"))?,
+                .map_err(|error| {
+                    contextual_error(error, "profile_error", "Codex app-server initialize failed")
+                })?,
         )
         .map_err(|_| {
             Error::new(
@@ -889,8 +920,9 @@ impl CodexPlugin {
         client
             .notify("initialized", None, Instant::now() + RPC_TIMEOUT)
             .await
-            .map_err(|_| {
-                Error::new(
+            .map_err(|error| {
+                contextual_error(
+                    error,
                     "profile_error",
                     "Codex app-server did not accept initialized",
                 )
@@ -903,7 +935,9 @@ impl CodexPlugin {
                 Instant::now() + RPC_TIMEOUT,
             )
             .await
-            .map_err(|_| Error::new("profile_error", "Codex account/read failed"))?;
+            .map_err(|error| {
+                contextual_error(error, "profile_error", "Codex account/read failed")
+            })?;
         if account
             .get("account")
             .and_then(|value| value.get("type"))
@@ -926,8 +960,9 @@ impl CodexPlugin {
                 Instant::now() + RPC_TIMEOUT,
             )
             .await
-            .map_err(|_| {
-                Error::new(
+            .map_err(|error| {
+                contextual_error(
+                    error,
                     "profile_error",
                     "Codex config/read could not verify the per-process route",
                 )
@@ -1691,13 +1726,11 @@ async fn register_native_process(
         )
         .await
         .map_err(|error| {
-            Error::new(
-                "process_registration",
-                format!(
-                    "Codex app-server process registration failed ({})",
-                    error.code
-                ),
-            )
+            let message = format!(
+                "Codex app-server process registration failed ({})",
+                error.code
+            );
+            contextual_error(error, "process_registration", message)
         })?;
     let record: ProcessRecord = serde_json::from_value(value).map_err(|_| {
         Error::new(
@@ -1730,6 +1763,11 @@ async fn discard_unstarted(session: &mut AgentSession) {
     session.phase = SessionPhase::Stopped;
 }
 
+async fn discard_failed_start(session: &mut AgentSession, error: Error) -> Error {
+    discard_unstarted(session).await;
+    session.native_client.diagnostic_error(error)
+}
+
 async fn discover_model(client: &NativeClient, requested_model: &str) -> Result<NativeModelEntry> {
     let mut cursor: Option<String> = None;
     let mut seen_cursors = HashSet::new();
@@ -1748,8 +1786,9 @@ async fn discover_model(client: &NativeClient, requested_model: &str) -> Result<
                 Instant::now() + RPC_TIMEOUT,
             )
             .await
-            .map_err(|_| {
-                Error::new(
+            .map_err(|error| {
+                contextual_error(
+                    error,
                     "profile_error",
                     "Codex model/list did not return a catalogue page",
                 )
@@ -2362,6 +2401,14 @@ fn native_no_write(code: &str) -> bool {
     matches!(code, "native_not_dispatched" | "busy" | "frame_too_large")
 }
 
+pub(crate) fn contextual_error(
+    error: Error,
+    code: impl Into<String>,
+    message: impl Into<String>,
+) -> Error {
+    error.with_code(code).with_message(message)
+}
+
 fn optional_profile_text(
     profile: &serde_json::Map<String, Value>,
     key: &str,
@@ -2401,7 +2448,7 @@ fn target_environment(environment: Option<&Value>) -> Result<TargetEnvironment> 
         let value = value.as_str().ok_or_else(|| {
             Error::new("profile_error", "Codex environment values must be strings")
         })?;
-        if is_secret_name(name) && value.len() >= 4 {
+        if is_secret_name(name) && !value.is_empty() {
             secrets.push(value.to_owned());
         }
         vars.push((OsString::from(name), OsString::from(value)));
@@ -2422,12 +2469,7 @@ fn is_secret_name(name: &str) -> bool {
 }
 
 fn redact(text: &str, secrets: &[String]) -> String {
-    secrets
-        .iter()
-        .filter(|secret| secret.len() >= 4)
-        .fold(text.to_owned(), |value, secret| {
-            value.replace(secret, "[REDACTED]")
-        })
+    SecretPolicy::new(secrets.iter().cloned()).redact_text(text)
 }
 
 fn app_server_args() -> Vec<OsString> {

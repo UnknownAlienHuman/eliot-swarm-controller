@@ -336,6 +336,7 @@ enum PluginCommand {
 struct Failure {
     exit_code: u8,
     message: String,
+    diagnostics: Vec<eliot_core::StderrDiagnostic>,
 }
 
 impl Failure {
@@ -343,6 +344,7 @@ impl Failure {
         Self {
             exit_code,
             message: message.into(),
+            diagnostics: Vec::new(),
         }
     }
 
@@ -369,11 +371,29 @@ impl Failure {
                 _ => 4,
             }
         };
-        Self::new(exit_code, error.to_string())
+        let mut failure = Self::new(exit_code, error.to_string());
+        failure.diagnostics = error.diagnostics;
+        eliot_core::bound_stderr_diagnostics(
+            &mut failure.diagnostics,
+            eliot_core::MAX_STDERR_DIAGNOSTIC_BYTES,
+        );
+        failure
     }
 
     fn timeout() -> Self {
         Self::new(5, "wait timed out; the admitted command was not cancelled")
+    }
+
+    fn from_command(exit_code: u8, message: impl Into<String>, command: &Value) -> Self {
+        let mut failure = Self::new(exit_code, message);
+        if let Some(value) = command.pointer("/outcome/diagnostics") {
+            failure.diagnostics = serde_json::from_value(value.clone()).unwrap_or_default();
+            eliot_core::bound_stderr_diagnostics(
+                &mut failure.diagnostics,
+                eliot_core::MAX_STDERR_DIAGNOSTIC_BYTES,
+            );
+        }
+        failure
     }
 }
 
@@ -393,6 +413,13 @@ async fn main() -> ExitCode {
 
 fn report_failure(failure: Failure) -> ExitCode {
     eprintln!("error: {}", failure.message);
+    if !failure.diagnostics.is_empty()
+        && let Ok(diagnostics) = serde_json::to_string(&failure.diagnostics)
+    {
+        // Escaped structured text preserves both actual stderr sources and their
+        // truncation/EOF/read-error flags without terminal control sequences.
+        eprintln!("stderr diagnostics: {diagnostics}");
+    }
     ExitCode::from(failure.exit_code)
 }
 
@@ -1045,15 +1072,21 @@ fn start_daemon(data_dir: &Path, json_output: bool) -> Result<(), Failure> {
             .arg("--foreground")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
+            // The daemon opens its authoritative private logs/daemon.log only
+            // after validating the root and holding its single-owner lock.
             .stderr(Stdio::null());
         command
             .spawn()
             .map_err(|error| Failure::new(1, format!("cannot start daemon: {error}")))?;
     }
+    let log_path = data_dir.join("logs").join("daemon.log");
     if json_output {
-        print_value(&json!({ "state": "starting" }), true);
+        print_value(
+            &json!({ "state": "starting", "log": log_path.to_string_lossy() }),
+            true,
+        );
     } else {
-        println!("daemon starting");
+        println!("daemon starting; diagnostics: {}", log_path.display());
     }
     Ok(())
 }
@@ -1278,10 +1311,18 @@ async fn wait_for_turn(
 fn command_state_result(command: &Value) -> Result<bool, Failure> {
     match command.get("state").and_then(Value::as_str) {
         Some("applied") => Ok(true),
-        Some("rejected") => Err(Failure::new(3, "command was rejected before native I/O")),
-        Some("failed") => Err(Failure::new(1, "command failed")),
-        Some("unknown") => Err(Failure::new(4, "command outcome is unknown")),
-        Some("cancelled") => Err(Failure::new(1, "command was cancelled")),
+        Some("rejected") => Err(Failure::from_command(
+            3,
+            "command was rejected before native I/O",
+            command,
+        )),
+        Some("failed") => Err(Failure::from_command(1, "command failed", command)),
+        Some("unknown") => Err(Failure::from_command(
+            4,
+            "command outcome is unknown",
+            command,
+        )),
+        Some("cancelled") => Err(Failure::from_command(1, "command was cancelled", command)),
         Some("accepted" | "queued" | "dispatched") => Ok(false),
         Some(state) => Err(Failure::new(
             4,

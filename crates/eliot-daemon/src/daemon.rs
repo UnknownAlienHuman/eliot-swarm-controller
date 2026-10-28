@@ -1,14 +1,18 @@
 use crate::{
     bus::Bus,
-    platform::{DataDir, IpcListener, IpcStream},
+    logging,
+    platform::{DataDir, IpcListener, IpcStream, data_dir::DaemonLock},
     router::Router,
 };
-use eliot_core::{Error, Result};
+use eliot_core::{
+    Error, MAX_STDERR_DIAGNOSTIC_BYTES, Result, SecretPolicy, bound_stderr_diagnostics,
+};
 use eliot_plugin::{RpcError, RpcRequest, RpcResponse};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 use tokio::{
@@ -28,6 +32,28 @@ const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(35);
 pub async fn run(path: PathBuf) -> Result<()> {
     let data_dir = DataDir::open(&path)?;
     let daemon_lock = data_dir.acquire_daemon_lock()?;
+    let _log = logging::init(&data_dir, &daemon_lock)?;
+    let policy = Arc::new(SecretPolicy::new([data_dir.owner_token()]));
+    logging::record(&policy, "daemon.starting", &[], None);
+    let outcome = run_owned(&data_dir, &daemon_lock, Arc::clone(&policy)).await;
+    logging::record(
+        &policy,
+        if outcome.is_ok() {
+            "daemon.stopped"
+        } else {
+            "daemon.failed"
+        },
+        &[],
+        outcome.as_ref().err(),
+    );
+    outcome
+}
+
+async fn run_owned(
+    data_dir: &DataDir,
+    daemon_lock: &DaemonLock,
+    policy: Arc<SecretPolicy>,
+) -> Result<()> {
     let store_path = data_dir.path().join("eliot.db");
     let store = eliot_store::Store::open(&store_path)?;
     let store = std::sync::Arc::new(Mutex::new(store));
@@ -47,8 +73,10 @@ pub async fn run(path: PathBuf) -> Result<()> {
     };
     router.note_events(&recovered);
 
-    let mut listener = IpcListener::bind(&data_dir, &daemon_lock).await?;
-    data_dir.publish_daemon(&daemon_lock, listener.endpoint(), env!("CARGO_PKG_VERSION"))?;
+    let mut listener = IpcListener::bind(data_dir, daemon_lock).await?;
+    let info =
+        data_dir.publish_daemon(daemon_lock, listener.endpoint(), env!("CARGO_PKG_VERSION"))?;
+    logging::record(&policy, "daemon.ready", &[("boot_id", &info.boot_id)], None);
 
     let (monitor_stop, monitor_shutdown) = watch::channel(false);
     let mut background = JoinSet::new();
@@ -70,8 +98,9 @@ pub async fn run(path: PathBuf) -> Result<()> {
                 match accepted {
                     Ok(stream) if connections.len() < MAX_CLIENTS => {
                         let router = router.clone();
+                        let policy = Arc::clone(&policy);
                         connections.spawn(async move {
-                            serve_connection(stream, router).await;
+                            serve_connection(stream, router, policy).await;
                         });
                     }
                     Ok(_stream) => {}
@@ -90,19 +119,37 @@ pub async fn run(path: PathBuf) -> Result<()> {
             }
             joined = background.join_next(), if !background.is_empty() => {
                 match joined {
-                    Some(Ok(Err(error))) => monitoring.mark_unavailable(&error.code),
-                    Some(Err(_)) => monitoring.mark_unavailable("monitor_task_failed"),
-                    _ => monitoring.mark_unavailable("monitor_task_stopped"),
+                    Some(Ok(Err(error))) => {
+                        logging::record(&policy, "daemon.monitor_failed", &[], Some(&error));
+                        monitoring.mark_unavailable(&error.code);
+                    }
+                    Some(Err(_)) => {
+                        logging::record(&policy, "daemon.monitor_task_failed", &[], None);
+                        monitoring.mark_unavailable("monitor_task_failed");
+                    }
+                    _ => {
+                        logging::record(&policy, "daemon.monitor_task_stopped", &[], None);
+                        monitoring.mark_unavailable("monitor_task_stopped");
+                    }
                 }
             }
             joined = recovery.join_next(), if !recovery.is_empty() => {
                 match joined {
                     Some(Ok(Ok(()))) => {}
-                    Some(Ok(Err(error))) => router.note_workspace_recovery_failure(&error.code),
-                    _ => router.note_workspace_recovery_failure("workspace_recovery_task_failed"),
+                    Some(Ok(Err(error))) => {
+                        logging::record(&policy, "daemon.workspace_recovery_failed", &[], Some(&error));
+                        router.note_workspace_recovery_failure(&error.code);
+                    }
+                    _ => {
+                        logging::record(&policy, "daemon.workspace_recovery_task_failed", &[], None);
+                        router.note_workspace_recovery_failure("workspace_recovery_task_failed");
+                    }
                 }
             }
             joined = connections.join_next(), if !connections.is_empty() => {
+                if matches!(joined, Some(Err(_))) {
+                    logging::record(&policy, "daemon.connection_task_failed", &[], None);
+                }
                 let _ = joined;
             }
             signal = tokio::signal::ctrl_c() => {
@@ -112,6 +159,7 @@ pub async fn run(path: PathBuf) -> Result<()> {
                         format!("listen for shutdown signal: {error}"),
                     ));
                 }
+                logging::record(&policy, "daemon.force_requested", &[], None);
                 router.request_force();
             }
         }
@@ -168,6 +216,10 @@ pub async fn client_call(path: &Path, method: &str, params: Value) -> Result<Val
             "credential": token,
         }),
     };
+    let policy = SecretPolicy::new([
+        data_dir.owner_token(),
+        auth["credential"].as_str().unwrap_or(""),
+    ]);
     let mut envelope = serde_json::Map::new();
     envelope.insert("_auth".to_owned(), auth);
     envelope.insert("_payload".to_owned(), params.clone());
@@ -216,7 +268,7 @@ pub async fn client_call(path: &Path, method: &str, params: Value) -> Result<Val
         }
         match (response.result, response.error) {
             (Some(value), None) => Ok(value),
-            (None, Some(error)) => Err(core_error(error)),
+            (None, Some(error)) => Err(core_error(error, &policy)),
             _ => Err(Error::new(
                 "invalid",
                 "daemon response must contain exactly one result or error",
@@ -227,7 +279,7 @@ pub async fn client_call(path: &Path, method: &str, params: Value) -> Result<Val
     .map_err(|_| Error::new("unknown", "daemon RPC exceeded its absolute deadline"))?
 }
 
-async fn serve_connection(stream: IpcStream, router: Router) {
+async fn serve_connection(stream: IpcStream, router: Router, policy: Arc<SecretPolicy>) {
     let mut framed = Framed::new(
         stream,
         LinesCodec::new_with_max_length(MAX_RPC_FRAME_BYTES.saturating_sub(1)),
@@ -249,12 +301,15 @@ async fn serve_connection(stream: IpcStream, router: Router) {
                                 error: None,
                             }
                         }
-                        Err(error) => RpcResponse {
-                            jsonrpc: "2.0".to_owned(),
-                            id: request.id,
-                            result: None,
-                            error: Some(rpc_error(error)),
-                        },
+                        Err(error) => {
+                            logging::record(&policy, "rpc.error", &[], Some(&error));
+                            RpcResponse {
+                                jsonrpc: "2.0".to_owned(),
+                                id: request.id,
+                                result: None,
+                                error: Some(rpc_error(error, &policy)),
+                            }
+                        }
                     }
                 }
                 Err((id, error)) => RpcResponse {
@@ -299,7 +354,9 @@ async fn serve_connection(stream: IpcStream, router: Router) {
             }
         }
     };
-    let _ = send_result;
+    if send_result.is_err() {
+        logging::record(&policy, "rpc.response_write_failed", &[], None);
+    }
     router.response_finished(arm_shutdown);
 }
 
@@ -358,27 +415,56 @@ fn decode_request(line: &str) -> std::result::Result<RpcRequest, (Value, RpcErro
     Ok(request)
 }
 
-fn rpc_error(error: Error) -> RpcError {
+fn rpc_error(mut error: Error, policy: &SecretPolicy) -> RpcError {
+    error.message = policy
+        .redact_text(&error.message)
+        .chars()
+        .take(1_024)
+        .collect();
+    for diagnostic in &mut error.diagnostics {
+        diagnostic.snapshot.text = policy.redact_text(&diagnostic.snapshot.text);
+    }
+    bound_stderr_diagnostics(&mut error.diagnostics, MAX_STDERR_DIAGNOSTIC_BYTES);
     let code = match error.code.as_str() {
         "unsupported" => -32601,
         "invalid" | "frame_too_large" => -32602,
         _ => -32000,
     };
+    let mut data = serde_json::to_value(&error).unwrap_or_else(|_| json!({"code": error.code}));
+    if let Some(object) = data.as_object_mut() {
+        object.remove("message");
+    }
     RpcError {
         code,
-        message: error.message.chars().take(1_024).collect(),
-        data: Some(json!({"code": error.code})),
+        message: error.message,
+        data: Some(data),
     }
 }
 
-fn core_error(error: RpcError) -> Error {
-    let code = error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
+fn core_error(error: RpcError, policy: &SecretPolicy) -> Error {
+    let mut data = error.data.unwrap_or_else(|| json!({}));
+    let code = data
+        .get("code")
         .and_then(Value::as_str)
-        .unwrap_or("internal");
-    Error::new(code, error.message)
+        .unwrap_or("internal")
+        .to_owned();
+    let message = policy.redact_text(&error.message);
+    if let Some(values) = data.get_mut("diagnostics").and_then(Value::as_array_mut) {
+        for diagnostic in values.iter_mut().take(2) {
+            if let Some(Value::String(text)) = diagnostic.pointer_mut("/snapshot/text") {
+                *text = policy.redact_text(text);
+            }
+        }
+    }
+    let Some(object) = data.as_object_mut() else {
+        return Error::new(code, message);
+    };
+    object.insert("code".to_owned(), json!(code));
+    object.insert("message".to_owned(), json!(message));
+    let mut result =
+        serde_json::from_value::<Error>(data).unwrap_or_else(|_| Error::new(code, message));
+    bound_stderr_diagnostics(&mut result.diagnostics, MAX_STDERR_DIAGNOSTIC_BYTES);
+    result
 }
 
 enum ClientIdentity {
@@ -475,4 +561,50 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
         .as_millis()
         .min(i64::MAX as u128) as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eliot_core::{MAX_STDERR_BYTES, StderrDiagnostic, StderrSnapshot, StderrSource};
+
+    #[test]
+    fn rpc_error_preserves_both_sources_and_primary_code_with_expanding_redaction() {
+        let policy = SecretPolicy::new(["!"]);
+        let mut original = Error::new("unknown", "same primary message");
+        original.diagnostics = [StderrSource::Plugin, StderrSource::Harness]
+            .into_iter()
+            .map(|source| StderrDiagnostic {
+                source,
+                snapshot: StderrSnapshot {
+                    text: "!\0".repeat(MAX_STDERR_BYTES / 2),
+                    truncated: false,
+                    eof: true,
+                    read_error: false,
+                },
+            })
+            .collect();
+        let wire = rpc_error(original, &policy);
+        assert!(serde_json::to_vec(&wire).unwrap().len() <= 64 * 1024);
+        let restored = core_error(wire, &policy);
+        assert_eq!(restored.code, "unknown");
+        assert_eq!(restored.message, "same primary message");
+        assert_eq!(restored.diagnostics.len(), 2);
+        assert!(
+            restored
+                .diagnostics
+                .iter()
+                .any(|tail| tail.source == StderrSource::Plugin)
+        );
+        assert!(
+            restored
+                .diagnostics
+                .iter()
+                .any(|tail| tail.source == StderrSource::Harness)
+        );
+        for diagnostic in &restored.diagnostics {
+            assert!(diagnostic.snapshot.truncated);
+            assert!(!diagnostic.snapshot.text.contains('!'));
+        }
+    }
 }

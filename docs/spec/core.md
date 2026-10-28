@@ -296,6 +296,28 @@ prove no effect; generic errors/timeouts may not. Restart makes dispatched work 
 only still-current undispatched work may continue. No external effect is automatically
 re-executed merely because it failed or became unknown.
 
+`Error` keeps its caller-facing `{code,message}` and may carry an optional bounded
+`diagnostics` list. Each `StderrDiagnostic` identifies `plugin` or `harness` and contains
+a `StderrSnapshot {text,truncated,eof,read_error}`. The list has at most one entry per
+source and at most two entries total; each redacted text tail is at most 16 KiB. The
+encoded diagnostics array is capped at 16 KiB aggregate, including escaping. Error
+serialization uses only the remaining space under its 64 KiB encoded bound after the
+primary code/message. These fields are non-authoritative and never change command/source
+settlement.
+
+`SecretPolicy` is the canonical literal-secret match/redaction policy for diagnostics and
+credential-bearing values. It ignores empty values, deduplicates and matches longer known
+secrets first, including short secrets; call sites do not set their own minimum length.
+Streaming redaction withholds a possible secret prefix across read chunks. Apply the same
+policy before stderr bytes enter a retained tail or log; never persist credentials in
+semantic event data. `contains_value` checks object keys and string values;
+`redact_values` changes string values but never rewrites keys or immutable identifiers.
+`logging::record(&SecretPolicy,code:&str,ids:&[(&str,&str)],error:Option<&Error>)->()`
+receives bounded identifiers and an optional `Error`, but records only the code, those
+identifiers and structured sanitized tails, applying that policy to the code and ID
+values. It does not log `Error.message`, request data or environment values. Failure to
+record a diagnostic cannot alter the external-effect result.
+
 ## Storage
 
 Use bundled SQLite, WAL, synchronous FULL, one writer and bounded read queries. Commit

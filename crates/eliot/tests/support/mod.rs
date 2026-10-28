@@ -111,10 +111,9 @@ impl Reply {
     pub fn json(self) -> Value {
         assert!(
             self.status.success(),
-            "CLI {} exit {:?}: {}",
+            "CLI {} exit {:?}; stderr omitted because a redaction regression may contain credentials",
             self.context,
-            self.status.code(),
-            self.stderr
+            self.status.code()
         );
         serde_json::from_str(&self.stdout).expect("CLI JSON response")
     }
@@ -238,9 +237,13 @@ impl Fixture {
                     command["state"].as_str(),
                     Some("accepted" | "queued" | "dispatched")
                 ),
-                "unexpected command outcome: {command}"
+                "unexpected command state {}; private outcome deliberately omitted",
+                command["state"]
             );
-            assert!(Instant::now() < deadline, "command deadline: {command}");
+            assert!(
+                Instant::now() < deadline,
+                "command readback deadline; private outcome deliberately omitted"
+            );
             thread::sleep(Duration::from_millis(25));
         }
     }

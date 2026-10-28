@@ -1,4 +1,4 @@
-use eliot_core::{Error, NativeEvent, Result, SourceBatch};
+use eliot_core::{Error, NativeEvent, Result, SecretPolicy, SourceBatch};
 use eliot_plugin::{CommitSink, MAX_EVENT_BYTES, PeerClient, protocol::MAX_COMMAND_ID_BYTES};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1580,10 +1580,5 @@ fn turn_status(status: &NativeTurnStatus) -> String {
 }
 
 fn redact(text: &str, secrets: &[String]) -> String {
-    secrets
-        .iter()
-        .filter(|secret| secret.len() >= 4)
-        .fold(text.to_owned(), |value, secret| {
-            value.replace(secret, "[REDACTED]")
-        })
+    SecretPolicy::new(secrets.iter().cloned()).redact_text(text)
 }

@@ -5,8 +5,9 @@ use crate::{
     workspaces::WorkspaceManager,
 };
 use eliot_core::{
-    Agent, AgentState, Command, CommandState, Error, Event, ProcessIdentity, Result, SubmitCommand,
-    Turn, TurnState, WorkspacePhase, WorkspacePreparationInput, classify_dispatched_error,
+    Agent, AgentState, Command, CommandState, Error, Event, ProcessIdentity, Result, SecretPolicy,
+    SubmitCommand, Turn, TurnState, WorkspacePhase, WorkspacePreparationInput,
+    classify_dispatched_error,
 };
 use eliot_plugin::{
     MAX_EVENT_BYTES, MAX_OBSERVATION_CURSOR_BYTES, MAX_OBSERVATION_PAGE_BYTES, ObservationPage,
@@ -1952,11 +1953,15 @@ impl Router {
                     .await
                 {
                     Ok(value) => {
-                        let summary = json!({
+                        let mut summary = json!({
                             "state": "applied",
                             "custody": value.get("custody").cloned().unwrap_or(Value::Null),
                             "graceful": value.get("graceful").cloned().unwrap_or(Value::Bool(false)),
                         });
+                        if let Some(diagnostics) = value.get("diagnostics") {
+                            summary["diagnostics"] = diagnostics.clone();
+                        }
+                        self.redact_native_value(&mut summary);
                         let _ = self.settle(&id, CommandState::Applied, Some(summary)).await;
                         Ok(value)
                     }
@@ -2119,7 +2124,7 @@ impl Router {
     }
 
     fn redact_native_value(&self, value: &mut Value) {
-        let mut secrets = self
+        let secrets = self
             .inner
             .secrets
             .lock()
@@ -2127,8 +2132,7 @@ impl Router {
             .iter()
             .cloned()
             .collect::<Vec<_>>();
-        secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
-        crate::redaction::redact_value(value, &secrets);
+        crate::redaction::redact_outcome(value, &secrets);
     }
 
     async fn settle_plugin_error(&self, id: &str, error: &Error) {
@@ -2136,45 +2140,64 @@ impl Router {
             let store = self.inner.store.lock().await;
             store.get_command(id)
         };
-        let (current_state, command_target) = match current {
-            Ok(Some(command)) => (Some(command.state), command.target.zip(command.generation)),
-            _ => (None, None),
+        let (current_state, command_target, previous_outcome) = match current {
+            Ok(Some(command)) => (
+                Some(command.state),
+                command.target.zip(command.generation),
+                command.outcome,
+            ),
+            _ => (None, None, None),
         };
         let late_batch_cause = command_target.as_ref().and_then(|(agent, generation)| {
             self.inner
                 .plugin_host
                 .take_late_batch_cause(agent, *generation)
         });
-        if current_state.is_some_and(|state| state.is_terminal() || state == CommandState::Unknown)
+        let secrets = self
+            .inner
+            .secrets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let error = crate::redaction::redact_error(error.clone(), &secrets);
+        crate::logging::record(
+            &SecretPolicy::new(&secrets),
+            &error.code,
+            &[("command", id)],
+            Some(&error),
+        );
+        if current_state.is_some_and(|state| state.is_terminal())
+            || current_state == Some(CommandState::Unknown) && error.diagnostics.is_empty()
         {
             return;
         }
-        let error = {
-            let mut secrets = self
-                .inner
-                .secrets
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>();
-            secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
-            Error::new(
-                error.code.clone(),
-                crate::redaction::redact_text(&error.message, &secrets),
-            )
+        let state = if current_state == Some(CommandState::Unknown) {
+            CommandState::Unknown
+        } else {
+            classify_dispatched_error(&error.code)
         };
-        let state = classify_dispatched_error(&error.code);
         let cause = if state == CommandState::Unknown {
             late_batch_cause.unwrap_or_else(|| unknown_cause(&error))
         } else {
             String::new()
         };
-        let mut outcome = if state == CommandState::Unknown {
+        let mut outcome = if current_state == Some(CommandState::Unknown) {
+            previous_outcome.unwrap_or_else(|| json!({}))
+        } else if state == CommandState::Unknown {
             json!({"code": error.code, "cause": cause})
         } else {
             json!({"code": error.code})
         };
+        for diagnostic in &error.diagnostics {
+            crate::redaction::attach_stderr(
+                &mut outcome,
+                diagnostic.source,
+                diagnostic.snapshot.clone(),
+                &secrets,
+            );
+        }
         self.redact_native_value(&mut outcome);
         let _ = self.settle(id, state, Some(outcome)).await;
     }
@@ -2183,8 +2206,17 @@ impl Router {
         &self,
         id: &str,
         state: CommandState,
-        outcome: Option<Value>,
+        mut outcome: Option<Value>,
     ) -> Option<Command> {
+        if let Some(outcome) = outcome.as_mut() {
+            let envelope = json!({"command_id": id, "state": state, "outcome": null});
+            let overhead = serde_json::to_vec(&envelope)
+                .map_or(usize::MAX, |bytes| bytes.len().saturating_sub(4));
+            crate::redaction::bound_outcome_diagnostics(
+                outcome,
+                MAX_EVENT_BYTES.saturating_sub(overhead),
+            );
+        }
         let persistence_cause = outcome
             .as_ref()
             .and_then(|value| value.get("cause"))
