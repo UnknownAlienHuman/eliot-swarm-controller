@@ -6,10 +6,13 @@ mod support;
 mod windows_process;
 
 use eliot_core::api::{
-    AgentDiscoverRequest, AgentHistoryRequest, AgentResultRequest, AgentResultResponse,
-    CommandGetRequest, DiscoverPage, EventsFilter, EventsReadRequest, EventsReadResponse,
+    AgentDiscoverRequest, AgentEditsRequest, AgentEditsResponse, AgentGetRequest, AgentGetResponse,
+    AgentGitRequest, AgentGitResponse, AgentHistoryRequest, AgentListRequest, AgentListResponse,
+    AgentProcessesRequest, AgentProcessesResponse, AgentResultRequest, AgentResultResponse,
+    AgentStatsRequest, AgentStatsResponse, CommandGetRequest, DaemonStatusRequest,
+    DaemonStatusResponse, DiscoverPage, EventsFilter, EventsReadRequest, EventsReadResponse,
     EventsSubscribeRequest, EventsSubscribeResponse, MAX_OBSERVATION_CURSOR_BYTES, ObservationPage,
-    TurnGetRequest,
+    PROCESS_CURSOR_MAX_BYTES, TurnGetRequest,
 };
 use eliot_core::{Command as CoreCommand, CommandState, Turn as CoreTurn, TurnState};
 use serde_json::{Value, json};
@@ -48,6 +51,706 @@ fn assert_invalid_read_rpc(
         Ok(_) => panic!("{method} accepted malformed {field}"),
     };
     assert_eq!(error.code, "invalid", "{method} malformed {field}");
+}
+
+#[test]
+fn public_agent_views_validate_without_mutation() {
+    let mut fixture = Fixture::new("typed Agent view validation");
+    fixture.start();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("public view RPC runtime");
+    let before: EventsReadResponse = serde_json::from_value(
+        public_read_rpc(&runtime, &fixture, "events.read", json!({}))
+            .unwrap_or_else(|_| panic!("view baseline failed")),
+    )
+    .expect("typed event boundary");
+    assert_eq!(before.high_water, 0);
+    for method in [
+        "agent.get",
+        "agent.list",
+        "agent.processes",
+        "agent.stats",
+        "agent.git",
+        "agent.edits",
+        "daemon.status",
+    ] {
+        for params in [
+            Value::Null,
+            json!([]),
+            json!(true),
+            json!("object-required"),
+        ] {
+            assert_invalid_read_rpc(&runtime, &fixture, method, "object params", params);
+        }
+        let mut params = if matches!(method, "agent.list" | "daemon.status") {
+            json!({})
+        } else {
+            json!({"id":"a1"})
+        };
+        params["extra"] = json!(true);
+        assert_invalid_read_rpc(&runtime, &fixture, method, "unknown key", params);
+    }
+    for method in [
+        "agent.get",
+        "agent.processes",
+        "agent.stats",
+        "agent.git",
+        "agent.edits",
+    ] {
+        assert_invalid_read_rpc(&runtime, &fixture, method, "missing id", json!({}));
+        for id in [
+            Value::Null,
+            json!(1),
+            json!(false),
+            json!([]),
+            json!({}),
+            json!(""),
+            json!(" \t\n"),
+        ] {
+            assert_invalid_read_rpc(&runtime, &fixture, method, "id type", json!({"id":id}));
+        }
+    }
+    for method in ["agent.processes", "agent.stats", "agent.git", "agent.edits"] {
+        for generation in [
+            json!(-1),
+            json!(u64::MAX),
+            json!("0"),
+            json!(false),
+            json!(1.0),
+            json!([]),
+            json!({}),
+        ] {
+            assert_invalid_read_rpc(
+                &runtime,
+                &fixture,
+                method,
+                "generation type",
+                json!({"id":"a1","generation":generation}),
+            );
+        }
+    }
+    for method in ["agent.list", "agent.processes", "agent.edits"] {
+        for limit in [
+            Value::Null,
+            json!(0),
+            json!(-1),
+            json!(1001),
+            json!("1"),
+            json!(true),
+            json!(1.0),
+            json!(u64::MAX),
+        ] {
+            let mut params = if method == "agent.list" {
+                json!({})
+            } else {
+                json!({"id":"a1"})
+            };
+            params["limit"] = limit;
+            assert_invalid_read_rpc(&runtime, &fixture, method, "limit", params);
+        }
+    }
+    for observations in [Value::Null, json!(0), json!("false"), json!([]), json!({})] {
+        assert_invalid_read_rpc(
+            &runtime,
+            &fixture,
+            "agent.list",
+            "observations",
+            json!({"observations":observations}),
+        );
+    }
+    for method in ["agent.list", "agent.processes"] {
+        for after in [
+            json!(1),
+            json!(true),
+            json!([]),
+            json!({}),
+            json!(""),
+            json!(" \t"),
+        ] {
+            let mut params = if method == "agent.list" {
+                json!({})
+            } else {
+                json!({"id":"a1"})
+            };
+            params["after"] = after;
+            assert_invalid_read_rpc(&runtime, &fixture, method, "after type", params);
+        }
+    }
+    for scope in [
+        json!(1),
+        json!(true),
+        json!([]),
+        json!({}),
+        json!(""),
+        json!(" "),
+        json!("other"),
+        json!(" agent "),
+    ] {
+        assert_invalid_read_rpc(
+            &runtime,
+            &fixture,
+            "agent.processes",
+            "scope",
+            json!({"id":"a1","scope":scope}),
+        );
+    }
+    for after in [
+        json!(1),
+        json!(true),
+        json!([]),
+        json!({}),
+        json!(""),
+        json!("a\0b"),
+        json!("é".repeat(32 * 1024 + 1)),
+    ] {
+        assert_invalid_read_rpc(
+            &runtime,
+            &fixture,
+            "agent.edits",
+            "edit cursor",
+            json!({"id":"a1","after":after}),
+        );
+    }
+    let cursor = json!({"agent":"a1","generation":0,"scope":"agent",
+        "identity":{"host_boot_id":"boot","pid":1,"start_time":1}});
+    for after in [
+        "not-json".to_owned(),
+        "[]".to_owned(),
+        "x".repeat(PROCESS_CURSOR_MAX_BYTES + 1),
+        serde_json::to_string(&cursor["identity"]).expect("obsolete identity cursor"),
+    ] {
+        assert_invalid_read_rpc(
+            &runtime,
+            &fixture,
+            "agent.processes",
+            "cursor wrapper",
+            json!({"id":"a1","after":after}),
+        );
+    }
+    for (field, value) in [
+        ("host_boot_id", json!("")),
+        ("host_boot_id", json!("é".repeat(257))),
+        ("host_boot_id", json!("boot\n")),
+        ("pid", json!(0)),
+        ("pid", json!(u64::from(u32::MAX) + 1)),
+        ("start_time", json!(0)),
+        ("start_time", json!(-1)),
+    ] {
+        let mut invalid = cursor.clone();
+        invalid["identity"][field] = value;
+        assert_invalid_read_rpc(
+            &runtime,
+            &fixture,
+            "agent.processes",
+            "cursor identity",
+            json!({"id":"a1","after":serde_json::to_string(&invalid).expect("invalid cursor wire")}),
+        );
+    }
+    let mut unknown = cursor.clone();
+    unknown["extra"] = json!(true);
+    assert_invalid_read_rpc(
+        &runtime,
+        &fixture,
+        "agent.processes",
+        "cursor unknown key",
+        json!({"id":"a1","after":serde_json::to_string(&unknown).expect("cursor wire")}),
+    );
+
+    for (method, params) in [
+        ("agent.get", json!({"id":"a1"})),
+        ("agent.stats", json!({"id":"a1","generation":null})),
+        ("agent.git", json!({"id":"a1","generation":null})),
+        (
+            "agent.processes",
+            json!({"id":"a1","generation":null,"scope":null,"after":null}),
+        ),
+        (
+            "agent.processes",
+            json!({"id":"a1","scope":"workspace","generation":null}),
+        ),
+        (
+            "agent.processes",
+            json!({"id":"a1","after":serde_json::to_string(&cursor).expect("valid cursor wire")}),
+        ),
+        (
+            "agent.edits",
+            json!({"id":"a1","generation":null,"after":null}),
+        ),
+        ("agent.edits", json!({"id":"a1","after":" "})),
+        (
+            "agent.edits",
+            json!({"id":"a1","after":" ../literal\\path// "}),
+        ),
+        (
+            "agent.edits",
+            json!({"id":"a1","after":"é".repeat(32 * 1024)}),
+        ),
+    ] {
+        let error = match public_read_rpc(&runtime, &fixture, method, params) {
+            Err(error) => error,
+            Ok(_) => panic!("{method} invented an Agent"),
+        };
+        assert_eq!(
+            error.code, "not_found",
+            "{method} tightened valid null/cursor grammar"
+        );
+    }
+    for observations in [None, Some(false), Some(true)] {
+        let mut params = json!({"after":null});
+        if let Some(value) = observations {
+            params["observations"] = json!(value);
+        }
+        let raw = public_read_rpc(&runtime, &fixture, "agent.list", params)
+            .unwrap_or_else(|_| panic!("valid empty Agent list failed"));
+        let reply: AgentListResponse =
+            serde_json::from_value(raw.clone()).expect("typed empty list");
+        assert!(reply.agents.is_empty());
+        assert!(reply.next.is_none());
+        assert!(
+            serde_json::to_value(reply).expect("list wire") == raw,
+            "typed list changed wire fields"
+        );
+    }
+    let raw = public_read_rpc(&runtime, &fixture, "daemon.status", json!({}))
+        .unwrap_or_else(|_| panic!("typed status read failed"));
+    let status: DaemonStatusResponse = serde_json::from_value(raw.clone()).expect("typed status");
+    DaemonStatusRequest::default()
+        .validate_response(&status)
+        .expect("matching empty status");
+    assert_eq!(status.agents, 0);
+    assert!(
+        serde_json::to_value(status).expect("status wire") == raw,
+        "typed status changed nullable fields"
+    );
+    let after: EventsReadResponse = serde_json::from_value(
+        public_read_rpc(&runtime, &fixture, "events.read", json!({}))
+            .unwrap_or_else(|_| panic!("view event readback failed")),
+    )
+    .expect("typed unchanged event boundary");
+    assert_eq!(after.high_water, before.high_water);
+    assert_eq!(after.events, before.events);
+    fixture.stop(false);
+}
+
+fn assert_public_agent_views(
+    fixture: &Fixture,
+    runtime: &tokio::runtime::Runtime,
+    agent: &str,
+    generation: i64,
+    observer: &str,
+) {
+    let commands_before: Vec<_> = fixture
+        .events()
+        .into_iter()
+        .filter(|event| {
+            event["kind"]
+                .as_str()
+                .is_some_and(|kind| kind.starts_with("command."))
+        })
+        .collect();
+    let get = AgentGetRequest::new(agent);
+    let raw = public_read_rpc(
+        runtime,
+        fixture,
+        "agent.get",
+        serde_json::to_value(&get).expect("get request"),
+    )
+    .unwrap_or_else(|_| panic!("Agent view failed"));
+    let reply: AgentGetResponse = serde_json::from_value(raw.clone()).expect("typed Agent view");
+    get.validate_response(&reply).expect("matching Agent view");
+    assert_eq!(reply.agent.generation, generation);
+    assert!(!reply.source_states.is_empty());
+    assert!(
+        serde_json::to_value(reply).expect("get wire") == raw,
+        "typed show changed source states or nulls"
+    );
+    for observations in [false, true] {
+        let request = AgentListRequest {
+            after: None,
+            limit: 1000,
+            observations,
+        };
+        let raw = public_read_rpc(
+            runtime,
+            fixture,
+            "agent.list",
+            serde_json::to_value(&request).expect("list request"),
+        )
+        .unwrap_or_else(|_| panic!("Agent list failed"));
+        let reply: AgentListResponse =
+            serde_json::from_value(raw.clone()).expect("typed Agent list");
+        request
+            .validate_response(&reply)
+            .expect("matching observation selection");
+        assert_eq!(reply.agents.len(), 2);
+        assert!(
+            reply
+                .agents
+                .iter()
+                .all(|row| row.observation.is_some() == observations)
+        );
+        for row in raw["agents"].as_array().expect("raw rows") {
+            assert_eq!(row.get("observation").is_some(), observations);
+        }
+        assert!(
+            serde_json::to_value(reply).expect("list wire") == raw,
+            "typed list changed observation presence"
+        );
+    }
+    let raw = public_read_rpc(runtime, fixture, "agent.list", json!({"limit":1}))
+        .unwrap_or_else(|_| panic!("default Agent list failed"));
+    assert!(raw["agents"][0].get("observation").is_none());
+    let next = raw["next"].as_str().expect("first list cursor");
+    let continued: AgentListResponse = serde_json::from_value(
+        public_read_rpc(
+            runtime,
+            fixture,
+            "agent.list",
+            json!({"after":next,"limit":1}),
+        )
+        .unwrap_or_else(|_| panic!("Agent list continuation failed")),
+    )
+    .expect("typed continued list");
+    assert_eq!(continued.agents.len(), 1);
+    assert_ne!(continued.agents[0].agent.id, raw["agents"][0]["id"]);
+
+    let stats_request = AgentStatsRequest::new(observer);
+    let raw = public_read_rpc(
+        runtime,
+        fixture,
+        "agent.stats",
+        serde_json::to_value(&stats_request).expect("stats request"),
+    )
+    .unwrap_or_else(|_| panic!("detached observer stats failed"));
+    let stats = raw["stats"].as_object().expect("cached stats fields");
+    assert_eq!(stats["available"], false);
+    assert_eq!(stats["ttl_ms"], 4000);
+    for field in [
+        "sampled_at",
+        "age_ms",
+        "complete",
+        "cpu_time_ns",
+        "rss_bytes",
+        "samples",
+    ] {
+        assert!(
+            stats.contains_key(field) && stats[field].is_null(),
+            "unavailable stats fabricated {field}"
+        );
+    }
+    assert!(raw["workspace"].is_null());
+    let reply: AgentStatsResponse =
+        serde_json::from_value(raw.clone()).expect("typed unavailable stats");
+    stats_request
+        .validate_response(&reply)
+        .expect("matching unavailable stats");
+    assert!(
+        serde_json::to_value(reply).expect("stats wire") == raw,
+        "typed stats changed freshness/null fields"
+    );
+    let git_request = AgentGitRequest::new(observer);
+    let raw = public_read_rpc(
+        runtime,
+        fixture,
+        "agent.git",
+        serde_json::to_value(&git_request).expect("Git request"),
+    )
+    .unwrap_or_else(|_| panic!("unavailable Git view failed"));
+    assert_eq!(raw["available"], false);
+    let reply: AgentGitResponse =
+        serde_json::from_value(raw.clone()).expect("typed unavailable Git");
+    git_request
+        .validate_response(&reply)
+        .expect("matching unavailable Git");
+    assert!(
+        serde_json::to_value(reply).expect("Git wire") == raw,
+        "typed Git changed unavailable wire fields"
+    );
+    let raw = public_read_rpc(runtime, fixture, "daemon.status", json!({}))
+        .unwrap_or_else(|_| panic!("daemon status failed"));
+    let status: DaemonStatusResponse =
+        serde_json::from_value(raw.clone()).expect("typed daemon status");
+    DaemonStatusRequest::default()
+        .validate_response(&status)
+        .expect("matching daemon status");
+    assert_eq!(status.agents, 2);
+    assert_eq!(status.observer_readers, 0);
+    assert!(
+        serde_json::to_value(status).expect("status wire") == raw,
+        "typed status changed nullable wire fields"
+    );
+
+    let process_request = AgentProcessesRequest {
+        generation: Some(generation),
+        limit: 1,
+        ..AgentProcessesRequest::new(agent)
+    };
+    let raw = public_read_rpc(
+        runtime,
+        fixture,
+        "agent.processes",
+        serde_json::to_value(&process_request).expect("process request"),
+    )
+    .unwrap_or_else(|_| panic!("Agent process read failed"));
+    assert!(raw.get("scope").is_none());
+    let process_page: AgentProcessesResponse =
+        serde_json::from_value(raw.clone()).expect("typed processes");
+    process_request
+        .validate_response(&process_page)
+        .expect("matching process page");
+    assert!(!process_page.processes.is_empty());
+    assert!(
+        serde_json::to_value(&process_page).expect("process wire") == raw,
+        "typed processes changed default scope wire"
+    );
+    let cursor = process_page
+        .next
+        .as_deref()
+        .expect("nonempty page birth cursor");
+    let continuation = AgentProcessesRequest {
+        after: Some(cursor.to_owned()),
+        ..process_request.clone()
+    };
+    let continued: AgentProcessesResponse = serde_json::from_value(
+        public_read_rpc(
+            runtime,
+            fixture,
+            "agent.processes",
+            serde_json::to_value(&continuation).expect("process continuation"),
+        )
+        .unwrap_or_else(|_| panic!("unchanged process cursor failed")),
+    )
+    .expect("typed process continuation");
+    continuation
+        .validate_response(&continued)
+        .expect("matching process continuation");
+    let parsed: Value = serde_json::from_str(cursor).expect("opaque process cursor wrapper");
+    for (field, value) in [
+        ("agent", json!(observer)),
+        ("generation", json!(generation - 1)),
+        ("scope", json!("workspace")),
+    ] {
+        let mut invalid = parsed.clone();
+        invalid[field] = value;
+        assert_invalid_read_rpc(
+            runtime,
+            fixture,
+            "agent.processes",
+            "resolved cursor binding",
+            json!({"id":agent,"after":serde_json::to_string(&invalid).expect("mismatched cursor")}),
+        );
+    }
+    assert_invalid_read_rpc(
+        runtime,
+        fixture,
+        "agent.processes",
+        "query scope binding",
+        json!({"id":agent,"scope":"workspace","after":cursor}),
+    );
+    let mut overflow = parsed;
+    overflow["identity"]["start_time"] = json!(u64::MAX);
+    assert_invalid_read_rpc(
+        runtime,
+        fixture,
+        "agent.processes",
+        "stored birth range",
+        json!({"id":agent,"generation":generation,"after":serde_json::to_string(&overflow).expect("overflow birth cursor")}),
+    );
+    let workspace_request = AgentProcessesRequest {
+        scope: Some("workspace".to_owned()),
+        ..AgentProcessesRequest::new(agent)
+    };
+    let raw = public_read_rpc(
+        runtime,
+        fixture,
+        "agent.processes",
+        serde_json::to_value(&workspace_request).expect("workspace process request"),
+    )
+    .unwrap_or_else(|_| panic!("exact managed target process view failed"));
+    let workspace_page: AgentProcessesResponse =
+        serde_json::from_value(raw.clone()).expect("typed workspace processes");
+    workspace_request
+        .validate_response(&workspace_page)
+        .expect("matching managed target owner");
+    assert_eq!(workspace_page.generation, generation);
+    assert_eq!(workspace_page.scope.as_deref(), Some("workspace"));
+    assert!(
+        serde_json::to_value(workspace_page).expect("workspace process wire") == raw,
+        "typed workspace scope was lost"
+    );
+
+    for method in ["agent.stats", "agent.git", "agent.processes", "agent.edits"] {
+        let error = match public_read_rpc(
+            runtime,
+            fixture,
+            method,
+            json!({"id":agent,"generation":generation + 1}),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("{method} accepted an unadmitted future generation"),
+        };
+        assert_eq!(error.code, "stale_generation");
+    }
+    let future = match public_read_rpc(
+        runtime,
+        fixture,
+        "agent.processes",
+        json!({"id":agent,"scope":"workspace","generation":generation + 1}),
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("workspace read bypassed exact preparation target"),
+    };
+    assert_eq!(future.code, "stale_generation");
+    for method in ["agent.stats", "agent.git"] {
+        let error = match public_read_rpc(
+            runtime,
+            fixture,
+            method,
+            json!({"id":agent,"generation":generation - 1}),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("{method} accepted a historical current-only query"),
+        };
+        assert_eq!(error.code, "stale_generation");
+    }
+    for method in ["agent.processes", "agent.edits"] {
+        let raw = public_read_rpc(
+            runtime,
+            fixture,
+            method,
+            json!({"id":agent,"generation":generation - 1}),
+        )
+        .unwrap_or_else(|_| panic!("{method} rejected owner historical query"));
+        assert_eq!(raw["generation"], generation - 1);
+    }
+    for after in [" ", " note.txt "] {
+        let edits_request = AgentEditsRequest {
+            after: Some(after.to_owned()),
+            ..AgentEditsRequest::new(agent)
+        };
+        let wire = serde_json::to_value(&edits_request).expect("literal edit cursor");
+        assert_eq!(wire["after"], after);
+        let raw = public_read_rpc(runtime, fixture, "agent.edits", wire)
+            .unwrap_or_else(|_| panic!("literal edit cursor was trimmed or normalized"));
+        let reply: AgentEditsResponse = serde_json::from_value(raw.clone()).expect("typed edits");
+        edits_request
+            .validate_response(&reply)
+            .expect("matching edit cursor result");
+        assert!(reply.edits.is_empty());
+        assert!(
+            serde_json::to_value(reply).expect("edit wire") == raw,
+            "typed edits changed null next"
+        );
+    }
+    // Public grammar preserves the literal string; the existing Store path gate
+    // still rejects it rather than normalizing it into a different cursor.
+    let rejected_path = AgentEditsRequest {
+        after: Some("../literal\\path".to_owned()),
+        ..AgentEditsRequest::new(agent)
+    };
+    let wire = serde_json::to_value(rejected_path).expect("literal rejected cursor");
+    assert_eq!(wire["after"], "../literal\\path");
+    assert_invalid_read_rpc(
+        runtime,
+        fixture,
+        "agent.edits",
+        "unchanged Store path validation",
+        wire,
+    );
+    let generation_argument = generation.to_string();
+    for args in [
+        vec!["status"],
+        vec!["ls"],
+        vec!["top"],
+        vec!["show", observer],
+        vec![
+            "processes",
+            agent,
+            "--generation",
+            &generation_argument,
+            "--limit",
+            "1",
+        ],
+        vec!["stats", observer],
+        vec!["git-status", observer],
+        vec!["edits", agent, "--after", " "],
+    ] {
+        let query = cli(&fixture.data, &args);
+        assert_eq!(query.status.code(), Some(0), "{} read failed", args[0]);
+        assert!(
+            !query.stderr.lines().any(|line| line.starts_with("id=")),
+            "{} used mutation metadata",
+            args[0]
+        );
+        let wire = query.json();
+        match args[0] {
+            "status" => {
+                let reply: DaemonStatusResponse = serde_json::from_value(wire).expect("CLI status");
+                DaemonStatusRequest::default()
+                    .validate_response(&reply)
+                    .expect("CLI status binding");
+            }
+            "ls" | "top" => {
+                let reply: AgentListResponse = serde_json::from_value(wire).expect("CLI list");
+                AgentListRequest {
+                    observations: args[0] == "top",
+                    ..AgentListRequest::default()
+                }
+                .validate_response(&reply)
+                .expect("CLI observation selection");
+            }
+            "show" => {
+                let reply: AgentGetResponse = serde_json::from_value(wire).expect("CLI show");
+                AgentGetRequest::new(observer)
+                    .validate_response(&reply)
+                    .expect("CLI show binding");
+            }
+            "processes" => {
+                let reply: AgentProcessesResponse =
+                    serde_json::from_value(wire).expect("CLI processes");
+                process_request
+                    .validate_response(&reply)
+                    .expect("CLI process binding");
+            }
+            "stats" => {
+                let reply: AgentStatsResponse = serde_json::from_value(wire).expect("CLI stats");
+                stats_request
+                    .validate_response(&reply)
+                    .expect("CLI stats binding");
+            }
+            "git-status" => {
+                let reply: AgentGitResponse = serde_json::from_value(wire).expect("CLI Git");
+                git_request
+                    .validate_response(&reply)
+                    .expect("CLI Git binding");
+            }
+            "edits" => {
+                let reply: AgentEditsResponse = serde_json::from_value(wire).expect("CLI edits");
+                AgentEditsRequest {
+                    after: Some(" ".to_owned()),
+                    ..AgentEditsRequest::new(agent)
+                }
+                .validate_response(&reply)
+                .expect("CLI edit binding");
+            }
+            _ => unreachable!(),
+        }
+    }
+    let commands_after: Vec<_> = fixture
+        .events()
+        .into_iter()
+        .filter(|event| {
+            event["kind"]
+                .as_str()
+                .is_some_and(|kind| kind.starts_with("command."))
+        })
+        .collect();
+    assert!(
+        commands_after == commands_before,
+        "view queries changed command/effect history"
+    );
 }
 
 #[test]
@@ -1506,6 +2209,7 @@ fn fake_discovery_observation_and_worktree_lifecycle() {
         .canonicalize()
         .unwrap();
     assert!(worktree.starts_with(fixture.data.canonicalize().unwrap().join("worktrees")));
+    assert_public_agent_views(&fixture, &runtime, agent, generation, observer);
     let stop = fixture.json(&["stop", agent, "--generation", &generation_argument]);
     fixture.wait_command(stop["command_id"].as_str().unwrap(), "applied");
     let stopped = fixture.json(&["show", agent]);

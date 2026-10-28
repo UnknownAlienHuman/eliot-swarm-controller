@@ -9,8 +9,13 @@ use crate::{
 use eliot_core::{
     Agent, Error, FileChangeHint, GitBaseline, GitHintPage, GitSnapshot, ProcessRecord,
     ProcessSnapshot, ProcessState, Result, SourceGap, WorkspacePreparation,
+    api::{
+        FilesystemInvalidationState, FilesystemInvalidationView, GitObservation, GitView,
+        LivenessBasis, LivenessView, MonitoringSourceState, ObservationData, ObservationView,
+        ProcessStatsView, SourceState, StatsCoverage, WorkspaceObservation, WorkspaceView,
+    },
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
@@ -128,18 +133,29 @@ impl Default for WatchSlot {
 }
 
 impl WatchSlot {
-    fn view(&self) -> Value {
+    fn view(&self) -> FilesystemInvalidationView {
         let state = match (self.active, self.watcher.as_ref()) {
-            (false, _) => "inactive",
-            (true, Some(watcher)) if watcher.is_degraded() => "degraded",
-            (true, Some(_)) => "healthy",
-            (true, None) => "unavailable",
+            (false, _) => FilesystemInvalidationState::Inactive,
+            (true, Some(watcher)) if watcher.is_degraded() => FilesystemInvalidationState::Degraded,
+            (true, Some(_)) => FilesystemInvalidationState::Healthy,
+            (true, None) => FilesystemInvalidationState::Unavailable,
         };
-        json!({
-            "state": state,
-            "retry_after_ms": (self.pending.is_none() && matches!(state, "degraded" | "unavailable"))
-                .then(|| self.retry_at.saturating_duration_since(Instant::now()).as_millis()),
-        })
+        FilesystemInvalidationView {
+            state,
+            retry_after_ms: Some(
+                (self.pending.is_none()
+                    && matches!(
+                        state,
+                        FilesystemInvalidationState::Degraded
+                            | FilesystemInvalidationState::Unavailable
+                    ))
+                .then(|| {
+                    self.retry_at
+                        .saturating_duration_since(Instant::now())
+                        .as_millis()
+                }),
+            ),
+        }
     }
 }
 
@@ -447,7 +463,7 @@ impl Monitoring {
         }
     }
 
-    pub(crate) async fn view(&self, agent: &Agent) -> Result<Value> {
+    pub(crate) async fn view(&self, agent: &Agent) -> Result<ObservationView> {
         let cache = self
             .target(&agent.id, agent.generation)
             .map(|target| {
@@ -480,37 +496,38 @@ impl Monitoring {
         };
         let now = now_ms();
         let model_clock_regressed = last_model_progress.is_some_and(|at| at > now);
-        let mut view = json!({
-            "processes_truncated": processes.len() == PAGE_LIMIT,
-            "processes": processes,
-            "stats": stats_view(&cache, unavailable, now),
-            "liveness": {
-                "state": agent.state,
-                "last_model_progress": last_model_progress,
-                "age_ms": last_model_progress.and_then(|at| age_ms(now, at)),
-                "clock_regressed": model_clock_regressed,
-                "basis": "committed_native_facts",
-                "source_healthy": source_healthy,
-            },
-        });
-        view["workspace"] = match self.workspace_view(agent).await {
+        let workspace = match self.workspace_view(agent).await {
             Ok(workspace) => workspace,
-            Err(error) => json!({"available": false, "error": error.code}),
+            Err(error) => Some(WorkspaceView::unavailable(error.code)),
         };
-        view["git"] = match self.git_view(agent).await {
+        let git = match self.git_view(agent).await {
             Ok(git) => git,
-            Err(error) => json!({"available": false, "error": error.code}),
+            Err(error) => GitView::error(error.code),
         };
-        Ok(view)
+        Ok(ObservationView::Data(Box::new(ObservationData {
+            processes_truncated: processes.len() == PAGE_LIMIT,
+            processes,
+            stats: stats_view(&cache, unavailable, now),
+            liveness: LivenessView {
+                state: agent.state,
+                last_model_progress,
+                age_ms: last_model_progress.and_then(|at| age_ms(now, at)),
+                clock_regressed: model_clock_regressed,
+                basis: LivenessBasis::CommittedNativeFacts,
+                source_healthy,
+            },
+            workspace,
+            git,
+        })))
     }
 
     /// Agent.generation remains native/control state. Workspace observation is
     /// explicitly named by its retained target, including target 1 while Agent is 0.
-    pub(crate) async fn workspace_view(&self, agent: &Agent) -> Result<Value> {
+    pub(crate) async fn workspace_view(&self, agent: &Agent) -> Result<Option<WorkspaceView>> {
         let (preparation, processes, source) = {
             let store = self.inner.store.lock().await;
             let Some(preparation) = store.get_workspace(&agent.id)? else {
-                return Ok(Value::Null);
+                return Ok(None);
             };
             let process_owner = workspace_owner(&agent.id, preparation.target_generation);
             let processes = store.list_processes(&process_owner, None, PAGE_LIMIT)?;
@@ -519,7 +536,10 @@ impl Monitoring {
                 .into_iter()
                 .find(|state| {
                     state.get("source").and_then(Value::as_str) == Some("workspace_process")
-                });
+                })
+                .map(serde_json::from_value::<SourceState>)
+                .transpose()
+                .map_err(|_| Error::new("internal", "invalid workspace source-state projection"))?;
             (preparation, processes, source)
         };
         let cache = self.workspace_cache(&agent.id, preparation.target_generation);
@@ -529,16 +549,16 @@ impl Monitoring {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        Ok(json!({
-            "owner": workspace_owner(&agent.id, preparation.target_generation),
-            "target_generation": preparation.target_generation,
-            "phase": preparation.phase,
-            "setup_index": preparation.setup_index,
-            "processes_truncated": processes.len() == PAGE_LIMIT,
-            "processes": processes,
-            "stats": stats_view(&cache, unavailable, now_ms()),
-            "source": source,
-        }))
+        Ok(Some(WorkspaceView::Data(Box::new(WorkspaceObservation {
+            owner: workspace_owner(&agent.id, preparation.target_generation),
+            target_generation: preparation.target_generation,
+            phase: preparation.phase,
+            setup_index: preparation.setup_index,
+            processes_truncated: processes.len() == PAGE_LIMIT,
+            processes,
+            stats: stats_view(&cache, unavailable, now_ms()),
+            source,
+        }))))
     }
 
     fn workspace_cache(&self, agent: &str, generation: i64) -> Cache {
@@ -597,7 +617,7 @@ impl Monitoring {
         }
     }
 
-    pub(crate) async fn git_view(&self, agent: &Agent) -> Result<Value> {
+    pub(crate) async fn git_view(&self, agent: &Agent) -> Result<GitView> {
         let workspace = agent.workspace.as_deref().ok_or_else(|| {
             Error::new("invalid", "Git observation requires an admitted workspace")
         })?;
@@ -627,7 +647,7 @@ impl Monitoring {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .view()
             })
-            .unwrap_or_else(|| json!({"state": "inactive"}));
+            .unwrap_or_else(FilesystemInvalidationView::inactive);
         let unavailable = self
             .inner
             .git_unavailable
@@ -641,7 +661,10 @@ impl Monitoring {
                 store.list_agent_edits(&agent.id, agent.generation, None, PAGE_LIMIT)?,
                 store
                     .read_source_state(&agent.id, agent.generation, "git")
-                    .ok(),
+                    .ok()
+                    .map(serde_json::from_value::<MonitoringSourceState>)
+                    .transpose()
+                    .map_err(|_| Error::new("internal", "invalid Git source-state projection"))?,
             )
         };
         let snapshot = cache.snapshot.as_ref();
@@ -653,32 +676,38 @@ impl Monitoring {
             || cache.error.is_some()
             || clock_regressed
             || age.is_some_and(|age| age > SAMPLE_TTL_MS);
-        let value = json!({
-            "available": snapshot.is_some() && !stale,
-            "workspace": workspace,
-            "observed_at": sampled_at,
-            "age_ms": age,
-            "ttl_ms": SAMPLE_TTL_MS,
-            "clock_regressed": clock_regressed,
-            "retry_after_ms": cache.next_attempt.saturating_duration_since(Instant::now()).as_millis(),
-            "filesystem_invalidation": invalidation,
-            "head": snapshot.and_then(|snapshot| snapshot.head.as_deref()),
-            "branch": snapshot.and_then(|snapshot| snapshot.branch.as_deref()),
-            "dirty": snapshot.map(|snapshot| &snapshot.dirty),
-            "commits": snapshot.map(|snapshot| &snapshot.commits),
-            "complete": snapshot.map(|snapshot| snapshot.complete),
-            "history_complete": snapshot.map(|snapshot| snapshot.history_complete),
-            "history_gap": snapshot.map(|snapshot| snapshot.history_gap),
-            "base_oid": snapshot.and_then(|snapshot| snapshot.base_oid.as_deref()),
-            "committed_paths": snapshot.map(|snapshot| &snapshot.committed_paths),
-            "base_complete": snapshot.map(|snapshot| snapshot.base_complete),
-            "baseline": baseline,
-            "edits_truncated": edits.len() == PAGE_LIMIT,
-            "edits": edits,
-            "source": source,
-            "error": unavailable.or(cache.error),
-        });
-        self.check_git_value(value.clone())?;
+        let value = GitView::Data(Box::new(GitObservation {
+            available: snapshot.is_some() && !stale,
+            workspace: workspace.to_owned(),
+            observed_at: sampled_at,
+            age_ms: age,
+            ttl_ms: SAMPLE_TTL_MS,
+            clock_regressed,
+            retry_after_ms: cache
+                .next_attempt
+                .saturating_duration_since(Instant::now())
+                .as_millis(),
+            filesystem_invalidation: invalidation,
+            head: snapshot.and_then(|snapshot| snapshot.head.clone()),
+            branch: snapshot.and_then(|snapshot| snapshot.branch.clone()),
+            dirty: snapshot.map(|snapshot| snapshot.dirty.clone()),
+            commits: snapshot.map(|snapshot| snapshot.commits.clone()),
+            complete: snapshot.map(|snapshot| snapshot.complete),
+            history_complete: snapshot.map(|snapshot| snapshot.history_complete),
+            history_gap: snapshot.map(|snapshot| snapshot.history_gap),
+            base_oid: snapshot.and_then(|snapshot| snapshot.base_oid.clone()),
+            committed_paths: snapshot.map(|snapshot| snapshot.committed_paths.clone()),
+            base_complete: snapshot.map(|snapshot| snapshot.base_complete),
+            baseline,
+            edits_truncated: edits.len() == PAGE_LIMIT,
+            edits,
+            source,
+            error: unavailable.or(cache.error),
+        }));
+        self.check_git_value(
+            serde_json::to_value(&value)
+                .map_err(|_| Error::new("internal", "cannot encode Git observation"))?,
+        )?;
         Ok(value)
     }
 
@@ -1605,7 +1634,7 @@ fn age_ms(now: i64, timestamp: i64) -> Option<i64> {
     now.checked_sub(timestamp).filter(|age| *age >= 0)
 }
 
-fn stats_view(cache: &Cache, unavailable: Option<String>, now: i64) -> Value {
+fn stats_view(cache: &Cache, unavailable: Option<String>, now: i64) -> ProcessStatsView {
     let sample_age_ms = cache.sampled_at.and_then(|at| age_ms(now, at));
     let clock_regressed = cache.sampled_at.is_some_and(|at| at > now);
     let stale = unavailable.is_some()
@@ -1614,10 +1643,10 @@ fn stats_view(cache: &Cache, unavailable: Option<String>, now: i64) -> Value {
         || sample_age_ms.is_some_and(|age| age > SAMPLE_TTL_MS);
     let available = cache.snapshot.is_some() && !stale;
     let coverage = match cache.snapshot.as_ref() {
-        None => "unknown",
-        Some(_) if stale => "stale",
-        Some(snapshot) if snapshot.complete => "complete",
-        Some(_) => "partial",
+        None => StatsCoverage::Unknown,
+        Some(_) if stale => StatsCoverage::Stale,
+        Some(snapshot) if snapshot.complete => StatsCoverage::Complete,
+        Some(_) => StatsCoverage::Partial,
     };
     let samples = cache
         .snapshot
@@ -1641,19 +1670,19 @@ fn stats_view(cache: &Cache, unavailable: Option<String>, now: i64) -> Value {
             .iter()
             .try_fold(0_u64, |total, sample| total.checked_add(sample.rss_bytes?))
     });
-    json!({
-        "available": available,
-        "sampled_at": cache.sampled_at,
-        "age_ms": sample_age_ms,
-        "ttl_ms": SAMPLE_TTL_MS,
-        "clock_regressed": clock_regressed,
-        "coverage": coverage,
-        "complete": cache.snapshot.as_ref().map(|snapshot| snapshot.complete),
-        "cpu_time_ns": cpu_time_ns,
-        "rss_bytes": rss_bytes,
-        "samples": samples,
-        "error": unavailable.or_else(|| cache.error.clone()),
-    })
+    ProcessStatsView {
+        available,
+        sampled_at: cache.sampled_at,
+        age_ms: sample_age_ms,
+        ttl_ms: SAMPLE_TTL_MS,
+        clock_regressed,
+        coverage,
+        complete: cache.snapshot.as_ref().map(|snapshot| snapshot.complete),
+        cpu_time_ns,
+        rss_bytes,
+        samples: samples.cloned(),
+        error: unavailable.or_else(|| cache.error.clone()),
+    }
 }
 
 pub(crate) fn workspace_owner(agent: &str, target_generation: i64) -> String {
@@ -1670,4 +1699,95 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
         .as_millis()
         .min(i64::MAX as u128) as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eliot_core::{ProcessIdentity, ProcessSample};
+
+    fn sample(cpu_time_ns: Option<u64>, rss_bytes: Option<u64>) -> ProcessSample {
+        ProcessSample {
+            record: ProcessRecord {
+                identity: ProcessIdentity {
+                    host_boot_id: "boot".to_owned(),
+                    pid: 1,
+                    start_time: 2,
+                },
+                owner: owner("a1", 1),
+                role: "harness".to_owned(),
+                state: ProcessState::Unknown,
+                exit_code: None,
+                updated_at: 1000,
+            },
+            cpu_time_ns,
+            rss_bytes,
+        }
+    }
+
+    #[test]
+    fn stats_keep_missing_partial_and_overflow_totals_unknown() {
+        let absent = stats_view(&Cache::default(), None, 1000);
+        assert!(!absent.available);
+        assert_eq!(absent.coverage, StatsCoverage::Unknown);
+        assert_eq!(
+            (absent.cpu_time_ns, absent.rss_bytes, absent.samples),
+            (None, None, None)
+        );
+
+        let mut cache = Cache {
+            snapshot: Some(ProcessSnapshot {
+                samples: vec![sample(Some(4), None)],
+                complete: true,
+            }),
+            sampled_at: Some(1000),
+            error: None,
+        };
+        let current = stats_view(&cache, None, 1001);
+        assert!(current.available);
+        assert_eq!((current.cpu_time_ns, current.rss_bytes), (Some(4), None));
+        assert_eq!(current.samples.as_ref().unwrap()[0].record.exit_code, None);
+
+        cache.snapshot.as_mut().unwrap().complete = false;
+        let partial = stats_view(&cache, None, 1001);
+        assert_eq!(partial.coverage, StatsCoverage::Partial);
+        assert_eq!((partial.cpu_time_ns, partial.rss_bytes), (None, None));
+
+        cache.snapshot = Some(ProcessSnapshot {
+            samples: vec![
+                sample(Some(u64::MAX), Some(u64::MAX)),
+                sample(Some(1), Some(1)),
+            ],
+            complete: true,
+        });
+        let overflow = stats_view(&cache, None, 1001);
+        assert_eq!((overflow.cpu_time_ns, overflow.rss_bytes), (None, None));
+    }
+
+    #[test]
+    fn stats_freshness_and_clock_regression_do_not_invent_samples() {
+        let cache = Cache {
+            snapshot: Some(ProcessSnapshot {
+                samples: vec![sample(Some(4), Some(5))],
+                complete: true,
+            }),
+            sampled_at: Some(1000),
+            error: None,
+        };
+        for now in [999, 5001] {
+            let stale = stats_view(&cache, None, now);
+            assert!(!stale.available);
+            assert_eq!(stale.coverage, StatsCoverage::Stale);
+            assert_eq!(stale.complete, Some(true));
+            assert_eq!(
+                (stale.cpu_time_ns, stale.rss_bytes, stale.samples),
+                (None, None, None)
+            );
+            assert_eq!(stale.clock_regressed, now < 1000);
+        }
+        let unavailable = stats_view(&cache, Some("unavailable".to_owned()), 1001);
+        assert!(!unavailable.available);
+        assert_eq!(unavailable.error.as_deref(), Some("unavailable"));
+        assert!(unavailable.samples.is_none());
+    }
 }
