@@ -2,6 +2,7 @@
 //! workspace_git owns Git identity/readback. Only this module runs their mutators.
 use crate::{
     bus::Bus,
+    common::now_ms,
     git_monitor::{canonical_root, reject_links},
     monitor::{Monitoring, WorkspaceProcessContext},
     platform::{CustodyObserver, OwnedChild},
@@ -21,7 +22,7 @@ use std::{
     path::{Component, Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
@@ -1391,14 +1392,6 @@ fn stop_id(preparation: &WorkspacePreparation) -> Option<&str> {
         .as_ref()
         .and_then(|value| value.get("stop_command_id"))
         .and_then(Value::as_str)
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(i64::MAX as u128) as i64
 }
 
 fn problem(code: &str, message: &str) -> Error {

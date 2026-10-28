@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 mod bus;
+mod common;
 mod config;
 mod daemon;
 mod fs_invalidation;

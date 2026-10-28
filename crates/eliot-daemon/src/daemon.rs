@@ -1,5 +1,6 @@
 use crate::{
     bus::Bus,
+    common::now_ms,
     logging,
     platform::{DataDir, IpcListener, IpcStream, data_dir::DaemonLock},
     router::Router,
@@ -546,9 +547,7 @@ fn caller_identity() -> Result<ClientIdentity> {
 }
 
 fn valid_agent_id(id: &str) -> bool {
-    id.strip_prefix('a')
-        .and_then(|digits| digits.parse::<i64>().ok())
-        .is_some_and(|number| number > 0)
+    eliot_core::parse_agent_id(id).is_ok()
 }
 
 fn valid_id(id: &Value) -> bool {
@@ -582,18 +581,36 @@ fn check_frame_size(frame: &str) -> Result<()> {
     }
 }
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(i64::MAX as u128) as i64
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use eliot_core::{MAX_STDERR_BYTES, StderrDiagnostic, StderrSnapshot, StderrSource};
+
+    #[test]
+    fn shared_helpers_managed_auth_requires_canonical_agent_ids() {
+        for id in ["a1", "a10", "a9223372036854775807"] {
+            assert!(valid_agent_id(id));
+        }
+        for id in [
+            "",
+            "a",
+            "A1",
+            "a0",
+            "a-1",
+            "a01",
+            "a+1",
+            "a0001",
+            " a1",
+            "a1 ",
+            "a1\n",
+            "a١",
+            "a１",
+            "a9223372036854775808",
+            "01MUTATIONID",
+        ] {
+            assert!(!valid_agent_id(id), "{id:?}");
+        }
+    }
 
     struct UnserializableParams(std::cell::Cell<usize>);
 

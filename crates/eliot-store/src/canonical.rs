@@ -5,35 +5,37 @@
 //! Donor: mature `serde_json` + `sha2` dependencies per `docs/reference/donors.md` L1-L2 map; no vendored code.
 
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 /// Compute SHA-256 (32 bytes) over deterministic canonical JSON.
 ///
 /// Recursively sorts object keys; arrays and scalar values keep their semantics.
 /// Caller passes only the semantic payload (no transport ids or timing).
 pub(crate) fn digest(value: &Value) -> eliot_core::Result<Vec<u8>> {
-    let canonical = canonicalize(value);
-    let bytes = serde_json::to_vec(&canonical)
-        .map_err(|err| eliot_core::Error::new("invalid", err.to_string()))?;
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    Ok(hasher.finalize().to_vec())
+    eliot_core::canonical_json_sha256(value)
+        .map(|digest| digest.to_vec())
+        .map_err(|err| eliot_core::Error::new("invalid", err.to_string()))
 }
 
-fn canonicalize(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            let mut out = serde_json::Map::new();
-            for key in keys {
-                if let Some(inner) = map.get(key) {
-                    out.insert(key.clone(), canonicalize(inner));
-                }
-            }
-            Value::Object(out)
-        }
-        Value::Array(items) => Value::Array(items.iter().map(canonicalize).collect()),
-        _ => value.clone(),
+#[cfg(test)]
+mod tests {
+    use super::digest;
+    use serde_json::json;
+
+    #[test]
+    fn store_digest_retains_semantic_payload_bytes() {
+        let payload = json!({
+            "verb": "send", "target": "a1", "expected_turn_id": null,
+            "expected_generation": 0, "args": {"text": "literal e\u{301}\n"},
+        });
+        // Independently hashed compact UTF-8 JSON with sorted keys. Keep the
+        // Store's persisted 32-byte representation, rather than a hex string.
+        assert_eq!(
+            digest(&payload).unwrap(),
+            [
+                0x6d, 0x5f, 0xaa, 0xa4, 0x75, 0xe9, 0xa3, 0x03, 0xe3, 0x20, 0x94, 0x7c, 0x95, 0x69,
+                0x5d, 0xb6, 0x46, 0xa2, 0x31, 0x2d, 0xa6, 0xe8, 0x22, 0x60, 0xa4, 0xec, 0x65, 0x0a,
+                0xbf, 0xac, 0x7b, 0xe2,
+            ]
+        );
     }
 }

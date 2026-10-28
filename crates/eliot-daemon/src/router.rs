@@ -1,5 +1,6 @@
 use crate::{
     bus::Bus,
+    common::{now_ms, secure_eq, valid_environment_name},
     monitor::Monitoring,
     plugin_host::{AgentCredentials, PluginHost, PluginHostOptions, SecretSet, UnknownCommands},
     workspaces::WorkspaceManager,
@@ -31,7 +32,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU8, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 use tokio::{
     sync::{Mutex as AsyncMutex, broadcast, watch},
@@ -2935,12 +2936,6 @@ fn validate_pass_env_references(
     Ok(())
 }
 
-fn valid_environment_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    matches!(chars.next(), Some('_' | 'A'..='Z' | 'a'..='z'))
-        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
-}
-
 fn is_native_control_verb(verb: &str) -> bool {
     matches!(
         verb,
@@ -3165,18 +3160,6 @@ fn reject_unknown_map_keys(
     }
 }
 
-fn secure_eq(left: &str, right: &str) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.bytes()
-        .zip(right.bytes())
-        .fold(0_u8, |difference, (left, right)| {
-            difference | (left ^ right)
-        })
-        == 0
-}
-
 fn unknown_cause(error: &Error) -> String {
     if let Some(cause) = error
         .message
@@ -3196,14 +3179,6 @@ fn unknown_cause(error: &Error) -> String {
     } else {
         "plugin_outcome_unknown".to_owned()
     }
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(i64::MAX as u128) as i64
 }
 
 #[cfg(test)]

@@ -2,10 +2,13 @@
 
 pub mod api;
 
+mod canonical;
 mod command;
 mod diagnostics;
+mod ids;
 mod secrets;
 
+pub use canonical::canonical_json_sha256;
 pub use command::{
     classify_dispatched_error, command_transition_allowed, workspace_preparation_transition_allowed,
 };
@@ -13,6 +16,7 @@ pub use diagnostics::{
     MAX_STDERR_BYTES, MAX_STDERR_DIAGNOSTIC_BYTES, StderrDiagnostic, StderrSnapshot, StderrSource,
     bound_stderr_diagnostics,
 };
+pub use ids::parse_agent_id;
 pub use secrets::SecretPolicy;
 
 use serde::{Deserialize, Serialize};
@@ -265,18 +269,6 @@ pub enum AgentOrigin {
     Eliot,
     Native,
     External,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ObserverBinding {
-    pub agent: String,
-    pub generation: i64,
-    pub harness: String,
-    pub native_scope: String,
-    pub native_ref: String,
-    pub profile_snapshot: Value,
-    pub source: String,
-    pub checkpoint: Option<String>,
 }
 
 impl AgentState {

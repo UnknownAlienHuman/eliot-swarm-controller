@@ -1,8 +1,9 @@
 //! Exact-subject reader actors. Presence here never grants native control.
 use super::{
     AgentKey, PluginHost, RPC_DEADLINE, RPC_GRACE, STOP_GRACE, StoreHandle,
-    build_process_environment, now_ms, redact_native_error, signal_progress,
+    build_process_environment, redact_native_error, signal_progress,
 };
+use crate::common::now_ms;
 use eliot_core::{Agent, Command, CommandState, Error, Result, StderrSource};
 use eliot_plugin::{ObservationPage, ObservationQuery};
 use serde_json::{Value, json};

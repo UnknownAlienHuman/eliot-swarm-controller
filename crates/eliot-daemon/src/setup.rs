@@ -1,12 +1,13 @@
 //! Explicit owner setup entry-file references. This module never spawns or writes Store state.
 
+use crate::platform::is_reparse_point;
 use eliot_core::{Error, FrozenSetupFile, Result, WorkspaceSetup, WorkspaceSetupArg};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     ffi::OsString,
-    fs::{self, File, Metadata, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::Read,
     path::{Component, Path, PathBuf},
     process::Stdio,
@@ -263,14 +264,17 @@ fn capture_file(path: &Path, root: Option<&Path>, remaining: &mut u64) -> Result
     }
     let metadata = fs::symlink_metadata(&canonical)
         .map_err(|_| invalid("setup file metadata is unavailable"))?;
-    if !metadata.is_file() || is_reparse(&metadata) {
+    if !metadata.is_file() || is_reparse_point(&metadata) {
         return Err(invalid("setup reference must be a regular file"));
     }
     let mut file = open_reference(&canonical)?;
     let before = file
         .metadata()
         .map_err(|_| invalid("setup file metadata is unavailable"))?;
-    if !before.is_file() || is_reparse(&before) || before.len() > MAX_FILE_BYTES.min(*remaining) {
+    if !before.is_file()
+        || is_reparse_point(&before)
+        || before.len() > MAX_FILE_BYTES.min(*remaining)
+    {
         return Err(invalid("setup reference must be a bounded regular file"));
     }
     let mut hasher = Sha256::new();
@@ -302,7 +306,7 @@ fn capture_file(path: &Path, root: Option<&Path>, remaining: &mut u64) -> Result
         || current.len() != before.len()
         || current.modified().ok() != before.modified().ok()
         || !current.is_file()
-        || is_reparse(&current)
+        || is_reparse_point(&current)
         || fs::canonicalize(path).ok().as_ref() != Some(&canonical)
     {
         return Err(invalid("setup file changed while it was read"));
@@ -509,24 +513,11 @@ fn reject_links(path: &Path) -> Result<()> {
     for ancestor in path.ancestors() {
         let metadata = fs::symlink_metadata(ancestor)
             .map_err(|_| invalid("setup path cannot be inspected"))?;
-        if metadata.file_type().is_symlink() || is_reparse(&metadata) {
+        if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
             return Err(invalid("setup symlink or reparse paths are not allowed"));
         }
     }
     Ok(())
-}
-
-fn is_reparse(metadata: &Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        metadata.file_attributes() & 0x400 != 0
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = metadata;
-        false
-    }
 }
 
 fn inside(root: &Path, candidate: &Path) -> bool {
@@ -574,4 +565,50 @@ fn check_metadata<T: Serialize + ?Sized>(value: &T) -> Result<()> {
 
 fn invalid(message: &str) -> Error {
     Error::new("profile_error", message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reparse_checks_allow_regular_file_and_directory_metadata() {
+        let root = fs::canonicalize(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let file = root.join("Cargo.toml");
+        let metadata = fs::symlink_metadata(&file).unwrap();
+        assert!(metadata.is_file());
+        assert!(!is_reparse_point(&metadata));
+        let metadata = fs::symlink_metadata(&root).unwrap();
+        assert!(metadata.is_dir());
+        assert!(!is_reparse_point(&metadata));
+        reject_links(&file).unwrap();
+        crate::git_monitor::reject_links(&file).unwrap();
+    }
+
+    #[test]
+    fn link_checks_preserve_missing_setup_and_git_policies() {
+        let missing = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("eliot missing reparse {}", ulid::Ulid::new()))
+            .join("deleted.txt");
+        assert_eq!(
+            fs::symlink_metadata(&missing).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        let error = reject_links(&missing).unwrap_err();
+        assert_eq!(error.code, "profile_error");
+        assert_eq!(error.message, "setup path cannot be inspected");
+        crate::git_monitor::reject_links(&missing).unwrap();
+
+        let frozen = FrozenSetupFile {
+            canonical_path: missing.to_str().unwrap().to_owned(),
+            size: 0,
+            sha256: "0".repeat(64),
+        };
+        let mut remaining = MAX_PLAN_FILE_BYTES;
+        assert_eq!(
+            verify_file(&frozen, &mut remaining).unwrap_err().code,
+            "setup_input_changed"
+        );
+    }
 }
