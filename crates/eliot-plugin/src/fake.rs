@@ -11,7 +11,7 @@ use crate::{
 };
 use eliot_core::{
     BatchAck, Error as CoreError, NativeEvent, SecretPolicy, SourceBatch, SourceHandoff,
-    SourceHandoffGap,
+    SourceHandoffGap, SourceHealthUpdate,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -35,6 +35,8 @@ const DISCOVERY_SCOPE: &str = "fake:discovery";
 const DISCOVERY_SUBJECTS: usize = 3;
 const MALFORMED_AFTER_DISPATCH: &str = "[fake:malformed-after-dispatch]";
 const HANDOFF_FIXTURE_INPUT: &str = "[fake:source-handoff]";
+const LIVE_OBSERVER_SUBJECT: &str = "fake-discovered-2";
+const LIVE_OBSERVER_TS: i64 = 1_730_000_000_000;
 
 #[derive(Debug)]
 pub struct PluginError {
@@ -125,6 +127,11 @@ async fn fake_actor(
         let is_shutdown = request.method == "shutdown";
         let result = dispatch(&request, &mut state, &client).await;
         let shutdown_after_reply = is_shutdown && result.is_ok();
+        let live_after_reply = request.method == "agent.attach"
+            && result.is_ok()
+            && state.observer.as_ref().is_some_and(|observer| {
+                observer.native_ref == LIVE_OBSERVER_SUBJECT && !observer.live_published
+            });
         client
             .respond(
                 id,
@@ -134,6 +141,11 @@ async fn fake_actor(
             .await
             .map_err(|error| PluginError::new(error.message))?;
 
+        if live_after_reply {
+            exercise_observer_live(&mut state, &client)
+                .await
+                .map_err(|_| PluginError::new("fake observer live publication stopped"))?;
+        }
         if shutdown_after_reply {
             state.credential.take();
             return Ok(());
@@ -318,6 +330,11 @@ fn handle_observer_attach(raw: &Value, state: &mut FakeState) -> Result<Value, R
             ));
         }
     } else {
+        state.source_policy = source_secret_policy(
+            Some(&params.profile),
+            Some(&params.target_environment),
+            state.credential.as_deref().ok_or_else(not_initialized)?,
+        );
         state.observer = Some(FakeObserver {
             agent_id: params.agent_id.clone(),
             generation: params.generation,
@@ -326,6 +343,7 @@ fn handle_observer_attach(raw: &Value, state: &mut FakeState) -> Result<Value, R
             attach_command_id: params.command_id.clone(),
             context,
             detach_command_id: None,
+            live_published: false,
         });
     }
     Ok(json!({
@@ -594,7 +612,11 @@ async fn handle_start(
     let credential = state.credential.clone().ok_or_else(not_initialized)?;
     let batch = session_ready_batch(&params.agent_id, params.generation);
 
-    state.source_policy = source_secret_policy(&params, &credential);
+    state.source_policy = source_secret_policy(
+        params.profile.as_ref(),
+        params.target_environment.as_ref(),
+        &credential,
+    );
     state.binding = Some(Binding {
         agent_id: params.agent_id.clone(),
         generation: params.generation,
@@ -886,6 +908,7 @@ fn session_ready_batch(agent_id: &str, generation: i64) -> SourceBatch {
         events: vec![NativeEvent {
             kind: "session.ready".to_owned(),
             native_id: event_id,
+            ts: None,
             data: empty_object(),
         }],
         cursor: None,
@@ -906,11 +929,13 @@ fn send_batch(params: &AgentCommandParams, turn_id: &str, text: &str) -> SourceB
             NativeEvent {
                 kind: "turn.started".to_owned(),
                 native_id: format!("{prefix}:turn.started"),
+                ts: None,
                 data: json!({"command_id": params.command_id, "turn_id": turn_id}),
             },
             NativeEvent {
                 kind: "message.completed".to_owned(),
                 native_id: format!("{prefix}:message.completed"),
+                ts: None,
                 data: json!({
                     "command_id": params.command_id,
                     "turn_id": turn_id,
@@ -920,6 +945,7 @@ fn send_batch(params: &AgentCommandParams, turn_id: &str, text: &str) -> SourceB
             NativeEvent {
                 kind: "turn.completed".to_owned(),
                 native_id: format!("{prefix}:turn.completed"),
+                ts: None,
                 data: json!({
                     "command_id": params.command_id,
                     "turn_id": turn_id,
@@ -940,6 +966,7 @@ fn session_ended_batch(agent_id: &str, generation: i64) -> SourceBatch {
         events: vec![NativeEvent {
             kind: "session.ended".to_owned(),
             native_id: format!("fake:{agent_id}:{generation}:session.ended"),
+            ts: None,
             data: empty_object(),
         }],
         cursor: None,
@@ -951,16 +978,14 @@ struct BatchFailure {
     uncertain: bool,
 }
 
-fn source_secret_policy(params: &AgentStartParams, credential: &str) -> SecretPolicy {
+fn source_secret_policy(
+    profile: Option<&Value>,
+    environment: Option<&Value>,
+    credential: &str,
+) -> SecretPolicy {
     let mut known = vec![credential.to_owned()];
-    if let Some(environment) = params
-        .target_environment
-        .as_ref()
-        .and_then(Value::as_object)
-    {
-        let names = params
-            .profile
-            .as_ref()
+    if let Some(environment) = environment.and_then(Value::as_object) {
+        let names = profile
             .and_then(|profile| profile.get("pass_env"))
             .and_then(Value::as_array);
         for (name, value) in environment {
@@ -1013,14 +1038,25 @@ async fn exercise_source_handoff(
     handoff
         .prepare(&state.source_policy)
         .map_err(core_error_to_rpc)?;
+    state.batch_unknown = true;
+    commit_handoff(&handoff, credential, client).await?;
+    state.publish_source = Some(handoff.successor);
+    state.batch_unknown = false;
+    Ok(())
+}
+
+async fn commit_handoff(
+    handoff: &SourceHandoff,
+    credential: &str,
+    client: &PeerClient,
+) -> Result<(), RpcError> {
     // Retain this exact prepared request for both the wire and full-digest proof.
-    let mut request = serde_json::to_value(&handoff)
+    let mut request = serde_json::to_value(handoff)
         .map_err(|_| domain_error("internal", -32603, "cannot encode fake handoff"))?;
     request["credential"] = json!(credential);
 
     // The actor has acknowledged all preceding batches and processes no later
     // request while this operation is unresolved. Never replay the operation.
-    state.batch_unknown = true;
     let _discarded_reply = client
         .call(
             "source.handoff",
@@ -1046,8 +1082,147 @@ async fn exercise_source_handoff(
     handoff
         .ack_from_state(&readback)
         .map_err(|_| unknown_effect())?;
-    state.publish_source = Some(handoff.successor);
-    state.batch_unknown = false;
+    Ok(())
+}
+
+async fn exercise_observer_live(
+    state: &mut FakeState,
+    client: &PeerClient,
+) -> Result<(), RpcError> {
+    let observer = state.observer.as_ref().ok_or_else(not_initialized)?;
+    let credential = state.credential.clone().ok_or_else(not_initialized)?;
+    let until = Instant::now() + HOST_RESPONSE_TIMEOUT;
+    loop {
+        let ready = client
+            .call(
+                "source.state",
+                json!({
+                    "credential": credential, "agent_id": observer.agent_id,
+                    "generation": observer.generation, "source": "observe",
+                }),
+                until,
+            )
+            .await
+            .map_err(core_error_to_rpc)?;
+        if ready["agent_id"] != observer.agent_id
+            || ready["generation"].as_i64() != Some(observer.generation)
+            || ready["source"] != "observe"
+            || ready["state"] != "open"
+        {
+            return Err(unknown_effect());
+        }
+        match ready["observer_ready"].as_bool() {
+            Some(true) => break,
+            Some(false) if Instant::now() < until => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            _ => return Err(unknown_effect()),
+        }
+    }
+    let mut handoff = SourceHandoff {
+        agent_id: observer.agent_id.clone(),
+        generation: observer.generation,
+        source: "observe".to_owned(),
+        families: vec!["message".to_owned(), "turn".to_owned()],
+        successor: "transcript".to_owned(),
+        mechanism: "rollout_tail".to_owned(),
+        cursor: None,
+        gap: Some(SourceHandoffGap {
+            gap_id: format!(
+                "fake:{}:{}:observer-live-edge",
+                observer.agent_id, observer.generation
+            ),
+            reason: "fake observer starts at the live edge".to_owned(),
+            from: None,
+            to: Some("fake-observer-edge:0".to_owned()),
+        }),
+    };
+    handoff
+        .prepare(&state.source_policy)
+        .map_err(core_error_to_rpc)?;
+    state.batch_unknown = true;
+    commit_handoff(&handoff, &credential, client).await?;
+    for health in ["stale", "stale", "ok"] {
+        let update = SourceHealthUpdate {
+            agent_id: handoff.agent_id.clone(),
+            generation: handoff.generation,
+            source: handoff.source.clone(),
+            health: health.to_owned(),
+        };
+        let expected = serde_json::to_value(&update).map_err(|_| unknown_effect())?;
+        let mut request = expected.clone();
+        request["credential"] = json!(credential);
+        let ack = client
+            .call(
+                "source.health",
+                request,
+                Instant::now() + HOST_RESPONSE_TIMEOUT,
+            )
+            .await;
+        if ack.as_ref().is_ok_and(|ack| ack != &expected) {
+            return Err(unknown_effect());
+        }
+        let readback = client
+            .call(
+                "source.state",
+                json!({
+                    "credential": credential, "agent_id": handoff.agent_id,
+                    "generation": handoff.generation, "source": handoff.source,
+                }),
+                Instant::now() + HOST_RESPONSE_TIMEOUT,
+            )
+            .await
+            .map_err(core_error_to_rpc)?;
+        handoff
+            .ack_from_state(&readback)
+            .map_err(|_| unknown_effect())?;
+        if readback["state"] != "open" || readback["health"] != health {
+            return Err(unknown_effect());
+        }
+    }
+    let turn_id = "fake-observed-live-turn";
+    let prefix = format!(
+        "fake:{}:{}:observer-live",
+        handoff.agent_id, handoff.generation
+    );
+    let batch = SourceBatch {
+        batch_id: format!("{prefix}:batch"),
+        agent_id: handoff.agent_id,
+        generation: handoff.generation,
+        source: handoff.successor,
+        cursor: Some("fake-observer-edge:1".to_owned()),
+        events: vec![
+            NativeEvent {
+                kind: "turn.started".to_owned(),
+                native_id: format!("{prefix}:started"),
+                ts: Some(LIVE_OBSERVER_TS + 1),
+                data: json!({"turn_id": turn_id, "started_at": LIVE_OBSERVER_TS - 1_000}),
+            },
+            NativeEvent {
+                kind: "message.completed".to_owned(),
+                native_id: format!("{prefix}:message"),
+                ts: Some(LIVE_OBSERVER_TS + 2),
+                data: json!({"turn_id": turn_id, "phase": "commentary",
+                    "text": "fake observed commentary"}),
+            },
+            NativeEvent {
+                kind: "turn.completed".to_owned(),
+                native_id: format!("{prefix}:completed"),
+                ts: Some(LIVE_OBSERVER_TS + 3),
+                data: json!({"turn_id": turn_id, "status": "completed",
+                    "completed_at": LIVE_OBSERVER_TS, "duration_ms": 1_000,
+                    "final_text": "fake observed live reply"}),
+            },
+        ],
+    };
+    commit_batch(state, batch, &credential, client)
+        .await
+        .map_err(|failure| failure.error)?;
+    state
+        .observer
+        .as_mut()
+        .ok_or_else(not_initialized)?
+        .live_published = true;
     Ok(())
 }
 
@@ -1196,6 +1371,7 @@ struct FakeObserver {
     attach_command_id: String,
     context: u64,
     detach_command_id: Option<String>,
+    live_published: bool,
 }
 
 struct Binding {

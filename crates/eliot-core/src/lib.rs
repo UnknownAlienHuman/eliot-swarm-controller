@@ -459,6 +459,56 @@ pub struct NativeEvent {
     pub kind: String,
     pub native_id: String,
     pub data: Value,
+    /// Original native epoch milliseconds, when supplied by a verified producer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ts: Option<i64>,
+}
+
+impl NativeEvent {
+    pub fn semantic_value(&self) -> Value {
+        let mut value =
+            serde_json::json!({"kind":self.kind,"native_id":self.native_id,"data":self.data});
+        if let Some(ts) = self.ts {
+            value["ts"] = serde_json::json!(ts);
+        }
+        value
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceHealthUpdate {
+    pub agent_id: String,
+    pub generation: i64,
+    pub source: String,
+    pub health: String,
+}
+
+impl SourceHealthUpdate {
+    pub fn new(
+        agent_id: impl Into<String>,
+        generation: i64,
+        source: impl Into<String>,
+        health: impl Into<String>,
+    ) -> Self {
+        Self {
+            agent_id: agent_id.into(),
+            generation,
+            source: source.into(),
+            health: health.into(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        parse_agent_id(&self.agent_id)?;
+        if self.generation < 0
+            || self.source.trim().is_empty()
+            || !matches!(self.health.as_str(), "ok" | "slow" | "stale" | "error")
+        {
+            return Err(Error::new("invalid", "invalid source health update"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -469,6 +519,19 @@ pub struct SourceBatch {
     pub source: String,
     pub events: Vec<NativeEvent>,
     pub cursor: Option<String>,
+}
+
+impl SourceBatch {
+    /// Headers and cursor have their own binding checks; this is exactly the
+    /// existing canonical event-array digest retained in source_state.
+    pub fn semantic_digest(&self) -> std::result::Result<[u8; 32], serde_json::Error> {
+        canonical_json_sha256(&Value::Array(
+            self.events
+                .iter()
+                .map(NativeEvent::semantic_value)
+                .collect(),
+        ))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -946,4 +1009,101 @@ fn optional_details(event: &NativeEvent) -> Result<Value> {
 
 fn bad_state(event: &NativeEvent, message: &str) -> Error {
     Error::new("bad_state", format!("{}: {message}", event.kind))
+}
+
+#[cfg(test)]
+mod live_wire_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn native_timestamp_none_preserves_legacy_wire_and_event_array_digest() {
+        let event = NativeEvent {
+            kind: "message.completed".to_owned(),
+            native_id: "n1".to_owned(),
+            data: json!({"text":"ok"}),
+            ts: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&event).unwrap(),
+            r#"{"kind":"message.completed","native_id":"n1","data":{"text":"ok"}}"#
+        );
+        assert_eq!(
+            serde_json::from_value::<NativeEvent>(event.semantic_value()).unwrap(),
+            event
+        );
+        let mut batch = SourceBatch {
+            batch_id: "b1".to_owned(),
+            agent_id: "a1".to_owned(),
+            generation: 1,
+            source: "stream".to_owned(),
+            events: vec![event],
+            cursor: None,
+        };
+        let legacy = batch.semantic_digest().unwrap();
+        assert_eq!(
+            legacy
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            "d633ea2f28cf283cfe23d4549499892a9c8e915192418b3a9f59e51874cde778"
+        );
+        batch.batch_id = "b2".to_owned();
+        batch.agent_id = "a2".to_owned();
+        batch.generation = 7;
+        batch.source = "transcript".to_owned();
+        batch.cursor = Some("edge".to_owned());
+        assert_eq!(batch.semantic_digest().unwrap(), legacy);
+        batch.events[0].ts = Some(123);
+        assert_ne!(batch.semantic_digest().unwrap(), legacy);
+        assert_eq!(batch.events[0].semantic_value()["ts"], 123);
+        batch.events[0].ts = Some(124);
+        assert_ne!(
+            batch.semantic_digest().unwrap(),
+            canonical_json_sha256(&Value::Array(vec![
+                json!({"kind":"message.completed","native_id":"n1","data":{"text":"ok"},"ts":123})
+            ]))
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn health_update_has_strict_fields_and_four_health_values() {
+        for health in ["ok", "slow", "stale", "error"] {
+            let update = SourceHealthUpdate::new("a1", 1, "transcript", health);
+            update.validate().unwrap();
+            assert_eq!(
+                serde_json::from_value::<SourceHealthUpdate>(
+                    serde_json::to_value(&update).unwrap()
+                )
+                .unwrap(),
+                update
+            );
+        }
+        for wire in [
+            json!({}),
+            json!({"agent_id":"a1","generation":1,"source":"transcript","health":null}),
+            json!({"agent_id":"a1","generation":"1","source":"transcript","health":"ok"}),
+            json!({"agent_id":"a1","generation":1,"source":"transcript","health":"ok","extra":0}),
+        ] {
+            assert!(serde_json::from_value::<SourceHealthUpdate>(wire).is_err());
+        }
+        assert_eq!(
+            SourceHealthUpdate::new("a1", 1, "transcript", "healthy")
+                .validate()
+                .unwrap_err()
+                .code,
+            "invalid"
+        );
+        assert!(
+            SourceHealthUpdate::new("a1", -1, "transcript", "ok")
+                .validate()
+                .is_err()
+        );
+        assert!(
+            SourceHealthUpdate::new("a1", 1, " ", "ok")
+                .validate()
+                .is_err()
+        );
+    }
 }

@@ -116,7 +116,7 @@ fn source_open(connection: &Connection, agent: i64, generation: i64) -> Result<b
 
 fn any_source_open(connection: &Connection, agent: i64) -> Result<bool> {
     connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM source_state WHERE agent = ?1 AND source = 'observe' AND state = 'open')",
+        "SELECT EXISTS(SELECT 1 FROM source_state WHERE agent = ?1 AND source NOT IN ('daemon','os','git','workspace_process') AND state = 'open')",
         [agent], |row| row.get(0),
     ).map_err(sql_error)
 }
@@ -134,6 +134,69 @@ pub(super) fn require_reader_source(
             "reader custody requires a committed active observation source",
         ));
     }
+    Ok(())
+}
+
+pub(super) fn live_families(harness: &str) -> Result<&'static [&'static str]> {
+    match harness {
+        "fake" => Ok(&["turn", "message"]),
+        "codex" => Ok(&["turn", "message", "tool"]),
+        _ => Err(Error::new(
+            "unsupported",
+            "harness has no observed live-fact grant",
+        )),
+    }
+}
+
+/// This is committed attach readiness, never native activity or completion.
+pub(super) fn live_ready(connection: &Connection, agent: &Agent, generation: i64) -> Result<bool> {
+    if generation <= 0
+        || require_observer(agent, generation).is_err()
+        || agent.state != AgentState::Unknown
+        || agent.native_scope.is_none()
+        || agent.native_ref.is_none()
+    {
+        return Ok(false);
+    }
+    let id = parse_agent_id(&agent.id)?;
+    if !source_open(connection, id, generation)? || detach_fenced(connection, id, generation)? {
+        return Ok(false);
+    }
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM commands c JOIN agents a ON a.id = c.target
+         WHERE c.target = ?1 AND c.generation = ?2 AND c.verb = 'attach' AND c.state = 'applied'
+           AND a.generation = ?2 AND a.token IS NULL
+           AND json_extract(c.args, '$.native_scope') = a.native_scope
+           AND json_extract(c.args, '$.native_ref') = a.native_ref)",
+            params![id, generation],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)
+}
+
+pub(super) fn require_live_subject(
+    connection: &Connection,
+    agent: &Agent,
+    generation: i64,
+    subject: (&str, &str),
+) -> Result<()> {
+    require_reader_source(connection, agent, generation)?;
+    if agent.native_scope.as_deref() != Some(subject.0)
+        || agent.native_ref.as_deref() != Some(subject.1)
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "observed live subject does not match its captured binding",
+        ));
+    }
+    if !live_ready(connection, agent, generation)? {
+        return Err(Error::new(
+            "not_allowed",
+            "observer attachment has not settled",
+        ));
+    }
+    live_families(&agent.harness)?;
     Ok(())
 }
 
@@ -470,7 +533,7 @@ pub(super) fn dispatch(
             now,
             events,
         )?;
-        db!(tx.execute("UPDATE source_state SET health = 'stale', updated_at = ?1 WHERE agent = ?2 AND generation <= ?3 AND source = 'observe' AND state = 'open'",
+        db!(tx.execute("UPDATE source_state SET health = 'stale', updated_at = ?1 WHERE agent = ?2 AND generation = ?3 AND source NOT IN ('daemon','os','git','workspace_process') AND state = 'open'",
             params![now, id, agent.generation]));
         let next = agent
             .generation
@@ -613,11 +676,9 @@ pub(super) fn settle_failure(
         return Ok(());
     }
     require_observer(&agent, generation)?;
-    db!(tx.execute(
-        "UPDATE source_state SET health = 'stale', updated_at = ?1
-        WHERE agent = ?2 AND generation <= ?3 AND source = 'observe' AND state = 'open'",
-        params![now, id, generation]
-    ));
+    events.extend(source_handoff::native_unavailable_tx(
+        tx, id, generation, false, now,
+    )?);
     events.push(insert_daemon_event(
         tx,
         now,
@@ -631,6 +692,23 @@ pub(super) fn settle_failure(
 }
 
 impl Store {
+    pub fn observer_ready(
+        &self,
+        agent: &str,
+        generation: i64,
+        expected_subject: (&str, &str),
+    ) -> Result<bool> {
+        let id = parse_agent_id(agent)?;
+        let current = load_agent_by_num(&self.connection, id)?
+            .ok_or_else(|| Error::new("not_found", "observer was not found"))?;
+        if current.native_scope.as_deref() != Some(expected_subject.0)
+            || current.native_ref.as_deref() != Some(expected_subject.1)
+        {
+            return Ok(false);
+        }
+        live_ready(&self.connection, &current, generation)
+    }
+
     pub fn observer_active(&self, agent: &str, generation: i64) -> Result<bool> {
         let id = parse_agent_id(agent)?;
         let current = load_agent_by_num(&self.connection, id)?
@@ -732,11 +810,13 @@ impl Store {
                     params![now, id, agent.generation]
                 ));
             } else {
-                let mut statement = tx.prepare("SELECT generation FROM source_state
-                    WHERE agent = ?1 AND generation < ?2 AND source = 'observe' AND state = 'open' ORDER BY generation")
+                let mut statement = tx.prepare("SELECT DISTINCT generation FROM source_state
+                    WHERE agent = ?1 AND generation = ?2 AND source NOT IN ('daemon','os','git','workspace_process') AND state = 'open' ORDER BY generation")
                     .map_err(sql_error)?;
                 let generations = statement
-                    .query_map(params![id, agent.generation], |row| row.get::<_, i64>(0))
+                    .query_map(params![id, agent.generation.saturating_sub(1)], |row| {
+                        row.get::<_, i64>(0)
+                    })
                     .map_err(sql_error)?
                     .collect::<rusqlite::Result<Vec<_>>>()
                     .map_err(sql_error)?;
@@ -751,16 +831,8 @@ impl Store {
                         now,
                         &mut events,
                     )?;
-                    db!(tx.execute("UPDATE source_state SET state = 'closed', updated_at = ?1
-                        WHERE agent = ?2 AND generation = ?3 AND source = 'observe' AND state = 'open'", params![now, id, generation]));
-                    events.push(insert_daemon_event(
-                        &tx,
-                        now,
-                        "source.closed",
-                        "source",
-                        Some(id),
-                        Some(generation),
-                        json!({"source": SOURCE}),
+                    events.extend(source_handoff::native_unavailable_tx(
+                        &tx, id, generation, true, now,
                     )?);
                 }
             }
@@ -838,13 +910,10 @@ impl Store {
             if generation == current.generation {
                 db!(tx.execute("UPDATE agents SET state = 'unknown', updated_at = ?1 WHERE id = ?2 AND generation = ?3 AND observe_only = 1", params![now,id,generation]));
             }
-            let changed = tx.execute(
-                "UPDATE source_state SET state = CASE WHEN ?1 THEN 'closed' ELSE state END, health = 'stale', updated_at = ?2
-                 WHERE agent = ?3 AND generation = ?4 AND source = 'observe'
-                   AND (health <> 'stale' OR (?1 AND state <> 'closed'))",
-                params![closed,now,id,generation],
-            ).map_err(sql_error)?;
-            if changed != 0 || !events.is_empty() {
+            events.extend(source_handoff::native_unavailable_tx(
+                &tx, id, generation, closed, now,
+            )?);
+            if !events.is_empty() {
                 events.push(insert_daemon_event(&tx, now, "observer.unavailable", "agent", Some(id), Some(generation),
                     json!({"source": SOURCE, "reason": reason, "closed": closed, "observation_state": "unknown"}))?);
             }

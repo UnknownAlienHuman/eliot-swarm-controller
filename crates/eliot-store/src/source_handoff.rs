@@ -52,7 +52,19 @@ impl Store {
         now: i64,
     ) -> Result<Change<SourceHandoffAck>> {
         self.ensure_writer_healthy()?;
-        let result = self.record_source_handoff_inner(handoff, now);
+        let result = self.record_source_handoff_inner(handoff, None, now);
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    pub fn record_observed_source_handoff(
+        &mut self,
+        handoff: SourceHandoff,
+        expected_subject: (&str, &str),
+        now: i64,
+    ) -> Result<Change<SourceHandoffAck>> {
+        self.ensure_writer_healthy()?;
+        let result = self.record_source_handoff_inner(handoff, Some(expected_subject), now);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -60,6 +72,7 @@ impl Store {
     fn record_source_handoff_inner(
         &mut self,
         mut handoff: SourceHandoff,
+        expected_subject: Option<(&str, &str)>,
         now: i64,
     ) -> Result<Change<SourceHandoffAck>> {
         if reserved_source(&handoff.source) || reserved_source(&handoff.successor) {
@@ -121,9 +134,24 @@ impl Store {
                 "handoff requires the current admitted generation",
             ));
         }
-        // Stage A transfers controlled facts only. Private observation history
-        // remains read-only; observer live recovery belongs to its next caller.
-        observer::require_controlled(&agent)?;
+        if let Some(subject) = expected_subject {
+            observer::require_live_subject(&tx, &agent, handoff.generation, subject)?;
+            if handoff.source != "observe"
+                || handoff.successor != "transcript"
+                || handoff.mechanism != "rollout_tail"
+                || handoff.families.iter().any(|family| {
+                    !observer::live_families(&agent.harness)
+                        .is_ok_and(|families| families.contains(&family.as_str()))
+                })
+            {
+                return Err(Error::new(
+                    "not_allowed",
+                    "observer handoff is outside its live-fact grant",
+                ));
+            }
+        } else {
+            observer::require_controlled(&agent)?;
+        }
         if agent.is_terminal() {
             return Err(Error::new(
                 "bad_state",
@@ -435,73 +463,13 @@ impl Store {
         } else {
             Vec::new()
         };
-        let mut statement = tx.prepare(
-            "SELECT source, state, health FROM source_state WHERE agent = ?1 AND generation = ?2
-             AND source NOT IN ('daemon','os','git','workspace_process') ORDER BY source LIMIT ?3",
-        ).map_err(sql_error)?;
-        let sources = statement
-            .query_map(
-                params![agent_num, generation, MAX_PAGE_ENTRIES as i64 + 1],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
-            )
-            .map_err(sql_error)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(sql_error)?;
-        drop(statement);
-        if sources.len() > MAX_PAGE_ENTRIES {
-            return Err(Error::new(
-                "frame_too_large",
-                "native reader unavailability exceeds its row bound",
-            ));
-        }
-        for (source, state, health) in sources {
-            let close = reader_closed && state == "open";
-            if health == "stale" && !close {
-                continue;
-            }
-            let next_state = if close { "closed" } else { state.as_str() };
-            let changed = tx
-                .execute(
-                    "UPDATE source_state SET health = 'stale', state = ?1, updated_at = ?2
-                 WHERE agent = ?3 AND generation = ?4 AND source = ?5",
-                    params![next_state, now, agent_num, generation, source],
-                )
-                .map_err(sql_error)?;
-            if changed != 1 {
-                return Err(Error::new(
-                    "source_integrity",
-                    "native source changed before unavailable commit",
-                ));
-            }
-            if health != "stale" {
-                events.push(insert_daemon_event(
-                    &tx,
-                    now,
-                    "source.health",
-                    "source",
-                    Some(agent_num),
-                    Some(generation),
-                    json!({"source":source,"state":next_state,"health":"stale"}),
-                )?);
-            }
-            if close {
-                events.push(insert_daemon_event(
-                    &tx,
-                    now,
-                    "source.closed",
-                    "source",
-                    Some(agent_num),
-                    Some(generation),
-                    json!({"source":source}),
-                )?);
-            }
-        }
+        events.extend(native_unavailable_tx(
+            &tx,
+            agent_num,
+            generation,
+            reader_closed,
+            now,
+        )?);
         commit_transaction(tx, &self.write_faulted)?;
         Ok(events)
     }
@@ -582,6 +550,86 @@ impl Store {
         commit_transaction(tx, &self.write_faulted)?;
         Ok(events)
     }
+}
+
+pub(super) fn native_unavailable_tx(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    generation: i64,
+    reader_closed: bool,
+    now: i64,
+) -> Result<Vec<Event>> {
+    let mut events = Vec::new();
+    let mut statement = tx
+        .prepare(
+            "SELECT source, state, health FROM source_state WHERE agent = ?1 AND generation = ?2
+             AND source NOT IN ('daemon','os','git','workspace_process') ORDER BY source LIMIT ?3",
+        )
+        .map_err(sql_error)?;
+    let sources = statement
+        .query_map(
+            params![agent_num, generation, MAX_PAGE_ENTRIES as i64 + 1],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .map_err(sql_error)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(sql_error)?;
+    drop(statement);
+    if sources.len() > MAX_PAGE_ENTRIES {
+        return Err(Error::new(
+            "frame_too_large",
+            "native reader unavailability exceeds its row bound",
+        ));
+    }
+    for (source, state, health) in sources {
+        let close = reader_closed && state == "open";
+        if health == "stale" && !close {
+            continue;
+        }
+        let next_state = if close { "closed" } else { state.as_str() };
+        let changed = tx
+            .execute(
+                "UPDATE source_state SET health = 'stale', state = ?1, updated_at = ?2
+                 WHERE agent = ?3 AND generation = ?4 AND source = ?5",
+                params![next_state, now, agent_num, generation, source],
+            )
+            .map_err(sql_error)?;
+        if changed != 1 {
+            return Err(Error::new(
+                "source_integrity",
+                "native source changed before unavailable commit",
+            ));
+        }
+        if health != "stale" {
+            events.push(insert_daemon_event(
+                tx,
+                now,
+                "source.health",
+                "source",
+                Some(agent_num),
+                Some(generation),
+                json!({"source":source,"state":next_state,"health":"stale"}),
+            )?);
+        }
+        if close {
+            events.push(insert_daemon_event(
+                tx,
+                now,
+                "source.closed",
+                "source",
+                Some(agent_num),
+                Some(generation),
+                json!({"source":source}),
+            )?);
+        }
+    }
+    Ok(events)
 }
 
 fn native_exit_gaps_tx(
@@ -718,6 +766,7 @@ mod tests {
                     generation: 1,
                     source: "stream".to_owned(),
                     events: vec![NativeEvent {
+                        ts: None,
                         kind: "session.ready".to_owned(),
                         native_id: "ready".to_owned(),
                         data: json!({"command_id":command_id,"native_scope":"synthetic:scope","native_ref":"synthetic:subject"}),
@@ -782,6 +831,7 @@ mod tests {
             generation: 1,
             source: source.to_owned(),
             events: vec![NativeEvent {
+                ts: None,
                 kind: "turn.started".to_owned(),
                 native_id: "turn".to_owned(),
                 data: json!({"command_id":command,"turn_id":"turn-1"}),
@@ -1111,7 +1161,8 @@ mod tests {
             .unwrap();
         store.put_batch(SourceBatch {
             batch_id:"edit".to_owned(), agent_id:agent.clone(), generation:1, source:"stream".to_owned(),
-            events:vec![NativeEvent { kind:"tool.completed".to_owned(), native_id:"edit".to_owned(),
+            events:vec![NativeEvent {
+                        ts: None, kind:"tool.completed".to_owned(), native_id:"edit".to_owned(),
                 data:json!({"turn_id":"turn-1","tool":"fileChange","status":"completed","changed_paths":["note.txt"]}) }],
             cursor:Some("native:edit".to_owned()),
         }, now + 2).unwrap();
@@ -1413,6 +1464,7 @@ mod tests {
                     generation: 1,
                     source: "transcript".to_owned(),
                     events: vec![NativeEvent {
+                        ts: None,
                         kind: "session.ended".to_owned(),
                         native_id: "ended".to_owned(),
                         data: json!({}),
@@ -1455,6 +1507,7 @@ mod tests {
                     generation: 1,
                     source: "transcript".to_owned(),
                     events: vec![NativeEvent {
+                        ts: None,
                         kind: "session.ended".to_owned(),
                         native_id: "ended".to_owned(),
                         data: json!({}),

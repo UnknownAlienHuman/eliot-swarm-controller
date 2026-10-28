@@ -1333,6 +1333,7 @@ impl EventProcessor {
                 kind: kind.to_owned(),
                 native_id,
                 data,
+                ts: None,
             }],
             cursor: None,
         };

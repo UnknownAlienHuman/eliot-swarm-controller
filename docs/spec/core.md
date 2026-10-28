@@ -142,6 +142,7 @@ profile/account/proxy capacity with their callers; do not silently change a spen
 ```text
 Event { seq?, ts, kind, family?, agent?, generation?, source,
         native_id?, cursor?, payload_digest?, cause?, subject?, data }
+NativeEvent { kind, native_id, data, ts?:i64 }
 SourceOwner { agent, generation, family, source, mechanism }
 SourceState {
   agent, generation, source, state: open|closed, health: ok|slow|stale|error,
@@ -150,6 +151,16 @@ SourceState {
   gap_id?, gap_digest?, gap_from?, gap_to?, gap_seq?
 }
 ```
+
+`NativeEvent.ts` is optional original native Unix epoch milliseconds. `None` is omitted
+from the wire and preserves the legacy semantic digest and ingestion-time `Event.ts`;
+`Some(ts)` is included in the native semantic digest and becomes the persisted `Event.ts`.
+This row timestamp is distinct from optional lifecycle times in `data`; it is never a
+substitute for a missing turn start or completion time.
+
+Private authenticated `source.state` may include a derived `observer_ready` proof;
+this field is not part of the public Agent `source_states` projection. An open source
+or dispatched attach does not establish readiness.
 
 `subject` is the bounded event-time post-transition Agent projection for rules:
 `{id,generation,project,parent,root,depth,harness,profile,state,workspace?,branch?,
@@ -161,6 +172,13 @@ Exactly one source owns each implemented family per Agent generation. Daemon-own
 Agent/command/mail/rule/Git/process facts and `session.lost` cannot be supplied as
 arbitrary plugin lifecycle. Persist bounded final facts; deltas/samples stay ephemeral.
 Mask known secrets in native output; reject known secrets in caller durable text.
+
+An observe-only live source may commit normalized source-owned facts only after settled
+`observer_ready` proof and an explicit source handoff. Store rechecks the exact subject,
+readiness and current family owner in the transaction. Observed batches cannot carry
+`command_id`, `cause` or `request_id`; they populate read-only event/turn views without
+entering controlled `apply`, changing the Agent's `unknown` state or identity, or settling
+commands/inputs. Private history pages remain read-only and nonpublishing.
 
 Within the request family, `request.resolved` remains bound to an exact owner reply
 command. Native cleanup uses `request.closed {request_id,turn_id}` with no `command_id`.

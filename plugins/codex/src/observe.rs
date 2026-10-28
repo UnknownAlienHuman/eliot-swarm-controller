@@ -1,5 +1,5 @@
-//! Exact-subject, read-only Codex observation. This module never controls a subject or
-//! publishes lifecycle events; it owns only its pinned reader process.
+//! Exact-subject, read-only Codex observation. This module never controls a subject.
+//! Private history and normalized live facts have separate cursors.
 
 #[path = "rollout.rs"]
 mod rollout;
@@ -9,29 +9,36 @@ use crate::{
         StoreContext, fingerprint, finish_reader, milliseconds, open_pinned_reader, probe_store,
         project_subject,
     },
+    live_recovery::RecoveryPublisher,
     native::{
         NativeClient, NativeLaunch, NativeProcess,
         types::{NativeHistoryItemsResponse, NativeObservedThreadReadResponse},
     },
 };
-use eliot_core::{Error, Result, SecretPolicy};
+use eliot_core::{BatchAck, Error, NativeEvent, Result, SecretPolicy};
 use eliot_plugin::{
     MAX_OBSERVATION_PAGE_BYTES, ObservationPage, ObservationQuery, ObserverAttachParams,
-    ObserverDetachParams, ObserverSnapshotParams, protocol::MAX_OBSERVATION_CURSOR_BYTES,
+    ObserverDetachParams, ObserverSnapshotParams, PeerClient,
+    protocol::MAX_OBSERVATION_CURSOR_BYTES,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
+    sync::Arc,
 };
-use tokio::{task::JoinHandle, time::Instant};
+use tokio::{
+    task::JoinHandle,
+    time::{Instant, timeout_at},
+};
 
 const CURSOR_PREFIX: &str = "codex-history-v1:";
 const MAX_NATIVE_CURSOR_BYTES: usize = 8 * 1024;
 const MAX_ID_BYTES: usize = 256;
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_PROFILE_BYTES: usize = 128 * 1024;
+const MAX_LIVE_RECORDS_PER_POLL: usize = 32;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -71,6 +78,32 @@ struct SubjectRead {
     cli_version: String,
 }
 
+enum PendingLive {
+    Record {
+        events: Vec<NativeEvent>,
+        from: String,
+        cursor: String,
+    },
+    Gap {
+        reason: String,
+        cursor: String,
+    },
+}
+
+#[derive(Clone, PartialEq)]
+enum LiveIntent {
+    Begin(String),
+    Recover(String),
+    Gap {
+        reason: String,
+        checkpoint: Option<String>,
+    },
+    Health {
+        source: String,
+        health: String,
+    },
+}
+
 pub(crate) struct ObserverSession {
     params: ObserverAttachParams,
     store: StoreContext,
@@ -84,6 +117,19 @@ pub(crate) struct ObserverSession {
     detach_result: Option<Value>,
     reader_closed: bool,
     shutting_down: bool,
+    live_policy: Arc<SecretPolicy>,
+    live_rollout: Option<rollout::LiveRollout>,
+    live_opening: Option<JoinHandle<Result<rollout::LiveRollout>>>,
+    live_publisher: Option<RecoveryPublisher>,
+    live_cursor: Option<String>,
+    live_baseline: Option<String>,
+    live_pending: Option<PendingLive>,
+    live_started: bool,
+    live_recovery_required: bool,
+    live_stale: bool,
+    live_reopen: bool,
+    live_problem: Option<&'static str>,
+    live_intent: Option<LiveIntent>,
 }
 
 impl ObserverSession {
@@ -131,6 +177,10 @@ impl ObserverSession {
             rollout_path,
             cli_version,
         } = subject_read;
+        if let Err(error) = validate_live_codec(&cli_version) {
+            finish_reader(&mut reader, Some(drainer)).await?;
+            return Err(reader.client().diagnostic_error(error));
+        }
 
         let metadata = match native_store_identity(&store).map(|identity| {
             json!({
@@ -165,6 +215,7 @@ impl ObserverSession {
             }
         };
 
+        let live_policy = Arc::new(SecretPolicy::new(&secrets));
         let session = Self {
             params,
             store,
@@ -178,6 +229,19 @@ impl ObserverSession {
             detach_result: None,
             reader_closed: false,
             shutting_down: false,
+            live_policy,
+            live_rollout: None,
+            live_opening: None,
+            live_publisher: None,
+            live_cursor: None,
+            live_baseline: None,
+            live_pending: None,
+            live_started: false,
+            live_recovery_required: false,
+            live_stale: false,
+            live_reopen: false,
+            live_problem: None,
+            live_intent: None,
         };
         Ok((session, attach_result))
     }
@@ -319,6 +383,406 @@ impl ObserverSession {
         )
     }
 
+    pub(crate) fn live_poll_enabled(&self) -> bool {
+        !self.reader_closed && !self.shutting_down && self.detach_command_id.is_none()
+    }
+
+    pub(crate) fn live_poll_timed_out(&mut self) {
+        self.live_stale = true;
+    }
+
+    pub(crate) async fn poll_live(
+        &mut self,
+        peer: &PeerClient,
+        credential: &str,
+        deadline: Instant,
+    ) -> Result<()> {
+        if !self.live_poll_enabled() || Instant::now() >= deadline {
+            return Ok(());
+        }
+        // observe opens during dispatch. Only the settled attach/fence proof
+        // grants live publication; false is a wait, not an uncertain operation.
+        if self.live_publisher.is_none() {
+            self.live_publisher = Some(RecoveryPublisher::new(
+                &self.params,
+                peer.clone(),
+                credential.to_owned(),
+                self.live_policy.clone(),
+            )?);
+        }
+        if !self
+            .live_publisher
+            .as_mut()
+            .ok_or_else(live_unknown)?
+            .wait_observer_ready(deadline)
+            .await?
+        {
+            return Ok(());
+        }
+        let result = self.poll_live_inner(deadline).await;
+        if result.is_err() {
+            // Report after pending publication settles; never turn a lost ACK
+            // into a different batch or a speculative gap operation.
+            self.live_stale = true;
+        }
+        result
+    }
+
+    async fn poll_live_inner(&mut self, deadline: Instant) -> Result<()> {
+        if let Some(ack) = self
+            .live_publisher
+            .as_mut()
+            .ok_or_else(live_unknown)?
+            .settle(deadline)
+            .await?
+        {
+            self.live_cursor = Some(settled_record_cursor(self.live_pending.as_ref(), &ack)?);
+            self.live_pending = None;
+        }
+        self.resume_live_intent(deadline).await?;
+        self.finish_live_pending(deadline).await?;
+        if let Some(reason) = self.live_problem {
+            if self.live_started {
+                self.publish_live_intent(
+                    LiveIntent::Gap {
+                        reason: reason.to_owned(),
+                        checkpoint: None,
+                    },
+                    deadline,
+                )
+                .await?;
+            } else {
+                // No transcript row/grant exists before the first handoff.
+                // Retain this unavailability and report only predecessor health.
+                self.publish_live_health("observe", "stale", deadline)
+                    .await?;
+            }
+        }
+        if self.live_stale {
+            self.publish_live_health(
+                if self.live_started {
+                    "transcript"
+                } else {
+                    "observe"
+                },
+                "stale",
+                deadline,
+            )
+            .await?;
+            self.live_stale = false;
+        }
+        if self.live_reopen {
+            if let Some(tail) = self.live_rollout.as_mut() {
+                tail.close().await?;
+            }
+            self.live_rollout = None;
+            self.live_cursor = None;
+            self.live_baseline = None;
+            self.rollout_path = None;
+            self.live_reopen = false;
+        }
+        self.open_live_rollout(deadline).await?;
+        self.finish_live_baseline(deadline).await?;
+        for _ in 0..MAX_LIVE_RECORDS_PER_POLL {
+            if Instant::now() >= deadline {
+                return Ok(());
+            }
+            let from = self.live_cursor.clone().ok_or_else(live_unknown)?;
+            let read = self
+                .live_rollout
+                .as_mut()
+                .ok_or_else(live_unknown)?
+                .read_page(&from, 1, deadline.into_std())
+                .await;
+            let page = match read {
+                Ok(page) => page,
+                Err(error) if Instant::now() >= deadline => return Err(error),
+                Err(error) => {
+                    self.live_problem = Some("observer rollout identity or read is unavailable");
+                    self.live_reopen = true;
+                    return Err(error);
+                }
+            };
+            if let Some(reason) = page.gap {
+                if !page.records.is_empty() {
+                    return Err(integrity());
+                }
+                self.live_pending = Some(PendingLive::Gap {
+                    reason,
+                    cursor: page.cursor,
+                });
+                self.finish_live_pending(deadline).await?;
+                return Ok(());
+            }
+            if page.records.len() > 1 {
+                return Err(integrity());
+            }
+            if let Some(record) = page.records.into_iter().next() {
+                if record.cursor != page.cursor
+                    || record.cursor == from
+                    || record.events.is_empty()
+                    || record
+                        .events
+                        .iter()
+                        .any(|event| event.ts.is_none() || event.data.get("command_id").is_some())
+                {
+                    return Err(integrity());
+                }
+                // Latch BEFORE any await. Reader turn context may already have
+                // advanced, so this record must settle before any further read.
+                self.live_pending = Some(PendingLive::Record {
+                    events: record.events,
+                    from,
+                    cursor: record.cursor,
+                });
+                self.finish_live_pending(deadline).await?;
+            } else {
+                if page.cursor == from && !page.at_end && !page.partial_tail {
+                    return Err(integrity());
+                }
+                self.live_cursor = Some(page.cursor);
+            }
+            self.publish_live_health(
+                "transcript",
+                if self.live_recovery_required {
+                    "stale"
+                } else if page.at_end || page.partial_tail {
+                    "ok"
+                } else {
+                    "slow"
+                },
+                deadline,
+            )
+            .await?;
+            if page.at_end || page.partial_tail {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    async fn finish_live_baseline(&mut self, deadline: Instant) -> Result<()> {
+        if let Some(edge) = self.live_baseline.clone() {
+            let intent = if self.live_started {
+                LiveIntent::Recover(edge)
+            } else {
+                LiveIntent::Begin(edge)
+            };
+            self.publish_live_intent(intent, deadline).await?;
+        }
+        Ok(())
+    }
+
+    async fn publish_live_health(
+        &mut self,
+        source: &str,
+        health: &str,
+        deadline: Instant,
+    ) -> Result<()> {
+        self.publish_live_intent(
+            LiveIntent::Health {
+                source: source.to_owned(),
+                health: health.to_owned(),
+            },
+            deadline,
+        )
+        .await
+    }
+
+    async fn publish_live_intent(&mut self, intent: LiveIntent, deadline: Instant) -> Result<()> {
+        if self
+            .live_intent
+            .as_ref()
+            .is_some_and(|pending| *pending != intent)
+        {
+            return Err(live_unknown());
+        }
+        self.live_intent = Some(intent);
+        self.resume_live_intent(deadline).await
+    }
+
+    async fn resume_live_intent(&mut self, deadline: Instant) -> Result<()> {
+        let Some(intent) = self.live_intent.clone() else {
+            return Ok(());
+        };
+        let publisher = self.live_publisher.as_mut().ok_or_else(live_unknown)?;
+        match &intent {
+            LiveIntent::Begin(edge) => publisher.begin(edge, deadline).await?,
+            LiveIntent::Recover(edge) => publisher.recover(edge, deadline).await?,
+            LiveIntent::Gap { reason, checkpoint } => {
+                let committed = publisher
+                    .unavailable(reason, checkpoint.clone(), deadline)
+                    .await?;
+                if committed != *checkpoint {
+                    return Err(live_unknown());
+                }
+            }
+            LiveIntent::Health { source, health } => {
+                publisher.health(source, health, deadline).await?
+            }
+        }
+        // Nothing mutates the original intent or the pending record across the
+        // await above. Apply its local checkpoint only after its exact proof.
+        self.live_intent = None;
+        match intent {
+            LiveIntent::Begin(edge) => {
+                self.live_cursor = Some(edge);
+                self.live_baseline = None;
+                self.live_started = true;
+                self.live_recovery_required = false;
+                self.live_problem = None;
+            }
+            LiveIntent::Recover(edge) => {
+                if self.live_baseline.as_deref() == Some(edge.as_str()) {
+                    self.live_cursor = Some(edge);
+                    self.live_baseline = None;
+                }
+                self.live_recovery_required = false;
+            }
+            LiveIntent::Gap { reason, checkpoint } => {
+                self.live_recovery_required = true;
+                if let (
+                    Some(PendingLive::Gap {
+                        reason: pending_reason,
+                        cursor,
+                    }),
+                    Some(checkpoint),
+                ) = (self.live_pending.as_ref(), checkpoint)
+                {
+                    if *pending_reason != reason || *cursor != checkpoint {
+                        return Err(live_unknown());
+                    }
+                    self.live_reopen |= self.live_cursor.as_deref() == Some(cursor.as_str());
+                    self.live_cursor = Some(checkpoint);
+                    self.live_pending = None;
+                } else {
+                    self.live_problem = None;
+                }
+            }
+            LiveIntent::Health { health, .. } => {
+                if health == "stale" {
+                    self.live_stale = false;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn finish_live_pending(&mut self, deadline: Instant) -> Result<()> {
+        match self.live_pending.as_ref() {
+            Some(PendingLive::Record {
+                events,
+                from,
+                cursor,
+            }) => {
+                let events = events.clone();
+                let from = from.clone();
+                let cursor = cursor.clone();
+                if self.live_recovery_required {
+                    self.publish_live_intent(LiveIntent::Recover(from), deadline)
+                        .await?;
+                }
+                let ack = self
+                    .live_publisher
+                    .as_mut()
+                    .ok_or_else(live_unknown)?
+                    .commit(events, cursor.clone(), deadline)
+                    .await?;
+                self.live_cursor = Some(settled_record_cursor(self.live_pending.as_ref(), &ack)?);
+            }
+            Some(PendingLive::Gap { reason, cursor }) => {
+                let reason = reason.clone();
+                let cursor = cursor.clone();
+                self.publish_live_intent(
+                    LiveIntent::Gap {
+                        reason,
+                        checkpoint: Some(cursor),
+                    },
+                    deadline,
+                )
+                .await?;
+            }
+            None => return Ok(()),
+        }
+        self.live_pending = None;
+        Ok(())
+    }
+
+    async fn open_live_rollout(&mut self, deadline: Instant) -> Result<()> {
+        if self.live_rollout.is_some() {
+            return Ok(());
+        }
+        if self.live_opening.is_none() {
+            if self.rollout_path.is_none() {
+                let client = self.reader.as_ref().ok_or_else(live_unknown)?.client();
+                let subject = match read_subject(&client, &self.params.native_ref, deadline).await {
+                    Ok(subject) => subject,
+                    Err(error) => {
+                        self.live_problem = Some("observer exact subject metadata is unavailable");
+                        return Err(error);
+                    }
+                };
+                if subject.cli_version != self.rollout_cli_version {
+                    self.live_problem = Some("observer rollout codec version changed");
+                    return Err(integrity());
+                }
+                self.rollout_path = subject.rollout_path;
+            }
+            let Some(path) = self.rollout_path.clone() else {
+                self.live_problem = Some("observer exact subject has no rollout path");
+                return Err(rollout_unavailable());
+            };
+            let home = self.store.home().to_path_buf();
+            let native_ref = self.params.native_ref.clone();
+            let version = self.rollout_cli_version.clone();
+            let binding = self.live_binding()?;
+            let policy = self.live_policy.clone();
+            self.live_opening = Some(tokio::task::spawn_blocking(move || {
+                rollout::LiveRollout::open(
+                    path,
+                    home,
+                    native_ref,
+                    version,
+                    binding,
+                    policy,
+                    deadline.into_std(),
+                )
+            }));
+        }
+        let opened = timeout_at(
+            deadline,
+            self.live_opening.as_mut().ok_or_else(live_unknown)?,
+        )
+        .await;
+        match opened {
+            Ok(result) => {
+                self.live_opening = None;
+                match result {
+                    Ok(Ok(tail)) => {
+                        self.live_baseline = Some(tail.baseline_cursor().to_owned());
+                        self.live_rollout = Some(tail);
+                        Ok(())
+                    }
+                    _ => {
+                        self.live_problem = Some("observer rollout live edge is unavailable");
+                        Err(rollout_unavailable())
+                    }
+                }
+            }
+            Err(_) => Err(Error::new("busy", "observer live opening deadline elapsed")),
+        }
+    }
+
+    fn live_binding(&self) -> Result<String> {
+        fingerprint(json!({
+            "domain":"eliot/codex/observer-live/v1", "agent_id":self.params.agent_id,
+            "generation":self.params.generation, "native_scope":self.store.scope(),
+            "native_ref":self.params.native_ref, "profile":self.params.profile,
+            "target_environment":self.params.target_environment, "store_binding":self.store.binding(),
+            "cli_version":self.rollout_cli_version, "source":"transcript", "mechanism":"rollout_tail",
+        }))
+    }
+
     pub(crate) async fn detach(
         &mut self,
         params: &ObserverDetachParams,
@@ -373,14 +837,35 @@ impl ObserverSession {
     }
 
     async fn close_reader(&mut self) -> Result<()> {
+        let live_result = self.close_live().await;
         let Some(reader) = self.reader.as_mut() else {
             self.reader_closed = true;
-            return Ok(());
+            return live_result;
         };
         let drainer = self.drainer.take();
-        finish_reader(reader, drainer).await?;
-        self.reader = None;
-        self.reader_closed = true;
+        let reader_result = finish_reader(reader, drainer).await;
+        if reader_result.is_ok() {
+            self.reader = None;
+            self.reader_closed = true;
+        }
+        live_result.and(reader_result)
+    }
+
+    async fn close_live(&mut self) -> Result<()> {
+        // Keep the opening handle in self while awaiting so another cancelled
+        // cleanup still has its owner. A completed opening owns a file too.
+        if let Some(opening) = self.live_opening.as_mut() {
+            let result = opening.await;
+            self.live_opening = None;
+            if let Ok(Ok(tail)) = result {
+                self.live_rollout = Some(tail);
+            }
+        }
+        if let Some(tail) = self.live_rollout.as_mut() {
+            tail.close().await?;
+        }
+        self.live_rollout = None;
+        self.live_pending = None;
         Ok(())
     }
 
@@ -872,6 +1357,32 @@ fn rollout_unavailable() -> Error {
         "Codex thread/read did not provide an exact rollout path",
     )
 }
+
+fn live_unknown() -> Error {
+    Error::new(
+        "unknown",
+        "Codex observer live publication has no verified current boundary",
+    )
+}
+
+fn validate_live_codec(version: &str) -> Result<()> {
+    if version != "0.161.0" {
+        return Err(Error::new(
+            "profile_error",
+            "Codex live observation requires the supported stable 0.161.0 codec",
+        ));
+    }
+    Ok(())
+}
+
+fn settled_record_cursor(pending: Option<&PendingLive>, ack: &BatchAck) -> Result<String> {
+    match pending {
+        Some(PendingLive::Record { cursor, .. }) if ack.cursor.as_ref() == Some(cursor) => {
+            Ok(cursor.clone())
+        }
+        _ => Err(live_unknown()),
+    }
+}
 fn secret_in_payload() -> Error {
     Error::new(
         "secret_in_payload",
@@ -887,7 +1398,72 @@ fn unverified_store() -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_text;
+    use super::{PendingLive, sanitize_text, settled_record_cursor, validate_live_codec};
+    use eliot_core::{BatchAck, NativeEvent};
+    use serde_json::json;
+
+    #[test]
+    fn uncertain_record_keeps_frozen_payload_and_cursor_until_exact_ack() {
+        let events = vec![NativeEvent {
+            kind: "message.completed".to_owned(),
+            native_id: "held-file-record".to_owned(),
+            ts: Some(1234),
+            data: json!({"turn_id":"native-turn","text":"dummy"}),
+        }];
+        let pending = PendingLive::Record {
+            events: events.clone(),
+            from: "before-record".to_owned(),
+            cursor: "after-record".to_owned(),
+        };
+        for cursor in [
+            None,
+            Some("before-record".to_owned()),
+            Some("another-record".to_owned()),
+        ] {
+            let ack = BatchAck {
+                first_seq: 1,
+                last_seq: 1,
+                cursor,
+            };
+            assert_eq!(
+                settled_record_cursor(Some(&pending), &ack)
+                    .unwrap_err()
+                    .code,
+                "unknown"
+            );
+        }
+        let ack = BatchAck {
+            first_seq: 1,
+            last_seq: 1,
+            cursor: Some("after-record".to_owned()),
+        };
+        assert_eq!(
+            settled_record_cursor(Some(&pending), &ack).unwrap(),
+            "after-record"
+        );
+        let PendingLive::Record {
+            events: retained,
+            from,
+            cursor,
+        } = pending
+        else {
+            panic!("record")
+        };
+        assert_eq!(retained, events);
+        assert_eq!(from, "before-record");
+        assert_eq!(cursor, "after-record");
+    }
+
+    #[test]
+    fn live_codec_is_explicit_stable_0161_without_alpha_fallback() {
+        validate_live_codec("0.161.0").unwrap();
+        for version in ["", "0.164.0-alpha", "0.164.0", "0.161.0-alpha", "0.161.0 "] {
+            assert_eq!(
+                validate_live_codec(version).unwrap_err().code,
+                "profile_error"
+            );
+        }
+    }
 
     #[test]
     fn short_and_overlapping_secrets_reject_routing_ids_without_mutation() {

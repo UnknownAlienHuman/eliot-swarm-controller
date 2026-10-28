@@ -1,7 +1,8 @@
 //! Bounded metadata projection of the exact Codex JSONL path returned by thread/read.
 //! This is deliberately not a session executor or a general rollout discovery API.
 
-use eliot_core::{Error, Result, SecretPolicy};
+use crate::discovery::fingerprint;
+use eliot_core::{Error, NativeEvent, Result, SecretPolicy};
 use eliot_plugin::{
     FileIdentity, MAX_OBSERVATION_CURSOR_BYTES, MAX_OBSERVATION_PAGE_BYTES,
     MAX_OBSERVATION_PAGE_ENTRIES, ObservationQuery, file_final_path, file_identity,
@@ -10,11 +11,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, mpsc},
     time::Instant,
 };
+use tokio::task::JoinHandle;
 
 const CURSOR_PREFIX: &str = "codex-rollout-v1:";
 const MAX_LINE_BYTES: usize = 256 * 1024;
@@ -22,6 +26,828 @@ const MAX_HEADER_BYTES: usize = 256 * 1024;
 const MAX_SCAN_BYTES: usize = 1024 * 1024;
 const ANCHOR_BYTES: usize = 4096;
 const MAX_PATH_BYTES: usize = 4096;
+const LIVE_CURSOR_PREFIX: &str = "codex-rollout-live-v1:";
+const LIVE_CLI_VERSION: &str = "0.161.0";
+
+pub(crate) struct LiveRecord {
+    pub events: Vec<NativeEvent>,
+    pub cursor: String,
+}
+
+pub(crate) struct LiveRolloutPage {
+    pub records: Vec<LiveRecord>,
+    pub cursor: String,
+    pub at_end: bool,
+    pub partial_tail: bool,
+    pub gap: Option<String>,
+}
+
+/// One held file and at most one owned blocking operation. Cancelled reads keep
+/// their task here; close joins it before releasing the file. Never clone/reopen.
+pub(crate) struct LiveRollout {
+    file: Option<LiveFile>,
+    pending: Option<PendingLiveRead>,
+    baseline: String,
+}
+
+struct LiveFile {
+    file: File,
+    home: PathBuf,
+    final_path: PathBuf,
+    identity: FileIdentity,
+    header_end: u64,
+    header_hash: String,
+    native_ref: String,
+    cli_version: String,
+    binding: String,
+    policy: Arc<SecretPolicy>,
+}
+
+struct PendingLiveRead {
+    task: JoinHandle<()>,
+    result: Mutex<mpsc::Receiver<(LiveFile, Result<LiveRolloutPage>)>>,
+}
+
+impl Drop for PendingLiveRead {
+    fn drop(&mut self) {
+        // Normal close/read awaits the task first. If the owner itself is
+        // dropped during a read, wait for its file to return instead of
+        // detaching a blocking operation with access to the private rollout.
+        let _ = self
+            .result
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recv();
+        while !self.task.is_finished() {
+            std::thread::yield_now();
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LiveCursor {
+    version: u8,
+    binding: String,
+    file_identity: FileIdentity,
+    offset: u64,
+    anchor_sha256: String,
+    current_turn_id: Option<String>,
+    calls: BTreeMap<String, LiveCall>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LiveCall {
+    turn_id: String,
+    name: String,
+}
+
+impl LiveRollout {
+    pub(crate) fn open(
+        path: PathBuf,
+        home: PathBuf,
+        native_ref: String,
+        cli_version: String,
+        binding: String,
+        policy: Arc<SecretPolicy>,
+        deadline: Instant,
+    ) -> Result<Self> {
+        if cli_version != LIVE_CLI_VERSION {
+            return Err(Error::new(
+                "unsupported",
+                "Codex live rollout codec requires 0.161.0",
+            ));
+        }
+        for value in [&native_ref, &cli_version, &binding] {
+            live_identifier(value, &policy)?;
+        }
+        if !path.is_absolute() || Instant::now() >= deadline {
+            return Err(unavailable());
+        }
+        let home = fs::canonicalize(home).map_err(map_io_error)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .open(path)
+            .map_err(map_io_error)?;
+        if !file.metadata().map_err(map_io_error)?.is_file() {
+            return Err(unavailable());
+        }
+        let identity = file_identity(&file).map_err(map_io_error)?;
+        let final_path = file_final_path(&file).map_err(map_io_error)?;
+        verify_final_path(&final_path, &home)?;
+        let (header_bytes, header_end) =
+            read_complete_line(&mut file, 0, MAX_HEADER_BYTES, deadline)?
+                .ok_or_else(unavailable)?;
+        let header = parse_line(&header_bytes)?;
+        validate_header(&header, &native_ref, &cli_version)?;
+        native_timestamp(&header.timestamp)?;
+        let binding = fingerprint(json!({
+            "domain":"eliot/codex/live-rollout/v1", "caller":binding,
+            "native_ref":native_ref, "cli_version":cli_version, "file_identity":identity,
+            "home":home.to_str().ok_or_else(unavailable)?,
+            "path":final_path.to_str().ok_or_else(unavailable)?,
+        }))?;
+        let length = file.metadata().map_err(map_io_error)?.len();
+        let offset = complete_live_edge(&mut file, header_end, length, deadline)?;
+        let cursor = LiveCursor {
+            version: 1,
+            binding: binding.clone(),
+            file_identity: identity,
+            offset,
+            anchor_sha256: anchor_at(&mut file, offset, deadline)?,
+            current_turn_id: None,
+            calls: BTreeMap::new(),
+        };
+        let baseline = encode_live_cursor(&cursor, &policy)?;
+        Ok(Self {
+            file: Some(LiveFile {
+                file,
+                home,
+                final_path,
+                identity,
+                header_end,
+                header_hash: hex_digest(&header_bytes),
+                native_ref,
+                cli_version,
+                binding,
+                policy,
+            }),
+            pending: None,
+            baseline,
+        })
+    }
+
+    pub(crate) fn baseline_cursor(&self) -> &str {
+        &self.baseline
+    }
+
+    pub(crate) async fn read_page(
+        &mut self,
+        cursor: &str,
+        limit: usize,
+        deadline: Instant,
+    ) -> Result<LiveRolloutPage> {
+        // A prior caller may have been cancelled at its await. Recover the file
+        // first, then deterministically read the supplied acknowledged cursor.
+        let _ = self.join_read().await?;
+        if !(1..=MAX_OBSERVATION_PAGE_ENTRIES).contains(&limit) {
+            return Err(invalid());
+        }
+        if Instant::now() >= deadline {
+            return Err(read_deadline());
+        }
+        let mut file = self.file.take().ok_or_else(unavailable)?;
+        let cursor = cursor.to_owned();
+        let (sender, result) = mpsc::sync_channel(1);
+        let task = tokio::task::spawn_blocking(move || {
+            let page = file.read_page(&cursor, limit, deadline);
+            let _ = sender.send((file, page));
+        });
+        self.pending = Some(PendingLiveRead {
+            task,
+            result: Mutex::new(result),
+        });
+        self.join_read().await?.ok_or_else(unavailable)?
+    }
+
+    pub(crate) async fn close(&mut self) -> Result<()> {
+        let joined = self.join_read().await;
+        self.file = None;
+        joined.map(|_| ())
+    }
+
+    async fn join_read(&mut self) -> Result<Option<Result<LiveRolloutPage>>> {
+        let Some(pending) = self.pending.as_mut() else {
+            return Ok(None);
+        };
+        let joined = (&mut pending.task).await;
+        let mut pending = self.pending.take().ok_or_else(unavailable)?;
+        joined.map_err(|_| Error::new("unknown", "Codex live rollout read task failed"))?;
+        let (file, page) = pending
+            .result
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .try_recv()
+            .map_err(|_| unavailable())?;
+        self.file = Some(file);
+        Ok(Some(page))
+    }
+}
+
+impl LiveFile {
+    fn verify(&mut self, deadline: Instant) -> Result<u64> {
+        let metadata = self.file.metadata().map_err(map_io_error)?;
+        if !metadata.is_file() || file_identity(&self.file).map_err(map_io_error)? != self.identity
+        {
+            return Err(unavailable());
+        }
+        let final_path = file_final_path(&self.file).map_err(map_io_error)?;
+        verify_final_path(&final_path, &self.home)?;
+        if final_path != self.final_path {
+            return Err(unavailable());
+        }
+        let (bytes, end) = read_complete_line(&mut self.file, 0, MAX_HEADER_BYTES, deadline)?
+            .ok_or_else(unavailable)?;
+        let header = parse_line(&bytes)?;
+        validate_header(&header, &self.native_ref, &self.cli_version)?;
+        if end != self.header_end || hex_digest(&bytes) != self.header_hash {
+            return Err(integrity());
+        }
+        Ok(metadata.len())
+    }
+
+    fn read_page(&mut self, raw: &str, limit: usize, deadline: Instant) -> Result<LiveRolloutPage> {
+        let mut state = decode_live_cursor(raw, &self.binding, self.identity, &self.policy)?;
+        let snapshot = match self.verify(deadline) {
+            Ok(length) => length,
+            Err(error) => return Ok(live_gap(raw, &error)),
+        };
+        if state.offset < self.header_end || state.offset > snapshot {
+            return Ok(live_gap(raw, &unavailable()));
+        }
+        if read_range(&mut self.file, state.offset - 1, 1, deadline)?.as_slice() != b"\n"
+            || anchor_at(&mut self.file, state.offset, deadline)? != state.anchor_sha256
+        {
+            return Ok(live_gap(raw, &unavailable()));
+        }
+        let available = snapshot - state.offset;
+        let length = available.min(MAX_SCAN_BYTES as u64) as usize;
+        let bytes = read_range(&mut self.file, state.offset, length, deadline)?;
+        let scan_limited = available > length as u64;
+        let mut position = 0;
+        let mut records = Vec::new();
+        let mut page_bytes = 0usize;
+        let mut partial_tail = false;
+        while position < bytes.len() {
+            if Instant::now() >= deadline {
+                return Err(read_deadline());
+            }
+            let remaining = &bytes[position..];
+            let Some(end) = remaining.iter().position(|byte| *byte == b'\n') else {
+                if remaining.len() > MAX_LINE_BYTES {
+                    return Ok(live_gap(raw, &too_large()));
+                }
+                partial_tail = !scan_limited;
+                break;
+            };
+            if end > MAX_LINE_BYTES {
+                return Ok(live_gap(raw, &too_large()));
+            }
+            let start = state.offset;
+            let next = start.checked_add(end as u64 + 1).ok_or_else(too_large)?;
+            let mut candidate = state.clone();
+            let normalized = parse_line(&remaining[..end]).and_then(|line| {
+                normalize_live_line(
+                    &mut candidate,
+                    &line,
+                    self.identity,
+                    &self.native_ref,
+                    start,
+                    next,
+                    &self.policy,
+                )
+            });
+            candidate.offset = next;
+            candidate.anchor_sha256 = anchor_at(&mut self.file, next, deadline)?;
+            let events = match normalized {
+                Ok(events) => events,
+                Err(error) => {
+                    candidate.current_turn_id = None;
+                    candidate.calls.clear();
+                    let cursor = encode_live_cursor(&candidate, &self.policy)?;
+                    let mut gap = live_gap(&cursor, &error);
+                    gap.partial_tail = false;
+                    return Ok(gap);
+                }
+            };
+            let cursor = match encode_live_cursor(&candidate, &self.policy) {
+                Ok(cursor) => cursor,
+                Err(error) => return Ok(live_gap(raw, &error)),
+            };
+            if !events.is_empty() {
+                let encoded = encoded_len(&json!({"events":events,"cursor":cursor}))?;
+                if page_bytes
+                    .saturating_add(encoded)
+                    .saturating_add(MAX_OBSERVATION_CURSOR_BYTES + 4096)
+                    > MAX_OBSERVATION_PAGE_BYTES
+                {
+                    if records.is_empty() {
+                        return Ok(live_gap(raw, &too_large()));
+                    }
+                    break;
+                }
+                page_bytes += encoded;
+                records.push(LiveRecord { events, cursor });
+            }
+            state = candidate;
+            position += end + 1;
+            if records.len() == limit {
+                break;
+            }
+        }
+        let after = match self.verify(deadline) {
+            Ok(length) => length,
+            Err(error) => return Ok(live_gap(raw, &error)),
+        };
+        if after < snapshot || after < state.offset {
+            return Ok(live_gap(raw, &unavailable()));
+        }
+        let cursor = encode_live_cursor(&state, &self.policy)?;
+        if state.offset
+            == decode_live_cursor(raw, &self.binding, self.identity, &self.policy)?.offset
+            && !partial_tail
+            && state.offset < snapshot
+        {
+            return Ok(live_gap(raw, &unavailable()));
+        }
+        Ok(LiveRolloutPage {
+            // This is the captured file edge, not a native completion assertion.
+            // An append racing the final metadata query belongs to the next poll.
+            records,
+            cursor,
+            at_end: state.offset == snapshot && !partial_tail,
+            partial_tail,
+            gap: None,
+        })
+    }
+}
+
+fn complete_live_edge(
+    file: &mut File,
+    header_end: u64,
+    length: u64,
+    deadline: Instant,
+) -> Result<u64> {
+    if length < header_end {
+        return Err(unavailable());
+    }
+    let start = length.saturating_sub(MAX_SCAN_BYTES as u64).max(header_end);
+    let bytes = read_range(file, start, (length - start) as usize, deadline)?;
+    let offset = match bytes.iter().rposition(|byte| *byte == b'\n') {
+        Some(end) => start + end as u64 + 1,
+        None if start == header_end => header_end,
+        None => return Err(too_large()),
+    };
+    if length - offset > MAX_LINE_BYTES as u64 {
+        return Err(too_large());
+    }
+    Ok(offset)
+}
+
+fn encode_live_cursor(cursor: &LiveCursor, policy: &SecretPolicy) -> Result<String> {
+    let raw = format!(
+        "{LIVE_CURSOR_PREFIX}{}",
+        serde_json::to_string(cursor).map_err(|_| integrity())?
+    );
+    if raw.len() > MAX_OBSERVATION_CURSOR_BYTES {
+        return Err(too_large());
+    }
+    if policy.contains_text(&raw) {
+        return Err(live_secret());
+    }
+    Ok(raw)
+}
+
+fn decode_live_cursor(
+    raw: &str,
+    binding: &str,
+    identity: FileIdentity,
+    policy: &SecretPolicy,
+) -> Result<LiveCursor> {
+    if raw.len() > MAX_OBSERVATION_CURSOR_BYTES {
+        return Err(too_large());
+    }
+    if policy.contains_text(raw) {
+        return Err(live_secret());
+    }
+    let cursor: LiveCursor = serde_json::from_str(
+        raw.strip_prefix(LIVE_CURSOR_PREFIX)
+            .ok_or_else(cursor_mismatch)?,
+    )
+    .map_err(|_| cursor_mismatch())?;
+    if cursor.version != 1
+        || cursor.binding != binding
+        || cursor.file_identity != identity
+        || encode_live_cursor(&cursor, policy)? != raw
+    {
+        return Err(cursor_mismatch());
+    }
+    if let Some(turn) = &cursor.current_turn_id {
+        live_identifier(turn, policy)?;
+    }
+    for (id, call) in &cursor.calls {
+        live_identifier(id, policy)?;
+        live_identifier(&call.turn_id, policy)?;
+    }
+    Ok(cursor)
+}
+
+fn live_identifier(value: &str, policy: &SecretPolicy) -> Result<()> {
+    validate_text(value, 256)?;
+    if policy.contains_text(value) {
+        return Err(live_secret());
+    }
+    Ok(())
+}
+
+fn live_secret() -> Error {
+    Error::new(
+        "secret_in_payload",
+        "Codex live rollout immutable binding contains a known secret",
+    )
+}
+
+fn live_gap(cursor: &str, error: &Error) -> LiveRolloutPage {
+    LiveRolloutPage {
+        records: Vec::new(),
+        cursor: cursor.to_owned(),
+        at_end: false,
+        partial_tail: false,
+        gap: Some(format!("codex_rollout_{}", error.code)),
+    }
+}
+
+// Pinned format: openai/codex 979011409de0a60b52f179721948e65531d26144,
+// protocol/src/{protocol,models}.rs and rollout/src/policy.rs. Lifecycle
+// EventMsg records are canonical; legacy message/tool echoes are not republished.
+fn normalize_live_line(
+    state: &mut LiveCursor,
+    line: &RolloutLine,
+    identity: FileIdentity,
+    native_ref: &str,
+    start: u64,
+    end: u64,
+    policy: &SecretPolicy,
+) -> Result<Vec<NativeEvent>> {
+    let ts = native_timestamp(&line.timestamp)?;
+    if line.kind == "session_meta" {
+        return Err(integrity());
+    }
+    if !line.payload.is_object() {
+        return Err(integrity());
+    }
+    if line.kind == "turn_context" {
+        let turn = live_optional_id(&line.payload, "turn_id", policy)?;
+        if state.current_turn_id.as_deref() != turn {
+            state.calls.clear();
+        }
+        state.current_turn_id = turn.map(str::to_owned);
+        return Ok(Vec::new());
+    }
+    let normalized = match line.kind.as_str() {
+        "event_msg" => normalize_live_event(state, &line.payload, policy)?,
+        "response_item" => normalize_live_item(state, &line.payload, policy)?,
+        _ => return Ok(Vec::new()),
+    };
+    let Some((kind, mut data)) = normalized else {
+        return Ok(Vec::new());
+    };
+    // Binding values are checked before any body redaction. Object keys are
+    // never rewritten; a known secret in a publication key rejects the record.
+    data["native_timestamp"] = json!(line.timestamp);
+    sanitize_live_publication(kind, &mut data, policy)?;
+    let digest = fingerprint(json!({
+        "domain":"eliot/codex/live-rollout-record/v1", "native_ref":native_ref,
+        "file_identity":identity, "byte_start":start, "byte_end":end,
+        "kind":kind, "data":data, "ts":ts,
+    }))?;
+    let native_id = format!("codex-rollout:{digest}");
+    if policy.contains_text(&native_id) {
+        return Err(live_secret());
+    }
+    let event = NativeEvent {
+        kind: kind.to_owned(),
+        native_id,
+        data,
+        ts: Some(ts),
+    };
+    if serde_json::to_vec(&event).map_err(|_| integrity())?.len() > eliot_plugin::MAX_EVENT_BYTES {
+        return Err(too_large());
+    }
+    Ok(vec![event])
+}
+
+fn sanitize_live_publication(kind: &str, data: &mut Value, policy: &SecretPolicy) -> Result<()> {
+    // Only body fields may change. IDs, roles, phases, status/reason/type
+    // discriminants and JSON keys retain their native meaning or reject.
+    for field in [
+        "text",
+        "final_text",
+        "arguments",
+        "input",
+        "tool",
+        "native_timestamp",
+        "error",
+    ] {
+        if let Some(value) = data.get_mut(field) {
+            policy.redact_values(value);
+        }
+    }
+    if let Some(output) = data.get_mut("output") {
+        if let Some(parts) = output.as_array_mut() {
+            for part in parts {
+                if let Some(text) = part.get_mut("text") {
+                    policy.redact_values(text);
+                }
+            }
+        } else {
+            policy.redact_values(output);
+        }
+    }
+    if policy.contains_text(kind) || policy.contains_value(data) {
+        return Err(live_secret());
+    }
+    Ok(())
+}
+
+fn normalize_live_event(
+    state: &mut LiveCursor,
+    payload: &Value,
+    policy: &SecretPolicy,
+) -> Result<Option<(&'static str, Value)>> {
+    let event_type = payload
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(integrity)?;
+    match event_type {
+        "agent_message" | "user_message" | "exec_command_end" => return Ok(None),
+        "task_started" | "turn_started" | "task_complete" | "turn_complete" | "task_aborted"
+        | "turn_aborted" => {}
+        _ => return Err(live_unsupported()),
+    }
+    let turn = live_optional_id(payload, "turn_id", policy)?.ok_or_else(live_unbound)?;
+    if state
+        .current_turn_id
+        .as_deref()
+        .is_some_and(|current| current != turn)
+    {
+        return Err(live_unbound());
+    }
+    let mut data = json!({"turn_id":turn});
+    for field in ["started_at", "completed_at"] {
+        if let Some(seconds) = optional_i64(payload, field)? {
+            data[field] = json!(seconds.checked_mul(1000).ok_or_else(integrity)?);
+        }
+    }
+    if let Some(duration) = optional_i64(payload, "duration_ms")? {
+        if duration < 0 {
+            return Err(integrity());
+        }
+        data["duration_ms"] = json!(duration);
+    }
+    if matches!(event_type, "task_started" | "turn_started") {
+        state.current_turn_id = Some(turn.to_owned());
+        return Ok(Some(("turn.started", data)));
+    }
+    let has_error = match payload.get("error") {
+        None | Some(Value::Null) => false,
+        Some(Value::Object(error)) => {
+            data["error"] = json!({"message":error.get("message").and_then(Value::as_str).ok_or_else(integrity)?});
+            true
+        }
+        Some(_) => return Err(integrity()),
+    };
+    let aborted = matches!(event_type, "task_aborted" | "turn_aborted");
+    if aborted {
+        let reason = payload
+            .get("reason")
+            .and_then(Value::as_str)
+            .ok_or_else(integrity)?;
+        if !matches!(
+            reason,
+            "interrupted" | "replaced" | "review_ended" | "budget_limited"
+        ) {
+            return Err(live_unsupported());
+        }
+        data["abort_reason"] = json!(reason);
+    } else {
+        match payload.get("last_agent_message") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(text)) => data["final_text"] = json!(text),
+            Some(_) => return Err(integrity()),
+        }
+    }
+    data["status"] = json!(if aborted || has_error {
+        "failed"
+    } else {
+        "completed"
+    });
+    state.current_turn_id = None;
+    state.calls.retain(|_, call| call.turn_id != turn);
+    // The terminal's own final_text is retained without emitting a duplicate
+    // message completion from last_agent_message.
+    Ok(Some(("turn.completed", data)))
+}
+
+fn normalize_live_item(
+    state: &mut LiveCursor,
+    payload: &Value,
+    policy: &SecretPolicy,
+) -> Result<Option<(&'static str, Value)>> {
+    let kind = payload
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(integrity)?;
+    if kind == "reasoning" {
+        return Ok(None);
+    }
+    if !matches!(
+        kind,
+        "message"
+            | "function_call"
+            | "custom_tool_call"
+            | "function_call_output"
+            | "custom_tool_call_output"
+    ) {
+        return Err(live_unsupported());
+    }
+    let explicit = match payload.get("internal_chat_message_metadata_passthrough") {
+        None | Some(Value::Null) => None,
+        Some(metadata) if metadata.is_object() => live_optional_id(metadata, "turn_id", policy)?,
+        Some(_) => return Err(integrity()),
+    };
+    let call_id = if kind == "message" {
+        None
+    } else {
+        live_optional_id(payload, "call_id", policy)?
+    };
+    let saved = call_id.and_then(|id| state.calls.get(id)).cloned();
+    let turn = explicit
+        .or(state.current_turn_id.as_deref())
+        .or_else(|| saved.as_ref().map(|call| call.turn_id.as_str()))
+        .ok_or_else(live_unbound)?
+        .to_owned();
+    live_identifier(&turn, policy)?;
+    if explicit.is_some_and(|id| id != turn)
+        || state
+            .current_turn_id
+            .as_deref()
+            .is_some_and(|id| id != turn)
+        || saved.as_ref().is_some_and(|call| call.turn_id != turn)
+    {
+        return Err(live_unbound());
+    }
+    let mut data = json!({"turn_id":turn});
+    if let Some(id) = live_optional_id(payload, "id", policy)? {
+        data["native_item_id"] = json!(id);
+    }
+    let event_kind = if kind == "message" {
+        let role = payload
+            .get("role")
+            .and_then(Value::as_str)
+            .ok_or_else(integrity)?;
+        if !matches!(role, "assistant" | "user" | "system" | "developer") {
+            return Err(live_unsupported());
+        }
+        data["role"] = json!(role);
+        data["text"] = json!(live_message_text(payload)?);
+        if let Some(id) = live_optional_id(payload, "id", policy)? {
+            data["item_id"] = json!(id);
+        }
+        match payload.get("phase") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(phase))
+                if matches!(phase.as_str(), "commentary" | "final_answer") =>
+            {
+                if role != "assistant" {
+                    return Err(live_unsupported());
+                }
+                data["phase"] = json!(phase);
+            }
+            _ => return Err(live_unsupported()),
+        }
+        "message.completed"
+    } else {
+        let call_id = call_id.ok_or_else(live_unbound)?;
+        data["item_id"] = json!(call_id);
+        data["call_id"] = json!(call_id);
+        let output = matches!(kind, "function_call_output" | "custom_tool_call_output");
+        let name = match payload.get("name") {
+            None | Some(Value::Null) if output => saved.as_ref().map(|call| call.name.as_str()),
+            Some(Value::String(name)) if !name.trim().is_empty() => Some(name.as_str()),
+            _ => return Err(integrity()),
+        };
+        if let Some(name) = name {
+            let name = policy.redact_text(name);
+            if saved.as_ref().is_some_and(|call| call.name != name) {
+                return Err(live_unbound());
+            }
+            data["tool"] = json!(name);
+        }
+        data["native_type"] = json!(kind);
+        if output {
+            data["output"] = live_tool_output(payload.get("output").ok_or_else(integrity)?)?;
+            state.calls.remove(call_id);
+            "tool.completed"
+        } else {
+            if saved.is_some() {
+                return Err(live_unbound());
+            }
+            let field = if kind == "function_call" {
+                "arguments"
+            } else {
+                "input"
+            };
+            data[field] = json!(
+                payload
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .ok_or_else(integrity)?
+            );
+            state.calls.insert(
+                call_id.to_owned(),
+                LiveCall {
+                    turn_id: turn.clone(),
+                    name: data["tool"].as_str().ok_or_else(integrity)?.to_owned(),
+                },
+            );
+            "tool.started"
+        }
+    };
+    state.current_turn_id = Some(turn);
+    Ok(Some((event_kind, data)))
+}
+
+fn live_message_text(payload: &Value) -> Result<String> {
+    let parts = payload
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or_else(integrity)?;
+    let mut text = String::new();
+    for (index, part) in parts.iter().enumerate() {
+        if !matches!(
+            part.get("type").and_then(Value::as_str),
+            Some("input_text" | "output_text")
+        ) {
+            return Err(live_unsupported());
+        }
+        if index != 0 {
+            text.push('\n');
+        }
+        text.push_str(
+            part.get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(integrity)?,
+        );
+    }
+    Ok(text)
+}
+
+fn live_tool_output(body: &Value) -> Result<Value> {
+    match body {
+        Value::String(_) => Ok(body.clone()),
+        Value::Array(parts) => {
+            let mut output = Vec::new();
+            for part in parts {
+                if part.get("type").and_then(Value::as_str) != Some("input_text") {
+                    return Err(live_unsupported());
+                }
+                output.push(json!({"type":"input_text", "text":
+                    part.get("text").and_then(Value::as_str).ok_or_else(integrity)?}));
+            }
+            Ok(Value::Array(output))
+        }
+        _ => Err(integrity()),
+    }
+}
+
+fn live_optional_id<'a>(
+    value: &'a Value,
+    field: &str,
+    policy: &SecretPolicy,
+) -> Result<Option<&'a str>> {
+    match value.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(id)) => {
+            live_identifier(id, policy)?;
+            Ok(Some(id))
+        }
+        Some(_) => Err(integrity()),
+    }
+}
+
+fn native_timestamp(value: &str) -> Result<i64> {
+    // Dependency, not copied parser code: chrono 0.4.45, MIT OR Apache-2.0,
+    // MSRV 1.62; https://docs.rs/chrono/0.4.45/chrono/struct.DateTime.html#method.parse_from_rfc3339
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|value| value.timestamp_millis())
+        .map_err(|_| integrity())
+}
+
+fn live_unsupported() -> Error {
+    Error::new(
+        "unsupported",
+        "Codex rollout record is outside the 0.161.0 live projection",
+    )
+}
+
+fn live_unbound() -> Error {
+    Error::new(
+        "source_integrity",
+        "Codex rollout record has no unambiguous native turn or call binding",
+    )
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct RolloutPage {
@@ -823,4 +1649,397 @@ fn too_large() -> Error {
         "frame_too_large",
         "Codex rollout line, cursor, or page exceeds its configured bound",
     )
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+    use std::{
+        io::Write,
+        sync::atomic::{AtomicU64, Ordering},
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    struct Fixture {
+        home: PathBuf,
+        path: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(history: &[Value]) -> Self {
+            let home = std::env::temp_dir().join(format!(
+                "eliot-live-rollout-{}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&home).unwrap();
+            fs::create_dir(home.join("sessions")).unwrap();
+            let path = home.join("sessions/rollout.jsonl");
+            let fixture = Self { home, path };
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&fixture.path)
+                .unwrap();
+            writeln!(
+                file,
+                "{}",
+                line(
+                    "session_meta",
+                    json!({
+                        "id":"fixture-thread", "cli_version":"0.161.0", "cwd":"fixture-workspace"
+                    })
+                )
+            )
+            .unwrap();
+            for record in history {
+                writeln!(file, "{record}").unwrap();
+            }
+            file.flush().unwrap();
+            fixture
+        }
+
+        fn append(&self, record: Value) {
+            let mut file = OpenOptions::new().append(true).open(&self.path).unwrap();
+            writeln!(file, "{record}").unwrap();
+            file.flush().unwrap();
+        }
+
+        fn reader(&self, policy: SecretPolicy) -> LiveRollout {
+            LiveRollout::open(
+                self.path.clone(),
+                self.home.clone(),
+                "fixture-thread".to_owned(),
+                "0.161.0".to_owned(),
+                "fixture-binding".to_owned(),
+                Arc::new(policy),
+                deadline(),
+            )
+            .unwrap()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            // Only the unique directory created by this fixture is owned here.
+            let _ = fs::remove_dir_all(&self.home);
+        }
+    }
+
+    fn deadline() -> Instant {
+        Instant::now() + Duration::from_secs(5)
+    }
+
+    fn line(kind: &str, payload: Value) -> Value {
+        json!({"timestamp":"1970-01-01T01:00:00.123+01:00", "type":kind, "payload":payload})
+    }
+
+    fn context(turn: &str) -> Value {
+        line("turn_context", json!({"turn_id":turn}))
+    }
+
+    fn message(text: &str, phase: Option<&str>) -> Value {
+        let mut item = json!({"type":"message", "role":"assistant", "content":[{"type":"output_text","text":text}]});
+        if let Some(phase) = phase {
+            item["phase"] = json!(phase);
+        }
+        line("response_item", item)
+    }
+
+    #[tokio::test]
+    async fn baseline_excludes_history_and_partial_lf_waits_without_a_gap() {
+        let fixture = Fixture::new(&[context("old"), message("historical", Some("final_answer"))]);
+        let mut reader = fixture.reader(SecretPolicy::default());
+        let baseline = reader.baseline_cursor().to_owned();
+        let empty = reader.read_page(&baseline, 1, deadline()).await.unwrap();
+        assert!(empty.records.is_empty() && empty.at_end && empty.gap.is_none());
+        assert_eq!(empty.cursor, baseline);
+        fixture.append(context("new"));
+        let raw = serde_json::to_vec(&message("live text", None)).unwrap();
+        let split = raw.len() / 2;
+        let mut writer = OpenOptions::new().append(true).open(&fixture.path).unwrap();
+        writer.write_all(&raw[..split]).unwrap();
+        writer.flush().unwrap();
+        let partial = reader.read_page(&baseline, 1, deadline()).await.unwrap();
+        assert!(partial.records.is_empty() && partial.partial_tail && partial.gap.is_none());
+        let again = reader
+            .read_page(&partial.cursor, 1, deadline())
+            .await
+            .unwrap();
+        assert_eq!(again.cursor, partial.cursor);
+        assert!(again.partial_tail && again.gap.is_none());
+        writer.write_all(&raw[split..]).unwrap();
+        writer.write_all(b"\n").unwrap();
+        writer.flush().unwrap();
+        let page = reader
+            .read_page(&partial.cursor, 1, deadline())
+            .await
+            .unwrap();
+        assert_eq!(page.records.len(), 1);
+        let event = &page.records[0].events[0];
+        assert_eq!(event.kind, "message.completed");
+        assert_eq!(event.ts, Some(123));
+        assert_eq!(event.data["text"], "live text");
+        assert!(event.data.get("phase").is_none());
+        assert_eq!(page.cursor, page.records[0].cursor);
+        assert!(page.at_end && !page.partial_tail && page.gap.is_none());
+        reader.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn canonical_lifecycle_phase_tools_and_original_timing_are_preserved() {
+        let fixture = Fixture::new(&[]);
+        let mut reader = fixture.reader(SecretPolicy::default());
+        let baseline = reader.baseline_cursor().to_owned();
+        fixture.append(line(
+            "event_msg",
+            json!({"type":"task_started","turn_id":"turn-1","started_at":7}),
+        ));
+        fixture.append(message("commentary", Some("commentary")));
+        fixture.append(line(
+            "event_msg",
+            json!({"type":"agent_message","message":"commentary"}),
+        ));
+        fixture.append(line("response_item", json!({"type":"function_call","name":"exec_command","call_id":"call-1","id":"call-item","arguments":"{}"})));
+        fixture.append(line("response_item", json!({"type":"function_call_output","call_id":"call-1","id":"output-item","output":"exit status unknown"})));
+        fixture.append(line(
+            "event_msg",
+            json!({"type":"exec_command_end","call_id":"call-1"}),
+        ));
+        fixture.append(line("response_item", json!({"type":"custom_tool_call","name":"apply_patch","call_id":"call-2","input":"fixture patch"})));
+        fixture.append(line("response_item", json!({"type":"custom_tool_call_output","call_id":"call-2","output":[{"type":"input_text","text":"native result"}]})));
+        fixture.append(message("final message", Some("final_answer")));
+        let page = reader.read_page(&baseline, 100, deadline()).await.unwrap();
+        let events: Vec<_> = page
+            .records
+            .iter()
+            .flat_map(|record| &record.events)
+            .collect();
+        assert_eq!(events.len(), 7);
+        assert!(
+            events
+                .iter()
+                .all(|event| event.ts == Some(123) && event.data.get("command_id").is_none())
+        );
+        assert!(events.iter().all(|event| event.kind != "turn.completed"));
+        assert_eq!(events[0].data["started_at"], 7000);
+        assert_eq!(events[1].data["phase"], "commentary");
+        assert_eq!(events[2].data["item_id"], events[3].data["item_id"]);
+        assert_eq!(events[3].data["tool"], "exec_command");
+        assert!(events[3].data.get("status").is_none());
+        assert_eq!(events[4].data["item_id"], events[5].data["item_id"]);
+        assert!(events[5].data.get("changed_paths").is_none());
+        assert!(page.at_end && page.gap.is_none());
+        fixture.append(line("event_msg", json!({"type":"turn_complete","turn_id":"turn-1", "error":{"message":"native failure"},
+            "started_at":7,"completed_at":9,"duration_ms":2000,"last_agent_message":"terminal answer"})));
+        let terminal = reader.read_page(&page.cursor, 1, deadline()).await.unwrap();
+        let event = &terminal.records[0].events[0];
+        assert_eq!(event.kind, "turn.completed");
+        assert_eq!(event.data["status"], "failed");
+        assert_eq!(event.data["started_at"], 7000);
+        assert_eq!(event.data["completed_at"], 9000);
+        assert_eq!(event.data["duration_ms"], 2000);
+        assert_eq!(event.data["final_text"], "terminal answer");
+        fixture.append(line(
+            "event_msg",
+            json!({"type":"turn_aborted","turn_id":"turn-2","reason":"interrupted"}),
+        ));
+        let abort = reader
+            .read_page(&terminal.cursor, 1, deadline())
+            .await
+            .unwrap();
+        assert_eq!(abort.records[0].events[0].data["status"], "failed");
+        assert_eq!(
+            abort.records[0].events[0].data["abort_reason"],
+            "interrupted"
+        );
+        assert!(abort.records[0].events[0].data.get("started_at").is_none());
+        reader.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unbound_and_malformed_records_have_only_gap_checkpoints() {
+        let fixture = Fixture::new(&[context("historical-turn")]);
+        let mut reader = fixture.reader(SecretPolicy::default());
+        let baseline = reader.baseline_cursor().to_owned();
+        fixture.append(message("no proven live turn", None));
+        let gap = reader.read_page(&baseline, 1, deadline()).await.unwrap();
+        assert!(gap.records.is_empty() && gap.gap.is_some());
+        assert_ne!(gap.cursor, baseline);
+        fixture.append(line(
+            "event_msg",
+            json!({"type":"task_complete","turn_id":"historical-turn"}),
+        ));
+        let terminal = reader.read_page(&gap.cursor, 1, deadline()).await.unwrap();
+        assert_eq!(terminal.records[0].events[0].kind, "turn.completed");
+        assert!(
+            terminal.records[0].events[0]
+                .data
+                .get("started_at")
+                .is_none()
+        );
+        fixture.append(line(
+            "event_msg",
+            json!({"type":"turn_aborted","reason":"interrupted"}),
+        ));
+        let missing_id = reader
+            .read_page(&terminal.cursor, 1, deadline())
+            .await
+            .unwrap();
+        assert!(missing_id.gap.is_some() && missing_id.records.is_empty());
+        let mut invalid_time = line(
+            "event_msg",
+            json!({"type":"task_started","turn_id":"bad-time"}),
+        );
+        invalid_time["timestamp"] = json!("2026-02-30T00:00:00Z");
+        fixture.append(invalid_time);
+        let invalid = reader
+            .read_page(&missing_id.cursor, 1, deadline())
+            .await
+            .unwrap();
+        assert!(invalid.gap.is_some() && invalid.records.is_empty());
+        reader.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn redaction_precedes_event_ids_and_encoded_bounds() {
+        let fixture = Fixture::new(&[]);
+        let mut reader = fixture.reader(SecretPolicy::new(["fixture-private"]));
+        let baseline = reader.baseline_cursor().to_owned();
+        fixture.append(context("turn-1"));
+        fixture.append(message("body fixture-private", None));
+        let page = reader.read_page(&baseline, 1, deadline()).await.unwrap();
+        assert_eq!(page.records[0].events[0].data["text"], "body [REDACTED]");
+        let repeat = reader.read_page(&baseline, 1, deadline()).await.unwrap();
+        assert_eq!(repeat.records[0].events[0], page.records[0].events[0]);
+        fixture.append(context("turn-fixture-private"));
+        let protected = reader.read_page(&page.cursor, 1, deadline()).await.unwrap();
+        assert!(protected.records.is_empty() && protected.gap.is_some());
+        assert!(!protected.cursor.contains("fixture-private"));
+        reader.close().await.unwrap();
+
+        let fixture = Fixture::new(&[]);
+        let mut reader = fixture.reader(SecretPolicy::new(["q"]));
+        let baseline = reader.baseline_cursor().to_owned();
+        fixture.append(context("turn-1"));
+        fixture.append(message(&"q".repeat(10_000), None));
+        let oversized = reader.read_page(&baseline, 1, deadline()).await.unwrap();
+        assert!(oversized.gap.is_some() && oversized.records.is_empty());
+        reader.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn held_file_rejects_rewrite_truncation_and_path_replacement() {
+        let fixture = Fixture::new(&[]);
+        let mut reader = fixture.reader(SecretPolicy::default());
+        let baseline = reader.baseline_cursor().to_owned();
+        fixture.append(context("turn-1"));
+        fixture.append(message("live", None));
+        let page = reader.read_page(&baseline, 1, deadline()).await.unwrap();
+        let cursor: LiveCursor =
+            serde_json::from_str(page.cursor.strip_prefix(LIVE_CURSOR_PREFIX).unwrap()).unwrap();
+        let mut writer = OpenOptions::new().write(true).open(&fixture.path).unwrap();
+        writer.seek(SeekFrom::Start(cursor.offset - 2)).unwrap();
+        writer.write_all(b"]").unwrap();
+        writer.flush().unwrap();
+        let rewritten = reader.read_page(&page.cursor, 1, deadline()).await.unwrap();
+        assert!(rewritten.gap.is_some() && rewritten.records.is_empty());
+        writer.set_len(0).unwrap();
+        let truncated = reader.read_page(&page.cursor, 1, deadline()).await.unwrap();
+        assert!(truncated.gap.is_some() && truncated.records.is_empty());
+        reader.close().await.unwrap();
+
+        let fixture = Fixture::new(&[]);
+        let mut reader = fixture.reader(SecretPolicy::default());
+        let baseline = reader.baseline_cursor().to_owned();
+        fs::rename(&fixture.path, fixture.home.join("sessions/old.jsonl")).unwrap();
+        fs::write(&fixture.path, b"foreign replacement\n").unwrap();
+        let replaced = reader.read_page(&baseline, 1, deadline()).await.unwrap();
+        assert!(replaced.gap.is_some() && replaced.records.is_empty());
+        reader.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cursor_subject_and_version_are_exactly_bound() {
+        let fixture = Fixture::new(&[]);
+        let mut reader = fixture.reader(SecretPolicy::default());
+        let baseline = reader.baseline_cursor().to_owned();
+        let mut other = LiveRollout::open(
+            fixture.path.clone(),
+            fixture.home.clone(),
+            "fixture-thread".to_owned(),
+            "0.161.0".to_owned(),
+            "other-binding".to_owned(),
+            Arc::new(SecretPolicy::default()),
+            deadline(),
+        )
+        .unwrap();
+        assert_eq!(
+            other
+                .read_page(&baseline, 1, deadline())
+                .await
+                .err()
+                .unwrap()
+                .code,
+            "cursor_mismatch"
+        );
+        for (native_ref, version, code) in [
+            ("foreign-thread", "0.161.0", "source_integrity"),
+            ("fixture-thread", "0.164.0-alpha.11.1", "unsupported"),
+        ] {
+            assert_eq!(
+                LiveRollout::open(
+                    fixture.path.clone(),
+                    fixture.home.clone(),
+                    native_ref.to_owned(),
+                    version.to_owned(),
+                    "fixture-binding".to_owned(),
+                    Arc::new(SecretPolicy::default()),
+                    deadline()
+                )
+                .err()
+                .unwrap()
+                .code,
+                code
+            );
+        }
+        other.close().await.unwrap();
+        reader.close().await.unwrap();
+    }
+
+    #[test]
+    fn cancelled_read_is_retained_and_close_joins_before_dropping_the_file() {
+        let fixture = Fixture::new(&[]);
+        let mut reader = fixture.reader(SecretPolicy::default());
+        let baseline = reader.baseline_cursor().to_owned();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (release, released) = mpsc::sync_channel(1);
+            let (started, waiting) = mpsc::sync_channel(1);
+            let blocker = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                released.recv().unwrap();
+            });
+            waiting.recv().unwrap();
+            {
+                let mut read = Box::pin(reader.read_page(&baseline, 1, deadline()));
+                assert!(futures_util::poll!(read.as_mut()).is_pending());
+            }
+            assert!(reader.pending.is_some());
+            release.send(()).unwrap();
+            reader.close().await.unwrap();
+            blocker.await.unwrap();
+            assert!(reader.pending.is_none() && reader.file.is_none());
+        });
+    }
 }

@@ -15,7 +15,7 @@ const WAIT: Duration = Duration::from_secs(20);
 
 pub struct Captured {
     pub child: Child,
-    stdout: Receiver<io::Result<String>>,
+    stdout: Option<Receiver<io::Result<String>>>,
     stderr: Receiver<io::Result<String>>,
 }
 
@@ -38,7 +38,15 @@ fn capture(pipe: impl Read + Send + 'static) -> Receiver<io::Result<String>> {
 }
 
 impl Captured {
-    pub fn spawn(mut command: Command) -> Self {
+    pub fn spawn(command: Command) -> Self {
+        Self::spawn_with_stdout(command, None)
+    }
+
+    pub fn spawn_stdout_file(command: Command, path: &Path) -> Self {
+        Self::spawn_with_stdout(command, Some(path))
+    }
+
+    fn spawn_with_stdout(mut command: Command, path: Option<&Path>) -> Self {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -46,11 +54,14 @@ impl Captured {
         }
         let mut child = command
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
+            .stdout(match path {
+                Some(path) => Stdio::from(fs::File::create(path).expect("create test stdout file")),
+                None => Stdio::piped(),
+            })
             .stderr(Stdio::piped())
             .spawn()
             .expect("start test-owned process");
-        let stdout = capture(child.stdout.take().expect("stdout pipe"));
+        let stdout = child.stdout.take().map(capture);
         let stderr = capture(child.stderr.take().expect("stderr pipe"));
         Self {
             child,
@@ -77,11 +88,12 @@ impl Captured {
 
     pub fn output(&self, timeout: Duration) -> (String, String) {
         let deadline = Instant::now() + timeout;
-        let stdout = self
-            .stdout
-            .recv_timeout(timeout)
-            .expect("stdout EOF deadline")
-            .expect("read stdout");
+        let stdout = self.stdout.as_ref().map_or_else(String::new, |stdout| {
+            stdout
+                .recv_timeout(timeout)
+                .expect("stdout EOF deadline")
+                .expect("read stdout")
+        });
         let stderr = self
             .stderr
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))

@@ -17,10 +17,8 @@ use eliot_core::api::{
 };
 use eliot_core::{Command as CoreCommand, CommandState, Turn as CoreTurn, TurnState};
 use serde_json::{Value, json};
-#[cfg(windows)]
 use std::time::Duration;
 use std::{collections::HashSet, fs, path::Path, process::Command};
-#[cfg(windows)]
 use support::Captured;
 use support::{CLI, Fixture, cli, run};
 
@@ -2689,6 +2687,311 @@ fn fake_discovery_observation_and_worktree_lifecycle() {
             ])
             .status
             .success()
+    );
+    fixture.stop(false);
+}
+
+#[test]
+fn fake_observer_live_rollout_preserves_unknown_and_detaches_reader() {
+    const ORIGINAL_TS: i64 = 1_730_000_000_000;
+    let mut fixture = Fixture::new("observer live rollout");
+    fixture.start();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("observer live RPC runtime");
+    let attached = fixture.json(&[
+        "attach",
+        "--profile",
+        "fake",
+        "--harness",
+        "fake",
+        "--scope",
+        "fake:discovery",
+        "--ref",
+        "fake-discovered-2",
+    ]);
+    let observer = attached["agent"].as_str().unwrap();
+    let attach_id = attached["command_id"].as_str().unwrap();
+    let attach_command = fixture.wait_command(attach_id, "applied");
+    let generation = attach_command["generation"].as_i64().unwrap();
+    let watch_path = fixture.root.join("observer-watch.ndjson");
+    let mut command = Command::new(CLI);
+    command
+        .arg("--data-dir")
+        .arg(&fixture.data)
+        .args(["--json", "watch", observer]);
+    let mut watch = Captured::spawn_stdout_file(command, &watch_path);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let events = loop {
+        let events: Vec<_> = fixture
+            .events()
+            .into_iter()
+            .filter(|event| event["agent"] == observer && event["generation"] == generation)
+            .collect();
+        if events.iter().any(|event| {
+            event["kind"] == "turn.completed"
+                && event["data"]["turn_id"] == "fake-observed-live-turn"
+        }) {
+            break events;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "observer live publication deadline"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    let view: AgentGetResponse = serde_json::from_value(fixture.json(&["show", observer]))
+        .expect("typed live observer view");
+    assert_eq!(view.agent.state, eliot_core::AgentState::Unknown);
+    assert!(view.agent.observe_only);
+    assert!(!view.agent.own_identity);
+    assert!(view.agent.active_turn.is_none());
+    assert!(view.agent.pending.is_empty());
+    let predecessor = view
+        .source_states
+        .iter()
+        .find(|source| source.source == "observe")
+        .unwrap();
+    assert_eq!(predecessor.state, "open");
+    assert_eq!(predecessor.health, "ok");
+    assert_eq!(predecessor.families, ["session"]);
+    let successor = view
+        .source_states
+        .iter()
+        .find(|source| source.source == "transcript")
+        .unwrap();
+    assert_eq!(successor.state, "open");
+    assert_eq!(successor.families, ["message", "turn"]);
+    assert!(
+        successor
+            .owners
+            .iter()
+            .all(|owner| owner.source == "transcript" && owner.mechanism == "rollout_tail")
+    );
+    let handoffs: Vec<_> = events
+        .iter()
+        .filter(|event| event["kind"] == "source.handoff")
+        .collect();
+    assert_eq!(handoffs.len(), 1);
+    let handoff = handoffs[0];
+    assert_eq!(handoff["data"]["source"], "observe");
+    assert_eq!(handoff["data"]["successor"], "transcript");
+    assert_eq!(handoff["data"]["mechanism"], "rollout_tail");
+    assert_eq!(handoff["data"]["families"], json!(["message", "turn"]));
+    let gap = events
+        .iter()
+        .find(|event| {
+            event["kind"] == "source.gap"
+                && event["data"]["gap_id"] == handoff["data"]["gap"]["gap_id"]
+        })
+        .unwrap();
+    assert_eq!(
+        predecessor.gap_id.as_deref(),
+        gap["data"]["gap_id"].as_str()
+    );
+    assert_eq!(predecessor.gap_seq, gap["seq"].as_i64());
+    let applied: Vec<_> = events
+        .iter()
+        .filter(|event| event["kind"] == "command.applied")
+        .collect();
+    assert_eq!(applied.len(), 1, "live facts acknowledged another command");
+    assert_eq!(applied[0]["data"]["command_id"], attach_id);
+    assert!(
+        applied[0]["seq"].as_i64().unwrap() < gap["seq"].as_i64().unwrap(),
+        "publication began before the reader's attach RESULT was settled"
+    );
+    assert!(gap["seq"].as_i64().unwrap() < handoff["seq"].as_i64().unwrap());
+    let health: Vec<_> = events
+        .iter()
+        .filter(|event| event["kind"] == "source.health")
+        .collect();
+    assert_eq!(
+        health
+            .iter()
+            .map(|event| event["data"]["health"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["stale", "ok"],
+        "same health must not publish another event"
+    );
+    assert!(
+        health
+            .iter()
+            .all(|event| event["data"]["source"] == "observe")
+    );
+    let facts: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event["source"] == "transcript" && event["data"]["turn_id"] == "fake-observed-live-turn"
+        })
+        .collect();
+    assert_eq!(facts.len(), 3);
+    for (event, (kind, ts)) in facts.iter().zip([
+        ("turn.started", ORIGINAL_TS + 1),
+        ("message.completed", ORIGINAL_TS + 2),
+        ("turn.completed", ORIGINAL_TS + 3),
+    ]) {
+        assert_eq!(event["kind"], kind);
+        assert_eq!(event["ts"], ts);
+        assert!(event["seq"].as_i64().unwrap() > handoff["seq"].as_i64().unwrap());
+        assert!(event["data"].get("command_id").is_none());
+        assert!(event["data"].get("request_id").is_none());
+    }
+    let request = TurnGetRequest::new(observer, generation, "fake-observed-live-turn");
+    let turn: CoreTurn = serde_json::from_value(
+        public_rpc(
+            &runtime,
+            &fixture,
+            "turn.get",
+            serde_json::to_value(&request).unwrap(),
+        )
+        .unwrap_or_else(|_| panic!("observed turn read failed")),
+    )
+    .expect("typed observed turn");
+    request
+        .validate_response(&turn)
+        .expect("observed turn binding");
+    assert_eq!(turn.state, TurnState::Completed);
+    assert_eq!(turn.final_text.as_deref(), Some("fake observed live reply"));
+    assert_eq!(turn.started_at, Some(ORIGINAL_TS - 1_000));
+    assert_eq!(turn.completed_at, Some(ORIGINAL_TS));
+    let result = fixture.json(&[
+        "result",
+        observer,
+        "--generation",
+        &generation.to_string(),
+        "--turn-id",
+        "fake-observed-live-turn",
+        "--limit",
+        "1",
+    ]);
+    assert_eq!(result["turns"], json!([turn]));
+    assert_eq!(result["agent_metadata"]["state"], "unknown");
+
+    let history = fixture.json(&["history", observer, "--view", "turns", "--limit", "1"]);
+    assert_eq!(history["entries"][0]["turn_id"], "fake-observed-turn-1");
+    let after_history = fixture.events();
+    let after_facts: Vec<_> = after_history
+        .iter()
+        .filter(|event| {
+            event["agent"] == observer
+                && event["generation"] == generation
+                && event["source"] == "transcript"
+                && event["data"]["turn_id"] == "fake-observed-live-turn"
+        })
+        .collect();
+    assert_eq!(after_facts, facts, "private history published live facts");
+    assert_eq!(
+        fixture.json(&["cmd", "show", attach_id]),
+        attach_command,
+        "private history changed the attach command"
+    );
+    let stale = public_rpc(
+        &runtime,
+        &fixture,
+        "agent.history",
+        json!({
+            "id":observer,"generation":generation+1,"source":"native","view":"turns"
+        }),
+    )
+    .expect_err("history must remain generation fenced");
+    assert_eq!(stale.code, "stale_generation");
+    let forbidden_id = ulid::Ulid::new().to_string();
+    assert!(
+        !cli(
+            &fixture.data,
+            &[
+                "--id",
+                &forbidden_id,
+                "send",
+                observer,
+                "--",
+                "forbidden-live-observer-input"
+            ]
+        )
+        .status
+        .success()
+    );
+
+    let detach = fixture.json(&["detach", observer]);
+    fixture.wait_command(detach["command_id"].as_str().unwrap(), "applied");
+    let final_events = fixture.events();
+    for source in ["observe", "transcript"] {
+        assert_eq!(
+            final_events
+                .iter()
+                .filter(|event| event["agent"] == observer
+                    && event["generation"] == generation
+                    && event["kind"] == "source.closed"
+                    && event["data"]["source"] == source)
+                .count(),
+            1
+        );
+    }
+    assert!(
+        !final_events
+            .iter()
+            .any(|event| event["agent"] == observer && event["kind"] == "session.ended"),
+        "reader detach ended the external session"
+    );
+    assert_eq!(fault_dispatches(&final_events, &forbidden_id), 0);
+    let detached = fixture.json(&["show", observer]);
+    assert_eq!(detached["generation"], generation + 1);
+    assert_eq!(detached["state"], "unknown");
+    assert_eq!(detached["own_identity"], false);
+    assert_eq!(fixture.json(&["status"])["observer_readers"], 0);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let watched = loop {
+        let lines = fs::read_to_string(&watch_path).expect("read owned watch output");
+        let events: Vec<Value> = lines
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        if events.iter().any(|event| {
+            event["kind"] == "source.closed"
+                && event["generation"] == generation
+                && event["data"]["source"] == "transcript"
+        }) {
+            break events;
+        }
+        assert!(
+            watch
+                .child
+                .try_wait()
+                .expect("watch process status")
+                .is_none(),
+            "watch exited before replaying the observer source closure"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "watch output deadline"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    watch
+        .child
+        .kill()
+        .expect("stop exact test-owned watch process");
+    watch
+        .wait(Duration::from_secs(5))
+        .expect("wait exact watch exit");
+    let _ = watch.output(Duration::from_secs(2));
+    for fact in facts {
+        assert!(
+            watched.iter().any(|event| event == fact),
+            "watch changed an original native fact"
+        );
+    }
+    let subjects = fixture.json(&["discover", "--profile", "fake", "--scope", "fake:discovery"]);
+    assert!(
+        subjects["subjects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|subject| subject["native_ref"] == "fake-discovered-2"),
+        "detaching a reader removed its external subject"
     );
     fixture.stop(false);
 }

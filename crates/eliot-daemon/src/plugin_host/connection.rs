@@ -99,6 +99,15 @@ impl PluginConnection {
 }
 
 impl PluginClient {
+    /// Observe transport closure, never native completion or a call timeout.
+    pub(crate) async fn wait_closed(&self) {
+        let mut closed = self.inner.closed_signal.subscribe();
+        if self.inner.closed.lock().await.is_some() {
+            return;
+        }
+        let _ = closed.changed().await;
+    }
+
     /// Transport EOF/framing failure, never a native session/command outcome.
     pub(crate) fn reader_closed(&self) -> bool {
         self.inner.reader_closed.load(Ordering::Acquire)
@@ -674,5 +683,40 @@ mod tests {
         }))))
         .await;
         assert_eq!(error.code, "native_not_dispatched");
+    }
+
+    #[tokio::test]
+    async fn wait_closed_observes_existing_and_subscribed_transport_eof() {
+        for closed_first in [false, true] {
+            let (host, peer) = duplex(64);
+            let (reader, writer) = split(host);
+            let connection = PluginConnection::new(reader, writer);
+            let client = connection.client();
+            if closed_first {
+                drop(peer);
+                timeout_at(
+                    Instant::now() + Duration::from_secs(5),
+                    client.wait_closed(),
+                )
+                .await
+                .unwrap();
+                // A second waiter cannot miss the already-recorded close signal.
+                timeout_at(
+                    Instant::now() + Duration::from_secs(5),
+                    client.wait_closed(),
+                )
+                .await
+                .unwrap();
+            } else {
+                let closed = client.wait_closed();
+                tokio::pin!(closed);
+                assert!(futures_util::poll!(&mut closed).is_pending());
+                drop(peer);
+                timeout_at(Instant::now() + Duration::from_secs(5), closed)
+                    .await
+                    .unwrap();
+            }
+            assert!(client.reader_closed());
+        }
     }
 }

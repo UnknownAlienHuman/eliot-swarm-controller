@@ -13,7 +13,7 @@ use std::sync::{
 };
 use tokio::{
     sync::{Mutex, mpsc, oneshot, watch},
-    time::{Instant, MissedTickBehavior, interval, timeout_at},
+    time::{Instant, timeout_at},
 };
 
 pub(super) struct ObserverEntry {
@@ -429,13 +429,14 @@ impl PluginHost {
         let mut detach = None;
         let mut reason = "observer_start_failed";
         if started && let Some(reader) = transport.as_mut() {
-            let mut ticks = interval(std::time::Duration::from_secs(2));
-            ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            ticks.tick().await;
             loop {
                 tokio::select! {
                     biased;
                     _ = cancellation.changed() => { reason = "observer_cancelled"; break; }
+                    _ = reader.client.wait_closed() => {
+                        reason = "observer_source_disconnected";
+                        break;
+                    }
                     status = reader.child.wait() => {
                         let _ = status;
                         reason = "observer_reader_exited";
@@ -474,16 +475,6 @@ impl PluginHost {
                         }
                         None => { reason = "observer_owner_closed"; break; }
                     },
-                    _ = ticks.tick(), if !entry.detaching.load(Ordering::SeqCst) => {
-                        let query = ObservationQuery {
-                            source: "native".to_owned(), view: "subject".to_owned(),
-                            turn_id: None, cursor: None, limit: 1,
-                        };
-                        if read_snapshot(self, reader, &entry.agent, query, Instant::now() + RPC_DEADLINE).await.is_err() {
-                            reason = "observer_readback_unavailable";
-                            break;
-                        }
-                    }
                 }
             }
         }
@@ -587,16 +578,29 @@ async fn check_binding(
         .into_iter()
         .filter(|state| state["source"] == "observe")
         .collect();
-    if source.is_some_and(|source| !matches!(source, "native" | "rollout" | "observe"))
-        || !states.iter().any(|state| state["state"] == "open")
+    if source.is_some_and(|source| !matches!(source, "native" | "rollout" | "observe")) {
+        return Err(Error::new(
+            "source_integrity",
+            "observer source is not committed and open",
+        ));
+    }
+    check_reader_source_lifetime(&states)?;
+    // This is reader lifetime, not publication authority. A committed handoff
+    // may leave its still-open predecessor with no owned families.
+    Ok(states)
+}
+
+fn check_reader_source_lifetime(states: &[Value]) -> Result<()> {
+    if !states
+        .iter()
+        .any(|state| state["source"] == "observe" && state["state"] == "open")
     {
         return Err(Error::new(
             "source_integrity",
             "observer source is not committed and open",
         ));
     }
-    source_plan(&states)?;
-    Ok(states)
+    Ok(())
 }
 
 fn source_plan(states: &[Value]) -> Result<Value> {
@@ -636,10 +640,10 @@ pub(super) async fn callback_error(
     until: Instant,
 ) -> Option<Error> {
     let agent = observation?;
-    if matches!(method, "process.put" | "events.put" | "source.handoff") {
+    if method == "process.put" {
         return Some(Error::new(
             "not_allowed",
-            "observer history is private and cannot publish lifecycle, hand off sources, or adopt processes",
+            "observer callbacks cannot adopt external processes",
         ));
     }
     if params["agent_id"].as_str() != Some(agent.id.as_str())
@@ -650,12 +654,34 @@ pub(super) async fn callback_error(
             "observer callback identity does not match its reader",
         ));
     }
-    let Some(source @ "observe") = params["source"].as_str() else {
+    let Some(source @ ("observe" | "transcript")) = params["source"].as_str() else {
         return Some(Error::new(
             "not_allowed",
             "observer callback source is outside its binding",
         ));
     };
+    if method == "events.put" && source != "transcript" {
+        return Some(Error::new(
+            "not_allowed",
+            "private observer history is not a live source batch",
+        ));
+    }
+    if method == "source.handoff"
+        && (source != "observe"
+            || params["successor"].as_str() != Some("transcript")
+            || params["mechanism"].as_str() != Some("rollout_tail")
+            || params["families"].as_array().is_none_or(|families| {
+                families.is_empty()
+                    || families
+                        .iter()
+                        .any(|family| !matches!(family.as_str(), Some("turn" | "message" | "tool")))
+            }))
+    {
+        return Some(Error::new(
+            "not_allowed",
+            "observer handoff is outside normalized live rollout authority",
+        ));
+    }
     if method == "source.state" {
         // A closed source can still expose its last committed acknowledgement;
         // this is Store readback, never permission for another native read/write.
@@ -665,7 +691,20 @@ pub(super) async fn callback_error(
         };
         return check_agent(&store, agent).err();
     }
-    match timeout_at(until, check_binding(store, agent, Some(source))).await {
+    let verify = async {
+        let store = store.lock().await;
+        check_agent(&store, agent)?;
+        if !store.observer_active(&agent.id, agent.generation)? {
+            return Err(Error::new(
+                "stale_generation",
+                "observer callbacks are fenced by detach or source closure",
+            ));
+        }
+        // Store rechecks settled attach readiness, exact subject, the named
+        // source, and current family owners in the mutation transaction.
+        Ok(())
+    };
+    match timeout_at(until, verify).await {
         Ok(result) => result.err(),
         Err(_) => Some(Error::new("busy", "observer source-check deadline elapsed")),
     }
@@ -781,4 +820,22 @@ fn detach_receipt(agent: &Agent, command_id: &str, logical_only: bool) -> Value 
         "metadata": {"logical_only": logical_only,
             "cleanup_capability": crate::workspaces::custody_capability(),
             "orphan_possible": !cfg!(windows)}})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_family_predecessor_has_reader_lifetime_without_publication_plan() {
+        let mut states =
+            vec![json!({"source":"observe", "state":"open", "families":[], "owners":[]})];
+        check_reader_source_lifetime(&states).unwrap();
+        assert_eq!(source_plan(&states).unwrap_err().code, "source_integrity");
+        states[0]["state"] = json!("closed");
+        assert_eq!(
+            check_reader_source_lifetime(&states).unwrap_err().code,
+            "source_integrity"
+        );
+    }
 }
