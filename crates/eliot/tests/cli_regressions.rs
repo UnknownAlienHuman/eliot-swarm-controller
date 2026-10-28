@@ -1772,6 +1772,13 @@ fn malformed_after_dispatch_remains_unknown_across_restart() {
     assert_eq!(launched["state"], "applied");
     let agent = launched["target"].as_str().unwrap();
     let generation = launched["generation"].as_i64().unwrap().to_string();
+    let handoff_id = ulid::Ulid::new().to_string();
+    let handoff_turn = send_fake_handoff(
+        &fixture,
+        agent,
+        generation.parse().expect("captured generation"),
+        &handoff_id,
+    );
     let fault_id = ulid::Ulid::new().to_string();
     let fault = cli(
         &fixture.data,
@@ -1904,10 +1911,17 @@ fn malformed_after_dispatch_remains_unknown_across_restart() {
     }
     assert!(!events.iter().any(|event| event["kind"] == "turn.started" && event["data"]["command_id"] == fault_id));
     assert!(
-        fixture.json(&["result", agent, "--generation", &generation])["turns"]
-            .as_array()
-            .unwrap()
-            .is_empty()
+        events.iter().any(|event| event["agent"] == agent
+            && event["generation"] == handoff_turn.generation
+            && event["kind"] == "source.gap"
+            && event["data"]["source"] == "transcript"),
+        "transport loss must record the uncovered tail on its current owner"
+    );
+    assert_eq!(fault_dispatches(&events, &handoff_id), 1);
+    assert_eq!(
+        fixture.json(&["result", agent, "--generation", &generation])["turns"],
+        json!([handoff_turn]),
+        "uncertain input must not create another turn or replay the handoff turn"
     );
     fixture.stop(true);
 }
@@ -1963,6 +1977,218 @@ fn fault_dispatches(events: &[Value], id: &str) -> usize {
         .iter()
         .filter(|event| event["kind"] == "command.dispatched" && event["data"]["command_id"] == id)
         .count()
+}
+
+fn send_fake_handoff(fixture: &Fixture, agent: &str, generation: i64, id: &str) -> CoreTurn {
+    let turn: CoreTurn = serde_json::from_value(fixture.json(&[
+        "--id",
+        id,
+        "send",
+        agent,
+        "--generation",
+        &generation.to_string(),
+        "--wait",
+        "--timeout-seconds",
+        "10",
+        "--",
+        "[fake:source-handoff]",
+    ]))
+    .expect("typed handoff input turn");
+    assert_eq!(turn.agent, agent);
+    assert_eq!(turn.generation, generation);
+    assert_eq!(turn.state, TurnState::Completed);
+    assert_eq!(turn.status.as_deref(), Some("completed"));
+    assert_eq!(turn.final_text.as_deref(), Some("[fake:source-handoff]"));
+    turn
+}
+
+fn assert_fake_source_handoff(
+    fixture: &Fixture,
+    runtime: &tokio::runtime::Runtime,
+    agent: &str,
+    generation: i64,
+) {
+    let before: AgentGetResponse =
+        serde_json::from_value(fixture.json(&["show", agent])).expect("before handoff view");
+    let families = ["message", "session", "turn"];
+    let unrelated_before: HashSet<_> = before
+        .source_states
+        .iter()
+        .flat_map(|source| &source.owners)
+        .filter(|owner| !families.contains(&owner.family.as_str()))
+        .map(|owner| {
+            (
+                owner.family.clone(),
+                owner.source.clone(),
+                owner.mechanism.clone(),
+            )
+        })
+        .collect();
+    assert!(
+        !unrelated_before.is_empty(),
+        "fixture must retain unrelated source ownership"
+    );
+
+    let marker_id = ulid::Ulid::new().to_string();
+    let marker_turn = send_fake_handoff(fixture, agent, generation, &marker_id);
+    let mut retry = CommandSubmitRequest::new(&marker_id, "send");
+    retry.target = Some(agent.to_owned());
+    retry.expected_generation = Some(generation);
+    retry.args = json!({"text":"[fake:source-handoff]"});
+    let retained = retained_submission(fixture, runtime, &retry);
+    assert_eq!(retained.state, CommandState::Applied);
+    let command = fixture.json(&["cmd", "show", &marker_id]);
+    assert_eq!(command["turn_id"], marker_turn.turn_id);
+    assert_eq!(
+        retained.outcome,
+        command
+            .get("outcome")
+            .filter(|value| !value.is_null())
+            .cloned()
+    );
+
+    let next_id = ulid::Ulid::new().to_string();
+    let next_turn: CoreTurn = serde_json::from_value(fixture.json(&[
+        "--id",
+        &next_id,
+        "send",
+        agent,
+        "--generation",
+        &generation.to_string(),
+        "--wait",
+        "--timeout-seconds",
+        "10",
+        "--",
+        "after-source-handoff",
+    ]))
+    .expect("typed successor input turn");
+    assert_eq!(next_turn.state, TurnState::Completed);
+    assert_eq!(next_turn.status.as_deref(), Some("completed"));
+    assert_eq!(
+        next_turn.final_text.as_deref(),
+        Some("after-source-handoff")
+    );
+    assert_ne!(marker_turn.turn_id, next_turn.turn_id);
+
+    let raw = fixture.json(&["show", agent]);
+    let view: AgentGetResponse = serde_json::from_value(raw.clone()).expect("after handoff view");
+    assert_eq!(
+        serde_json::to_value(&view.source_states).unwrap(),
+        raw["source_states"],
+        "public source states must retain their existing shape without private ACK fields"
+    );
+    let predecessor = view
+        .source_states
+        .iter()
+        .find(|source| source.source == "stream")
+        .unwrap();
+    assert_eq!(predecessor.state, "open");
+    assert!(predecessor.families.is_empty());
+    assert!(predecessor.owners.is_empty());
+    let successor = view
+        .source_states
+        .iter()
+        .find(|source| source.source == "transcript")
+        .unwrap();
+    assert_eq!(successor.state, "open");
+    assert_eq!(successor.families, families);
+    assert_eq!(successor.owners.len(), families.len());
+    for owner in &successor.owners {
+        assert!(families.contains(&owner.family.as_str()));
+        assert_eq!(owner.source, "transcript");
+        assert_eq!(owner.mechanism, "fake_recovery");
+    }
+    let unrelated_after: HashSet<_> = view
+        .source_states
+        .iter()
+        .flat_map(|source| &source.owners)
+        .filter(|owner| !families.contains(&owner.family.as_str()))
+        .map(|owner| {
+            (
+                owner.family.clone(),
+                owner.source.clone(),
+                owner.mechanism.clone(),
+            )
+        })
+        .collect();
+    // Independent monitors may register another family while these CLI calls
+    // run; the handoff must preserve every unrelated binding already present.
+    assert!(unrelated_before.is_subset(&unrelated_after));
+
+    let all_events = fixture.events();
+    let events: Vec<_> = all_events
+        .iter()
+        .filter(|event| event["agent"] == agent && event["generation"] == generation)
+        .collect();
+    let handoffs: Vec<_> = events
+        .iter()
+        .filter(|event| event["kind"] == "source.handoff")
+        .collect();
+    assert_eq!(handoffs.len(), 1);
+    let handoff = handoffs[0];
+    assert_eq!(handoff["data"]["source"], "stream");
+    assert_eq!(handoff["data"]["successor"], "transcript");
+    assert_eq!(handoff["data"]["mechanism"], "fake_recovery");
+    assert_eq!(handoff["data"]["families"], json!(families));
+    assert!(handoff["data"]["cursor"].is_null());
+    let gaps: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event["kind"] == "source.gap"
+                && event["data"]["gap_id"] == handoff["data"]["gap"]["gap_id"]
+        })
+        .collect();
+    assert_eq!(gaps.len(), 1);
+    let gap = gaps[0];
+    assert_eq!(gap["data"]["source"], "stream");
+    assert_eq!(gap["data"]["families"], json!(families));
+    for reason in [&gap["data"]["reason"], &handoff["data"]["gap"]["reason"]] {
+        assert!(
+            reason.as_str() == Some("fake_source_handoff_fixture [REDACTED]"),
+            "handoff gap reason was not sanitized; actual text deliberately omitted"
+        );
+    }
+    assert_eq!(
+        predecessor.gap_id.as_deref(),
+        gap["data"]["gap_id"].as_str()
+    );
+    assert_eq!(predecessor.gap_seq, gap["seq"].as_i64());
+    assert!(gap["seq"].as_i64().unwrap() < handoff["seq"].as_i64().unwrap());
+
+    for (id, turn) in [(&marker_id, &marker_turn), (&next_id, &next_turn)] {
+        assert_eq!(fault_dispatches(&all_events, id), 1);
+        let facts: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event["data"]["turn_id"] == turn.turn_id
+                    && matches!(
+                        event["kind"].as_str(),
+                        Some("turn.started" | "message.completed" | "turn.completed")
+                    )
+            })
+            .collect();
+        assert_eq!(
+            facts
+                .iter()
+                .map(|event| event["kind"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["turn.started", "message.completed", "turn.completed"]
+        );
+        assert!(facts.iter().all(|event| event["source"] == "transcript"
+            && event["native_id"].is_string()
+            && event["seq"].as_i64().unwrap() > handoff["seq"].as_i64().unwrap()));
+        let result = fixture.json(&[
+            "result",
+            agent,
+            "--generation",
+            &generation.to_string(),
+            "--turn-id",
+            &turn.turn_id,
+            "--limit",
+            "1",
+        ]);
+        assert_eq!(result["turns"], json!([turn]));
+    }
 }
 
 #[test]
@@ -2375,6 +2601,7 @@ fn fake_discovery_observation_and_worktree_lifecycle() {
         .unwrap();
     assert!(worktree.starts_with(fixture.data.canonicalize().unwrap().join("worktrees")));
     assert_public_agent_views(&fixture, &runtime, agent, generation, observer);
+    assert_fake_source_handoff(&fixture, &runtime, agent, generation);
     let stop = fixture.json(&["stop", agent, "--generation", &generation_argument]);
     fixture.wait_command(stop["command_id"].as_str().unwrap(), "applied");
     let stopped = fixture.json(&["show", agent]);
@@ -2416,6 +2643,30 @@ fn fake_discovery_observation_and_worktree_lifecycle() {
         "owned-process readback exceeded its page bound"
     );
     assert!(exited > 0, "stop had no retained owned-process evidence");
+    let drained: AgentGetResponse =
+        serde_json::from_value(fixture.json(&["show", agent])).expect("drained source view");
+    for name in ["stream", "transcript"] {
+        let source = drained
+            .source_states
+            .iter()
+            .find(|source| source.source == name)
+            .unwrap();
+        assert_eq!(
+            source.state, "closed",
+            "native source survived confirmed process exit"
+        );
+    }
+    let ended = fixture.events();
+    let ended: Vec<_> = ended
+        .iter()
+        .filter(|event| {
+            event["agent"] == agent
+                && event["generation"] == generation
+                && event["kind"] == "session.ended"
+        })
+        .collect();
+    assert_eq!(ended.len(), 1);
+    assert_eq!(ended[0]["source"], "transcript");
     let removed = fixture.json(&[
         "worktree",
         "remove",

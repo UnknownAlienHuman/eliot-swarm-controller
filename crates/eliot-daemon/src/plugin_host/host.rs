@@ -2,6 +2,7 @@ use super::{PluginClient, PluginConnection};
 mod discovery;
 mod observation;
 mod reader;
+mod source_handoff;
 use crate::bus::Bus;
 use crate::common::{now_ms, secure_eq, valid_environment_name};
 use crate::monitor::Monitoring;
@@ -29,6 +30,43 @@ use ulid::Ulid;
 const RPC_DEADLINE: Duration = Duration::from_secs(30);
 const RPC_GRACE: Duration = Duration::from_secs(2);
 const STOP_GRACE: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy)]
+struct StopDeadlines {
+    queued_until: Instant,
+    rpc_until: Instant,
+    custody_until: Instant,
+    source_until: Instant,
+    reply_until: Instant,
+}
+
+impl StopDeadlines {
+    fn new(now: Instant) -> Self {
+        let queued_until = now + RPC_DEADLINE;
+        // agent.stop + shutdown; the force snapshot fits the second RPC window.
+        let rpc_until = queued_until + RPC_DEADLINE + RPC_DEADLINE;
+        // close_input, then two attempts, each with leader and family waits.
+        let custody_until = rpc_until + STOP_GRACE + (STOP_GRACE + STOP_GRACE) * 2;
+        // Callback drain/abort-join and one bounded Store settlement.
+        let source_until = custody_until + STOP_GRACE + RPC_GRACE + RPC_DEADLINE;
+        let reply_until = source_until + RPC_GRACE;
+        Self {
+            queued_until,
+            rpc_until,
+            custody_until,
+            source_until,
+            reply_until,
+        }
+    }
+
+    fn rpc_deadline(self, budget: Duration) -> Instant {
+        self.rpc_deadline_at(Instant::now(), budget)
+    }
+
+    fn rpc_deadline_at(self, now: Instant, budget: Duration) -> Instant {
+        (now + budget).min(self.rpc_until)
+    }
+}
 
 pub(crate) type SecretSet = Arc<Mutex<HashSet<String>>>;
 pub(crate) type AgentCredentials = Arc<Mutex<HashMap<(String, i64), String>>>;
@@ -71,6 +109,7 @@ enum RuntimeMessage {
     Stop {
         command: Command,
         force: bool,
+        deadlines: StopDeadlines,
         reply: oneshot::Sender<Result<Value>>,
     },
     DaemonForce {
@@ -304,12 +343,28 @@ impl PluginHost {
         let observer = match child.observer() {
             Ok(observer) => observer,
             Err(error) => {
-                terminate_child(child, &self.state.monitoring, &agent).await;
+                let exited = terminate_child(child, &self.state.monitoring, &agent).await;
+                settle_owned_source_exit(
+                    &Arc::downgrade(&self.state),
+                    &key,
+                    None,
+                    exited,
+                    "plugin_startup_exit",
+                )
+                .await?;
                 return Err(error);
             }
         };
         if let Err(error) = self.state.monitoring.attach(&agent, observer).await {
-            terminate_child(child, &self.state.monitoring, &agent).await;
+            let exited = terminate_child(child, &self.state.monitoring, &agent).await;
+            settle_owned_source_exit(
+                &Arc::downgrade(&self.state),
+                &key,
+                None,
+                exited,
+                "plugin_startup_exit",
+            )
+            .await?;
             return Err(error);
         }
         self.state
@@ -321,8 +376,17 @@ impl PluginHost {
         let stdout = child.take_stdout();
         let stderr = child.take_stderr();
         let (Some(stdin), Some(stdout), Some(stderr)) = (stdin, stdout, stderr) else {
-            terminate_child(child, &self.state.monitoring, &agent).await;
+            let exited = terminate_child(child, &self.state.monitoring, &agent).await;
+            let source_exit = settle_owned_source_exit(
+                &Arc::downgrade(&self.state),
+                &key,
+                None,
+                exited,
+                "plugin_startup_exit",
+            )
+            .await;
             self.remove_plugin_secret(&credential);
+            source_exit?;
             return Err(Error::new(
                 "process_pipes",
                 "Agent plugin did not expose all three owned pipes",
@@ -476,23 +540,19 @@ impl PluginHost {
         };
         let (sender, stderr, credentials) = self.sender(&key, "stop")?;
         let (reply, response) = oneshot::channel();
-        timeout_at(
-            Instant::now() + RPC_DEADLINE,
-            sender.send(RuntimeMessage::Stop {
+        let deadlines = StopDeadlines::new(Instant::now());
+        enqueue_stop(
+            &sender,
+            RuntimeMessage::Stop {
                 command,
                 force,
+                deadlines,
                 reply,
-            }),
+            },
+            deadlines.queued_until,
         )
-        .await
-        .map_err(|_| Error::new("busy", "Agent plugin command queue is full"))?
-        .map_err(|_| Error::new("unknown", "owned Agent plugin is no longer available"))?;
-        let result = match timeout_at(
-            Instant::now() + RPC_DEADLINE + STOP_GRACE + STOP_GRACE + RPC_GRACE,
-            response,
-        )
-        .await
-        {
+        .await?;
+        let result = match timeout_at(deadlines.reply_until, response).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(Error::new(
                 "unknown",
@@ -530,7 +590,7 @@ impl PluginHost {
                 )
                 .await;
             } else {
-                self.mark_lost(&key).await;
+                self.mark_reader_unavailable(&key).await;
             }
         }
     }
@@ -688,16 +748,16 @@ impl PluginHost {
             .remove(credential);
     }
 
-    async fn mark_lost(&self, key: &AgentKey) {
+    async fn mark_reader_unavailable(&self, key: &AgentKey) {
+        let _ = settle_drained_source_exit(
+            &Arc::downgrade(&self.state),
+            key,
+            false,
+            false,
+            "daemon_force_actor_unavailable",
+        )
+        .await;
         fence_runtime_generation(&self.state, key);
-        {
-            let mut store = self.state.store.lock().await;
-            if let Ok(events) = store.mark_lost(&key.id, key.generation, now_ms()) {
-                self.state.bus.publish(&events);
-                note_unknown_commands(&self.state, &events);
-            }
-        }
-        forget_if_revoked(&self.state, key).await;
         signal_progress(&self.state);
     }
 }
@@ -785,8 +845,22 @@ async fn run_agent_inner(
         Ok(value) => value,
         Err(error) => {
             let _ = started.send(Err(redact_native_error(error, &source_credentials)));
-            terminate_child(child, &monitoring, &agent).await;
-            let _ = event_task.await;
+            let exited = terminate_child(child, &monitoring, &agent).await;
+            if let Err(error) = settle_owned_source_exit(
+                &state,
+                &key,
+                Some(&mut event_task),
+                exited,
+                "plugin_startup_exit",
+            )
+            .await
+            {
+                pending_failure.get_or_insert(PendingFailure {
+                    reply: None,
+                    error,
+                    command_id: last_command_id.clone(),
+                });
+            }
             cleanup_actor(&state, &key, &plugin_credential, false).await;
             return;
         }
@@ -798,8 +872,22 @@ async fn run_agent_inner(
                 "unsupported",
                 "Agent plugin returned a malformed manifest",
             )));
-            terminate_child(child, &monitoring, &agent).await;
-            let _ = event_task.await;
+            let exited = terminate_child(child, &monitoring, &agent).await;
+            if let Err(error) = settle_owned_source_exit(
+                &state,
+                &key,
+                Some(&mut event_task),
+                exited,
+                "plugin_startup_exit",
+            )
+            .await
+            {
+                pending_failure.get_or_insert(PendingFailure {
+                    reply: None,
+                    error,
+                    command_id: last_command_id.clone(),
+                });
+            }
             cleanup_actor(&state, &key, &plugin_credential, false).await;
             return;
         }
@@ -808,8 +896,22 @@ async fn run_agent_inner(
         Ok(source_plan) => source_plan,
         Err(error) => {
             let _ = started.send(Err(error));
-            terminate_child(child, &monitoring, &agent).await;
-            let _ = event_task.await;
+            let exited = terminate_child(child, &monitoring, &agent).await;
+            if let Err(error) = settle_owned_source_exit(
+                &state,
+                &key,
+                Some(&mut event_task),
+                exited,
+                "plugin_startup_exit",
+            )
+            .await
+            {
+                pending_failure.get_or_insert(PendingFailure {
+                    reply: None,
+                    error,
+                    command_id: last_command_id.clone(),
+                });
+            }
             cleanup_actor(&state, &key, &plugin_credential, false).await;
             return;
         }
@@ -823,16 +925,44 @@ async fn run_agent_inner(
             "unsupported",
             format!("Agent plugin does not advertise {}", start_command.verb),
         )));
-        terminate_child(child, &monitoring, &agent).await;
-        let _ = event_task.await;
+        let exited = terminate_child(child, &monitoring, &agent).await;
+        if let Err(error) = settle_owned_source_exit(
+            &state,
+            &key,
+            Some(&mut event_task),
+            exited,
+            "plugin_startup_exit",
+        )
+        .await
+        {
+            pending_failure.get_or_insert(PendingFailure {
+                reply: None,
+                error,
+                command_id: last_command_id.clone(),
+            });
+        }
         cleanup_actor(&state, &key, &plugin_credential, false).await;
         return;
     }
     let verbs: HashSet<String> = manifest.verbs.iter().cloned().collect();
     if let Err(error) = PluginHost::install_runtime_verbs(&state, &key, verbs) {
         let _ = started.send(Err(error));
-        terminate_child(child, &monitoring, &agent).await;
-        let _ = event_task.await;
+        let exited = terminate_child(child, &monitoring, &agent).await;
+        if let Err(error) = settle_owned_source_exit(
+            &state,
+            &key,
+            Some(&mut event_task),
+            exited,
+            "plugin_startup_exit",
+        )
+        .await
+        {
+            pending_failure.get_or_insert(PendingFailure {
+                reply: None,
+                error,
+                command_id: last_command_id.clone(),
+            });
+        }
         cleanup_actor(&state, &key, &plugin_credential, false).await;
         return;
     }
@@ -859,8 +989,22 @@ async fn run_agent_inner(
             let error = Error::new("unknown", "plugin start did not prove session readiness");
             let _ = started.send(Err(error.clone()));
             if error.code != "unknown" {
-                terminate_child(child, &monitoring, &agent).await;
-                let _ = event_task.await;
+                let exited = terminate_child(child, &monitoring, &agent).await;
+                if let Err(error) = settle_owned_source_exit(
+                    &state,
+                    &key,
+                    Some(&mut event_task),
+                    exited,
+                    "plugin_startup_exit",
+                )
+                .await
+                {
+                    pending_failure.get_or_insert(PendingFailure {
+                        reply: None,
+                        error,
+                        command_id: last_command_id.clone(),
+                    });
+                }
                 cleanup_actor(&state, &key, &plugin_credential, false).await;
                 return;
             }
@@ -870,8 +1014,22 @@ async fn run_agent_inner(
             let uncertain = error.code == "unknown";
             let _ = started.send(Err(error));
             if !uncertain {
-                terminate_child(child, &monitoring, &agent).await;
-                let _ = event_task.await;
+                let exited = terminate_child(child, &monitoring, &agent).await;
+                if let Err(error) = settle_owned_source_exit(
+                    &state,
+                    &key,
+                    Some(&mut event_task),
+                    exited,
+                    "plugin_startup_exit",
+                )
+                .await
+                {
+                    pending_failure.get_or_insert(PendingFailure {
+                        reply: None,
+                        error,
+                        command_id: last_command_id.clone(),
+                    });
+                }
                 cleanup_actor(&state, &key, &plugin_credential, false).await;
                 return;
             }
@@ -889,22 +1047,21 @@ async fn run_agent_inner(
                     let _ = monitoring.sample_generation(&agent).await;
                 }
                 // Keep source authorization intact throughout the bounded drain.
-                let gap_reason = match timeout_at(
+                let (gap_reason, drained) = match timeout_at(
                     Instant::now() + STOP_GRACE,
                     &mut event_task,
                 ).await {
-                    Ok(Ok(())) => "root_exit_without_session_terminal",
-                    Ok(Err(_)) => "root_exit_source_failed",
+                    Ok(Ok(())) => ("root_exit_without_session_terminal", true),
+                    Ok(Err(_)) => ("root_exit_source_failed", true),
                     Err(_) => {
                         event_task.abort();
-                        let _ = timeout_at(
+                        let drained = timeout_at(
                             Instant::now() + RPC_GRACE,
                             &mut event_task,
-                        ).await;
-                        "root_exit_drain_timeout"
+                        ).await.is_ok();
+                        ("root_exit_drain_timeout", drained)
                     }
                 };
-                let source_settled = record_root_exit_gap(&state, &key, gap_reason).await.is_ok();
                 #[cfg(windows)]
                 let control_gone = match child.wait_family_empty(Duration::ZERO).await {
                     Ok(true) => true,
@@ -921,6 +1078,9 @@ async fn run_agent_inner(
                 if control_gone {
                     let _ = monitoring.sample_generation(&agent).await;
                 }
+                let source_settled = settle_drained_source_exit(
+                    &state, &key, drained, control_gone, gap_reason,
+                ).await.is_ok();
                 if source_settled && control_gone && !planned_exit {
                     mark_lost_state(&state, &key).await;
                 }
@@ -935,9 +1095,11 @@ async fn run_agent_inner(
                 } else {
                     "stream_task_failed"
                 };
-                let source_settled = record_root_exit_gap(&state, &key, gap_reason).await.is_ok();
                 let control_gone = child.terminate().is_ok()
                     && wait_child(&mut child, STOP_GRACE, &monitoring, &agent).await;
+                let source_settled = settle_drained_source_exit(
+                    &state, &key, true, control_gone, gap_reason,
+                ).await.is_ok();
                 if source_settled && control_gone {
                     mark_lost_state(&state, &key).await;
                 }
@@ -946,6 +1108,14 @@ async fn run_agent_inner(
             }
             message = messages.recv() => {
                 let Some(message) = message else {
+                    let exited = child.terminate().is_ok()
+                        && wait_child(&mut child, STOP_GRACE, &monitoring, &agent).await;
+                    if settle_owned_source_exit(
+                        &state, &key, Some(&mut event_task), exited,
+                        "plugin_owner_closed_without_session_terminal",
+                    ).await.is_ok() {
+                        mark_lost_state(&state, &key).await;
+                    }
                     break;
                 };
                 match message {
@@ -993,41 +1163,52 @@ async fn run_agent_inner(
                             }
                         }
                     }
-                    RuntimeMessage::Stop { command, force, reply } => {
-                        let snapshot_command_id = last_command_id.clone();
-                        last_command_id = command.id.clone();
+                    RuntimeMessage::Stop { command, force, deadlines, reply } => {
                         let params = json!({
                             "agent_id": agent.id,
                             "generation": agent.generation,
                             "command_id": command.id,
                             "force": force,
                         });
-                        let cooperative = client
-                            .call("agent.stop", params, deadline())
+                        let stop_call = match prepare_queued_stop_call(&client, params, deadlines) {
+                            Ok(call) => call,
+                            Err(error) => {
+                                let _ = reply.send(Err(error));
+                                continue;
+                            }
+                        };
+                        let snapshot_command_id = last_command_id.clone();
+                        last_command_id = command.id.clone();
+                        let cooperative = stop_call
                             .await
                             .map_err(|error| redact_native_error(error, &source_credentials))
                             .and_then(validate_applied);
                         match cooperative {
                             Ok(result) => {
                                 let guarantee = child.guarantee();
-                                let shutdown = client
-                                    .call("shutdown", json!({}), deadline())
-                                    .await
-                                    .and_then(validate_shutdown);
+                                let shutdown = if Instant::now() < deadlines.rpc_until {
+                                    client.call("shutdown", json!({}), deadlines.rpc_deadline(RPC_DEADLINE))
+                                        .await.and_then(validate_shutdown)
+                                } else {
+                                    Err(Error::new("unknown", "stop RPC deadline elapsed before shutdown"))
+                                };
                                 if shutdown.is_ok() {
                                     let _ = client
-                                        .close_input(Instant::now() + STOP_GRACE)
+                                        .close_input((Instant::now() + STOP_GRACE).min(deadlines.custody_until))
                                         .await;
                                 }
-                                let graceful = wait_child(&mut child, STOP_GRACE, &monitoring, &agent).await;
+                                let graceful = wait_stop_child(&mut child, &monitoring, &agent, deadlines.custody_until).await;
                                 let mut exited = graceful;
                                 if !exited {
                                     let _ = child.terminate();
-                                    exited = wait_child(&mut child, STOP_GRACE, &monitoring, &agent).await;
+                                    exited = wait_stop_child(&mut child, &monitoring, &agent, deadlines.custody_until).await;
                                 }
                                 if !exited {
                                     drop(child);
-                                    let _ = event_task.await;
+                                    let _ = settle_owned_source_exit(
+                                        &state, &key, Some(&mut event_task), false,
+                                        "stop_exit_without_session_terminal",
+                                    ).await;
                                     if let Some(state) = state.upgrade() {
                                         fence_runtime_generation(&state, &key);
                                     }
@@ -1038,11 +1219,22 @@ async fn run_agent_inner(
                                     )));
                                     break;
                                 }
-                                let _ = event_task.await;
+                                let source_exit = settle_owned_source_exit(
+                                    &state, &key, Some(&mut event_task), true,
+                                    "stop_exit_without_session_terminal",
+                                ).await;
                                 if let Some(state) = state.upgrade() {
                                     fence_runtime_generation(&state, &key);
                                 }
                                 planned_exit = true;
+                                if let Err(error) = source_exit {
+                                    let _ = reply.send(Err(error));
+                                    break;
+                                }
+                                if Instant::now() > deadlines.source_until {
+                                    let _ = reply.send(Err(Error::new("unknown", "stop source settlement exceeded its absolute deadline")));
+                                    break;
+                                }
                                 let _ = reply.send(Ok(json!({
                                     "state": "applied",
                                     "custody": custody_label(guarantee),
@@ -1053,22 +1245,27 @@ async fn run_agent_inner(
                             }
                             Err(_) if force => {
                                 let snapshot_command = snapshot_command_id.clone();
-                                let snapshot = client.call(
+                                let snapshot = if Instant::now() < deadlines.rpc_until { client.call(
                                     "agent.snapshot",
                                     json!({
                                         "agent_id": agent.id,
                                         "generation": agent.generation,
                                         "command_id": snapshot_command,
                                     }),
-                                    Instant::now() + Duration::from_secs(5),
-                                ).await.ok();
+                                    deadlines.rpc_deadline(STOP_GRACE),
+                                ).await.ok() } else { None };
                                 let guarantee = child.guarantee();
                                 let terminated = child.terminate().is_ok();
-                                let exited = wait_child(&mut child, STOP_GRACE, &monitoring, &agent).await;
+                                let exited = wait_stop_child(&mut child, &monitoring, &agent, deadlines.custody_until).await;
                                 if !terminated || !exited {
                                     drop(child);
-                                    let _ = event_task.await;
-                                    mark_lost_state(&state, &key).await;
+                                    let _ = settle_owned_source_exit(
+                                        &state, &key, Some(&mut event_task), false,
+                                        "force_stop_exit_without_session_terminal",
+                                    ).await;
+                                    if let Some(state) = state.upgrade() {
+                                        fence_runtime_generation(&state, &key);
+                                    }
                                     planned_exit = true;
                                     let _ = reply.send(Err(Error::new(
                                         "unknown",
@@ -1079,11 +1276,22 @@ async fn run_agent_inner(
                                     )));
                                     break;
                                 }
-                                let _ = event_task.await;
+                                let source_exit = settle_owned_source_exit(
+                                    &state, &key, Some(&mut event_task), true,
+                                    "force_stop_exit_without_session_terminal",
+                                ).await;
                                 if let Some(state) = state.upgrade() {
                                     fence_runtime_generation(&state, &key);
                                 }
                                 planned_exit = true;
+                                if let Err(error) = source_exit {
+                                    let _ = reply.send(Err(error));
+                                    break;
+                                }
+                                if Instant::now() > deadlines.source_until {
+                                    let _ = reply.send(Err(Error::new("unknown", "stop source settlement exceeded its absolute deadline")));
+                                    break;
+                                }
                                 let mut response = json!({
                                     "state": "applied",
                                     "custody": custody_label(guarantee),
@@ -1097,7 +1305,7 @@ async fn run_agent_inner(
                                 break;
                             }
                             Err(error) => {
-                                if error.code == "unknown" {
+                                if error.code == "unknown" && Instant::now() < deadlines.rpc_until {
                                     let _ = client.call(
                                         "agent.snapshot",
                                         json!({
@@ -1105,7 +1313,7 @@ async fn run_agent_inner(
                                             "generation": agent.generation,
                                             "command_id": snapshot_command_id,
                                         }),
-                                        Instant::now() + Duration::from_secs(5),
+                                        deadlines.rpc_deadline(STOP_GRACE),
                                     ).await;
                                 }
                                 let _ = reply.send(Err(error));
@@ -1118,8 +1326,13 @@ async fn run_agent_inner(
                         let exited = wait_child(&mut child, STOP_GRACE, &monitoring, &agent).await;
                         if !terminated || !exited {
                             drop(child);
-                            let _ = event_task.await;
-                            mark_lost_state(&state, &key).await;
+                            let _ = settle_owned_source_exit(
+                                &state, &key, Some(&mut event_task), false,
+                                "daemon_force_exit_without_session_terminal",
+                            ).await;
+                            if let Some(state) = state.upgrade() {
+                                fence_runtime_generation(&state, &key);
+                            }
                             planned_exit = true;
                             let _ = reply.send(Err(Error::new(
                                 "unknown",
@@ -1130,7 +1343,18 @@ async fn run_agent_inner(
                             )));
                             break;
                         }
-                        let _ = event_task.await;
+                        let source_exit = settle_owned_source_exit(
+                            &state, &key, Some(&mut event_task), true,
+                            "daemon_force_exit_without_session_terminal",
+                        ).await;
+                        if let Err(error) = source_exit {
+                            if let Some(state) = state.upgrade() {
+                                fence_runtime_generation(&state, &key);
+                            }
+                            planned_exit = true;
+                            let _ = reply.send(Err(error));
+                            break;
+                        }
                         mark_lost_state(&state, &key).await;
                         planned_exit = true;
                         let _ = reply.send(Ok(()));
@@ -1163,11 +1387,11 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
         let request_deadline = deadline();
         let result = if !matches!(
             method.as_str(),
-            "events.put" | "source.gap" | "source.state" | "process.put"
+            "events.put" | "source.gap" | "source.handoff" | "source.state" | "process.put"
         ) {
             Err(Error::new(
                 "unsupported",
-                "plugin host only accepts events.put, source.gap, source.state, and process.put",
+                "plugin host only accepts events.put, source.gap, source.handoff, source.state, and process.put",
             ))
         } else {
             let mut params = request.params;
@@ -1355,6 +1579,18 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
                         )),
                         Err(_) => Err(Error::new("invalid", "source.gap params are malformed")),
                     },
+                    "source.handoff" => {
+                        source_handoff::record_source_handoff(
+                            &store,
+                            &bus,
+                            params,
+                            &agent_id,
+                            generation,
+                            &source_credentials,
+                            request_deadline,
+                        )
+                        .await
+                    }
                     "source.state" => match source_state_binding(&params, &agent_id, generation) {
                         Ok(source_name) => match timeout_at(request_deadline, store.lock()).await {
                             Ok(store) => {
@@ -1955,6 +2191,43 @@ fn deadline() -> Instant {
     Instant::now() + RPC_DEADLINE
 }
 
+async fn enqueue_stop(
+    sender: &mpsc::Sender<RuntimeMessage>,
+    message: RuntimeMessage,
+    until: Instant,
+) -> Result<()> {
+    // Cancelling pending mpsc::send cannot enqueue its value. SendError likewise
+    // returns an unreceived value; neither path can have reached native I/O.
+    timeout_at(until, sender.send(message))
+        .await
+        .map_err(|_| {
+            Error::new(
+                "native_not_dispatched",
+                "stop was not enqueued before its queue deadline",
+            )
+        })?
+        .map_err(|_| {
+            Error::new(
+                "native_not_dispatched",
+                "stop queue closed before admission",
+            )
+        })
+}
+
+fn prepare_queued_stop_call(
+    client: &PluginClient,
+    params: Value,
+    deadlines: StopDeadlines,
+) -> Result<impl std::future::Future<Output = Result<Value>> + '_> {
+    if Instant::now() >= deadlines.queued_until {
+        return Err(Error::new(
+            "native_not_dispatched",
+            "stop queue deadline elapsed before native dispatch",
+        ));
+    }
+    Ok(client.call("agent.stop", params, deadlines.rpc_deadline(RPC_DEADLINE)))
+}
+
 async fn wait_child(
     child: &mut OwnedChild,
     duration: Duration,
@@ -1985,11 +2258,22 @@ async fn wait_child(
     }
 }
 
-async fn terminate_child(mut child: OwnedChild, monitoring: &Monitoring, agent: &Agent) {
-    if child.terminate().is_ok() && wait_child(&mut child, STOP_GRACE, monitoring, agent).await {
-        return;
-    }
+async fn wait_stop_child(
+    child: &mut OwnedChild,
+    monitoring: &Monitoring,
+    agent: &Agent,
+    until: Instant,
+) -> bool {
+    timeout_at(until, wait_child(child, STOP_GRACE, monitoring, agent))
+        .await
+        .unwrap_or(false)
+}
+
+async fn terminate_child(mut child: OwnedChild, monitoring: &Monitoring, agent: &Agent) -> bool {
+    let exited =
+        child.terminate().is_ok() && wait_child(&mut child, STOP_GRACE, monitoring, agent).await;
     drop(child);
+    exited
 }
 
 fn custody_label(guarantee: crate::platform::CustodyGuarantee) -> &'static str {
@@ -2003,50 +2287,112 @@ fn custody_label(guarantee: crate::platform::CustodyGuarantee) -> &'static str {
     }
 }
 
-// The loss transaction preserves terminal projections but does not record gaps.
-// Store serialization lets a terminal fact committed during cancellation win.
+// Reader availability is independent of custody. Finishing or abandoning this
+// reader must be recorded even when native control loss remains unconfirmed.
+async fn settle_owned_source_exit(
+    state: &Weak<HostState>,
+    key: &AgentKey,
+    event_task: Option<&mut tokio::task::JoinHandle<()>>,
+    exited: bool,
+    reason: &'static str,
+) -> Result<()> {
+    let (reason, reader_closed) = if let Some(task) = event_task {
+        match timeout_at(Instant::now() + STOP_GRACE, &mut *task).await {
+            Ok(Ok(())) => (reason, true),
+            Ok(Err(_)) => ("owned_exit_source_failed", true),
+            Err(_) => {
+                task.abort();
+                let joined = timeout_at(Instant::now() + RPC_GRACE, task).await.is_ok();
+                ("owned_exit_drain_timeout", joined)
+            }
+        }
+    } else {
+        // The startup caller has not armed a reader; confirmed custody exit
+        // proves its pipes cannot later acquire publication authority.
+        (reason, exited)
+    };
+    settle_drained_source_exit(state, key, reader_closed, exited, reason).await
+}
+
+async fn settle_drained_source_exit(
+    state: &Weak<HostState>,
+    key: &AgentKey,
+    reader_closed: bool,
+    exited: bool,
+    reason: &'static str,
+) -> Result<()> {
+    let settlement = async {
+        if reader_closed && exited {
+            return record_root_exit_gap(state, key, reason).await;
+        }
+        let state = state
+            .upgrade()
+            .ok_or_else(|| Error::new("unavailable", "plugin host is unavailable"))?;
+        let events = {
+            let mut store = timeout_at(deadline(), state.store.lock())
+                .await
+                .map_err(|_| {
+                    Error::new(
+                        "unknown",
+                        "native reader availability persistence timed out",
+                    )
+                })?;
+            store.record_native_reader_unavailable(
+                &key.id,
+                key.generation,
+                reason,
+                reader_closed,
+                now_ms(),
+            )?
+        };
+        state.bus.publish(&events);
+        Ok(())
+    }
+    .await;
+    settlement.map_err(|mut error: Error| {
+        error.code = "unknown".to_owned();
+        error.message = "owned exit native source settlement is unconfirmed".to_owned();
+        error
+    })?;
+    if !reader_closed {
+        return Err(Error::new(
+            "unknown",
+            "owned source task cleanup is unconfirmed",
+        ));
+    }
+    if !exited {
+        return Err(Error::new("unknown", "owned custody exit is unconfirmed"));
+    }
+    Ok(())
+}
+
+// Drain terminal facts first. Retiring generations close only their own rows;
+// current nonterminal generations also gap the actual native family owners.
 async fn record_root_exit_gap(state: &Weak<HostState>, key: &AgentKey, reason: &str) -> Result<()> {
     let state = state
         .upgrade()
         .ok_or_else(|| Error::new("unavailable", "plugin host is unavailable"))?;
-    let mut store = state.store.lock().await;
+    let mut store = timeout_at(deadline(), state.store.lock())
+        .await
+        .map_err(|_| Error::new("unknown", "native source exit persistence timed out"))?;
     let agent = store
         .get_agent(&key.id)?
         .ok_or_else(|| Error::new("not_found", "exited plugin Agent was not found"))?;
-    if agent.generation != key.generation {
+    if agent.generation < key.generation {
         return Err(Error::new(
             "stale_generation",
             "exited plugin generation is no longer current",
         ));
     }
-    if agent.is_terminal() {
-        return Ok(());
+    let now = now_ms();
+    if agent.generation == key.generation && !agent.is_terminal() {
+        let events = store.record_native_exit_gaps(&key.id, key.generation, reason, now)?;
+        state.bus.publish(&events);
     }
-    let source = store.read_source_state(&key.id, key.generation, "stream")?;
-    let families = serde_json::from_value(
-        source
-            .get("families")
-            .cloned()
-            .ok_or_else(|| Error::new("source_integrity", "stream has no owned families"))?,
-    )
-    .map_err(|_| Error::new("source_integrity", "stream families are malformed"))?;
-    let change = store.record_source_gap(
-        SourceGap {
-            gap_id: format!("host-root-exit:{}:{}", key.id, key.generation),
-            agent_id: key.id.clone(),
-            generation: key.generation,
-            source: "stream".to_owned(),
-            families,
-            reason: reason.to_owned(),
-            from: source
-                .get("cursor")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
-            to: None,
-        },
-        now_ms(),
-    )?;
-    state.bus.publish(&change.events);
+    // A zero-family predecessor still has a transport lifetime to close. A
+    // committed native terminal fact suppresses gaps, never this source cleanup.
+    let events = store.close_native_sources(&key.id, key.generation, now)?;
+    state.bus.publish(&events);
     Ok(())
 }
 
@@ -2419,5 +2765,770 @@ mod tests {
 
         client.close_input(deadline()).await.unwrap();
         timeout_at(deadline(), task).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn source_handoff_private_boundary_readback_and_owned_exit_follow_owners() {
+        let mut store = eliot_store::Store::open(Path::new(":memory:")).unwrap();
+        let command_id = Ulid::new().to_string();
+        let agent_id = store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: command_id.clone(),
+                    target: None,
+                    verb: "launch".to_owned(),
+                    args: json!({"project":"handoff-boundary", "workspace":"synthetic-workspace"}),
+                    expected_generation: Some(0),
+                    expected_turn_id: None,
+                    request_id: None,
+                },
+                now_ms(),
+            )
+            .unwrap()
+            .command
+            .target
+            .unwrap();
+        store.dispatch(&command_id, now_ms()).unwrap();
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: "initial-ready".to_owned(),
+                    agent_id: agent_id.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    cursor: Some("edge-1".to_owned()),
+                    events: vec![NativeEvent {
+                        kind: "session.ready".to_owned(),
+                        native_id: "initial-ready".to_owned(),
+                        data: json!({"command_id":command_id}),
+                    }],
+                },
+                now_ms(),
+            )
+            .unwrap();
+        store
+            .settle(
+                &command_id,
+                eliot_core::CommandState::Applied,
+                None,
+                now_ms(),
+            )
+            .unwrap();
+        let before = store.high_water().unwrap();
+        let store = Arc::new(AsyncMutex::new(store));
+        let bus = Bus::new(64);
+        let mut published = bus.subscribe();
+        let secrets = Arc::new(Mutex::new(HashSet::new()));
+        let monitoring = Monitoring::new(store.clone(), bus.clone(), secrets.clone());
+        let (progress, _) = watch::channel(0);
+        let host = PluginHost::new(
+            PluginHostOptions::new(
+                PathBuf::from("synthetic-data-root"),
+                "owner-test".to_owned(),
+            ),
+            store.clone(),
+            bus.clone(),
+            secrets,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashSet::new())),
+            progress,
+            monitoring.clone(),
+        );
+        let key = AgentKey {
+            id: agent_id.clone(),
+            generation: 1,
+        };
+        let credential = "private-handoff-peer";
+        let (host_io, peer_io) = tokio::io::duplex(16 * 1024);
+        let (host_read, host_write) = tokio::io::split(host_io);
+        let (peer_read, peer_write) = tokio::io::split(peer_io);
+        let peer = PluginConnection::new(peer_read, peer_write);
+        let client = peer.client();
+        let task = tokio::spawn(serve_plugin_requests(
+            PluginConnection::new(host_read, host_write),
+            EventSource {
+                store: store.clone(),
+                bus: bus.clone(),
+                monitoring,
+                source_credentials: Arc::from([credential.to_owned(), SECRET.to_owned()]),
+                state: Arc::downgrade(&host.state),
+                key: key.clone(),
+                agent_id: agent_id.clone(),
+                generation: 1,
+                expected_credential: credential.to_owned(),
+                observation: None,
+            },
+        ));
+        let handoff = json!({
+            "credential":credential, "agent_id":agent_id, "generation":1,
+            "source":"stream", "families":["message","turn"],
+            "successor":"transcript", "mechanism":"fake_recovery", "cursor":"edge-1",
+        });
+        for (field, value, code) in [
+            ("credential", json!("wrong-private-peer"), "not_allowed"),
+            ("agent_id", json!("a999"), "not_allowed"),
+            ("generation", json!(2), "stale_generation"),
+            ("cursor", json!(SECRET), "secret_in_payload"),
+        ] {
+            let mut params = handoff.clone();
+            params[field] = value;
+            let error = client
+                .call("source.handoff", params, deadline())
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, code, "{field}");
+            assert!(!serde_json::to_string(&error).unwrap().contains(SECRET));
+        }
+        assert_eq!(store.lock().await.high_water().unwrap(), before);
+        assert!(matches!(
+            published.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        // Cancel the pending caller after observing its committed publication,
+        // without consuming the wire ACK. Recover only through source.state.
+        let first_event = {
+            let pending_ack = client.call("source.handoff", handoff.clone(), deadline());
+            tokio::pin!(pending_ack);
+            tokio::select! {
+                biased;
+                event = published.recv() => event.unwrap(),
+                _ = &mut pending_ack => panic!("handoff replied before committed publication"),
+            }
+        };
+        let committed = store.lock().await.high_water().unwrap();
+        let state = client
+            .call(
+                "source.state",
+                json!({
+                    "credential":credential, "agent_id":agent_id, "generation":1, "source":"stream",
+                }),
+                deadline(),
+            )
+            .await
+            .unwrap();
+        let ack = state["last_handoff"].clone();
+        assert!(ack.is_object());
+        assert_eq!(ack["seq"].as_i64(), Some(committed));
+        let persisted = store.lock().await.read_events(before, 1000, None).unwrap();
+        assert!(persisted.contains(&first_event));
+        let mut delivered_ack_event = Some(first_event.seq) == ack["seq"].as_i64();
+        while let Ok(event) = published.try_recv() {
+            assert!(persisted.contains(&event));
+            delivered_ack_event |= Some(event.seq) == ack["seq"].as_i64();
+        }
+        assert!(delivered_ack_event);
+        // No native operation is retried to obtain the retained handoff proof.
+        assert!(
+            state["owners"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|owner| owner["family"] == "turn"
+                    && owner["source"] == "transcript"
+                    && owner["mechanism"] == "fake_recovery")
+        );
+        assert_eq!(
+            client
+                .call("source.handoff", handoff.clone(), deadline())
+                .await
+                .unwrap(),
+            ack
+        );
+        assert_eq!(store.lock().await.high_water().unwrap(), committed);
+        assert!(matches!(
+            published.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        let mut mixed = handoff.clone();
+        mixed["families"] = json!(["session", "turn"]);
+        mixed["cursor"] = json!("mixed-edge");
+        assert_eq!(
+            client
+                .call("source.handoff", mixed, deadline())
+                .await
+                .unwrap_err()
+                .code,
+            "source_integrity"
+        );
+        assert_eq!(store.lock().await.high_water().unwrap(), committed);
+        let mut remainder = handoff.clone();
+        remainder["families"] = json!(["session"]);
+        remainder["cursor"] = json!("edge-1");
+        let final_ack = client
+            .call("source.handoff", remainder, deadline())
+            .await
+            .unwrap();
+        let after_final = store.lock().await.high_water().unwrap();
+        assert_eq!(
+            client
+                .call("source.handoff", handoff, deadline())
+                .await
+                .unwrap_err()
+                .code,
+            "source_integrity"
+        );
+        assert_eq!(store.lock().await.high_water().unwrap(), after_final);
+        let predecessor = client
+            .call(
+                "source.state",
+                json!({
+                    "credential":credential, "agent_id":agent_id, "generation":1, "source":"stream",
+                }),
+                deadline(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(predecessor["families"], json!([]));
+        assert_eq!(predecessor["state"], json!("open"));
+        assert_eq!(predecessor["last_handoff"], final_ack);
+
+        let send_id = Ulid::new().to_string();
+        {
+            let mut store = store.lock().await;
+            store
+                .submit(
+                    "owner",
+                    SubmitCommand {
+                        id: send_id.clone(),
+                        target: Some(agent_id.clone()),
+                        verb: "send".to_owned(),
+                        args: json!({"text":"successor fact"}),
+                        expected_generation: Some(1),
+                        expected_turn_id: None,
+                        request_id: None,
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            store.dispatch(&send_id, now_ms()).unwrap();
+        }
+        client.call("events.put", json!({
+            "credential":credential, "agent_id":agent_id, "generation":1,
+            "batch_id":"successor-facts", "source":"transcript", "cursor":"tail-1",
+            "events":[
+                {"kind":"turn.started", "native_id":"successor-turn", "data":{"command_id":send_id, "turn_id":"recovered-turn"}},
+                {"kind":"message.completed", "native_id":"successor-message", "data":{"command_id":send_id, "turn_id":"recovered-turn", "text":"recovered"}}
+            ],
+        }), deadline()).await.unwrap();
+        assert_eq!(
+            store
+                .lock()
+                .await
+                .get_agent(&agent_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            eliot_core::AgentState::Busy
+        );
+        assert_eq!(
+            store
+                .lock()
+                .await
+                .get_turn(&agent_id, 1, "recovered-turn")
+                .unwrap()
+                .unwrap()
+                .state,
+            eliot_core::TurnState::Running
+        );
+        // Exercise the actual Host EOF gap/loss sequence without starting a process.
+        client.close_input(deadline()).await.unwrap();
+        timeout_at(deadline(), task).await.unwrap().unwrap();
+        record_root_exit_gap(
+            &Arc::downgrade(&host.state),
+            &key,
+            "root_exit_without_session_terminal",
+        )
+        .await
+        .unwrap();
+        mark_lost_state(&Arc::downgrade(&host.state), &key).await;
+        let store = store.lock().await;
+        assert_eq!(
+            store.get_agent(&agent_id).unwrap().unwrap().state,
+            eliot_core::AgentState::Lost
+        );
+        assert_eq!(
+            store
+                .get_turn(&agent_id, 1, "recovered-turn")
+                .unwrap()
+                .unwrap()
+                .state,
+            eliot_core::TurnState::Unknown
+        );
+        let events = store.read_events(after_final, 1000, None).unwrap();
+        let gap = events
+            .iter()
+            .find(|event| event.kind == "source.gap" && event.data["source"] == "transcript")
+            .unwrap();
+        let mut families: Vec<String> =
+            serde_json::from_value(gap.data["families"].clone()).unwrap();
+        families.sort();
+        assert_eq!(families, ["message", "session", "turn"]);
+        for source in ["stream", "transcript"] {
+            assert_eq!(
+                store.read_source_state(&agent_id, 1, source).unwrap()["state"],
+                json!("closed")
+            );
+        }
+        assert_eq!(
+            store.read_source_state(&agent_id, 1, "stream").unwrap()["gap_id"],
+            Value::Null
+        );
+    }
+
+    #[tokio::test]
+    async fn source_handoff_private_history_observer_is_explicitly_denied() {
+        let mut store = eliot_store::Store::open(Path::new(":memory:")).unwrap();
+        let id = Ulid::new().to_string();
+        let agent_id = store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: id.clone(),
+                    target: None,
+                    verb: "attach".to_owned(),
+                    args: json!({"profile":"observer-fixture", "harness":"fake", "mode":"observe",
+                "native_scope":"fixture-scope", "native_ref":"fixture-ref", "profile_snapshot":{}}),
+                    expected_generation: Some(0),
+                    expected_turn_id: None,
+                    request_id: None,
+                },
+                now_ms(),
+            )
+            .unwrap()
+            .command
+            .target
+            .unwrap();
+        store.dispatch(&id, now_ms()).unwrap();
+        let agent = store.get_agent(&agent_id).unwrap().unwrap();
+        assert!(agent.observe_only);
+        assert!(!agent.own_identity);
+        let before = store.high_water().unwrap();
+        let store = Arc::new(AsyncMutex::new(store));
+        let error = observation::callback_error(
+            &store,
+            Some(&agent),
+            "source.handoff",
+            &json!({
+                "agent_id":agent_id, "generation":1, "source":"observe", "families":["turn"],
+                "successor":"transcript", "mechanism":"fake_recovery", "cursor":"edge",
+            }),
+            deadline(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(error.code, "not_allowed");
+        assert_eq!(store.lock().await.high_water().unwrap(), before);
+    }
+
+    fn source_exit_fixture(harness: &str) -> (PluginHost, AgentKey, String) {
+        let mut store = eliot_store::Store::open(Path::new(":memory:")).unwrap();
+        let start_id = Ulid::new().to_string();
+        let profile = if harness == "fake" { "fake" } else { "fixture" };
+        let agent = store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: start_id.clone(),
+                    target: None,
+                    verb: "launch".to_owned(),
+                    args: json!({"project":"source-exit", "workspace":"synthetic-workspace",
+                "harness":harness, "profile":profile, "profile_snapshot":{}}),
+                    expected_generation: Some(0),
+                    expected_turn_id: None,
+                    request_id: None,
+                },
+                now_ms(),
+            )
+            .unwrap()
+            .command
+            .target
+            .unwrap();
+        store.dispatch(&start_id, now_ms()).unwrap();
+        let store = Arc::new(AsyncMutex::new(store));
+        let bus = Bus::new(32);
+        let secrets = Arc::new(Mutex::new(HashSet::new()));
+        let monitoring = Monitoring::new(store.clone(), bus.clone(), secrets.clone());
+        let (progress, _) = watch::channel(0);
+        let host = PluginHost::new(
+            PluginHostOptions::new(
+                PathBuf::from("synthetic-data-root"),
+                "owner-test".to_owned(),
+            ),
+            store,
+            bus,
+            secrets,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashSet::new())),
+            progress,
+            monitoring,
+        );
+        (
+            host,
+            AgentKey {
+                id: agent,
+                generation: 1,
+            },
+            start_id,
+        )
+    }
+
+    #[tokio::test]
+    async fn owned_source_exit_tracks_reader_independently_of_custody() {
+        let (host, key, start_id) = source_exit_fixture("fake");
+        let before = host.state.store.lock().await.high_water().unwrap();
+        let error = settle_drained_source_exit(
+            &Arc::downgrade(&host.state),
+            &key,
+            false,
+            false,
+            "test_exit",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "unknown");
+        {
+            let store = host.state.store.lock().await;
+            let source = store.read_source_state(&key.id, 1, "stream").unwrap();
+            assert_eq!(source["state"], json!("open"));
+            assert_eq!(source["health"], json!("stale"));
+        }
+        let mut drained = tokio::spawn(async {});
+        let error = settle_owned_source_exit(
+            &Arc::downgrade(&host.state),
+            &key,
+            Some(&mut drained),
+            false,
+            "test_exit",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "unknown");
+        {
+            let store = host.state.store.lock().await;
+            let source = store.read_source_state(&key.id, 1, "stream").unwrap();
+            assert_eq!(source["state"], json!("closed"));
+            assert_eq!(source["health"], json!("stale"));
+            assert_eq!(
+                store.get_agent(&key.id).unwrap().unwrap().state,
+                eliot_core::AgentState::Starting
+            );
+            assert_eq!(
+                store.get_command(&start_id).unwrap().unwrap().state,
+                eliot_core::CommandState::Dispatched
+            );
+            assert!(
+                store
+                    .read_events(before, 1000, None)
+                    .unwrap()
+                    .iter()
+                    .all(|event| !matches!(
+                        event.kind.as_str(),
+                        "agent.lost" | "session.lost" | "session.ended" | "command.applied"
+                    ))
+            );
+        }
+        let agent = host
+            .state
+            .store
+            .lock()
+            .await
+            .get_agent(&key.id)
+            .unwrap()
+            .unwrap();
+        match host.state.monitoring.view(&agent).await.unwrap() {
+            eliot_core::api::ObservationView::Data(view) => {
+                assert_eq!(view.liveness.source_healthy, Some(false));
+            }
+            _ => panic!("expected the ordinary observation view"),
+        }
+        let mut drained = tokio::spawn(async {});
+        settle_owned_source_exit(
+            &Arc::downgrade(&host.state),
+            &key,
+            Some(&mut drained),
+            true,
+            "test_exit",
+        )
+        .await
+        .unwrap();
+        let store = host.state.store.lock().await;
+        assert_eq!(
+            store.read_source_state(&key.id, 1, "stream").unwrap()["state"],
+            json!("closed")
+        );
+        assert_eq!(
+            store.get_agent(&key.id).unwrap().unwrap().state,
+            eliot_core::AgentState::Starting
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_source_exit_retiring_generation_does_not_touch_current() {
+        let (host, key, start_id) = source_exit_fixture("codex");
+        let (current, sources, token, before) = {
+            let mut store = host.state.store.lock().await;
+            for (kind, data) in [
+                (
+                    "session.ready",
+                    json!({"native_scope":"fixture-scope", "native_ref":"fixture-ref"}),
+                ),
+                ("session.ended", json!({})),
+            ] {
+                store
+                    .put_batch(
+                        SourceBatch {
+                            batch_id: Ulid::new().to_string(),
+                            agent_id: key.id.clone(),
+                            generation: 1,
+                            source: "stream".to_owned(),
+                            cursor: None,
+                            events: vec![NativeEvent {
+                                kind: kind.to_owned(),
+                                native_id: Ulid::new().to_string(),
+                                data,
+                            }],
+                        },
+                        now_ms(),
+                    )
+                    .unwrap();
+                if kind == "session.ready" {
+                    store
+                        .settle(&start_id, eliot_core::CommandState::Applied, None, now_ms())
+                        .unwrap();
+                }
+            }
+            let resume_id = Ulid::new().to_string();
+            store
+                .submit(
+                    "owner",
+                    SubmitCommand {
+                        id: resume_id.clone(),
+                        target: Some(key.id.clone()),
+                        verb: "resume".to_owned(),
+                        args: json!({}),
+                        expected_generation: Some(1),
+                        expected_turn_id: None,
+                        request_id: None,
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            store.dispatch(&resume_id, now_ms()).unwrap();
+            (
+                store.get_agent(&key.id).unwrap().unwrap(),
+                store.list_source_states(&key.id, 2).unwrap(),
+                store.get_agent_token(&key.id, 2).unwrap(),
+                store.high_water().unwrap(),
+            )
+        };
+        assert_eq!(current.generation, 2);
+        let mut drained = tokio::spawn(async {});
+        settle_owned_source_exit(
+            &Arc::downgrade(&host.state),
+            &key,
+            Some(&mut drained),
+            true,
+            "retiring_exit",
+        )
+        .await
+        .unwrap();
+        let store = host.state.store.lock().await;
+        assert_eq!(store.get_agent(&key.id).unwrap().unwrap(), current);
+        assert_eq!(store.list_source_states(&key.id, 2).unwrap(), sources);
+        assert_eq!(store.get_agent_token(&key.id, 2).unwrap(), token);
+        assert_eq!(store.high_water().unwrap(), before);
+        drop(store);
+        assert_eq!(
+            settle_drained_source_exit(
+                &Arc::downgrade(&host.state),
+                &key,
+                false,
+                false,
+                "retiring_reader_unavailable",
+            )
+            .await
+            .unwrap_err()
+            .code,
+            "unknown"
+        );
+        let store = host.state.store.lock().await;
+        assert_eq!(store.get_agent(&key.id).unwrap().unwrap(), current);
+        assert_eq!(store.list_source_states(&key.id, 2).unwrap(), sources);
+        assert_eq!(store.get_agent_token(&key.id, 2).unwrap(), token);
+        assert!(
+            store
+                .list_source_states(&key.id, 1)
+                .unwrap()
+                .iter()
+                .all(|source| source["health"] == "stale")
+        );
+        assert!(
+            store
+                .read_events(before, 1000, None)
+                .unwrap()
+                .iter()
+                .all(|event| event.generation == Some(1))
+        );
+    }
+
+    #[test]
+    fn owned_source_exit_stop_deadlines_cover_queue_two_rpcs_custody_drain_and_store() {
+        let now = Instant::now();
+        let deadlines = StopDeadlines::new(now);
+        assert_eq!(deadlines.queued_until - now, RPC_DEADLINE);
+        let second_rpc_starts = deadlines.queued_until + RPC_DEADLINE;
+        assert_eq!(
+            deadlines.rpc_deadline_at(second_rpc_starts, RPC_DEADLINE),
+            deadlines.rpc_until
+        );
+        assert_eq!(
+            deadlines.custody_until - deadlines.rpc_until,
+            STOP_GRACE + (STOP_GRACE + STOP_GRACE) * 2
+        );
+        assert_eq!(
+            deadlines.source_until - deadlines.custody_until,
+            STOP_GRACE + RPC_GRACE + RPC_DEADLINE
+        );
+        assert_eq!(deadlines.reply_until - deadlines.source_until, RPC_GRACE);
+        assert!(deadlines.reply_until > now + RPC_DEADLINE + STOP_GRACE + STOP_GRACE + RPC_GRACE);
+        assert!(
+            deadlines.queued_until < deadlines.rpc_until
+                && deadlines.rpc_until < deadlines.custody_until
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_pre_io_full_and_closed_queues_are_rejected_without_admission() {
+        let (host, key, start_id) = source_exit_fixture("fake");
+        let command = {
+            let mut store = host.state.store.lock().await;
+            store
+                .put_batch(
+                    SourceBatch {
+                        batch_id: "queue-test-ready".to_owned(),
+                        agent_id: key.id.clone(),
+                        generation: 1,
+                        source: "stream".to_owned(),
+                        cursor: None,
+                        events: vec![NativeEvent {
+                            kind: "session.ready".to_owned(),
+                            native_id: "queue-test-ready".to_owned(),
+                            data: json!({"command_id":start_id}),
+                        }],
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            store
+                .settle(&start_id, eliot_core::CommandState::Applied, None, now_ms())
+                .unwrap();
+            let id = Ulid::new().to_string();
+            store
+                .submit(
+                    "owner",
+                    SubmitCommand {
+                        id: id.clone(),
+                        target: Some(key.id.clone()),
+                        verb: "stop".to_owned(),
+                        args: json!({}),
+                        expected_generation: Some(1),
+                        expected_turn_id: None,
+                        request_id: None,
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            store.dispatch(&id, now_ms()).unwrap().value
+        };
+        let (sender, mut receiver) = mpsc::channel(1);
+        let (blocker, _blocked_reply) = oneshot::channel();
+        sender
+            .send(RuntimeMessage::DaemonForce { reply: blocker })
+            .await
+            .unwrap_or_else(|_| panic!("queue fixture closed"));
+        let deadlines =
+            StopDeadlines::new(Instant::now() - RPC_DEADLINE - Duration::from_millis(1));
+        let (reply, response) = oneshot::channel();
+        let error = enqueue_stop(
+            &sender,
+            RuntimeMessage::Stop {
+                command: command.clone(),
+                force: true,
+                deadlines,
+                reply,
+            },
+            deadlines.queued_until,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "native_not_dispatched");
+        assert_eq!(
+            eliot_core::classify_dispatched_error(&error.code),
+            eliot_core::CommandState::Rejected
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(RuntimeMessage::DaemonForce { .. })
+        ));
+        // The rejected stop never reached the actor, so no native work can follow it.
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(response.await.is_err());
+
+        drop(receiver);
+        let (reply, _response) = oneshot::channel();
+        let error = enqueue_stop(
+            &sender,
+            RuntimeMessage::Stop {
+                command,
+                force: true,
+                deadlines,
+                reply,
+            },
+            Instant::now() + RPC_DEADLINE,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "native_not_dispatched");
+        assert_eq!(
+            eliot_core::classify_dispatched_error(&error.code),
+            eliot_core::CommandState::Rejected
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_pre_io_expired_actor_deadline_is_rejected_without_rpc_bytes() {
+        use tokio::io::AsyncReadExt;
+
+        let (host_io, mut native_io) = tokio::io::duplex(256);
+        let (reader, writer) = tokio::io::split(host_io);
+        let connection = PluginConnection::new(reader, writer);
+        let client = connection.client();
+        let deadlines =
+            StopDeadlines::new(Instant::now() - RPC_DEADLINE - Duration::from_millis(1));
+        let error = match prepare_queued_stop_call(
+            &client,
+            json!({
+                "agent_id":"a1", "generation":1, "command_id":Ulid::new().to_string(), "force":true,
+            }),
+            deadlines,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("expired actor must reject before constructing native RPC"),
+        };
+        assert_eq!(error.code, "native_not_dispatched");
+        assert_eq!(
+            eliot_core::classify_dispatched_error(&error.code),
+            eliot_core::CommandState::Rejected
+        );
+        tokio::task::yield_now().await;
+        let mut bytes = [0_u8; 1];
+        let native_read = native_io.read(&mut bytes);
+        tokio::pin!(native_read);
+        assert!(futures_util::poll!(&mut native_read).is_pending());
     }
 }

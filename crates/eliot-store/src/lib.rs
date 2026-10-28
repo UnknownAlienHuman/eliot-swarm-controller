@@ -39,6 +39,7 @@ macro_rules! db {
 }
 
 mod observer;
+mod source_handoff;
 
 fn sql_error(error: rusqlite::Error) -> Error {
     Error::new("internal", error.to_string())
@@ -125,7 +126,7 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(sql_error)?;
-        if current > 7 {
+        if current > 8 {
             return Err(Error::new(
                 "unsupported",
                 format!("Store schema version {current} is newer than this binary"),
@@ -387,6 +388,21 @@ impl Store {
                      CHECK(observe_only IN (0,1) AND (state <> 'unknown' OR observe_only = 1) AND (observe_only = 0 OR token IS NULL));
                  INSERT INTO schema_migrations(version) VALUES (7);",
             ).map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 8 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE source_state ADD COLUMN last_handoff_digest BLOB
+                     CHECK(last_handoff_digest IS NULL OR length(last_handoff_digest) = 32);
+                 ALTER TABLE source_state ADD COLUMN last_handoff TEXT
+                     CHECK((last_handoff IS NULL) = (last_handoff_digest IS NULL));
+                 INSERT INTO schema_migrations(version) VALUES (8);",
+            )
+            .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
         Ok(())
@@ -3050,13 +3066,12 @@ impl Store {
     }
 
     /// Native model facts and validated file-change causes count at their original timestamps.
+    /// Ownership was verified on commit; later handoff cannot erase those facts.
     pub fn last_model_progress(&self, agent: &str, generation: i64) -> Result<Option<i64>> {
         let agent_num = parse_agent_id(agent)?;
         self.connection
             .query_row(
-                "SELECT MAX(e.ts) FROM events e JOIN source_owners o
-                   ON o.agent = e.agent AND o.generation = e.generation
-                  AND o.family = e.family AND o.source = e.source
+                "SELECT MAX(e.ts) FROM events e
                  WHERE e.agent = ?1 AND e.generation = ?2
                    AND EXISTS(SELECT 1 FROM agents a WHERE a.id = e.agent AND a.observe_only = 0)
                    AND ((e.source NOT IN ('os', 'daemon', 'git', 'workspace_process') AND e.native_id IS NOT NULL
@@ -3685,10 +3700,11 @@ fn pending_git_hints(
     generation: i64,
     cursor: u64,
 ) -> Result<bool> {
-    connection.query_row(
-        "SELECT EXISTS(
-            SELECT 1 FROM events e JOIN source_owners o
-              ON o.agent = e.agent AND o.generation = e.generation AND o.family = e.family AND o.source = e.source
+    // Persisted native hints remain authoritative after their family changes owner.
+    connection
+        .query_row(
+            "SELECT EXISTS(
+            SELECT 1 FROM events e
             WHERE e.agent = ?1 AND e.generation = ?2 AND e.seq > ?3 AND e.family = 'tool'
               AND e.kind = 'tool.completed' AND e.native_id IS NOT NULL
               AND e.source NOT IN ('git', 'os', 'daemon')
@@ -3697,8 +3713,10 @@ fn pending_git_hints(
               AND (json_array_length(e.data, '$.changed_paths') > 0
                    OR json_extract(e.data, '$.changed_paths_truncated') = 1
                    OR json_extract(e.data, '$.redacted') = 1))",
-        params![agent, generation, git_sequence(cursor)?], |row| row.get(0),
-    ).map_err(sql_error)
+            params![agent, generation, git_sequence(cursor)?],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)
 }
 
 fn current_git_agent(
@@ -3816,10 +3834,6 @@ fn scan_git_hints(
             "Git cursor exceeds committed high-water",
         ));
     }
-    let owner: Option<String> = connection.query_row(
-        "SELECT source FROM source_owners WHERE agent = ?1 AND generation = ?2 AND family = 'tool'",
-        params![parse_agent_id(agent)?, generation], |row| row.get(0),
-    ).optional().map_err(sql_error)?;
     let mut statement = connection
         .prepare(
             "SELECT seq, ts, kind, agent, generation, source, native_id, data
@@ -3838,7 +3852,6 @@ fn scan_git_hints(
     scanned.retain(|event| {
         event.agent.as_deref() == Some(agent)
             && event.generation == Some(generation)
-            && owner.as_deref() == Some(event.source.as_str())
             && event.source != GIT_SOURCE
             && event.source != PROCESS_SOURCE
             && event.source != "daemon"
@@ -3859,8 +3872,7 @@ fn load_native_git_hint(
     let record = connection
         .query_row(
             "SELECT e.seq, e.ts, e.kind, e.agent, e.generation, e.source, e.native_id, e.data
-         FROM events e JOIN source_owners o ON o.agent = e.agent AND o.generation = e.generation
-           AND o.family = e.family AND o.source = e.source
+         FROM events e
          WHERE e.seq = ?1 AND e.agent = ?2 AND e.generation = ?3 AND e.family = 'tool'
            AND e.source NOT IN ('git', 'os', 'daemon') AND e.native_id IS NOT NULL",
             params![git_sequence(seq)?, agent, generation],
@@ -5758,6 +5770,8 @@ struct SourceStateRecord {
     gap_from: Option<String>,
     gap_to: Option<String>,
     gap_seq: Option<i64>,
+    last_handoff_digest: Option<Vec<u8>>,
+    last_handoff: Option<String>,
 }
 
 struct CommandInsert<'a> {
@@ -6330,7 +6344,7 @@ fn load_source_state(
         .query_row(
             "SELECT cursor, last_store_seq, last_batch_id, last_batch_digest,
                     last_batch_first_seq, last_batch_last_seq, state, health,
-                    gap_id, gap_digest, gap_from, gap_to, gap_seq
+                    gap_id, gap_digest, gap_from, gap_to, gap_seq, last_handoff_digest, last_handoff
              FROM source_state WHERE agent = ?1 AND generation = ?2 AND source = ?3",
             params![agent, generation, source],
             |row| {
@@ -6348,6 +6362,8 @@ fn load_source_state(
                     gap_from: row.get(10)?,
                     gap_to: row.get(11)?,
                     gap_seq: row.get(12)?,
+                    last_handoff_digest: row.get(13)?,
+                    last_handoff: row.get(14)?,
                 })
             },
         )
@@ -7731,6 +7747,9 @@ impl Store {
             "gap_from": state.gap_from,
             "gap_to": state.gap_to,
             "gap_seq": state.gap_seq,
+            "last_handoff_digest": state.last_handoff_digest,
+            "last_handoff": state.last_handoff.as_deref().map(decode_json).transpose()?,
+            "owners": source_handoff::owner_bindings(&self.connection, agent_num, generation)?,
         });
         if encode_json(&state)?.len() > MAX_PAGE_BYTES {
             return Err(Error::new(

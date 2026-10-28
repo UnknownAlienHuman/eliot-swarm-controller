@@ -9,7 +9,10 @@ use crate::{
         RpcError, RpcRequest, empty_object, fake_manifest,
     },
 };
-use eliot_core::{BatchAck, Error as CoreError, NativeEvent, SourceBatch};
+use eliot_core::{
+    BatchAck, Error as CoreError, NativeEvent, SecretPolicy, SourceBatch, SourceHandoff,
+    SourceHandoffGap,
+};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::{
@@ -31,6 +34,7 @@ const HOST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const DISCOVERY_SCOPE: &str = "fake:discovery";
 const DISCOVERY_SUBJECTS: usize = 3;
 const MALFORMED_AFTER_DISPATCH: &str = "[fake:malformed-after-dispatch]";
+const HANDOFF_FIXTURE_INPUT: &str = "[fake:source-handoff]";
 
 #[derive(Debug)]
 pub struct PluginError {
@@ -590,6 +594,7 @@ async fn handle_start(
     let credential = state.credential.clone().ok_or_else(not_initialized)?;
     let batch = session_ready_batch(&params.agent_id, params.generation);
 
+    state.source_policy = source_secret_policy(&params, &credential);
     state.binding = Some(Binding {
         agent_id: params.agent_id.clone(),
         generation: params.generation,
@@ -695,7 +700,26 @@ async fn handle_command(
         "fake-{}-{}-{}",
         params.agent_id, params.generation, params.command_id
     );
-    let batch = send_batch(&params, &turn_id, text);
+    if text == HANDOFF_FIXTURE_INPUT {
+        if state.publish_source.is_some() {
+            return Err(domain_error(
+                "bad_state",
+                -32024,
+                "fake source has already been transferred",
+            ));
+        }
+        if let Err(error) = exercise_source_handoff(state, &params, &credential, client).await {
+            state.phase = SessionPhase::Unknown;
+            state.batch_unknown = true;
+            return Err(error);
+        }
+    }
+    let mut batch = send_batch(&params, &turn_id, text);
+    batch.source = state
+        .publish_source
+        .as_deref()
+        .unwrap_or("stream")
+        .to_owned();
 
     state.phase = SessionPhase::Busy;
     state.active_turn = Some(turn_id.clone());
@@ -765,7 +789,12 @@ async fn handle_stop(
     }
 
     let credential = state.credential.clone().ok_or_else(not_initialized)?;
-    let batch = session_ended_batch(&params.agent_id, params.generation);
+    let mut batch = session_ended_batch(&params.agent_id, params.generation);
+    batch.source = state
+        .publish_source
+        .as_deref()
+        .unwrap_or("stream")
+        .to_owned();
     state.phase = SessionPhase::Stopping;
     state.stop_command_id = Some(params.command_id);
 
@@ -922,6 +951,106 @@ struct BatchFailure {
     uncertain: bool,
 }
 
+fn source_secret_policy(params: &AgentStartParams, credential: &str) -> SecretPolicy {
+    let mut known = vec![credential.to_owned()];
+    if let Some(environment) = params
+        .target_environment
+        .as_ref()
+        .and_then(Value::as_object)
+    {
+        let names = params
+            .profile
+            .as_ref()
+            .and_then(|profile| profile.get("pass_env"))
+            .and_then(Value::as_array);
+        for (name, value) in environment {
+            let matches = |expected: &str| {
+                if cfg!(windows) {
+                    name.eq_ignore_ascii_case(expected)
+                } else {
+                    name == expected
+                }
+            };
+            if (matches("ELIOT_AGENT_TOKEN")
+                || names.is_some_and(|names| names.iter().filter_map(Value::as_str).any(matches)))
+                && let Some(value) = value.as_str()
+            {
+                known.push(value.to_owned());
+            }
+        }
+    }
+    SecretPolicy::new(known)
+}
+
+async fn exercise_source_handoff(
+    state: &mut FakeState,
+    command: &AgentCommandParams,
+    credential: &str,
+    client: &PeerClient,
+) -> Result<(), RpcError> {
+    let mut handoff = SourceHandoff {
+        agent_id: command.agent_id.clone(),
+        generation: command.generation,
+        source: "stream".to_owned(),
+        families: vec![
+            "message".to_owned(),
+            "session".to_owned(),
+            "turn".to_owned(),
+        ],
+        successor: "transcript".to_owned(),
+        mechanism: "fake_recovery".to_owned(),
+        cursor: None,
+        gap: Some(SourceHandoffGap {
+            gap_id: format!(
+                "fake:{}:{}:{}:handoff-gap",
+                command.agent_id, command.generation, command.command_id
+            ),
+            reason: format!("fake_source_handoff_fixture {credential}"),
+            from: None,
+            to: None,
+        }),
+    };
+    handoff
+        .prepare(&state.source_policy)
+        .map_err(core_error_to_rpc)?;
+    // Retain this exact prepared request for both the wire and full-digest proof.
+    let mut request = serde_json::to_value(&handoff)
+        .map_err(|_| domain_error("internal", -32603, "cannot encode fake handoff"))?;
+    request["credential"] = json!(credential);
+
+    // The actor has acknowledged all preceding batches and processes no later
+    // request while this operation is unresolved. Never replay the operation.
+    state.batch_unknown = true;
+    let _discarded_reply = client
+        .call(
+            "source.handoff",
+            request,
+            Instant::now() + HOST_RESPONSE_TIMEOUT,
+        )
+        .await;
+    // Deliberately choose readback instead of the direct ACK. This exercises
+    // proof selection, without claiming that the transport actually lost a reply.
+    let readback = client
+        .call(
+            "source.state",
+            json!({
+                "credential": credential,
+                "agent_id": handoff.agent_id,
+                "generation": handoff.generation,
+                "source": handoff.source,
+            }),
+            Instant::now() + HOST_RESPONSE_TIMEOUT,
+        )
+        .await
+        .map_err(|_| unknown_effect())?;
+    handoff
+        .ack_from_state(&readback)
+        .map_err(|_| unknown_effect())?;
+    state.publish_source = Some(handoff.successor);
+    state.batch_unknown = false;
+    Ok(())
+}
+
 async fn commit_batch(
     state: &mut FakeState,
     batch: SourceBatch,
@@ -1045,8 +1174,10 @@ fn domain_error(code: &str, rpc_code: i64, message: &str) -> RpcError {
 #[derive(Default)]
 struct FakeState {
     credential: Option<String>,
+    source_policy: SecretPolicy,
     binding: Option<Binding>,
     observer: Option<FakeObserver>,
+    publish_source: Option<String>,
     start_command_id: Option<String>,
     stop_command_id: Option<String>,
     phase: SessionPhase,
