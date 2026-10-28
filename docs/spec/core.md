@@ -375,12 +375,16 @@ CREATE TABLE source_state (
   last_batch_first_seq INTEGER, last_batch_last_seq INTEGER,
   state TEXT NOT NULL, health TEXT NOT NULL,
   gap_id TEXT, gap_digest BLOB, gap_from TEXT, gap_to TEXT, gap_seq INTEGER,
+  last_handoff_digest BLOB, last_handoff TEXT,
   updated_at INTEGER NOT NULL,
   PRIMARY KEY(agent,generation,source),
   CHECK(state IN ('open','closed')),
   CHECK(health IN ('ok','slow','stale','error')),
   CHECK(last_batch_digest IS NULL OR length(last_batch_digest)=32),
-  CHECK(gap_digest IS NULL OR length(gap_digest)=32)
+  CHECK(gap_digest IS NULL OR length(gap_digest)=32),
+  CHECK((last_handoff IS NULL AND last_handoff_digest IS NULL)
+        OR (last_handoff IS NOT NULL AND last_handoff_digest IS NOT NULL
+            AND length(last_handoff_digest)=32))
 );
 CREATE TABLE commands (
   id TEXT PRIMARY KEY,
@@ -422,9 +426,12 @@ CREATE TABLE git_workspaces (
 `agents.pending` is the serialized pending-request projection; `pending_requests` stores
 indexed request lifecycle rows. These are separate current Store structures, not
 interchangeable schemas. `git_workspaces` stores the workspace Git-head cache. The
-`source_state` checks shown here match the current database constraints: Store
-transactions validate complete batch and gap bindings; SQLite does not enforce
-cross-column nullability for those groups.
+`last_handoff_digest`/`last_handoff` pair retains only the latest canonical handoff
+digest and serialized `SourceHandoffAck` on the predecessor source row. Store transactions
+validate complete batch, gap and handoff bindings; SQLite checks digest lengths and the
+paired-null handoff columns, but not every semantic binding. This handoff readback is
+available through the authenticated private `source.state` request only; public Agent
+`source_states` owner rows and their DTO do not expose the ACK or digest.
 
 Current projections and source recovery state outlive ordinary event retention. A new
 batch replaces only its last-batch acknowledgement. Retained event/native-id history is

@@ -636,10 +636,10 @@ pub(super) async fn callback_error(
     until: Instant,
 ) -> Option<Error> {
     let agent = observation?;
-    if matches!(method, "process.put" | "events.put") {
+    if matches!(method, "process.put" | "events.put" | "source.handoff") {
         return Some(Error::new(
             "not_allowed",
-            "observer history is private and cannot publish lifecycle or process authority",
+            "observer history is private and cannot publish lifecycle, hand off sources, or adopt processes",
         ));
     }
     if params["agent_id"].as_str() != Some(agent.id.as_str())

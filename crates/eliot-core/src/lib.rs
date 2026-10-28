@@ -7,6 +7,7 @@ mod command;
 mod diagnostics;
 mod ids;
 mod secrets;
+mod source_handoff;
 
 pub use canonical::canonical_json_sha256;
 pub use command::{
@@ -18,6 +19,7 @@ pub use diagnostics::{
 };
 pub use ids::parse_agent_id;
 pub use secrets::SecretPolicy;
+pub use source_handoff::{SourceHandoff, SourceHandoffAck, SourceHandoffGap};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

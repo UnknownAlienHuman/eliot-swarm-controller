@@ -487,12 +487,9 @@ impl Monitoring {
                 store.list_processes(&owner(&agent.id, agent.generation), None, PAGE_LIMIT)?;
             let progress = store.last_model_progress(&agent.id, agent.generation)?;
             let healthy = store
-                .read_source_state(&agent.id, agent.generation, "stream")
+                .list_source_states(&agent.id, agent.generation)
                 .ok()
-                .map(|state| {
-                    state.get("state").and_then(Value::as_str) == Some("open")
-                        && state.get("health").and_then(Value::as_str) == Some("ok")
-                });
+                .and_then(native_sources_healthy);
             (processes, progress, healthy)
         };
         let now = now_ms();
@@ -1631,6 +1628,41 @@ fn verified_file_hints(workspace: &str, input: &GitBindingInput) -> (Vec<FileCha
     (hints, gap)
 }
 
+/// Only committed owners of native lifecycle families determine live-source health.
+/// Retained gap boundaries and predecessors without those families are independent.
+fn native_sources_healthy(states: Vec<Value>) -> Option<bool> {
+    let mut selected = false;
+    let mut unknown = false;
+    let mut unhealthy = false;
+    for state in states {
+        let state: SourceState = serde_json::from_value(state).ok()?;
+        if matches!(
+            state.source.as_str(),
+            "daemon" | "os" | "git" | "workspace_process"
+        ) || !state.families.iter().any(|family| {
+            matches!(
+                family.as_str(),
+                "session" | "turn" | "message" | "tool" | "request" | "child" | "goal" | "usage"
+            )
+        }) {
+            continue;
+        }
+        selected = true;
+        match (state.state.as_str(), state.health.as_str()) {
+            ("open", "ok") => {}
+            ("closed", _) | ("open", "slow" | "stale" | "error") => unhealthy = true,
+            _ => unknown = true,
+        }
+    }
+    if unhealthy {
+        Some(false)
+    } else if selected && !unknown {
+        Some(true)
+    } else {
+        None
+    }
+}
+
 fn age_ms(now: i64, timestamp: i64) -> Option<i64> {
     now.checked_sub(timestamp).filter(|age| *age >= 0)
 }
@@ -1698,6 +1730,118 @@ fn owner(agent: &str, generation: i64) -> String {
 mod tests {
     use super::*;
     use eliot_core::{ProcessIdentity, ProcessSample};
+
+    fn handoff_health_fixture(families: &[&str]) -> (eliot_store::Store, String) {
+        let mut store = eliot_store::Store::open(std::path::Path::new(":memory:")).unwrap();
+        let mut request = eliot_core::SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+        request.args = serde_json::json!({
+            "project":"source-health", "workspace":"synthetic-workspace", "harness":"fake",
+        });
+        let command_id = request.id.clone();
+        let agent = store
+            .submit("owner", request, 1000)
+            .unwrap()
+            .command
+            .target
+            .unwrap();
+        store.dispatch(&command_id, 1001).unwrap();
+        store
+            .record_source_handoff(
+                eliot_core::SourceHandoff {
+                    agent_id: agent.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    families: families.iter().map(|family| (*family).to_owned()).collect(),
+                    successor: "transcript".to_owned(),
+                    mechanism: "rollout".to_owned(),
+                    cursor: None,
+                    gap: Some(eliot_core::SourceHandoffGap {
+                        gap_id: "health-baseline".to_owned(),
+                        reason: "bounded fixture baseline".to_owned(),
+                        from: None,
+                        to: Some("baseline".to_owned()),
+                    }),
+                },
+                1002,
+            )
+            .unwrap();
+        (store, agent)
+    }
+
+    #[test]
+    fn native_health_follows_successor_and_ignores_empty_predecessor() {
+        let (store, agent) = handoff_health_fixture(&["session", "turn", "message"]);
+        let mut states = store.list_source_states(&agent, 1).unwrap();
+        let predecessor = states
+            .iter_mut()
+            .find(|row| row["source"] == "stream")
+            .unwrap();
+        assert_eq!(predecessor["families"], serde_json::json!([]));
+        assert_eq!(predecessor["gap_id"], "health-baseline");
+        predecessor["health"] = serde_json::json!("stale");
+        assert_eq!(native_sources_healthy(states.clone()), Some(true));
+
+        for health in ["slow", "stale", "error"] {
+            let mut unhealthy = states.clone();
+            let successor = unhealthy
+                .iter_mut()
+                .find(|row| row["source"] == "transcript")
+                .unwrap();
+            successor["health"] = serde_json::json!(health);
+            assert_eq!(native_sources_healthy(unhealthy), Some(false));
+        }
+        let successor = states
+            .iter_mut()
+            .find(|row| row["source"] == "transcript")
+            .unwrap();
+        successor["state"] = serde_json::json!("closed");
+        assert_eq!(native_sources_healthy(states), Some(false));
+    }
+
+    #[test]
+    fn native_health_requires_all_current_native_owners_and_known_health() {
+        let (store, agent) = handoff_health_fixture(&["message"]);
+        let mut states = store.list_source_states(&agent, 1).unwrap();
+        let predecessor = states
+            .iter_mut()
+            .find(|row| row["source"] == "stream")
+            .unwrap();
+        assert_eq!(
+            predecessor["families"],
+            serde_json::json!(["session", "turn"])
+        );
+        predecessor["health"] = serde_json::json!("stale");
+        assert_eq!(native_sources_healthy(states.clone()), Some(false));
+        let predecessor = states
+            .iter_mut()
+            .find(|row| row["source"] == "stream")
+            .unwrap();
+        predecessor["health"] = serde_json::json!("unverified");
+        assert_eq!(native_sources_healthy(states), None);
+    }
+
+    #[test]
+    fn native_health_ignores_unrelated_sources_and_empty_ownership() {
+        let (mut store, agent) = handoff_health_fixture(&["session", "turn", "message"]);
+        store.ensure_process_source(&agent, 1, 1003).unwrap();
+        store
+            .set_process_source_status(&agent, 1, "stale", false, 1004)
+            .unwrap();
+        store
+            .ensure_git_source(&agent, 1, "synthetic-workspace", 1003)
+            .unwrap();
+        store
+            .set_git_source_status(&agent, 1, "error", true, 1004)
+            .unwrap();
+        let states = store.list_source_states(&agent, 1).unwrap();
+        assert_eq!(native_sources_healthy(states.clone()), Some(true));
+        let unrelated = states
+            .into_iter()
+            .filter(|row| row["source"] != "transcript")
+            .collect();
+        assert_eq!(native_sources_healthy(unrelated), None);
+        assert_eq!(native_sources_healthy(Vec::new()), None);
+    }
 
     fn sample(cpu_time_ns: Option<u64>, rss_bytes: Option<u64>) -> ProcessSample {
         ProcessSample {

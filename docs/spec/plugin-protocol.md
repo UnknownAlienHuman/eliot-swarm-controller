@@ -155,9 +155,9 @@ inventing completion or issuing another start.
 | Method | Fields / result |
 | --- | --- |
 | `events.put` | stable batch id, agent/generation/source, complete bounded normalized native-record batch, optional exclusive cursor; returns committed seq range/cursor |
-| `source.state` | read-only family owners, cursor, lifecycle, health, latest gap and last-batch acknowledgement |
+| `source.state` | private readback of source state, all current family owners, latest gap, batch acknowledgement, and latest handoff digest/ack |
 | `source.gap` | stable gap id, owned families, reason and optional from/to cursor; commits one gap boundary |
-| `source.handoff` | named families, expected predecessor, successor/mechanism and final cursor or gap; atomic ownership transfer |
+| `source.handoff` | `SourceHandoff` request; atomically returns `SourceHandoffAck` after commit |
 | `process.put` | credential, agent_id, generation, pid, role; returns the OS-verified `ProcessRecord`, not plugin-authoritative process lifecycle |
 | `child` | registration id, parent/generation, exact child subject and optional identity request; canonical child row/source plan |
 
@@ -192,6 +192,33 @@ notifications.
 A source row's `open|closed` lifecycle, health and latest historical gap are independent.
 A gap neither closes the source nor changes its owner or health automatically.
 
+The typed handoff contract is:
+
+```text
+SourceHandoff {
+  agent_id:String, generation:i64, source:String, families:Vec<String>,
+  successor:String, mechanism:String, cursor:Option<String>, gap:Option<SourceHandoffGap>
+}
+SourceHandoffGap { gap_id:String, reason:String, from:Option<String>, to:Option<String> }
+SourceHandoffAck {
+  agent_id:String, generation:i64, source:String, families:Vec<String>,
+  successor:String, mechanism:String, cursor:Option<String>, gap_id:Option<String>, seq:i64
+}
+```
+
+`seq` is positive and is the committed `source.handoff` event sequence; it is independent
+of the predecessor's `last_store_seq`. For a gap-backed handoff, `0 < gap_seq < ack.seq`.
+
+`source` is the expected predecessor. `families` is a unique nonempty set; order is not
+significant, and Store sorts it before hashing the canonical operation and forming the
+ACK. Store rechecks the selected harness subset: Fake supports `session`, `turn` and
+`message`; Codex supports those plus `tool` and `request`. Other native families such as
+`child`, `goal` and `usage` return `unsupported`; daemon-owned families and reserved
+`daemon`, `os`, `git` and `workspace_process` sources return `not_allowed`. Exactly one
+of `cursor` or `gap` is non-null. A cursor must equal the predecessor's committed
+exclusive cursor; a gap carries its stable id/reason and optional from/to boundary.
+There is no `handoff_id`.
+
 `gap_id` identifies one uncovered interval. Same id and canonical fields return its
 stored result; the same id with different fields is an integrity error. After that
 operation is acknowledged/read back, a new interval uses a new stable id and replaces
@@ -200,12 +227,30 @@ only the latest gap metadata; the previous gap event remains in retained history
 At most one unacknowledged gap/handoff operation is allowed per source. Settle a lost
 reply with `source.state` before issuing the next operation.
 
-Handoff checks that all named families have the expected predecessor, records the
-final exclusive cursor or gap, and transfers only those families to an open successor
-in one transaction. The predecessor may remain open for other families or as a private
-standby. Its lifecycle changes only on its own close/drain facts. Successor publication
-starts after commit. Readback of owner plus supplied boundary settles a lost reply;
-unproven/mixed state remains unknown. No source epoch, open-id or source sequence layer.
+Handoff is a single Store compare-and-swap. It verifies the current generation, a
+controlled Agent, an open predecessor and predecessor ownership of every named family.
+An absent successor row is created open in the same transaction; an existing successor
+must already be open. Closed rows never reopen. Transfer only the named family-owner
+rows. The predecessor lifecycle is unchanged, including when it owns zero families.
+
+Commit any new gap boundary, successor-open fact, owner transfer, `source.handoff` event
+and predecessor `last_handoff_digest`/`last_handoff` acknowledgement in that transaction.
+Publish the committed events and return `SourceHandoffAck` only after commit. Stage A's
+connected caller is the controlled Fake source; it verifies the handoff through
+`source.state` before switching to successor facts. Private history cannot be handed
+off or published by this caller. This scoped rule is not a permanent observer ban: a
+separate live-recovery caller requires an explicit grant for normalized live facts,
+without control identity, private-history publication or input/command acknowledgement.
+
+The private authenticated `source.state` readback includes paired nullable
+`last_handoff_digest` (32-byte array) and `last_handoff` (ACK) fields, null before the
+first handoff, and all current generation owner/mechanism rows.
+The retained digest binds the canonical request, including the sorted family set and
+gap reason. After a lost reply, accept only a matching digest/ACK, current successor
+owners and the same cursor or gap boundary. If any owner or boundary advanced, or the
+state is mixed/stale, the result is unknown; do not blindly retry. Retain only the latest
+handoff proof on the predecessor row. The public Agent `source_states` projection remains
+unchanged and never exposes that digest or ACK. No source epoch or open-id layer.
 
 ### Children and processes
 
