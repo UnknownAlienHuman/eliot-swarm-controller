@@ -1,6 +1,11 @@
 //! Public event-read DTOs. Authorization, high-water and live-buffer behavior
 //! remain in the Router; this module only validates the implemented wire shape.
 
+mod read_validation;
+mod reads;
+
+pub use reads::{AgentResultRequest, AgentResultResponse, CommandGetRequest, TurnGetRequest};
+
 use crate::{Error, Event, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};

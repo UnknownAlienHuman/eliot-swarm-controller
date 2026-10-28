@@ -8,8 +8,9 @@ use eliot_core::{
     Agent, AgentState, Command, CommandState, Error, Event, ProcessIdentity, Result, SecretPolicy,
     SubmitCommand, Turn, TurnState, WorkspacePhase, WorkspacePreparationInput,
     api::{
-        EventsFilter, EventsReadRequest, EventsReadResponse, EventsSubscribeRequest,
-        EventsSubscribeResponse,
+        AgentResultRequest, AgentResultResponse, CommandGetRequest, EventsFilter,
+        EventsReadRequest, EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse,
+        TurnGetRequest,
     },
     classify_dispatched_error,
 };
@@ -731,8 +732,10 @@ impl Router {
     }
 
     async fn command_get(&self, params: &Value, principal: &Principal) -> Result<Value> {
-        reject_unknown_keys(params, &["id"], "command.get")?;
-        let id = required_text(params, "id")?;
+        let request: CommandGetRequest = serde_json::from_value(params.clone())
+            .map_err(|_| Error::new("invalid", "command.get params are invalid"))?;
+        request.validate()?;
+        let id = request.id.as_str();
         let mut command = {
             let store = self.inner.store.lock().await;
             store.get_command(id)?
@@ -1252,50 +1255,44 @@ impl Router {
     }
 
     async fn agent_result(&self, params: &Value, principal: &Principal) -> Result<Value> {
-        reject_unknown_keys(
-            params,
-            &["id", "generation", "turn_id", "limit"],
-            "agent.result",
-        )?;
-        let id = required_text(params, "id")?;
-        authorize_agent_read(
-            principal,
-            id,
-            params.get("generation").and_then(Value::as_i64),
-        )?;
+        let request: AgentResultRequest = serde_json::from_value(params.clone())
+            .map_err(|_| Error::new("invalid", "agent.result params are invalid"))?;
+        request.validate()?;
+        let id = request.id.as_str();
+        authorize_agent_read(principal, id, request.generation)?;
         let (agent_metadata, generation, mut turns) = {
             let store = self.inner.store.lock().await;
             let agent = store
                 .get_agent(id)?
                 .ok_or_else(|| Error::new("not_found", format!("Agent {id} was not found")))?;
-            let generation = params
-                .get("generation")
-                .and_then(Value::as_i64)
-                .unwrap_or(agent.generation);
-            let turns = if let Some(turn_id) = params.get("turn_id").and_then(Value::as_str) {
+            let generation = request.generation.unwrap_or(agent.generation);
+            let turns = if let Some(turn_id) = request.turn_id.as_deref() {
                 vec![store.get_turn(id, generation, turn_id)?.ok_or_else(|| {
                     Error::new("not_found", format!("turn {turn_id} was not found"))
                 })?]
             } else {
-                store.list_turns(id, generation, page_limit(params)?)?
+                store.list_turns(id, generation, request.limit)?
             };
             (agent, generation, turns)
         };
         self.mask_unknown_turns(id, generation, &mut turns).await?;
-        Ok(json!({
-            "agent": id,
-            "generation": generation,
-            "turns": turns,
-            "agent_metadata": agent_metadata,
-        }))
+        serde_json::to_value(AgentResultResponse {
+            agent: request.id,
+            generation,
+            turns,
+            agent_metadata,
+        })
+        .map_err(|_| Error::new("internal", "agent.result response could not be encoded"))
     }
 
     async fn turn_get(&self, params: &Value, principal: &Principal) -> Result<Value> {
-        reject_unknown_keys(params, &["agent", "generation", "turn_id"], "turn.get")?;
-        let agent = required_text(params, "agent")?;
-        let generation = required_i64(params, "generation")?;
+        let request: TurnGetRequest = serde_json::from_value(params.clone())
+            .map_err(|_| Error::new("invalid", "turn.get params are invalid"))?;
+        request.validate()?;
+        let agent = request.agent.as_str();
+        let generation = request.generation;
         authorize_agent_read(principal, agent, Some(generation))?;
-        let turn_id = required_text(params, "turn_id")?;
+        let turn_id = request.turn_id.as_str();
         let mut turn = {
             let store = self.inner.store.lock().await;
             store.get_turn(agent, generation, turn_id)?
@@ -3319,6 +3316,388 @@ mod tests {
             )
             .unwrap()
             .events
+    }
+
+    fn read_fixture_event(store: &mut eliot_store::Store, agent: &str, kind: &str, data: Value) {
+        store
+            .put_batch(
+                eliot_core::SourceBatch {
+                    batch_id: ulid::Ulid::new().to_string(),
+                    agent_id: agent.to_owned(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![eliot_core::NativeEvent {
+                        kind: kind.to_owned(),
+                        native_id: ulid::Ulid::new().to_string(),
+                        data,
+                    }],
+                    cursor: None,
+                },
+                now_ms(),
+            )
+            .unwrap();
+    }
+
+    fn result_fixture(store: &mut eliot_store::Store) -> (String, String) {
+        let launch_id = ulid::Ulid::new().to_string();
+        let agent = store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: launch_id.clone(),
+                    target: None,
+                    verb: "launch".to_owned(),
+                    args: json!({
+                        "project":"typed-results", "workspace":"synthetic-workspace",
+                        "harness":"codex", "profile":"synthetic", "profile_snapshot":{},
+                    }),
+                    expected_generation: Some(0),
+                    expected_turn_id: None,
+                    request_id: None,
+                },
+                now_ms(),
+            )
+            .unwrap()
+            .command
+            .target
+            .unwrap();
+        store.dispatch(&launch_id, now_ms()).unwrap();
+        read_fixture_event(
+            store,
+            &agent,
+            "session.ready",
+            json!({"native_scope":"fixture-scope", "native_ref":"fixture-ref"}),
+        );
+        store
+            .settle(&launch_id, CommandState::Applied, None, now_ms())
+            .unwrap();
+        let send_id = ulid::Ulid::new().to_string();
+        store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: send_id.clone(),
+                    target: Some(agent.clone()),
+                    verb: "send".to_owned(),
+                    args: json!({"text":"fixture input"}),
+                    expected_generation: Some(1),
+                    expected_turn_id: None,
+                    request_id: None,
+                },
+                now_ms(),
+            )
+            .unwrap();
+        store.dispatch(&send_id, now_ms()).unwrap();
+        read_fixture_event(
+            store,
+            &agent,
+            "turn.started",
+            json!({"command_id":send_id, "turn_id":"turn-1"}),
+        );
+        (agent, send_id)
+    }
+
+    #[tokio::test]
+    async fn typed_result_handlers_reject_malformed_params_before_lookup() {
+        let router = router();
+        let cases = [
+            ("command.get", json!({})),
+            ("command.get", json!({"id":null})),
+            ("command.get", json!({"id":false})),
+            ("command.get", json!({"id":" \t"})),
+            ("command.get", json!({"id":"missing", "extra":0})),
+            ("turn.get", json!({"agent":"a1", "turn_id":"turn-1"})),
+            (
+                "turn.get",
+                json!({"agent":"a1", "generation":1, "turn_id":null}),
+            ),
+            (
+                "turn.get",
+                json!({"agent":"a1", "generation":1, "turn_id":" \t"}),
+            ),
+            (
+                "turn.get",
+                json!({"agent":"a1", "generation":1, "turn_id":"turn-1", "extra":0}),
+            ),
+            ("agent.result", json!({"id":"a1", "turn_id":null})),
+            ("agent.result", json!({"id":"a1", "turn_id":false})),
+            ("agent.result", json!({"id":"a1", "turn_id":" \t"})),
+            ("agent.result", json!({"id":"a1", "extra":0})),
+        ];
+        for (method, params) in cases {
+            let error = router
+                .handle(
+                    method,
+                    json!({
+                        "_auth":{"kind":"owner", "credential":"owner-credential"},
+                        "_payload":params,
+                    }),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "invalid", "{method}: {params}");
+        }
+        for generation in [
+            json!(null),
+            json!(-1),
+            json!(1.0),
+            json!("1"),
+            json!(true),
+            json!(u64::MAX),
+        ] {
+            for method in ["turn.get", "agent.result"] {
+                let params = if method == "turn.get" {
+                    json!({"agent":"a1", "generation":generation, "turn_id":"turn-1"})
+                } else {
+                    json!({"id":"a1", "generation":generation})
+                };
+                let result = if method == "turn.get" {
+                    router.turn_get(&params, &Principal::Owner).await
+                } else {
+                    router.agent_result(&params, &Principal::Owner).await
+                };
+                assert_eq!(result.unwrap_err().code, "invalid");
+            }
+        }
+        for limit in [
+            json!(null),
+            json!(0),
+            json!(1001),
+            json!(-1),
+            json!(1.0),
+            json!("1"),
+            json!(false),
+        ] {
+            let error = router
+                .agent_result(
+                    &json!({"id":"a1", "turn_id":"turn-1", "limit":limit}),
+                    &Principal::Owner,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "invalid", "exact-turn limit: {limit}");
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_result_reads_preserve_historical_generation_and_principal_scope() {
+        let router = router();
+        let (agent, send_id) = {
+            let mut store = router.inner.store.lock().await;
+            let (agent, send_id) = result_fixture(&mut store);
+            read_fixture_event(
+                &mut store,
+                &agent,
+                "turn.completed",
+                json!({"command_id":send_id, "turn_id":"turn-1", "status":"completed"}),
+            );
+            read_fixture_event(&mut store, &agent, "session.ended", json!({}));
+            let resume_id = ulid::Ulid::new().to_string();
+            store
+                .submit(
+                    "owner",
+                    SubmitCommand {
+                        id: resume_id.clone(),
+                        target: Some(agent.clone()),
+                        verb: "resume".to_owned(),
+                        args: json!({}),
+                        expected_generation: Some(1),
+                        expected_turn_id: None,
+                        request_id: None,
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            // Store-only generation transition; no Router dispatch or process I/O.
+            store.dispatch(&resume_id, now_ms()).unwrap();
+            (agent, send_id)
+        };
+        let historical = json!({"id":agent, "generation":1, "turn_id":"turn-1"});
+        let result: AgentResultResponse = serde_json::from_value(
+            router
+                .agent_result(&historical, &Principal::Owner)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result.agent, agent);
+        assert_eq!(result.generation, 1);
+        assert_eq!(result.agent_metadata.generation, 2);
+        assert_eq!(result.turns[0].state, TurnState::Completed);
+        let turn_params = json!({"agent":agent, "generation":1, "turn_id":"turn-1"});
+        let turn: Turn = serde_json::from_value(
+            router
+                .turn_get(&turn_params, &Principal::Owner)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(turn, result.turns[0]);
+        let current = router
+            .agent_result(&json!({"id":agent}), &Principal::Owner)
+            .await
+            .unwrap();
+        assert_eq!(current["generation"], json!(2));
+        assert_eq!(current["agent_metadata"]["generation"], json!(2));
+        assert_eq!(current["turns"], json!([]));
+
+        let current_principal = Principal::Agent {
+            id: agent.clone(),
+            generation: 2,
+        };
+        assert_eq!(
+            router
+                .agent_result(&historical, &current_principal)
+                .await
+                .unwrap_err()
+                .code,
+            "not_allowed"
+        );
+        assert_eq!(
+            router
+                .turn_get(&turn_params, &current_principal)
+                .await
+                .unwrap_err()
+                .code,
+            "not_allowed"
+        );
+        assert_eq!(
+            router
+                .command_get(&json!({"id":send_id}), &current_principal)
+                .await
+                .unwrap_err()
+                .code,
+            "not_allowed"
+        );
+        let historical_principal = Principal::Agent {
+            id: agent.clone(),
+            generation: 1,
+        };
+        assert!(
+            router
+                .agent_result(&historical, &historical_principal)
+                .await
+                .is_ok()
+        );
+        assert!(
+            router
+                .turn_get(&turn_params, &historical_principal)
+                .await
+                .is_ok()
+        );
+        assert!(
+            router
+                .command_get(&json!({"id":send_id}), &historical_principal)
+                .await
+                .is_ok()
+        );
+        let other_principal = Principal::Agent {
+            id: "a999".to_owned(),
+            generation: 1,
+        };
+        assert_eq!(
+            router
+                .agent_result(&historical, &other_principal)
+                .await
+                .unwrap_err()
+                .code,
+            "not_allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_result_reads_retain_unknown_masks_and_opaque_outcome() {
+        let router = router();
+        let (agent, interrupt_id) = {
+            let mut store = router.inner.store.lock().await;
+            let (agent, _) = result_fixture(&mut store);
+            let interrupt_id = ulid::Ulid::new().to_string();
+            store
+                .submit(
+                    "owner",
+                    SubmitCommand {
+                        id: interrupt_id.clone(),
+                        target: Some(agent.clone()),
+                        verb: "interrupt".to_owned(),
+                        args: json!({}),
+                        expected_generation: Some(1),
+                        expected_turn_id: Some("turn-1".to_owned()),
+                        request_id: None,
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            store.dispatch(&interrupt_id, now_ms()).unwrap();
+            (agent, interrupt_id)
+        };
+        router.note_unknown_id(&interrupt_id, "fixture_transport_loss");
+        let command: Command = serde_json::from_value(
+            router
+                .command_get(&json!({"id":interrupt_id}), &Principal::Owner)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(command.state, CommandState::Unknown);
+        assert_eq!(command.turn_id, None);
+        assert_eq!(
+            command.outcome.unwrap()["cause"],
+            json!("fixture_transport_loss")
+        );
+        let turn: Turn = serde_json::from_value(
+            router
+                .turn_get(
+                    &json!({"agent":agent, "generation":1, "turn_id":"turn-1"}),
+                    &Principal::Owner,
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(turn.state, TurnState::Unknown);
+        assert_eq!(turn.status, None);
+        let result: AgentResultResponse = serde_json::from_value(
+            router
+                .agent_result(&json!({"id":agent}), &Principal::Owner)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result.turns, vec![turn]);
+
+        let retained = {
+            let mut store = router.inner.store.lock().await;
+            assert_eq!(
+                store.get_turn(&agent, 1, "turn-1").unwrap().unwrap().state,
+                TurnState::Running
+            );
+            assert_eq!(
+                store.get_command(&interrupt_id).unwrap().unwrap().state,
+                CommandState::Dispatched
+            );
+            let outcome = json!({"opaque":{"nested":[1, false, null]}, "diagnostics":[{
+                "source":"plugin", "snapshot":{"text":"safe tail", "truncated":false, "eof":true, "read_error":false}
+            }]});
+            store
+                .settle(
+                    &interrupt_id,
+                    CommandState::Unknown,
+                    Some(outcome),
+                    now_ms(),
+                )
+                .unwrap()
+                .value
+        };
+        let observed: Command = serde_json::from_value(
+            router
+                .command_get(&json!({"id":interrupt_id}), &Principal::Owner)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(observed.outcome, retained.outcome);
+        assert_eq!(observed.state, CommandState::Unknown);
+        assert_eq!(observed.turn_id, None);
     }
 
     #[tokio::test]
