@@ -548,6 +548,7 @@ This owner-only request requires exactly an `id` and the `ShutdownMode` value `d
 reply is retained under the literal mutation ID. An exact retry returns that same reply,
 including the original drain blocker snapshot; use owner-only `daemon.status` for current
 state. Reusing the ID with another mode returns `id_conflict`.
+Force admission is monotonic; a later, in-flight, or replayed drain cannot downgrade it.
 
 Drain returns `state:"applied"` with an empty typed blocker list when no blockers were
 observed, otherwise `state:"dispatched"` with the captured `StatusBlocker` list. Force

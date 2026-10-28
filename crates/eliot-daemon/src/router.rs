@@ -1584,7 +1584,8 @@ impl Router {
             }),
         };
         self.inner.plugin_host.close_discovery_admission();
-        self.inner.mode.store(
+        // Retried or in-flight drain requests must never reopen forcing admission.
+        self.inner.mode.fetch_max(
             if mode == ShutdownMode::Force {
                 MODE_FORCE
             } else {
@@ -3336,6 +3337,67 @@ mod tests {
             "id_conflict"
         );
         assert_eq!(router.inner.mode.load(Ordering::SeqCst), MODE_DRAIN);
+    }
+
+    #[tokio::test]
+    async fn typed_mutation_retained_drain_cannot_downgrade_force() {
+        let router = router();
+        let agent = {
+            let mut store = router.inner.store.lock().await;
+            admit(&mut store)[0].agent.clone().unwrap()
+        };
+        let progress = router.progress_receiver();
+        let drain = json!({"id":ulid::Ulid::new().to_string(), "mode":"drain"});
+        let first = router.shutdown(&drain, &Principal::Owner).await.unwrap();
+        router.response_finished(true);
+        assert!(router.inner.shutdown_ready.load(Ordering::SeqCst));
+
+        let force = router
+            .shutdown(
+                &json!({"id":ulid::Ulid::new().to_string(), "mode":"force"}),
+                &Principal::Owner,
+            )
+            .await
+            .unwrap();
+        assert_eq!(force, json!({"state":"dispatched", "mode":"force"}));
+        assert!(router.is_force_requested());
+        assert!(!router.inner.shutdown_ready.load(Ordering::SeqCst));
+        router.response_finished(true);
+        let before_retry = *progress.borrow();
+
+        assert_eq!(
+            router.shutdown(&drain, &Principal::Owner).await.unwrap(),
+            first
+        );
+        assert_eq!(router.inner.mode.load(Ordering::SeqCst), MODE_FORCE);
+        assert_eq!(router.mode_name(), "forcing");
+        assert!(!router.inner.shutdown_ready.load(Ordering::SeqCst));
+        assert_eq!(*progress.borrow(), before_retry.wrapping_add(1));
+
+        let stop_id = ulid::Ulid::new().to_string();
+        let before_events = router
+            .inner
+            .store
+            .lock()
+            .await
+            .read_events(0, 1000, None)
+            .unwrap();
+        let before_submit = *progress.borrow();
+        let error = router.submit(
+            &json!({"id":stop_id, "target":agent, "verb":"stop", "args":{}, "expected_generation":0}),
+            &Principal::Owner,
+        ).await.unwrap_err();
+        assert_eq!(error.code, "unavailable");
+        {
+            let store = router.inner.store.lock().await;
+            assert!(store.get_command(&stop_id).unwrap().is_none());
+            assert_eq!(store.read_events(0, 1000, None).unwrap(), before_events);
+        }
+        assert_eq!(*progress.borrow(), before_submit);
+        router.response_finished(true);
+        assert!(router.inner.shutdown_ready.load(Ordering::SeqCst));
+        assert_eq!(*progress.borrow(), before_submit.wrapping_add(1));
+        assert!(router.should_exit().await.unwrap());
     }
 
     #[tokio::test]
