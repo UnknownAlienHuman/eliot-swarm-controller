@@ -5,13 +5,18 @@ use crate::{
     workspaces::WorkspaceManager,
 };
 use eliot_core::{
-    Agent, AgentState, Command, CommandState, Error, Event, ProcessIdentity, Result, SecretPolicy,
-    SubmitCommand, Turn, TurnState, WorkspacePhase, WorkspacePreparationInput,
+    Agent, AgentState, Command, CommandState, Error, Event, Result, SecretPolicy, SubmitCommand,
+    Turn, TurnState, WorkspacePhase, WorkspacePreparationInput,
     api::{
-        AgentDiscoverRequest, AgentHistoryRequest, AgentResultRequest, AgentResultResponse,
-        CommandGetRequest, DiscoverPage, EventsFilter, EventsReadRequest, EventsReadResponse,
-        EventsSubscribeRequest, EventsSubscribeResponse, MAX_OBSERVATION_PAGE_BYTES,
-        ObservationPage, ObservationQuery, TurnGetRequest,
+        AgentDiscoverRequest, AgentEditsRequest, AgentEditsResponse, AgentGetRequest,
+        AgentGetResponse, AgentGitRequest, AgentGitResponse, AgentHistoryRequest, AgentListRequest,
+        AgentListResponse, AgentListRow, AgentProcessesRequest, AgentProcessesResponse,
+        AgentResultRequest, AgentResultResponse, AgentStatsRequest, AgentStatsResponse,
+        CommandGetRequest, DaemonStatusRequest, DaemonStatusResponse, DiscoverPage, EventsFilter,
+        EventsReadRequest, EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse,
+        GitView, MAX_OBSERVATION_PAGE_BYTES, ObservationPage, ObservationQuery, ObservationView,
+        ProcessPageCursor, SourceState, StatusBlocker, TurnGetRequest, UnsettledCommandSummary,
+        WorkspaceCustodyView,
     },
     classify_dispatched_error,
 };
@@ -33,7 +38,6 @@ use tokio::{
 };
 
 const PAGE_MAX: usize = 1_000;
-const PROCESS_CURSOR_MAX_BYTES: usize = 2_048;
 const EVENT_SCAN_MAX: usize = 1_000;
 const EVENT_RESPONSE_MAX_BYTES: usize = 900 * 1024;
 const EVENT_RESPONSE_WRAPPER_RESERVE_BYTES: usize = 4 * 1024;
@@ -84,16 +88,6 @@ struct EventFilter {
     sources: HashSet<String>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProcessPageCursor {
-    agent: String,
-    generation: i64,
-    scope: String,
-    #[serde(deserialize_with = "deserialize_cursor_identity")]
-    identity: ProcessIdentity,
-}
-
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ObserverCommandResult {
@@ -110,24 +104,6 @@ struct ObserverCommandResult {
     coverage: Option<Value>,
     #[serde(default)]
     reader_closed: Option<bool>,
-}
-
-fn deserialize_cursor_identity<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<ProcessIdentity, D::Error> {
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Identity {
-        host_boot_id: String,
-        pid: u32,
-        start_time: u64,
-    }
-    let identity = <Identity as serde::Deserialize<'de>>::deserialize(deserializer)?;
-    Ok(ProcessIdentity {
-        host_boot_id: identity.host_boot_id,
-        pid: identity.pid,
-        start_time: identity.start_time,
-    })
 }
 
 impl Router {
@@ -186,7 +162,9 @@ impl Router {
         match method {
             "daemon.status" => {
                 require_owner(&principal)?;
-                reject_unknown_keys(&params, &[], method)?;
+                let request: DaemonStatusRequest = serde_json::from_value(params)
+                    .map_err(|_| Error::new("invalid", "daemon.status params are invalid"))?;
+                request.validate()?;
                 self.status().await
             }
             "daemon.shutdown" => {
@@ -916,8 +894,10 @@ impl Router {
     }
 
     async fn agent_get(&self, params: &Value, principal: &Principal) -> Result<Value> {
-        reject_unknown_keys(params, &["id"], "agent.get")?;
-        let id = required_text(params, "id")?;
+        let request: AgentGetRequest = serde_json::from_value(params.clone())
+            .map_err(|_| Error::new("invalid", "agent.get params are invalid"))?;
+        request.validate()?;
+        let id = request.id.as_str();
         authorize_agent_read(principal, id, None)?;
         let (agent, source_states, observer_active) = {
             let store = self.inner.store.lock().await;
@@ -955,56 +935,38 @@ impl Router {
             ));
         }
         let observation = self.observation_view(&agent).await;
-        let mut value = serde_json::to_value(agent)
-            .map_err(|error| Error::new("internal", format!("encode Agent: {error}")))?;
-        value["observation"] = observation;
-        value["source_states"] = json!(source_states);
-        Ok(value)
+        let source_states = source_states
+            .into_iter()
+            .map(|value| {
+                serde_json::from_value::<SourceState>(value)
+                    .map_err(|_| Error::new("internal", "source state view is invalid"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        serde_json::to_value(AgentGetResponse {
+            agent,
+            observation,
+            source_states,
+        })
+        .map_err(|_| Error::new("internal", "Agent view could not be encoded"))
     }
 
-    async fn observation_view(&self, agent: &Agent) -> Value {
+    async fn observation_view(&self, agent: &Agent) -> ObservationView {
         match self.inner.monitoring.view(agent).await {
             Ok(value) => value,
-            Err(error) => json!({"available": false, "error_code": error.code}),
+            Err(error) => ObservationView::unavailable(error.code),
         }
     }
 
     async fn agent_processes(&self, params: &Value, principal: &Principal) -> Result<Value> {
-        reject_unknown_keys(
-            params,
-            &["id", "generation", "scope", "after", "limit"],
-            "agent.processes",
-        )?;
-        let id = required_text(params, "id")?;
-        let generation = optional_observation_generation(params)?;
+        let request: AgentProcessesRequest = serde_json::from_value(params.clone())
+            .map_err(|_| Error::new("invalid", "agent.processes params are invalid"))?;
+        request.validate()?;
+        let id = request.id.as_str();
+        let generation = request.generation;
         authorize_agent_read(principal, id, generation)?;
-        let scope = optional_text(params, "scope")?.unwrap_or("agent");
-        if !matches!(scope, "agent" | "workspace") {
-            return Err(Error::new(
-                "invalid",
-                "process scope must be agent or workspace",
-            ));
-        }
-        let after = optional_text(params, "after")?
-            .map(|cursor| {
-                if cursor.len() > PROCESS_CURSOR_MAX_BYTES {
-                    return Err(Error::new("invalid", "process cursor exceeds its bound"));
-                }
-                let cursor: ProcessPageCursor = serde_json::from_str(cursor)
-                    .map_err(|_| Error::new("invalid", "invalid process cursor"))?;
-                let identity = &cursor.identity;
-                if identity.pid == 0
-                    || identity.start_time == 0
-                    || identity.host_boot_id.is_empty()
-                    || identity.host_boot_id.len() > 512
-                    || identity.host_boot_id.chars().any(char::is_control)
-                {
-                    return Err(Error::new("invalid", "invalid process cursor identity"));
-                }
-                Ok(cursor)
-            })
-            .transpose()?;
-        let limit = page_limit(params)?;
+        let scope = request.effective_scope();
+        let after = request.cursor()?;
+        let limit = request.limit;
         let (generation, processes) = {
             let store = self.inner.store.lock().await;
             let agent = store
@@ -1037,13 +999,8 @@ impl Router {
             if scope == "workspace" {
                 authorize_agent_read(principal, id, Some(generation))?;
             }
-            if let Some(cursor) = &after
-                && (cursor.agent != id || cursor.generation != generation || cursor.scope != scope)
-            {
-                return Err(Error::new(
-                    "invalid",
-                    "process cursor does not match the Agent, generation, and scope",
-                ));
+            if let Some(cursor) = &after {
+                cursor.validate_binding(id, generation, scope)?;
             }
             let owner = format!("{scope}:{id}#{generation}");
             (
@@ -1058,34 +1015,31 @@ impl Router {
         let next = processes
             .last()
             .map(|process| {
-                let cursor = serde_json::to_string(&ProcessPageCursor {
+                ProcessPageCursor {
                     agent: id.to_owned(),
                     generation,
                     scope: scope.to_owned(),
                     identity: process.identity.clone(),
-                })
-                .map_err(|_| Error::new("internal", "cannot encode process cursor"))?;
-                if cursor.len() > PROCESS_CURSOR_MAX_BYTES {
-                    return Err(Error::new(
-                        "frame_too_large",
-                        "encoded process cursor exceeds its bound",
-                    ));
                 }
-                Ok(cursor)
+                .encode()
             })
             .transpose()?;
-        let mut value =
-            json!({"agent": id, "generation": generation, "processes": processes, "next": next});
-        if scope == "workspace" {
-            value["scope"] = json!(scope);
-        }
-        Ok(value)
+        serde_json::to_value(AgentProcessesResponse {
+            agent: id.to_owned(),
+            generation,
+            processes,
+            next,
+            scope: (scope == "workspace").then(|| scope.to_owned()),
+        })
+        .map_err(|_| Error::new("internal", "process page could not be encoded"))
     }
 
     async fn agent_git(&self, params: &Value, principal: &Principal) -> Result<Value> {
-        reject_unknown_keys(params, &["id", "generation"], "agent.git")?;
-        let id = required_text(params, "id")?;
-        let expected = optional_observation_generation(params)?;
+        let request: AgentGitRequest = serde_json::from_value(params.clone())
+            .map_err(|_| Error::new("invalid", "agent.git params are invalid"))?;
+        request.validate()?;
+        let id = request.id.as_str();
+        let expected = request.generation;
         authorize_agent_read(principal, id, expected)?;
         let agent = {
             let store = self.inner.store.lock().await;
@@ -1098,34 +1052,27 @@ impl Router {
                 "Git view requires the current Agent generation",
             ));
         }
-        let mut value = match self.inner.monitoring.git_view(&agent).await {
+        let git = match self.inner.monitoring.git_view(&agent).await {
             Ok(value) => value,
-            Err(error) => json!({"available": false, "error_code": error.code}),
+            Err(error) => GitView::unavailable(error.code),
         };
-        value["agent"] = json!(agent.id);
-        value["generation"] = json!(agent.generation);
-        Ok(value)
+        serde_json::to_value(AgentGitResponse {
+            agent: agent.id,
+            generation: agent.generation,
+            git,
+        })
+        .map_err(|_| Error::new("internal", "Git view could not be encoded"))
     }
 
     async fn agent_edits(&self, params: &Value, principal: &Principal) -> Result<Value> {
-        reject_unknown_keys(
-            params,
-            &["id", "generation", "after", "limit"],
-            "agent.edits",
-        )?;
-        let id = required_text(params, "id")?;
-        let generation = optional_observation_generation(params)?;
+        let request: AgentEditsRequest = serde_json::from_value(params.clone())
+            .map_err(|_| Error::new("invalid", "agent.edits params are invalid"))?;
+        request.validate()?;
+        let id = request.id.as_str();
+        let generation = request.generation;
         authorize_agent_read(principal, id, generation)?;
-        let after = match params.get("after") {
-            None | Some(Value::Null) => None,
-            Some(Value::String(path))
-                if !path.is_empty() && path.len() <= 64 * 1_024 && !path.contains('\0') =>
-            {
-                Some(path.as_str())
-            }
-            Some(_) => return Err(Error::new("invalid", "invalid edit cursor")),
-        };
-        let limit = page_limit(params)?;
+        let after = request.after.as_deref();
+        let limit = request.limit;
         let (generation, edits) = {
             let store = self.inner.store.lock().await;
             let agent = store
@@ -1144,13 +1091,21 @@ impl Router {
             )
         };
         let next = edits.last().map(|edit| edit.path.clone());
-        Ok(json!({"agent": id, "generation": generation, "edits": edits, "next": next}))
+        serde_json::to_value(AgentEditsResponse {
+            agent: id.to_owned(),
+            generation,
+            edits,
+            next,
+        })
+        .map_err(|_| Error::new("internal", "edit page could not be encoded"))
     }
 
     async fn agent_stats(&self, params: &Value, principal: &Principal) -> Result<Value> {
-        reject_unknown_keys(params, &["id", "generation"], "agent.stats")?;
-        let id = required_text(params, "id")?;
-        let expected = optional_observation_generation(params)?;
+        let request: AgentStatsRequest = serde_json::from_value(params.clone())
+            .map_err(|_| Error::new("invalid", "agent.stats params are invalid"))?;
+        request.validate()?;
+        let id = request.id.as_str();
+        let expected = request.generation;
         authorize_agent_read(principal, id, expected)?;
         let agent = {
             let store = self.inner.store.lock().await;
@@ -1163,22 +1118,22 @@ impl Router {
                 "stats require the current Agent generation",
             ));
         }
-        let mut value = self.observation_view(&agent).await;
-        value["agent"] = json!(agent.id);
-        value["generation"] = json!(agent.generation);
-        Ok(value)
+        let observation = self.observation_view(&agent).await;
+        serde_json::to_value(AgentStatsResponse {
+            agent: agent.id,
+            generation: agent.generation,
+            observation,
+        })
+        .map_err(|_| Error::new("internal", "stats view could not be encoded"))
     }
 
     async fn agent_list(&self, params: &Value, principal: &Principal) -> Result<Value> {
-        reject_unknown_keys(params, &["after", "limit", "observations"], "agent.list")?;
-        let after = optional_text(params, "after")?;
-        let limit = page_limit(params)?;
-        let observations = match params.get("observations") {
-            None => false,
-            Some(value) => value
-                .as_bool()
-                .ok_or_else(|| Error::new("invalid", "observations must be a boolean"))?,
-        };
+        let request: AgentListRequest = serde_json::from_value(params.clone())
+            .map_err(|_| Error::new("invalid", "agent.list params are invalid"))?;
+        request.validate()?;
+        let after = request.after.as_deref();
+        let limit = request.limit;
+        let observations = request.observations;
         let agents = {
             let store = self.inner.store.lock().await;
             match principal {
@@ -1192,9 +1147,11 @@ impl Router {
             let mut rows = Vec::new();
             let mut encoded_bytes = 0_usize;
             for agent in agents {
-                let mut row = serde_json::to_value(&agent)
-                    .map_err(|_| Error::new("internal", "cannot encode Agent projection"))?;
-                row["observation"] = self.observation_view(&agent).await;
+                let observation = self.observation_view(&agent).await;
+                let row = AgentListRow {
+                    agent,
+                    observation: Some(observation),
+                };
                 let row_bytes = serde_json::to_vec(&row)
                     .map_err(|_| Error::new("internal", "cannot encode Agent observation"))?
                     .len();
@@ -1211,19 +1168,27 @@ impl Router {
                 rows.push(row);
             }
             let next = match principal {
-                Principal::Owner => rows.last().and_then(|row| row.get("id")).cloned(),
+                Principal::Owner => rows.last().map(|row| row.agent.id.clone()),
                 Principal::Agent { .. } => None,
             };
-            return Ok(json!({"agents": rows, "next": next}));
+            return serde_json::to_value(AgentListResponse { agents: rows, next })
+                .map_err(|_| Error::new("internal", "Agent list could not be encoded"));
         }
         let next = match principal {
-            Principal::Owner => agents.last().map(|agent| Value::String(agent.id.clone())),
+            Principal::Owner => agents.last().map(|agent| agent.id.clone()),
             Principal::Agent { .. } => None,
         };
-        Ok(json!({
-            "agents": agents,
-            "next": next,
-        }))
+        serde_json::to_value(AgentListResponse {
+            agents: agents
+                .into_iter()
+                .map(|agent| AgentListRow {
+                    agent,
+                    observation: None,
+                })
+                .collect(),
+            next,
+        })
+        .map_err(|_| Error::new("internal", "Agent list could not be encoded"))
     }
 
     async fn agent_result(&self, params: &Value, principal: &Principal) -> Result<Value> {
@@ -1457,38 +1422,45 @@ impl Router {
         let unsettled_commands_truncated = unsettled_commands.len() == STATUS_BLOCKER_MAX;
         let unsettled_command_details = unsettled_commands
             .iter()
-            .map(|command| {
-                json!({
-                    "id": command.id,
-                    "agent": command.target,
-                    "generation": command.generation,
-                    "verb": command.verb,
-                    "state": command.state,
-                })
+            .map(|command| UnsettledCommandSummary {
+                id: command.id.clone(),
+                agent: command.target.clone(),
+                generation: command.generation,
+                verb: command.verb.clone(),
+                state: command.state,
             })
             .collect::<Vec<_>>();
-        Ok(json!({
-            "state": if mode == "open" { "running" } else { mode },
-            "admission": mode,
-            "agents": agent_count,
-            "store_write_faulted": write_faulted,
-            "owned_plugins": self.inner.plugin_host.live_count(),
-            "observer_readers": self.inner.plugin_host.observer_count(),
-            "discovery_readers": self.inner.plugin_host.reader_count(),
-            "workspace_custody": crate::workspaces::custody_capability(),
-            "workspace_recovery_error": self.inner.workspace_recovery_error.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
-            "unknown_commands_count": unknown_commands_count,
-            "unknown_commands": unknown_commands,
-            "unknown_commands_truncated": unknown_commands_truncated,
-            "unsettled_commands_count": unsettled_commands.len(),
-            "unsettled_commands": unsettled_command_details,
-            "unsettled_commands_truncated": unsettled_commands_truncated,
-            "blockers": blockers,
-        }))
+        let workspace_custody: WorkspaceCustodyView =
+            serde_json::from_value(crate::workspaces::custody_capability())
+                .map_err(|_| Error::new("internal", "workspace custody view is invalid"))?;
+        serde_json::to_value(DaemonStatusResponse {
+            state: if mode == "open" { "running" } else { mode }.to_owned(),
+            admission: mode.to_owned(),
+            agents: usize::try_from(agent_count)
+                .map_err(|_| Error::new("internal", "Agent count is invalid"))?,
+            store_write_faulted: write_faulted,
+            owned_plugins: self.inner.plugin_host.live_count(),
+            observer_readers: self.inner.plugin_host.observer_count(),
+            discovery_readers: self.inner.plugin_host.reader_count(),
+            workspace_custody,
+            workspace_recovery_error: self
+                .inner
+                .workspace_recovery_error
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            unknown_commands_count,
+            unknown_commands,
+            unknown_commands_truncated,
+            unsettled_commands_count: unsettled_commands.len(),
+            unsettled_commands: unsettled_command_details,
+            unsettled_commands_truncated,
+            blockers,
+        })
+        .map_err(|_| Error::new("internal", "daemon status could not be encoded"))
     }
 
-    async fn status_blockers(&self) -> Result<Vec<Value>> {
+    async fn status_blockers(&self) -> Result<Vec<StatusBlocker>> {
         let (agents, active_observers, unsettled_commands, write_faulted) = {
             let store = self.inner.store.lock().await;
             let agents = store.list_nonterminal_agents(STATUS_BLOCKER_MAX)?;
@@ -1512,11 +1484,13 @@ impl Router {
         };
         let mut blockers = Vec::new();
         if self.inner.workspaces.has_owned_processes() {
-            blockers.push(json!({"kind": "workspace_processes"}));
+            blockers.push(StatusBlocker::WorkspaceProcesses);
         }
         let discovery_readers = self.inner.plugin_host.reader_count();
         if discovery_readers > 0 {
-            blockers.push(json!({"kind": "discovery_readers", "count": discovery_readers}));
+            blockers.push(StatusBlocker::DiscoveryReaders {
+                count: discovery_readers,
+            });
         }
         for (agent, source_active) in agents.into_iter().zip(active_observers) {
             let observer_present = self
@@ -1530,37 +1504,36 @@ impl Router {
             {
                 continue;
             }
-            blockers.push(json!({
-                "kind": "agent_live",
-                "agent": agent.id,
-                "generation": agent.generation,
-                "state": agent.state,
-            }));
+            blockers.push(StatusBlocker::AgentLive {
+                agent: agent.id,
+                generation: agent.generation,
+                state: agent.state,
+            });
         }
         let mut unsettled_ids = HashSet::new();
         for command in unsettled_commands {
             unsettled_ids.insert(command.id.clone());
-            blockers.push(json!({
-                "kind": "command_unsettled",
-                "command_id": command.id,
-                "state": command.state,
-            }));
+            blockers.push(StatusBlocker::CommandUnsettled {
+                command_id: command.id,
+                state: command.state,
+            });
         }
         if write_faulted {
-            blockers.push(json!({"kind": "store_write_faulted"}));
+            blockers.push(StatusBlocker::StoreWriteFaulted);
         }
         let unknown_ids = self.unknown_ids();
         for id in unknown_ids.iter().take(STATUS_BLOCKER_MAX) {
             if unsettled_ids.contains(id) {
                 continue;
             }
-            blockers.push(json!({"kind": "command_unknown", "command_id": id}));
+            blockers.push(StatusBlocker::CommandUnknown {
+                command_id: id.clone(),
+            });
         }
         if unknown_ids.len() > STATUS_BLOCKER_MAX {
-            blockers.push(json!({
-                "kind": "command_unknown_more",
-                "count": unknown_ids.len() - STATUS_BLOCKER_MAX,
-            }));
+            blockers.push(StatusBlocker::CommandUnknownMore {
+                count: unknown_ids.len() - STATUS_BLOCKER_MAX,
+            });
         }
         Ok(blockers)
     }
@@ -3166,34 +3139,6 @@ fn optional_text<'a>(params: &'a Value, field: &str) -> Result<Option<&'a str>> 
     }
 }
 
-fn required_i64(params: &Value, field: &str) -> Result<i64> {
-    params
-        .get(field)
-        .and_then(Value::as_i64)
-        .filter(|value| *value >= 0)
-        .ok_or_else(|| Error::new("invalid", format!("{field} must be a nonnegative integer")))
-}
-
-fn optional_observation_generation(params: &Value) -> Result<Option<i64>> {
-    match params.get("generation") {
-        None | Some(Value::Null) => Ok(None),
-        Some(_) => required_i64(params, "generation").map(Some),
-    }
-}
-
-fn page_limit(params: &Value) -> Result<usize> {
-    let limit = match params.get("limit") {
-        None => 100,
-        Some(value) => value
-            .as_u64()
-            .ok_or_else(|| Error::new("invalid", "limit must be a positive integer"))?,
-    };
-    if limit == 0 || limit > PAGE_MAX as u64 {
-        return Err(Error::new("invalid", "limit must be between 1 and 1000"));
-    }
-    Ok(limit as usize)
-}
-
 fn reject_unknown_keys(params: &Value, allowed: &[&str], method: &str) -> Result<()> {
     let object = params
         .as_object()
@@ -3288,6 +3233,388 @@ mod tests {
             )
             .unwrap()
             .events
+    }
+
+    #[tokio::test]
+    async fn typed_agent_views_reject_malformed_requests_and_keep_null_defaults() {
+        let router = router();
+        for method in [
+            "agent.get",
+            "agent.list",
+            "agent.processes",
+            "agent.stats",
+            "agent.git",
+            "agent.edits",
+            "daemon.status",
+        ] {
+            let params = if matches!(method, "agent.list" | "daemon.status") {
+                json!({"extra":0})
+            } else {
+                json!({"id":"a1", "extra":0})
+            };
+            assert_eq!(router.handle(method, json!({
+                "_auth":{"kind":"owner", "credential":"owner-credential"}, "_payload":params
+            })).await.unwrap_err().code, "invalid", "{method}");
+        }
+        for method in ["agent.processes", "agent.stats", "agent.git", "agent.edits"] {
+            for generation in [json!(-1), json!(false), json!(1.0), json!("1")] {
+                assert_eq!(
+                    router
+                        .handle(
+                            method,
+                            json!({
+                                "_auth":{"kind":"owner", "credential":"owner-credential"},
+                                "_payload":{"id":"a1", "generation":generation}
+                            })
+                        )
+                        .await
+                        .unwrap_err()
+                        .code,
+                    "invalid",
+                    "{method}"
+                );
+            }
+            assert_eq!(
+                router
+                    .handle(
+                        method,
+                        json!({
+                            "_auth":{"kind":"owner", "credential":"owner-credential"},
+                            "_payload":{"id":"a1", "generation":null}
+                        })
+                    )
+                    .await
+                    .unwrap_err()
+                    .code,
+                "not_found",
+                "{method}"
+            );
+        }
+        for method in ["agent.list", "agent.processes", "agent.edits"] {
+            for limit in [
+                json!(null),
+                json!(0),
+                json!(1001),
+                json!(1.0),
+                json!(false),
+                json!("1"),
+            ] {
+                let mut params = json!({"limit":limit});
+                if method != "agent.list" {
+                    params["id"] = json!("a1");
+                }
+                assert_eq!(router.handle(method, json!({
+                    "_auth":{"kind":"owner", "credential":"owner-credential"}, "_payload":params
+                })).await.unwrap_err().code, "invalid", "{method}");
+            }
+        }
+        assert_eq!(
+            router
+                .agent_list(&json!({"observations":null}), &Principal::Owner)
+                .await
+                .unwrap_err()
+                .code,
+            "invalid"
+        );
+        let list = router
+            .agent_list(&json!({"after":null}), &Principal::Owner)
+            .await
+            .unwrap();
+        assert_eq!(list, json!({"agents":[], "next":null}));
+        assert_eq!(
+            router
+                .agent_processes(&json!({"id":"a1", "scope":false}), &Principal::Owner)
+                .await
+                .unwrap_err()
+                .code,
+            "invalid"
+        );
+        assert_eq!(
+            router
+                .agent_processes(
+                    &json!({"id":"a1", "scope":null, "after":null}),
+                    &Principal::Owner
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "not_found"
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_agent_views_preserve_self_list_and_live_presence_gate() {
+        let router = router();
+        let (id, other) = {
+            let mut store = router.inner.store.lock().await;
+            (
+                admit(&mut store)[0].agent.clone().unwrap(),
+                admit(&mut store)[0].agent.clone().unwrap(),
+            )
+        };
+        let principal = Principal::Agent {
+            id: id.clone(),
+            generation: 0,
+        };
+        for observations in [false, true] {
+            let reply = router
+                .agent_list(
+                    &json!({"after":"not-canonical", "limit":1, "observations":observations}),
+                    &principal,
+                )
+                .await
+                .unwrap();
+            assert_eq!(reply["next"], Value::Null);
+            assert_eq!(reply["agents"].as_array().unwrap().len(), 1);
+            assert_eq!(reply["agents"][0]["id"], json!(id));
+            assert_eq!(
+                reply["agents"][0].get("observation").is_some(),
+                observations
+            );
+            assert!(reply["agents"][0].get("agent").is_none());
+        }
+        let get = router
+            .agent_get(&json!({"id":id}), &principal)
+            .await
+            .unwrap();
+        assert_eq!(get["id"], json!(id));
+        assert!(get.get("agent").is_none());
+        assert_eq!(get["source_states"], json!([]));
+        assert_eq!(
+            router
+                .agent_get(&json!({"id":other}), &principal)
+                .await
+                .unwrap_err()
+                .code,
+            "not_allowed"
+        );
+        assert_eq!(
+            router
+                .agent_stats(&json!({"id":id, "generation":1}), &Principal::Owner)
+                .await
+                .unwrap_err()
+                .code,
+            "stale_generation"
+        );
+        assert_eq!(
+            router
+                .agent_git(&json!({"id":id, "generation":1}), &Principal::Owner)
+                .await
+                .unwrap_err()
+                .code,
+            "stale_generation"
+        );
+        let edits = router
+            .agent_edits(&json!({"id":id, "after":" \t"}), &principal)
+            .await
+            .unwrap();
+        assert_eq!(edits["edits"], json!([]));
+        assert_eq!(edits["next"], Value::Null);
+        let busy = {
+            let mut store = router.inner.store.lock().await;
+            result_fixture(&mut store).0
+        };
+        assert_eq!(
+            router
+                .agent_get(&json!({"id":busy}), &Principal::Owner)
+                .await
+                .unwrap_err()
+                .code,
+            "unknown"
+        );
+        assert_eq!(
+            router
+                .inner
+                .store
+                .lock()
+                .await
+                .get_agent(&busy)
+                .unwrap()
+                .unwrap()
+                .state,
+            AgentState::Busy
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_agent_views_workspace_cursor_binds_after_target_resolution() {
+        let router = router();
+        let id = {
+            let mut store = router.inner.store.lock().await;
+            let input = WorkspacePreparationInput {
+                project: "typed-views".to_owned(),
+                repo_path: "/synthetic-source".to_owned(),
+                repo_common_dir: "/synthetic-source/.git".to_owned(),
+                requested_branch: "codex/typed-views".to_owned(),
+                base_ref: None,
+                base_oid: "a".repeat(40),
+                worktree_path: "/synthetic-worktree".to_owned(),
+                frozen_setup: Vec::new(),
+            };
+            let id = store.submit_with_workspace("owner", SubmitCommand {
+                id:ulid::Ulid::new().to_string(), target:None, verb:"launch".to_owned(),
+                args:json!({"project":input.project, "workspace":input.repo_path, "worktree":input.requested_branch}),
+                expected_generation:Some(0), expected_turn_id:None, request_id:None,
+            }, input, now_ms()).unwrap().command.target.unwrap();
+            store
+                .ensure_workspace_process_source(&id, 1, now_ms())
+                .unwrap();
+            store
+                .observe_workspace_processes(
+                    &id,
+                    1,
+                    &eliot_core::ProcessSnapshot {
+                        samples: vec![eliot_core::ProcessSample {
+                            record: eliot_core::ProcessRecord {
+                                identity: eliot_core::ProcessIdentity {
+                                    host_boot_id: "fixture-boot".to_owned(),
+                                    pid: 42,
+                                    start_time: 1,
+                                },
+                                owner: format!("workspace:{id}#1"),
+                                role: "setup".to_owned(),
+                                state: eliot_core::ProcessState::Exited,
+                                exit_code: Some(0),
+                                updated_at: now_ms(),
+                            },
+                            cpu_time_ns: None,
+                            rss_bytes: None,
+                        }],
+                        complete: true,
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            id
+        };
+        let first = router
+            .agent_processes(&json!({"id":id, "scope":"workspace"}), &Principal::Owner)
+            .await
+            .unwrap();
+        assert_eq!(first["generation"], json!(1));
+        assert_eq!(first["scope"], json!("workspace"));
+        assert_eq!(first["processes"].as_array().unwrap().len(), 1);
+        let next = first["next"].as_str().unwrap();
+        ProcessPageCursor::decode(next)
+            .unwrap()
+            .validate_binding(&id, 1, "workspace")
+            .unwrap();
+        let empty = router
+            .agent_processes(
+                &json!({"id":id, "scope":"workspace", "after":next}),
+                &Principal::Owner,
+            )
+            .await
+            .unwrap();
+        assert_eq!(empty["processes"], json!([]));
+        assert_eq!(empty["next"], Value::Null);
+        assert_eq!(
+            router
+                .agent_processes(&json!({"id":id, "after":next}), &Principal::Owner)
+                .await
+                .unwrap_err()
+                .code,
+            "invalid"
+        );
+        assert_eq!(
+            router
+                .agent_processes(
+                    &json!({"id":id, "scope":"workspace", "generation":2}),
+                    &Principal::Owner
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "stale_generation"
+        );
+        assert_eq!(
+            router
+                .agent_processes(&json!({"id":id, "generation":1}), &Principal::Owner)
+                .await
+                .unwrap_err()
+                .code,
+            "stale_generation"
+        );
+        let principal = Principal::Agent {
+            id: id.clone(),
+            generation: 0,
+        };
+        assert_eq!(
+            router
+                .agent_processes(&json!({"id":id, "scope":"workspace"}), &principal)
+                .await
+                .unwrap_err()
+                .code,
+            "not_allowed"
+        );
+        let native = router
+            .agent_processes(&json!({"id":id, "scope":null}), &Principal::Owner)
+            .await
+            .unwrap();
+        assert_eq!(native["generation"], json!(0));
+        assert!(native.get("scope").is_none());
+        let get: AgentGetResponse = serde_json::from_value(
+            router
+                .agent_get(&json!({"id":id}), &Principal::Owner)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(get.agent.generation, 0);
+        assert!(
+            get.source_states
+                .iter()
+                .any(|state| state.source == "workspace_process" && state.generation == 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_agent_views_status_and_shutdown_keep_identical_blocker_wire() {
+        let router = router();
+        {
+            let mut store = router.inner.store.lock().await;
+            admit(&mut store);
+        }
+        let status = router
+            .handle(
+                "daemon.status",
+                json!({
+                    "_auth":{"kind":"owner", "credential":"owner-credential"}, "_payload":{}
+                }),
+            )
+            .await
+            .unwrap();
+        let typed: DaemonStatusResponse = serde_json::from_value(status.clone()).unwrap();
+        assert_eq!(typed.state, "running");
+        assert_eq!(typed.admission, "open");
+        assert_eq!(typed.agents, 1);
+        assert!(
+            typed
+                .blockers
+                .iter()
+                .any(|blocker| matches!(blocker, StatusBlocker::AgentLive { .. }))
+        );
+        assert!(
+            typed
+                .blockers
+                .iter()
+                .any(|blocker| matches!(blocker, StatusBlocker::CommandUnsettled { .. }))
+        );
+        let shutdown = router
+            .shutdown(
+                &json!({"id":ulid::Ulid::new().to_string(), "mode":"drain"}),
+                &Principal::Owner,
+            )
+            .await
+            .unwrap();
+        assert_eq!(shutdown["blockers"], status["blockers"]);
+        assert_eq!(shutdown["state"], json!("dispatched"));
+        assert_eq!(shutdown["mode"], json!("drain"));
+        assert_eq!(
+            router.status().await.unwrap()["admission"],
+            json!("draining")
+        );
+        assert!(!router.should_exit().await.unwrap());
     }
 
     #[tokio::test]

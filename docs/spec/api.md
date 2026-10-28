@@ -50,7 +50,7 @@ rule actions have bounded derived ids. No general receipt/floor framework.
 
 | Method | Purpose |
 | --- | --- |
-| `daemon.status/shutdown` | current state, admission mode and exact drain/force |
+| `daemon.status/shutdown` | owner-only current state/admission and exact drain/force |
 | `agent.list/get/result` | scoped, paginated Agent state and exact results |
 | `agent.processes/stats` | scoped process records and ephemeral OS samples |
 | `agent.git/edits` | current Git snapshot and paginated native-attributed edits |
@@ -68,55 +68,114 @@ Filter shape is `{kinds?,agents?,tree?,sources?,ephemeral?}`. Errors include
 `busy`, `unavailable`, `capacity_unavailable`, `history_gap`, `source_integrity`,
 `secret_in_payload`, `frame_too_large`, `mailbox_full`, `internal`.
 
-Process reads use the existing daemon and private data directory:
+## Agent and daemon read views
+
+The seven view calls use shared Core request/response DTOs and keep the existing JSON
+wire shape:
+
+The request/response DTOs and `AgentListRow` are re-exported through `core::api`.
 
 ```text
-agent.processes {id, generation?, scope?:agent|workspace, after?, limit?}
-  -> {agent, generation, processes:[ProcessRecord], next:string|null}
-agent.stats {id, generation?}
-  -> {agent, generation, ...monitorView}
-```
-
-Generation is a nonnegative integer; omission selects the current generation for
-default scope `agent`, or the managed workspace's target generation for scope
-`workspace`. The latter may still be preparing while the Agent is generation 0.
-The Router validates the exact preparation target before allowing a future-generation
-workspace read. Owners may read historical generations with `agent.processes`;
-`agent.stats` accepts only the current generation, with an explicit generation acting
-as an expectation. Process ownership is `agent:<id>#<generation>` or
-`workspace:<id>#<target_generation>`. Each page selects one scope; the cursor stays
-within that query's owner and generation. `agent.processes` is
-paginated, with default limit 100 and allowed range 1–1,000. Its `after` cursor is an opaque string
-containing `{agent,generation,scope,identity}`, where `identity` is the OS birth-bound
-`ProcessIdentity` (`host_boot_id`, `pid`, `start_time`). Pass it back unchanged;
-a different Agent, generation or scope rejects before querying process rows.
-`next` contains the last returned identity even on the last nonempty page; continue
-until `processes` is empty rather than using non-null `next` as proof of another record.
-
-Process identity/state and CPU-time/RSS samples are distinct. Statistics are ephemeral,
-and absent values remain unknown, never zero. Process activity does not establish
-model progress; incomplete observation does not prove custody empty. `agent.get` retains
-the Agent object and may enrich it with `observation`; `show` prints that object unchanged.
-Windows canonical path strings remain opaque to these CLI reads.
-
-Git and edit reads use the same existing daemon:
-
-```text
-agent.git {id, generation?}
+daemon.status {} -> DaemonStatusResponse
+agent.get {id} -> AgentGetResponse
+agent.list {after?, limit?, observations?}
+  -> AgentListResponse {agents:[AgentListRow], next:string|null}
+agent.processes {id, generation?, scope?, after?, limit?}
+  -> AgentProcessesResponse {agent, generation, processes:[ProcessRecord], next, scope?}
+agent.stats {id, generation?} -> AgentStatsResponse
+agent.git {id, generation?} -> AgentGitResponse
 agent.edits {id, generation?, after?, limit?}
+  -> AgentEditsResponse {agent, generation, edits:[AgentEdit], next:string|null}
 ```
 
-Generation is nonnegative and defaults to the current generation. The Router validates
-scope and requires the current generation for Git snapshots; owners may query historical
-edit attribution. Edit pages default to 100 rows, with limits 1–1,000. `after` is an
-opaque path string passed back unchanged; the CLI does not resolve it against the local
-filesystem or normalize Windows canonical paths.
+`daemon.status` is owner-only and accepts an empty object. Its response carries
+`state`, `admission`, `agents`, `store_write_faulted`, `owned_plugins`,
+`observer_readers`, `discovery_readers`, `workspace_custody`,
+`workspace_recovery_error`, the unknown/unsettled command counts and bounded lists with
+their truncation flags, and `blockers`. Unknown commands remain unknown in this view.
 
-Git snapshots report current HEAD/branch/dirty paths and recovered commit history, with
-`complete`, `history_complete` and `history_gap` describing observation coverage. Missing
-or incomplete history is not an unchanged or clean workspace. Edit attribution requires
-verified, generation-matched native file-change hints; a Git dirty set alone never proves
-Agent authorship. Git polling alone updates neither process statistics nor model progress.
+`AgentGetResponse` flattens the existing `Agent` fields and adds `observation` and
+`source_states`. `AgentListRow` also flattens `Agent`, adding `observation` only when
+`observations` is true. `AgentStatsResponse` flattens `ObservationView` beside
+`agent`/`generation`; `AgentGitResponse` similarly flattens `GitView`. `SourceState`
+rows include `agent_id`, `generation`, `source`, `families`, `owners`, `state`, `health`,
+`cursor`, `last_store_seq`, last-batch id/sequence fields and gap id/from/to/sequence
+fields. Cursor and sequence/acknowledgement values that are not present remain null.
+`agent.get` includes the current generation's source rows and the managed workspace
+target generation's rows when it differs. If persisted state requires a live owner and
+the corresponding source is absent, `agent.get` returns `unknown` rather than asserting
+the persisted state is current.
+
+Request DTOs reject unknown fields. Required Agent IDs are nonempty after a trim check
+and are kept as supplied. Optional `generation`, `after` and process `scope` members may
+be omitted or null to mean absent; wrong types are `invalid`. `generation`, when present,
+must be a nonnegative integer. `scope` accepts `agent` or `workspace`; absence/null means
+`agent`. `limit` defaults to 100 only when omitted and must be 1–1,000; explicit null,
+wrong types and out-of-range values are `invalid`. `observations` defaults to false only
+when omitted and must be a boolean when present; explicit null is `invalid`. Absent
+optional members are omitted when requests are serialized.
+
+Owner `agent.list` calls page by Agent ID. An Agent principal gets only its own row and
+the Router ignores `after` and page selection for that self-only result, with `next:null`;
+generic response validation must not impose owner paging assumptions on it. `next` for
+an owner is the last returned ID on a nonempty page; pass it back unchanged. It is not
+proof another row exists. Typed response binding failures remain `unknown`; validate the
+reply before printing it or advancing a cursor.
+
+For `agent.processes`, omitted generation selects the current Agent generation for
+`scope:"agent"`, or the managed workspace target generation for `scope:"workspace"`.
+The Router resolves and authorizes that exact target before checking the cursor; owners
+may read retained historical Agent generations. `ProcessPageCursor` encodes
+`{agent,generation,scope,identity}`, with identity `{host_boot_id,pid,start_time}`, and
+is limited to 2 KiB. Pass it back unchanged. `next` is the last returned identity even
+on the last nonempty page; continue until `processes` is empty. A different Agent,
+generation or scope rejects before querying process rows. The workspace response includes
+`scope:"workspace"`; the Agent-scope response omits `scope`.
+
+`agent.stats` and `agent.git` read the current generation; an explicit generation is an
+expectation and a mismatch is `stale_generation`. `agent.edits` defaults to the current
+generation, while an authorized owner may request a retained historical generation.
+Its `after` is a path cursor: nonempty, at most 64 KiB, and without NUL. Pass it through
+unchanged; the CLI does not resolve or normalize it. Edit pages default to 100 rows,
+with limits 1–1,000, and `next` is the last returned path even on a nonempty final page.
+
+`ObservationView::Data` contains `processes_truncated`, `processes`, `stats`, `liveness`,
+`workspace` and `git`; its unavailable variant is `{available:false,error_code}`.
+`ProcessStatsView` contains `available`, `sampled_at`, `age_ms`, `ttl_ms`,
+`clock_regressed`, `coverage`, `complete`, `cpu_time_ns`, `rss_bytes`, `samples` and
+`error`. `StatsCoverage` is `unknown`, `stale`, `complete` or `partial`. `LivenessView`
+contains `state`, `last_model_progress`, `age_ms`, `clock_regressed`, `basis` and
+`source_healthy`. Missing or stale metrics remain null/unknown, never zero.
+
+`WorkspaceView::Data` contains `owner`, `target_generation`, `phase`, `setup_index`,
+`processes_truncated`, `processes`, `stats` and `source`; its unavailable variant retains
+`error`. `GitView::Data` contains `available`, `workspace`, `observed_at`, `age_ms`,
+`ttl_ms`, `clock_regressed`, `retry_after_ms`, `filesystem_invalidation`, `head`,
+`branch`, `dirty`, `commits`, `complete`, `history_complete`, `history_gap`, `base_oid`,
+`committed_paths`, `base_complete`, `baseline`, `edits_truncated`, `edits`, `source` and
+`error`. Its unavailable variant retains `error_code`; its nested error variant retains
+`error`. Git and Windows canonical paths remain opaque strings to the CLI; it does not
+resolve or normalize them. `FilesystemInvalidationState` is `healthy`, `degraded`,
+`unavailable` or `inactive`; `retry_after_ms` distinguishes an absent watch slot from
+an inactive one.
+
+The neutral types are `ObservationView`, `ObservationData`, `ProcessStatsView`,
+`StatsCoverage`, `LivenessView`, `WorkspaceView`, `WorkspaceObservation`, `GitView`,
+`GitObservation`, `MonitoringSourceState`, `FilesystemInvalidationView` and
+`FilesystemInvalidationState`. `WorkspaceObservation.source` uses `SourceState`, whose
+owner rows contain family/source/mechanism. `GitObservation.source` uses
+`MonitoringSourceState`, which has no owners. Its `last_batch_digest` and `gap_digest`
+are nullable JSON byte arrays, not strings. Source cursor and sequence/acknowledgement
+values remain nullable. Normal view variants may retain cached data while marked
+unavailable. Process records and ephemeral CPU/RSS samples stay distinct; process
+activity is not model progress. Stale, partial, gap and unknown values are not converted
+to clean, complete or zero. See
+[monitoring](monitoring.md#process-observation-and-terminal-ordering) for freshness and
+[Git coverage](monitoring.md#git-and-filesystem-monitor) semantics.
+
+`agent.edits` attribution requires verified, generation-matched native file-change hints;
+a Git dirty set alone never proves Agent authorship. Git polling alone updates neither
+process statistics nor model progress.
 
 ## Command admission
 

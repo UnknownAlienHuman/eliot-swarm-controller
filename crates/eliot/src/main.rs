@@ -2,9 +2,13 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use eliot_core::{
     Command as CoreCommand, CommandState, Error as CoreError, Turn as CoreTurn, TurnState,
     api::{
-        AgentDiscoverRequest, AgentHistoryRequest, AgentResultRequest, AgentResultResponse,
-        CommandGetRequest, DiscoverPage, EventsFilter, EventsReadRequest, EventsReadResponse,
-        EventsSubscribeRequest, EventsSubscribeResponse, ObservationPage, TurnGetRequest,
+        AgentDiscoverRequest, AgentEditsRequest, AgentEditsResponse, AgentGetRequest,
+        AgentGetResponse, AgentGitRequest, AgentGitResponse, AgentHistoryRequest, AgentListRequest,
+        AgentListResponse, AgentProcessesRequest, AgentProcessesResponse, AgentResultRequest,
+        AgentResultResponse, AgentStatsRequest, AgentStatsResponse, CommandGetRequest,
+        DaemonStatusRequest, DaemonStatusResponse, DiscoverPage, EventsFilter, EventsReadRequest,
+        EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse, ObservationPage,
+        TurnGetRequest,
     },
 };
 use serde_json::{Value, json};
@@ -518,7 +522,19 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             }
         }
         CliCommand::Status => {
-            let result = read_call(&data_dir, "daemon.status", json!({})).await?;
+            let params = DaemonStatusRequest::default();
+            params
+                .validate()
+                .map_err(|error| Failure::from_core(error, false))?;
+            let response: DaemonStatusResponse =
+                eliot_daemon::client_call_typed(&data_dir, "daemon.status", &params)
+                    .await
+                    .map_err(|error| Failure::from_core(error, false))?;
+            params
+                .validate_response(&response)
+                .map_err(|error| Failure::from_core(error, false))?;
+            let result = serde_json::to_value(response)
+                .map_err(|_| Failure::new(4, "daemon.status response is invalid"))?;
             print_value(&result, json_output);
             Ok(0)
         }
@@ -854,26 +870,62 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
         }
         CliCommand::Ls { after, limit } => {
             validate_limit(limit)?;
-            let mut params = json!({ "limit": limit });
-            if let Some(after) = after {
-                params["after"] = Value::String(after);
-            }
-            let result = read_call(&data_dir, "agent.list", params).await?;
+            let params = AgentListRequest {
+                after,
+                limit,
+                observations: false,
+            };
+            params
+                .validate()
+                .map_err(|error| Failure::from_core(error, false))?;
+            let response: AgentListResponse =
+                eliot_daemon::client_call_typed(&data_dir, "agent.list", &params)
+                    .await
+                    .map_err(|error| Failure::from_core(error, false))?;
+            params
+                .validate_response(&response)
+                .map_err(|error| Failure::from_core(error, false))?;
+            let result = serde_json::to_value(response)
+                .map_err(|_| Failure::new(4, "agent.list response is invalid"))?;
             print_value(&result, json_output);
             Ok(0)
         }
         CliCommand::Top { after, limit } => {
             validate_limit(limit)?;
-            let mut params = json!({ "limit": limit, "observations": true });
-            if let Some(after) = after {
-                params["after"] = Value::String(after);
-            }
-            let result = read_call(&data_dir, "agent.list", params).await?;
+            let params = AgentListRequest {
+                after,
+                limit,
+                observations: true,
+            };
+            params
+                .validate()
+                .map_err(|error| Failure::from_core(error, false))?;
+            let response: AgentListResponse =
+                eliot_daemon::client_call_typed(&data_dir, "agent.list", &params)
+                    .await
+                    .map_err(|error| Failure::from_core(error, false))?;
+            params
+                .validate_response(&response)
+                .map_err(|error| Failure::from_core(error, false))?;
+            let result = serde_json::to_value(response)
+                .map_err(|_| Failure::new(4, "agent.list response is invalid"))?;
             print_value(&result, json_output);
             Ok(0)
         }
         CliCommand::Show { agent } => {
-            let result = read_call(&data_dir, "agent.get", json!({ "id": agent })).await?;
+            let params = AgentGetRequest::new(agent);
+            params
+                .validate()
+                .map_err(|error| Failure::from_core(error, false))?;
+            let response: AgentGetResponse =
+                eliot_daemon::client_call_typed(&data_dir, "agent.get", &params)
+                    .await
+                    .map_err(|error| Failure::from_core(error, false))?;
+            params
+                .validate_response(&response)
+                .map_err(|error| Failure::from_core(error, false))?;
+            let result = serde_json::to_value(response)
+                .map_err(|_| Failure::new(4, "agent.get response is invalid"))?;
             print_value(&result, json_output);
             Ok(0)
         }
@@ -885,32 +937,65 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             limit,
         } => {
             validate_limit(limit)?;
-            let mut params = json!({ "id": agent, "scope": scope, "limit": limit });
-            if let Some(generation) = generation {
-                params["generation"] = json!(generation);
-            }
-            if let Some(after) = after {
-                params["after"] = Value::String(after);
-            }
-            let result = read_call(&data_dir, "agent.processes", params).await?;
+            let params = AgentProcessesRequest {
+                id: agent,
+                generation,
+                scope: Some(scope),
+                after,
+                limit,
+            };
+            params
+                .validate()
+                .map_err(|error| Failure::from_core(error, false))?;
+            let response: AgentProcessesResponse =
+                eliot_daemon::client_call_typed(&data_dir, "agent.processes", &params)
+                    .await
+                    .map_err(|error| Failure::from_core(error, false))?;
+            params
+                .validate_response(&response)
+                .map_err(|error| Failure::from_core(error, false))?;
+            let result = serde_json::to_value(response)
+                .map_err(|_| Failure::new(4, "agent.processes response is invalid"))?;
             print_value(&result, json_output);
             Ok(0)
         }
         CliCommand::Stats { agent, generation } => {
-            let mut params = json!({ "id": agent });
-            if let Some(generation) = generation {
-                params["generation"] = json!(generation);
-            }
-            let result = read_call(&data_dir, "agent.stats", params).await?;
+            let params = AgentStatsRequest {
+                id: agent,
+                generation,
+            };
+            params
+                .validate()
+                .map_err(|error| Failure::from_core(error, false))?;
+            let response: AgentStatsResponse =
+                eliot_daemon::client_call_typed(&data_dir, "agent.stats", &params)
+                    .await
+                    .map_err(|error| Failure::from_core(error, false))?;
+            params
+                .validate_response(&response)
+                .map_err(|error| Failure::from_core(error, false))?;
+            let result = serde_json::to_value(response)
+                .map_err(|_| Failure::new(4, "agent.stats response is invalid"))?;
             print_value(&result, json_output);
             Ok(0)
         }
         CliCommand::GitStatus { agent, generation } => {
-            let mut params = json!({ "id": agent });
-            if let Some(generation) = generation {
-                params["generation"] = json!(generation);
-            }
-            let result = read_call(&data_dir, "agent.git", params).await?;
+            let params = AgentGitRequest {
+                id: agent,
+                generation,
+            };
+            params
+                .validate()
+                .map_err(|error| Failure::from_core(error, false))?;
+            let response: AgentGitResponse =
+                eliot_daemon::client_call_typed(&data_dir, "agent.git", &params)
+                    .await
+                    .map_err(|error| Failure::from_core(error, false))?;
+            params
+                .validate_response(&response)
+                .map_err(|error| Failure::from_core(error, false))?;
+            let result = serde_json::to_value(response)
+                .map_err(|_| Failure::new(4, "agent.git response is invalid"))?;
             print_value(&result, json_output);
             Ok(0)
         }
@@ -921,14 +1006,24 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             limit,
         } => {
             validate_limit(limit)?;
-            let mut params = json!({ "id": agent, "limit": limit });
-            if let Some(generation) = generation {
-                params["generation"] = json!(generation);
-            }
-            if let Some(after) = after {
-                params["after"] = Value::String(after);
-            }
-            let result = read_call(&data_dir, "agent.edits", params).await?;
+            let params = AgentEditsRequest {
+                id: agent,
+                generation,
+                after,
+                limit,
+            };
+            params
+                .validate()
+                .map_err(|error| Failure::from_core(error, false))?;
+            let response: AgentEditsResponse =
+                eliot_daemon::client_call_typed(&data_dir, "agent.edits", &params)
+                    .await
+                    .map_err(|error| Failure::from_core(error, false))?;
+            params
+                .validate_response(&response)
+                .map_err(|error| Failure::from_core(error, false))?;
+            let result = serde_json::to_value(response)
+                .map_err(|_| Failure::new(4, "agent.edits response is invalid"))?;
             print_value(&result, json_output);
             Ok(0)
         }
@@ -1145,12 +1240,6 @@ fn start_daemon(data_dir: &Path, json_output: bool) -> Result<(), Failure> {
         println!("daemon starting; diagnostics: {}", log_path.display());
     }
     Ok(())
-}
-
-async fn read_call(data_dir: &Path, method: &str, params: Value) -> Result<Value, Failure> {
-    eliot_daemon::client_call(data_dir, method, params)
-        .await
-        .map_err(|error| Failure::from_core(error, false))
 }
 
 async fn mutation_call(
