@@ -322,8 +322,12 @@ impl Router {
     }
 
     pub(crate) fn note_events(&self, events: &[Event]) {
-        note_unknown(&self.inner.unknown_commands, events);
+        self.note_committed_events(events);
         self.signal_progress();
+    }
+
+    pub(crate) fn note_committed_events(&self, events: &[Event]) {
+        self.note_unknown(events);
     }
 
     fn signal_progress(&self) {
@@ -479,7 +483,7 @@ impl Router {
             self.publish_locked(&admission.events);
             admission
         };
-        note_unknown(&self.inner.unknown_commands, &admission.events);
+        self.note_unknown(&admission.events);
         if admission.command.state == CommandState::Unknown {
             self.inner
                 .unknown_commands
@@ -1693,7 +1697,9 @@ impl Router {
         }
         .ok_or_else(|| Error::new("not_found", format!("command {id} was not found")))?;
         authorize_command_read(principal, &command)?;
-        if command.state == CommandState::Unknown {
+        if command.state.is_terminal() {
+            self.clear_unknown_id(id);
+        } else if command.state == CommandState::Unknown {
             command.turn_id = None;
         } else if let Some(cause) = self.unknown_cause(id) {
             command.state = CommandState::Unknown;
@@ -2439,6 +2445,7 @@ impl Router {
     }
 
     async fn status_blockers(&self) -> Result<Vec<StatusBlocker>> {
+        self.clear_terminal_unknown_cache().await;
         let (agents, active_observers, unsettled_commands, write_faulted) = {
             let store = self.inner.store.lock().await;
             let agents = store.list_nonterminal_agents(STATUS_BLOCKER_MAX)?;
@@ -3191,24 +3198,35 @@ impl Router {
 
     async fn reject_undispatched(&self, id: &str, reason: &str) {
         let outcome = json!({"reason": reason});
-        let (result, write_faulted) = {
+        let (result, write_faulted, pre_settlement_state) = {
             let mut store = self.inner.store.lock().await;
-            let result = match store.get_command(id) {
+            let (result, pre_settlement_state) = match store.get_command(id) {
                 Ok(Some(command))
                     if matches!(command.state, CommandState::Accepted | CommandState::Queued) =>
                 {
-                    store.settle(id, CommandState::Rejected, Some(outcome), now_ms())
+                    let state = command.state;
+                    (
+                        store.settle(id, CommandState::Rejected, Some(outcome), now_ms()),
+                        Some(state),
+                    )
                 }
                 Ok(_) => return,
-                Err(error) => Err(error),
+                Err(error) => (Err(error), None),
             };
             if let Ok(change) = &result {
                 self.publish_locked(&change.events);
             }
-            (result, store.is_write_faulted())
+            (result, store.is_write_faulted(), pre_settlement_state)
         };
-        self.finish_settlement(id, result, write_faulted, "store_settlement_failed")
-            .await;
+        self.finish_settlement(
+            id,
+            result,
+            write_faulted,
+            "store_settlement_failed",
+            pre_settlement_state,
+            false,
+        )
+        .await;
     }
 
     async fn settle_observe_attach(&self, id: &str, snapshot: Value) -> Option<Command> {
@@ -3367,25 +3385,45 @@ impl Router {
             .and_then(Value::as_str)
             .unwrap_or("store_settlement_failed")
             .to_owned();
-        let (result, write_faulted) = {
+        let (result, write_faulted, pre_settlement_state) = {
             let mut store = self.inner.store.lock().await;
             // A source batch may have settled this command after the error
             // handler's initial read. Retain that outcome under the writer lock.
-            let result = match store.get_command(id) {
-                Ok(Some(command)) if command.state.is_terminal() => Ok(eliot_store::Change {
-                    value: command,
-                    events: Vec::new(),
-                }),
-                Ok(_) => store.settle(id, state, outcome, now_ms()),
-                Err(error) => Err(error),
+            let (result, pre_settlement_state) = match store.get_command(id) {
+                Ok(Some(command)) if command.state.is_terminal() => {
+                    let prior_state = command.state;
+                    (
+                        Ok(eliot_store::Change {
+                            value: command,
+                            events: Vec::new(),
+                        }),
+                        Some(prior_state),
+                    )
+                }
+                Ok(Some(command)) => {
+                    let prior_state = command.state;
+                    (
+                        store.settle(id, state, outcome, now_ms()),
+                        Some(prior_state),
+                    )
+                }
+                Ok(None) => (store.settle(id, state, outcome, now_ms()), None),
+                Err(error) => (Err(error), None),
             };
             if let Ok(change) = &result {
                 self.publish_locked(&change.events);
             }
-            (result, store.is_write_faulted())
+            (result, store.is_write_faulted(), pre_settlement_state)
         };
-        self.finish_settlement(id, result, write_faulted, &persistence_cause)
-            .await
+        self.finish_settlement(
+            id,
+            result,
+            write_faulted,
+            &persistence_cause,
+            pre_settlement_state,
+            true,
+        )
+        .await
     }
 
     async fn finish_settlement(
@@ -3394,22 +3432,31 @@ impl Router {
         result: Result<eliot_store::Change<Command>>,
         write_faulted: bool,
         persistence_cause: &str,
+        pre_settlement_state: Option<CommandState>,
+        external_effect_may_be_uncertain: bool,
     ) -> Option<Command> {
         match result {
             Ok(change) => {
                 self.note_unknown(&change.events);
-                if change.value.state.is_terminal()
-                    && let (Some(agent), Some(generation)) =
+                if change.value.state.is_terminal() {
+                    self.clear_unknown_id(id);
+                    if let (Some(agent), Some(generation)) =
                         (change.value.target.as_deref(), change.value.generation)
-                {
-                    self.forget_token_if_revoked(agent, generation).await;
+                    {
+                        self.forget_token_if_revoked(agent, generation).await;
+                    }
                 }
                 let command = change.value;
                 self.signal_progress();
                 Some(command)
             }
             Err(_) => {
-                if write_faulted {
+                let external_effect_is_uncertain = matches!(
+                    pre_settlement_state,
+                    Some(CommandState::Dispatched | CommandState::Unknown)
+                ) || pre_settlement_state.is_none()
+                    && external_effect_may_be_uncertain;
+                if write_faulted && external_effect_is_uncertain {
                     self.note_unknown_id(id, persistence_cause);
                 }
                 self.signal_progress();
@@ -3438,18 +3485,58 @@ impl Router {
     }
 
     fn note_unknown(&self, events: &[Event]) {
-        note_unknown(&self.inner.unknown_commands, events);
+        let mut unknown = self.inner.unknown_commands.lock_recover();
+        let mut causes = self.inner.unknown_causes.lock_recover();
+        for event in events {
+            let Some(id) = event.data.get("command_id").and_then(Value::as_str) else {
+                continue;
+            };
+            if event.kind == "command.unknown" {
+                unknown.insert(id.to_owned());
+            } else if matches!(
+                event.kind.as_str(),
+                "command.applied" | "command.failed" | "command.rejected" | "command.cancelled"
+            ) {
+                unknown.remove(id);
+                causes.remove(id);
+            }
+        }
     }
 
     fn note_unknown_id(&self, id: &str, cause: &str) {
-        self.inner
-            .unknown_commands
-            .lock_recover()
-            .insert(id.to_owned());
-        self.inner
-            .unknown_causes
-            .lock_recover()
-            .insert(id.to_owned(), cause.to_owned());
+        let mut unknown = self.inner.unknown_commands.lock_recover();
+        let mut causes = self.inner.unknown_causes.lock_recover();
+        unknown.insert(id.to_owned());
+        causes.insert(id.to_owned(), cause.to_owned());
+    }
+
+    fn clear_unknown_id(&self, id: &str) {
+        let mut unknown = self.inner.unknown_commands.lock_recover();
+        let mut causes = self.inner.unknown_causes.lock_recover();
+        unknown.remove(id);
+        causes.remove(id);
+    }
+
+    pub(crate) async fn clear_terminal_unknown_cache(&self) {
+        let ids = self.unknown_ids();
+        if ids.is_empty() {
+            return;
+        }
+        let terminal = {
+            let store = self.inner.store.lock().await;
+            ids.into_iter()
+                .filter(|id| {
+                    store
+                        .get_command(id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|command| command.state.is_terminal())
+                })
+                .collect::<Vec<_>>()
+        };
+        for id in terminal {
+            self.clear_unknown_id(&id);
+        }
     }
 
     fn unknown_cause(&self, id: &str) -> Option<String> {
@@ -3462,6 +3549,7 @@ impl Router {
         generation: i64,
         turns: &mut [Turn],
     ) -> Result<()> {
+        self.clear_terminal_unknown_cache().await;
         let memory_unknown = self.unknown_ids().into_iter().collect::<HashSet<String>>();
         let (associated, maybe_more) = {
             let store = self.inner.store.lock().await;
@@ -4387,18 +4475,6 @@ fn contains_secret_value(value: &Value, secrets: &HashSet<String>) -> bool {
             .values()
             .any(|item| contains_secret_value(item, secrets)),
         _ => false,
-    }
-}
-
-fn note_unknown(unknown: &UnknownCommands, events: &[Event]) {
-    let mut unknown = unknown.lock_recover();
-    for event in events
-        .iter()
-        .filter(|event| event.kind == "command.unknown")
-    {
-        if let Some(id) = event.data.get("command_id").and_then(Value::as_str) {
-            unknown.insert(id.to_owned());
-        }
     }
 }
 
@@ -5331,6 +5407,378 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
     }
 
     #[tokio::test]
+    async fn drain_worker_releases_ordered_successor_after_predecessor_applies() {
+        let data_root =
+            std::env::temp_dir().join(format!("eliot-drain-worker-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&data_root).unwrap();
+        let router = router_with_data_root(data_root.clone());
+        let store = Arc::clone(&router.inner.store);
+
+        let (first_child_id, second_child_id, admitted_events, first_dispatch_events) = {
+            let mut store = store.lock().await;
+            let create_agent_fixture =
+                |store: &mut eliot_store::Store, native_scope: &str, native_ref: &str| {
+                    let launch_id = ulid::Ulid::new().to_string();
+                    let agent = store
+                        .submit(
+                            "owner",
+                            SubmitCommand {
+                                id: launch_id.clone(),
+                                target: None,
+                                verb: "launch".to_owned(),
+                                args: json!({
+                                    "project":"typed-results", "workspace":"synthetic-workspace",
+                                    "harness":"codex", "profile":"synthetic", "profile_snapshot":{},
+                                }),
+                                expected_generation: Some(0),
+                                expected_turn_id: None,
+                                request_id: None,
+                                probe: false,
+                            },
+                            now_ms(),
+                        )
+                        .unwrap()
+                        .command
+                        .target
+                        .unwrap();
+                    store.dispatch(&launch_id, now_ms()).unwrap();
+                    read_fixture_event(
+                        store,
+                        &agent,
+                        "session.ready",
+                        json!({"native_scope":native_scope, "native_ref":native_ref}),
+                    );
+                    store
+                        .settle(&launch_id, CommandState::Applied, None, now_ms())
+                        .unwrap();
+
+                    let send_id = ulid::Ulid::new().to_string();
+                    store
+                        .submit(
+                            "owner",
+                            SubmitCommand {
+                                id: send_id.clone(),
+                                target: Some(agent.clone()),
+                                verb: "send".to_owned(),
+                                args: json!({"text":"fixture input"}),
+                                expected_generation: Some(1),
+                                expected_turn_id: None,
+                                request_id: None,
+                                probe: false,
+                            },
+                            now_ms(),
+                        )
+                        .unwrap();
+                    store.dispatch(&send_id, now_ms()).unwrap();
+                    read_fixture_event(
+                        store,
+                        &agent,
+                        "turn.started",
+                        json!({"command_id":send_id, "turn_id":"turn-1"}),
+                    );
+                    (agent, send_id)
+                };
+            let (first_agent, first_send) =
+                create_agent_fixture(&mut store, "drain-first-scope", "drain-first-ref");
+            let (second_agent, second_send) =
+                create_agent_fixture(&mut store, "drain-second-scope", "drain-second-ref");
+            for (agent, send_id) in [(&first_agent, &first_send), (&second_agent, &second_send)] {
+                read_fixture_event(
+                    &mut store,
+                    agent,
+                    "turn.completed",
+                    json!({"command_id":send_id, "turn_id":"turn-1", "status":"completed"}),
+                );
+                if store.get_command(send_id).unwrap().unwrap().state == CommandState::Dispatched {
+                    store
+                        .settle(
+                            send_id,
+                            CommandState::Applied,
+                            Some(json!({"turn_id":"turn-1"})),
+                            now_ms(),
+                        )
+                        .unwrap();
+                }
+            }
+
+            let history = store.read_events(0, 1_000, None).unwrap();
+            let first_event = history
+                .iter()
+                .find(|event| {
+                    event.kind == "turn.completed"
+                        && event.agent.as_deref() == Some(first_agent.as_str())
+                })
+                .unwrap()
+                .seq;
+            let second_event = history
+                .iter()
+                .find(|event| {
+                    event.kind == "turn.completed"
+                        && event.agent.as_deref() == Some(second_agent.as_str())
+                })
+                .unwrap()
+                .seq;
+            let definition_value = json!({"id":"drain-order", "enabled":true});
+            let definition = eliot_store::RuleDefinitionInput {
+                id: "drain-order".to_owned(),
+                canonical_definition: serde_json::to_string(&definition_value).unwrap(),
+                definition_digest: eliot_core::canonical_json_sha256(&definition_value).unwrap(),
+                enabled: true,
+            };
+            let state = store
+                .ensure_rule_state("owner", &definition, now_ms())
+                .unwrap();
+            let request_id = ulid::Ulid::new();
+            let now = i64::try_from(request_id.timestamp_ms()).unwrap() + 1;
+            let request = RuleCatchUpRequest::new(
+                request_id.to_string(),
+                "drain-order",
+                first_event - 1,
+                Some(state.current_cursor),
+            );
+            let actions = [
+                RuleCatchUpAction {
+                    event_seq: first_event,
+                    request: SubmitCommand {
+                        id: ulid::Ulid::new().to_string(),
+                        target: Some(first_agent.clone()),
+                        verb: "stop".to_owned(),
+                        args: json!({}),
+                        expected_generation: Some(1),
+                        expected_turn_id: None,
+                        request_id: None,
+                        probe: false,
+                    },
+                },
+                RuleCatchUpAction {
+                    event_seq: second_event,
+                    request: SubmitCommand {
+                        id: ulid::Ulid::new().to_string(),
+                        target: Some(second_agent.clone()),
+                        verb: "stop".to_owned(),
+                        args: json!({}),
+                        expected_generation: Some(1),
+                        expected_turn_id: None,
+                        request_id: None,
+                        probe: false,
+                    },
+                },
+            ];
+            let admission = store
+                .admit_rule_catch_up(
+                    "owner",
+                    &request,
+                    &state,
+                    state.current_cursor,
+                    &actions,
+                    now,
+                )
+                .unwrap();
+            assert_eq!(admission.children.len(), 2);
+            assert_ne!(admission.children[0].target, admission.children[1].target);
+            let first_child_id = admission.children[0].id.clone();
+            let second_child_id = admission.children[1].id.clone();
+            let first_dispatch = store.dispatch(&first_child_id, now + 1).unwrap();
+            assert_eq!(first_dispatch.value.state, CommandState::Dispatched);
+            (
+                first_child_id,
+                second_child_id,
+                admission.events,
+                first_dispatch.events,
+            )
+        };
+        router.note_events(&admitted_events);
+        router.note_events(&first_dispatch_events);
+
+        let (worker_shutdown, worker_shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut worker = tokio::spawn(crate::automation::run_global_rules(
+            router.clone(),
+            crate::automation::RuleWorkerStart {
+                global_rules: Vec::new(),
+                project_rules: Vec::new(),
+                max_event_backlog: 100_000,
+                data_root: data_root.clone(),
+                policy: Arc::new(SecretPolicy::default()),
+                initial_notices: crate::automation::ReloadNoticeContext::default(),
+            },
+            worker_shutdown_rx,
+        ));
+        tokio::task::yield_now().await;
+        let mut worker_events = router.inner.bus.subscribe();
+
+        let scenario: Result<_> = async {
+            let drain = router
+                .shutdown(
+                    &json!({"id":ulid::Ulid::new().to_string(), "mode":"drain"}),
+                    &Principal::Owner,
+                )
+                .await?;
+            router.response_finished(true);
+            let firing_closed = !router.rule_firings_open();
+            let initial_blockers = router.status_blockers().await?;
+            let initial_first_blocker = initial_blockers.iter().any(|blocker| match blocker {
+                StatusBlocker::CommandUnsettled { command_id, .. }
+                | StatusBlocker::CommandUnknown { command_id } => command_id == &first_child_id,
+                _ => false,
+            });
+            let initial_second_blocker = initial_blockers.iter().any(|blocker| match blocker {
+                StatusBlocker::CommandUnsettled { command_id, .. }
+                | StatusBlocker::CommandUnknown { command_id } => command_id == &second_child_id,
+                _ => false,
+            });
+
+            let first_applied = router
+                .settle(
+                    &first_child_id,
+                    CommandState::Applied,
+                    Some(json!({"state":"stopped"})),
+                )
+                .await
+                .ok_or_else(|| Error::new("internal", "predecessor settlement was not retained"))?;
+            let dispatched_event = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match worker_events.recv().await {
+                        Ok(event)
+                            if event.kind == "command.dispatched"
+                                && event.data.get("command_id").and_then(Value::as_str)
+                                    == Some(second_child_id.as_str()) =>
+                        {
+                            break Ok(event);
+                        }
+                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(broadcast::error::RecvError::Closed) => {
+                            break Err(Error::new(
+                                "unavailable",
+                                "router event bus closed before successor dispatch",
+                            ));
+                        }
+                    }
+                }
+            })
+            .await
+            .map_err(|_| {
+                Error::new(
+                    "timeout",
+                    "rule worker did not dispatch the stored successor",
+                )
+            })??;
+            let second_before_settle = {
+                let store = store.lock().await;
+                store
+                    .get_command(&second_child_id)?
+                    .ok_or_else(|| Error::new("not_found", "successor command disappeared"))?
+                    .state
+            };
+            let blockers_before_second_settle = router.status_blockers().await?;
+            let second_blocker_before_settle =
+                blockers_before_second_settle
+                    .iter()
+                    .any(|blocker| match blocker {
+                        StatusBlocker::CommandUnsettled { command_id, .. }
+                        | StatusBlocker::CommandUnknown { command_id } => {
+                            command_id == &second_child_id
+                        }
+                        _ => false,
+                    });
+            let first_blocker_after_applied =
+                blockers_before_second_settle
+                    .iter()
+                    .any(|blocker| match blocker {
+                        StatusBlocker::CommandUnsettled { command_id, .. }
+                        | StatusBlocker::CommandUnknown { command_id } => {
+                            command_id == &first_child_id
+                        }
+                        _ => false,
+                    });
+            let should_exit_before_second_settle = router.should_exit().await?;
+
+            let second_applied = router
+                .settle(
+                    &second_child_id,
+                    CommandState::Applied,
+                    Some(json!({"state":"stopped"})),
+                )
+                .await
+                .ok_or_else(|| Error::new("internal", "successor settlement was not retained"))?;
+            let blockers_after_second_settle = router.status_blockers().await?;
+            let second_blocker_after_settle =
+                blockers_after_second_settle
+                    .iter()
+                    .any(|blocker| match blocker {
+                        StatusBlocker::CommandUnsettled { command_id, .. }
+                        | StatusBlocker::CommandUnknown { command_id } => {
+                            command_id == &second_child_id
+                        }
+                        _ => false,
+                    });
+            Ok::<_, Error>((
+                drain,
+                firing_closed,
+                initial_first_blocker,
+                initial_second_blocker,
+                first_applied.state,
+                dispatched_event,
+                second_before_settle,
+                second_blocker_before_settle,
+                first_blocker_after_applied,
+                should_exit_before_second_settle,
+                second_applied.state,
+                second_blocker_after_settle,
+            ))
+        }
+        .await;
+
+        let _ = worker_shutdown.send(true);
+        let worker_join = match tokio::time::timeout(Duration::from_secs(5), &mut worker).await {
+            Ok(result) => result,
+            Err(_) => {
+                worker.abort();
+                worker.await
+            }
+        };
+        let worker_result = worker_join;
+        std::fs::remove_dir_all(&data_root).unwrap();
+        assert!(
+            worker_result.is_ok(),
+            "global rule worker failed: {worker_result:?}"
+        );
+        let worker_result = worker_result.unwrap();
+        assert!(
+            worker_result.is_ok(),
+            "global rule worker failed: {worker_result:?}"
+        );
+        let (
+            drain,
+            firing_closed,
+            initial_first_blocker,
+            initial_second_blocker,
+            first_state,
+            dispatched_event,
+            second_before_settle,
+            second_blocker_before_settle,
+            first_blocker_after_applied,
+            should_exit_before_second_settle,
+            second_state,
+            second_blocker_after_settle,
+        ) = scenario.expect("drain worker ordering scenario completed");
+        assert_eq!(drain["state"], json!("dispatched"));
+        assert!(firing_closed);
+        assert!(initial_first_blocker);
+        assert!(initial_second_blocker);
+        assert_eq!(first_state, CommandState::Applied);
+        assert_eq!(dispatched_event.data["command_id"], second_child_id);
+        assert!(matches!(
+            second_before_settle,
+            CommandState::Dispatched | CommandState::Unknown
+        ));
+        assert!(second_blocker_before_settle);
+        assert!(!first_blocker_after_applied);
+        assert!(!should_exit_before_second_settle);
+        assert_eq!(second_state, CommandState::Applied);
+        assert!(!second_blocker_after_settle);
+    }
+
+    #[tokio::test]
     async fn typed_mutation_shutdown_returns_first_retained_drain_reply() {
         let router = router();
         let id = ulid::Ulid::new().to_string().to_ascii_lowercase();
@@ -5729,6 +6177,209 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             .await
             .expect("the dispatched winner settles");
         assert_eq!(applied.state, CommandState::Applied);
+    }
+
+    #[tokio::test]
+    async fn store_write_fault_overlays_unknown_only_for_uncertain_dispatch() {
+        let router = router();
+        let accepted_id = ulid::Ulid::new().to_string();
+        let (dispatched_id, queued_id, terminal_id) = {
+            let mut store = router.inner.store.lock().await;
+            let mut launch = SubmitCommand::new(accepted_id.clone(), "launch");
+            launch.args = json!({
+                "project":"fault-accepted",
+                "workspace":"workspace-fault-accepted",
+            });
+            launch.expected_generation = Some(0);
+            store.submit("owner", launch, now_ms()).unwrap();
+            let (agent, _) = result_fixture(&mut store);
+            let dispatched_id = ulid::Ulid::new().to_string();
+            store
+                .submit(
+                    "owner",
+                    SubmitCommand {
+                        id: dispatched_id.clone(),
+                        target: Some(agent.clone()),
+                        verb: "interrupt".to_owned(),
+                        args: json!({}),
+                        expected_generation: Some(1),
+                        expected_turn_id: Some("turn-1".to_owned()),
+                        request_id: None,
+                        probe: false,
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            let dispatched = store.dispatch(&dispatched_id, now_ms()).unwrap();
+            assert_eq!(dispatched.value.state, CommandState::Dispatched);
+            let definition = json!({
+                "id":"fault-queued",
+                "enabled":true,
+                "on":{"event":"turn.completed"},
+                "do":[{"action":"stop", "target":"${event.agent}",
+                    "expected_generation":"${event.generation}"}],
+            });
+            let input = eliot_store::RuleDefinitionInput {
+                id: "fault-queued".to_owned(),
+                canonical_definition: serde_json::to_string(&definition).unwrap(),
+                definition_digest: eliot_core::canonical_json_sha256(&definition).unwrap(),
+                enabled: true,
+            };
+            let rule_state = store.ensure_rule_state("owner", &input, now_ms()).unwrap();
+            let event_seqs = store
+                .read_events(0, 1_000, None)
+                .unwrap()
+                .into_iter()
+                .filter(|event| {
+                    event.agent.as_deref() == Some(agent.as_str())
+                        && event.generation == Some(1)
+                        && matches!(event.kind.as_str(), "session.ready" | "turn.started")
+                })
+                .map(|event| event.seq)
+                .collect::<Vec<_>>();
+            assert_eq!(event_seqs.len(), 2);
+            let through = rule_state.current_cursor;
+            let request: RuleCatchUpRequest = serde_json::from_value(json!({
+                "id":ulid::Ulid::new().to_string(),
+                "rule":"fault-queued",
+                "after_seq":0,
+                "through_seq":through,
+            }))
+            .unwrap();
+            let actions = event_seqs
+                .into_iter()
+                .map(|event_seq| RuleCatchUpAction {
+                    event_seq,
+                    request: SubmitCommand {
+                        id: ulid::Ulid::new().to_string(),
+                        target: Some(agent.clone()),
+                        verb: "stop".to_owned(),
+                        args: json!({}),
+                        expected_generation: Some(1),
+                        expected_turn_id: None,
+                        request_id: None,
+                        probe: false,
+                    },
+                })
+                .collect::<Vec<_>>();
+            let admission = store
+                .admit_rule_catch_up("owner", &request, &rule_state, through, &actions, now_ms())
+                .unwrap();
+            let terminal_id = admission.parent.id.clone();
+            assert_eq!(admission.parent.state, CommandState::Applied);
+            let first_id = admission.children[0].id.clone();
+            let queued_id = admission.children[1].id.clone();
+            let dispatched = store.dispatch(&first_id, now_ms()).unwrap();
+            assert_eq!(dispatched.value.state, CommandState::Dispatched);
+            let queued = store.dispatch(&queued_id, now_ms()).unwrap();
+            assert_eq!(queued.value.state, CommandState::Queued);
+            (dispatched_id, queued_id, terminal_id)
+        };
+
+        for (id, state) in [
+            (accepted_id.as_str(), CommandState::Accepted),
+            (terminal_id.as_str(), CommandState::Applied),
+            (queued_id.as_str(), CommandState::Queued),
+        ] {
+            let persisted = router
+                .inner
+                .store
+                .lock()
+                .await
+                .get_command(id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(persisted.state, state);
+            router
+                .finish_settlement(
+                    id,
+                    Err(Error::new("internal", "injected Store write failure")),
+                    true,
+                    "store_settlement_failed",
+                    Some(state),
+                    false,
+                )
+                .await;
+            let command: Command = serde_json::from_value(
+                router
+                    .command_get(&json!({"id":id}), &Principal::Owner)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(command.state, state);
+        }
+
+        let persisted = router
+            .inner
+            .store
+            .lock()
+            .await
+            .get_command(&dispatched_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.state, CommandState::Dispatched);
+        router
+            .finish_settlement(
+                &dispatched_id,
+                Err(Error::new("internal", "injected Store write failure")),
+                true,
+                "store_settlement_failed",
+                Some(CommandState::Dispatched),
+                true,
+            )
+            .await;
+        let persisted = router
+            .inner
+            .store
+            .lock()
+            .await
+            .get_command(&dispatched_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.state, CommandState::Dispatched);
+        let readback: Command = serde_json::from_value(
+            router
+                .command_get(&json!({"id":dispatched_id}), &Principal::Owner)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(readback.state, CommandState::Unknown);
+        assert!(router.unknown_ids().contains(&dispatched_id));
+        assert_eq!(
+            router.unknown_cause(&dispatched_id).as_deref(),
+            Some("store_settlement_failed")
+        );
+
+        let applied = router
+            .settle(
+                &dispatched_id,
+                CommandState::Applied,
+                Some(json!({"command_id":dispatched_id.clone(), "turn_id":"turn-1"})),
+            )
+            .await
+            .expect("the exact committed result settles the dispatched command");
+        assert_eq!(applied.state, CommandState::Applied);
+        let readback: Command = serde_json::from_value(
+            router
+                .command_get(&json!({"id":dispatched_id}), &Principal::Owner)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(readback.state, CommandState::Applied);
+        assert!(!router.unknown_ids().contains(&dispatched_id));
+        assert!(router.unknown_cause(&dispatched_id).is_none());
+        let blockers = router.status_blockers().await.unwrap();
+        assert!(!blockers.iter().any(|blocker| matches!(
+            blocker,
+            StatusBlocker::CommandUnknown { command_id } if command_id == &dispatched_id
+        )));
+        assert!(!blockers.iter().any(|blocker| matches!(
+            blocker,
+            StatusBlocker::CommandUnsettled { command_id, .. } if command_id == &dispatched_id
+        )));
     }
 
     #[tokio::test]

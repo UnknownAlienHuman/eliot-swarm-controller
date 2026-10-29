@@ -1010,7 +1010,12 @@ pub(crate) async fn run_global_rules(
                 recover_rule_children = true;
             }
             received = events.recv() => match received {
-                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                Ok(event) => {
+                    router.note_committed_events(std::slice::from_ref(&event));
+                    recover_rule_children = true;
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    router.clear_terminal_unknown_cache().await;
                     recover_rule_children = true;
                 }
                 Err(broadcast::error::RecvError::Closed) => {
