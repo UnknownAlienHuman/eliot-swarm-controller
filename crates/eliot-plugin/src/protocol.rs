@@ -2,17 +2,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
+pub use eliot_core::AgentStartParams;
 pub use eliot_core::api::{
     DiscoverCoverage, DiscoverPage, DiscoverSubject, MAX_DISCOVER_PAGE_BYTES,
     MAX_DISCOVER_PAGE_ENTRIES, MAX_OBSERVATION_CURSOR_BYTES, MAX_OBSERVATION_PAGE_BYTES,
     MAX_OBSERVATION_PAGE_ENTRIES, ObservationPage, ObservationQuery,
 };
-
-pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
-pub const MAX_TEXT_BYTES: usize = 512 * 1024;
-pub const MAX_EVENT_BYTES: usize = 64 * 1024;
-pub const MAX_CREDENTIAL_BYTES: usize = 4 * 1024;
-pub const MAX_COMMAND_ID_BYTES: usize = 256;
+pub use eliot_core::limits::{
+    MAX_COMMAND_ID_BYTES, MAX_CREDENTIAL_BYTES, MAX_EVENT_BYTES, MAX_FRAME_BYTES, MAX_TEXT_BYTES,
+};
 
 pub(crate) fn empty_object() -> Value {
     Value::Object(Map::new())
@@ -193,29 +191,6 @@ pub struct InitializeParams {
     pub instance_dir: String,
     #[serde(default = "empty_object")]
     pub config: Value,
-}
-
-#[derive(Deserialize)]
-pub struct AgentStartParams {
-    pub agent_id: String,
-    pub generation: i64,
-    pub command_id: String,
-    #[serde(default)]
-    pub profile: Option<Value>,
-    #[serde(default)]
-    pub workspace: Option<String>,
-    #[serde(default)]
-    pub target_environment: Option<Value>,
-    #[serde(default)]
-    pub note: Option<String>,
-    #[serde(default)]
-    pub source_plan: Option<Value>,
-    #[serde(default)]
-    pub source_state: Option<Value>,
-    #[serde(default)]
-    pub resume_from: Option<Value>,
-    #[serde(default)]
-    pub initial: Option<Value>,
 }
 
 #[derive(Deserialize)]

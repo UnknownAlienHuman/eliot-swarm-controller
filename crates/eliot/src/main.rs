@@ -33,6 +33,24 @@ const MAX_TEXT_BYTES: usize = 512 * 1024;
 const MAX_ANSWERS_FILE_BYTES: usize = 512 * 1024;
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+#[derive(Args)]
+struct GenerationArgs {
+    #[arg(long, value_name = "GENERATION")]
+    generation: Option<i64>,
+}
+
+#[derive(Args)]
+struct ReadGenerationArgs {
+    #[arg(long, value_name = "GENERATION", value_parser = clap::value_parser!(i64).range(0..))]
+    generation: Option<i64>,
+}
+
+#[derive(Args)]
+struct PageArgs {
+    #[arg(long, default_value_t = PAGE_SIZE)]
+    limit: usize,
+}
+
 #[derive(Parser)]
 #[command(
     name = "eliot",
@@ -72,8 +90,8 @@ enum CliCommand {
         scope: Option<String>,
         #[arg(long, value_name = "CURSOR")]
         cursor: Option<String>,
-        #[arg(long, default_value_t = PAGE_SIZE)]
-        limit: usize,
+        #[command(flatten)]
+        page: PageArgs,
     },
     /// Attach to an exact native subject without taking control of it.
     Attach {
@@ -113,8 +131,8 @@ enum CliCommand {
         text: String,
         #[arg(long)]
         wait: bool,
-        #[arg(long, value_name = "GENERATION")]
-        generation: Option<i64>,
+        #[command(flatten)]
+        generation: GenerationArgs,
         #[arg(long, default_value_t = DEFAULT_WAIT_SECONDS, value_name = "SECONDS")]
         timeout_seconds: u64,
     },
@@ -126,8 +144,8 @@ enum CliCommand {
         prompt: Option<String>,
         #[arg(long)]
         wait: bool,
-        #[arg(long, value_name = "GENERATION")]
-        generation: Option<i64>,
+        #[command(flatten)]
+        generation: GenerationArgs,
     },
     /// Steer the exact active turn.
     Steer {
@@ -135,8 +153,8 @@ enum CliCommand {
         agent: String,
         #[arg(value_name = "TEXT", allow_hyphen_values = true)]
         text: String,
-        #[arg(long, value_name = "GENERATION")]
-        generation: Option<i64>,
+        #[command(flatten)]
+        generation: GenerationArgs,
         #[arg(long, value_name = "TURN")]
         turn: Option<String>,
     },
@@ -145,8 +163,8 @@ enum CliCommand {
     Interrupt {
         #[arg(value_name = "AGENT")]
         agent: String,
-        #[arg(long, value_name = "GENERATION")]
-        generation: Option<i64>,
+        #[command(flatten)]
+        generation: GenerationArgs,
         #[arg(long, value_name = "TURN")]
         turn: Option<String>,
     },
@@ -154,8 +172,8 @@ enum CliCommand {
     Approve {
         #[arg(value_name = "AGENT")]
         agent: String,
-        #[arg(long, value_name = "GENERATION")]
-        generation: Option<i64>,
+        #[command(flatten)]
+        generation: GenerationArgs,
         #[arg(long, value_name = "REQUEST")]
         request: Option<String>,
     },
@@ -163,8 +181,8 @@ enum CliCommand {
     Deny {
         #[arg(value_name = "AGENT")]
         agent: String,
-        #[arg(long, value_name = "GENERATION")]
-        generation: Option<i64>,
+        #[command(flatten)]
+        generation: GenerationArgs,
         #[arg(long, value_name = "REQUEST")]
         request: Option<String>,
     },
@@ -174,8 +192,8 @@ enum CliCommand {
         agent: String,
         #[arg(long, value_name = "PATH")]
         answers_file: PathBuf,
-        #[arg(long, value_name = "GENERATION")]
-        generation: Option<i64>,
+        #[command(flatten)]
+        generation: GenerationArgs,
         #[arg(long, value_name = "REQUEST")]
         request: Option<String>,
     },
@@ -183,15 +201,15 @@ enum CliCommand {
     Ls {
         #[arg(long, value_name = "AGENT")]
         after: Option<String>,
-        #[arg(long, default_value_t = PAGE_SIZE)]
-        limit: usize,
+        #[command(flatten)]
+        page: PageArgs,
     },
     /// Read one page of Agents with their current cached observations.
     Top {
         #[arg(long, value_name = "AGENT")]
         after: Option<String>,
-        #[arg(long, default_value_t = PAGE_SIZE)]
-        limit: usize,
+        #[command(flatten)]
+        page: PageArgs,
     },
     /// Show one Agent.
     Show { agent: String },
@@ -199,57 +217,57 @@ enum CliCommand {
     Processes {
         #[arg(value_name = "AGENT")]
         agent: String,
-        #[arg(long, value_name = "GENERATION", value_parser = clap::value_parser!(i64).range(0..))]
-        generation: Option<i64>,
+        #[command(flatten)]
+        generation: ReadGenerationArgs,
         #[arg(long, default_value = "agent", value_name = "SCOPE")]
         scope: String,
         #[arg(long, value_name = "CURSOR")]
         after: Option<String>,
-        #[arg(long, default_value_t = PAGE_SIZE)]
-        limit: usize,
+        #[command(flatten)]
+        page: PageArgs,
     },
     /// Read an Agent's ephemeral process statistics.
     Stats {
         #[arg(value_name = "AGENT")]
         agent: String,
-        #[arg(long, value_name = "GENERATION", value_parser = clap::value_parser!(i64).range(0..))]
-        generation: Option<i64>,
+        #[command(flatten)]
+        generation: ReadGenerationArgs,
     },
     /// Read the current Git snapshot for an Agent's workspace.
     GitStatus {
         #[arg(value_name = "AGENT")]
         agent: String,
-        #[arg(long, value_name = "GENERATION", value_parser = clap::value_parser!(i64).range(0..))]
-        generation: Option<i64>,
+        #[command(flatten)]
+        generation: ReadGenerationArgs,
     },
     /// Read one page of edits attributed to an Agent by native file-change hints.
     Edits {
         #[arg(value_name = "AGENT")]
         agent: String,
-        #[arg(long, value_name = "GENERATION", value_parser = clap::value_parser!(i64).range(0..))]
-        generation: Option<i64>,
+        #[command(flatten)]
+        generation: ReadGenerationArgs,
         #[arg(long, value_name = "PATH")]
         after: Option<String>,
-        #[arg(long, default_value_t = PAGE_SIZE)]
-        limit: usize,
+        #[command(flatten)]
+        page: PageArgs,
     },
     /// Follow committed events. With an Agent argument, filter to that Agent.
     Watch { agent: Option<String> },
     /// Read an Agent's retained turn results.
     Result {
         agent: String,
-        #[arg(long, value_name = "GENERATION")]
-        generation: Option<i64>,
+        #[command(flatten)]
+        generation: GenerationArgs,
         #[arg(long, value_name = "TURN")]
         turn_id: Option<String>,
-        #[arg(long, default_value_t = PAGE_SIZE)]
-        limit: usize,
+        #[command(flatten)]
+        page: PageArgs,
     },
     /// Read a bounded, private page of native or rollout history.
     History {
         agent: String,
-        #[arg(long, value_name = "GENERATION", value_parser = clap::value_parser!(i64).range(0..))]
-        generation: Option<i64>,
+        #[command(flatten)]
+        generation: ReadGenerationArgs,
         #[arg(long, default_value = "native", value_name = "SOURCE", value_parser = ["native", "rollout"])]
         source: String,
         #[arg(long, value_name = "VIEW", value_parser = ["subject", "turns", "items"])]
@@ -258,8 +276,8 @@ enum CliCommand {
         turn_id: Option<String>,
         #[arg(long, value_name = "CURSOR")]
         cursor: Option<String>,
-        #[arg(long, default_value_t = PAGE_SIZE)]
-        limit: usize,
+        #[command(flatten)]
+        page: PageArgs,
     },
     /// Detach Eliot's observer from an Agent generation.
     Detach {
@@ -272,8 +290,8 @@ enum CliCommand {
         agent: String,
         #[arg(long)]
         force: bool,
-        #[arg(long, value_name = "GENERATION")]
-        generation: Option<i64>,
+        #[command(flatten)]
+        generation: GenerationArgs,
     },
     /// Manage an Agent's retained worktree.
     Worktree {
@@ -289,8 +307,8 @@ enum CliCommand {
     Events {
         #[arg(long, value_name = "SEQ")]
         since: Option<i64>,
-        #[arg(long, default_value_t = PAGE_SIZE)]
-        limit: usize,
+        #[command(flatten)]
+        page: PageArgs,
     },
     /// Internal plugin entry point used by the daemon.
     #[command(hide = true)]
@@ -333,8 +351,8 @@ enum WorktreeCommand {
     Remove {
         #[arg(value_name = "AGENT")]
         agent: String,
-        #[arg(long, value_name = "GENERATION", value_parser = clap::value_parser!(i64).range(0..))]
-        generation: Option<i64>,
+        #[command(flatten)]
+        generation: ReadGenerationArgs,
     },
 }
 
@@ -480,6 +498,27 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
         ..
     } = cli;
 
+    // The concrete request/response pair stays at each read caller. Binding is
+    // checked before any response data is printed.
+    macro_rules! read_and_print {
+        ($method:literal, $params:expr, $response:ty) => {{
+            let params = $params;
+            params
+                .validate()
+                .map_err(|error| Failure::from_core(error, false))?;
+            let response: $response = eliot_daemon::client_call_typed(&data_dir, $method, &params)
+                .await
+                .map_err(|error| Failure::from_core(error, false))?;
+            params
+                .validate_response(&response)
+                .map_err(|error| Failure::from_core(error, false))?;
+            let result = serde_json::to_value(response)
+                .map_err(|_| Failure::new(4, concat!($method, " response is invalid")))?;
+            print_value(&result, json_output);
+            Ok(0)
+        }};
+    }
+
     let Some(command) = command else {
         let mut command = Cli::command();
         let _ = command.print_help();
@@ -532,28 +571,18 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             }
         }
         CliCommand::Status => {
-            let params = DaemonStatusRequest::default();
-            params
-                .validate()
-                .map_err(|error| Failure::from_core(error, false))?;
-            let response: DaemonStatusResponse =
-                eliot_daemon::client_call_typed(&data_dir, "daemon.status", &params)
-                    .await
-                    .map_err(|error| Failure::from_core(error, false))?;
-            params
-                .validate_response(&response)
-                .map_err(|error| Failure::from_core(error, false))?;
-            let result = serde_json::to_value(response)
-                .map_err(|_| Failure::new(4, "daemon.status response is invalid"))?;
-            print_value(&result, json_output);
-            Ok(0)
+            read_and_print!(
+                "daemon.status",
+                DaemonStatusRequest::default(),
+                DaemonStatusResponse
+            )
         }
         CliCommand::Discover {
             profile,
             harness,
             scope,
             cursor,
-            limit,
+            page: PageArgs { limit },
         } => {
             validate_limit(limit)?;
             let params = AgentDiscoverRequest {
@@ -563,20 +592,7 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 cursor,
                 limit,
             };
-            params
-                .validate()
-                .map_err(|error| Failure::from_core(error, false))?;
-            let response: DiscoverPage =
-                eliot_daemon::client_call_typed(&data_dir, "agent.discover", &params)
-                    .await
-                    .map_err(|error| Failure::from_core(error, false))?;
-            params
-                .validate_response(&response)
-                .map_err(|error| Failure::from_core(error, false))?;
-            let result = serde_json::to_value(response)
-                .map_err(|_| Failure::new(4, "agent.discover response is invalid"))?;
-            print_value(&result, json_output);
-            Ok(0)
+            read_and_print!("agent.discover", params, DiscoverPage)
         }
         CliCommand::Attach {
             profile,
@@ -596,9 +612,7 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 args["project"] = Value::String(project);
             }
             let params = submit_request(id, None, "attach", args)?;
-            let result = submit_command(&data_dir, &params).await?;
-            print_value(&submit_value(&result)?, json_output);
-            Ok(response_exit_code(result.state))
+            submit_and_print(&data_dir, &params, json_output).await
         }
         CliCommand::Launch {
             profile,
@@ -662,7 +676,7 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             agent,
             text,
             wait,
-            generation,
+            generation: GenerationArgs { generation },
             timeout_seconds,
         } => {
             validate_text(Some(&text))?;
@@ -693,7 +707,7 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             agent,
             prompt,
             wait,
-            generation,
+            generation: GenerationArgs { generation },
         } => {
             validate_text(prompt.as_deref())?;
             let deadline = if wait {
@@ -737,57 +751,49 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
         CliCommand::Steer {
             agent,
             text,
-            generation,
+            generation: GenerationArgs { generation },
             turn,
         } => {
             validate_text(Some(&text))?;
             let mut params = submit_request(id, Some(agent), "steer", json!({ "text": text }))?;
             params.expected_generation = generation;
             params.expected_turn_id = turn;
-            let result = submit_command(&data_dir, &params).await?;
-            print_value(&submit_value(&result)?, json_output);
-            Ok(response_exit_code(result.state))
+            submit_and_print(&data_dir, &params, json_output).await
         }
         CliCommand::Interrupt {
             agent,
-            generation,
+            generation: GenerationArgs { generation },
             turn,
         } => {
             let mut params = submit_request(id, Some(agent), "interrupt", json!({}))?;
             params.expected_generation = generation;
             params.expected_turn_id = turn;
-            let result = submit_command(&data_dir, &params).await?;
-            print_value(&submit_value(&result)?, json_output);
-            Ok(response_exit_code(result.state))
+            submit_and_print(&data_dir, &params, json_output).await
         }
         CliCommand::Approve {
             agent,
-            generation,
+            generation: GenerationArgs { generation },
             request,
         } => {
             let mut params = submit_request(id, Some(agent), "approve", json!({}))?;
             params.expected_generation = generation;
             params.request_id = request;
-            let result = submit_command(&data_dir, &params).await?;
-            print_value(&submit_value(&result)?, json_output);
-            Ok(response_exit_code(result.state))
+            submit_and_print(&data_dir, &params, json_output).await
         }
         CliCommand::Deny {
             agent,
-            generation,
+            generation: GenerationArgs { generation },
             request,
         } => {
             let mut params = submit_request(id, Some(agent), "deny", json!({}))?;
             params.expected_generation = generation;
             params.request_id = request;
-            let result = submit_command(&data_dir, &params).await?;
-            print_value(&submit_value(&result)?, json_output);
-            Ok(response_exit_code(result.state))
+            submit_and_print(&data_dir, &params, json_output).await
         }
         CliCommand::Answer {
             agent,
             answers_file,
-            generation,
+            generation: GenerationArgs { generation },
             request,
         } => {
             let answers = read_answers_file(&answers_file)?;
@@ -795,77 +801,41 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 submit_request(id, Some(agent), "answer", json!({ "answers": answers }))?;
             params.expected_generation = generation;
             params.request_id = request;
-            let result = submit_command(&data_dir, &params).await?;
-            print_value(&submit_value(&result)?, json_output);
-            Ok(response_exit_code(result.state))
+            submit_and_print(&data_dir, &params, json_output).await
         }
-        CliCommand::Ls { after, limit } => {
+        CliCommand::Ls {
+            after,
+            page: PageArgs { limit },
+        } => {
             validate_limit(limit)?;
             let params = AgentListRequest {
                 after,
                 limit,
                 observations: false,
             };
-            params
-                .validate()
-                .map_err(|error| Failure::from_core(error, false))?;
-            let response: AgentListResponse =
-                eliot_daemon::client_call_typed(&data_dir, "agent.list", &params)
-                    .await
-                    .map_err(|error| Failure::from_core(error, false))?;
-            params
-                .validate_response(&response)
-                .map_err(|error| Failure::from_core(error, false))?;
-            let result = serde_json::to_value(response)
-                .map_err(|_| Failure::new(4, "agent.list response is invalid"))?;
-            print_value(&result, json_output);
-            Ok(0)
+            read_and_print!("agent.list", params, AgentListResponse)
         }
-        CliCommand::Top { after, limit } => {
+        CliCommand::Top {
+            after,
+            page: PageArgs { limit },
+        } => {
             validate_limit(limit)?;
             let params = AgentListRequest {
                 after,
                 limit,
                 observations: true,
             };
-            params
-                .validate()
-                .map_err(|error| Failure::from_core(error, false))?;
-            let response: AgentListResponse =
-                eliot_daemon::client_call_typed(&data_dir, "agent.list", &params)
-                    .await
-                    .map_err(|error| Failure::from_core(error, false))?;
-            params
-                .validate_response(&response)
-                .map_err(|error| Failure::from_core(error, false))?;
-            let result = serde_json::to_value(response)
-                .map_err(|_| Failure::new(4, "agent.list response is invalid"))?;
-            print_value(&result, json_output);
-            Ok(0)
+            read_and_print!("agent.list", params, AgentListResponse)
         }
         CliCommand::Show { agent } => {
-            let params = AgentGetRequest::new(agent);
-            params
-                .validate()
-                .map_err(|error| Failure::from_core(error, false))?;
-            let response: AgentGetResponse =
-                eliot_daemon::client_call_typed(&data_dir, "agent.get", &params)
-                    .await
-                    .map_err(|error| Failure::from_core(error, false))?;
-            params
-                .validate_response(&response)
-                .map_err(|error| Failure::from_core(error, false))?;
-            let result = serde_json::to_value(response)
-                .map_err(|_| Failure::new(4, "agent.get response is invalid"))?;
-            print_value(&result, json_output);
-            Ok(0)
+            read_and_print!("agent.get", AgentGetRequest::new(agent), AgentGetResponse)
         }
         CliCommand::Processes {
             agent,
-            generation,
+            generation: ReadGenerationArgs { generation },
             scope,
             after,
-            limit,
+            page: PageArgs { limit },
         } => {
             validate_limit(limit)?;
             let params = AgentProcessesRequest {
@@ -875,66 +845,33 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 after,
                 limit,
             };
-            params
-                .validate()
-                .map_err(|error| Failure::from_core(error, false))?;
-            let response: AgentProcessesResponse =
-                eliot_daemon::client_call_typed(&data_dir, "agent.processes", &params)
-                    .await
-                    .map_err(|error| Failure::from_core(error, false))?;
-            params
-                .validate_response(&response)
-                .map_err(|error| Failure::from_core(error, false))?;
-            let result = serde_json::to_value(response)
-                .map_err(|_| Failure::new(4, "agent.processes response is invalid"))?;
-            print_value(&result, json_output);
-            Ok(0)
+            read_and_print!("agent.processes", params, AgentProcessesResponse)
         }
-        CliCommand::Stats { agent, generation } => {
+        CliCommand::Stats {
+            agent,
+            generation: ReadGenerationArgs { generation },
+        } => {
             let params = AgentStatsRequest {
                 id: agent,
                 generation,
             };
-            params
-                .validate()
-                .map_err(|error| Failure::from_core(error, false))?;
-            let response: AgentStatsResponse =
-                eliot_daemon::client_call_typed(&data_dir, "agent.stats", &params)
-                    .await
-                    .map_err(|error| Failure::from_core(error, false))?;
-            params
-                .validate_response(&response)
-                .map_err(|error| Failure::from_core(error, false))?;
-            let result = serde_json::to_value(response)
-                .map_err(|_| Failure::new(4, "agent.stats response is invalid"))?;
-            print_value(&result, json_output);
-            Ok(0)
+            read_and_print!("agent.stats", params, AgentStatsResponse)
         }
-        CliCommand::GitStatus { agent, generation } => {
+        CliCommand::GitStatus {
+            agent,
+            generation: ReadGenerationArgs { generation },
+        } => {
             let params = AgentGitRequest {
                 id: agent,
                 generation,
             };
-            params
-                .validate()
-                .map_err(|error| Failure::from_core(error, false))?;
-            let response: AgentGitResponse =
-                eliot_daemon::client_call_typed(&data_dir, "agent.git", &params)
-                    .await
-                    .map_err(|error| Failure::from_core(error, false))?;
-            params
-                .validate_response(&response)
-                .map_err(|error| Failure::from_core(error, false))?;
-            let result = serde_json::to_value(response)
-                .map_err(|_| Failure::new(4, "agent.git response is invalid"))?;
-            print_value(&result, json_output);
-            Ok(0)
+            read_and_print!("agent.git", params, AgentGitResponse)
         }
         CliCommand::Edits {
             agent,
-            generation,
+            generation: ReadGenerationArgs { generation },
             after,
-            limit,
+            page: PageArgs { limit },
         } => {
             validate_limit(limit)?;
             let params = AgentEditsRequest {
@@ -943,27 +880,14 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 after,
                 limit,
             };
-            params
-                .validate()
-                .map_err(|error| Failure::from_core(error, false))?;
-            let response: AgentEditsResponse =
-                eliot_daemon::client_call_typed(&data_dir, "agent.edits", &params)
-                    .await
-                    .map_err(|error| Failure::from_core(error, false))?;
-            params
-                .validate_response(&response)
-                .map_err(|error| Failure::from_core(error, false))?;
-            let result = serde_json::to_value(response)
-                .map_err(|_| Failure::new(4, "agent.edits response is invalid"))?;
-            print_value(&result, json_output);
-            Ok(0)
+            read_and_print!("agent.edits", params, AgentEditsResponse)
         }
         CliCommand::Watch { agent } => watch(&data_dir, agent.as_deref(), json_output).await,
         CliCommand::Result {
             agent,
-            generation,
+            generation: GenerationArgs { generation },
             turn_id,
-            limit,
+            page: PageArgs { limit },
         } => {
             validate_limit(limit)?;
             let params = AgentResultRequest {
@@ -972,29 +896,16 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 turn_id,
                 limit,
             };
-            params
-                .validate()
-                .map_err(|error| Failure::from_core(error, false))?;
-            let response: AgentResultResponse =
-                eliot_daemon::client_call_typed(&data_dir, "agent.result", &params)
-                    .await
-                    .map_err(|error| Failure::from_core(error, false))?;
-            params
-                .validate_response(&response)
-                .map_err(|error| Failure::from_core(error, false))?;
-            let result = serde_json::to_value(response)
-                .map_err(|_| Failure::new(4, "agent.result response is invalid"))?;
-            print_value(&result, json_output);
-            Ok(0)
+            read_and_print!("agent.result", params, AgentResultResponse)
         }
         CliCommand::History {
             agent,
-            generation,
+            generation: ReadGenerationArgs { generation },
             source,
             view,
             turn_id,
             cursor,
-            limit,
+            page: PageArgs { limit },
         } => {
             validate_limit(limit)?;
             let params = AgentHistoryRequest {
@@ -1006,41 +917,27 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 cursor,
                 limit,
             };
-            params
-                .validate()
-                .map_err(|error| Failure::from_core(error, false))?;
-            let response: ObservationPage =
-                eliot_daemon::client_call_typed(&data_dir, "agent.history", &params)
-                    .await
-                    .map_err(|error| Failure::from_core(error, false))?;
-            params
-                .validate_response(&response)
-                .map_err(|error| Failure::from_core(error, false))?;
-            let result = serde_json::to_value(response)
-                .map_err(|_| Failure::new(4, "agent.history response is invalid"))?;
-            print_value(&result, json_output);
-            Ok(0)
+            read_and_print!("agent.history", params, ObservationPage)
         }
         CliCommand::Detach { agent, generation } => {
             let mut params = submit_request(id, Some(agent), "detach", json!({}))?;
             params.expected_generation = generation;
-            let result = submit_command(&data_dir, &params).await?;
-            print_value(&submit_value(&result)?, json_output);
-            Ok(response_exit_code(result.state))
+            submit_and_print(&data_dir, &params, json_output).await
         }
         CliCommand::Stop {
             agent,
             force,
-            generation,
+            generation: GenerationArgs { generation },
         } => {
             let mut params = submit_request(id, Some(agent), "stop", json!({ "force": force }))?;
             params.expected_generation = generation;
-            let result = submit_command(&data_dir, &params).await?;
-            print_value(&submit_value(&result)?, json_output);
-            Ok(response_exit_code(result.state))
+            submit_and_print(&data_dir, &params, json_output).await
         }
         CliCommand::Worktree { command } => match command {
-            WorktreeCommand::Remove { agent, generation } => {
+            WorktreeCommand::Remove {
+                agent,
+                generation: ReadGenerationArgs { generation },
+            } => {
                 let deadline = wait_deadline(DEFAULT_WAIT_SECONDS)?;
                 let mut params = submit_request(id, Some(agent), "worktree.remove", json!({}))?;
                 params.expected_generation = generation;
@@ -1075,7 +972,10 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 Ok(0)
             }
         },
-        CliCommand::Events { since, limit } => {
+        CliCommand::Events {
+            since,
+            page: PageArgs { limit },
+        } => {
             validate_limit(limit)?;
             let params = EventsReadRequest {
                 after: since.unwrap_or(0),
@@ -1189,6 +1089,16 @@ async fn submit_command(
         .validate_response(&response)
         .map_err(|_| Failure::new(4, "command.submit response is invalid"))?;
     Ok(response)
+}
+
+async fn submit_and_print(
+    data_dir: &Path,
+    params: &SubmitCommand,
+    json_output: bool,
+) -> Result<u8, Failure> {
+    let result = submit_command(data_dir, params).await?;
+    print_value(&submit_value(&result)?, json_output);
+    Ok(response_exit_code(result.state))
 }
 
 async fn shutdown_daemon(

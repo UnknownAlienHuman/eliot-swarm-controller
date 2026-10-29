@@ -1,5 +1,5 @@
 use eliot_core::{Error, Result, SecretPolicy, StderrSnapshot, StderrSource};
-use eliot_plugin::{StderrCapture, StderrView, spawn_stderr};
+use eliot_plugin::{StderrCapture, StderrView, spawn_stderr, sync::LockExt};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -387,10 +387,7 @@ impl NativeClient {
 
         let (response_tx, response_rx) = oneshot::channel();
         {
-            self.pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(id.clone(), response_tx);
+            self.pending.lock_recover().insert(id.clone(), response_tx);
         }
         let _guard = PendingGuard {
             pending: Arc::clone(&self.pending),
@@ -528,11 +525,7 @@ impl NativeClient {
             .map(ToOwned::to_owned)
             .or_else(|| serde_json::to_string(id).ok());
         let Some(key) = key else { return };
-        let sender = self
-            .pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&key);
+        let sender = self.pending.lock_recover().remove(&key);
         if let Some(sender) = sender {
             let _ = sender.send(result);
         }
@@ -540,10 +533,7 @@ impl NativeClient {
 
     fn fail_pending(&self, error: Error) {
         let pending = {
-            let mut pending = self
-                .pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut pending = self.pending.lock_recover();
             std::mem::take(&mut *pending)
         };
         for (_, sender) in pending {
@@ -757,10 +747,7 @@ fn empty_object() -> Value {
 
 impl Drop for PendingGuard {
     fn drop(&mut self) {
-        self.pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.id);
+        self.pending.lock_recover().remove(&self.id);
     }
 }
 

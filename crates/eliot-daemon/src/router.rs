@@ -22,7 +22,7 @@ use eliot_core::{
     },
     classify_dispatched_error,
 };
-use eliot_plugin::MAX_EVENT_BYTES;
+use eliot_plugin::{MAX_EVENT_BYTES, sync::LockExt};
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 use std::{
@@ -277,11 +277,7 @@ impl Router {
     }
 
     pub(crate) fn note_workspace_recovery_failure(&self, code: &str) {
-        *self
-            .inner
-            .workspace_recovery_error
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(code.to_owned());
+        *self.inner.workspace_recovery_error.lock_recover() = Some(code.to_owned());
         self.signal_progress();
     }
 
@@ -382,13 +378,11 @@ impl Router {
                 {
                     self.inner
                         .agent_credentials
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .lock_recover()
                         .insert((id.to_owned(), generation), credential.to_owned());
                     self.inner
                         .secrets
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .lock_recover()
                         .insert(credential.to_owned());
                 }
                 Ok((
@@ -564,8 +558,7 @@ impl Router {
         if admission.command.state == CommandState::Unknown {
             self.inner
                 .unknown_commands
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .lock_recover()
                 .insert(admission.command.id.clone());
         }
 
@@ -1433,12 +1426,7 @@ impl Router {
             observer_readers: self.inner.plugin_host.observer_count(),
             discovery_readers: self.inner.plugin_host.reader_count(),
             workspace_custody,
-            workspace_recovery_error: self
-                .inner
-                .workspace_recovery_error
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone(),
+            workspace_recovery_error: self.inner.workspace_recovery_error.lock_recover().clone(),
             unknown_commands_count,
             unknown_commands,
             unknown_commands_truncated,
@@ -2068,8 +2056,7 @@ impl Router {
         let secrets = self
             .inner
             .secrets
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_recover()
             .iter()
             .cloned()
             .collect::<Vec<_>>();
@@ -2097,8 +2084,7 @@ impl Router {
         let secrets = self
             .inner
             .secrets
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_recover()
             .iter()
             .cloned()
             .collect::<Vec<_>>();
@@ -2230,23 +2216,16 @@ impl Router {
     fn note_unknown_id(&self, id: &str, cause: &str) {
         self.inner
             .unknown_commands
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_recover()
             .insert(id.to_owned());
         self.inner
             .unknown_causes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_recover()
             .insert(id.to_owned(), cause.to_owned());
     }
 
     fn unknown_cause(&self, id: &str) -> Option<String> {
-        self.inner
-            .unknown_causes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(id)
-            .cloned()
+        self.inner.unknown_causes.lock_recover().get(id).cloned()
     }
 
     async fn mask_unknown_turns(
@@ -2293,8 +2272,7 @@ impl Router {
         let mut ids: Vec<_> = self
             .inner
             .unknown_commands
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_recover()
             .iter()
             .cloned()
             .collect();
@@ -3084,9 +3062,7 @@ fn contains_secret_question(value: &Value) -> bool {
 }
 
 fn contains_known_secret(value: &Value, secrets: &SecretSet) -> bool {
-    let secrets = secrets
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let secrets = secrets.lock_recover();
     contains_secret_value(value, &secrets)
 }
 
@@ -3106,9 +3082,7 @@ fn contains_secret_value(value: &Value, secrets: &HashSet<String>) -> bool {
 }
 
 fn note_unknown(unknown: &UnknownCommands, events: &[Event]) {
-    let mut unknown = unknown
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut unknown = unknown.lock_recover();
     for event in events
         .iter()
         .filter(|event| event.kind == "command.unknown")

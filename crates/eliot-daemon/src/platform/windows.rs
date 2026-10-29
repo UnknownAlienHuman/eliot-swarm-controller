@@ -6,6 +6,7 @@ use super::process_observation::{
 use eliot_core::{
     Error, ProcessIdentity, ProcessRecord, ProcessSample, ProcessSnapshot, ProcessState, Result,
 };
+use eliot_plugin::sync::LockExt;
 use std::ffi::{OsStr, c_void};
 use std::fs;
 use std::os::windows::ffi::OsStrExt;
@@ -493,10 +494,7 @@ unsafe impl Send for Job {}
 
 impl Job {
     pub(crate) fn observer(&self, pid: u32) -> Result<ProcessObserver> {
-        let mut query = self
-            .query
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut query = self.query.lock_recover();
         if query.is_none() {
             let mut handle = null_mut();
             // JOB_OBJECT_QUERY (0x0004) is documented by Job Object Security and
@@ -652,10 +650,7 @@ impl Drop for Job {
         // Explicitly terminate, then close the shared query handle before the
         // original handle: kill-on-close remains effective even if termination fails.
         let _ = self.terminate();
-        self.query
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
+        self.query.lock_recover().take();
         // SAFETY: this object uniquely owns the handle.
         unsafe { CloseHandle(self.handle) };
     }
@@ -687,10 +682,7 @@ impl ProcessObserver {
     }
 
     pub(crate) fn snapshot(&self, owner: &str, now: i64) -> Result<ProcessSnapshot> {
-        let query = self
-            .query
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let query = self.query.lock_recover();
         let job = query.as_ref().map(|handle| handle.0);
         let (pids, mut complete) = match job {
             Some(job) => job_members(job)?,
@@ -738,10 +730,7 @@ impl ProcessObserver {
         owner: &str,
         now: i64,
     ) -> Result<ProcessSample> {
-        let query = self
-            .query
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let query = self.query.lock_recover();
         let job = query
             .as_ref()
             .ok_or_else(|| Error::new("not_allowed", "owned Job has been released"))?
@@ -764,10 +753,7 @@ impl ProcessObserver {
     }
 
     pub(crate) fn refresh(&self, old: &ProcessSample, now: i64) -> ProcessSample {
-        let query = self
-            .query
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let query = self.query.lock_recover();
         self.refresh_with_job(query.as_ref().map(|handle| handle.0), old, now)
     }
 

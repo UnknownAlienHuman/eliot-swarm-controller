@@ -1,4 +1,5 @@
 use eliot_core::{Error, Result};
+use eliot_plugin::sync::LockExt;
 use std::process::ExitStatus;
 #[cfg(windows)]
 use std::time::Duration;
@@ -33,10 +34,7 @@ pub struct OwnedChild {
 impl OwnedChild {
     /// Capture observation authority while the exact leader identity is owned.
     pub fn observer(&self) -> Result<super::CustodyObserver> {
-        let mut retained = self
-            .observation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut retained = self.observation.lock_recover();
         if let Some(observer) = retained.as_ref() {
             return Ok(observer.clone());
         }
@@ -240,12 +238,7 @@ impl OwnedChild {
             .wait()
             .await
             .map_err(|error| io_error("wait for owned child", error))?;
-        if let Some(observer) = self
-            .observation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-        {
+        if let Some(observer) = self.observation.lock_recover().as_ref() {
             observer.record_root_exit(status.code());
         }
         #[cfg(unix)]

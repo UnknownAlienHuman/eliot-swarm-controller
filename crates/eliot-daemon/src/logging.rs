@@ -8,6 +8,7 @@ use crate::platform::{
 use eliot_core::{
     Error, MAX_STDERR_DIAGNOSTIC_BYTES, Result, SecretPolicy, bound_stderr_diagnostics,
 };
+use eliot_plugin::sync::LockExt;
 use serde_json::{Map, Value, json};
 use std::{
     fs::{self, File},
@@ -28,9 +29,7 @@ pub(crate) struct DaemonLog {
 }
 
 pub(crate) fn init(data: &DataDir, lock: &DaemonLock) -> Result<DaemonLog> {
-    let mut current = LOG
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut current = LOG.lock_recover();
     if current.is_some() {
         return Err(Error::new(
             "daemon_log_busy",
@@ -43,9 +42,7 @@ pub(crate) fn init(data: &DataDir, lock: &DaemonLock) -> Result<DaemonLog> {
 
 impl Drop for DaemonLog {
     fn drop(&mut self) {
-        let mut current = LOG
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut current = LOG.lock_recover();
         if let Some(mut log) = current.take()
             && let Some(file) = log.file.as_mut()
         {
@@ -66,9 +63,7 @@ pub(crate) fn record(
     let Some(bytes) = encode_record(policy, code, ids, error) else {
         return;
     };
-    let mut current = LOG
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut current = LOG.lock_recover();
     if let Some(log) = current.as_mut()
         && log.write(&bytes).is_err()
     {

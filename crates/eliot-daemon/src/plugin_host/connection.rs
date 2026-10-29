@@ -144,7 +144,14 @@ impl PluginClient {
             method: method.to_owned(),
             params,
         };
-        let frame = encode_frame(&request)?;
+        // Only this local encoding boundary proves no frame was enqueued.
+        // Errors from the awaited transport or plugin reply retain C1 uncertainty.
+        let frame = encode_frame(&request).map_err(|_| {
+            Error::new(
+                "native_not_dispatched",
+                "plugin request could not be encoded within its frame bound before dispatch",
+            )
+        })?;
 
         let (response_tx, response_rx) = oneshot::channel();
         {
@@ -640,6 +647,96 @@ mod tests {
             .expect_err("fault must not prove a definite outcome");
         responder.await.expect("peer task");
         error
+    }
+
+    #[tokio::test]
+    async fn agent_start_checks_completed_runtime_frame_before_writing() {
+        use eliot_core::AgentStartParams;
+
+        let (host, peer) = duplex(64);
+        let (reader, writer) = split(host);
+        let connection = PluginConnection::new(reader, writer);
+        let client = connection.client();
+        let sequence = 1_000_000_000_000_000_000_u64;
+        client.inner.next_id.store(sequence, Ordering::Relaxed);
+        let mut params = AgentStartParams::new("a12345", 7, "captured-start-command");
+        params.profile = Some(json!({"harness":"codex", "model":"frozen-model"}));
+        params.workspace = Some("C:\\workspace\\with quotes\"".to_owned());
+        params.source_plan = Some(json!({"session":"stream"}));
+        let preflight = serde_json::to_vec(&params).unwrap();
+        assert!(preflight.len() < MAX_FRAME_BYTES);
+        params.source_state = Some(json!({"retained_generation":6}));
+        params.resume_from =
+            Some(json!({"native_scope":"captured-scope", "native_ref":"captured-thread"}));
+        params.target_environment = Some(json!({"RUNTIME_VALUE":""}));
+        let mut request = RpcRequest {
+            jsonrpc: "2.0".to_owned(),
+            id: json!(format!("host-{sequence}")),
+            method: "agent.start".to_owned(),
+            params: serde_json::to_value(&params).unwrap(),
+        };
+        let remaining = MAX_FRAME_BYTES - serde_json::to_vec(&request).unwrap().len();
+        // JSON escaping, the actual RPC ID and the NDJSON newline all count.
+        params.target_environment.as_mut().unwrap()["RUNTIME_VALUE"] = json!(format!(
+            "{}{}",
+            "\u{1}".repeat(remaining / 6),
+            "x".repeat(remaining % 6)
+        ));
+        request.params = serde_json::to_value(&params).unwrap();
+        assert!(serde_json::to_vec(&request.params).unwrap().len() < MAX_FRAME_BYTES);
+        assert_eq!(serde_json::to_vec(&request).unwrap().len(), MAX_FRAME_BYTES);
+        let until = Instant::now() + Duration::from_secs(5);
+        let error = client
+            .call("agent.start", request.params, until)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "native_not_dispatched");
+        assert_eq!(
+            eliot_core::classify_dispatched_error(&error.code),
+            eliot_core::CommandState::Rejected
+        );
+        assert!(client.inner.pending.lock().await.is_empty());
+
+        // A subsequent valid typed start must be the FIRST frame on the pipe.
+        params.target_environment = Some(json!({"RUNTIME_VALUE":"bounded"}));
+        let expected = serde_json::to_value(params).unwrap();
+        let responder = async {
+            let mut peer = BufReader::new(peer);
+            let mut line = String::new();
+            timeout_at(until, peer.read_line(&mut line))
+                .await
+                .unwrap()
+                .unwrap();
+            let written: RpcRequest = serde_json::from_str(&line).unwrap();
+            assert_eq!(written.id, json!(format!("host-{}", sequence + 1)));
+            assert_eq!(written.method, "agent.start");
+            assert_eq!(written.params, expected);
+            assert!(written.params["note"].is_null() && written.params["initial"].is_null());
+            peer.get_mut()
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"jsonrpc":"2.0", "id":written.id, "result":{"received":true}})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        };
+        let (response, ()) = tokio::join!(
+            client.call("agent.start", expected.clone(), until),
+            responder
+        );
+        assert_eq!(response.unwrap(), json!({"received":true}));
+        let after_io = error_after_written_request(PeerFault::ErrorReply(Some(json!({
+            "code":"frame_too_large",
+        }))))
+        .await;
+        assert_eq!(after_io.code, "frame_too_large");
+        assert_eq!(
+            eliot_core::classify_dispatched_error(&after_io.code),
+            eliot_core::CommandState::Unknown
+        );
     }
 
     #[tokio::test]

@@ -3,6 +3,7 @@
 //! Uses the existing Tokio child-pipe primitive from the donor map. Unlike the
 //! finite Git capture, reaching this tail's cap never stops pipe drainage.
 
+use crate::sync::LockExt;
 pub use eliot_core::StderrSnapshot;
 use eliot_core::{MAX_STDERR_BYTES, SecretPolicy};
 use std::{
@@ -67,10 +68,7 @@ pub struct StderrView {
 impl StderrView {
     pub fn snapshot(&self) -> StderrSnapshot {
         let (bytes, mut truncated, eof, read_error) = {
-            let state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let state = self.state.lock_recover();
             (
                 state.bytes.iter().copied().collect::<Vec<_>>(),
                 state.truncated,
@@ -128,11 +126,7 @@ impl StderrCapture {
     }
 
     fn mark_failed(&self) {
-        self.view
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .end(false, true);
+        self.view.state.lock_recover().end(false, true);
     }
 }
 
@@ -142,11 +136,7 @@ impl Drop for StderrCapture {
             // This is the sole task owner's cancellation path, never a view's
             // Drop. Explicit finish is required to await cancellation completion.
             task.abort();
-            let mut state = self
-                .view
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut state = self.view.state.lock_recover();
             if !state.eof {
                 state.end(false, true);
             }
@@ -181,34 +171,23 @@ async fn drain<R: AsyncRead + Unpin>(
     loop {
         let count = match reader.read(&mut input).await {
             Ok(0) => {
-                state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .end(true, false);
+                state.lock_recover().end(true, false);
                 return;
             }
             Ok(count) => count,
             Err(_) => {
-                state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .end(false, true);
+                state.lock_recover().end(false, true);
                 return;
             }
         };
         pending.extend_from_slice(&input[..count]);
         let (sanitized, consumed) = policy.redact_prefix(&pending, false);
         if consumed > pending.len() {
-            state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .end(false, true);
+            state.lock_recover().end(false, true);
             return;
         }
         pending.drain(..consumed);
-        let mut tail = state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut tail = state.lock_recover();
         tail.append(&sanitized);
         tail.pending_bytes = pending.len();
     }

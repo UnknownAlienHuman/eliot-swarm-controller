@@ -34,6 +34,10 @@ runtime or tooling. Select the next unchecked increment in the roadmap.
 
 - Core types/reducer contain no I/O. Store owns SQLite; plugins own vendor protocols.
   Automation and coordination call the router, never another harness executor.
+- Use one serializable DTO per implemented wire message. Validate syntax at its owning
+  boundary; retain live generation, authority and state checks at transaction/effect boundaries.
+- Factor repeated current behavior. Specs own semantics and link code DTOs/constants
+  instead of copying field catalogs.
 - Preserve generation/turn/request binding, commit-before-ack and explicit unknown
   outcomes from the owning specs. Do not replay an uncertain external effect.
 - Add a crate or trait for a real boundary, not a future caller or a line-count target.

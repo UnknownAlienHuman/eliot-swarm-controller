@@ -12,7 +12,7 @@ use tokio::{
 };
 
 use crate::native::{
-    NativeClient, NativeFrame, StreamState,
+    NativeClient, NativeFrame, StreamState, native_no_write,
     requests::{self, CorePending},
     types::{
         NativeFileChangeItem, NativeItemCompletedNotification, NativePatchChangeKind,
@@ -1070,7 +1070,7 @@ impl EventProcessor {
             .get("text")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::new("native_protocol", "Codex agentMessage omitted its text"))?;
-        let text = redact(text, &self.secrets);
+        let text = SecretPolicy::new(self.secrets.iter().cloned()).redact_text(text);
         let mut data = json!({
             "command_id": self.status.active_command_id.as_deref().unwrap_or_default(),
             "turn_id": turn_id,
@@ -1528,15 +1528,11 @@ fn transport_key(id: &Value) -> Result<String> {
         .map_err(|_| Error::new("native_protocol", "Codex transport request id is invalid"))
 }
 
-fn native_no_write(code: &str) -> bool {
-    matches!(code, "native_not_dispatched" | "busy" | "frame_too_large")
-}
-
-fn rejected_control(reason: &str) -> Value {
+pub(crate) fn rejected_control(reason: &str) -> Value {
     json!({"state": "rejected", "reason": reason})
 }
 
-fn unknown_control(reason: &str) -> Value {
+pub(crate) fn unknown_control(reason: &str) -> Value {
     json!({"state": "unknown", "reason": reason})
 }
 
@@ -1578,8 +1574,4 @@ fn turn_status(status: &NativeTurnStatus) -> String {
         NativeTurnStatus::Failed => "failed".to_owned(),
         NativeTurnStatus::InProgress => "inProgress".to_owned(),
     }
-}
-
-fn redact(text: &str, secrets: &[String]) -> String {
-    SecretPolicy::new(secrets.iter().cloned()).redact_text(text)
 }
