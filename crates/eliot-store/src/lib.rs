@@ -7,7 +7,10 @@ mod capacity;
 mod provider_holds;
 mod rules;
 
-pub use rules::{RuleCursorOutcome, RuleDefinitionInput, RuleEventAdmission};
+pub use rules::{
+    RuleCursorOutcome, RuleDefinitionInput, RuleEventAdmission, TimerDefinitionInput,
+    TimerSlotAdmission, TimerSlotCommit,
+};
 
 use eliot_core::{
     self as core, Agent, AgentEdit, AgentState, BatchAck, Command, CommandState, Effect, Event,
@@ -133,7 +136,7 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(sql_error)?;
-        if current > 11 {
+        if current > 12 {
             return Err(Error::new(
                 "unsupported",
                 format!("Store schema version {current} is newer than this binary"),
@@ -474,6 +477,33 @@ impl Store {
                  CREATE INDEX commands_rule_action_window ON commands(created_at)
                      WHERE link_kind = 'rule_action';
                  INSERT INTO schema_migrations(version) VALUES (11);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 12 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE TABLE timers (
+                     principal TEXT NOT NULL,
+                     rule TEXT NOT NULL,
+                     schedule_revision INTEGER NOT NULL CHECK(schedule_revision > 0),
+                     trigger TEXT NOT NULL,
+                     anchor INTEGER NOT NULL,
+                     last_key INTEGER,
+                     next_due_at INTEGER,
+                     catch_up TEXT NOT NULL DEFAULT 'none'
+                         CHECK(catch_up IN ('latest','none')),
+                     PRIMARY KEY(principal, rule),
+                     FOREIGN KEY(principal, rule) REFERENCES rule_state(principal, rule)
+                         ON DELETE CASCADE
+                 );
+                 CREATE INDEX timers_due ON timers(next_due_at, principal, rule)
+                     WHERE next_due_at IS NOT NULL;
+                 INSERT INTO schema_migrations(version) VALUES (12);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
@@ -8541,3 +8571,6 @@ impl Store {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod timer_tests;

@@ -1,4 +1,5 @@
 use crate::{
+    automation::RuleDefinition,
     bus::Bus,
     common::{now_ms, secure_eq, valid_environment_name},
     monitor::Monitoring,
@@ -19,11 +20,13 @@ use eliot_core::{
         EventsSubscribeResponse, GitView, MAX_OBSERVATION_PAGE_BYTES, ObservationPage,
         ObservationQuery, ObservationView, ProcessPageCursor, ProviderClearHoldRequest,
         ProviderHoldsRequest, RuleGetRequest, RuleStateView, ShutdownMode, SourceState,
-        StatusBlocker, TurnGetRequest, UnsettledCommandSummary, WorkspaceCustodyView,
+        StatusBlocker, TimerGetRequest, TimerRunRequest, TimerStateView, TurnGetRequest,
+        UnsettledCommandSummary, WorkspaceCustodyView,
     },
     classify_dispatched_error,
 };
 use eliot_plugin::{MAX_EVENT_BYTES, sync::LockExt};
+use eliot_store::{TimerDefinitionInput, TimerSlotAdmission, TimerSlotCommit};
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 use std::{
@@ -70,6 +73,7 @@ struct RouterInner {
     agent_credentials: AgentCredentials,
     unknown_commands: UnknownCommands,
     unknown_causes: Mutex<HashMap<String, String>>,
+    global_rule_definitions: Mutex<HashMap<String, RuleDefinition>>,
     plugin_host: PluginHost,
     monitoring: Monitoring,
     workspaces: WorkspaceManager,
@@ -154,6 +158,7 @@ impl Router {
                 agent_credentials,
                 unknown_commands,
                 unknown_causes: Mutex::new(HashMap::new()),
+                global_rule_definitions: Mutex::new(HashMap::new()),
                 plugin_host,
                 monitoring,
                 workspaces,
@@ -194,6 +199,8 @@ impl Router {
             "events.read" => self.events_read(&params, &principal).await,
             "events.subscribe" => self.events_subscribe(&params, &principal).await,
             "rule.get" => self.rule_get(&params, &principal).await,
+            "timer.get" => self.timer_get(&params, &principal).await,
+            "timer.run" => self.timer_run(&params, &principal).await,
             "provider.holds" => self.provider_holds(&params, &principal).await,
             "provider.clear_hold" => self.provider_clear_hold(&params, &principal).await,
             _ => Err(Error::new(
@@ -783,9 +790,184 @@ impl Router {
             .map_err(|_| Error::new("internal", "rule state could not be encoded"))
     }
 
+    async fn timer_get(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        require_owner(principal)?;
+        let request: TimerGetRequest = serde_json::from_value(params.clone())
+            .map_err(|_| Error::new("invalid", "timer.get params are invalid"))?;
+        request.validate()?;
+        let state = self
+            .inner
+            .store
+            .lock()
+            .await
+            .get_timer_state("owner", &request.id)?
+            .ok_or_else(|| Error::new("not_found", "timer was not found"))?;
+        request.validate_response(&state)?;
+        serde_json::to_value(state)
+            .map_err(|_| Error::new("internal", "timer state could not be encoded"))
+    }
+
+    async fn timer_run(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        require_owner(principal)?;
+        let request: TimerRunRequest = serde_json::from_value(params.clone())
+            .map_err(|_| Error::new("invalid", "timer.run params are invalid"))?;
+        request.validate()?;
+        if contains_known_secret_including_keys(params, &self.inner.secrets) {
+            return Err(Error::new(
+                "secret_in_payload",
+                "timer.run request contains a known credential",
+            ));
+        }
+
+        // An exact external-ID replay is returned before current timer, mode,
+        // or target-generation gates are evaluated again.
+        if let Some(parent) = self.replay_timer_run(&request).await? {
+            request.validate_response(&parent)?;
+            return serde_json::to_value(parent)
+                .map_err(|_| Error::new("internal", "timer.run result could not be encoded"));
+        }
+
+        if !self.rule_firings_open() {
+            return Err(Error::new("unavailable", "automation is draining"));
+        }
+        let definition = self
+            .global_rule_definition(&request.rule)
+            .ok_or_else(|| Error::new("not_found", "timer rule was not found"))?;
+        if definition.schedule().is_none() {
+            return Err(Error::new("unsupported", "rule is not a timer"));
+        }
+        let timer = self
+            .inner
+            .store
+            .lock()
+            .await
+            .get_timer_state("owner", &request.rule)?
+            .ok_or_else(|| Error::new("not_found", "timer was not found"))?;
+        if !timer.enabled {
+            return Err(Error::new("bad_state", "timer is disabled or paused"));
+        }
+        if !self.rule_firings_open() {
+            return Err(Error::new("unavailable", "automation is draining"));
+        }
+
+        let stop = definition.evaluate_timer()?;
+        let command = SubmitCommand {
+            id: String::new(),
+            target: Some(stop.target),
+            verb: "stop".to_owned(),
+            args: json!({}),
+            expected_generation: Some(stop.expected_generation),
+            expected_turn_id: None,
+            request_id: None,
+            probe: false,
+        };
+        let prepared = match self.prepare_owner_submission(command).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if let Some(parent) = self.replay_timer_run(&request).await? {
+                    request.validate_response(&parent)?;
+                    return serde_json::to_value(parent).map_err(|_| {
+                        Error::new("internal", "timer.run result could not be encoded")
+                    });
+                }
+                return Err(error);
+            }
+        };
+        let Some(admission) = self
+            .admit_manual_timer_run(&request, &timer, prepared)
+            .await?
+        else {
+            if let Some(parent) = self.replay_timer_run(&request).await? {
+                request.validate_response(&parent)?;
+                return serde_json::to_value(parent)
+                    .map_err(|_| Error::new("internal", "timer.run result could not be encoded"));
+            }
+            return Err(Error::new("unavailable", "automation is draining"));
+        };
+        if admission.blocked {
+            return Err(Error::new(
+                "busy",
+                "previous timer action is still open or unknown",
+            ));
+        }
+        let parent = admission
+            .parent
+            .ok_or_else(|| Error::new("internal", "timer.run admission omitted its parent"))?;
+        request.validate_response(&parent)?;
+        serde_json::to_value(parent)
+            .map_err(|_| Error::new("internal", "timer.run result could not be encoded"))
+    }
+
+    async fn replay_timer_run(&self, request: &TimerRunRequest) -> Result<Option<Command>> {
+        self.inner
+            .store
+            .lock()
+            .await
+            .replay_timer_run("owner", request)
+    }
+
+    async fn admit_manual_timer_run(
+        &self,
+        request: &TimerRunRequest,
+        state: &TimerStateView,
+        prepared: PreparedSubmission,
+    ) -> Result<Option<TimerSlotAdmission>> {
+        let PreparedSubmission {
+            request: action,
+            workspace,
+        } = prepared;
+        if action.verb != "stop" || workspace.is_some() {
+            return Err(Error::new(
+                "invalid",
+                "timer firing must contain one prepared stop command",
+            ));
+        }
+        let admission = {
+            let mut store = self.inner.store.lock().await;
+            let replay = store.replay_timer_run("owner", request)?.is_some();
+            if !replay && self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
+                return Ok(None);
+            }
+            let admission =
+                store.admit_manual_timer_run("owner", request, state, action, now_ms())?;
+            self.publish_locked(&admission.events);
+            admission
+        };
+        if admission.is_new
+            && let Some(child) = &admission.child
+            && matches!(child.state, CommandState::Accepted | CommandState::Queued)
+        {
+            self.schedule_command(child.id.clone(), None);
+        }
+        if admission.is_new {
+            self.signal_progress();
+        }
+        Ok(Some(admission))
+    }
+
+    pub(crate) fn install_global_rule_definitions(&self, definitions: &[RuleDefinition]) {
+        let mut stored = self.inner.global_rule_definitions.lock_recover();
+        stored.clear();
+        stored.extend(
+            definitions
+                .iter()
+                .cloned()
+                .map(|definition| (definition.id.clone(), definition)),
+        );
+    }
+
+    fn global_rule_definition(&self, id: &str) -> Option<RuleDefinition> {
+        self.inner
+            .global_rule_definitions
+            .lock_recover()
+            .get(id)
+            .cloned()
+    }
+
     pub(crate) async fn initialize_global_rules(
         &self,
         definitions: &[eliot_store::RuleDefinitionInput],
+        registration_now: i64,
     ) -> Result<Vec<RuleStateView>> {
         // Check every canonical definition before the first durable seed. Rule
         // text is persisted by Store and must use the same known-secret policy
@@ -802,11 +984,66 @@ impl Router {
         }
 
         let mut store = self.inner.store.lock().await;
-        let now = now_ms();
         definitions
             .iter()
-            .map(|definition| store.ensure_rule_state("owner", definition, now))
+            .map(|definition| store.ensure_rule_state("owner", definition, registration_now))
             .collect()
+    }
+
+    pub(crate) async fn get_global_timer(&self, id: &str) -> Result<Option<TimerStateView>> {
+        self.inner.store.lock().await.get_timer_state("owner", id)
+    }
+
+    pub(crate) async fn initialize_global_timer(
+        &self,
+        input: &TimerDefinitionInput,
+        registration_now: i64,
+    ) -> Result<TimerStateView> {
+        self.inner
+            .store
+            .lock()
+            .await
+            .ensure_timer_state("owner", input, registration_now)
+    }
+
+    pub(crate) async fn list_due_global_timers(
+        &self,
+        after_id: Option<&str>,
+        due_by_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<TimerStateView>> {
+        self.inner
+            .store
+            .lock()
+            .await
+            .list_due_timer_states("owner", after_id, due_by_ms, limit)
+    }
+
+    pub(crate) async fn commit_global_timer_slot(
+        &self,
+        state: &TimerStateView,
+        slot: TimerSlotCommit,
+        now: i64,
+    ) -> Result<Option<TimerSlotAdmission>> {
+        let admission = {
+            let mut store = self.inner.store.lock().await;
+            if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
+                return Ok(None);
+            }
+            let admission = store.commit_timer_slot("owner", state, slot, now)?;
+            self.publish_locked(&admission.events);
+            admission
+        };
+        if admission.is_new
+            && let Some(child) = &admission.child
+            && matches!(child.state, CommandState::Accepted | CommandState::Queued)
+        {
+            self.schedule_command(child.id.clone(), None);
+        }
+        if admission.is_new {
+            self.signal_progress();
+        }
+        Ok(Some(admission))
     }
 
     pub(crate) fn subscribe_rule_events(&self) -> broadcast::Receiver<Event> {
@@ -3578,9 +3815,13 @@ mod tests {
     use super::*;
 
     fn router() -> Router {
+        router_with_data_root(PathBuf::from("synthetic-data-root"))
+    }
+
+    fn router_with_data_root(data_root: PathBuf) -> Router {
         let store = eliot_store::Store::open(std::path::Path::new(":memory:")).unwrap();
         Router::new(
-            PathBuf::from("synthetic-data-root"),
+            data_root,
             "owner-credential".to_owned(),
             Arc::new(AsyncMutex::new(store)),
             Bus::new(16),
@@ -3634,7 +3875,7 @@ mod tests {
             vec![secret_key_definition],
         ] {
             let error = router
-                .initialize_global_rules(&definitions)
+                .initialize_global_rules(&definitions, now_ms())
                 .await
                 .unwrap_err();
             assert_eq!(error.code, "secret_in_payload");
@@ -3654,6 +3895,81 @@ mod tests {
             assert_eq!(store.high_water().unwrap(), before_high_water);
             assert_eq!(store.read_events(0, 100, None).unwrap(), before_events);
         }
+    }
+
+    #[tokio::test]
+    async fn invalid_initial_timer_slot_leaves_rules_unseeded_and_same_id_registers_after_fix() {
+        let root =
+            std::env::temp_dir().join(format!("eliot-timer-preflight-{}", ulid::Ulid::new()));
+        let rules_dir = root.join("rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        let rule_path = rules_dir.join("timers.toml");
+        let router = router_with_data_root(root.clone());
+        let invalid = r#"
+[[rule]]
+id = "preflight-existing"
+on = { event = "turn.completed" }
+do = [{ action = "stop", target = "a1", expected_generation = 1 }]
+
+[[rule]]
+id = "same-timer"
+on = { every = "1s", anchor = 9223372036854775807 }
+do = [{ action = "stop", target = "a1", expected_generation = 1 }]
+"#;
+        std::fs::write(&rule_path, invalid).unwrap();
+        let high_water = router.inner.store.lock().await.high_water().unwrap();
+
+        let error = match crate::automation::initialize_global_rules(&router, &root).await {
+            Err(error) => error,
+            Ok(_) => panic!("overflowing first timer slot should fail preflight"),
+        };
+        assert_eq!(error.code, "invalid");
+        {
+            let store = router.inner.store.lock().await;
+            assert!(
+                store
+                    .get_rule_state("owner", "preflight-existing")
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                store
+                    .get_rule_state("owner", "same-timer")
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                store
+                    .get_timer_state("owner", "same-timer")
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(store.high_water().unwrap(), high_water);
+        }
+
+        let corrected = invalid.replace(
+            "on = { every = \"1s\", anchor = 9223372036854775807 }",
+            "on = { every = \"1s\" }",
+        );
+        std::fs::write(&rule_path, corrected).unwrap();
+        let initialized = crate::automation::initialize_global_rules(&router, &root)
+            .await
+            .unwrap();
+        assert_eq!(initialized.len(), 2);
+        let store = router.inner.store.lock().await;
+        assert!(
+            store
+                .get_rule_state("owner", "same-timer")
+                .unwrap()
+                .is_some()
+        );
+        let timer = store
+            .get_timer_state("owner", "same-timer")
+            .unwrap()
+            .unwrap();
+        assert_eq!(timer.next_due_at, Some(timer.anchor + 1_000));
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(windows)]

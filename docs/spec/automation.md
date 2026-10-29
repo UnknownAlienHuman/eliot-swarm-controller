@@ -78,6 +78,65 @@ text alone. Do not stack timer firings while the previous command set is open/un
 Schedule edits increment schedule revision and start after the edit boundary; action-
 only edits preserve the schedule. Reconcile timers from stored state on restart.
 
+## First connected timer slice
+
+Global timers use the same startup-loaded rule files and the existing command router.
+The connected subset supports interval, once, five-field cron and owner-triggered manual
+runs, each with one ordinary `stop` action. Other action verbs remain future work.
+
+```toml
+[[rule]]
+id = "periodic-stop"
+on = { every = "30m", anchor = 1800000000000 }
+catch_up = "none"
+do = [{ action = "stop", target = "a1", expected_generation = 1 }]
+```
+
+An interval `every` value uses the humantime duration grammar and must be positive with
+whole-millisecond precision; it is normalized to signed `period_ms`. An explicit interval
+`anchor` is a signed Unix epoch millisecond integer. Registration captures one
+signed epoch-millisecond sample and uses that same value to resolve an omitted interval
+anchor, compute the initial `next_due_at`, and initialize Store state. Store commits the
+effective anchor and initial due time with the timer row. Slots are `anchor + k*period_ms`,
+starting at `k=1`. Existing timer state reuses its persisted anchor, `last_key` and
+`next_due_at`; a restart never recalculates defaults from a new clock sample. A once `at`
+value is RFC3339 with an explicit offset and whole-millisecond precision; it is normalized
+to signed Unix epoch milliseconds. Cron has exactly five fields; `tz` is an IANA timezone
+name and defaults to `UTC`. Persist due instants and numeric `last_key` as signed Unix
+epoch milliseconds; the key denotes the selected UTC slot. Cron and once have no
+user-specified anchor; their persisted `anchor` is the registration boundary used to seed
+slot selection. It is never recaptured on restart.
+
+For a newly registered timer, the first eligible slot is strictly after its captured
+registration time. An explicit historical interval anchor establishes phase, not
+pre-registration catch-up. A once instant at or before registration starts with no
+`next_due_at`; `timer.run` remains available.
+Repeated DST wall times have distinct UTC keys, while a missing wall time coalesces to the
+first valid instant after the gap. Clock rollback never replays a slot at or before
+`last_key`.
+
+`catch_up` accepts `latest` or `none` and defaults to `none`. It applies to missed slots of
+persisted timers on restart, not slots before initial registration. On restart, `none`
+advances past missed slots without firing; `latest` coalesces missed slots to one firing at
+the most recent due instant. A normally delayed wake for a timer that remained armed in
+the live daemon still fires its due slot under either policy. Do not burst missed slots or
+stack another firing while the previous action children are open or unknown.
+
+The timer action freezes its literal `target` and `expected_generation`; it does not look
+up an Agent row to fill either value. Timer invocations have no event or subject, so a
+template that requires `${event...}` or `${subject...}` fails admission. `timer.get` is
+an owner-only read of the canonical Core timer view. `timer.run ID` is an owner-only
+manual firing keyed by an external ULID. Reusing that ULID returns the retained parent
+before checking current enabled/paused/drain/rate gates and never dispatches a second
+child. A new manual run obeys those gates and does not change scheduled `last_key` or
+`next_due_at`. Its external ULID remains the parent command ID and never becomes a
+scheduled `last_key`.
+
+Restart resumes unchanged schedules. The schedule-edit semantics above remain the
+target contract; startup changes to an existing schedule are rejected as unsupported in
+this slice. Schedule replacement and hot reload remain future work. The canonical timer
+wire types are in [Core `timers.rs`](../../crates/eliot-core/src/api/timers.rs).
+
 ## First connected event slice
 
 The initial L4.1 path loads owner-approved global rules from
@@ -112,7 +171,7 @@ Store-only rejected parent and advances without admitting an action child. Expli
 custom `limit` and `catch_up` values are unsupported here and must be rejected rather
 than ignored.
 
-Other triggers, project rules, non-exact match operators, multiple actions, timers,
+Other event triggers, project rules, non-exact match operators, multiple actions,
 scripts, Goals and hot reload remain unsupported. This stop-only action cannot create a
 new turn event, so the current slice cannot loop on its own `turn.completed`; the target
 cause-depth guard remains required before adding actions that can produce their own
@@ -255,7 +314,7 @@ CREATE TABLE rule_state (
 );
 CREATE TABLE timers (
   principal TEXT NOT NULL, rule TEXT NOT NULL, schedule_revision INTEGER NOT NULL,
-  trigger TEXT NOT NULL, anchor INTEGER NOT NULL, last_key TEXT, next_due_at INTEGER,
+  trigger TEXT NOT NULL, anchor INTEGER NOT NULL, last_key INTEGER, next_due_at INTEGER,
   PRIMARY KEY(principal,rule)
 );
 CREATE TABLE goals (

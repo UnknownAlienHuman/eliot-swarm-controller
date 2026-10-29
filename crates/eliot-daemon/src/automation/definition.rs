@@ -1,4 +1,8 @@
-use eliot_core::{Error, Event, canonical_json_sha256, parse_agent_id};
+use eliot_core::{
+    Error, Event,
+    api::{CatchUp, TimerSchedule},
+    canonical_json_sha256, parse_agent_id,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -19,17 +23,35 @@ pub struct RuleDefinition {
     #[serde(default = "enabled_by_default")]
     pub enabled: bool,
     #[serde(rename = "on")]
-    trigger: EventTrigger,
+    trigger: TriggerDefinition,
     #[serde(rename = "do")]
     actions: Vec<StopActionDefinition>,
+    #[serde(
+        default = "default_catch_up",
+        skip_serializing_if = "is_default_catch_up"
+    )]
+    catch_up: CatchUp,
+    #[serde(skip)]
+    schedule: Option<TimerSchedule>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct EventTrigger {
-    event: String,
+struct TriggerDefinition {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    event: Option<String>,
     #[serde(default, rename = "match")]
     matches: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    every: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    anchor: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cron: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tz: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    at: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -54,6 +76,14 @@ struct RuleFile {
 
 fn enabled_by_default() -> bool {
     true
+}
+
+fn default_catch_up() -> CatchUp {
+    CatchUp::None
+}
+
+fn is_default_catch_up(catch_up: &CatchUp) -> bool {
+    matches!(catch_up, CatchUp::None)
 }
 
 /// Reads and validates one bounded global rule file.
@@ -84,10 +114,10 @@ pub fn load(reader: impl Read) -> Result<Vec<RuleDefinition>, Error> {
     let mut ids = HashSet::with_capacity(file.rule.len());
     for raw in file.rule {
         reject_unimplemented_options(&raw)?;
-        let rule: RuleDefinition = raw
+        let mut rule: RuleDefinition = raw
             .try_into()
             .map_err(|_| Error::new("invalid", "rule definition is malformed"))?;
-        validate_rule(&rule)?;
+        validate_rule(&mut rule)?;
         if !ids.insert(rule.id.clone()) {
             return Err(Error::new("invalid", "rule file contains duplicate ids"));
         }
@@ -104,13 +134,43 @@ impl RuleDefinition {
         canonical_json_sha256(&value)
             .map_err(|_| Error::new("invalid", "rule definition cannot be canonicalized"))
     }
+
+    pub fn schedule(&self) -> Option<&TimerSchedule> {
+        self.schedule.as_ref()
+    }
+
+    pub fn catch_up(&self) -> &CatchUp {
+        &self.catch_up
+    }
+
+    /// Render the frozen literal stop action. Lifecycle and admission gates are
+    /// enforced by the caller before invoking this projection.
+    pub fn evaluate_timer(&self) -> Result<StopAction, Error> {
+        if self.schedule.is_none() {
+            return Err(Error::new("unsupported", "rule is not a timer"));
+        }
+        timer_stop_action(self)
+    }
+}
+
+impl TriggerDefinition {
+    fn has_timer_fields(&self) -> bool {
+        self.every.is_some()
+            || self.anchor.is_some()
+            || self.cron.is_some()
+            || self.tz.is_some()
+            || self.at.is_some()
+    }
 }
 
 /// Matches `Event.subject`, the captured event-time subject, and renders the stop action.
 /// `None` means disabled, a different event, or no exact match. The caller advances
 /// disabled/no-match cursors and settles rate-limit skips with the event transaction.
 pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<StopAction>, Error> {
-    if !rule.enabled || event.kind != rule.trigger.event {
+    if !rule.enabled
+        || event.kind != SUPPORTED_EVENT
+        || rule.trigger.event.as_deref() != Some(event.kind.as_str())
+    {
         return Ok(None);
     }
 
@@ -162,17 +222,13 @@ fn reject_unimplemented_options(raw: &toml::Value) -> Result<(), Error> {
     let Some(rule) = raw.as_table() else {
         return Ok(());
     };
-    let has_unsupported_rule_option = ["limit", "catch_up", "allow_self"]
+    let has_unsupported_rule_option = ["limit", "allow_self"]
         .iter()
         .any(|key| rule.contains_key(*key));
-    let has_unsupported_trigger =
-        rule.get("on")
-            .and_then(toml::Value::as_table)
-            .is_some_and(|on| {
-                ["every", "cron", "tz", "anchor", "at", "manual"]
-                    .iter()
-                    .any(|key| on.contains_key(*key))
-            });
+    let has_unsupported_trigger = rule
+        .get("on")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|on| ["manual"].iter().any(|key| on.contains_key(*key)));
     let has_unsupported_selector =
         rule.get("do")
             .and_then(toml::Value::as_array)
@@ -192,35 +248,10 @@ fn reject_unimplemented_options(raw: &toml::Value) -> Result<(), Error> {
     Ok(())
 }
 
-fn validate_rule(rule: &RuleDefinition) -> Result<(), Error> {
+fn validate_rule(rule: &mut RuleDefinition) -> Result<(), Error> {
     if rule.id.trim().is_empty() || rule.id.contains("${") {
         return Err(Error::new("invalid", "rule id must be a nonempty literal"));
     }
-    if rule.trigger.event != SUPPORTED_EVENT {
-        return Err(Error::new(
-            "unsupported",
-            "only turn.completed rules are supported",
-        ));
-    }
-    for (path, expected) in &rule.trigger.matches {
-        validate_path(path)?;
-        match expected {
-            Value::String(value) if value.starts_with("glob:") || value.starts_with("re:") => {
-                return Err(Error::new(
-                    "unsupported",
-                    "only exact rule matches are supported",
-                ));
-            }
-            Value::String(_) | Value::Number(_) | Value::Bool(_) => {}
-            Value::Null | Value::Array(_) | Value::Object(_) => {
-                return Err(Error::new(
-                    "unsupported",
-                    "only exact scalar rule matches are supported",
-                ));
-            }
-        }
-    }
-
     if rule.actions.len() != 1 {
         let code = if rule.actions.is_empty() {
             "invalid"
@@ -239,6 +270,82 @@ fn validate_rule(rule: &RuleDefinition) -> Result<(), Error> {
             "only the stop action is supported",
         ));
     }
+
+    if let Some(event) = rule.trigger.event.as_deref() {
+        if rule.trigger.has_timer_fields() {
+            return Err(Error::new(
+                "invalid",
+                "rule on cannot mix event and timer triggers",
+            ));
+        }
+        if event != SUPPORTED_EVENT {
+            return Err(Error::new(
+                "unsupported",
+                "only turn.completed event rules are supported",
+            ));
+        }
+        if !is_default_catch_up(&rule.catch_up) {
+            return Err(Error::new("invalid", "catch_up requires a timer trigger"));
+        }
+        validate_event_matches(&rule.trigger.matches)?;
+        validate_event_action(action)?;
+        rule.schedule = None;
+        return Ok(());
+    }
+
+    if !rule.trigger.matches.is_empty() {
+        return Err(Error::new("invalid", "match requires an event trigger"));
+    }
+    let schedule = match (
+        rule.trigger.every.as_deref(),
+        rule.trigger.cron.as_deref(),
+        rule.trigger.at.as_deref(),
+    ) {
+        (Some(every), None, None) if rule.trigger.tz.is_none() => {
+            super::schedule::parse_interval(every, rule.trigger.anchor)?
+        }
+        (None, Some(expression), None) if rule.trigger.anchor.is_none() => {
+            super::schedule::parse_cron(expression, rule.trigger.tz.as_deref().unwrap_or("UTC"))?
+        }
+        (None, None, Some(at)) if rule.trigger.anchor.is_none() && rule.trigger.tz.is_none() => {
+            super::schedule::parse_once(at)?
+        }
+        _ => {
+            return Err(Error::new(
+                "invalid",
+                "rule on must select exactly one interval, cron or once trigger",
+            ));
+        }
+    };
+    schedule.validate()?;
+    rule.schedule = Some(schedule);
+    timer_stop_action(rule)?;
+    Ok(())
+}
+
+fn validate_event_matches(matches: &BTreeMap<String, Value>) -> Result<(), Error> {
+    for (path, expected) in matches {
+        validate_path(path)?;
+        match expected {
+            Value::String(value) if value.starts_with("glob:") || value.starts_with("re:") => {
+                return Err(Error::new(
+                    "unsupported",
+                    "only exact rule matches are supported",
+                ));
+            }
+            Value::String(_) | Value::Number(_) | Value::Bool(_) => {}
+            Value::Null | Value::Array(_) | Value::Object(_) => {
+                return Err(Error::new(
+                    "unsupported",
+                    "only exact scalar rule matches are supported",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_event_action(action: &StopActionDefinition) -> Result<(), Error> {
     let target = action
         .target
         .as_str()
@@ -263,6 +370,40 @@ fn validate_rule(rule: &RuleDefinition) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+fn timer_stop_action(rule: &RuleDefinition) -> Result<StopAction, Error> {
+    let action = rule
+        .actions
+        .first()
+        .ok_or_else(|| Error::new("invalid", "rule has no stop action"))?;
+    let target = action
+        .target
+        .as_str()
+        .ok_or_else(|| Error::new("invalid", "timer stop target must be a string"))?;
+    if target.contains("${") || target.contains('}') {
+        return Err(Error::new(
+            "invalid",
+            "timer stop target cannot use templates without event data",
+        ));
+    }
+    ensure_agent_id_capacity(target.len())?;
+    parse_agent_id(target)
+        .map_err(|_| Error::new("invalid", "timer stop target is not a canonical Agent id"))?;
+    let expected_generation = action
+        .expected_generation
+        .as_i64()
+        .filter(|generation| *generation >= 0)
+        .ok_or_else(|| {
+            Error::new(
+                "invalid",
+                "timer stop generation must be a nonnegative integer without templates",
+            )
+        })?;
+    Ok(StopAction {
+        target: target.to_owned(),
+        expected_generation,
+    })
 }
 
 fn validate_template(value: &str, embedded: bool) -> Result<(), Error> {
@@ -475,6 +616,27 @@ on = { event = 'turn.completed', match = { 'subject.harness' = 'fake' } }
 do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${event.generation}' }]
 "#;
 
+    const INTERVAL_TIMER: &str = r#"
+[[rule]]
+id = 'interval-stop'
+on = { every = '30m' }
+do = [{ action = 'stop', target = 'a7', expected_generation = 3 }]
+"#;
+
+    const CRON_TIMER: &str = r#"
+[[rule]]
+id = 'cron-stop'
+on = { cron = '0 12 * * *' }
+do = [{ action = 'stop', target = 'a7', expected_generation = 3 }]
+"#;
+
+    const ONCE_TIMER: &str = r#"
+[[rule]]
+id = 'once-stop'
+on = { at = '1970-01-01T00:00:01Z' }
+do = [{ action = 'stop', target = 'a7', expected_generation = 3 }]
+"#;
+
     fn event() -> Event {
         Event {
             seq: 7,
@@ -499,7 +661,6 @@ do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${eve
     fn load_rejects_invalid_and_unimplemented_rule_fields() {
         let unsupported = [
             RULE.replace("do =", "limit = { max = 2 }\ndo ="),
-            RULE.replace("event = 'turn.completed'", "every = '30m', event = 'turn.completed'"),
             RULE.replace("action = 'stop'", "action = 'send'"),
             RULE.replace("'subject.harness' = 'fake'", "'subject.harness' = ['fake']"),
             RULE.replace("'subject.harness' = 'fake'", "'subject.labels.role' = 'writer'"),
@@ -521,6 +682,11 @@ do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${eve
         assert_eq!(load(Cursor::new(unknown)).unwrap_err().code, "invalid");
         let duplicate = format!("{RULE}\n{RULE}");
         assert_eq!(load(Cursor::new(duplicate)).unwrap_err().code, "invalid");
+        let mixed = RULE.replace(
+            "event = 'turn.completed'",
+            "event = 'turn.completed', every = '30m'",
+        );
+        assert_eq!(load(Cursor::new(mixed)).unwrap_err().code, "invalid");
     }
 
     #[test]
@@ -574,5 +740,54 @@ do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${eve
             first.semantic_digest().unwrap(),
             second.semantic_digest().unwrap()
         );
+    }
+
+    #[test]
+    fn timer_on_forms_parse_to_core_schedules_and_literal_stop() {
+        let interval = load(Cursor::new(INTERVAL_TIMER)).unwrap().remove(0);
+        assert_eq!(
+            interval.schedule(),
+            Some(&TimerSchedule::Interval {
+                period_ms: 30 * 60 * 1_000,
+                anchor: None,
+            })
+        );
+        assert_eq!(interval.catch_up(), &CatchUp::None);
+        assert_eq!(
+            interval.evaluate_timer().unwrap(),
+            StopAction {
+                target: "a7".to_owned(),
+                expected_generation: 3,
+            }
+        );
+
+        let cron = load(Cursor::new(CRON_TIMER)).unwrap().remove(0);
+        assert!(matches!(
+            cron.schedule(),
+            Some(TimerSchedule::Cron { expression, tz })
+                if expression.as_str() == "0 12 * * *" && tz.as_str() == "UTC"
+        ));
+
+        let once = load(Cursor::new(ONCE_TIMER)).unwrap().remove(0);
+        assert_eq!(once.schedule(), Some(&TimerSchedule::Once { at: 1_000 }));
+    }
+
+    #[test]
+    fn timer_explicit_latest_catch_up_is_typed() {
+        let latest_source = INTERVAL_TIMER.replace(
+            "on = { every = '30m' }",
+            "on = { every = '30m' }\ncatch_up = 'latest'",
+        );
+        let latest = load(Cursor::new(latest_source)).unwrap().remove(0);
+        assert_eq!(latest.catch_up(), &CatchUp::Latest);
+    }
+
+    #[test]
+    fn timer_rejects_unresolved_templates_and_mixed_trigger_forms() {
+        let templated = INTERVAL_TIMER.replace("target = 'a7'", "target = '${event.agent}'");
+        assert_eq!(load(Cursor::new(templated)).unwrap_err().code, "invalid");
+
+        let mixed = INTERVAL_TIMER.replace("every = '30m'", "every = '30m', cron = '0 12 * * *'");
+        assert_eq!(load(Cursor::new(mixed)).unwrap_err().code, "invalid");
     }
 }
