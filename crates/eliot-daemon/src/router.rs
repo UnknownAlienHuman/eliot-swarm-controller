@@ -787,6 +787,20 @@ impl Router {
         &self,
         definitions: &[eliot_store::RuleDefinitionInput],
     ) -> Result<Vec<RuleStateView>> {
+        // Check every canonical definition before the first durable seed. Rule
+        // text is persisted by Store and must use the same known-secret policy
+        // as command semantic data.
+        for definition in definitions {
+            let value: Value = serde_json::from_str(&definition.canonical_definition)
+                .map_err(|_| Error::new("invalid", "canonical rule definition is invalid"))?;
+            if contains_known_secret_including_keys(&value, &self.inner.secrets) {
+                return Err(Error::new(
+                    "secret_in_payload",
+                    "rule definition contains a known credential",
+                ));
+            }
+        }
+
         let mut store = self.inner.store.lock().await;
         let now = now_ms();
         definitions
@@ -3571,6 +3585,75 @@ mod tests {
             Arc::new(AsyncMutex::new(store)),
             Bus::new(16),
         )
+    }
+
+    #[tokio::test]
+    async fn global_rule_known_secret_is_rejected_before_any_rule_seed() {
+        const SECRET: &str = "fixture-known-rule-secret";
+
+        let router = router();
+        router
+            .inner
+            .secrets
+            .lock_recover()
+            .insert(SECRET.to_owned());
+        let (before_high_water, before_events) = {
+            let store = router.inner.store.lock().await;
+            (
+                store.high_water().unwrap(),
+                store.read_events(0, 100, None).unwrap(),
+            )
+        };
+        let make_rule = |id: &str, matches: serde_json::Map<String, Value>| {
+            let value = json!({
+                "id":id,
+                "enabled":true,
+                "on":{"event":"turn.completed", "match":matches},
+                "do":[{"action":"stop", "target":"${event.agent}",
+                    "expected_generation":"${event.generation}"}],
+            });
+            eliot_store::RuleDefinitionInput {
+                id: id.to_owned(),
+                canonical_definition: serde_json::to_string(&value).unwrap(),
+                definition_digest: eliot_core::canonical_json_sha256(&value).unwrap(),
+                enabled: true,
+            }
+        };
+        let mut ordinary_match = serde_json::Map::new();
+        ordinary_match.insert("subject.harness".to_owned(), json!("fake"));
+        let ordinary_definition = make_rule("ordinary-first", ordinary_match);
+        let mut secret_value_match = serde_json::Map::new();
+        secret_value_match.insert("subject.harness".to_owned(), json!(SECRET));
+        let secret_value_definition = make_rule("secret-match", secret_value_match);
+        let mut dynamic_match = serde_json::Map::new();
+        dynamic_match.insert(format!("data.{SECRET}"), json!("ordinary-value"));
+        let secret_key_definition = make_rule("secret-match-key", dynamic_match);
+
+        for definitions in [
+            vec![ordinary_definition, secret_value_definition],
+            vec![secret_key_definition],
+        ] {
+            let error = router
+                .initialize_global_rules(&definitions)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "secret_in_payload");
+            assert!(error.diagnostics.is_empty());
+            assert!(!error.message.contains(SECRET));
+            assert!(!format!("{error:?}").contains(SECRET));
+
+            let store = router.inner.store.lock().await;
+            for definition in &definitions {
+                assert!(
+                    store
+                        .get_rule_state("owner", &definition.id)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            assert_eq!(store.high_water().unwrap(), before_high_water);
+            assert_eq!(store.read_events(0, 100, None).unwrap(), before_events);
+        }
     }
 
     #[cfg(windows)]
