@@ -2718,10 +2718,52 @@ fn fake_discovery_observation_and_worktree_lifecycle() {
             .unwrap_or_else(|_| panic!("private history event readback failed")),
     )
     .expect("typed private-history readback boundary");
-    assert_eq!(
-        history_after.high_water, history_before.high_water,
-        "private pages published durable events"
+    assert!(
+        history_after.high_water >= history_before.high_water,
+        "private-history event readback regressed"
     );
+    assert!(
+        !history_after.truncated,
+        "event attribution requires the complete bounded event page"
+    );
+    let process_owner = format!("agent:{observer}#{observed_generation}");
+    for event in history_after
+        .events
+        .iter()
+        .filter(|event| event.seq > history_before.high_water)
+    {
+        // The Windows OS sampler can publish process transitions or health
+        // changes after this baseline; private history pages cannot publish.
+        let process_monitor_event = matches!(
+            event.kind.as_str(),
+            "process.started" | "process.exited" | "process.unknown"
+        ) && event.agent.as_deref() == Some(observer)
+            && event.generation == Some(observed_generation)
+            && event.source == "os"
+            && event.data["owner"].as_str() == Some(process_owner.as_str());
+        let os_health_event = event.kind == "source.health"
+            && event.agent.as_deref() == Some(observer)
+            && event.generation == Some(observed_generation)
+            && event.source == "daemon"
+            && event.data["source"] == "os";
+        assert!(
+            process_monitor_event || os_health_event,
+            "private history readback coincided with an event outside this observer's OS monitor: {event:?}"
+        );
+        let serialized = serde_json::to_string(event).expect("serialize attributed monitor event");
+        for private_content in [
+            "fake-discovered-1",
+            "fake-observed-turn-1",
+            "fake-observed-turn-2",
+            "fake observation history fixture",
+        ] {
+            assert!(
+                !serialized.contains(private_content),
+                "private observation content was published in event {}",
+                event.seq
+            );
+        }
+    }
     assert_eq!(
         fixture.json(&["cmd", "show", attached["command_id"].as_str().unwrap()]),
         attach_command,
