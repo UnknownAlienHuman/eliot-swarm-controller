@@ -6,8 +6,8 @@ use crate::{
     workspaces::WorkspaceManager,
 };
 use eliot_core::{
-    Agent, AgentState, Command, CommandState, Error, Event, Result, SecretPolicy, SubmitCommand,
-    Turn, TurnState, WorkspacePhase, WorkspacePreparationInput,
+    Agent, AgentState, Command, CommandState, Error, Event, NativeStoreBinding, Result,
+    SecretPolicy, SubmitCommand, Turn, TurnState, WorkspacePhase, WorkspacePreparationInput,
     api::{
         AgentDiscoverRequest, AgentEditsRequest, AgentEditsResponse, AgentGetRequest,
         AgentGetResponse, AgentGitRequest, AgentGitResponse, AgentHistoryRequest, AgentListRequest,
@@ -1609,6 +1609,40 @@ impl Router {
             self.signal_progress();
             return;
         }
+        let launch_binding = if command.verb == "launch" {
+            let agent = match self.accepted_launch_agent(&id).await {
+                Ok(Some(agent)) => agent,
+                Ok(None) => return, // A retained/settled command cannot acquire new I/O.
+                Err(error) => {
+                    self.reject_undispatched(&id, &error.code).await;
+                    return;
+                }
+            };
+            if agent.harness == "codex" {
+                let resolved = async {
+                    let workspace = agent
+                        .workspace
+                        .as_deref()
+                        .ok_or_else(|| Error::new("invalid", "launch workspace is missing"))?;
+                    self.inner
+                        .plugin_host
+                        .profile_store(agent.profile_snapshot.clone(), workspace)
+                        .await
+                }
+                .await;
+                match resolved {
+                    Ok(binding) => Some((agent, binding)),
+                    Err(error) => {
+                        self.reject_undispatched(&id, &error.code).await;
+                        return;
+                    }
+                }
+            } else {
+                None // Fake retains its ordinary dispatch; no metadata filesystem I/O.
+            }
+        } else {
+            None
+        };
         let resume_source_state = match self.capture_resume_source_state(&id).await {
             Ok(source_state) => source_state,
             Err(error) => {
@@ -1619,7 +1653,16 @@ impl Router {
         let dispatched = loop {
             let change = {
                 let mut store = self.inner.store.lock().await;
-                let result = match store.dispatch(&id, now_ms()) {
+                let dispatched = match &launch_binding {
+                    Some((expected_agent, binding)) => store.dispatch_with_native_store_binding(
+                        &id,
+                        now_ms(),
+                        expected_agent,
+                        binding,
+                    ),
+                    None => store.dispatch(&id, now_ms()),
+                };
+                let result = match dispatched {
                     Ok(change) => {
                         self.publish_locked(&change.events);
                         Ok(change)
@@ -1654,15 +1697,8 @@ impl Router {
                 }
                 Ok(change) => break change.value,
                 Err(error) => {
-                    if change.1 {
-                        self.note_unknown_id(&id, "store_dispatch_outcome_unknown");
-                    } else if matches!(
-                        error.code.as_str(),
-                        "bad_state" | "stale_generation" | "not_found"
-                    ) {
-                        self.reject_undispatched(&id, &error.code).await;
-                    }
-                    self.signal_progress();
+                    self.settle_dispatch_error(&id, &error, change.1, launch_binding.is_some())
+                        .await;
                     return;
                 }
             }
@@ -1934,6 +1970,62 @@ impl Router {
         self.signal_progress();
     }
 
+    async fn settle_dispatch_error(
+        &self,
+        id: &str,
+        error: &Error,
+        write_faulted: bool,
+        native_binding: bool,
+    ) {
+        // This is only the local Store dispatch result, before any control RPC.
+        // A plugin error with the same code still follows post-I/O C1 handling.
+        if write_faulted {
+            self.note_unknown_id(id, "store_dispatch_outcome_unknown");
+        } else if matches!(
+            error.code.as_str(),
+            "bad_state" | "stale_generation" | "not_found"
+        ) || native_binding
+            && matches!(
+                error.code.as_str(),
+                "source_integrity" | "frame_too_large" | "invalid"
+            )
+        {
+            self.reject_undispatched(id, &error.code).await;
+        }
+        self.signal_progress();
+    }
+
+    async fn accepted_launch_agent(&self, command_id: &str) -> Result<Option<Agent>> {
+        let agent = {
+            let store = self.inner.store.lock().await;
+            let command = store
+                .get_command(command_id)?
+                .ok_or_else(|| Error::new("not_found", "launch command was not found"))?;
+            if command.verb != "launch" || command.state != CommandState::Accepted {
+                return Ok(None);
+            }
+            let target = command
+                .target
+                .as_deref()
+                .ok_or_else(|| Error::new("bad_state", "launch target is missing"))?;
+            let agent = store
+                .get_agent(target)?
+                .ok_or_else(|| Error::new("not_found", "launch Agent was not found"))?;
+            if command.generation != Some(agent.generation)
+                || agent.generation != 0
+                || agent.state != AgentState::Created
+                || agent.observe_only
+            {
+                return Err(Error::new(
+                    "stale_generation",
+                    "launch no longer targets its admitted Agent",
+                ));
+            }
+            agent
+        };
+        Ok(Some(agent))
+    }
+
     async fn capture_resume_source_state(&self, command_id: &str) -> Result<Option<Value>> {
         let (generation, source, latest_turn) = {
             let store = self.inner.store.lock().await;
@@ -1958,6 +2050,33 @@ impl Router {
                     "resume did not capture its old generation",
                 )
             })?;
+            let agent = store
+                .get_agent(&agent_id)?
+                .ok_or_else(|| Error::new("not_found", "resume Agent was not found"))?;
+            let binding: NativeStoreBinding = agent
+                .profile_snapshot
+                .get("native_store_binding")
+                .cloned()
+                .ok_or_else(|| {
+                    Error::new(
+                        "unsupported",
+                        "resume requires a retained native store binding",
+                    )
+                })
+                .and_then(|value| {
+                    serde_json::from_value(value).map_err(|_| {
+                        Error::new(
+                            "source_integrity",
+                            "retained native store binding is malformed",
+                        )
+                    })
+                })?;
+            if agent.native_scope.as_deref() != Some(binding.native_scope.as_str()) {
+                return Err(Error::new(
+                    "source_integrity",
+                    "resume native scope differs from its retained store binding",
+                ));
+            }
             if command.generation != Some(generation) {
                 return Err(Error::new(
                     "stale_generation",
@@ -3172,6 +3291,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_store_binding_dispatch_keeps_caller_payload_and_settles_validation_failure() {
+        let router = router();
+        let mut request = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+        request.args = json!({"project":"binding-test", "workspace":"synthetic-workspace", "profile":"fixture", "harness":"codex",
+            "profile_snapshot":{"harness":"codex", "pass_env":[], "pass_env_values":{"CODEX_HOME":null,"CODEX_SQLITE_HOME":null}}});
+        {
+            let mut store = router.inner.store.lock().await;
+            store.submit("owner", request.clone(), now_ms()).unwrap();
+        }
+        let expected = router
+            .accepted_launch_agent(&request.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let directory = std::env::temp_dir().to_str().unwrap().to_owned();
+        let binding = NativeStoreBinding {
+            home: directory.clone(),
+            root: directory,
+            native_scope: "verified-test-scope".to_owned(),
+        };
+        {
+            let mut store = router.inner.store.lock().await;
+            let change = store
+                .dispatch_with_native_store_binding(&request.id, now_ms(), &expected, &binding)
+                .unwrap();
+            router.publish_locked(&change.events);
+            assert_eq!(change.value.state, CommandState::Dispatched);
+            assert_eq!(change.value.args, request.args);
+            let agent = store.get_agent(&expected.id).unwrap().unwrap();
+            assert_eq!(
+                agent.profile_snapshot["native_store_binding"],
+                serde_json::to_value(&binding).unwrap()
+            );
+            assert!(
+                !store
+                    .submit("owner", request.clone(), now_ms())
+                    .unwrap()
+                    .is_new
+            );
+        }
+        assert!(
+            router
+                .accepted_launch_agent(&request.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let mut invalid = request.clone();
+        invalid.id = ulid::Ulid::new().to_string();
+        {
+            let mut store = router.inner.store.lock().await;
+            store.submit("owner", invalid.clone(), now_ms()).unwrap();
+        }
+        let expected = router
+            .accepted_launch_agent(&invalid.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut oversized = binding;
+        oversized
+            .root
+            .push_str(&"x".repeat(eliot_plugin::MAX_FRAME_BYTES));
+        let (error, faulted) = {
+            let mut store = router.inner.store.lock().await;
+            let error = store
+                .dispatch_with_native_store_binding(&invalid.id, now_ms(), &expected, &oversized)
+                .unwrap_err();
+            assert_eq!(error.code, "frame_too_large");
+            assert_eq!(
+                store.get_command(&invalid.id).unwrap().unwrap().state,
+                CommandState::Accepted
+            );
+            (error, store.is_write_faulted())
+        };
+        assert!(!faulted);
+        router
+            .settle_dispatch_error(&invalid.id, &error, faulted, true)
+            .await;
+        let store = router.inner.store.lock().await;
+        let rejected = store.get_command(&invalid.id).unwrap().unwrap();
+        assert_eq!(rejected.state, CommandState::Rejected);
+        assert_eq!(rejected.args, invalid.args);
+        assert!(store.get_agent_token(&expected.id, 0).unwrap().is_none());
+        assert!(
+            !store
+                .read_events(0, 1000, None)
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == "command.dispatched"
+                    && event.data["command_id"] == invalid.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn native_store_binding_fake_launch_skips_metadata_resolution() {
+        let router = router();
+        let mut request = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+        request.args = json!({"project":"legacy-fake", "workspace":"missing-synthetic-workspace"});
+        {
+            let mut store = router.inner.store.lock().await;
+            store.submit("owner", request.clone(), now_ms()).unwrap();
+        }
+        router
+            .clone()
+            .process_command_inner(request.id.clone(), None)
+            .await;
+        let store = router.inner.store.lock().await;
+        let command = store.get_command(&request.id).unwrap().unwrap();
+        // Fake reaches its existing start validation; no metadata process is
+        // spawned for a synthetic/nonexistent workspace or legacy snapshot.
+        assert_eq!(command.state, CommandState::Unknown);
+        assert_eq!(command.outcome.unwrap()["code"], "invalid");
+        assert!(
+            store
+                .read_events(0, 1000, None)
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == "command.dispatched"
+                    && event.data["command_id"] == request.id)
+        );
+        let agent = store
+            .get_agent(command.target.as_deref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(agent.profile_snapshot.get("native_store_binding").is_none());
+    }
+
+    #[tokio::test]
     async fn native_store_inputs_retained_hydration_survives_store_reopen() {
         let root = std::env::temp_dir().join(format!("eliot-store-inputs-{}", ulid::Ulid::new()));
         std::fs::create_dir(&root).unwrap();
@@ -3206,7 +3454,14 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("pass_env_values");
-        {
+        // Supply a typed metadata result at the Store boundary; no native probe
+        // is run by this persistence/hydration regression.
+        let binding = NativeStoreBinding {
+            home: root.to_str().unwrap().to_owned(),
+            root: root.to_str().unwrap().to_owned(),
+            native_scope: "retained-launch-store".to_owned(),
+        };
+        let launch_agent = {
             let mut store = eliot_store::Store::open(&db).unwrap();
             for request in [&launch, &attach, &legacy] {
                 assert!(
@@ -3216,7 +3471,18 @@ mod tests {
                         .is_new
                 );
             }
-        }
+            let target = store
+                .get_command(&launch_id)
+                .unwrap()
+                .unwrap()
+                .target
+                .unwrap();
+            let expected = store.get_agent(&target).unwrap().unwrap();
+            store
+                .dispatch_with_native_store_binding(&launch_id, now_ms(), &expected, &binding)
+                .unwrap();
+            target
+        };
         let store = eliot_store::Store::open(&db).unwrap();
         let router = Router::new(
             root.join("no-current-config"),
@@ -3236,6 +3502,11 @@ mod tests {
             // A retained ID must return before current config or selector capture.
             assert!(router.freeze_launch_profile(&mut retry).await.unwrap());
             assert_eq!(retry.args, original.args);
+            assert!(
+                retry.args["profile_snapshot"]
+                    .get("native_store_binding")
+                    .is_none()
+            );
             let mut store = router.inner.store.lock().await;
             assert!(!store.submit("owner", retry, now_ms()).unwrap().is_new);
         }
@@ -3252,8 +3523,22 @@ mod tests {
             assert!(!store.submit("owner", retry, now_ms()).unwrap().is_new);
             assert_eq!(store.high_water().unwrap(), before);
             assert_eq!(
+                store.get_command(&launch_id).unwrap().unwrap().args,
+                launch.args
+            );
+            assert_eq!(
                 store.get_command(&launch_id).unwrap().unwrap().args["profile_snapshot"],
                 snapshot
+            );
+            let mut derived_snapshot = snapshot.clone();
+            derived_snapshot["native_store_binding"] = serde_json::to_value(&binding).unwrap();
+            assert_eq!(
+                store
+                    .get_agent(&launch_agent)
+                    .unwrap()
+                    .unwrap()
+                    .profile_snapshot,
+                derived_snapshot
             );
             assert!(
                 store.get_command(&legacy.id).unwrap().unwrap().args["profile_snapshot"]

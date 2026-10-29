@@ -1994,6 +1994,25 @@ fn source_secret_snapshot(
     known.into()
 }
 
+fn metadata_secret_snapshot(
+    profile: &Value,
+    environment: &Value,
+    known: Vec<String>,
+) -> Arc<[String]> {
+    let mut policy_profile = profile.clone();
+    if let Some(names) = policy_profile
+        .get_mut("pass_env")
+        .and_then(Value::as_array_mut)
+    {
+        // Exclude contributions by NAME, never subtract a matching secret value.
+        names.retain(|name| {
+            name.as_str()
+                .is_none_or(|name| crate::config::native_store_selector(name).is_none())
+        });
+    }
+    source_secret_snapshot(&policy_profile, environment, known)
+}
+
 pub(crate) fn build_process_environment(profile: &Value) -> Result<Map<String, Value>> {
     build_process_environment_with(profile, |name| std::env::var_os(name))
 }
@@ -2451,6 +2470,40 @@ mod tests {
     const SECRET: &str = "__payload_guard_secret__";
     const SECRET_ERROR: &str =
         "native source payload contains a known secret in immutable metadata";
+
+    #[test]
+    fn native_store_metadata_excludes_selector_contributions_not_matching_secrets() {
+        let profile = json!({"pass_env":["CODEX_HOME", "CODEX_SQLITE_HOME", "OTHER_CREDENTIAL"]});
+        let environment = json!({"CODEX_HOME":"same-literal", "CODEX_SQLITE_HOME":"sqlite-only", "OTHER_CREDENTIAL":"same-literal"});
+        let policy = metadata_secret_snapshot(
+            &profile,
+            &environment,
+            vec![
+                "owner-secret".to_owned(),
+                "instance-secret".to_owned(),
+                "agent-secret".to_owned(),
+            ],
+        );
+        let policy = SecretPolicy::new(policy.iter());
+        assert!(!policy.contains_text("sqlite-only"));
+        for value in [
+            "same-literal",
+            "owner-secret",
+            "instance-secret",
+            "agent-secret",
+        ] {
+            assert!(policy.contains_text(value));
+        }
+        let selectors_only = json!({"pass_env":["CODEX_HOME", "CODEX_SQLITE_HOME"]});
+        let metadata = metadata_secret_snapshot(
+            &selectors_only,
+            &environment,
+            vec!["same-literal".to_owned()],
+        );
+        assert!(SecretPolicy::new(metadata.iter()).contains_text("same-literal"));
+        let diagnostics = source_secret_snapshot(&selectors_only, &environment, Vec::new());
+        assert!(SecretPolicy::new(diagnostics.iter()).contains_text("sqlite-only"));
+    }
 
     #[test]
     fn native_store_inputs_runtime_uses_capture_and_final_secret_environment() {

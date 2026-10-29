@@ -15,12 +15,12 @@ use crate::{
     },
     observe::ObserverSession,
 };
-use eliot_core::{Error, ProcessRecord, ProcessState, Result, SecretPolicy};
+use eliot_core::{Error, NativeStoreBinding, ProcessRecord, ProcessState, Result, SecretPolicy};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, DiscoverParams,
     InitializeParams, MAX_EVENT_BYTES, MAX_TEXT_BYTES, ObserverAttachParams, ObserverDetachParams,
     ObserverSnapshotParams, Peer, PeerClient, PluginManifest, RpcRequest,
-    protocol::{MAX_COMMAND_ID_BYTES, MAX_CREDENTIAL_BYTES},
+    protocol::{MAX_COMMAND_ID_BYTES, MAX_CREDENTIAL_BYTES, ProfileStoreParams},
 };
 use serde_json::{Value, json};
 use std::{
@@ -114,6 +114,7 @@ enum ControlOutcome {
 struct TargetEnvironment {
     variables: Vec<(OsString, OsString)>,
     secrets: Vec<String>,
+    metadata_secrets: Vec<String>,
 }
 
 struct ResumeSubject {
@@ -195,6 +196,7 @@ impl CodexPlugin {
         let result = match request.method.as_str() {
             "initialize" => self.initialize(&request.params),
             "discover" => self.discover(&request.params).await,
+            "profile.store" => self.profile_store(&request.params).await,
             "agent.attach" => self.attach(&request.params).await,
             "agent.detach" => self.detach(&request.params).await,
             "agent.start" => self.start(&request.params, client).await,
@@ -278,7 +280,8 @@ impl CodexPlugin {
             ));
         }
         let params: DiscoverParams = decode(raw, "Codex discover params are invalid")?;
-        let (launch, secrets) = self.reader_launch(&params.profile, &params.target_environment)?;
+        let (launch, secrets, _) =
+            self.reader_launch(&params.profile, &params.target_environment)?;
         crate::discovery::discover(params, launch, secrets).await
     }
 
@@ -286,7 +289,7 @@ impl CodexPlugin {
         &self,
         profile: &Value,
         environment: &Value,
-    ) -> Result<(NativeLaunch, Vec<String>)> {
+    ) -> Result<(NativeLaunch, Vec<String>, Vec<String>)> {
         let initialized = self.initialized.as_ref().ok_or_else(not_initialized)?;
         let profile = profile.as_object().ok_or_else(|| {
             Error::new(
@@ -313,6 +316,7 @@ impl CodexPlugin {
         let TargetEnvironment {
             variables,
             mut secrets,
+            mut metadata_secrets,
         } = target_environment(Some(environment), profile.get("pass_env"))?;
         if variables.iter().any(|(name, _)| {
             name.to_string_lossy()
@@ -324,16 +328,8 @@ impl CodexPlugin {
                 "discovery cannot receive Agent identity or tokens",
             ));
         }
-        if let Some(environment) = environment.as_object() {
-            for (name, value) in environment {
-                if is_secret_name(name)
-                    && let Some(value) = value.as_str().filter(|value| !value.is_empty())
-                {
-                    secrets.push(value.to_owned());
-                }
-            }
-        }
         secrets.push(initialized.credential.clone());
+        metadata_secrets.push(initialized.credential.clone());
         let launch = NativeLaunch {
             program,
             args: ["app-server", "--listen", "stdio://"]
@@ -343,7 +339,47 @@ impl CodexPlugin {
             cwd: PathBuf::from(&initialized.instance_dir),
             environment: variables,
         };
-        Ok((launch, secrets))
+        Ok((launch, secrets, metadata_secrets))
+    }
+
+    async fn profile_store(&mut self, raw: &Value) -> Result<Value> {
+        if self.session.is_some() || self.failed_start.is_some() || self.observer.is_some() {
+            return Err(Error::new(
+                "bad_state",
+                "Codex profile.store requires a dedicated metadata instance",
+            ));
+        }
+        if !raw.is_object() {
+            return Err(Error::new(
+                "invalid",
+                "Codex profile.store params are invalid",
+            ));
+        }
+        let params: ProfileStoreParams = decode(raw, "Codex profile.store params are invalid")?;
+        let workspace = Path::new(&params.workspace);
+        if params.workspace.trim().is_empty() || !workspace.is_dir() {
+            return Err(Error::new(
+                "profile_error",
+                "Codex profile.store requires an existing workspace",
+            ));
+        }
+        let (mut launch, diagnostic_secrets, metadata_secrets) =
+            self.reader_launch(&params.profile, &params.target_environment)?;
+        launch.cwd = workspace.to_path_buf();
+        let binding = crate::discovery::profile_store(
+            &launch,
+            &params.target_environment,
+            &metadata_secrets,
+            &diagnostic_secrets,
+            Instant::now() + crate::discovery::READ_TIMEOUT,
+        )
+        .await?;
+        serde_json::to_value(binding).map_err(|_| {
+            Error::new(
+                "native_scope_unverified",
+                "Codex native store binding could not be encoded",
+            )
+        })
     }
 
     async fn attach(&mut self, raw: &Value) -> Result<Value> {
@@ -358,7 +394,8 @@ impl CodexPlugin {
         if let Some(observer) = &self.observer {
             return observer.repeat_attach(&params);
         }
-        let (launch, secrets) = self.reader_launch(&params.profile, &params.target_environment)?;
+        let (launch, secrets, _) =
+            self.reader_launch(&params.profile, &params.target_environment)?;
         let (observer, result) = ObserverSession::attach(
             params,
             launch,
@@ -461,6 +498,7 @@ impl CodexPlugin {
                 "Codex plugin received a profile for another harness",
             ));
         }
+        let frozen_store = frozen_store_binding(profile)?;
         let requested_model = profile
             .get("model")
             .and_then(Value::as_str)
@@ -534,14 +572,17 @@ impl CodexPlugin {
         let TargetEnvironment {
             variables: environment,
             mut secrets,
+            mut metadata_secrets,
         } = target_environment(params.target_environment.as_ref(), profile.get("pass_env"))?;
         secrets.push(initialized.credential.clone());
+        metadata_secrets.push(initialized.credential.clone());
         let launch = NativeLaunch {
             program,
             args: app_server_args(),
             cwd: workspace.clone(),
             environment,
         };
+        let launch = crate::discovery::pinned_launch_for_binding(&launch, &frozen_store)?;
         let mut native =
             NativeProcess::spawn(launch, SecretPolicy::new(secrets.iter().cloned())).await?;
         let frames = native.take_frames()?;
@@ -615,15 +656,16 @@ impl CodexPlugin {
             return Err(error);
         }
 
-        let (selected_effort, native_scope) = match self
-            .initialize_native(
-                &session.native_client,
-                &workspace,
-                &requested_model,
-                requested_effort.as_deref(),
-                collaboration_mode.is_some(),
-            )
-            .await
+        let (selected_effort, native_scope) = match Self::initialize_native(
+            &session.native_client,
+            &workspace,
+            &requested_model,
+            requested_effort.as_deref(),
+            collaboration_mode.is_some(),
+            &frozen_store,
+            &metadata_secrets,
+        )
+        .await
         {
             Ok((effort, scope)) => (effort, scope),
             Err(error) => {
@@ -897,12 +939,13 @@ impl CodexPlugin {
     }
 
     async fn initialize_native(
-        &self,
         client: &NativeClient,
         workspace: &Path,
         requested_model: &str,
         requested_effort: Option<&str>,
         experimental_api: bool,
+        frozen_store: &NativeStoreBinding,
+        metadata_secrets: &[String],
     ) -> Result<(String, String)> {
         let init_params = NativeInitializeParams {
             client_info: NativeClientInfo {
@@ -945,7 +988,6 @@ impl CodexPlugin {
                 "Codex app-server initialize omitted runtime identity fields",
             ));
         }
-        let native_scope = native_scope(&initialized.codex_home);
         client
             .notify("initialized", None, Instant::now() + RPC_TIMEOUT)
             .await
@@ -956,6 +998,17 @@ impl CodexPlugin {
                     "Codex app-server did not accept initialized",
                 )
             })?;
+
+        crate::discovery::verify_initialized_store(
+            client,
+            &initialized,
+            frozen_store,
+            workspace,
+            metadata_secrets,
+            Instant::now() + RPC_TIMEOUT,
+        )
+        .await?;
+        let native_scope = frozen_store.native_scope.clone();
 
         let account = client
             .call(
@@ -2449,6 +2502,7 @@ fn target_environment(
         return Ok(TargetEnvironment {
             variables: Vec::new(),
             secrets: Vec::new(),
+            metadata_secrets: Vec::new(),
         });
     };
     let object = environment.as_object().ok_or_else(|| {
@@ -2460,6 +2514,7 @@ fn target_environment(
     let pass_env = pass_env.and_then(Value::as_array);
     let mut vars = Vec::with_capacity(object.len());
     let mut secrets = Vec::new();
+    let mut metadata_secrets = Vec::new();
     for (name, value) in object {
         if name.is_empty() || name.contains('=') || name.contains('\0') {
             return Err(Error::new(
@@ -2481,12 +2536,27 @@ fn target_environment(
         });
         if (is_secret_name(name) || explicitly_passed) && !value.is_empty() {
             secrets.push(value.to_owned());
+            // Only selector contributions are public store metadata. Never
+            // remove by value: a credential may have the same bytes as a path.
+            let selector = ["CODEX_HOME", "CODEX_SQLITE_HOME"]
+                .into_iter()
+                .any(|selector| {
+                    if cfg!(windows) {
+                        name.eq_ignore_ascii_case(selector)
+                    } else {
+                        name == selector
+                    }
+                });
+            if !selector {
+                metadata_secrets.push(value.to_owned());
+            }
         }
         vars.push((OsString::from(name), OsString::from(value)));
     }
     Ok(TargetEnvironment {
         variables: vars,
         secrets,
+        metadata_secrets,
     })
 }
 
@@ -2497,6 +2567,24 @@ fn is_secret_name(name: &str) -> bool {
         || upper.contains("PASSWORD")
         || upper.contains("API_KEY")
         || upper.contains("AUTH")
+}
+
+fn frozen_store_binding(profile: &serde_json::Map<String, Value>) -> Result<NativeStoreBinding> {
+    let binding = profile
+        .get("native_store_binding")
+        .filter(|value| value.is_object())
+        .ok_or_else(|| {
+            Error::new(
+                "native_scope_unverified",
+                "Codex controlled start requires its admitted native store binding",
+            )
+        })?;
+    serde_json::from_value(binding.clone()).map_err(|_| {
+        Error::new(
+            "native_scope_unverified",
+            "Codex admitted native store binding is malformed",
+        )
+    })
 }
 
 fn app_server_args() -> Vec<OsString> {
@@ -2585,9 +2673,129 @@ fn not_initialized() -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{target_environment, validate_resume_preflight};
+    use super::{
+        CodexPlugin, Initialized, NativeLaunch, app_server_args, frozen_store_binding,
+        target_environment, validate_resume_preflight,
+    };
     use eliot_core::SecretPolicy;
     use serde_json::json;
+    use std::{ffi::OsString, path::PathBuf};
+
+    #[test]
+    fn store_metadata_policy_excludes_selector_names_not_colliding_credentials() {
+        let profile = json!({
+            "harness": "codex",
+            "pass_env": ["CODEX_HOME", "CODEX_SQLITE_HOME", "DIAGNOSTIC_VALUE"],
+        });
+        for credential_name in [None, Some("DIAGNOSTIC_VALUE"), Some("ELIOT_OWNER_TOKEN")] {
+            let mut environment = json!({
+                "CODEX_HOME": "dummy-home-value",
+                "CODEX_SQLITE_HOME": "dummy-root-value",
+            });
+            if let Some(name) = credential_name {
+                environment[name] = json!("dummy-home-value");
+            }
+            let plugin = CodexPlugin {
+                initialized: Some(Initialized {
+                    // An instance credential colliding with a selector must
+                    // remain protected too, independently of environment names.
+                    credential: "dummy-root-value".to_owned(),
+                    instance_dir: "dummy-private-instance".to_owned(),
+                }),
+                ..CodexPlugin::default()
+            };
+            let (_, diagnostics, metadata) = plugin.reader_launch(&profile, &environment).unwrap();
+            let diagnostics = SecretPolicy::new(diagnostics);
+            let metadata = SecretPolicy::new(metadata);
+            assert!(diagnostics.contains_text("dummy-home-value"));
+            assert!(diagnostics.contains_text("dummy-root-value"));
+            assert_eq!(
+                metadata.contains_text("dummy-home-value"),
+                credential_name.is_some()
+            );
+            assert!(metadata.contains_text("dummy-root-value"));
+        }
+
+        let captured = target_environment(
+            Some(&json!({"CODEX_HOME": "dummy-shared-value", "ELIOT_AGENT_TOKEN": "dummy-shared-value"})),
+            profile.get("pass_env"),
+        ).unwrap();
+        assert!(SecretPolicy::new(captured.metadata_secrets).contains_text("dummy-shared-value"));
+
+        for name in ["CODEX_HOME", "codex_home"] {
+            let names = json!([name]);
+            let captured =
+                target_environment(Some(&json!({(name): "dummy-selector-value"})), Some(&names))
+                    .unwrap();
+            assert!(SecretPolicy::new(captured.secrets).contains_text("dummy-selector-value"));
+            assert_eq!(
+                SecretPolicy::new(captured.metadata_secrets).contains_text("dummy-selector-value"),
+                !cfg!(windows) && name != "CODEX_HOME",
+            );
+        }
+    }
+
+    #[test]
+    fn controlled_start_requires_an_admitted_binding_without_legacy_reselection() {
+        for profile in [
+            json!({"pass_env_values": {"CODEX_HOME": null, "CODEX_SQLITE_HOME": null}}),
+            json!({"native_store_binding": null}),
+            json!({"native_store_binding": {"home": "fixture", "root": "fixture"}}),
+            json!({"native_store_binding": ["fixture", "fixture", "fixture"]}),
+        ] {
+            let error = frozen_store_binding(profile.as_object().unwrap()).unwrap_err();
+            assert_eq!(error.code, "native_scope_unverified");
+        }
+    }
+
+    #[test]
+    fn controlled_launch_pins_binding_despite_changed_selector_inputs() {
+        let home = if cfg!(windows) {
+            r"C:\fixture\frozen-home"
+        } else {
+            "/fixture/frozen-home"
+        };
+        let root = if cfg!(windows) {
+            r"C:\fixture\frozen-root"
+        } else {
+            "/fixture/frozen-root"
+        };
+        let profile = json!({"native_store_binding": {
+            "home": home, "root": root, "native_scope": "fixture-retained-scope",
+        }});
+        let binding = frozen_store_binding(profile.as_object().unwrap()).unwrap();
+        let launch = NativeLaunch {
+            program: OsString::from("codex-not-executed"),
+            args: app_server_args(),
+            cwd: PathBuf::from(home),
+            environment: vec![
+                (
+                    OsString::from("CODEX_HOME"),
+                    OsString::from("changed-home-input"),
+                ),
+                (
+                    OsString::from("CODEX_SQLITE_HOME"),
+                    OsString::from("changed-root-input"),
+                ),
+            ],
+        };
+        let pinned = crate::discovery::pinned_launch_for_binding(&launch, &binding).unwrap();
+        let homes: Vec<_> = pinned
+            .environment
+            .iter()
+            .filter(|(name, _)| name.to_str() == Some("CODEX_HOME"))
+            .collect();
+        assert_eq!(homes.len(), 1);
+        assert_eq!(homes[0].1.to_str(), Some(home));
+        let sqlite_pin = format!("sqlite_home={}", serde_json::to_string(root).unwrap());
+        assert!(
+            pinned
+                .args
+                .iter()
+                .any(|arg| arg.to_str() == Some(sqlite_pin.as_str()))
+        );
+        assert_eq!(binding.native_scope, "fixture-retained-scope");
+    }
 
     #[test]
     fn producer_policy_includes_explicit_pass_env_values_from_target_environment() {

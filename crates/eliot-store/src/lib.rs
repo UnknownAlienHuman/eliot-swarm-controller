@@ -7,10 +7,11 @@ mod canonical;
 use eliot_core::{
     self as core, Agent, AgentEdit, AgentState, BatchAck, Command, CommandState, Effect, Event,
     FileChangeHint, FrozenSetupFile, GitBaseline, GitHintPage, GitSnapshot, NativeEvent,
-    PendingRequest, ProcessIdentity, ProcessRecord, ProcessSnapshot, ProcessState, SourceBatch,
-    SourceGap, SourceGapAck, SubmitCommand, Turn, TurnState, WorkspaceCancelOutcome,
-    WorkspaceCreationOutcome, WorkspacePhase, WorkspacePreparation, WorkspacePreparationInput,
-    WorkspaceRemovalOutcome, WorkspaceSetupArg, WorkspaceSetupOutcome, parse_agent_id,
+    NativeStoreBinding, PendingRequest, ProcessIdentity, ProcessRecord, ProcessSnapshot,
+    ProcessState, SourceBatch, SourceGap, SourceGapAck, SubmitCommand, Turn, TurnState,
+    WorkspaceCancelOutcome, WorkspaceCreationOutcome, WorkspacePhase, WorkspacePreparation,
+    WorkspacePreparationInput, WorkspaceRemovalOutcome, WorkspaceSetupArg, WorkspaceSetupOutcome,
+    parse_agent_id,
 };
 pub use eliot_core::{Error, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -540,6 +541,17 @@ impl Store {
             return Err(Error::new(
                 "id_conflict",
                 "mutation id is already used by another write",
+            ));
+        }
+        if matches!(request.verb.as_str(), "launch" | "attach")
+            && request
+                .args
+                .get("profile_snapshot")
+                .is_some_and(|snapshot| snapshot.get("native_store_binding").is_some())
+        {
+            return Err(Error::new(
+                "invalid",
+                "native store binding is derived at launch dispatch",
             ));
         }
         validate_id_age(&request.id, now)?;
@@ -1254,12 +1266,32 @@ impl Store {
                 events: change.events,
             });
         }
-        let result = self.dispatch_inner(id, now);
+        let result = self.dispatch_inner(id, now, None);
         self.fault_on_persistence_error(&result);
         result
     }
 
-    fn dispatch_inner(&mut self, id: &str, now: i64) -> Result<Change<Command>> {
+    /// Append the verified store to an unchanged launch target in the same
+    /// transaction that commits its generation, credential and dispatch decision.
+    pub fn dispatch_with_native_store_binding(
+        &mut self,
+        id: &str,
+        now: i64,
+        expected_agent: &Agent,
+        binding: &NativeStoreBinding,
+    ) -> Result<Change<Command>> {
+        self.ensure_writer_healthy()?;
+        let result = self.dispatch_inner(id, now, Some((expected_agent, binding)));
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    fn dispatch_inner(
+        &mut self,
+        id: &str,
+        now: i64,
+        native_store: Option<(&Agent, &NativeStoreBinding)>,
+    ) -> Result<Change<Command>> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1273,6 +1305,12 @@ impl Store {
                     "command {} in state {:?} cannot be dispatched",
                     command.command.id, command.state
                 ),
+            ));
+        }
+        if native_store.is_some() && command.command.verb != "launch" {
+            return Err(Error::new(
+                "bad_state",
+                "native store binding can be appended only at launch dispatch",
             ));
         }
         let agent_num = command.target.ok_or_else(|| {
@@ -1300,12 +1338,18 @@ impl Store {
                     ));
                 }
                 gate_workspace_start(&tx, &agent, &command.command, 1)?;
+                let snapshot = native_store
+                    .map(|(expected, binding)| {
+                        launch_snapshot_with_native_store(&agent, expected, binding, id)
+                    })
+                    .transpose()?;
                 let token = format!("{}{}", Ulid::new(), Ulid::new());
                 let changed = db!(tx.execute(
                     "UPDATE agents SET generation = 1, state = 'starting', token = ?1,
-                                         updated_at = ?2
-                     WHERE id = ?3 AND generation = 0 AND state = 'created'",
-                    params![token, now, agent_num],
+                                         updated_at = ?2,
+                                         profile_snapshot = COALESCE(?3, profile_snapshot)
+                     WHERE id = ?4 AND generation = 0 AND state = 'created'",
+                    params![token, now, snapshot, agent_num],
                 ));
                 if changed != 1 {
                     return Err(Error::new(
@@ -4090,6 +4134,59 @@ fn require_managed_path_ready(connection: &Connection, path: &str) -> Result<()>
         }
     }
     Ok(())
+}
+
+fn launch_snapshot_with_native_store(
+    agent: &Agent,
+    expected: &Agent,
+    binding: &NativeStoreBinding,
+    command_id: &str,
+) -> Result<String> {
+    if expected.id != agent.id
+        || expected.generation != 0
+        || expected.state != AgentState::Created
+        || expected.harness != agent.harness
+        || expected.profile != agent.profile
+        || expected.workspace != agent.workspace
+        || expected.profile_snapshot != agent.profile_snapshot
+    {
+        return Err(Error::new(
+            "stale_generation",
+            "launch target changed during native store verification",
+        ));
+    }
+    let mut snapshot = agent.profile_snapshot.clone();
+    let object = snapshot
+        .as_object_mut()
+        .ok_or_else(|| Error::new("invalid", "frozen profile snapshot must be an object"))?;
+    if let Some(retained) = object.get("native_store_binding") {
+        let retained: NativeStoreBinding =
+            serde_json::from_value(retained.clone()).map_err(|_| {
+                Error::new(
+                    "source_integrity",
+                    "retained native store binding is invalid",
+                )
+            })?;
+        if retained != *binding {
+            return Err(Error::new(
+                "source_integrity",
+                "retained native store binding cannot be replaced",
+            ));
+        }
+    } else {
+        object.insert(
+            "native_store_binding".to_owned(),
+            serde_json::to_value(binding)
+                .map_err(|error| Error::new("invalid", error.to_string()))?,
+        );
+    }
+    let encoded = encode_json(&snapshot)?;
+    let mut start = core::AgentStartParams::new(&agent.id, 1, command_id);
+    start.profile = Some(snapshot);
+    start.workspace = agent.workspace.clone();
+    // Runtime environment/readback are supplied and checked by Host at send.
+    check_rpc_frame("agent.start", &start)?;
+    Ok(encoded)
 }
 
 fn gate_workspace_start(
@@ -7282,7 +7379,7 @@ fn check_input(text: &str) -> Result<()> {
     Ok(())
 }
 
-fn check_rpc_frame(method: &str, params: &Value) -> Result<()> {
+fn check_rpc_frame(method: &str, params: &impl serde::Serialize) -> Result<()> {
     let frame = json!({
         "jsonrpc": "2.0",
         "id": "preflight",

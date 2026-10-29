@@ -172,6 +172,15 @@ Read effective model/provider/cwd/permissions from documented native fields. Whe
 endpoint/billing fact is not exposed, report it as unverified rather than inventing
 readback. An unexpected effective route does not authorize further input.
 
+Controlled launch resolves the effective native store through a dedicated read-only
+`profile.store` reader after workspace preparation, then commits its binding with launch
+dispatch. The controlled app-server pins and verifies that same store before
+`thread/start` or `thread/resume`. Resume reuses the retained binding; a legacy Agent
+without one refuses before native control. This does not change admitted command
+arguments/digests or replay input. See
+[profile binding](../spec/configuration.md#frozen-profile-and-route-binding) and the
+[shared binding type](../../crates/eliot-core/src/native_store.rs).
+
 ## Recovery and later capabilities
 
 Installed Codex 0.161.0 discovery uses `initialize`/`initialized` followed by bounded
