@@ -37,7 +37,10 @@ pub use provider::{
     ProviderClearHoldRequest, ProviderClearHoldResponse, ProviderCorrectiveEvidence,
     ProviderHoldsRequest, ProviderHoldsResponse,
 };
-pub use reads::{AgentResultRequest, AgentResultResponse, CommandGetRequest, TurnGetRequest};
+pub use reads::{
+    AgentResultRequest, AgentResultResponse, CommandGetRequest, RuleGetRequest, RuleStateView,
+    TurnGetRequest,
+};
 
 use crate::{Error, Event, Result};
 use serde::{Deserialize, Serialize};
@@ -486,6 +489,7 @@ mod tests {
                 ts: 0,
                 kind: "fixture".to_owned(),
                 agent: None,
+                subject: None,
                 generation: None,
                 source: "fixture".to_owned(),
                 native_id: None,

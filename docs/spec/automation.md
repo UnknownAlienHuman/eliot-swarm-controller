@@ -78,6 +78,46 @@ text alone. Do not stack timer firings while the previous command set is open/un
 Schedule edits increment schedule revision and start after the edit boundary; action-
 only edits preserve the schedule. Reconcile timers from stored state on restart.
 
+## First connected event slice
+
+The initial L4.1 path loads owner-approved global rules from
+`<data_dir>/rules/*.toml` at daemon startup. It supports only the persisted
+`turn.completed` trigger, exact equality match, and one ordinary `stop` action. The
+match uses the event-time `subject`, not a later Agent read:
+
+```toml
+[[rule]]
+id = "stop-on-result"
+on = { event = "turn.completed", match = { "subject.harness" = "fake" } }
+do = [{ action = "stop", target = "${event.agent}", expected_generation = "${event.generation}" }]
+```
+
+Whole-value rendering preserves the source JSON type, so `expected_generation` remains
+an integer. Templates cannot choose the action, action name, executable, environment or
+authority. The stop target and `expected_generation` must equal the triggering event's
+`agent` and `generation`; another Agent or generation is rejected. A firing atomically
+admits one Store-only parent and one ordinary stop child;
+the parent's fixed child set is durable, and `applied` means admission rather than
+completion. A new rule's captured high-water cursor is seeded atomically with its state.
+Restart keeps the stored definition and cursor for an unchanged definition. A changed
+valid definition for an existing rule is rejected as unsupported, leaving the stored
+definition and cursor in force; backlog is never reinterpreted. Disabled rules advance
+the skipped range without firing.
+
+The default per-rule limit is 10 firings/minute and the global limit is 120 actions/minute.
+Rate accounting counts each already admitted ordinary rule-action child command once and
+excludes Store-only admission parents. Both limits are enforced atomically with command
+admission and cursor advancement. A limit hit records the deterministic skip in a
+Store-only rejected parent and advances without admitting an action child. Explicit
+custom `limit` and `catch_up` values are unsupported here and must be rejected rather
+than ignored.
+
+Other triggers, project rules, non-exact match operators, multiple actions, timers,
+scripts, Goals and hot reload remain unsupported. This stop-only action cannot create a
+new turn event, so the current slice cannot loop on its own `turn.completed`; the target
+cause-depth guard remains required before adding actions that can produce their own
+triggering events. The L4.1 target contract above remains in force.
+
 ## Matching and rendering
 
 The only template roots are `{event, subject, data}`. `subject` may be absent for
@@ -226,7 +266,8 @@ CREATE TABLE goals (
 ```
 
 Goal definition/state retain text/check/cadence, budgets, counters and previous progress
-observations. Action state lives in commands. Recent rule events provide rate accounting.
+observations. Action state lives in commands. Rate accounting counts already admitted
+ordinary action child command rows once; Store-only admission parents are excluded.
 
 ## Guardrails
 

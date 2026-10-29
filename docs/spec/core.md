@@ -185,10 +185,14 @@ Private authenticated `source.state` may include a derived `observer_ready` proo
 this field is not part of the public Agent `source_states` projection. An open source
 or dispatched attach does not establish readiness.
 
-`subject` is the bounded event-time post-transition Agent projection for rules:
-`{id,generation,project,parent,root,depth,harness,profile,state,workspace?,branch?,
-control,observe_only,own_identity,labels}`. `cause` carries command/rule/Goal correlation
-and loop depth. Do not later substitute the current Agent row when replaying rules.
+`subject` is the event-time post-transition projection used for rule matching. Persist
+the captured [`Event.subject`](../../crates/eliot-core/src/lib.rs) with the event and
+replay it unchanged; a missing subject remains missing. Its canonical type is
+[`EventSubject`](../../crates/eliot-core/src/lib.rs), while event identity is carried by
+[`Event.agent` and `Event.generation`](../../crates/eliot-core/src/lib.rs). Never look up
+a later Agent row to replace the captured subject. Future hierarchy or labels require
+real L5 sources and callers before they are added to this projection. `cause` carries
+command/rule/Goal correlation and loop depth.
 
 Native families are session/turn/message/tool/request/child/goal/usage/provider/edit.
 Exactly one source owns each implemented family per Agent generation. Daemon-owned

@@ -13,11 +13,11 @@ use eliot_core::api::{
     CommandSubmitResponse, DaemonShutdownRequest, DaemonShutdownResponse, DaemonStatusRequest,
     DaemonStatusResponse, DiscoverPage, EventsFilter, EventsReadRequest, EventsReadResponse,
     EventsSubscribeRequest, EventsSubscribeResponse, MAX_OBSERVATION_CURSOR_BYTES, ObservationPage,
-    PROCESS_CURSOR_MAX_BYTES, ProviderClearHoldResponse, ProviderHoldsResponse, ShutdownMode,
-    TurnGetRequest,
+    PROCESS_CURSOR_MAX_BYTES, ProviderClearHoldResponse, ProviderHoldsResponse, RuleStateView,
+    ShutdownMode, TurnGetRequest,
 };
 use eliot_core::{
-    Command as CoreCommand, CommandState, ProviderHoldState, ProviderRestrictionKind,
+    AgentState, Command as CoreCommand, CommandState, ProviderHoldState, ProviderRestrictionKind,
     Turn as CoreTurn, TurnState,
 };
 use serde_json::{Value, json};
@@ -3979,5 +3979,231 @@ max_live = 3
         serde_json::from_value(fixture.json(&["stop", &agent, "--generation", &generation_arg]))
             .expect("typed Fake stop submission");
     fixture.wait_command(&stop.command_id, "applied");
+    fixture.stop(false);
+}
+
+#[test]
+fn cli_fake_rule_stop_keeps_cursor_and_does_not_replay_after_restart() {
+    let mut fixture = Fixture::new("event rule restart");
+    fixture.start();
+    fixture.stop(false);
+
+    let rules = fixture.data.join("rules");
+    fs::create_dir_all(&rules).expect("create rules under initialized private data root");
+    fs::write(
+        rules.join("stop-on-result.toml"),
+        r#"
+[[rule]]
+id = "stop-on-result"
+on = { event = "turn.completed", match = { "subject.harness" = "fake" } }
+do = [{ action = "stop", target = "${event.agent}", expected_generation = "${event.generation}" }]
+"#,
+    )
+    .expect("write owner-approved global rule");
+
+    fixture.start();
+    let rule_id = "stop-on-result";
+    let load_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let loaded: RuleStateView = loop {
+        let reply = cli(&fixture.data, &["rule", "show", rule_id]);
+        if reply.status.success() {
+            break serde_json::from_str(&reply.stdout).expect("typed startup-loaded rule state");
+        }
+        assert!(
+            std::time::Instant::now() < load_deadline,
+            "startup-loaded rule state deadline"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(loaded.id, rule_id);
+    assert!(loaded.enabled);
+    assert!(loaded.paused_reason.is_none());
+
+    let launched = fixture.json(&[
+        "launch",
+        "--profile",
+        "fake",
+        "--workspace",
+        fixture.workspace.to_str().unwrap(),
+    ]);
+    let agent = launched["target"].as_str().expect("Fake Agent").to_owned();
+    let generation = launched["generation"].as_i64().expect("Fake generation");
+    let generation_arg = generation.to_string();
+    let send_id = ulid::Ulid::new().to_string();
+    let turn: CoreTurn = serde_json::from_value(fixture.json(&[
+        "--id",
+        &send_id,
+        "send",
+        &agent,
+        "--generation",
+        &generation_arg,
+        "--wait",
+        "--timeout-seconds",
+        "10",
+        "--",
+        "rule-trigger-result",
+    ]))
+    .expect("typed Fake result turn");
+    assert_eq!(turn.agent, agent);
+    assert_eq!(turn.generation, generation);
+    assert_eq!(turn.state, TurnState::Completed);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let (state, events, fired) = loop {
+        let state: RuleStateView = serde_json::from_value(fixture.json(&["rule", "show", rule_id]))
+            .expect("typed rule cursor readback");
+        let events = fixture.events();
+        let terminal = events.iter().find(|event| {
+            event["kind"] == "turn.completed"
+                && event["agent"] == agent
+                && event["generation"] == generation
+                && event["data"]["command_id"] == send_id
+        });
+        let fired = events
+            .iter()
+            .find(|event| event["kind"] == "rule.fired" && event["data"]["rule"] == rule_id)
+            .cloned();
+        if let (Some(terminal), Some(fired)) = (terminal, fired)
+            && state.current_cursor >= terminal["seq"].as_i64().expect("terminal event seq")
+        {
+            break (state, events, fired);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "rule cursor and firing event deadline"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+
+    assert_eq!(fired["data"]["revision"], state.revision);
+    let terminal_event = events
+        .iter()
+        .find(|event| {
+            event["kind"] == "turn.completed"
+                && event["agent"] == agent
+                && event["generation"] == generation
+                && event["data"]["command_id"] == send_id
+        })
+        .expect("exact result event");
+    assert_eq!(
+        fired["data"]["event_seq"], terminal_event["seq"],
+        "rule firing is bound to this result event"
+    );
+    assert_eq!(fired["data"]["rule"], rule_id);
+    let parent_id = fired["data"]["parent_command"]
+        .as_str()
+        .expect("firing parent command id")
+        .to_owned();
+    let child_id = fired["data"]["child_command"]
+        .as_str()
+        .expect("firing child command id")
+        .to_owned();
+    let parent: CoreCommand = serde_json::from_value(fixture.wait_command(&parent_id, "applied"))
+        .expect("typed Store-only rule parent");
+    assert_eq!(parent.id, parent_id);
+    assert_eq!(parent.verb, "rule");
+    assert_eq!(parent.target, None);
+    assert_eq!(parent.expected_generation, None);
+    assert_eq!(parent.generation, None);
+    assert_eq!(
+        parent.args,
+        json!({
+            "rule": rule_id,
+            "revision": state.revision,
+            "event_seq": terminal_event["seq"],
+        })
+    );
+    assert_eq!(
+        parent.outcome,
+        Some(json!({"children":[child_id]})),
+        "parent outcome preserves its exact fixed child set"
+    );
+    let child: CoreCommand = serde_json::from_value(fixture.wait_command(&child_id, "applied"))
+        .expect("typed ordinary stop child");
+    assert_eq!(child.id, child_id);
+    assert_eq!(child.verb, "stop");
+    assert_eq!(child.target.as_deref(), Some(agent.as_str()));
+    assert_eq!(child.expected_generation, Some(generation));
+    assert_eq!(child.generation, Some(generation));
+    assert_eq!(child.state, CommandState::Applied);
+    assert_eq!(
+        fault_dispatches(&events, &parent_id),
+        0,
+        "parent is Store-only"
+    );
+    assert_eq!(fault_dispatches(&events, &child_id), 1);
+    let stopped: AgentGetResponse =
+        serde_json::from_value(fixture.json(&["show", &agent])).expect("typed stopped Agent");
+    assert_eq!(stopped.agent.state, AgentState::Stopped);
+    let events = fixture.events();
+
+    let fired_before_restart: Vec<_> = events
+        .iter()
+        .filter(|event| event["kind"] == "rule.fired" && event["data"]["rule"] == rule_id)
+        .cloned()
+        .collect();
+    assert_eq!(fired_before_restart, vec![fired]);
+    let command_events_before_restart: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            let command_id = event["data"]["command_id"].as_str();
+            command_id.is_some_and(|id| id == parent_id.as_str() || id == child_id.as_str())
+        })
+        .cloned()
+        .collect();
+
+    fixture.stop(false);
+    fixture.start();
+    let resume_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let resumed: RuleStateView = loop {
+        let reply = cli(&fixture.data, &["rule", "show", rule_id]);
+        if reply.status.success() {
+            break serde_json::from_str(&reply.stdout).expect("typed resumed rule state");
+        }
+        assert!(
+            std::time::Instant::now() < resume_deadline,
+            "resumed rule state deadline"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(resumed.id, state.id);
+    assert_eq!(resumed.revision, state.revision);
+    assert_eq!(resumed.enabled, state.enabled);
+    assert_eq!(resumed.paused_reason, state.paused_reason);
+    assert!(
+        resumed.current_cursor >= state.current_cursor,
+        "restart rewound the persisted rule cursor"
+    );
+    let after_restart = fixture.events();
+    let fired_after_restart: Vec<_> = after_restart
+        .iter()
+        .filter(|event| event["kind"] == "rule.fired" && event["data"]["rule"] == rule_id)
+        .cloned()
+        .collect();
+    assert_eq!(fired_after_restart, fired_before_restart);
+    assert_eq!(fault_dispatches(&after_restart, &child_id), 1);
+    let command_events_after_restart: Vec<_> = after_restart
+        .iter()
+        .filter(|event| {
+            let command_id = event["data"]["command_id"].as_str();
+            command_id.is_some_and(|id| id == parent_id.as_str() || id == child_id.as_str())
+        })
+        .cloned()
+        .collect();
+    assert_eq!(
+        command_events_after_restart, command_events_before_restart,
+        "restart admitted or dispatched another rule command"
+    );
+    let parent_after_restart: CoreCommand =
+        serde_json::from_value(fixture.json(&["cmd", "show", parent_id.as_str()]))
+            .expect("retained rule parent");
+    let child_after_restart: CoreCommand =
+        serde_json::from_value(fixture.json(&["cmd", "show", child_id.as_str()]))
+            .expect("retained rule child");
+    assert_eq!(parent_after_restart, parent);
+    assert_eq!(child_after_restart, child);
+    let stopped_after_restart: AgentGetResponse =
+        serde_json::from_value(fixture.json(&["show", &agent])).expect("retained stopped Agent");
+    assert_eq!(stopped_after_restart.agent.state, AgentState::Stopped);
     fixture.stop(false);
 }

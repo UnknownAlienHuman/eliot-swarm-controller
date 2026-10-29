@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 
+pub(crate) mod automation;
 mod bus;
 mod common;
 mod config;

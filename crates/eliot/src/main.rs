@@ -11,7 +11,7 @@ use eliot_core::{
         DaemonStatusResponse, DiscoverPage, EventsFilter, EventsReadRequest, EventsReadResponse,
         EventsSubscribeRequest, EventsSubscribeResponse, ObservationPage, ProviderClearHoldRequest,
         ProviderClearHoldResponse, ProviderCorrectiveEvidence, ProviderHoldsRequest,
-        ProviderHoldsResponse, ShutdownMode, TurnGetRequest,
+        ProviderHoldsResponse, RuleGetRequest, RuleStateView, ShutdownMode, TurnGetRequest,
     },
 };
 use serde_json::{Value, json};
@@ -85,6 +85,11 @@ enum CliCommand {
     Provider {
         #[command(subcommand)]
         command: ProviderCommand,
+    },
+    /// Read one startup-loaded global rule.
+    Rule {
+        #[command(subcommand)]
+        command: RuleCommand,
     },
     /// Discover one page of native sessions through an explicit profile.
     Discover {
@@ -379,6 +384,12 @@ enum ProviderCommand {
 }
 
 #[derive(Subcommand)]
+enum RuleCommand {
+    /// Show the current loaded rule state and durable cursor.
+    Show { id: String },
+}
+
+#[derive(Subcommand)]
 enum WorktreeCommand {
     /// Remove a terminal Agent's clean worktree while retaining its branch.
     Remove {
@@ -659,6 +670,9 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 Ok(0)
             }
         },
+        CliCommand::Rule {
+            command: RuleCommand::Show { id },
+        } => read_and_print!("rule.get", RuleGetRequest::new(id), RuleStateView),
         CliCommand::Discover {
             profile,
             harness,

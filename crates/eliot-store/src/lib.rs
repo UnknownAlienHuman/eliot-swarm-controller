@@ -5,15 +5,18 @@
 mod canonical;
 mod capacity;
 mod provider_holds;
+mod rules;
+
+pub use rules::{RuleCursorOutcome, RuleDefinitionInput, RuleEventAdmission};
 
 use eliot_core::{
     self as core, Agent, AgentEdit, AgentState, BatchAck, Command, CommandState, Effect, Event,
-    FileChangeHint, FrozenSetupFile, GitBaseline, GitHintPage, GitSnapshot, NativeEvent,
-    NativeStoreBinding, PendingRequest, ProcessIdentity, ProcessRecord, ProcessSnapshot,
-    ProcessState, SourceBatch, SourceGap, SourceGapAck, SubmitCommand, Turn, TurnState,
-    WorkspaceCancelOutcome, WorkspaceCreationOutcome, WorkspacePhase, WorkspacePreparation,
-    WorkspacePreparationInput, WorkspaceRemovalOutcome, WorkspaceSetupArg, WorkspaceSetupOutcome,
-    parse_agent_id,
+    EventSubject, FileChangeHint, FrozenSetupFile, GitBaseline, GitHintPage, GitSnapshot,
+    NativeEvent, NativeStoreBinding, PendingRequest, ProcessIdentity, ProcessRecord,
+    ProcessSnapshot, ProcessState, SourceBatch, SourceGap, SourceGapAck, SubmitCommand, Turn,
+    TurnState, WorkspaceCancelOutcome, WorkspaceCreationOutcome, WorkspacePhase,
+    WorkspacePreparation, WorkspacePreparationInput, WorkspaceRemovalOutcome, WorkspaceSetupArg,
+    WorkspaceSetupOutcome, parse_agent_id,
 };
 pub use eliot_core::{Error, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -130,7 +133,7 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(sql_error)?;
-        if current > 10 {
+        if current > 11 {
             return Err(Error::new(
                 "unsupported",
                 format!("Store schema version {current} is newer than this binary"),
@@ -449,6 +452,32 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
+        if current < 11 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE events ADD COLUMN subject TEXT;
+                 CREATE TABLE rule_state (
+                     principal TEXT NOT NULL,
+                     rule TEXT NOT NULL,
+                     revision INTEGER NOT NULL CHECK(revision >= 0),
+                     current_definition TEXT NOT NULL,
+                     definition_digest BLOB NOT NULL CHECK(length(definition_digest) = 32),
+                     current_cursor INTEGER NOT NULL CHECK(current_cursor >= 0),
+                     enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+                     paused_reason TEXT,
+                     updated_at INTEGER NOT NULL,
+                     PRIMARY KEY(principal, rule)
+                 );
+                 CREATE INDEX commands_rule_action_window ON commands(created_at)
+                     WHERE link_kind = 'rule_action';
+                 INSERT INTO schema_migrations(version) VALUES (11);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
         Ok(())
     }
 
@@ -509,760 +538,757 @@ impl Store {
         preparation: Option<WorkspacePreparationInput>,
         now: i64,
     ) -> Result<Admission> {
-        require_nonempty(principal, "principal")?;
-        if !request.args.is_object() {
-            return Err(Error::new("invalid", "command args must be a JSON object"));
-        }
-        if request.probe && request.verb != "send" {
-            return Err(Error::new(
-                "bad_state",
-                "provider probes are allowed only for SEND commands",
-            ));
-        }
-        // Bound durable admission data here. Host checks the completed start
-        // frame, including runtime environment and source state, before writing.
-        if request.verb != "attach" && encode_json(&request)?.len() > MAX_FRAME_BYTES {
-            return Err(Error::new(
-                "frame_too_large",
-                "command request exceeds 1 MiB",
-            ));
-        }
-        validate_ulid(&request.id)?;
-        let mut semantic_args = request.args.clone();
-        if request.verb == "attach" {
-            semantic_args
-                .as_object_mut()
-                .ok_or_else(|| Error::new("invalid", "attach args must be an object"))?
-                .remove("profile_snapshot");
-        }
-        let mut semantic_payload = json!({
-            "target": request.target,
-            "verb": request.verb,
-            "args": semantic_args,
-            "expected_generation": request.expected_generation,
-            "expected_turn_id": request.expected_turn_id,
-        });
-        if request.probe {
-            semantic_payload["probe"] = Value::Bool(true);
-        }
-        if let Some(request_id) = request.request_id.as_deref() {
-            let object = semantic_payload.as_object_mut().ok_or_else(|| {
-                Error::new("internal", "command semantic payload is not an object")
-            })?;
-            object.insert(
-                "request_id".to_owned(),
-                Value::String(request_id.to_owned()),
-            );
-        }
-        if encode_json(&semantic_payload)?.len() > MAX_FRAME_BYTES {
-            return Err(Error::new(
-                "frame_too_large",
-                "command semantic request exceeds its bound",
-            ));
-        }
-        let payload_digest = canonical::digest(&semantic_payload)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
+        let admission = submit_tx(&tx, principal, request, preparation, now, false)?;
+        commit_transaction(tx, &self.write_faulted)?;
+        Ok(admission)
+    }
+}
 
-        if let Some((old_principal, old_method, old_digest)) = command_binding(&tx, &request.id)? {
-            if old_principal != principal
-                || old_method != COMMAND_METHOD
-                || old_digest != payload_digest
-            {
-                return Err(Error::new(
-                    "id_conflict",
-                    "command id is already bound to another principal, method, or payload",
-                ));
-            }
-            let command = load_command(&tx, &request.id)?.ok_or_else(|| {
-                Error::new("internal", "command binding exists without its command row")
-            })?;
-            let linked_command = load_linked_command(&tx, &request.id)?;
-            commit_transaction(tx, &self.write_faulted)?;
-            return Ok(Admission {
-                command,
-                linked_command,
-                events: Vec::new(),
-                is_new: false,
-            });
-        }
-        if write_exists(&tx, &request.id)? {
+fn submit_tx(
+    tx: &Transaction<'_>,
+    principal: &str,
+    request: SubmitCommand,
+    preparation: Option<WorkspacePreparationInput>,
+    now: i64,
+    derived_rule: bool,
+) -> Result<Admission> {
+    require_nonempty(principal, "principal")?;
+    if !request.args.is_object() {
+        return Err(Error::new("invalid", "command args must be a JSON object"));
+    }
+    if request.probe && request.verb != "send" {
+        return Err(Error::new(
+            "bad_state",
+            "provider probes are allowed only for SEND commands",
+        ));
+    }
+    // Bound durable admission data here. Host checks the completed start
+    // frame, including runtime environment and source state, before writing.
+    if request.verb != "attach" && encode_json(&request)?.len() > MAX_FRAME_BYTES {
+        return Err(Error::new(
+            "frame_too_large",
+            "command request exceeds 1 MiB",
+        ));
+    }
+    validate_ulid(&request.id)?;
+    let mut semantic_args = request.args.clone();
+    if request.verb == "attach" {
+        semantic_args
+            .as_object_mut()
+            .ok_or_else(|| Error::new("invalid", "attach args must be an object"))?
+            .remove("profile_snapshot");
+    }
+    let mut semantic_payload = json!({
+        "target": request.target,
+        "verb": request.verb,
+        "args": semantic_args,
+        "expected_generation": request.expected_generation,
+        "expected_turn_id": request.expected_turn_id,
+    });
+    if request.probe {
+        semantic_payload["probe"] = Value::Bool(true);
+    }
+    if let Some(request_id) = request.request_id.as_deref() {
+        let object = semantic_payload
+            .as_object_mut()
+            .ok_or_else(|| Error::new("internal", "command semantic payload is not an object"))?;
+        object.insert(
+            "request_id".to_owned(),
+            Value::String(request_id.to_owned()),
+        );
+    }
+    if encode_json(&semantic_payload)?.len() > MAX_FRAME_BYTES {
+        return Err(Error::new(
+            "frame_too_large",
+            "command semantic request exceeds its bound",
+        ));
+    }
+    let payload_digest = canonical::digest(&semantic_payload)?;
+    if let Some((old_principal, old_method, old_digest)) = command_binding(tx, &request.id)? {
+        if old_principal != principal
+            || old_method != COMMAND_METHOD
+            || old_digest != payload_digest
+        {
             return Err(Error::new(
                 "id_conflict",
-                "mutation id is already used by another write",
+                "command id is already bound to another principal, method, or payload",
             ));
         }
-        if matches!(request.verb.as_str(), "launch" | "attach")
-            && request
-                .args
-                .get("profile_snapshot")
-                .is_some_and(|snapshot| snapshot.get("native_store_binding").is_some())
-        {
+        let command = load_command(tx, &request.id)?.ok_or_else(|| {
+            Error::new("internal", "command binding exists without its command row")
+        })?;
+        let linked_command = load_linked_command(tx, &request.id)?;
+        return Ok(Admission {
+            command,
+            linked_command,
+            events: Vec::new(),
+            is_new: false,
+        });
+    }
+    if write_exists(tx, &request.id)? {
+        return Err(Error::new(
+            "id_conflict",
+            "mutation id is already used by another write",
+        ));
+    }
+    if matches!(request.verb.as_str(), "launch" | "attach")
+        && request
+            .args
+            .get("profile_snapshot")
+            .is_some_and(|snapshot| snapshot.get("native_store_binding").is_some())
+    {
+        return Err(Error::new(
+            "invalid",
+            "native store binding is derived at launch dispatch",
+        ));
+    }
+    if !derived_rule {
+        validate_id_age(&request.id, now)?;
+    }
+    if !matches!(request.verb.as_str(), "attach" | "detach")
+        && let Some(target) = request.target.as_deref()
+        && let Some(agent) = load_agent_by_num(tx, parse_agent_id(target)?)?
+    {
+        observer::require_controlled(&agent)?;
+    }
+    if let Some(input) = &preparation {
+        if !matches!(request.verb.as_str(), "launch" | "resume") {
             return Err(Error::new(
                 "invalid",
-                "native store binding is derived at launch dispatch",
+                "workspace preparation requires launch or resume",
             ));
         }
-        validate_id_age(&request.id, now)?;
-        if !matches!(request.verb.as_str(), "attach" | "detach")
-            && let Some(target) = request.target.as_deref()
-            && let Some(agent) = load_agent_by_num(&tx, parse_agent_id(target)?)?
-        {
-            observer::require_controlled(&agent)?;
+        validate_workspace_input(input)?;
+    } else if request.verb == "launch"
+        && request
+            .args
+            .get("worktree")
+            .is_some_and(|value| !value.is_null())
+    {
+        return Err(Error::new(
+            "invalid",
+            "worktree launch requires frozen preparation",
+        ));
+    }
+
+    let mut events = Vec::new();
+    let linked = match request.verb.as_str() {
+        "attach" | "detach" => {
+            observer::admit(tx, principal, &request, &payload_digest, now, &mut events)?;
+            None
         }
-        if let Some(input) = &preparation {
-            if !matches!(request.verb.as_str(), "launch" | "resume") {
+        "launch" => {
+            if request.target.is_some() {
+                return Err(Error::new("invalid", "launch does not take a target"));
+            }
+            if request.request_id.is_some() {
                 return Err(Error::new(
                     "invalid",
-                    "workspace preparation requires launch or resume",
+                    "launch does not take a native request id",
                 ));
             }
-            validate_workspace_input(input)?;
-        } else if request.verb == "launch"
-            && request
-                .args
-                .get("worktree")
-                .is_some_and(|value| !value.is_null())
-        {
-            return Err(Error::new(
-                "invalid",
-                "worktree launch requires frozen preparation",
+            if request.expected_turn_id.is_some()
+                || request
+                    .expected_generation
+                    .is_some_and(|expected| expected != 0)
+            {
+                return Err(Error::new(
+                    "stale_generation",
+                    "a new launch starts from generation 0",
+                ));
+            }
+            let project = required_string(&request.args, "project")?;
+            let harness = if request.args.get("harness").is_none() {
+                "fake".to_owned()
+            } else {
+                required_string(&request.args, "harness")?
+            };
+            if !matches!(harness.as_str(), "fake" | "codex") {
+                return Err(Error::new(
+                    "unsupported",
+                    format!("unsupported launch harness {harness}"),
+                ));
+            }
+            let profile = if request.args.get("profile").is_none() && harness == "fake" {
+                "fake".to_owned()
+            } else {
+                required_string(&request.args, "profile")?
+            };
+            let profile_snapshot = match request.args.get("profile_snapshot") {
+                Some(Value::Object(_)) => request.args["profile_snapshot"].clone(),
+                Some(_) => {
+                    return Err(Error::new(
+                        "invalid",
+                        "args.profile_snapshot must be a JSON object",
+                    ));
+                }
+                None if harness == "fake" => json!({}),
+                None => {
+                    return Err(Error::new(
+                        "invalid",
+                        "the codex harness requires a frozen profile_snapshot",
+                    ));
+                }
+            };
+            let encoded_profile_snapshot = encode_json(&profile_snapshot)?;
+            let workspace = match &preparation {
+                Some(input) => {
+                    if input.project != project {
+                        return Err(Error::new(
+                            "invalid",
+                            "workspace project differs from launch",
+                        ));
+                    }
+                    input.worktree_path.clone()
+                }
+                None => required_string(&request.args, "workspace")?,
+            };
+            if preparation.is_some() && load_workspace_by_path(tx, &workspace)?.is_some() {
+                return Err(Error::new(
+                    "id_conflict",
+                    "worktree path is already managed",
+                ));
+            }
+            require_managed_path_ready(tx, &workspace)?;
+            if request.args.get("prompt").is_some() {
+                return Err(Error::new(
+                    "invalid",
+                    "use args.text for the linked launch input",
+                ));
+            }
+            let text = optional_string(&request.args, "text")?;
+            if let Some(text) = &text {
+                require_nonempty(text, "args.text")?;
+                check_input(text)?;
+            }
+            db!(tx.execute(
+                "INSERT INTO agents(generation, project, harness, profile,
+                                        profile_snapshot, workspace, state,
+                                        created_at, updated_at)
+                     VALUES (0, ?1, ?2, ?3, ?4, ?5, 'created', ?6, ?6)",
+                params![
+                    project,
+                    harness,
+                    profile,
+                    encoded_profile_snapshot,
+                    workspace,
+                    now
+                ],
             ));
-        }
+            let agent_num = tx.last_insert_rowid();
+            let agent_id = format_agent_id(agent_num);
+            let agent = load_agent_by_num(tx, agent_num)?
+                .ok_or_else(|| Error::new("internal", "new launch Agent disappeared"))?;
+            provider_holds::require_unheld_tx(tx, &agent)?;
+            events.push(insert_daemon_event(
+                    tx,
+                    now,
+                    "agent.created",
+                    "agent",
+                    Some(agent_num),
+                    Some(0),
+                    json!({"agent_id": agent_id, "project": project, "harness": harness, "profile": profile}),
+                )?);
 
-        let mut events = Vec::new();
-        let linked = match request.verb.as_str() {
-            "attach" | "detach" => {
-                observer::admit(&tx, principal, &request, &payload_digest, now, &mut events)?;
+            events.push(admit_command(
+                tx,
+                &CommandInsert::admitted(principal, &request, &payload_digest, (agent_num, 0), now),
+                json!({"command_id": request.id, "verb": "launch"}),
+            )?);
+
+            if let Some(text) = text {
+                let (linked_id, event) =
+                    admit_linked_send(tx, principal, &request.id, agent_num, 1, &text, now)?;
+                events.push(event);
+                Some(linked_id)
+            } else {
                 None
             }
-            "launch" => {
-                if request.target.is_some() {
-                    return Err(Error::new("invalid", "launch does not take a target"));
-                }
-                if request.request_id.is_some() {
-                    return Err(Error::new(
-                        "invalid",
-                        "launch does not take a native request id",
-                    ));
-                }
-                if request.expected_turn_id.is_some()
-                    || request
-                        .expected_generation
-                        .is_some_and(|expected| expected != 0)
-                {
-                    return Err(Error::new(
-                        "stale_generation",
-                        "a new launch starts from generation 0",
-                    ));
-                }
-                let project = required_string(&request.args, "project")?;
-                let harness = if request.args.get("harness").is_none() {
-                    "fake".to_owned()
-                } else {
-                    required_string(&request.args, "harness")?
-                };
-                if !matches!(harness.as_str(), "fake" | "codex") {
-                    return Err(Error::new(
-                        "unsupported",
-                        format!("unsupported launch harness {harness}"),
-                    ));
-                }
-                let profile = if request.args.get("profile").is_none() && harness == "fake" {
-                    "fake".to_owned()
-                } else {
-                    required_string(&request.args, "profile")?
-                };
-                let profile_snapshot = match request.args.get("profile_snapshot") {
-                    Some(Value::Object(_)) => request.args["profile_snapshot"].clone(),
-                    Some(_) => {
-                        return Err(Error::new(
-                            "invalid",
-                            "args.profile_snapshot must be a JSON object",
-                        ));
-                    }
-                    None if harness == "fake" => json!({}),
-                    None => {
-                        return Err(Error::new(
-                            "invalid",
-                            "the codex harness requires a frozen profile_snapshot",
-                        ));
-                    }
-                };
-                let encoded_profile_snapshot = encode_json(&profile_snapshot)?;
-                let workspace = match &preparation {
-                    Some(input) => {
-                        if input.project != project {
-                            return Err(Error::new(
-                                "invalid",
-                                "workspace project differs from launch",
-                            ));
-                        }
-                        input.worktree_path.clone()
-                    }
-                    None => required_string(&request.args, "workspace")?,
-                };
-                if preparation.is_some() && load_workspace_by_path(&tx, &workspace)?.is_some() {
-                    return Err(Error::new(
-                        "id_conflict",
-                        "worktree path is already managed",
-                    ));
-                }
-                require_managed_path_ready(&tx, &workspace)?;
-                if request.args.get("prompt").is_some() {
-                    return Err(Error::new(
-                        "invalid",
-                        "use args.text for the linked launch input",
-                    ));
-                }
-                let text = optional_string(&request.args, "text")?;
-                if let Some(text) = &text {
-                    require_nonempty(text, "args.text")?;
-                    check_input(text)?;
-                }
-                db!(tx.execute(
-                    "INSERT INTO agents(generation, project, harness, profile,
-                                            profile_snapshot, workspace, state,
-                                            created_at, updated_at)
-                         VALUES (0, ?1, ?2, ?3, ?4, ?5, 'created', ?6, ?6)",
-                    params![
-                        project,
-                        harness,
-                        profile,
-                        encoded_profile_snapshot,
-                        workspace,
-                        now
-                    ],
+        }
+        "send" | "stop" => {
+            if request.request_id.is_some() {
+                return Err(Error::new(
+                    "invalid",
+                    "send and stop do not take a native request id",
                 ));
-                let agent_num = tx.last_insert_rowid();
-                let agent_id = format_agent_id(agent_num);
-                let agent = load_agent_by_num(&tx, agent_num)?
-                    .ok_or_else(|| Error::new("internal", "new launch Agent disappeared"))?;
-                provider_holds::require_unheld_tx(&tx, &agent)?;
-                events.push(insert_daemon_event(
-                        &tx,
-                        now,
-                        "agent.created",
-                        "agent",
-                        Some(agent_num),
-                        Some(0),
-                        json!({"agent_id": agent_id, "project": project, "harness": harness, "profile": profile}),
-                    )?);
-
+            }
+            let target = request
+                .target
+                .as_deref()
+                .ok_or_else(|| Error::new("invalid", "send and stop require an Agent target"))?;
+            let agent_num = parse_agent_id(target)?;
+            let agent = load_agent_by_num(tx, agent_num)?
+                .ok_or_else(|| Error::new("not_found", format!("Agent {target} was not found")))?;
+            if let Some(expected) = request.expected_generation
+                && expected != agent.generation
+            {
+                return Err(Error::new(
+                    "stale_generation",
+                    format!(
+                        "expected generation {expected}, current is {}",
+                        agent.generation
+                    ),
+                ));
+            }
+            if let Some(expected_turn) = request.expected_turn_id.as_deref()
+                && agent.active_turn.as_deref() != Some(expected_turn)
+            {
+                return Err(Error::new(
+                    "stale_generation",
+                    "expected turn does not match the current Agent turn",
+                ));
+            }
+            if request.verb == "send" {
+                if agent.generation == 0 || agent.state == AgentState::Created {
+                    return Err(Error::new(
+                        "bad_state",
+                        "dispatch launch before submitting Agent input",
+                    ));
+                }
+                if agent.is_terminal() {
+                    return Err(Error::new("bad_state", "cannot send to a terminal Agent"));
+                }
+                let text = required_string(&request.args, "text")?;
+                check_input(&text)?;
+                check_rpc_frame(
+                    "agent.command",
+                    &json!({
+                        "agent_id": agent.id,
+                        "generation": agent.generation,
+                        "command_id": request.id,
+                        "verb": "send",
+                        "args": request.args,
+                    }),
+                )?;
+                let ready = send_gate_open(tx, agent_num, agent.generation)?
+                    && earliest_pending_send(tx, agent_num, agent.generation)?.is_none();
+                let state = if ready {
+                    CommandState::Accepted
+                } else {
+                    CommandState::Queued
+                };
                 events.push(admit_command(
-                    &tx,
-                    &CommandInsert::admitted(
+                    tx,
+                    &CommandInsert {
+                        state,
+                        ..CommandInsert::admitted(
+                            principal,
+                            &request,
+                            &payload_digest,
+                            (agent_num, agent.generation),
+                            now,
+                        )
+                    },
+                    json!({"command_id": request.id, "verb": "send"}),
+                )?);
+                if let Some(event) =
+                    provider_holds::admit_send_tx(tx, &agent, &request.id, request.probe, now)?
+                {
+                    events.push(event);
+                }
+                None
+            } else {
+                if request
+                    .args
+                    .get("force")
+                    .is_some_and(|value| !value.is_boolean())
+                {
+                    return Err(Error::new("invalid", "stop force must be a boolean"));
+                }
+                check_rpc_frame(
+                    "agent.stop",
+                    &json!({
+                        "agent_id": agent.id,
+                        "generation": agent.generation,
+                        "command_id": request.id,
+                        "force": request.args.get("force").and_then(Value::as_bool).unwrap_or(false),
+                    }),
+                )?;
+                events.push(admit_command(
+                    tx,
+                    &CommandInsert {
+                        turn_id: request.expected_turn_id.as_deref(),
+                        ..CommandInsert::admitted(
+                            principal,
+                            &request,
+                            &payload_digest,
+                            (agent_num, agent.generation),
+                            now,
+                        )
+                    },
+                    json!({"command_id": request.id, "verb": "stop"}),
+                )?);
+                None
+            }
+        }
+        "worktree.remove" => {
+            let target = request
+                .target
+                .as_deref()
+                .ok_or_else(|| Error::new("invalid", "worktree.remove requires an Agent"))?;
+            let agent_num = parse_agent_id(target)?;
+            let agent = load_agent_by_num(tx, agent_num)?
+                .ok_or_else(|| Error::new("not_found", "workspace owner was not found"))?;
+            if request.request_id.is_some()
+                || request.expected_turn_id.is_some()
+                || request
+                    .expected_generation
+                    .is_some_and(|expected| expected != agent.generation)
+                || request.args.as_object().is_none_or(|args| !args.is_empty())
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "invalid worktree.remove binding or arguments",
+                ));
+            }
+            let workspace = load_workspace(tx, agent_num)?
+                .ok_or_else(|| Error::new("not_found", "Agent has no managed worktree"))?;
+            require_workspace_removable(tx, &agent, &workspace)?;
+            let args = json!({"target_generation": workspace.target_generation});
+            events.push(admit_command(
+                tx,
+                &CommandInsert {
+                    args: &args,
+                    ..CommandInsert::admitted(
                         principal,
                         &request,
                         &payload_digest,
-                        (agent_num, 0),
+                        (agent_num, agent.generation),
                         now,
+                    )
+                },
+                json!({"command_id": request.id, "verb": "worktree.remove"}),
+            )?);
+            None
+        }
+        "resume" => {
+            let target = request
+                .target
+                .as_deref()
+                .ok_or_else(|| Error::new("invalid", "resume requires an Agent target"))?;
+            let agent_num = parse_agent_id(target)?;
+            let agent = load_agent_by_num(tx, agent_num)?
+                .ok_or_else(|| Error::new("not_found", format!("Agent {target} was not found")))?;
+            if let Some(path) = &agent.workspace {
+                require_managed_path_ready(tx, path)?;
+            }
+            if agent.harness != "codex" {
+                return Err(Error::new(
+                    "unsupported",
+                    "resume is only supported for a Codex Agent with a retained native subject",
+                ));
+            }
+            if let Some(expected) = request.expected_generation
+                && expected != agent.generation
+            {
+                return Err(Error::new(
+                    "stale_generation",
+                    format!(
+                        "expected generation {expected}, current is {}",
+                        agent.generation
                     ),
-                    json!({"command_id": request.id, "verb": "launch"}),
-                )?);
+                ));
+            }
+            if request.expected_turn_id.is_some() {
+                return Err(Error::new(
+                    "stale_generation",
+                    "resume cannot target an active turn",
+                ));
+            }
+            if request.request_id.is_some() {
+                return Err(Error::new(
+                    "invalid",
+                    "resume does not take a native request id",
+                ));
+            }
+            if !matches!(
+                agent.state,
+                AgentState::Stopped | AgentState::Failed | AgentState::Lost
+            ) || agent.active_turn.is_some()
+            {
+                return Err(Error::new(
+                    "bad_state",
+                    "resume requires a stopped, failed, or lost Agent with no active turn",
+                ));
+            }
+            let pending_resume: bool = tx
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM commands
+                         WHERE target = ?1 AND generation = ?2 AND verb = 'resume'
+                           AND id <> ?3
+                           AND state IN ('accepted', 'queued', 'dispatched', 'unknown')
+                     )",
+                    params![agent_num, agent.generation, request.id],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?;
+            if pending_resume {
+                return Err(Error::new(
+                    "bad_state",
+                    "a pending resume already targets this Agent generation",
+                ));
+            }
+            if [&agent.native_scope, &agent.native_ref]
+                .iter()
+                .any(|value| value.as_deref().is_none_or(|value| value.trim().is_empty()))
+            {
+                return Err(Error::new(
+                    "unsupported",
+                    "resume requires a retained native_scope and native_ref",
+                ));
+            }
+            if request
+                .args
+                .as_object()
+                .is_some_and(|args| args.keys().any(|key| key != "text"))
+            {
+                return Err(Error::new(
+                    "unsupported",
+                    "resume accepts only new linked input text; profile and subject are retained",
+                ));
+            }
+            let text = optional_string(&request.args, "text")?;
+            if let Some(text) = &text {
+                require_nonempty(text, "args.text")?;
+                check_input(text)?;
+                provider_holds::require_unheld_tx(tx, &agent)?;
+            }
+            let next_generation = agent
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| Error::new("bad_state", "Agent generation cannot be incremented"))?;
+            let resume_args = json!({});
+            events.push(admit_command(
+                tx,
+                &CommandInsert {
+                    args: &resume_args,
+                    ..CommandInsert::admitted(
+                        principal,
+                        &request,
+                        &payload_digest,
+                        (agent_num, agent.generation),
+                        now,
+                    )
+                },
+                json!({"command_id": request.id, "verb": "resume"}),
+            )?);
 
-                if let Some(text) = text {
-                    let (linked_id, event) =
-                        admit_linked_send(&tx, principal, &request.id, agent_num, 1, &text, now)?;
-                    events.push(event);
-                    Some(linked_id)
-                } else {
-                    None
-                }
-            }
-            "send" | "stop" => {
-                if request.request_id.is_some() {
-                    return Err(Error::new(
-                        "invalid",
-                        "send and stop do not take a native request id",
-                    ));
-                }
-                let target = request.target.as_deref().ok_or_else(|| {
-                    Error::new("invalid", "send and stop require an Agent target")
-                })?;
-                let agent_num = parse_agent_id(target)?;
-                let agent = load_agent_by_num(&tx, agent_num)?.ok_or_else(|| {
-                    Error::new("not_found", format!("Agent {target} was not found"))
-                })?;
-                if let Some(expected) = request.expected_generation
-                    && expected != agent.generation
-                {
-                    return Err(Error::new(
-                        "stale_generation",
-                        format!(
-                            "expected generation {expected}, current is {}",
-                            agent.generation
-                        ),
-                    ));
-                }
-                if let Some(expected_turn) = request.expected_turn_id.as_deref()
-                    && agent.active_turn.as_deref() != Some(expected_turn)
-                {
-                    return Err(Error::new(
-                        "stale_generation",
-                        "expected turn does not match the current Agent turn",
-                    ));
-                }
-                if request.verb == "send" {
-                    if agent.generation == 0 || agent.state == AgentState::Created {
-                        return Err(Error::new(
-                            "bad_state",
-                            "dispatch launch before submitting Agent input",
-                        ));
-                    }
-                    if agent.is_terminal() {
-                        return Err(Error::new("bad_state", "cannot send to a terminal Agent"));
-                    }
-                    let text = required_string(&request.args, "text")?;
-                    check_input(&text)?;
-                    check_rpc_frame(
-                        "agent.command",
-                        &json!({
-                            "agent_id": agent.id,
-                            "generation": agent.generation,
-                            "command_id": request.id,
-                            "verb": "send",
-                            "args": request.args,
-                        }),
-                    )?;
-                    let ready = send_gate_open(&tx, agent_num, agent.generation)?
-                        && earliest_pending_send(&tx, agent_num, agent.generation)?.is_none();
-                    let state = if ready {
-                        CommandState::Accepted
-                    } else {
-                        CommandState::Queued
-                    };
-                    events.push(admit_command(
-                        &tx,
-                        &CommandInsert {
-                            state,
-                            ..CommandInsert::admitted(
-                                principal,
-                                &request,
-                                &payload_digest,
-                                (agent_num, agent.generation),
-                                now,
-                            )
-                        },
-                        json!({"command_id": request.id, "verb": "send"}),
-                    )?);
-                    if let Some(event) =
-                        provider_holds::admit_send_tx(&tx, &agent, &request.id, request.probe, now)?
-                    {
-                        events.push(event);
-                    }
-                    None
-                } else {
-                    if request
-                        .args
-                        .get("force")
-                        .is_some_and(|value| !value.is_boolean())
-                    {
-                        return Err(Error::new("invalid", "stop force must be a boolean"));
-                    }
-                    check_rpc_frame(
-                        "agent.stop",
-                        &json!({
-                            "agent_id": agent.id,
-                            "generation": agent.generation,
-                            "command_id": request.id,
-                            "force": request.args.get("force").and_then(Value::as_bool).unwrap_or(false),
-                        }),
-                    )?;
-                    events.push(admit_command(
-                        &tx,
-                        &CommandInsert {
-                            turn_id: request.expected_turn_id.as_deref(),
-                            ..CommandInsert::admitted(
-                                principal,
-                                &request,
-                                &payload_digest,
-                                (agent_num, agent.generation),
-                                now,
-                            )
-                        },
-                        json!({"command_id": request.id, "verb": "stop"}),
-                    )?);
-                    None
-                }
-            }
-            "worktree.remove" => {
-                let target = request
-                    .target
-                    .as_deref()
-                    .ok_or_else(|| Error::new("invalid", "worktree.remove requires an Agent"))?;
-                let agent_num = parse_agent_id(target)?;
-                let agent = load_agent_by_num(&tx, agent_num)?
-                    .ok_or_else(|| Error::new("not_found", "workspace owner was not found"))?;
-                if request.request_id.is_some()
-                    || request.expected_turn_id.is_some()
-                    || request
-                        .expected_generation
-                        .is_some_and(|expected| expected != agent.generation)
-                    || request.args.as_object().is_none_or(|args| !args.is_empty())
-                {
-                    return Err(Error::new(
-                        "invalid",
-                        "invalid worktree.remove binding or arguments",
-                    ));
-                }
-                let workspace = load_workspace(&tx, agent_num)?
-                    .ok_or_else(|| Error::new("not_found", "Agent has no managed worktree"))?;
-                require_workspace_removable(&tx, &agent, &workspace)?;
-                let args = json!({"target_generation": workspace.target_generation});
-                events.push(admit_command(
-                    &tx,
-                    &CommandInsert {
-                        args: &args,
-                        ..CommandInsert::admitted(
-                            principal,
-                            &request,
-                            &payload_digest,
-                            (agent_num, agent.generation),
-                            now,
-                        )
-                    },
-                    json!({"command_id": request.id, "verb": "worktree.remove"}),
-                )?);
+            if let Some(text) = text {
+                let (linked_id, event) = admit_linked_send(
+                    tx,
+                    principal,
+                    &request.id,
+                    agent_num,
+                    next_generation,
+                    &text,
+                    now,
+                )?;
+                events.push(event);
+                Some(linked_id)
+            } else {
                 None
             }
-            "resume" => {
-                let target = request
-                    .target
-                    .as_deref()
-                    .ok_or_else(|| Error::new("invalid", "resume requires an Agent target"))?;
-                let agent_num = parse_agent_id(target)?;
-                let agent = load_agent_by_num(&tx, agent_num)?.ok_or_else(|| {
-                    Error::new("not_found", format!("Agent {target} was not found"))
-                })?;
-                if let Some(path) = &agent.workspace {
-                    require_managed_path_ready(&tx, path)?;
-                }
-                if agent.harness != "codex" {
-                    return Err(Error::new(
-                        "unsupported",
-                        "resume is only supported for a Codex Agent with a retained native subject",
-                    ));
-                }
-                if let Some(expected) = request.expected_generation
-                    && expected != agent.generation
-                {
-                    return Err(Error::new(
-                        "stale_generation",
-                        format!(
-                            "expected generation {expected}, current is {}",
-                            agent.generation
-                        ),
-                    ));
-                }
-                if request.expected_turn_id.is_some() {
-                    return Err(Error::new(
-                        "stale_generation",
-                        "resume cannot target an active turn",
-                    ));
-                }
-                if request.request_id.is_some() {
-                    return Err(Error::new(
-                        "invalid",
-                        "resume does not take a native request id",
-                    ));
-                }
-                if !matches!(
-                    agent.state,
-                    AgentState::Stopped | AgentState::Failed | AgentState::Lost
-                ) || agent.active_turn.is_some()
-                {
-                    return Err(Error::new(
-                        "bad_state",
-                        "resume requires a stopped, failed, or lost Agent with no active turn",
-                    ));
-                }
-                let pending_resume: bool = tx
-                    .query_row(
-                        "SELECT EXISTS(
-                             SELECT 1 FROM commands
-                             WHERE target = ?1 AND generation = ?2 AND verb = 'resume'
-                               AND id <> ?3
-                               AND state IN ('accepted', 'queued', 'dispatched', 'unknown')
-                         )",
-                        params![agent_num, agent.generation, request.id],
-                        |row| row.get(0),
-                    )
-                    .map_err(sql_error)?;
-                if pending_resume {
-                    return Err(Error::new(
-                        "bad_state",
-                        "a pending resume already targets this Agent generation",
-                    ));
-                }
-                if [&agent.native_scope, &agent.native_ref]
-                    .iter()
-                    .any(|value| value.as_deref().is_none_or(|value| value.trim().is_empty()))
-                {
-                    return Err(Error::new(
-                        "unsupported",
-                        "resume requires a retained native_scope and native_ref",
-                    ));
-                }
-                if request
-                    .args
-                    .as_object()
-                    .is_some_and(|args| args.keys().any(|key| key != "text"))
-                {
-                    return Err(Error::new(
-                        "unsupported",
-                        "resume accepts only new linked input text; profile and subject are retained",
-                    ));
-                }
-                let text = optional_string(&request.args, "text")?;
-                if let Some(text) = &text {
-                    require_nonempty(text, "args.text")?;
-                    check_input(text)?;
-                    provider_holds::require_unheld_tx(&tx, &agent)?;
-                }
-                let next_generation = agent.generation.checked_add(1).ok_or_else(|| {
-                    Error::new("bad_state", "Agent generation cannot be incremented")
-                })?;
-                let resume_args = json!({});
-                events.push(admit_command(
-                    &tx,
-                    &CommandInsert {
-                        args: &resume_args,
-                        ..CommandInsert::admitted(
-                            principal,
-                            &request,
-                            &payload_digest,
-                            (agent_num, agent.generation),
-                            now,
-                        )
-                    },
-                    json!({"command_id": request.id, "verb": "resume"}),
-                )?);
+        }
+        "steer" | "interrupt" | "approve" | "deny" | "answer" => {
+            let target = request
+                .target
+                .as_deref()
+                .ok_or_else(|| Error::new("invalid", "control command requires an Agent target"))?;
+            let agent_num = parse_agent_id(target)?;
+            let agent = load_agent_by_num(tx, agent_num)?
+                .ok_or_else(|| Error::new("not_found", format!("Agent {target} was not found")))?;
+            if agent.harness != "codex" {
+                return Err(Error::new(
+                    "unsupported",
+                    format!(
+                        "{} is not supported by the {} harness",
+                        request.verb, agent.harness
+                    ),
+                ));
+            }
+            if let Some(expected) = request.expected_generation
+                && expected != agent.generation
+            {
+                return Err(Error::new(
+                    "stale_generation",
+                    format!(
+                        "expected generation {expected}, current is {}",
+                        agent.generation
+                    ),
+                ));
+            }
+            if !matches!(agent.state, AgentState::Busy | AgentState::Waiting) {
+                return Err(Error::new(
+                    "bad_state",
+                    "turn controls require a busy or waiting Agent",
+                ));
+            }
+            let turn_id = agent.active_turn.clone().ok_or_else(|| {
+                Error::new("bad_state", "turn control requires an exact active turn")
+            })?;
+            if request
+                .expected_turn_id
+                .as_deref()
+                .is_some_and(|expected| expected != turn_id.as_str())
+            {
+                return Err(Error::new(
+                    "stale_generation",
+                    "expected turn does not match the current Agent turn",
+                ));
+            }
 
-                if let Some(text) = text {
-                    let (linked_id, event) = admit_linked_send(
-                        &tx,
-                        principal,
-                        &request.id,
-                        agent_num,
-                        next_generation,
-                        &text,
-                        now,
-                    )?;
-                    events.push(event);
-                    Some(linked_id)
-                } else {
+            let request_id = match request.verb.as_str() {
+                "steer" | "interrupt" => {
+                    if request.request_id.is_some() {
+                        return Err(Error::new(
+                            "invalid",
+                            "steer and interrupt do not take a native request id",
+                        ));
+                    }
                     None
                 }
-            }
-            "steer" | "interrupt" | "approve" | "deny" | "answer" => {
-                let target = request.target.as_deref().ok_or_else(|| {
-                    Error::new("invalid", "control command requires an Agent target")
-                })?;
-                let agent_num = parse_agent_id(target)?;
-                let agent = load_agent_by_num(&tx, agent_num)?.ok_or_else(|| {
-                    Error::new("not_found", format!("Agent {target} was not found"))
-                })?;
-                if agent.harness != "codex" {
-                    return Err(Error::new(
-                        "unsupported",
-                        format!(
-                            "{} is not supported by the {} harness",
-                            request.verb, agent.harness
-                        ),
-                    ));
-                }
-                if let Some(expected) = request.expected_generation
-                    && expected != agent.generation
-                {
-                    return Err(Error::new(
-                        "stale_generation",
-                        format!(
-                            "expected generation {expected}, current is {}",
-                            agent.generation
-                        ),
-                    ));
-                }
-                if !matches!(agent.state, AgentState::Busy | AgentState::Waiting) {
-                    return Err(Error::new(
-                        "bad_state",
-                        "turn controls require a busy or waiting Agent",
-                    ));
-                }
-                let turn_id = agent.active_turn.clone().ok_or_else(|| {
-                    Error::new("bad_state", "turn control requires an exact active turn")
-                })?;
-                if request
-                    .expected_turn_id
-                    .as_deref()
-                    .is_some_and(|expected| expected != turn_id.as_str())
-                {
-                    return Err(Error::new(
-                        "stale_generation",
-                        "expected turn does not match the current Agent turn",
-                    ));
-                }
-
-                let request_id = match request.verb.as_str() {
-                    "steer" | "interrupt" => {
-                        if request.request_id.is_some() {
-                            return Err(Error::new(
-                                "invalid",
-                                "steer and interrupt do not take a native request id",
-                            ));
-                        }
-                        None
-                    }
-                    _ => {
-                        let pending = if let Some(request_id) = request.request_id.as_deref() {
-                            require_nonempty(request_id, "request_id")?;
-                            let (pending, state) = load_pending_request(
-                                &tx,
-                                agent_num,
-                                agent.generation,
-                                request_id,
-                            )?
-                            .ok_or_else(|| {
-                                Error::new(
-                                    "not_found",
-                                    "pending request was not found in this Agent generation",
-                                )
-                            })?;
-                            if state != "pending" {
-                                return Err(Error::new(
-                                    "source_integrity",
-                                    "native request is no longer pending",
-                                ));
-                            }
-                            pending
-                        } else {
-                            capture_single_pending_request(&tx, agent_num, agent.generation)?
-                        };
-                        if pending.turn_id.as_str() != turn_id.as_str()
-                            || request
-                                .expected_turn_id
-                                .as_deref()
-                                .is_some_and(|expected| expected != pending.turn_id.as_str())
-                        {
-                            return Err(Error::new(
-                                "stale_generation",
-                                "pending request does not belong to the captured active turn",
-                            ));
-                        }
-                        if !agent.pending.contains(&pending) {
+                _ => {
+                    let pending = if let Some(request_id) = request.request_id.as_deref() {
+                        require_nonempty(request_id, "request_id")?;
+                        let (pending, state) =
+                            load_pending_request(tx, agent_num, agent.generation, request_id)?
+                                .ok_or_else(|| {
+                                    Error::new(
+                                        "not_found",
+                                        "pending request was not found in this Agent generation",
+                                    )
+                                })?;
+                        if state != "pending" {
                             return Err(Error::new(
                                 "source_integrity",
-                                "pending request row does not match the Agent projection",
+                                "native request is no longer pending",
                             ));
                         }
-                        if request.verb == "answer" && contains_secret_marker(&pending.details) {
-                            return Err(Error::new(
-                                "secret_in_payload",
-                                "answer to a secret question is not permitted",
-                            ));
-                        }
-                        if has_open_request_reply(
-                            &tx,
-                            agent_num,
-                            agent.generation,
-                            &pending.id,
-                            None,
-                        )? {
-                            return Err(Error::new(
-                                "bad_state",
-                                "a reply command is already unresolved for this native request",
-                            ));
-                        }
-                        Some(pending.id)
+                        pending
+                    } else {
+                        capture_single_pending_request(tx, agent_num, agent.generation)?
+                    };
+                    if pending.turn_id.as_str() != turn_id.as_str()
+                        || request
+                            .expected_turn_id
+                            .as_deref()
+                            .is_some_and(|expected| expected != pending.turn_id.as_str())
+                    {
+                        return Err(Error::new(
+                            "stale_generation",
+                            "pending request does not belong to the captured active turn",
+                        ));
                     }
-                };
-                if request.verb == "steer" {
-                    let text = required_string(&request.args, "text")?;
-                    check_input(&text)?;
-                    provider_holds::require_unheld_tx(&tx, &agent)?;
+                    if !agent.pending.contains(&pending) {
+                        return Err(Error::new(
+                            "source_integrity",
+                            "pending request row does not match the Agent projection",
+                        ));
+                    }
+                    if request.verb == "answer" && contains_secret_marker(&pending.details) {
+                        return Err(Error::new(
+                            "secret_in_payload",
+                            "answer to a secret question is not permitted",
+                        ));
+                    }
+                    if has_open_request_reply(tx, agent_num, agent.generation, &pending.id, None)? {
+                        return Err(Error::new(
+                            "bad_state",
+                            "a reply command is already unresolved for this native request",
+                        ));
+                    }
+                    Some(pending.id)
                 }
-                let mut params = json!({
-                    "agent_id": agent.id,
-                    "generation": agent.generation,
+            };
+            if request.verb == "steer" {
+                let text = required_string(&request.args, "text")?;
+                check_input(&text)?;
+                provider_holds::require_unheld_tx(tx, &agent)?;
+            }
+            let mut params = json!({
+                "agent_id": agent.id,
+                "generation": agent.generation,
+                "command_id": request.id,
+                "verb": request.verb,
+                "turn_id": turn_id,
+                "args": request.args,
+            });
+            if let Some(request_id) = request_id.as_deref() {
+                params["request_id"] = Value::String(request_id.to_owned());
+            }
+            check_rpc_frame("agent.command", &params)?;
+            events.push(admit_command(
+                tx,
+                &CommandInsert {
+                    turn_id: Some(&turn_id),
+                    request_id: request_id.as_deref(),
+                    ..CommandInsert::admitted(
+                        principal,
+                        &request,
+                        &payload_digest,
+                        (agent_num, agent.generation),
+                        now,
+                    )
+                },
+                json!({
                     "command_id": request.id,
                     "verb": request.verb,
                     "turn_id": turn_id,
-                    "args": request.args,
-                });
-                if let Some(request_id) = request_id.as_deref() {
-                    params["request_id"] = Value::String(request_id.to_owned());
-                }
-                check_rpc_frame("agent.command", &params)?;
-                events.push(admit_command(
-                    &tx,
-                    &CommandInsert {
-                        turn_id: Some(&turn_id),
-                        request_id: request_id.as_deref(),
-                        ..CommandInsert::admitted(
-                            principal,
-                            &request,
-                            &payload_digest,
-                            (agent_num, agent.generation),
-                            now,
-                        )
-                    },
-                    json!({
-                        "command_id": request.id,
-                        "verb": request.verb,
-                        "turn_id": turn_id,
-                        "request_id": request_id
-                    }),
-                )?);
-                None
-            }
-            verb => {
-                return Err(Error::new(
-                    "unsupported",
-                    format!("Store does not admit the {verb} verb"),
-                ));
-            }
-        };
+                    "request_id": request_id
+                }),
+            )?);
+            None
+        }
+        verb => {
+            return Err(Error::new(
+                "unsupported",
+                format!("Store does not admit the {verb} verb"),
+            ));
+        }
+    };
 
-        if matches!(request.verb.as_str(), "launch" | "resume") {
-            admit_workspace_preparation(&tx, &request, preparation.as_ref(), now, &mut events)?;
-        }
-        let command = load_command(&tx, &request.id)?.ok_or_else(|| {
-            Error::new("internal", "new command was not visible in its transaction")
-        })?;
-        let linked_command = match linked.as_deref() {
-            Some(linked_id) => load_command(&tx, linked_id)?,
-            None => None,
-        };
-        if matches!(request.verb.as_str(), "launch" | "resume") {
-            let agent_num = command
-                .target
-                .as_deref()
-                .map(parse_agent_id)
-                .transpose()?
-                .ok_or_else(|| Error::new("internal", "start admission has no Agent"))?;
-            let agent = load_agent_by_num(&tx, agent_num)?
-                .ok_or_else(|| Error::new("internal", "start admission Agent disappeared"))?;
-            let generation = if request.verb == "launch" {
-                1
-            } else {
-                agent
-                    .generation
-                    .checked_add(1)
-                    .ok_or_else(|| Error::new("bad_state", "generation overflow"))?
-            };
-            capacity::reserve_tx(&tx, &agent, generation)?;
-        }
-        commit_transaction(tx, &self.write_faulted)?;
-        Ok(Admission {
-            command,
-            linked_command,
-            events,
-            is_new: true,
-        })
+    if matches!(request.verb.as_str(), "launch" | "resume") {
+        admit_workspace_preparation(tx, &request, preparation.as_ref(), now, &mut events)?;
     }
+    let command = load_command(tx, &request.id)?
+        .ok_or_else(|| Error::new("internal", "new command was not visible in its transaction"))?;
+    let linked_command = match linked.as_deref() {
+        Some(linked_id) => load_command(tx, linked_id)?,
+        None => None,
+    };
+    if matches!(request.verb.as_str(), "launch" | "resume") {
+        let agent_num = command
+            .target
+            .as_deref()
+            .map(parse_agent_id)
+            .transpose()?
+            .ok_or_else(|| Error::new("internal", "start admission has no Agent"))?;
+        let agent = load_agent_by_num(tx, agent_num)?
+            .ok_or_else(|| Error::new("internal", "start admission Agent disappeared"))?;
+        let generation = if request.verb == "launch" {
+            1
+        } else {
+            agent
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| Error::new("bad_state", "generation overflow"))?
+        };
+        capacity::reserve_tx(tx, &agent, generation)?;
+    }
+    Ok(Admission {
+        command,
+        linked_command,
+        events,
+        is_new: true,
+    })
+}
 
+impl Store {
     /// Persist an idempotent non-command write. L1 uses this for daemon shutdown;
     /// command admission remains in the commands table.
     pub fn record_write(
@@ -2297,7 +2323,7 @@ impl Store {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT seq, ts, kind, agent, generation, source, native_id, data
+                "SELECT seq, ts, kind, agent, generation, source, native_id, data, subject
                  FROM events
                  WHERE seq > ?1 AND (?2 IS NULL OR seq <= ?2)
                  ORDER BY seq LIMIT ?3",
@@ -3781,7 +3807,7 @@ fn scan_git_hints(
     }
     let mut statement = connection
         .prepare(
-            "SELECT seq, ts, kind, agent, generation, source, native_id, data
+            "SELECT seq, ts, kind, agent, generation, source, native_id, data, subject
          FROM events WHERE seq > ?1 AND seq <= ?2 ORDER BY seq LIMIT ?3",
         )
         .map_err(sql_error)?;
@@ -3816,7 +3842,7 @@ fn load_native_git_hint(
 ) -> Result<Event> {
     let record = connection
         .query_row(
-            "SELECT e.seq, e.ts, e.kind, e.agent, e.generation, e.source, e.native_id, e.data
+            "SELECT e.seq, e.ts, e.kind, e.agent, e.generation, e.source, e.native_id, e.data, e.subject
          FROM events e
          WHERE e.seq = ?1 AND e.agent = ?2 AND e.generation = ?3 AND e.family = 'tool'
            AND e.source NOT IN ('git', 'os', 'daemon') AND e.native_id IS NOT NULL",
@@ -4074,6 +4100,7 @@ fn insert_git_event(
             native_id: None,
             cursor: None,
             payload_digest: None,
+            subject: event_subject_for_generation(tx, agent, generation)?,
             data,
         },
     )
@@ -5610,6 +5637,7 @@ fn insert_process_event(
             native_id: None,
             cursor: None,
             payload_digest: None,
+            subject: event_subject_for_generation(tx, agent, generation)?,
             data: json!(record),
         },
     )
@@ -5845,6 +5873,7 @@ struct EventRecord {
     source: String,
     native_id: Option<String>,
     data: String,
+    subject: Option<String>,
 }
 
 struct EventInsert<'a> {
@@ -5857,6 +5886,7 @@ struct EventInsert<'a> {
     native_id: Option<&'a str>,
     cursor: Option<&'a str>,
     payload_digest: Option<&'a [u8]>,
+    subject: Option<EventSubject>,
     data: Value,
 }
 
@@ -5869,6 +5899,7 @@ struct NativeEventInsert<'a> {
     source: &'a str,
     cursor: Option<&'a str>,
     payload_digest: &'a [u8],
+    subject: Option<EventSubject>,
 }
 
 struct TurnInsert<'a> {
@@ -6278,6 +6309,10 @@ fn insert_daemon_event(
     generation: Option<i64>,
     data: Value,
 ) -> Result<Event> {
+    let subject = match (agent, generation) {
+        (Some(agent), Some(generation)) => event_subject_for_generation(tx, agent, generation)?,
+        _ => None,
+    };
     insert_event(
         tx,
         EventInsert {
@@ -6290,9 +6325,24 @@ fn insert_daemon_event(
             native_id: None,
             cursor: None,
             payload_digest: None,
+            subject,
             data,
         },
     )
+}
+
+fn event_subject_for_generation(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    generation: i64,
+) -> Result<Option<EventSubject>> {
+    let Some(agent) = load_agent_by_num(tx, agent_num)? else {
+        return Ok(None);
+    };
+    if agent.generation != generation {
+        return Ok(None);
+    }
+    Ok(Some(EventSubject::from(&agent)))
 }
 
 fn insert_native_event(tx: &Transaction<'_>, event: NativeEventInsert<'_>) -> Result<Event> {
@@ -6308,6 +6358,7 @@ fn insert_native_event(tx: &Transaction<'_>, event: NativeEventInsert<'_>) -> Re
             native_id: Some(&event.native_event.native_id),
             cursor: event.cursor,
             payload_digest: Some(event.payload_digest),
+            subject: event.subject,
             data: event.native_event.data.clone(),
         },
     )
@@ -6321,10 +6372,11 @@ fn insert_event(tx: &Transaction<'_>, event: EventInsert<'_>) -> Result<Event> {
             "persisted event data exceeds 64 KiB",
         ));
     }
+    let subject_json = event.subject.as_ref().map(encode_json).transpose()?;
     db!(tx.execute(
         "INSERT INTO events(ts, kind, family, agent, generation, source, native_id,
-                            cursor, payload_digest, data)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                            cursor, payload_digest, data, subject)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             event.ts,
             event.kind,
@@ -6336,6 +6388,7 @@ fn insert_event(tx: &Transaction<'_>, event: EventInsert<'_>) -> Result<Event> {
             event.cursor,
             event.payload_digest,
             data_json,
+            subject_json,
         ],
     ));
     let seq = tx.last_insert_rowid();
@@ -6348,6 +6401,7 @@ fn insert_event(tx: &Transaction<'_>, event: EventInsert<'_>) -> Result<Event> {
         source: event.source.to_owned(),
         native_id: event.native_id.map(ToOwned::to_owned),
         data: event.data,
+        subject: event.subject,
     })
 }
 
@@ -6361,10 +6415,21 @@ fn event_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRecor
         source: row.get(5)?,
         native_id: row.get(6)?,
         data: row.get(7)?,
+        subject: row.get(8)?,
     })
 }
 
 fn event_from_record(record: EventRecord) -> Result<Event> {
+    let subject = record
+        .subject
+        .as_deref()
+        .map(decode_json)
+        .transpose()?
+        .map(|value| {
+            serde_json::from_value::<EventSubject>(value)
+                .map_err(|error| Error::new("internal", error.to_string()))
+        })
+        .transpose()?;
     Ok(Event {
         seq: record.seq,
         ts: record.ts,
@@ -6374,6 +6439,7 @@ fn event_from_record(record: EventRecord) -> Result<Event> {
         source: record.source,
         native_id: record.native_id,
         data: decode_json(&record.data)?,
+        subject,
     })
 }
 
@@ -8374,6 +8440,7 @@ impl Store {
                     source: &batch.source,
                     cursor,
                     payload_digest: &event_digest,
+                    subject: Some(EventSubject::from(&next)),
                 },
             )?;
             let (effects, hold_events) = persist_effects(
