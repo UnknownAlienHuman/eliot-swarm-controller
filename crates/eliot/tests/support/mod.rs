@@ -204,16 +204,30 @@ impl Fixture {
         self.daemon = Some(Captured::spawn(command));
         let deadline = Instant::now() + WAIT;
         loop {
-            assert!(
-                self.daemon
-                    .as_mut()
-                    .unwrap()
-                    .child
-                    .try_wait()
-                    .expect("daemon status")
-                    .is_none(),
-                "foreground daemon exited during startup"
-            );
+            if let Some(status) = self
+                .daemon
+                .as_mut()
+                .unwrap()
+                .child
+                .try_wait()
+                .expect("daemon status")
+            {
+                let (_, stderr) = self.daemon.as_ref().unwrap().output(Duration::from_secs(2));
+                let mut end = stderr.len().min(16 * 1024);
+                while !stderr.is_char_boundary(end) {
+                    end -= 1;
+                }
+                let truncated = if end < stderr.len() {
+                    "\n[stderr truncated at 16384 bytes]"
+                } else {
+                    ""
+                };
+                panic!(
+                    "foreground daemon exited during startup (status={status:?}); stderr:\n{}{}",
+                    &stderr[..end],
+                    truncated,
+                );
+            }
             let response = cli(&self.data, &["status"]);
             if response.status.success() {
                 assert_eq!(response.json()["state"], "running");

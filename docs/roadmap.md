@@ -50,7 +50,7 @@ per-task report packets or another status registry.
       help/version smoke commands on Windows/Ubuntu. No empty framework crates or
       test platform.
 
-**Next:** L4.1 rules/timers.
+**Next:** L4.2 actions/scripts.
 
 ## L1 — Core, Store, bus and one fake command path
 
@@ -135,9 +135,10 @@ route still works without any proxy installation or worktree machinery.
 Read [automation](spec/automation.md). Reuse the existing router and command storage.
 No second executor, workflow graph or acceptance engine.
 
-- [ ] **L4.1 Rules/timers.** Event-time subject, persisted cursor, bounded matching,
-      interval/cron/one-shot and deterministic command admission. Add atomic definition
-      replacement and bounded backlog when enabling hot reload, not before basic firing.
+- [x] **L4.1 Rules/timers.** Global and owner-registered project rules use event-time
+      subjects, durable cursors, bounded matching/reload/backlog and finite history
+      catch-up. Interval/cron/once/manual timers and action limits use ordinary command
+      admission; the connected action subset is one generation-bound `stop`.
 - [ ] **L4.2 Actions/scripts.** Agent commands first, then bounded explicit scripts.
       Frozen inputs, scoped principal, exit/output handling and unknown outcomes use
       normal commands. Add Git fetch/push wrappers only with their concrete recipe;

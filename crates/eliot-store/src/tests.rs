@@ -242,16 +242,27 @@ fn project_workspace_stop_revalidates_registration_in_cancel_transaction() {
     let worktree_path = "/synthetic-worktree";
     let branch = "codex/project-binding";
     let base_oid = "b".repeat(40);
+    let input = WorkspacePreparationInput {
+        project: checkout.to_owned(),
+        repo_path: checkout.to_owned(),
+        repo_common_dir: repo_common_dir.to_owned(),
+        requested_branch: branch.to_owned(),
+        base_ref: Some("HEAD".to_owned()),
+        base_oid: base_oid.clone(),
+        worktree_path: worktree_path.to_owned(),
+        frozen_setup: Vec::new(),
+    };
     let launch = store
-        .submit(
+        .submit_with_workspace(
             "owner",
             SubmitCommand {
                 id: start_id.clone(),
                 target: None,
                 verb: "launch".to_owned(),
                 args: json!({
-                    "project": project,
-                    "workspace": worktree_path,
+                    "project": checkout,
+                    "workspace": checkout,
+                    "worktree": branch,
                     "harness": "fake",
                     "profile": "fake",
                     "profile_snapshot": {}
@@ -261,36 +272,25 @@ fn project_workspace_stop_revalidates_registration_in_cancel_transaction() {
                 request_id: None,
                 probe: false,
             },
+            input.clone(),
             now,
         )
-        .expect("admit project launch");
+        .expect("admit managed project launch");
     let agent = launch.command.target.expect("workspace Agent");
-    let frozen_setup = serde_json::to_string(&Vec::<eliot_core::WorkspaceSetup>::new())
-        .expect("encode empty frozen setup");
-    let outcome = serde_json::to_string(&json!({"stage":"creation", "reuse":false}))
-        .expect("encode verified creation state");
     store
-        .connection
-        .execute(
-            "INSERT INTO workspaces(
-                 agent, target_generation, start_command_id, project, repo_path,
-                 repo_common_dir, requested_branch, base_ref, base_oid, worktree_path,
-                 frozen_setup, phase, setup_index, outcome, updated_at
-             ) VALUES (?1, 1, ?2, ?3, ?3, ?4, ?5, 'HEAD', ?6, ?7, ?8, 'ready', 0, ?9, ?10)",
-            rusqlite::params![
-                eliot_core::parse_agent_id(&agent).expect("valid Agent id"),
-                start_id,
-                checkout,
-                repo_common_dir,
-                branch,
-                base_oid,
-                worktree_path,
-                frozen_setup,
-                outcome,
-                now + 1,
-            ],
+        .settle_workspace_creation(
+            &start_id,
+            1,
+            WorkspaceCreationOutcome::Verified {
+                repo_path: input.repo_path.clone(),
+                repo_common_dir: input.repo_common_dir.clone(),
+                worktree_path: input.worktree_path.clone(),
+                branch: input.requested_branch.clone(),
+                head: input.base_oid.clone(),
+            },
+            now + 1,
         )
-        .expect("seed L3 workspace with canonical checkout project");
+        .expect("verify L3 workspace with canonical checkout project");
     let registration = ProjectRegistrationInput {
         id: project.to_owned(),
         checkout: checkout.to_owned(),

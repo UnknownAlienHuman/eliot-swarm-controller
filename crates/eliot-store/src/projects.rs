@@ -284,10 +284,10 @@ fn project_binding_for_agent_tx(
     let agent_num = parse_agent_id(target_agent)?;
     let agent = load_agent_by_num(tx, agent_num)?
         .ok_or_else(|| Error::new("not_found", "project action target Agent was not found"))?;
-    if agent.generation != generation || agent.project != registration.id {
+    if agent.generation != generation {
         return Err(Error::new(
             "not_allowed",
-            "project action target does not match its registered project and generation",
+            "project action target generation does not match",
         ));
     }
     if !registration
@@ -304,8 +304,8 @@ fn project_binding_for_agent_tx(
         .workspace
         .as_deref()
         .ok_or_else(|| Error::new("not_allowed", "project Agent has no frozen workspace"))?;
-    // L3 stores the canonical checkout path in WorkspacePreparation.project;
-    // Agent.project above remains the owner-approved registration ID.
+    // L3 stores the canonical checkout path in WorkspacePreparation.project,
+    // independently of the Agent.project label.
     let (repo_path, repo_common_dir) = match load_workspace(tx, agent_num)? {
         Some(workspace)
             if workspace.project == registration.checkout
