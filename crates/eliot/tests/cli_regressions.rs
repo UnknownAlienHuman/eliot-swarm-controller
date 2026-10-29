@@ -106,19 +106,8 @@ fn assert_public_mutation_grammar(fixture: &Fixture, runtime: &tokio::runtime::R
 
 #[test]
 fn cli_launch_rejects_selector_credential_collision_before_persistence() {
-    let fixture = Fixture::new("native store selector credential collision");
+    let fixture = Fixture::new("selector credential collision");
     let credential = format!("test-selector-credential-{}", ulid::Ulid::new());
-    fs::create_dir_all(&fixture.data).expect("create fixture data root");
-    fs::write(
-        fixture.data.join("config.toml"),
-        r#"
-[profiles.privacy-audit]
-harness = "codex"
-model = "test-model"
-pass_env = ["CODEX_HOME", "CODEX_SQLITE_HOME", "EPHEMERAL_TOKEN"]
-"#,
-    )
-    .expect("write privacy regression profile");
 
     let mut data_argument = fixture.data.as_os_str().to_os_string();
     data_argument.push(std::path::MAIN_SEPARATOR_STR);
@@ -133,14 +122,13 @@ pass_env = ["CODEX_HOME", "CODEX_SQLITE_HOME", "EPHEMERAL_TOKEN"]
     let mut daemon = Captured::spawn(daemon_command);
     let startup_deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
-        assert!(
-            daemon
-                .child
-                .try_wait()
-                .expect("foreground daemon status")
-                .is_none(),
-            "foreground daemon exited during startup"
-        );
+        if let Some(exit) = daemon.child.try_wait().expect("foreground daemon status") {
+            let (stdout, stderr) = daemon.output(Duration::from_secs(2));
+            let safe_output = format!("stdout: {stdout}\nstderr: {stderr}")
+                .replace(credential.as_str(), "[REDACTED_TEST_CREDENTIAL]");
+            let bounded_output = safe_output.chars().take(2048).collect::<String>();
+            panic!("foreground daemon exited during startup ({exit}): {bounded_output}");
+        }
         let status = cli(&fixture.data, &["status"]);
         if status.status.success() {
             assert_eq!(status.json()["state"], "running");
@@ -152,6 +140,17 @@ pass_env = ["CODEX_HOME", "CODEX_SQLITE_HOME", "EPHEMERAL_TOKEN"]
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+
+    fs::write(
+        fixture.data.join("config.toml"),
+        r#"
+[profiles.privacy-audit]
+harness = "codex"
+model = "test-model"
+pass_env = ["CODEX_HOME", "CODEX_SQLITE_HOME", "EPHEMERAL_TOKEN"]
+"#,
+    )
+    .expect("write privacy regression profile under the initialized private root");
 
     let mut launch = Command::new(CLI);
     launch

@@ -300,7 +300,7 @@ impl ReaderTransport {
         #[cfg(not(any(unix, windows)))]
         let empty = false;
         if let Some(agent) = agent {
-            let _ = host.state.monitoring.sample_generation(agent).await;
+            let _ = timeout_at(close_until, host.state.monitoring.sample_generation(agent)).await;
         }
         let drained = matches!(
             timeout_at(bounded_deadline(close_until, RPC_GRACE), &mut self.requests).await,
@@ -328,6 +328,7 @@ fn bounded_deadline(close_until: Instant, budget: std::time::Duration) -> Instan
     (Instant::now() + budget).min(close_until)
 }
 
+#[cfg(windows)]
 fn remaining(until: Instant) -> std::time::Duration {
     let now = Instant::now();
     if until > now {
