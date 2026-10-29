@@ -336,6 +336,13 @@ its prior scope value rather than being summed.
 Requested route/settings are not proof of effective values; unavailable readback is
 reported as such. The host owns queued-send FIFO and unknown gates.
 
+`turn.completed.data.native_error` optionally summarizes an available native error as
+`{message,truncated}`. Redact known secrets with `SecretPolicy` before bounding its
+encoded JSON to 4 KiB and the remaining event-data budget; omit it if it cannot fit.
+Never invent unavailable text or alter terminal settlement, bindings, status, final
+text or input acknowledgement for diagnostics. Raw vendor detail maps stay private;
+message text never determines error classification.
+
 `failed` means a known unsuccessful completed operation, which may have partial side
 effects; it does not mean rollback. `rejected` proves no native I/O. Missing authoritative
 outcome is `unknown`. None authorizes automatic re-execution of an external effect.

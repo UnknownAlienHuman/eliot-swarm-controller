@@ -313,7 +313,7 @@ impl CodexPlugin {
         let TargetEnvironment {
             variables,
             mut secrets,
-        } = target_environment(Some(environment))?;
+        } = target_environment(Some(environment), profile.get("pass_env"))?;
         if variables.iter().any(|(name, _)| {
             name.to_string_lossy()
                 .to_ascii_uppercase()
@@ -534,7 +534,7 @@ impl CodexPlugin {
         let TargetEnvironment {
             variables: environment,
             mut secrets,
-        } = target_environment(params.target_environment.as_ref())?;
+        } = target_environment(params.target_environment.as_ref(), profile.get("pass_env"))?;
         secrets.push(initialized.credential.clone());
         let launch = NativeLaunch {
             program,
@@ -2441,7 +2441,10 @@ fn optional_profile_text(
     }
 }
 
-fn target_environment(environment: Option<&Value>) -> Result<TargetEnvironment> {
+fn target_environment(
+    environment: Option<&Value>,
+    pass_env: Option<&Value>,
+) -> Result<TargetEnvironment> {
     let Some(environment) = environment else {
         return Ok(TargetEnvironment {
             variables: Vec::new(),
@@ -2454,6 +2457,7 @@ fn target_environment(environment: Option<&Value>) -> Result<TargetEnvironment> 
             "Codex target_environment must be an object",
         )
     })?;
+    let pass_env = pass_env.and_then(Value::as_array);
     let mut vars = Vec::with_capacity(object.len());
     let mut secrets = Vec::new();
     for (name, value) in object {
@@ -2466,7 +2470,16 @@ fn target_environment(environment: Option<&Value>) -> Result<TargetEnvironment> 
         let value = value.as_str().ok_or_else(|| {
             Error::new("profile_error", "Codex environment values must be strings")
         })?;
-        if is_secret_name(name) && !value.is_empty() {
+        let explicitly_passed = pass_env.is_some_and(|names| {
+            names.iter().filter_map(Value::as_str).any(|passed| {
+                if cfg!(windows) {
+                    name.eq_ignore_ascii_case(passed)
+                } else {
+                    name == passed
+                }
+            })
+        });
+        if (is_secret_name(name) || explicitly_passed) && !value.is_empty() {
             secrets.push(value.to_owned());
         }
         vars.push((OsString::from(name), OsString::from(value)));
@@ -2572,7 +2585,33 @@ fn not_initialized() -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_resume_preflight;
+    use super::{target_environment, validate_resume_preflight};
+    use eliot_core::SecretPolicy;
+    use serde_json::json;
+
+    #[test]
+    fn producer_policy_includes_explicit_pass_env_values_from_target_environment() {
+        let profile = json!({"pass_env": ["DIAGNOSTIC_VALUE", "MISSING_VALUE"]});
+        for name in ["DIAGNOSTIC_VALUE", "diagnostic_value"] {
+            for value in ["native_error", "private diagnostic message"] {
+                let environment = json!({
+                    (name): value,
+                    "SERVICE_TOKEN": "dummy heuristic credential",
+                    "ORDINARY_VALUE": "ordinary target value",
+                });
+                let captured =
+                    target_environment(Some(&environment), profile.get("pass_env")).unwrap();
+                let policy = SecretPolicy::new(captured.secrets);
+                let matches = cfg!(windows) || name == "DIAGNOSTIC_VALUE";
+                assert_eq!(policy.contains_text(value), matches);
+                if matches {
+                    assert_eq!(policy.redact_text(value), "[REDACTED]");
+                }
+                assert!(policy.contains_text("dummy heuristic credential"));
+                assert!(!policy.contains_text("ordinary target value"));
+            }
+        }
+    }
 
     #[test]
     fn unloaded_retained_thread_requires_latest_terminal_turn() {

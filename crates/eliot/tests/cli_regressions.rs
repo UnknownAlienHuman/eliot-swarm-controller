@@ -1482,6 +1482,66 @@ fn public_result_queries_read_one_exact_fake_turn() {
         1,
         "read queries resubmitted input"
     );
+    let failed_id = ulid::Ulid::new().to_string();
+    let failed = cli(
+        &fixture.data,
+        &[
+            "--id",
+            &failed_id,
+            "send",
+            agent,
+            "--generation",
+            &generation.to_string(),
+            "--wait",
+            "--timeout-seconds",
+            "10",
+            "--",
+            "[fake:native-turn-error]",
+        ],
+    );
+    assert_eq!(failed.status.code(), Some(1));
+    let failed_turn: CoreTurn = serde_json::from_str(&failed.stdout).expect("failed terminal turn");
+    assert_eq!(failed_turn.agent, agent);
+    assert_eq!(failed_turn.generation, generation);
+    assert_eq!(failed_turn.state, TurnState::Completed);
+    assert_eq!(failed_turn.status.as_deref(), Some("failed"));
+    assert!(failed_turn.final_text.is_none());
+    let failed_result: AgentResultResponse = serde_json::from_value(fixture.json(&[
+        "result",
+        agent,
+        "--generation",
+        &generation.to_string(),
+        "--turn-id",
+        &failed_turn.turn_id,
+        "--limit",
+        "1",
+    ]))
+    .expect("failed turn result read");
+    assert_eq!(failed_result.turns, vec![failed_turn.clone()]);
+    let applied = fixture.wait_command(&failed_id, "applied");
+    assert_eq!(applied["turn_id"], failed_turn.turn_id);
+    let events = fixture.events();
+    assert_eq!(fault_dispatches(&events, &failed_id), 1);
+    let terminal: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event["agent"] == agent
+                && event["generation"] == generation
+                && event["kind"] == "turn.completed"
+                && event["data"]["turn_id"] == failed_turn.turn_id
+        })
+        .collect();
+    assert_eq!(terminal.len(), 1);
+    assert_eq!(terminal[0]["data"]["command_id"], failed_id);
+    assert_eq!(terminal[0]["data"]["status"], "failed");
+    let diagnostic = &terminal[0]["data"]["native_error"];
+    assert_eq!(
+        diagnostic,
+        &json!({
+            "message":"fake native request failed (HTTP 401)", "truncated":false
+        })
+    );
+    assert!(serde_json::to_vec(diagnostic).unwrap().len() <= 4 * 1024);
     let stop = fixture.json(&["stop", agent, "--generation", &generation.to_string()]);
     fixture.wait_command(
         stop["command_id"].as_str().expect("stop command"),

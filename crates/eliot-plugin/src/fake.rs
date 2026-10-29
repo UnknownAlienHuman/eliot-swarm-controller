@@ -34,6 +34,7 @@ const HOST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const DISCOVERY_SCOPE: &str = "fake:discovery";
 const DISCOVERY_SUBJECTS: usize = 3;
 const MALFORMED_AFTER_DISPATCH: &str = "[fake:malformed-after-dispatch]";
+const NATIVE_ERROR_FIXTURE_INPUT: &str = "[fake:native-turn-error]";
 const HANDOFF_FIXTURE_INPUT: &str = "[fake:source-handoff]";
 const LIVE_OBSERVER_SUBJECT: &str = "fake-discovered-2";
 const LIVE_OBSERVER_TS: i64 = 1_730_000_000_000;
@@ -874,11 +875,12 @@ fn handle_snapshot(raw_params: &Value, state: &FakeState) -> Result<Value, RpcEr
     }
 
     let last_turn = state.last_turn.as_ref().map(|turn| {
+        let failed = turn.text == NATIVE_ERROR_FIXTURE_INPUT;
         json!({
             "command_id": turn.command_id,
             "turn_id": turn.turn_id,
-            "status": "completed",
-            "final_text": turn.text
+            "status": if failed { "failed" } else { "completed" },
+            "final_text": (!failed).then_some(&turn.text)
         })
     });
     Ok(json!({
@@ -920,6 +922,18 @@ fn send_batch(params: &AgentCommandParams, turn_id: &str, text: &str) -> SourceB
         "fake:{}:{}:{}",
         params.agent_id, params.generation, params.command_id
     );
+    let failed = text == NATIVE_ERROR_FIXTURE_INPUT;
+    let mut completion = json!({
+        "command_id": params.command_id,
+        "turn_id": turn_id,
+        "status": if failed { "failed" } else { "completed" }
+    });
+    if failed {
+        completion["native_error"] = json!({
+            "message": "fake native request failed (HTTP 401)",
+            "truncated": false
+        });
+    }
     SourceBatch {
         batch_id: format!("{prefix}:turn"),
         agent_id: params.agent_id.clone(),
@@ -946,13 +960,12 @@ fn send_batch(params: &AgentCommandParams, turn_id: &str, text: &str) -> SourceB
                 kind: "turn.completed".to_owned(),
                 native_id: format!("{prefix}:turn.completed"),
                 ts: None,
-                data: json!({
-                    "command_id": params.command_id,
-                    "turn_id": turn_id,
-                    "status": "completed"
-                }),
+                data: completion,
             },
-        ],
+        ]
+        .into_iter()
+        .filter(|event| !failed || event.kind != "message.completed")
+        .collect(),
         cursor: None,
     }
 }

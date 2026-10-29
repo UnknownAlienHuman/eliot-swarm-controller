@@ -16,7 +16,7 @@ use crate::native::{
     requests::{self, CorePending},
     types::{
         NativeFileChangeItem, NativeItemCompletedNotification, NativePatchChangeKind,
-        NativeServerRequestResolvedNotification, NativeTurnCompletedNotification,
+        NativeServerRequestResolvedNotification, NativeTurnCompletedNotification, NativeTurnError,
         NativeTurnStartedNotification, NativeTurnStatus,
     },
 };
@@ -1212,6 +1212,11 @@ impl EventProcessor {
         if let Some(text) = self.final_text.as_ref() {
             data["final_text"] = Value::String(text.clone());
         }
+        attach_native_error(
+            &mut data,
+            notification.turn.error.as_ref(),
+            &SecretPolicy::new(self.secrets.iter().cloned()),
+        );
         let native_id = event_id(
             self.status.thread_id.as_deref().unwrap_or_default(),
             &notification.turn.id,
@@ -1468,6 +1473,48 @@ async fn run(
     }
 }
 
+fn attach_native_error(data: &mut Value, error: Option<&NativeTurnError>, policy: &SecretPolicy) {
+    let Some(error) = error else { return };
+    if ["native_error", "message", "truncated"]
+        .into_iter()
+        .any(|key| policy.contains_text(key))
+    {
+        return;
+    }
+    let Some(data) = data.as_object_mut() else {
+        return;
+    };
+    let Ok(encoded) = serde_json::to_vec(&*data) else {
+        return;
+    };
+    let budget = MAX_EVENT_BYTES
+        .saturating_sub(encoded.len().saturating_add(r#","native_error":"#.len()))
+        .min(4 * 1024);
+    let mut message = policy.redact_text(&error.message);
+    let mut truncated = false;
+    loop {
+        let diagnostic = json!({"message": &message, "truncated": truncated});
+        let Ok(encoded) = serde_json::to_vec(&diagnostic) else {
+            return;
+        };
+        if encoded.len() <= budget {
+            data.insert("native_error".to_owned(), diagnostic);
+            return;
+        }
+        if message.is_empty() {
+            return;
+        }
+        let mut end = message.len() / 2;
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        // Preserve complete masks across the host's repeated sanitization.
+        let (safe, _) = policy.redact_prefix(&message.as_bytes()[..end], false);
+        message = String::from_utf8_lossy(&safe).into_owned();
+        truncated = true;
+    }
+}
+
 fn validate_thread_and_turn(status: &EventStatus, thread_id: &str, turn_id: &str) -> Result<()> {
     if status.thread_id.as_deref() != Some(thread_id) || turn_id.trim().is_empty() {
         return Err(Error::new(
@@ -1573,5 +1620,115 @@ fn turn_status(status: &NativeTurnStatus) -> String {
         NativeTurnStatus::Interrupted => "interrupted".to_owned(),
         NativeTurnStatus::Failed => "failed".to_owned(),
         NativeTurnStatus::InProgress => "inProgress".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_error_omits_secret_keys_without_changing_terminal_data() {
+        let error = NativeTurnError {
+            message: "native failure".to_owned(),
+            additional_details: None,
+            codex_error_info: None,
+        };
+        let original = json!({
+            "command_id":"send-1", "turn_id":"turn-1", "status":"failed", "final_text":"existing final",
+        });
+        for secret in [
+            "native_error",
+            "message",
+            "truncated",
+            "_error",
+            "mess",
+            "trunc",
+        ] {
+            let policy = SecretPolicy::new([secret]);
+            assert!(!policy.contains_value(&original));
+            let mut data = original.clone();
+            attach_native_error(&mut data, Some(&error), &policy);
+            assert_eq!(data, original);
+        }
+    }
+
+    #[test]
+    fn native_error_preserves_failed_turn_reason_without_changing_terminal_data() {
+        let error: NativeTurnError = serde_json::from_value(json!({
+            "message": "unexpected status 401 Unauthorized: Invalid Authorization header or token",
+            "additionalDetails": "private extra data",
+            "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 401}},
+        }))
+        .unwrap();
+        let mut data = json!({"command_id":"send-1", "turn_id":"turn-1", "status":"failed"});
+        let original = data.clone();
+        attach_native_error(&mut data, Some(&error), &SecretPolicy::default());
+        assert_eq!(
+            data["native_error"],
+            json!({"message":error.message, "truncated":false})
+        );
+        data.as_object_mut().unwrap().remove("native_error");
+        assert_eq!(data, original);
+        assert!(data.get("final_text").is_none());
+        attach_native_error(&mut data, None, &SecretPolicy::default());
+        assert_eq!(data, original);
+    }
+
+    #[test]
+    fn native_error_bounds_encoded_redaction_expansion_and_control_bytes() {
+        for (message, secrets) in [
+            ("x".repeat(600), vec!["x"]),
+            ("\0".repeat(800), vec![]),
+            ("密钥🙂x\n".repeat(200), vec!["密钥", "x"]),
+            ("R🙂x\0".repeat(250), vec!["R", "x"]),
+        ] {
+            assert!(message.len() < 4 * 1024);
+            let policy = SecretPolicy::new(secrets);
+            let error = NativeTurnError {
+                message,
+                additional_details: None,
+                codex_error_info: None,
+            };
+            let mut data = json!({"command_id":"send-1", "turn_id":"turn-1", "status":"failed"});
+            attach_native_error(&mut data, Some(&error), &policy);
+            let diagnostic = &data["native_error"];
+            assert_eq!(diagnostic["truncated"], true);
+            assert!(serde_json::to_vec(diagnostic).unwrap().len() <= 4 * 1024);
+            assert!(serde_json::to_vec(&data).unwrap().len() <= MAX_EVENT_BYTES);
+            let message = diagnostic["message"].as_str().unwrap();
+            assert_eq!(policy.redact_text(message), message);
+            assert!(policy.redact_text(&error.message).starts_with(message));
+        }
+    }
+
+    #[test]
+    fn native_error_respects_remaining_event_budget_or_leaves_terminal_data_intact() {
+        let error = NativeTurnError {
+            message: "diagnostic reason".repeat(100),
+            additional_details: None,
+            codex_error_info: None,
+        };
+        for remaining in [0, 1, 16, 48, 128, 4096] {
+            let mut data = json!({
+                "command_id":"send-1", "turn_id":"turn-1", "status":"failed", "final_text":"",
+            });
+            let base = serde_json::to_vec(&data).unwrap().len();
+            data["final_text"] = json!("t".repeat(MAX_EVENT_BYTES - base - remaining));
+            let original = data.clone();
+            attach_native_error(&mut data, Some(&error), &SecretPolicy::default());
+            assert!(serde_json::to_vec(&data).unwrap().len() <= MAX_EVENT_BYTES);
+            if remaining <= 16 {
+                assert_eq!(data, original);
+            } else {
+                let diagnostic = data
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("native_error")
+                    .unwrap();
+                assert!(serde_json::to_vec(&diagnostic).unwrap().len() <= remaining);
+                assert_eq!(data, original);
+            }
+        }
     }
 }
