@@ -11,6 +11,7 @@ use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, HashSet},
     io::Read,
 };
@@ -812,15 +813,15 @@ fn render_agent_target(value: &Value, roots: &TemplateRoots<'_>) -> Result<Strin
 
     let mut rendered = String::new();
     for part in parts {
-        let fragment = match part {
-            TemplatePart::Literal(text) => text,
-            TemplatePart::Placeholder(path) => lookup(path, roots.event, roots.subject, roots.data)
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    Error::new("invalid", "embedded rule template values must be strings")
-                })?,
-        };
-        push_agent_id_fragment(&mut rendered, fragment)?;
+        match part {
+            TemplatePart::Literal(text) => push_agent_id_fragment(&mut rendered, text)?,
+            TemplatePart::Placeholder(path) => {
+                let value = lookup(path, roots.event, roots.subject, roots.data)
+                    .ok_or_else(|| Error::new("invalid", "rule template value is unavailable"))?;
+                let text = scalar_text(value)?;
+                push_agent_id_fragment(&mut rendered, text.as_ref())?;
+            }
+        }
     }
     Ok(rendered)
 }
@@ -844,6 +845,19 @@ fn push_agent_id_fragment(target: &mut String, fragment: &str) -> Result<(), Err
     }
     target.push_str(fragment);
     Ok(())
+}
+
+fn scalar_text(value: &Value) -> Result<Cow<'_, str>, Error> {
+    match value {
+        Value::String(value) => Ok(Cow::Borrowed(value)),
+        Value::Number(value) => Ok(Cow::Owned(value.to_string())),
+        Value::Bool(true) => Ok(Cow::Borrowed("true")),
+        Value::Bool(false) => Ok(Cow::Borrowed("false")),
+        Value::Null | Value::Array(_) | Value::Object(_) => Err(Error::new(
+            "invalid",
+            "embedded rule template values must be scalar",
+        )),
+    }
 }
 
 fn render_generation(value: &Value, roots: &TemplateRoots<'_>) -> Result<Value, Error> {
@@ -1197,11 +1211,11 @@ do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${eve
         );
         let numeric_target = load(Cursor::new(numeric_target)).unwrap().remove(0);
         let mut target_event = event();
-        target_event.agent = Some("a3".to_owned());
-        assert_eq!(
-            evaluate(&numeric_target, &target_event).unwrap_err().code,
-            "invalid"
-        );
+        target_event.agent = Some("a1".to_owned());
+        target_event.generation = Some(1);
+        let command = evaluate(&numeric_target, &target_event).unwrap().unwrap();
+        assert_eq!(command.target.as_deref(), Some("a1"));
+        assert_eq!(command.expected_generation, Some(1));
 
         let string_generation = RULE.replace(
             "expected_generation = '${event.generation}'",
