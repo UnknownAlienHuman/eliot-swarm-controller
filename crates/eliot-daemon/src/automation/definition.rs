@@ -1,10 +1,11 @@
 use eliot_core::{
     Error, Event,
-    api::{CatchUp, TimerSchedule},
+    api::{CatchUp, RuleLimit, RuleLimitScope, TimerSchedule},
     canonical_json_sha256, parse_agent_id,
 };
 use globset::{Glob, GlobMatcher};
 use regex::Regex;
+use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -28,6 +29,12 @@ pub struct RuleDefinition {
     trigger: TriggerDefinition,
     #[serde(rename = "do")]
     actions: Vec<StopActionDefinition>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_rule_limit"
+    )]
+    limit: Option<RuleLimit>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_self: bool,
     #[serde(
@@ -66,6 +73,17 @@ struct StopActionDefinition {
     action: String,
     target: Value,
     expected_generation: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuleLimitInput {
+    max: u64,
+    per: RuleLimitScope,
+    #[serde(default)]
+    window: Option<String>,
+    #[serde(default)]
+    window_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -119,6 +137,34 @@ fn default_catch_up() -> CatchUp {
 
 fn is_default_catch_up(catch_up: &CatchUp) -> bool {
     matches!(catch_up, CatchUp::None)
+}
+
+fn deserialize_rule_limit<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<RuleLimit>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(input) = Option::<RuleLimitInput>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    let window_ms = match (input.window, input.window_ms) {
+        (Some(window), None) => super::schedule::parse_positive_duration_ms(&window)
+            .map_err(|_| D::Error::custom("limit window must be positive whole milliseconds"))?,
+        (None, Some(window_ms)) => window_ms,
+        _ => {
+            return Err(D::Error::custom(
+                "limit requires exactly one window or normalized window_ms",
+            ));
+        }
+    };
+    let limit = RuleLimit {
+        max: input.max,
+        per: input.per,
+        window_ms,
+    };
+    limit.validate().map_err(D::Error::custom)?;
+    Ok(Some(limit))
 }
 
 /// Reads and validates one bounded global rule file.
@@ -284,7 +330,16 @@ fn reject_unimplemented_options(raw: &toml::Value) -> Result<(), Error> {
     let Some(rule) = raw.as_table() else {
         return Ok(());
     };
-    let has_unsupported_rule_option = ["limit"].iter().any(|key| rule.contains_key(*key));
+    if rule
+        .get("limit")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|limit| limit.contains_key("window_ms"))
+    {
+        return Err(Error::new(
+            "invalid",
+            "rule files express limit windows as durations",
+        ));
+    }
     let has_unsupported_trigger = rule
         .get("on")
         .and_then(toml::Value::as_table)
@@ -299,7 +354,7 @@ fn reject_unimplemented_options(raw: &toml::Value) -> Result<(), Error> {
                         .is_some_and(|action| action.contains_key("selector"))
                 })
             });
-    if has_unsupported_rule_option || has_unsupported_trigger || has_unsupported_selector {
+    if has_unsupported_trigger || has_unsupported_selector {
         return Err(Error::new(
             "unsupported",
             "rule uses a trigger or option not supported in this increment",
@@ -740,6 +795,14 @@ on = { at = '1970-01-01T00:00:01Z' }
 do = [{ action = 'stop', target = 'a7', expected_generation = 3 }]
 "#;
 
+    const LIMITED_RULE: &str = r#"
+[[rule]]
+id = 'limited-stop'
+on = { event = 'command.applied' }
+limit = { max = 3, per = 'agent', window = '1m' }
+do = [{ action = 'stop', target = 'a7', expected_generation = 3 }]
+"#;
+
     const OPERATOR_RULE: &str = r#"
 [[rule]]
 id = 'command-launch'
@@ -770,8 +833,13 @@ do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${eve
 
     #[test]
     fn load_rejects_invalid_and_unimplemented_rule_fields() {
+        let incomplete_limit = RULE.replace("do =", "limit = { max = 2 }\ndo =");
+        assert_eq!(
+            load(Cursor::new(incomplete_limit)).unwrap_err().code,
+            "invalid"
+        );
+
         let unsupported = [
-            RULE.replace("do =", "limit = { max = 2 }\ndo ="),
             RULE.replace("action = 'stop'", "action = 'send'"),
             RULE.replace("'subject.harness' = 'fake'", "'subject.labels.role' = 'writer'"),
             RULE.replace("'subject.harness' = 'fake'", "'event.parent' = 'command-id'"),
@@ -956,6 +1024,51 @@ do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${eve
         );
         let latest = load(Cursor::new(latest_source)).unwrap().remove(0);
         assert_eq!(latest.catch_up(), &CatchUp::Latest);
+    }
+
+    #[test]
+    fn custom_rule_limit_normalizes_and_survives_saved_decode() {
+        let definition = load(Cursor::new(LIMITED_RULE)).unwrap().remove(0);
+        let canonical_value = serde_json::to_value(&definition).unwrap();
+        let limit: RuleLimit = serde_json::from_value(canonical_value["limit"].clone()).unwrap();
+        assert_eq!(limit.max, 3);
+        assert_eq!(limit.per, RuleLimitScope::Agent);
+        assert_eq!(limit.window_ms, 60_000);
+
+        let per_rule = LIMITED_RULE.replace("per = 'agent'", "per = 'rule'");
+        let per_rule = load(Cursor::new(per_rule)).unwrap().remove(0);
+        let per_rule_value = serde_json::to_value(&per_rule).unwrap();
+        let per_rule_limit: RuleLimit =
+            serde_json::from_value(per_rule_value["limit"].clone()).unwrap();
+        assert_eq!(per_rule_limit.per, RuleLimitScope::Rule);
+
+        let canonical = serde_json::to_string(&definition).unwrap();
+        assert!(canonical.contains("\"window_ms\":60000"));
+        let restored = RuleDefinition::deserialize_saved(&canonical).unwrap();
+        let restored_value = serde_json::to_value(&restored).unwrap();
+        let restored_limit: RuleLimit =
+            serde_json::from_value(restored_value["limit"].clone()).unwrap();
+        assert_eq!(restored_limit.window_ms, 60_000);
+        assert_eq!(
+            restored.semantic_digest().unwrap(),
+            definition.semantic_digest().unwrap()
+        );
+    }
+
+    #[test]
+    fn custom_rule_limit_requires_positive_whole_milliseconds() {
+        let zero_max = LIMITED_RULE.replace("max = 3", "max = 0");
+        assert_eq!(load(Cursor::new(zero_max)).unwrap_err().code, "invalid");
+        let submillisecond = LIMITED_RULE.replace("window = '1m'", "window = '500us'");
+        assert_eq!(
+            load(Cursor::new(submillisecond)).unwrap_err().code,
+            "invalid"
+        );
+        let internal_unit = LIMITED_RULE.replace("window = '1m'", "window_ms = 60000");
+        assert_eq!(
+            load(Cursor::new(internal_unit)).unwrap_err().code,
+            "invalid"
+        );
     }
 
     #[test]

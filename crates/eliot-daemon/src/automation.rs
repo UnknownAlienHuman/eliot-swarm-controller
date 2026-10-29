@@ -1,12 +1,13 @@
 mod definition;
+mod projects;
 mod reload;
 mod schedule;
 pub(crate) use definition::RuleDefinition;
 
 use crate::{common::now_ms, logging, router::Router};
 use eliot_core::{
-    Error, Result, SecretPolicy, SubmitCommand,
-    api::{CatchUp, RuleStateView, TimerSchedule, TimerStateView},
+    Error, Event, Result, SecretPolicy, SubmitCommand,
+    api::{CatchUp, ProjectRegistrationView, RuleStateView, TimerSchedule, TimerStateView},
     canonical_json_sha256,
 };
 use eliot_store::{
@@ -15,16 +16,16 @@ use eliot_store::{
 };
 use serde_json::json;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 use tokio::sync::{broadcast, watch};
 
-const RULE_EVENT_PAGE_SIZE: usize = 128;
+pub(crate) const RULE_EVENT_PAGE_SIZE: usize = 128;
 const TIMER_PAGE_SIZE: usize = 128;
-const MAX_RULE_EVENT_BACKLOG: i64 = 100_000;
+const RULE_CHILD_RECOVERY_PAGE_SIZE: usize = 1_000;
 const RULE_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,6 +38,11 @@ pub(crate) enum ReloadNoticeKey {
 pub(crate) struct ReloadNoticeContext {
     deferred: Option<ReloadNoticeKey>,
     rejected: Option<ReloadNoticeKey>,
+}
+
+struct ReloadReporter<'a> {
+    policy: &'a SecretPolicy,
+    notices: &'a mut ReloadNoticeContext,
 }
 
 enum TimerDecision {
@@ -54,10 +60,30 @@ enum TimerDecision {
 }
 
 pub(crate) struct ActiveRule {
+    principal: String,
+    project: Option<ProjectRegistrationView>,
     definition: RuleDefinition,
     state: RuleStateView,
     retiring: Option<RetiringRule>,
     timer: Option<ActiveTimer>,
+}
+
+pub(crate) struct ProjectRuleNamespace {
+    principal: String,
+    registration: projects::RegistrationSnapshot,
+    registration_view: ProjectRegistrationView,
+    registration_current: bool,
+    rules: Vec<ActiveRule>,
+    notices: ReloadNoticeContext,
+}
+
+pub(crate) struct RuleWorkerStart {
+    pub global_rules: Vec<ActiveRule>,
+    pub project_rules: Vec<ProjectRuleNamespace>,
+    pub max_event_backlog: i64,
+    pub data_root: PathBuf,
+    pub policy: Arc<SecretPolicy>,
+    pub initial_notices: ReloadNoticeContext,
 }
 
 struct RetiringRule {
@@ -80,7 +106,7 @@ pub(crate) async fn initialize_global_rules(
     policy: &SecretPolicy,
 ) -> Result<(Vec<ActiveRule>, ReloadNoticeContext)> {
     let mut notices = ReloadNoticeContext::default();
-    let prior = router.global_rule_processing().await?;
+    let prior = router.rule_processing("owner").await?;
     let registration_now = now_ms();
     let (snapshot, from_file) = match reload::load(data_root) {
         Ok(snapshot) => (snapshot, true),
@@ -91,7 +117,9 @@ pub(crate) async fn initialize_global_rules(
         Err(error) => return Err(error),
     };
     let (rules, candidate_from_file) =
-        match apply_global_rule_snapshot(router, &snapshot, None, registration_now).await {
+        match apply_global_rule_snapshot(router, "owner", None, &snapshot, None, registration_now)
+            .await
+        {
             Ok(rules) => (rules, from_file),
             Err(error)
                 if !prior.is_empty()
@@ -103,7 +131,15 @@ pub(crate) async fn initialize_global_rules(
                 report_rejected_reload(policy, &snapshot.inputs, &error, &mut notices)?;
                 let saved = reload::from_processing(&prior)?;
                 (
-                    apply_global_rule_snapshot(router, &saved, None, registration_now).await?,
+                    apply_global_rule_snapshot(
+                        router,
+                        "owner",
+                        None,
+                        &saved,
+                        None,
+                        registration_now,
+                    )
+                    .await?,
                     false,
                 )
             }
@@ -121,6 +157,326 @@ pub(crate) async fn initialize_global_rules(
         report_deferred_reload(policy, &snapshot.inputs, &mut notices)?;
     }
     Ok((rules, notices))
+}
+
+pub(crate) async fn initialize_project_rules(
+    router: &Router,
+    data_root: &Path,
+    policy: &SecretPolicy,
+) -> Result<Vec<ProjectRuleNamespace>> {
+    let registration_result = projects::load_registrations(data_root).await;
+    let registrations = match registration_result {
+        Ok(registrations) => registrations,
+        Err(error) => {
+            logging::record(policy, "daemon.rule_reload_rejected", &[], Some(&error));
+            return Ok(Vec::new());
+        }
+    };
+    let inputs = registrations
+        .iter()
+        .map(project_registration_input)
+        .collect::<Vec<_>>();
+    let views = router.reconcile_project_registrations(&inputs).await?;
+    let mut namespaces = Vec::with_capacity(views.len());
+    for view in views {
+        let Some(registration) = registrations
+            .iter()
+            .find(|item| item.id == view.id)
+            .cloned()
+        else {
+            return Err(Error::new(
+                "source_integrity",
+                "Store returned an unconfigured project registration",
+            ));
+        };
+        let initialized =
+            initialize_project_namespace(router, data_root, policy, registration, view).await;
+        match initialized {
+            Ok(namespace) => namespaces.push(namespace),
+            Err(error) => logging::record(policy, "daemon.rule_reload_rejected", &[], Some(&error)),
+        }
+    }
+    Ok(namespaces)
+}
+
+async fn initialize_project_namespace(
+    router: &Router,
+    data_root: &Path,
+    policy: &SecretPolicy,
+    registration: projects::RegistrationSnapshot,
+    registration_view: ProjectRegistrationView,
+) -> Result<ProjectRuleNamespace> {
+    let principal = format!("project:{}", registration.id);
+    registration_view.validate()?;
+    if project_registration_snapshot(&registration_view) != registration {
+        return Err(Error::new(
+            "source_integrity",
+            "Store project registration differs from the owner configuration",
+        ));
+    }
+    let prior = router.rule_processing(&principal).await?;
+    let mut notices = ReloadNoticeContext::default();
+    let registration_now = now_ms();
+    let loaded_result = projects::load_project_rules(data_root, registration.clone()).await;
+    let loaded = match loaded_result {
+        Ok(loaded) => loaded,
+        Err(error) if !prior.is_empty() => {
+            report_rejected_source(policy, &error, &mut notices)?;
+            let snapshot = reload::from_processing(&prior)?;
+            let rules = apply_global_rule_snapshot(
+                router,
+                &principal,
+                Some(&registration_view),
+                &snapshot,
+                None,
+                registration_now,
+            )
+            .await?;
+            return Ok(ProjectRuleNamespace {
+                principal,
+                registration,
+                registration_view,
+                registration_current: true,
+                rules,
+                notices,
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    if loaded.principal != principal || loaded.registration != registration {
+        return Err(Error::new(
+            "source_integrity",
+            "project rule loader returned a different authority scope",
+        ));
+    }
+    let snapshot = loaded.snapshot;
+    let rules_result = apply_global_rule_snapshot(
+        router,
+        &principal,
+        Some(&registration_view),
+        &snapshot,
+        None,
+        registration_now,
+    )
+    .await;
+    let rules = match rules_result {
+        Ok(rules) => rules,
+        Err(error)
+            if !prior.is_empty()
+                && matches!(
+                    error.code.as_str(),
+                    "frame_too_large" | "invalid" | "secret_in_payload" | "unsupported"
+                ) =>
+        {
+            report_rejected_reload(policy, &snapshot.inputs, &error, &mut notices)?;
+            let saved = reload::from_processing(&prior)?;
+            apply_global_rule_snapshot(
+                router,
+                &principal,
+                Some(&registration_view),
+                &saved,
+                None,
+                registration_now,
+            )
+            .await?
+        }
+        Err(error) => return Err(error),
+    };
+    let current = rules
+        .iter()
+        .map(|rule| rule.definition.clone())
+        .collect::<Vec<_>>();
+    let deferred = rules
+        .iter()
+        .any(|rule| rule.state.retiring_revision.is_some())
+        && !snapshot.matches(&current)?;
+    if deferred {
+        report_deferred_reload(policy, &snapshot.inputs, &mut notices)?;
+    }
+    Ok(ProjectRuleNamespace {
+        principal,
+        registration: loaded.registration,
+        registration_view,
+        registration_current: true,
+        rules,
+        notices,
+    })
+}
+
+fn project_registration_input(
+    registration: &projects::RegistrationSnapshot,
+) -> eliot_store::ProjectRegistrationInput {
+    eliot_store::ProjectRegistrationInput {
+        id: registration.id.clone(),
+        checkout: registration.checkout.clone(),
+        repo_common_dir: registration.repo_common_dir.clone(),
+        profiles: registration.profiles.clone(),
+        actions: registration.actions.clone(),
+    }
+}
+
+fn project_registration_snapshot(
+    registration: &ProjectRegistrationView,
+) -> projects::RegistrationSnapshot {
+    projects::RegistrationSnapshot {
+        id: registration.id.clone(),
+        checkout: registration.checkout.clone(),
+        repo_common_dir: registration.repo_common_dir.clone(),
+        profiles: registration.profiles.clone(),
+        actions: registration.actions.clone(),
+    }
+}
+
+pub(crate) async fn verify_project_registration(
+    data_root: &Path,
+    registration: &ProjectRegistrationView,
+) -> Result<()> {
+    registration.validate()?;
+    projects::verify_registration(data_root, &project_registration_snapshot(registration)).await
+}
+
+pub(crate) async fn verify_managed_project_workspace(
+    registration: &ProjectRegistrationView,
+    workspace: &eliot_core::WorkspacePreparation,
+    target_workspace: &str,
+    expected_generation: i64,
+) -> Result<()> {
+    registration.validate()?;
+    projects::verify_managed_workspace_identity(
+        &project_registration_snapshot(registration),
+        workspace,
+        target_workspace,
+        expected_generation,
+    )
+    .await
+}
+
+async fn refresh_project_namespaces(
+    router: &Router,
+    data_root: &Path,
+    policy: &SecretPolicy,
+    namespaces: &mut Vec<ProjectRuleNamespace>,
+    owner_config_notices: &mut ReloadNoticeContext,
+) -> Result<bool> {
+    let registrations = match projects::load_registrations(data_root).await {
+        Ok(registrations) => registrations,
+        Err(error) => {
+            report_rejected_source(policy, &error, owner_config_notices)?;
+            for namespace in namespaces.iter_mut() {
+                namespace.registration_current = false;
+            }
+            return Ok(false);
+        }
+    };
+    let inputs = registrations
+        .iter()
+        .map(project_registration_input)
+        .collect::<Vec<_>>();
+    let views = match router.reconcile_project_registrations(&inputs).await {
+        Ok(views) => views,
+        Err(error) => {
+            report_rejected_source(policy, &error, owner_config_notices)?;
+            for namespace in namespaces.iter_mut() {
+                namespace.registration_current = false;
+            }
+            return Ok(false);
+        }
+    };
+    let current_ids: HashSet<_> = views.iter().map(|view| view.id.clone()).collect();
+    namespaces.retain(|namespace| current_ids.contains(&namespace.registration.id));
+
+    for view in views {
+        let Some(registration) = registrations
+            .iter()
+            .find(|item| item.id == view.id)
+            .cloned()
+        else {
+            return Err(Error::new(
+                "source_integrity",
+                "Store returned an unconfigured project registration",
+            ));
+        };
+        let Some(index) = namespaces
+            .iter()
+            .position(|namespace| namespace.registration.id == view.id)
+        else {
+            match initialize_project_namespace(router, data_root, policy, registration, view).await
+            {
+                Ok(namespace) => namespaces.push(namespace),
+                Err(error) => {
+                    logging::record(policy, "daemon.rule_reload_rejected", &[], Some(&error));
+                }
+            }
+            continue;
+        };
+
+        let namespace = &mut namespaces[index];
+        namespace.registration_current = true;
+        namespace.registration = registration.clone();
+        namespace.registration_view = view.clone();
+        for rule in &mut namespace.rules {
+            rule.project = Some(view.clone());
+        }
+
+        let loaded = match projects::load_project_rules(data_root, registration.clone()).await {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                report_rejected_source(policy, &error, &mut namespace.notices)?;
+                continue;
+            }
+        };
+        if loaded.principal != namespace.principal || loaded.registration != namespace.registration
+        {
+            namespace.registration_current = false;
+            let error = Error::new(
+                "source_integrity",
+                "project rule loader returned a different authority scope",
+            );
+            report_rejected_source(policy, &error, &mut namespace.notices)?;
+            continue;
+        }
+        let snapshot = loaded.snapshot;
+        let current = namespace
+            .rules
+            .iter()
+            .map(|rule| rule.definition.clone())
+            .collect::<Vec<_>>();
+        if snapshot.matches(&current)? {
+            namespace.notices.deferred = None;
+            namespace.notices.rejected = None;
+            continue;
+        }
+        let key = reload_notice_key(&snapshot.inputs)?;
+        if namespace.notices.rejected.as_ref() == Some(&key)
+            || (namespace
+                .rules
+                .iter()
+                .any(|rule| rule.state.retiring_revision.is_some())
+                && namespace.notices.deferred.as_ref() == Some(&key))
+        {
+            continue;
+        }
+        let update = {
+            let mut reporter = ReloadReporter {
+                policy,
+                notices: &mut namespace.notices,
+            };
+            attempt_reload_snapshot(
+                router,
+                &namespace.principal,
+                Some(&namespace.registration_view),
+                &snapshot,
+                &namespace.rules,
+                now_ms(),
+                &mut reporter,
+            )
+            .await?
+        };
+        if let Some((updated, _deferred)) = update {
+            namespace.rules = updated;
+        }
+    }
+    Ok(true)
 }
 
 fn reload_notice_key(inputs: &[RuleDefinitionInput]) -> Result<ReloadNoticeKey> {
@@ -201,37 +557,54 @@ fn report_rejected_source(
 
 async fn apply_global_rule_snapshot(
     router: &Router,
+    principal: &str,
+    project: Option<&ProjectRegistrationView>,
     snapshot: &reload::RuleSnapshot,
     previous: Option<&[ActiveRule]>,
     registration_now: i64,
 ) -> Result<Vec<ActiveRule>> {
     router
-        .validate_global_rule_definitions(&snapshot.inputs)
+        .validate_rule_definitions(principal, &snapshot.inputs)
         .await?;
-    let prior = router.global_rule_processing().await?;
+    let prior = router.rule_processing(principal).await?;
+    // Preflight schedule arithmetic against the complete incoming snapshot
+    // before a retiring revision can replace a deferred definition below.
+    let _candidate_timers =
+        timer_inputs(router, principal, snapshot, &prior, registration_now).await?;
     let effective = defer_retiring_edits(snapshot, &prior)?;
-    let timers = timer_inputs(router, &effective, &prior, registration_now).await?;
+    let timers = timer_inputs(router, principal, &effective, &prior, registration_now).await?;
     let states = router
-        .initialize_global_rules(&effective.inputs, &timers, registration_now)
+        .initialize_rules(principal, &effective.inputs, &timers, registration_now)
         .await?;
-    let active = active_rules(router, states, previous, registration_now).await?;
+    let active = active_rules(
+        router,
+        principal,
+        project,
+        states,
+        previous,
+        registration_now,
+    )
+    .await?;
     let cached = active
         .iter()
         .map(|rule| (rule.state.revision, rule.definition.clone()))
         .collect::<Vec<_>>();
-    router.install_global_rule_definitions(&cached);
+    router.install_rule_definitions(principal, &cached);
     Ok(active)
 }
 
 async fn attempt_reload_snapshot(
     router: &Router,
+    principal: &str,
+    project: Option<&ProjectRegistrationView>,
     snapshot: &reload::RuleSnapshot,
     previous: &[ActiveRule],
     now: i64,
-    policy: &SecretPolicy,
-    notices: &mut ReloadNoticeContext,
+    reporter: &mut ReloadReporter<'_>,
 ) -> Result<Option<(Vec<ActiveRule>, bool)>> {
-    match apply_global_rule_snapshot(router, snapshot, Some(previous), now).await {
+    match apply_global_rule_snapshot(router, principal, project, snapshot, Some(previous), now)
+        .await
+    {
         Ok(updated) => {
             let definitions = updated
                 .iter()
@@ -242,10 +615,10 @@ async fn attempt_reload_snapshot(
                 .any(|rule| rule.state.retiring_revision.is_some())
                 && !snapshot.matches(&definitions)?;
             if deferred {
-                report_deferred_reload(policy, &snapshot.inputs, notices)?;
+                report_deferred_reload(reporter.policy, &snapshot.inputs, reporter.notices)?;
             } else {
-                notices.deferred = None;
-                notices.rejected = None;
+                reporter.notices.deferred = None;
+                reporter.notices.rejected = None;
             }
             Ok(Some((updated, deferred)))
         }
@@ -255,7 +628,7 @@ async fn attempt_reload_snapshot(
                 "frame_too_large" | "invalid" | "secret_in_payload" | "unsupported"
             ) =>
         {
-            report_rejected_reload(policy, &snapshot.inputs, &error, notices)?;
+            report_rejected_reload(reporter.policy, &snapshot.inputs, &error, reporter.notices)?;
             Ok(None)
         }
         Err(error) => Err(error),
@@ -320,6 +693,7 @@ fn defer_retiring_edits(
 
 async fn timer_inputs(
     router: &Router,
+    principal: &str,
     snapshot: &reload::RuleSnapshot,
     prior: &[RuleProcessingState],
     registration_now: i64,
@@ -342,7 +716,7 @@ async fn timer_inputs(
             .map(RuleDefinition::schedule_digest)
             .transpose()?
             != Some(definition.schedule_digest()?);
-        let existing = router.get_global_timer(&definition.id).await?;
+        let existing = router.get_rule_timer(principal, &definition.id).await?;
         let schedule_revision =
             match &existing {
                 Some(timer) if schedule_changed => timer
@@ -375,6 +749,8 @@ async fn timer_inputs(
 
 async fn active_rules(
     router: &Router,
+    principal: &str,
+    project: Option<&ProjectRegistrationView>,
     states: Vec<RuleProcessingState>,
     previous: Option<&[ActiveRule]>,
     armed_at: i64,
@@ -423,7 +799,7 @@ async fn active_rules(
         };
         let timer = if definition.schedule().is_some() {
             let state = router
-                .get_global_timer(&definition.id)
+                .get_rule_timer(principal, &definition.id)
                 .await?
                 .ok_or_else(|| Error::new("source_integrity", "timer rule has no timer state"))?;
             let old_timer = previous
@@ -451,6 +827,8 @@ async fn active_rules(
             None
         };
         active.push(ActiveRule {
+            principal: principal.to_owned(),
+            project: project.cloned(),
             definition,
             state: processing.view,
             retiring,
@@ -462,12 +840,15 @@ async fn active_rules(
 
 pub(crate) async fn run_global_rules(
     router: Router,
-    mut rules: Vec<ActiveRule>,
-    data_root: PathBuf,
-    policy: Arc<SecretPolicy>,
-    initial_notices: ReloadNoticeContext,
+    start: RuleWorkerStart,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
+    let mut rules = start.global_rules;
+    let mut project_rules = start.project_rules;
+    let data_root = start.data_root;
+    let policy = start.policy;
+    let initial_notices = start.initial_notices;
+    let initial_max_event_backlog = start.max_event_backlog;
     // Bus messages are wake hints; durable Store pages remain authoritative.
     // Register before the first high-water read so no event can fall between them.
     let mut events = router.subscribe_rule_events();
@@ -479,10 +860,41 @@ pub(crate) async fn run_global_rules(
             None
         }
     };
+    let mut project_watchers = Vec::new();
+    for namespace in &project_rules {
+        match reload::RuleWatcher::watch_project(Path::new(&namespace.registration.checkout)) {
+            Ok(watcher) => project_watchers.push(watcher),
+            Err(error) => {
+                logging::record(&policy, "daemon.rule_watch_unavailable", &[], Some(&error));
+            }
+        }
+    }
     let mut reconcile = tokio::time::interval(RULE_RECONCILE_INTERVAL);
     reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut notices = initial_notices;
+    let mut owner_config_notices = ReloadNoticeContext::default();
+    let mut max_event_backlog = initial_max_event_backlog;
     let mut last_applied_inputs = None;
+    let mut recover_rule_children = true;
+    match crate::config::load_automation_config(&data_root) {
+        Ok(config) => {
+            max_event_backlog = config.max_event_backlog;
+            let _ = refresh_project_namespaces(
+                &router,
+                &data_root,
+                &policy,
+                &mut project_rules,
+                &mut owner_config_notices,
+            )
+            .await?;
+        }
+        Err(error) => {
+            report_rejected_source(&policy, &error, &mut owner_config_notices)?;
+            for namespace in &mut project_rules {
+                namespace.registration_current = false;
+            }
+        }
+    }
     if let Ok(snapshot) = reload::load(&data_root) {
         let current = rules
             .iter()
@@ -499,39 +911,91 @@ pub(crate) async fn run_global_rules(
                 .iter()
                 .any(|rule| rule.state.retiring_revision.is_some())
                 && notices.deferred.as_ref() == Some(&key);
-            if !already_rejected
-                && !already_deferred
-                && let Some((updated, deferred)) = attempt_reload_snapshot(
-                    &router,
-                    &snapshot,
-                    &rules,
-                    now_ms(),
-                    &policy,
-                    &mut notices,
-                )
-                .await?
-            {
-                rules = updated;
-                if !deferred {
-                    last_applied_inputs = Some(snapshot.inputs);
+            if !already_rejected && !already_deferred {
+                let update = {
+                    let mut reporter = ReloadReporter {
+                        policy: &policy,
+                        notices: &mut notices,
+                    };
+                    attempt_reload_snapshot(
+                        &router,
+                        "owner",
+                        None,
+                        &snapshot,
+                        &rules,
+                        now_ms(),
+                        &mut reporter,
+                    )
+                    .await?
+                };
+                if let Some((updated, deferred)) = update {
+                    rules = updated;
+                    if !deferred {
+                        last_applied_inputs = Some(snapshot.inputs);
+                    }
                 }
             }
         }
     }
     loop {
-        if *shutdown.borrow() || !router.rule_firings_open() {
+        if *shutdown.borrow() {
             return Ok(());
         }
-        let high_water = router.rule_high_water().await?;
-        if !reconcile_event_rules(&router, &mut rules, high_water, now_ms()).await? {
-            return Ok(());
+        if recover_rule_children {
+            router
+                .recover_rule_children(RULE_CHILD_RECOVERY_PAGE_SIZE)
+                .await?;
+            recover_rule_children = false;
+        }
+        let firing_open = router.rule_firings_open();
+        if firing_open {
+            let high_water = router.rule_high_water().await?;
+            if !reconcile_event_rules(&router, &mut rules, high_water, now_ms(), max_event_backlog)
+                .await?
+            {
+                return Ok(());
+            }
+            for namespace in &mut project_rules {
+                if namespace.registration_current
+                    && !reconcile_event_rules(
+                        &router,
+                        &mut namespace.rules,
+                        high_water,
+                        now_ms(),
+                        max_event_backlog,
+                    )
+                    .await?
+                {
+                    return Ok(());
+                }
+            }
+
+            if !reconcile_due_timers(&router, &mut rules, now_ms()).await? {
+                return Ok(());
+            }
+            for namespace in &mut project_rules {
+                if namespace.registration_current
+                    && !reconcile_due_timers(&router, &mut namespace.rules, now_ms()).await?
+                {
+                    return Ok(());
+                }
+            }
         }
 
-        if !reconcile_due_timers(&router, &mut rules, now_ms()).await? {
-            return Ok(());
-        }
-
-        let timer_wait = next_timer_wait(&rules, now_ms());
+        let now = now_ms();
+        let timer_wait = if firing_open {
+            std::iter::once(next_timer_wait(&rules, now))
+                .chain(
+                    project_rules
+                        .iter()
+                        .filter(|namespace| namespace.registration_current)
+                        .map(|namespace| next_timer_wait(&namespace.rules, now)),
+                )
+                .flatten()
+                .min()
+        } else {
+            None
+        };
         let mut reload_requested = false;
         tokio::select! {
             changed = shutdown.changed() => {
@@ -540,12 +1004,20 @@ pub(crate) async fn run_global_rules(
                 }
             }
             changed = progress.changed() => {
-                if changed.is_err() || !router.rule_firings_open() {
+                if changed.is_err() {
                     return Ok(());
                 }
+                recover_rule_children = true;
             }
             received = events.recv() => match received {
-                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Ok(event) => {
+                    router.note_committed_events(std::slice::from_ref(&event));
+                    recover_rule_children = true;
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    router.clear_terminal_unknown_cache().await;
+                    recover_rule_children = true;
+                }
                 Err(broadcast::error::RecvError::Closed) => {
                     return Err(Error::new("unavailable", "event bus is closed"));
                 }
@@ -558,6 +1030,7 @@ pub(crate) async fn run_global_rules(
                     std::future::pending::<()>().await;
                 }
             } => reload_requested = true,
+            _ = wait_project_rule_watchers(&mut project_watchers) => reload_requested = true,
             _ = async {
                 if let Some(wait) = timer_wait {
                     tokio::time::sleep(wait).await;
@@ -566,13 +1039,56 @@ pub(crate) async fn run_global_rules(
                 }
             } => {}
         }
+        if recover_rule_children {
+            router
+                .recover_rule_children(RULE_CHILD_RECOVERY_PAGE_SIZE)
+                .await?;
+            recover_rule_children = false;
+        }
         for rule in &mut rules {
             if let Some(timer) = &mut rule.timer {
                 timer.blocked = false;
             }
         }
+        for namespace in &mut project_rules {
+            for rule in &mut namespace.rules {
+                if let Some(timer) = &mut rule.timer {
+                    timer.blocked = false;
+                }
+            }
+        }
         if !reload_requested {
             continue;
+        }
+
+        match crate::config::load_automation_config(&data_root) {
+            Ok(config) => {
+                max_event_backlog = config.max_event_backlog;
+                let registrations_valid = refresh_project_namespaces(
+                    &router,
+                    &data_root,
+                    &policy,
+                    &mut project_rules,
+                    &mut owner_config_notices,
+                )
+                .await?;
+                if registrations_valid {
+                    owner_config_notices.deferred = None;
+                    owner_config_notices.rejected = None;
+                }
+            }
+            Err(error) => {
+                report_rejected_source(&policy, &error, &mut owner_config_notices)?;
+            }
+        }
+        project_watchers.clear();
+        for namespace in &project_rules {
+            if namespace.registration_current
+                && let Ok(watcher) =
+                    reload::RuleWatcher::watch_project(Path::new(&namespace.registration.checkout))
+            {
+                project_watchers.push(watcher);
+            }
         }
 
         let snapshot = match reload::load(&data_root) {
@@ -607,10 +1123,23 @@ pub(crate) async fn run_global_rules(
         if retirement_pending && notices.deferred.as_ref() == Some(&snapshot_key) {
             continue;
         }
-        if let Some((updated, deferred)) =
-            attempt_reload_snapshot(&router, &snapshot, &rules, now_ms(), &policy, &mut notices)
-                .await?
-        {
+        let update = {
+            let mut reporter = ReloadReporter {
+                policy: &policy,
+                notices: &mut notices,
+            };
+            attempt_reload_snapshot(
+                &router,
+                "owner",
+                None,
+                &snapshot,
+                &rules,
+                now_ms(),
+                &mut reporter,
+            )
+            .await?
+        };
+        if let Some((updated, deferred)) = update {
             rules = updated;
             if !deferred {
                 last_applied_inputs = Some(snapshot.inputs);
@@ -619,11 +1148,28 @@ pub(crate) async fn run_global_rules(
     }
 }
 
+async fn wait_project_rule_watchers(watchers: &mut [reload::RuleWatcher]) {
+    if watchers.is_empty() {
+        std::future::pending::<()>().await;
+        return;
+    }
+    let waits = watchers
+        .iter_mut()
+        .map(|watcher| {
+            Box::pin(async move {
+                let _ = watcher.changed().await;
+            })
+        })
+        .collect::<Vec<_>>();
+    let _ = futures_util::future::select_all(waits).await;
+}
+
 async fn reconcile_event_rules(
     router: &Router,
     rules: &mut [ActiveRule],
     high_water: i64,
     now: i64,
+    max_event_backlog: i64,
 ) -> Result<bool> {
     for rule in rules {
         if rule.state.paused_reason.as_deref() == Some("backlog_exceeded") {
@@ -651,11 +1197,16 @@ async fn reconcile_event_rules(
         .into_iter()
         .flatten()
         .min();
-        if oldest_needed
-            .is_some_and(|cursor| high_water.saturating_sub(cursor) > MAX_RULE_EVENT_BACKLOG)
+        if oldest_needed.is_some_and(|cursor| high_water.saturating_sub(cursor) > max_event_backlog)
         {
             let processing = router
-                .settle_rule_backlog(&rule.state, high_water, MAX_RULE_EVENT_BACKLOG, now)
+                .settle_rule_backlog(
+                    &rule.principal,
+                    &rule.state,
+                    high_water,
+                    max_event_backlog,
+                    now,
+                )
                 .await?;
             rule.state = processing.view;
             refresh_retiring(rule)?;
@@ -756,7 +1307,15 @@ async fn process_rule_cursor(
             if !router.rule_firings_open() {
                 return Ok(false);
             }
-            let prepared = match router.prepare_owner_submission(stop_command(stop)).await {
+            let prepared_result = match rule.project.as_ref() {
+                Some(project) => {
+                    router
+                        .prepare_project_rule_submission(stop_command(stop), project)
+                        .await
+                }
+                None => router.prepare_owner_submission(stop_command(stop)).await,
+            };
+            let prepared = match prepared_result {
                 Ok(prepared) => prepared,
                 Err(_) if !router.rule_firings_open() => return Ok(false),
                 Err(error) if deterministic_rejection(&error.code) => {
@@ -773,7 +1332,13 @@ async fn process_rule_cursor(
                 Err(error) => return Err(error),
             };
             let Some(admission) = router
-                .admit_rule_stop(&rule.state, event.seq, prepared)
+                .admit_rule_stop(
+                    &rule.principal,
+                    rule.project.as_ref(),
+                    &rule.state,
+                    event.seq,
+                    prepared,
+                )
                 .await?
             else {
                 return Ok(false);
@@ -803,7 +1368,7 @@ async fn advance_rule_cursor(
     outcome: RuleCursorOutcome,
 ) -> Result<()> {
     rule.state = router
-        .advance_rule_cursor(&rule.state, through, outcome)
+        .advance_rule_cursor(&rule.principal, &rule.state, through, outcome)
         .await?;
     refresh_retiring(rule)
 }
@@ -865,8 +1430,11 @@ fn initial_next_due_at(schedule: &TimerSchedule, registration_now: i64) -> Resul
 async fn reconcile_due_timers(router: &Router, rules: &mut [ActiveRule], now: i64) -> Result<bool> {
     let mut after_id = None;
     loop {
+        let principal = rules
+            .first()
+            .map_or_else(|| "owner".to_owned(), |rule| rule.principal.clone());
         let page = router
-            .list_due_global_timers(after_id.as_deref(), now, TIMER_PAGE_SIZE)
+            .list_due_rule_timers(&principal, after_id.as_deref(), now, TIMER_PAGE_SIZE)
             .await?;
         let page_len = page.len();
         if page_len == 0 {
@@ -881,6 +1449,7 @@ async fn reconcile_due_timers(router: &Router, rules: &mut [ActiveRule], now: i6
                     rule.timer
                         .as_ref()
                         .is_some_and(|timer| timer.state.id == state.id)
+                        && rule.principal == principal
                 })
                 .ok_or_else(|| {
                     Error::new(
@@ -916,7 +1485,17 @@ async fn reconcile_due_timers(router: &Router, rules: &mut [ActiveRule], now: i6
                         live_armed,
                     } => {
                         let prepared = match rule.definition.evaluate_timer() {
-                            Ok(stop) => router.prepare_owner_submission(stop_command(stop)).await,
+                            Ok(stop) => match rule.project.as_ref() {
+                                Some(project) => {
+                                    router
+                                        .prepare_project_rule_submission(
+                                            stop_command(stop),
+                                            project,
+                                        )
+                                        .await
+                                }
+                                None => router.prepare_owner_submission(stop_command(stop)).await,
+                            },
                             Err(error) if deterministic_rejection(&error.code) => Err(error),
                             Err(error) => return Err(error),
                         };
@@ -948,7 +1527,13 @@ async fn reconcile_due_timers(router: &Router, rules: &mut [ActiveRule], now: i6
                 skip_code,
             };
             let Some(admission) = router
-                .commit_global_timer_slot(&timer.state, slot, now)
+                .commit_rule_timer_slot(
+                    &rule.principal,
+                    rule.project.as_ref(),
+                    &timer.state,
+                    slot,
+                    now,
+                )
                 .await?
             else {
                 return Ok(false);
@@ -1050,6 +1635,49 @@ fn stop_command(stop: definition::StopAction) -> SubmitCommand {
     }
 }
 
+pub(crate) async fn prepare_rule_catch_up_actions(
+    router: &Router,
+    definition: &RuleDefinition,
+    events: &[Event],
+    project: Option<&ProjectRegistrationView>,
+) -> Result<Vec<eliot_store::RuleCatchUpAction>> {
+    let mut rendered = Vec::new();
+    for event in events {
+        if let Some(stop) = definition::evaluate(definition, event)? {
+            rendered.push((event.seq, stop_command(stop)));
+        }
+    }
+    if let Some(project) = project {
+        let requests = rendered
+            .iter()
+            .map(|(_, request)| request.clone())
+            .collect();
+        let prepared = router
+            .prepare_project_rule_submissions(requests, project)
+            .await?;
+        return Ok(rendered
+            .into_iter()
+            .zip(prepared)
+            .map(
+                |((event_seq, _), prepared)| eliot_store::RuleCatchUpAction {
+                    event_seq,
+                    request: prepared.request,
+                },
+            )
+            .collect());
+    }
+
+    let mut actions = Vec::with_capacity(rendered.len());
+    for (event_seq, request) in rendered {
+        let prepared = router.prepare_owner_submission(request).await?;
+        actions.push(eliot_store::RuleCatchUpAction {
+            event_seq,
+            request: prepared.request,
+        });
+    }
+    Ok(actions)
+}
+
 fn deterministic_rejection(code: &str) -> bool {
     matches!(
         code,
@@ -1072,6 +1700,7 @@ mod timer_tests {
         ActiveTimer {
             state: TimerStateView {
                 id: "interval".to_owned(),
+                project: None,
                 schedule_revision: 1,
                 schedule: TimerSchedule::Interval {
                     period_ms: 10,
@@ -1106,6 +1735,142 @@ mod timer_tests {
         assert!(!claim_deferred_reload(std::slice::from_ref(&first), &mut notices).unwrap());
         assert!(claim_deferred_reload(std::slice::from_ref(&changed), &mut notices).unwrap());
         assert!(!claim_deferred_reload(std::slice::from_ref(&changed), &mut notices).unwrap());
+    }
+
+    #[tokio::test]
+    async fn configured_nondefault_backlog_settles_global_and_project_rules() {
+        use std::io::Cursor;
+
+        let root =
+            std::env::temp_dir().join(format!("eliot-rule-backlog-config-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("config.toml"),
+            "[automation]\nmax_event_backlog = 1\n",
+        )
+        .unwrap();
+        let max_event_backlog = crate::config::load_automation_config(&root)
+            .unwrap()
+            .max_event_backlog;
+        let store = Arc::new(tokio::sync::Mutex::new(
+            eliot_store::Store::open(Path::new(":memory:")).unwrap(),
+        ));
+        let router = Router::new(
+            root.clone(),
+            "backlog-fixture-owner".to_owned(),
+            Arc::clone(&store),
+            crate::bus::Bus::new(16),
+        );
+        let definition = definition::load(Cursor::new(
+            r#"
+[[rule]]
+id = "same-rule-id"
+on = { event = "turn.completed" }
+do = [{ action = "stop", target = "a1", expected_generation = 1 }]
+"#,
+        ))
+        .unwrap()
+        .remove(0);
+        let snapshot = reload::from_definitions(vec![definition]).unwrap();
+        let now = now_ms();
+        router
+            .initialize_rules("owner", &snapshot.inputs, &[], now)
+            .await
+            .unwrap();
+        let checkout = root
+            .join("registered-project")
+            .to_string_lossy()
+            .into_owned();
+        let registration = router
+            .reconcile_project_registrations(&[eliot_store::ProjectRegistrationInput {
+                id: "backlog-project".to_owned(),
+                checkout: checkout.clone(),
+                repo_common_dir: format!("{checkout}/.git"),
+                profiles: vec!["fake".to_owned()],
+                actions: vec!["stop".to_owned()],
+            }])
+            .await
+            .unwrap()
+            .remove(0);
+        let project_principal = format!("project:{}", registration.id);
+        router
+            .initialize_rules(&project_principal, &snapshot.inputs, &[], now)
+            .await
+            .unwrap();
+        let mut global_rules = active_rules(
+            &router,
+            "owner",
+            None,
+            router.rule_processing("owner").await.unwrap(),
+            None,
+            now,
+        )
+        .await
+        .unwrap();
+        let mut project_rules = active_rules(
+            &router,
+            &project_principal,
+            Some(&registration),
+            router.rule_processing(&project_principal).await.unwrap(),
+            None,
+            now,
+        )
+        .await
+        .unwrap();
+
+        for index in 0..2 {
+            let mut launch = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+            launch.args = json!({
+                "project": format!("backlog-event-{index}"),
+                "workspace": format!("backlog-workspace-{index}"),
+            });
+            launch.expected_generation = Some(0);
+            store
+                .lock()
+                .await
+                .submit("owner", launch, now_ms())
+                .unwrap();
+        }
+        let high_water = router.rule_high_water().await.unwrap();
+        assert!(high_water > max_event_backlog);
+        assert!(
+            reconcile_event_rules(
+                &router,
+                &mut global_rules,
+                high_water,
+                now_ms(),
+                max_event_backlog,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            reconcile_event_rules(
+                &router,
+                &mut project_rules,
+                high_water,
+                now_ms(),
+                max_event_backlog,
+            )
+            .await
+            .unwrap()
+        );
+
+        let store = store.lock().await;
+        let global = store
+            .get_rule_state("owner", "same-rule-id")
+            .unwrap()
+            .unwrap();
+        let project = store
+            .get_rule_state(&project_principal, "same-rule-id")
+            .unwrap()
+            .unwrap();
+        assert_eq!(global.paused_reason.as_deref(), Some("backlog_exceeded"));
+        assert_eq!(project.paused_reason.as_deref(), Some("backlog_exceeded"));
+        assert_eq!(global.current_cursor, high_water);
+        assert_eq!(project.current_cursor, high_water);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -1168,7 +1933,7 @@ mod timer_tests {
             .await
             .unwrap();
         assert!(retiring_rules[0].state.retiring_revision.is_some());
-        let before = router.global_rule_processing().await.unwrap();
+        let before = router.rule_processing("owner").await.unwrap();
         let high_water_before = store.lock().await.high_water().unwrap();
 
         let oversized_match = "\"".repeat(66 * 1024);
@@ -1179,22 +1944,29 @@ mod timer_tests {
         assert!(invalid_snapshot.inputs[0].canonical_definition.len() > 128 * 1024);
 
         let mut notices = ReloadNoticeContext::default();
-        let invalid_attempt = attempt_reload_snapshot(
-            &router,
-            &invalid_snapshot,
-            &retiring_rules,
-            now_ms(),
-            &policy,
-            &mut notices,
-        )
-        .await
-        .unwrap();
+        let invalid_attempt = {
+            let mut reporter = ReloadReporter {
+                policy: &policy,
+                notices: &mut notices,
+            };
+            attempt_reload_snapshot(
+                &router,
+                "owner",
+                None,
+                &invalid_snapshot,
+                &retiring_rules,
+                now_ms(),
+                &mut reporter,
+            )
+            .await
+            .unwrap()
+        };
         assert!(invalid_attempt.is_none());
         let invalid_key = reload_notice_key(&invalid_snapshot.inputs).unwrap();
         assert_eq!(notices.rejected, Some(invalid_key));
         assert!(notices.deferred.is_none());
 
-        let after_invalid = router.global_rule_processing().await.unwrap();
+        let after_invalid = router.rule_processing("owner").await.unwrap();
         assert_eq!(after_invalid.len(), before.len());
         assert_eq!(after_invalid[0].view, before[0].view);
         assert_eq!(
@@ -1209,31 +1981,45 @@ mod timer_tests {
 
         std::fs::write(&rule_path, render_rule(Some("second-pending-edit"))).unwrap();
         let valid_snapshot = reload::load(&root).unwrap();
-        let (updated_rules, deferred) = attempt_reload_snapshot(
-            &router,
-            &valid_snapshot,
-            &retiring_rules,
-            now_ms(),
-            &policy,
-            &mut notices,
-        )
-        .await
-        .unwrap()
+        let (updated_rules, deferred) = {
+            let mut reporter = ReloadReporter {
+                policy: &policy,
+                notices: &mut notices,
+            };
+            attempt_reload_snapshot(
+                &router,
+                "owner",
+                None,
+                &valid_snapshot,
+                &retiring_rules,
+                now_ms(),
+                &mut reporter,
+            )
+            .await
+            .unwrap()
+        }
         .expect("valid pending edit should apply through the shared attempt path");
         assert!(deferred);
         let valid_key = reload_notice_key(&valid_snapshot.inputs).unwrap();
         assert_eq!(notices.deferred, Some(valid_key));
 
-        let (_, deferred_again) = attempt_reload_snapshot(
-            &router,
-            &valid_snapshot,
-            &updated_rules,
-            now_ms(),
-            &policy,
-            &mut notices,
-        )
-        .await
-        .unwrap()
+        let (_, deferred_again) = {
+            let mut reporter = ReloadReporter {
+                policy: &policy,
+                notices: &mut notices,
+            };
+            attempt_reload_snapshot(
+                &router,
+                "owner",
+                None,
+                &valid_snapshot,
+                &updated_rules,
+                now_ms(),
+                &mut reporter,
+            )
+            .await
+            .unwrap()
+        }
         .expect("repeat attempt remains a valid deferred edit");
         assert!(deferred_again);
         assert!(!claim_deferred_reload(&valid_snapshot.inputs, &mut notices).unwrap());

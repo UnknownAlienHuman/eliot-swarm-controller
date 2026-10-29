@@ -41,14 +41,47 @@ impl RuleSnapshot {
 }
 
 pub(crate) fn load(data_root: &Path) -> Result<RuleSnapshot> {
-    let directory = data_root.join("rules");
-    let entries = match fs::read_dir(&directory) {
+    load_rule_directory(&data_root.join("rules"))
+}
+
+/// Load the shared rule-file grammar from the registered checkout's rules path.
+/// Project authorization, link rejection, and overlay rejection stay in
+/// `automation::projects` before this parser is called.
+pub(crate) fn load_project(checkout: &Path) -> Result<RuleSnapshot> {
+    let checkout = fs::canonicalize(checkout)
+        .map_err(|_| Error::new("unavailable", "registered project checkout is unavailable"))?;
+    let requested = checkout.join(".eliot").join("rules");
+    let rules = match fs::canonicalize(&requested) {
+        Ok(rules) if rules.starts_with(&checkout) => rules,
+        Ok(_) => {
+            return Err(Error::new(
+                "not_allowed",
+                "registered project rule directory escapes its checkout",
+            ));
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(empty_snapshot()),
+        Err(_) => {
+            return Err(Error::new(
+                "unavailable",
+                "registered project rule directory is unavailable",
+            ));
+        }
+    };
+    load_rule_directory(&rules)
+}
+
+fn empty_snapshot() -> RuleSnapshot {
+    RuleSnapshot {
+        definitions: Vec::new(),
+        inputs: Vec::new(),
+    }
+}
+
+fn load_rule_directory(directory: &Path) -> Result<RuleSnapshot> {
+    let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == ErrorKind::NotFound => {
-            return Ok(RuleSnapshot {
-                definitions: Vec::new(),
-                inputs: Vec::new(),
-            });
+            return Ok(empty_snapshot());
         }
         Err(_) => return Err(Error::new("unavailable", "cannot enumerate global rules")),
     };
@@ -71,32 +104,38 @@ pub(crate) fn load(data_root: &Path) -> Result<RuleSnapshot> {
     }
     paths.sort();
 
-    let mut ids = HashSet::new();
     let mut definitions = Vec::new();
-    let mut inputs = Vec::new();
     for path in paths {
         let file = File::open(&path)
             .map_err(|_| Error::new("unavailable", "cannot open global rule file"))?;
-        for definition in definition::load(file)? {
-            if !ids.insert(definition.id.clone()) {
-                return Err(Error::new(
-                    "invalid",
-                    "global rule files contain duplicate IDs",
-                ));
-            }
-            let canonical_value = serde_json::to_value(&definition)
-                .map_err(|_| Error::new("invalid", "rule definition cannot be encoded"))?;
-            let canonical_definition = serde_json::to_string(&canonical_value)
-                .map_err(|_| Error::new("invalid", "rule definition cannot be canonicalized"))?;
-            let definition_digest = definition.semantic_digest()?;
-            inputs.push(RuleDefinitionInput {
-                id: definition.id.clone(),
-                canonical_definition,
-                definition_digest,
-                enabled: definition.enabled,
-            });
-            definitions.push(definition);
-        }
+        definitions.extend(definition::load(file)?);
+    }
+    let mut ids = HashSet::new();
+    if definitions
+        .iter()
+        .any(|definition| !ids.insert(definition.id.clone()))
+    {
+        return Err(Error::new(
+            "invalid",
+            "global rule files contain duplicate IDs",
+        ));
+    }
+    from_definitions(definitions)
+}
+
+pub(crate) fn from_definitions(definitions: Vec<RuleDefinition>) -> Result<RuleSnapshot> {
+    let mut inputs = Vec::with_capacity(definitions.len());
+    for definition in &definitions {
+        let canonical_value = serde_json::to_value(definition)
+            .map_err(|_| Error::new("invalid", "rule definition cannot be encoded"))?;
+        let canonical_definition = serde_json::to_string(&canonical_value)
+            .map_err(|_| Error::new("invalid", "rule definition cannot be canonicalized"))?;
+        inputs.push(RuleDefinitionInput {
+            id: definition.id.clone(),
+            canonical_definition,
+            definition_digest: definition.semantic_digest()?,
+            enabled: definition.enabled,
+        });
     }
     Ok(RuleSnapshot {
         definitions,
@@ -144,8 +183,30 @@ pub(crate) struct RuleWatcher {
 
 impl RuleWatcher {
     pub(crate) fn watch(data_root: &Path) -> Result<Self> {
-        let watched_root = data_root.to_path_buf();
-        let rules_root = watched_root.join("rules");
+        Self::watch_paths(data_root, &data_root.join("rules"))
+    }
+
+    pub(crate) fn watch_project(checkout: &Path) -> Result<Self> {
+        let checkout = fs::canonicalize(checkout)
+            .map_err(|_| Error::new("unavailable", "registered project checkout is unavailable"))?;
+        let rules_root = fs::canonicalize(checkout.join(".eliot").join("rules")).map_err(|_| {
+            Error::new(
+                "unavailable",
+                "registered project rule directory is unavailable",
+            )
+        })?;
+        if !rules_root.starts_with(&checkout) {
+            return Err(Error::new(
+                "not_allowed",
+                "registered project rule directory escapes its checkout",
+            ));
+        }
+        Self::watch_paths(&rules_root, &rules_root)
+    }
+
+    fn watch_paths(watched_root: &Path, rules_root: &Path) -> Result<Self> {
+        let watched_root = watched_root.to_path_buf();
+        let rules_root = rules_root.to_path_buf();
         let (sender, changed) = watch::channel(0u64);
         let callback_rules = rules_root.clone();
         let mut watcher = RecommendedWatcher::new(

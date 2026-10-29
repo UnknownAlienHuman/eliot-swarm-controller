@@ -28,7 +28,6 @@ use ulid::Ulid;
 
 const MAX_RPC_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CLIENTS: usize = 128;
-const RULE_CHILD_RECOVERY_PAGE_SIZE: usize = 1_000;
 const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(35);
 
 /// Open the private local daemon, recover durable state without replaying any
@@ -76,9 +75,12 @@ async fn run_owned(
         events
     };
     router.note_events(&recovered);
+    let automation_config = crate::config::load_automation_config(data_dir.path())?;
     // Parse global definitions and seed only new rules before publishing ready.
     let (global_rules, initial_deferred_notice) =
         automation::initialize_global_rules(&router, data_dir.path(), &policy).await?;
+    let project_rule_namespaces =
+        automation::initialize_project_rules(&router, data_dir.path(), &policy).await?;
 
     let mut listener = IpcListener::bind(data_dir, daemon_lock).await?;
     let info =
@@ -94,22 +96,20 @@ async fn run_owned(
     recovery.spawn(async move { recovery_router.recover_workspaces().await });
     let (automation_stop, automation_shutdown) = watch::channel(false);
     let mut automation_tasks = JoinSet::new();
-    let rule_recovery_router = router.clone();
-    automation_tasks.spawn(async move {
-        rule_recovery_router
-            .recover_rule_children(RULE_CHILD_RECOVERY_PAGE_SIZE)
-            .await
-    });
     let rule_router = router.clone();
     let rule_data_root = data_dir.path().to_path_buf();
     let rule_policy = Arc::clone(&policy);
     automation_tasks.spawn(async move {
         automation::run_global_rules(
             rule_router,
-            global_rules,
-            rule_data_root,
-            rule_policy,
-            initial_deferred_notice,
+            automation::RuleWorkerStart {
+                global_rules,
+                project_rules: project_rule_namespaces,
+                max_event_backlog: automation_config.max_event_backlog,
+                data_root: rule_data_root,
+                policy: rule_policy,
+                initial_notices: initial_deferred_notice,
+            },
             automation_shutdown,
         )
         .await

@@ -66,14 +66,15 @@ rule actions have bounded derived ids. No general receipt/floor framework.
 | `agent.git/edits` | current Git snapshot and paginated native-attributed edits |
 | `command.submit/get/children/resolve` | immutable admission, linked commands, child readback and constrained resolution |
 | `turn.get/resolve` | running/completed/unknown turn; constrained owner assertion |
-| `rule.get` | owner-only read of one startup-loaded global rule state |
+| `project.list/get` | owner-only read of registered project authority |
+| `rule.get/catch_up` | owner-only rule read and finite committed-history catch-up |
 | `timer.get/run` | owner-only timer read and idempotent manual firing |
 | `events.read/subscribe` | persisted replay plus bounded live delivery |
 | `agent.discover` | owner-only native metadata discovery, without creating Agents |
 | `agent.history` | owner-only bounded history of an exact observed subject |
 | `hook.event` | later exact request/deadline decision |
 | `mail.send/inbox/read/ack`, `var.*`, `who`, `claim.*` | later coordination |
-| `rule.*` except `rule.get`, `goal.*` | later automation; effects remain commands |
+| `rule.*` except `rule.get/catch_up`, `goal.*` | later automation; effects remain commands |
 
 Canonical public wire types are re-exported by
 [`eliot_core::api`](../../crates/eliot-core/src/api.rs). These DTOs and their validators
@@ -83,8 +84,10 @@ authentication precedes method parameter validation.
 | Surface | Canonical DTO definitions |
 | --- | --- |
 | Agent/daemon views and cursors | [agent_views.rs](../../crates/eliot-core/src/api/agent_views.rs) |
+| Project registration view | [agent_views.rs](../../crates/eliot-core/src/api/agent_views.rs) |
 | Nested observation/Git views | [monitor_views.rs](../../crates/eliot-core/src/api/monitor_views.rs) |
 | Command, turn and result queries | [reads.rs](../../crates/eliot-core/src/api/reads.rs) |
+| Rule reads and history catch-up | [reads.rs](../../crates/eliot-core/src/api/reads.rs), [rules.rs](../../crates/eliot-core/src/api/rules.rs) |
 | Command submission and shutdown | [mutations.rs](../../crates/eliot-core/src/api/mutations.rs) and [Core `SubmitCommand`](../../crates/eliot-core/src/lib.rs) |
 | Timer schedules and requests | [timers.rs](../../crates/eliot-core/src/api/timers.rs) |
 | Discovery/history queries and pages | [native_requests.rs](../../crates/eliot-core/src/api/native_requests.rs), [native_pages.rs](../../crates/eliot-core/src/api/native_pages.rs) |
@@ -114,18 +117,30 @@ and accepts an empty object. Its bounded blocker/command lists retain truncation
 unknown commands remain unknown. Agent list observations appear only when requested.
 Absent source cursors and sequence/acknowledgement values remain null.
 
-`rule.get` uses the typed Core `RuleGetRequest`/`RuleStateView`, is owner-only, and
-reads the loaded definition's current cursor and any retiring definition's cursor/boundary.
-It does not reload configuration or advance either cursor. The event-rule behavior is
-described in [automation](automation.md#event-cursor-and-compact-definition-handoff).
+`project.list` and `project.get` are owner-only readbacks of the owner-registered
+canonical checkout, repository common directory, and explicit profile/action allowlists.
+They do not create or modify registrations. Their project values use the Core
+`ProjectRegistrationView` linked above.
 
-`timer.get` uses `TimerGetRequest`/`TimerStateView` and reads one startup-loaded global
-timer without advancing its schedule. `timer.run` accepts `TimerRunRequest { id, rule }`,
-where `id` is the external ULID mutation ID and `rule` is the timer ID. It returns the
-existing Core `Command` parent bound to that timer and exact requested mutation ID.
+`rule.get` uses `RuleGetRequest`/`RuleStateView`, is owner-only, and reads the selected
+global or project rule's current cursor and any retiring definition's cursor/boundary. An
+optional `project` selects that registered project principal; omission selects global
+Owner scope. It does not reload configuration or advance either cursor.
+`rule.catch_up` accepts `RuleCatchUpRequest` and returns the retained Core `Command` parent
+for a finite committed-event range. Its ULID binds the principal and original semantic
+request; the retained command records the revision and captured range selected on first
+admission. Same-ID replay returns that result before current gates without repeating an
+effect. See the exact range and retention semantics in
+[automation](automation.md#retention-and-bounded-backlog).
+
+`timer.get` uses `TimerGetRequest`/`TimerStateView` and reads the selected timer without
+advancing its schedule. `timer.run` accepts `TimerRunRequest { id, rule, project? }`,
+where `id` is the external ULID mutation ID and `rule` is the timer ID. An optional
+`project` selects the registered project principal; omission selects global Owner scope.
+It returns the existing Core `Command` parent bound to that timer and exact mutation ID.
 An exact mutation-ID retry returns that parent without admitting or dispatching another
-action child. Manual runs do not consume the scheduled slot. See the first connected
-timer semantics in [automation](automation.md#first-connected-timer-slice).
+action child. Manual runs do not consume the scheduled slot. See the timer semantics in
+[automation](automation.md#first-connected-timer-slice).
 
 `agent.get` includes the current generation's source rows and the managed workspace
 target generation's rows when it differs. If persisted state requires a live owner and
@@ -574,16 +589,16 @@ eliot cmd show|children|cancel|resolve ...
 eliot events [--since SEQ] [--allow-gap]
 eliot msg send ... | inbox [--wait SECS] [--all]
 eliot var ... | who ... | claim ... | release ...
-eliot rule ... | rules pause|resume
-eliot timer show ID | run ID
+eliot project list | show ID
+eliot rule show ID [--project PROJECT]
+eliot rule catch-up ID --after SEQ [--through SEQ] [--project PROJECT]
+eliot timer show ID [--project PROJECT] | run ID [--project PROJECT]
 eliot discover --profile P [--harness H] [--scope S] [--cursor C] [--limit N]
 eliot attach --profile P --harness H --scope S --ref R [--project LABEL]
 eliot history A --view subject|turns|items [--source native|rollout] [--turn-id ID] [--cursor C] [--limit N]
 eliot detach A [--generation N]
 eliot provider holds [--after SCOPE] [--limit N]
 eliot provider clear-hold SCOPE --corrective-evidence credentials_updated|configuration_updated|owner_verified [--expected-probe-command ID]
-eliot rule show ID
-eliot timer show ID | run ID
 eliot plugin NAME | plugin-test ... | hook ... | mcp
 ```
 

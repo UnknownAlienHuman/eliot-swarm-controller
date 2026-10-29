@@ -22,6 +22,7 @@ use std::path::Path;
 const MAX_CONFIG_BYTES: usize = 128 * 1024;
 const MAX_PROFILE_NAME_LEN: usize = 128;
 const MAX_PROFILES: usize = 256;
+const MAX_PROJECT_PATH_LEN: usize = 4096;
 const MAX_MODEL_LEN: usize = 256;
 const MAX_EFFORT_LEN: usize = 128;
 const MAX_CMD_LEN: usize = 1024;
@@ -52,6 +53,14 @@ pub(crate) fn capture_native_store_inputs(
     selector_lookup: impl FnMut(&str) -> Option<OsString>,
 ) -> core::Result<()> {
     capture_native_store_inputs_inner(profile, selector_lookup, |name| std::env::var_os(name))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProjectRegistrationConfig {
+    pub id: String,
+    pub path: String,
+    pub profiles: Vec<String>,
+    pub actions: Vec<String>,
 }
 
 #[cfg(test)]
@@ -122,7 +131,43 @@ struct FileConfig {
     accounts: HashMap<String, toml::Spanned<AccountEntry>>,
     #[serde(default)]
     proxies: HashMap<String, toml::Spanned<ProxyEntry>>,
+    #[serde(default)]
+    projects: HashMap<String, toml::Spanned<ProjectEntry>>,
+    #[serde(default)]
+    automation: AutomationConfig,
 }
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AutomationConfig {
+    #[serde(default = "default_max_event_backlog")]
+    pub(crate) max_event_backlog: i64,
+}
+
+impl Default for AutomationConfig {
+    fn default() -> Self {
+        Self {
+            max_event_backlog: default_max_event_backlog(),
+        }
+    }
+}
+
+impl AutomationConfig {
+    fn validate(self) -> core::Result<Self> {
+        if self.max_event_backlog <= 0 {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: automation.max_event_backlog must be a positive integer",
+            ));
+        }
+        Ok(self)
+    }
+}
+
+fn default_max_event_backlog() -> i64 {
+    100_000
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AccountEntry {
@@ -173,6 +218,143 @@ struct ProfileEntry {
     setup: Vec<crate::setup::SetupEntry>,
     #[serde(default = "default_scratch")]
     scratch: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectEntry {
+    path: String,
+    #[serde(default)]
+    profiles: Vec<String>,
+    #[serde(default)]
+    actions: Vec<String>,
+}
+
+/// Read only owner-configured project registrations. Paths and Git identity are
+/// canonicalized by `automation::projects` outside Store transactions.
+pub(crate) fn load_project_registration_config(
+    data_root: &Path,
+) -> core::Result<Vec<ProjectRegistrationConfig>> {
+    let Some((config, source)) = read_config(data_root)? else {
+        return Ok(Vec::new());
+    };
+    if config.projects.is_empty() {
+        return Ok(Vec::new());
+    }
+    if config.profiles.len() > MAX_PROFILES {
+        return Err(core::Error::new(
+            "profile_error",
+            "config.toml: profiles: profile count exceeds 256 entries",
+        ));
+    }
+    if config.profiles.contains_key(FAKE_PROFILE) {
+        return Err(core::Error::new(
+            "profile_error",
+            "config.toml: profiles.fake: builtin profile cannot be overridden",
+        ));
+    }
+
+    let global_profiles: HashSet<&str> = config
+        .profiles
+        .keys()
+        .map(String::as_str)
+        .chain(std::iter::once(FAKE_PROFILE))
+        .collect();
+    let mut projects = Vec::with_capacity(config.projects.len());
+    for (id, spanned) in &config.projects {
+        let entry = spanned.get_ref();
+        let offset = spanned.span().start;
+        if validate_profile_name(id).is_err() {
+            return Err(config_error_at(
+                &source,
+                offset,
+                &format!("projects.{id}"),
+                "invalid project id",
+                "profile_error",
+            ));
+        }
+
+        let path = entry.path.trim();
+        if path.is_empty()
+            || path.len() > MAX_PROJECT_PATH_LEN
+            || path.chars().any(char::is_control)
+            || !Path::new(path).is_absolute()
+        {
+            return Err(config_error_at(
+                &source,
+                offset,
+                &format!("projects.{id}.path"),
+                "must be a nonempty absolute checkout path of at most 4096 characters",
+                "profile_error",
+            ));
+        }
+
+        let profiles = normalize_project_allowlist(
+            &entry.profiles,
+            &source,
+            offset,
+            id,
+            "profiles",
+            |profile| global_profiles.contains(profile) && validate_profile_name(profile).is_ok(),
+        )?;
+        let actions = normalize_project_allowlist(
+            &entry.actions,
+            &source,
+            offset,
+            id,
+            "actions",
+            |action| action == "stop",
+        )?;
+
+        projects.push(ProjectRegistrationConfig {
+            id: id.clone(),
+            path: path.to_owned(),
+            profiles,
+            actions,
+        });
+    }
+    projects.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(projects)
+}
+
+fn normalize_project_allowlist(
+    values: &[String],
+    source: &str,
+    offset: usize,
+    project_id: &str,
+    field: &str,
+    allowed: impl Fn(&str) -> bool,
+) -> core::Result<Vec<String>> {
+    let mut normalized = Vec::with_capacity(values.len());
+    let mut seen = HashSet::with_capacity(values.len());
+    for raw in values {
+        let value = raw.trim();
+        if value.is_empty() || value.len() > MAX_PROFILE_NAME_LEN || !allowed(value) {
+            return Err(config_error_at(
+                source,
+                offset,
+                &format!("projects.{project_id}.{field}"),
+                if field == "actions" {
+                    "only the implemented stop action may be approved"
+                } else {
+                    "must name an existing global profile"
+                },
+                "profile_error",
+            ));
+        }
+        if !seen.insert(value.to_owned()) {
+            return Err(config_error_at(
+                source,
+                offset,
+                &format!("projects.{project_id}.{field}"),
+                "contains a duplicate entry",
+                "profile_error",
+            ));
+        }
+        normalized.push(value.to_owned());
+    }
+    normalized.sort();
+    Ok(normalized)
 }
 pub(crate) fn resolve_profile(data_root: &Path, name: &str) -> core::Result<Value> {
     validate_profile_name(name)?;
@@ -284,6 +466,14 @@ fn read_config(data_root: &Path) -> core::Result<Option<(FileConfig, String)>> {
         toml::from_str(&source).map_err(|error| map_toml_error(&source, error))?;
     Ok(Some((config, source)))
 }
+
+pub(crate) fn load_automation_config(data_root: &Path) -> core::Result<AutomationConfig> {
+    let Some((config, _source)) = read_config(data_root)? else {
+        return Ok(AutomationConfig::default());
+    };
+    config.automation.validate()
+}
+
 fn fake_snapshot() -> Value {
     let mut snapshot = fake_profile_snapshot();
     snapshot["capacity_scopes"] = json!([{"scope":"profile:fake", "max_live":null}]);
@@ -972,6 +1162,90 @@ fn is_unsupported_field(field: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct AutomationConfigFixture {
+        root: std::path::PathBuf,
+    }
+
+    impl AutomationConfigFixture {
+        fn new() -> Self {
+            let root =
+                std::env::temp_dir().join(format!("eliot-automation-config-{}", ulid::Ulid::new()));
+            std::fs::create_dir(&root).expect("create automation config fixture");
+            Self { root }
+        }
+
+        fn write(&self, source: &str) {
+            std::fs::write(self.root.join("config.toml"), source)
+                .expect("write automation config fixture");
+        }
+    }
+
+    impl Drop for AutomationConfigFixture {
+        fn drop(&mut self) {
+            let base = std::env::temp_dir();
+            if self.root.parent() == Some(base.as_path())
+                && self
+                    .root
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("eliot-automation-config-"))
+            {
+                let _ = std::fs::remove_dir_all(&self.root);
+            }
+        }
+    }
+
+    #[test]
+    fn automation_backlog_defaults_and_coexists_with_project_registrations() {
+        let fixture = AutomationConfigFixture::new();
+        assert_eq!(
+            load_automation_config(&fixture.root).unwrap(),
+            AutomationConfig::default()
+        );
+
+        fixture.write("[automation]\n");
+        assert_eq!(
+            load_automation_config(&fixture.root).unwrap(),
+            AutomationConfig::default()
+        );
+
+        let project_path = format!("{:?}", fixture.root.to_string_lossy());
+        fixture.write(&format!(
+            "[projects.sample]\npath = {project_path}\nprofiles = ['fake']\nactions = ['stop']\n\
+             [automation]\nmax_event_backlog = 4096\n"
+        ));
+        assert_eq!(
+            load_automation_config(&fixture.root).unwrap(),
+            AutomationConfig {
+                max_event_backlog: 4096
+            }
+        );
+        assert_eq!(
+            load_project_registration_config(&fixture.root).unwrap(),
+            vec![ProjectRegistrationConfig {
+                id: "sample".to_owned(),
+                path: fixture.root.to_string_lossy().into_owned(),
+                profiles: vec!["fake".to_owned()],
+                actions: vec!["stop".to_owned()],
+            }]
+        );
+    }
+
+    #[test]
+    fn automation_backlog_rejects_nonpositive_wrong_type_and_unknown_fields() {
+        let fixture = AutomationConfigFixture::new();
+        for source in [
+            "[automation]\nmax_event_backlog = 0\n",
+            "[automation]\nmax_event_backlog = -1\n",
+            "[automation]\nmax_event_backlog = '1000'\n",
+            "[automation]\nfuture_setting = 1\n",
+        ] {
+            fixture.write(source);
+            let error = load_automation_config(&fixture.root).unwrap_err();
+            assert_eq!(error.code, "profile_error", "accepted {source:?}");
+        }
+    }
 
     #[test]
     fn native_store_inputs_capture_only_selected_raw_values() {

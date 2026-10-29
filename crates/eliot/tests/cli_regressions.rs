@@ -13,8 +13,9 @@ use eliot_core::api::{
     CommandSubmitResponse, DaemonShutdownRequest, DaemonShutdownResponse, DaemonStatusRequest,
     DaemonStatusResponse, DiscoverPage, EventsFilter, EventsReadRequest, EventsReadResponse,
     EventsSubscribeRequest, EventsSubscribeResponse, MAX_OBSERVATION_CURSOR_BYTES, ObservationPage,
-    PROCESS_CURSOR_MAX_BYTES, ProviderClearHoldResponse, ProviderHoldsResponse, RuleStateView,
-    ShutdownMode, TimerSchedule, TimerStateView, TurnGetRequest,
+    PROCESS_CURSOR_MAX_BYTES, ProjectRegistrationView, ProviderClearHoldResponse,
+    ProviderHoldsResponse, RuleStateView, ShutdownMode, TimerSchedule, TimerStateView,
+    TurnGetRequest,
 };
 use eliot_core::{
     AgentState, Command as CoreCommand, CommandState, ProviderHoldState, ProviderRestrictionKind,
@@ -4819,5 +4820,770 @@ fn cli_event_rule_matching_reload_and_invalid_retention_survive_restart() {
         serde_json::from_value(fixture.json(&["cmd", "show", &cleanup.command_id]))
             .expect("retained cleanup stop after restart");
     assert_eq!(cleanup_after_restart, cleanup_command);
+    fixture.stop(false);
+}
+
+#[test]
+fn cli_project_rule_catchup_enforces_scope_limit_and_replays_same_id() {
+    let mut fixture = Fixture::new("project rule history catchup");
+    let diagnostic_data = fixture.data.clone();
+    let bounded_text = |text: &str| text.chars().take(4096).collect::<String>();
+    let checked_json = |reply: support::Reply, operation: &str| -> Value {
+        let stdout = bounded_text(&reply.stdout);
+        let stderr = bounded_text(&reply.stderr);
+        assert!(
+            reply.status.success(),
+            "{operation} exited {:?}; bounded stdout={stdout:?}; bounded stderr={stderr:?}",
+            reply.status.code()
+        );
+        serde_json::from_str(&reply.stdout).unwrap_or_else(|error| {
+            panic!(
+                "{operation} returned invalid JSON ({error}); bounded stdout={stdout:?}; bounded stderr={stderr:?}"
+            )
+        })
+    };
+    assert!(
+        fixture
+            .git(&["init", "--initial-branch=main"])
+            .status
+            .success()
+    );
+    fs::write(fixture.workspace.join("seed.txt"), "project baseline\n")
+        .expect("write project baseline");
+    assert!(fixture.git(&["add", "--", "seed.txt"]).status.success());
+    assert!(
+        fixture
+            .git(&["commit", "-m", "Project scope fixture"])
+            .status
+            .success()
+    );
+
+    let other_project = fixture.root.join("other repo");
+    fs::create_dir(&other_project).expect("create second registered checkout");
+    let mut init_other = Command::new("git");
+    init_other
+        .current_dir(&other_project)
+        .args(["init", "--initial-branch=main", "--quiet"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        )
+        .env("GIT_TERMINAL_PROMPT", "0");
+    for (name, _) in std::env::vars_os() {
+        if name
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            init_other.env_remove(name);
+        }
+    }
+    assert!(
+        run(init_other).status.success(),
+        "initialize second checkout"
+    );
+
+    // Create the private data root before installing owner configuration.
+    fixture.start();
+    fixture.stop(false);
+
+    let config = format!(
+        concat!(
+            "[projects.approved]\n",
+            "path = {:?}\nprofiles = [\"fake\"]\nactions = [\"stop\"]\n\n",
+            "[projects.other]\n",
+            "path = {:?}\nprofiles = [\"fake\"]\nactions = [\"stop\"]\n",
+        ),
+        fixture.workspace.to_string_lossy(),
+        other_project.to_string_lossy(),
+    );
+    fs::write(fixture.data.join("config.toml"), config)
+        .expect("write owner project registrations under the private root");
+    let approved_rules = fixture.workspace.join(".eliot").join("rules");
+    let other_rules = other_project.join(".eliot").join("rules");
+    fs::create_dir_all(&approved_rules).expect("create approved project rule directory");
+    fs::create_dir_all(&other_rules).expect("create second project rule directory");
+
+    fixture.start();
+    let registration_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let listed: Vec<ProjectRegistrationView> = loop {
+        let reply = cli(&diagnostic_data, &["project", "list"]);
+        let stdout = bounded_text(&reply.stdout);
+        let stderr = bounded_text(&reply.stderr);
+        if reply.status.success() {
+            let projects: Vec<ProjectRegistrationView> =
+                serde_json::from_value(checked_json(reply, "project.list"))
+                    .expect("typed owner project registrations");
+            if projects.len() == 2 {
+                break projects;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < registration_deadline,
+            "project registration readback deadline; bounded stdout={stdout:?}; bounded stderr={stderr:?}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    for project in &listed {
+        project.validate().expect("valid project registration view");
+    }
+    let approved_reply = cli(&diagnostic_data, &["project", "show", "approved"]);
+    let approved: ProjectRegistrationView =
+        serde_json::from_value(checked_json(approved_reply, "project.show approved"))
+            .expect("typed approved project readback");
+    assert_eq!(approved.id, "approved");
+    assert_eq!(approved.profiles, vec!["fake".to_owned()]);
+    assert_eq!(approved.actions, vec!["stop".to_owned()]);
+
+    let base = fixture.git(&["rev-parse", "--verify", "HEAD"]);
+    assert!(base.status.success());
+    let base = base.stdout.trim();
+    let launch_reply = cli(
+        &diagnostic_data,
+        &[
+            "launch",
+            "--profile",
+            "fake",
+            "--workspace",
+            fixture.workspace.to_str().unwrap(),
+            "--worktree",
+            "codex/project-scope-history",
+            "--base",
+            base,
+        ],
+    );
+    let launch = checked_json(launch_reply, "Fake launch");
+    let agent = launch["target"].as_str().expect("Fake Agent").to_owned();
+    let generation = launch["generation"].as_i64().expect("Fake generation");
+    let generation_arg = generation.to_string();
+    let after_seq = fixture
+        .events()
+        .last()
+        .and_then(|event| event["seq"].as_i64())
+        .unwrap_or(0);
+
+    let send_ids = [ulid::Ulid::new().to_string(), ulid::Ulid::new().to_string()];
+    for (index, send_id) in send_ids.iter().enumerate() {
+        let text = format!("project-history-{index}");
+        let send_reply = cli(
+            &diagnostic_data,
+            &[
+                "--id",
+                send_id,
+                "send",
+                &agent,
+                "--generation",
+                &generation_arg,
+                "--wait",
+                "--timeout-seconds",
+                "10",
+                "--",
+                &text,
+            ],
+        );
+        let turn: CoreTurn = serde_json::from_value(checked_json(send_reply, "Fake send"))
+            .expect("typed Fake history turn");
+        assert_eq!(turn.agent, agent);
+        assert_eq!(turn.generation, generation);
+        assert_eq!(turn.state, TurnState::Completed);
+    }
+    let history = fixture.events();
+    let send_events: Vec<_> = history
+        .iter()
+        .filter(|event| {
+            event["kind"] == "command.applied"
+                && send_ids
+                    .iter()
+                    .any(|id| event["data"]["command_id"] == id.as_str())
+        })
+        .collect();
+    assert_eq!(send_events.len(), 2, "both fixed send events are retained");
+    assert!(send_events.iter().all(|event| {
+        event["agent"] == agent
+            && event["generation"] == generation
+            && event["subject"]["harness"] == "fake"
+    }));
+    let through_seq = send_events
+        .iter()
+        .filter_map(|event| event["seq"].as_i64())
+        .max()
+        .expect("finite history range end");
+    assert!(through_seq > after_seq);
+
+    let project_rule = |id: &str| {
+        format!(
+            concat!(
+                "[[rule]]\n",
+                "id = \"{id}\"\n",
+                "on = {{ event = \"command.applied\", match = {{ ",
+                "\"event.data.command_id\" = {{ one_of = [\"{first}\", \"{second}\"] }}, ",
+                "\"event.agent\" = \"{agent}\", ",
+                "\"event.generation\" = {{ exists = true }}, ",
+                "\"subject.harness\" = \"fake\" }} }}\n",
+                "limit = {{ max = 1, per = \"agent\", window = \"1h\" }}\n",
+                "do = [{{ action = \"stop\", target = \"${{event.agent}}\", ",
+                "expected_generation = \"${{event.generation}}\" }}]\n",
+            ),
+            id = id,
+            first = send_ids[0],
+            second = send_ids[1],
+            agent = agent,
+        )
+    };
+    fs::write(
+        approved_rules.join("history-stop.toml"),
+        project_rule("project-history-stop"),
+    )
+    .expect("write rule only in the approved checkout");
+    fs::write(
+        other_rules.join("foreign-stop.toml"),
+        project_rule("foreign-history-stop"),
+    )
+    .expect("write cross-project rule in the second registered checkout");
+
+    let wait_rule = |id: &str, project: &str| -> RuleStateView {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let reply = cli(
+                &diagnostic_data,
+                &["rule", "show", id, "--project", project],
+            );
+            let stdout = bounded_text(&reply.stdout);
+            let stderr = bounded_text(&reply.stderr);
+            if reply.status.success() {
+                let state: RuleStateView =
+                    serde_json::from_value(checked_json(reply, "project rule.get"))
+                        .expect("typed project rule state");
+                assert_eq!(state.id, id);
+                assert_eq!(state.project.as_deref(), Some(project));
+                return state;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "project rule reload deadline; bounded stdout={stdout:?}; bounded stderr={stderr:?}"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    };
+    let initial = wait_rule("project-history-stop", "approved");
+    wait_rule("foreign-history-stop", "other");
+    let no_owner_fallback = cli(&diagnostic_data, &["rule", "show", "project-history-stop"]);
+    assert_eq!(no_owner_fallback.status.code(), Some(1));
+    let no_owner_stderr = bounded_text(&no_owner_fallback.stderr);
+    assert!(no_owner_stderr.contains("not_found"), "{no_owner_stderr}");
+
+    let after_arg = after_seq.to_string();
+    let through_arg = through_seq.to_string();
+    let denied_id = ulid::Ulid::new().to_string();
+    let denied = cli(
+        &diagnostic_data,
+        &[
+            "--id",
+            &denied_id,
+            "rule",
+            "catch-up",
+            "foreign-history-stop",
+            "--after",
+            &after_arg,
+            "--through",
+            &through_arg,
+            "--project",
+            "other",
+        ],
+    );
+    let denied_stdout = bounded_text(&denied.stdout);
+    let denied_stderr = bounded_text(&denied.stderr);
+    assert_eq!(
+        denied.status.code(),
+        Some(3),
+        "cross-project catch-up must be denied before command admission; bounded stdout={denied_stdout:?}; bounded stderr={denied_stderr:?}"
+    );
+    assert!(
+        denied_stdout.is_empty(),
+        "denied catch-up returned a command: {denied_stdout:?}"
+    );
+    assert!(denied_stderr.contains("not_allowed"), "{denied_stderr}");
+    let unadmitted = cli(&diagnostic_data, &["cmd", "show", &denied_id]);
+    assert_eq!(unadmitted.status.code(), Some(1));
+    let unadmitted_stderr = bounded_text(&unadmitted.stderr);
+    assert!(
+        unadmitted_stderr.contains("not_found"),
+        "{unadmitted_stderr}"
+    );
+    let denial_events = fixture.events();
+    assert_eq!(fault_dispatches(&denial_events, &denied_id), 0);
+    assert!(!denial_events.iter().any(|event| {
+        event["data"]["command_id"] == denied_id
+            || event["data"]["parent_command"] == denied_id
+            || (event["kind"] == "rule.fired"
+                && event["data"]["rule"] == "foreign-history-stop"
+                && event["data"]["project"] == "other")
+    }));
+    let agent_reply = cli(&diagnostic_data, &["show", &agent]);
+    let agent_after_denial: AgentGetResponse = serde_json::from_value(checked_json(
+        agent_reply,
+        "Agent readback after cross-project denial",
+    ))
+    .expect("typed Agent readback after cross-project denial");
+    assert_ne!(agent_after_denial.agent.state, AgentState::Stopped);
+
+    let catchup_id = ulid::Ulid::new().to_string();
+    let catchup_args = [
+        "--id",
+        catchup_id.as_str(),
+        "rule",
+        "catch-up",
+        "project-history-stop",
+        "--after",
+        after_arg.as_str(),
+        "--through",
+        through_arg.as_str(),
+        "--project",
+        "approved",
+    ];
+    let catchup_reply = cli(&diagnostic_data, &catchup_args);
+    let catchup_value = checked_json(catchup_reply, "approved finite history catch-up");
+    let catchup: CoreCommand =
+        serde_json::from_value(catchup_value).expect("typed finite history catch-up command");
+    assert_eq!(catchup.id, catchup_id);
+    assert_eq!(catchup.verb, "rule.catch_up");
+    assert_eq!(catchup.args["rule"], "project-history-stop");
+    assert_eq!(catchup.args["project"], "approved");
+    assert_eq!(catchup.args["after_seq"], after_seq);
+    assert_eq!(catchup.args["through_seq"], through_seq);
+    assert_eq!(catchup.args["revision"], initial.revision);
+
+    let expected_fired_seq = send_events[0]["seq"].as_i64().expect("first matched event");
+    let expected_rate_seq = send_events[1]["seq"]
+        .as_i64()
+        .expect("second matched event");
+    let result_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let (fired, rate_rejection) = loop {
+        // Rule markers are daemon-owned and may have no Agent; read the unfiltered
+        // event stream and bind markers to this parent, revision and input range.
+        let events = fixture.events();
+        let fired = events.iter().find(|event| {
+            event["kind"] == "rule.fired"
+                && event["data"]["rule"] == "project-history-stop"
+                && event["data"]["project"] == "approved"
+                && event["data"]["parent_command"] == catchup_id
+                && event["data"]["revision"] == initial.revision
+                && event["data"]["event_seq"] == expected_fired_seq
+        });
+        let rejected = events.iter().find(|event| {
+            event["kind"] == "rule.rejected"
+                && event["data"]["rule"] == "project-history-stop"
+                && event["data"]["project"] == "approved"
+                && event["data"]["parent_command"] == catchup_id
+                && event["data"]["revision"] == initial.revision
+                && event["data"]["event_seq"] == expected_rate_seq
+                && event["data"]["code"] == "rate_limited"
+        });
+        if let (Some(fired), Some(rejected)) = (fired, rejected) {
+            break (fired.clone(), rejected.clone());
+        }
+        if std::time::Instant::now() >= result_deadline {
+            let parent_children = catchup
+                .outcome
+                .as_ref()
+                .and_then(|outcome| outcome.get("children"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let child_readbacks = parent_children
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(|id| {
+                    let reply = cli(&diagnostic_data, &["cmd", "show", id]);
+                    if reply.status.success() {
+                        let value = checked_json(reply, "deadline child readback");
+                        json!({
+                            "id": value["id"],
+                            "state": value["state"],
+                            "target": value["target"],
+                            "generation": value["generation"],
+                            "outcome": value["outcome"],
+                        })
+                    } else {
+                        json!({
+                            "id": id,
+                            "exit": reply.status.code(),
+                            "stderr": bounded_text(&reply.stderr),
+                        })
+                    }
+                })
+                .collect::<Vec<_>>();
+            let agent_reply = cli(&diagnostic_data, &["show", &agent]);
+            let agent_state = if agent_reply.status.success() {
+                let value = checked_json(agent_reply, "deadline Agent readback");
+                let view: AgentGetResponse =
+                    serde_json::from_value(value).expect("typed deadline Agent readback");
+                json!({
+                    "id": view.agent.id,
+                    "generation": view.agent.generation,
+                    "state": serde_json::to_value(view.agent.state).unwrap(),
+                    "profile": view.agent.profile,
+                })
+            } else {
+                json!({
+                    "exit": agent_reply.status.code(),
+                    "stderr": bounded_text(&agent_reply.stderr),
+                })
+            };
+            let markers = events
+                .iter()
+                .filter(|event| {
+                    matches!(event["kind"].as_str(), Some("rule.fired" | "rule.rejected"))
+                        && event["data"]["rule"] == "project-history-stop"
+                        && event["data"]["project"] == "approved"
+                        && event["data"]["parent_command"] == catchup_id
+                        && event["data"]["revision"] == initial.revision
+                        && [expected_fired_seq, expected_rate_seq]
+                            .contains(&event["data"]["event_seq"].as_i64().unwrap_or(-1))
+                })
+                .map(|event| {
+                    json!({
+                        "seq": event["seq"],
+                        "kind": event["kind"],
+                        "agent": event["agent"],
+                        "generation": event["generation"],
+                        "event_seq": event["data"]["event_seq"],
+                        "code": event["data"]["code"],
+                        "parent_command": event["data"]["parent_command"],
+                    })
+                })
+                .collect::<Vec<_>>();
+            let fired_count = markers
+                .iter()
+                .filter(|event| event["kind"] == "rule.fired")
+                .count();
+            let rate_limited_count = markers
+                .iter()
+                .filter(|event| event["kind"] == "rule.rejected" && event["code"] == "rate_limited")
+                .count();
+            let matched_inputs = send_events
+                .iter()
+                .map(|event| {
+                    json!({
+                        "seq": event["seq"],
+                        "command_id": event["data"]["command_id"],
+                        "agent": event["agent"],
+                        "generation": event["generation"],
+                        "harness": event["subject"]["harness"],
+                    })
+                })
+                .collect::<Vec<_>>();
+            panic!(
+                "finite catch-up deadline; parent_id={catchup_id}; parent_state={:?}; parent_args={}; parent_outcome_children={parent_children}; child_readbacks={child_readbacks:?}; agent={agent_state}; matched_inputs={matched_inputs:?}; fired_count={fired_count}; rate_limited_count={rate_limited_count}; observed_markers={markers:?}",
+                catchup.state, catchup.args,
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(fired["data"]["event_seq"], expected_fired_seq);
+    assert_eq!(rate_rejection["data"]["event_seq"], expected_rate_seq);
+    let child_id = fired["data"]["child_command"]
+        .as_str()
+        .expect("one admitted action child")
+        .to_owned();
+    assert_eq!(
+        catchup.outcome.as_ref().unwrap()["children"],
+        json!([child_id]),
+        "catch-up parent keeps its fixed admitted-child set"
+    );
+    let child_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let child: CoreCommand = loop {
+        let reply = cli(&diagnostic_data, &["cmd", "show", &child_id]);
+        let value = checked_json(reply, "catch-up stop child readback");
+        let command: CoreCommand =
+            serde_json::from_value(value).expect("typed catch-up stop child");
+        if command.state == CommandState::Applied {
+            break command;
+        }
+        assert!(
+            matches!(
+                &command.state,
+                CommandState::Accepted | CommandState::Queued | CommandState::Dispatched
+            ),
+            "catch-up stop child settled unexpectedly: {:?}",
+            command.state
+        );
+        assert!(
+            std::time::Instant::now() < child_deadline,
+            "catch-up stop child did not apply"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(child.id, child_id);
+    let events_after_catchup = fixture.events();
+    assert_eq!(fault_dispatches(&events_after_catchup, &child_id), 1);
+
+    let replay_reply = cli(&diagnostic_data, &catchup_args);
+    let replay_value = checked_json(replay_reply, "same-ID history catch-up replay");
+    let replay: CoreCommand =
+        serde_json::from_value(replay_value).expect("typed idempotent catch-up replay");
+    assert_eq!(replay, catchup);
+    let after_replay = fixture.events();
+    assert_eq!(
+        after_replay
+            .iter()
+            .filter(|event| {
+                event["kind"] == "rule.fired"
+                    && event["data"]["rule"] == "project-history-stop"
+                    && event["data"]["project"] == "approved"
+            })
+            .count(),
+        1,
+        "same external ID did not repeat the action"
+    );
+    assert_eq!(
+        after_replay
+            .iter()
+            .filter(|event| {
+                event["kind"] == "rule.rejected"
+                    && event["data"]["rule"] == "project-history-stop"
+                    && event["data"]["project"] == "approved"
+                    && event["data"]["code"] == "rate_limited"
+            })
+            .count(),
+        1,
+        "same external ID did not repeat the stored limit result"
+    );
+    assert_eq!(fault_dispatches(&after_replay, &child_id), 1);
+    let resumed = wait_rule("project-history-stop", "approved");
+    assert_eq!(resumed.revision, initial.revision);
+    assert!(resumed.current_cursor >= initial.current_cursor);
+    fixture.stop(false);
+}
+
+#[test]
+fn cli_fake_history_catchup_dispatches_siblings_in_order_and_replays() {
+    let mut fixture = Fixture::new("ordered rule catch-up");
+    fixture.start();
+    fixture.stop(false);
+
+    let rules = fixture.data.join("rules");
+    fs::create_dir_all(&rules).expect("create global rule directory");
+    let second_workspace = fixture.root.join("second workspace");
+    fs::create_dir(&second_workspace).expect("create second Fake workspace");
+    fixture.start();
+
+    let workspaces = [fixture.workspace.clone(), second_workspace];
+    let mut agents = Vec::new();
+    for workspace in &workspaces {
+        let launched = fixture.json(&[
+            "launch",
+            "--profile",
+            "fake",
+            "--workspace",
+            workspace.to_str().unwrap(),
+        ]);
+        agents.push((
+            launched["target"].as_str().expect("Fake Agent").to_owned(),
+            launched["generation"].as_i64().expect("Fake generation"),
+        ));
+    }
+    assert_ne!(agents[0].0, agents[1].0);
+    let after_seq = fixture
+        .events()
+        .last()
+        .and_then(|event| event["seq"].as_i64())
+        .unwrap_or(0);
+
+    let send_ids = [ulid::Ulid::new().to_string(), ulid::Ulid::new().to_string()];
+    for (index, (agent, generation)) in agents.iter().enumerate() {
+        let text = format!("ordered-history-{index}");
+        let turn: CoreTurn = serde_json::from_value(fixture.json(&[
+            "--id",
+            &send_ids[index],
+            "send",
+            agent,
+            "--generation",
+            &generation.to_string(),
+            "--wait",
+            "--timeout-seconds",
+            "10",
+            "--",
+            &text,
+        ]))
+        .expect("typed ordered-history Fake turn");
+        assert_eq!(turn.agent, *agent);
+        assert_eq!(turn.generation, *generation);
+        assert_eq!(turn.state, TurnState::Completed);
+    }
+
+    let history = fixture.events();
+    let send_events: Vec<_> = history
+        .iter()
+        .filter(|event| {
+            event["kind"] == "command.applied"
+                && send_ids
+                    .iter()
+                    .any(|id| event["data"]["command_id"] == id.as_str())
+        })
+        .collect();
+    assert_eq!(send_events.len(), 2);
+    for (index, event) in send_events.iter().enumerate() {
+        assert_eq!(event["agent"], agents[index].0);
+        assert_eq!(event["generation"], agents[index].1);
+        assert_eq!(event["subject"]["harness"], "fake");
+    }
+    let through_seq = send_events
+        .iter()
+        .filter_map(|event| event["seq"].as_i64())
+        .max()
+        .expect("finite ordered-history range end");
+    assert!(through_seq > after_seq);
+
+    let command_values = send_ids
+        .iter()
+        .map(|id| format!("\"{id}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let agent_values = agents
+        .iter()
+        .map(|(agent, _)| format!("\"{agent}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let source = format!(
+        concat!(
+            "[[rule]]\n",
+            "id = \"ordered-stop\"\n",
+            "on = {{ event = \"command.applied\", match = {{ ",
+            "\"event.data.command_id\" = {{ one_of = [{commands}] }}, ",
+            "\"event.agent\" = {{ one_of = [{agents}] }}, ",
+            "\"event.generation\" = {{ exists = true }}, ",
+            "\"subject.harness\" = \"fake\" }} }}\n",
+            "limit = {{ max = 2, per = \"rule\", window = \"1h\" }}\n",
+            "do = [{{ action = \"stop\", target = \"${{event.agent}}\", ",
+            "expected_generation = \"${{event.generation}}\" }}]\n",
+        ),
+        commands = command_values,
+        agents = agent_values,
+    );
+    fs::write(rules.join("ordered-stop.toml"), source).expect("write ordered sibling history rule");
+
+    let load_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let state: RuleStateView = loop {
+        let reply = cli(&fixture.data, &["rule", "show", "ordered-stop"]);
+        if reply.status.success() {
+            break serde_json::from_str(&reply.stdout).expect("typed ordered rule state");
+        }
+        assert!(
+            std::time::Instant::now() < load_deadline,
+            "ordered history rule load deadline; stderr: {}",
+            reply.stderr
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(state.current_cursor >= through_seq);
+
+    let after_arg = after_seq.to_string();
+    let through_arg = through_seq.to_string();
+    let catchup_id = ulid::Ulid::new().to_string();
+    let catchup_args = [
+        "--id",
+        catchup_id.as_str(),
+        "rule",
+        "catch-up",
+        "ordered-stop",
+        "--after",
+        after_arg.as_str(),
+        "--through",
+        through_arg.as_str(),
+    ];
+    let catchup_reply = cli(&fixture.data, &catchup_args);
+    assert!(
+        catchup_reply.status.success(),
+        "ordered sibling catch-up failed; bounded stdout={:?}; bounded stderr={:?}",
+        catchup_reply.stdout.chars().take(4096).collect::<String>(),
+        catchup_reply.stderr.chars().take(4096).collect::<String>()
+    );
+    let catchup: CoreCommand =
+        serde_json::from_str(&catchup_reply.stdout).expect("typed ordered catch-up parent");
+    assert_eq!(catchup.id, catchup_id);
+    assert_eq!(catchup.args["rule"], "ordered-stop");
+    assert_eq!(catchup.args["after_seq"], after_seq);
+    assert_eq!(catchup.args["through_seq"], through_seq);
+    assert_eq!(catchup.args["revision"], state.revision);
+    let child_ids: Vec<String> =
+        serde_json::from_value(catchup.outcome.as_ref().unwrap()["children"].clone())
+            .expect("fixed ordered catch-up child IDs");
+    assert_eq!(child_ids.len(), 2, "both ordered stops were admitted");
+
+    let mut children = Vec::new();
+    for child_id in &child_ids {
+        let child: CoreCommand = serde_json::from_value(fixture.wait_command(child_id, "applied"))
+            .expect("typed completed ordered stop child");
+        children.push(child);
+    }
+    for (index, child) in children.iter().enumerate() {
+        assert_eq!(child.id, child_ids[index]);
+        assert_eq!(child.state, CommandState::Applied);
+        assert_eq!(child.target.as_deref(), Some(agents[index].0.as_str()));
+        assert_eq!(child.expected_generation, Some(agents[index].1));
+    }
+
+    let events = fixture.events();
+    let mut fired: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event["kind"] == "rule.fired"
+                && event["data"]["rule"] == "ordered-stop"
+                && event["data"]["parent_command"] == catchup_id
+        })
+        .collect();
+    fired.sort_by_key(|event| event["data"]["event_seq"].as_i64().unwrap_or(i64::MAX));
+    assert_eq!(fired.len(), 2);
+    for index in 0..2 {
+        assert_eq!(fired[index]["data"]["event_seq"], send_events[index]["seq"]);
+        assert_eq!(fired[index]["data"]["child_command"], child_ids[index]);
+        assert_eq!(fault_dispatches(&events, &child_ids[index]), 1);
+        let stopped: AgentGetResponse =
+            serde_json::from_value(fixture.json(&["show", &agents[index].0]))
+                .expect("typed stopped Fake Agent");
+        assert_eq!(stopped.agent.state, AgentState::Stopped);
+        assert_eq!(stopped.agent.generation, agents[index].1);
+    }
+    let first_applied_seq = events
+        .iter()
+        .find(|event| {
+            event["kind"] == "command.applied" && event["data"]["command_id"] == child_ids[0]
+        })
+        .and_then(|event| event["seq"].as_i64())
+        .expect("first stop applied event");
+    let second_dispatched_seq = events
+        .iter()
+        .find(|event| {
+            event["kind"] == "command.dispatched" && event["data"]["command_id"] == child_ids[1]
+        })
+        .and_then(|event| event["seq"].as_i64())
+        .expect("second stop dispatched event");
+    assert!(
+        second_dispatched_seq > first_applied_seq,
+        "second sibling dispatched at {second_dispatched_seq} before predecessor applied at {first_applied_seq}"
+    );
+
+    let replay: CoreCommand = serde_json::from_value(fixture.json(&catchup_args))
+        .expect("same-ID ordered catch-up replay");
+    assert_eq!(replay, catchup);
+    let after_replay = fixture.events();
+    assert_eq!(
+        after_replay
+            .iter()
+            .filter(|event| {
+                event["kind"] == "rule.fired"
+                    && event["data"]["rule"] == "ordered-stop"
+                    && event["data"]["parent_command"] == catchup_id
+            })
+            .count(),
+        2,
+        "same-ID replay did not duplicate firing markers"
+    );
+    for child_id in &child_ids {
+        assert_eq!(fault_dispatches(&after_replay, child_id), 1);
+    }
     fixture.stop(false);
 }

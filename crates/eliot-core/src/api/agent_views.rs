@@ -500,6 +500,34 @@ pub struct WorkspaceCustodyView {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectRegistrationView {
+    pub id: String,
+    pub checkout: String,
+    pub repo_common_dir: String,
+    pub profiles: Vec<String>,
+    pub actions: Vec<String>,
+    pub revision: i64,
+}
+
+impl ProjectRegistrationView {
+    /// Pure readback grammar. Store/daemon own canonical repository identity and
+    /// the authority checks for the explicit profile/action allowsets.
+    pub fn validate(&self) -> Result<()> {
+        text(&self.id)?;
+        text(&self.checkout)?;
+        text(&self.repo_common_dir)?;
+        if self.revision < 0 {
+            return Err(Error::new(
+                "invalid",
+                "project registration revision must be nonnegative",
+            ));
+        }
+        validate_project_allowset(&self.profiles, "profiles")?;
+        validate_project_allowset(&self.actions, "actions")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnsettledCommandSummary {
     pub id: String,
     #[serde(deserialize_with = "nullable")]
@@ -636,6 +664,20 @@ fn binding(id: &str, expected: Option<i64>, agent: &str, actual: i64) -> bool {
 fn text(value: &str) -> Result<()> {
     if value.trim().is_empty() {
         return Err(Error::new("invalid", "text must be non-empty"));
+    }
+    Ok(())
+}
+
+fn validate_project_allowset(values: &[String], field: &str) -> Result<()> {
+    let mut unique = BTreeSet::new();
+    if values
+        .iter()
+        .any(|value| text(value).is_err() || !unique.insert(value.as_str()))
+    {
+        return Err(Error::new(
+            "invalid",
+            format!("project {field} must contain unique nonempty values"),
+        ));
     }
     Ok(())
 }
@@ -843,6 +885,33 @@ mod tests {
         assert_eq!(error.code, "unknown");
         assert_eq!(error.message, "Agent view response is invalid");
         assert!(error.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn project_registration_readback_preserves_explicit_empty_allowsets() {
+        let view = ProjectRegistrationView {
+            id: "project-a".to_owned(),
+            checkout: r"C:\work\project-a".to_owned(),
+            repo_common_dir: r"C:\work\project-a\.git".to_owned(),
+            profiles: Vec::new(),
+            actions: Vec::new(),
+            revision: 1,
+        };
+        view.validate().unwrap();
+        let wire = serde_json::to_value(&view).unwrap();
+        assert_eq!(wire["profiles"], json!([]));
+        assert_eq!(wire["actions"], json!([]));
+        assert_eq!(
+            serde_json::from_value::<ProjectRegistrationView>(wire).unwrap(),
+            view
+        );
+
+        let mut invalid = view.clone();
+        invalid.profiles = vec!["fake".to_owned(), "fake".to_owned()];
+        assert!(invalid.validate().is_err());
+        invalid = view;
+        invalid.actions = vec!["stop".to_owned(), " ".to_owned()];
+        assert!(invalid.validate().is_err());
     }
 
     #[test]

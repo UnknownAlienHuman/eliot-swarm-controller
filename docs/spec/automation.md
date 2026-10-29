@@ -1,28 +1,49 @@
 # Automation
 
-Delivered in L4, after the Codex command path and monitoring work. Rules, timers,
-scripts and Goals submit ordinary commands through the existing router. There is no
-Task/review engine, second executor or generic run/action graph.
+Rules and timers submit ordinary commands through the existing router. This contract
+does not add a second executor or a generic run/action graph.
 
 ## Rule files and authority
 
-Global rules: `<data_dir>/rules/*.toml`. Project rules: the registered checkout's
-`.eliot/rules/*.toml`, with project-scoped authority and approved profiles/actions.
-Connected global event rules watch these files for changes. Invalid reload keeps the last
-valid definition and reports the error through bounded daemon diagnostics.
+Global rules load from `<data_dir>/rules/*.toml`. Project rules load only from the
+owner-registered canonical checkout's `.eliot/rules/*.toml`, under project-scoped
+authority and its approved profiles/actions. Connected rule loading watches those files
+for changes. Invalid reload keeps the last valid definition and reports the error through
+bounded daemon diagnostics.
 
 ```toml
 [[rule]]
-id = "push-writer-commits"
-on = { event = "git.commit", match = { "subject.labels.role" = "writer" } }
-do = [{ action = "git.push", workspace = "${subject.workspace}" }]
+id = "stop-on-fake-result"
+on = { event = "turn.completed", match = { "subject.harness" = "fake" } }
+do = [{ action = "stop", target = "${event.agent}", expected_generation = "${event.generation}" }]
 limit = { max = 3, per = "agent", window = "1h" }
 ```
 
-This example requires a Git event with an unambiguous Agent `subject`; unattributed
-shared-worktree commits do not match it. Required keys are `id`, `on`, `do`; optional
-keys are `enabled`, `limit`, `catch_up`, `allow_self`. Unknown keys and duplicate ids
-are errors. A project rule cannot widen project, command, credential or route authority.
+Required keys are `id`, `on`, `do`; optional keys are `enabled`, `limit`, `catch_up` and
+`allow_self`. `catch_up` configures timer-slot recovery; committed-history catch-up is an
+explicit owner request described below. Unknown keys and duplicate ids are errors. A
+project rule cannot widen project, command, credential or route authority.
+
+## Project registration and rule authority
+
+Only owner-global `[projects.ID]` configuration registers a project. Its `path` names the
+checkout; `profiles` and `actions` are explicit allowlists over existing global profiles
+and supported actions. Missing or empty allowlists deny all. `project list` and
+`project show ID` are owner-only readbacks of the canonical registration; there is no
+project-registration mutation command in this increment.
+
+Load project rules only from the registered canonical checkout's `.eliot/rules/*.toml`,
+never from an Agent worktree. Their principal is `project:ID`. Router authorization and
+Store admission/dispatch fences revalidate the registration's canonical checkout and
+repository common directory, profile allowlist and action allowlist before effects.
+`Agent.project` is a label and never establishes project authority. Project rules use
+global profile definitions; project files cannot override native profiles, executables,
+model, route, environment, permissions, workspace mode or Git identity.
+
+Owner `rule.get`, `rule.catch_up`, `timer.get` and `timer.run` accept an optional project
+scope. Supplying one selects its project principal even though the caller is Owner; an
+unscoped call remains global-owner scope. There is no owner fallback when project
+authority is absent or the selected project is not permitted.
 
 ## Event cursor and compact definition handoff
 
@@ -54,9 +75,14 @@ missed watcher notifications. Already admitted commands retain their original in
 ### Retention and bounded backlog
 
 Enabled current/retiring cursors pin the events they still need. Disabled rules pin
-nothing. At `automation.max_event_backlog` (default 100,000), atomically record the
-skipped range, advance to captured high-water, clear retirement and pause the rule with
-`backlog_exceeded`. Existing commands continue. Explicit catch-up fails `history_gap`
+nothing. Daemon startup validates `automation.max_event_backlog` before readiness. The
+rule worker reloads it during startup and each two-second reconciliation, applying the
+current value to both global and registered-project rule lanes. An invalid runtime reload
+reports a bounded diagnostic and retains the last valid value; an invalid initial value
+prevents startup. When high-water exceeds the oldest enabled current/retiring cursor by
+more than the configured limit, atomically record the skipped range, advance to captured
+high-water, clear retirement and pause the rule with `backlog_exceeded`. Existing
+commands continue. Explicit catch-up fails `history_gap`
 when its requested history has already been pruned. A lagging rule cannot pin storage
 indefinitely.
 
@@ -81,9 +107,10 @@ only edits preserve the schedule. Reconcile timers from stored state on restart.
 
 ## First connected timer slice
 
-Global timers use the same startup-loaded rule files and the existing command router.
-The connected subset supports interval, once, five-field cron and owner-triggered manual
-runs, each with one ordinary `stop` action. Other action verbs remain future work.
+Global and registered-project timers use their namespace's startup-loaded rule files and
+the existing command router. The connected subset supports interval, once, five-field
+cron and owner-triggered manual runs, each with one ordinary `stop` action. Other action
+verbs remain future work.
 
 ```toml
 [[rule]]
@@ -187,21 +214,11 @@ valid definition and reports the error. Each event's match/validation result and
 advance commit atomically with any admitted command set; Store failure commits neither.
 Disabled rules advance their skipped range without firing.
 
-Enabled current/retiring cursors pin events until consumed. At
-`automation.max_event_backlog` (default 100,000), atomically record the skipped range,
-advance to captured high-water, clear retirement and pause with `backlog_exceeded`.
-Existing commands continue. This increment does not add project overlays or explicit
-history catch-up.
-
-The default per-rule limit remains 10 firings/minute and the global limit 120
-actions/minute. Count admitted action children once, excluding Store-only parents, and
-enforce limits with cursor/admission. A rate skip records its deterministic result in a
-Store-only rejected parent without an action child. Event rule files cannot override
-these limits with custom `limit` or `catch_up` values.
-
-This increment still supports one ordinary `stop` action. Other actions, selectors,
-scripts, Goals, project rules and schedule replacement remain future work. Cause-depth
-suppression is silent; it does not emit an endlessly retriggerable rejection event.
+Backlog, explicit history catch-up, and rate-limit semantics are defined in
+[Retention and bounded backlog](#retention-and-bounded-backlog). This connected event-rule
+subset supports one ordinary `stop` action; other action verbs, scripts, Goals, and
+project configuration overlays remain unsupported. Cause-depth suppression is silent and
+does not emit an endlessly retriggerable rejection event.
 
 ## Matching and rendering
 

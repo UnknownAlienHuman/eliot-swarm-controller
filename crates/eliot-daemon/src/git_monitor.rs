@@ -818,7 +818,7 @@ fn resolve_windows_git(program: PathBuf) -> Result<PathBuf> {
 
 async fn bounded_read<R: AsyncRead + Unpin>(mut reader: R, cap: usize) -> Result<Vec<u8>> {
     let mut output = Vec::new();
-    let mut buffer = [0u8; 8192];
+    let mut buffer = vec![0u8; 8192];
     loop {
         let read = reader
             .read(&mut buffer)

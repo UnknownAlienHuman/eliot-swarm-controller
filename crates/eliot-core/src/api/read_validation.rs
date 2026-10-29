@@ -9,7 +9,11 @@ use crate::{Command, CommandState, Error, Result, Turn};
 
 impl RuleGetRequest {
     pub fn validate_response(&self, response: &RuleStateView) -> Result<()> {
-        if self.validate().is_err() || response.id != self.id || response.validate().is_err() {
+        if self.validate().is_err()
+            || response.id != self.id
+            || response.project != self.project
+            || response.validate().is_err()
+        {
             return Err(binding_mismatch());
         }
         Ok(())
@@ -158,6 +162,7 @@ mod tests {
         let request = RuleGetRequest::new("rule-1");
         let response = RuleStateView {
             id: "rule-1".to_owned(),
+            project: None,
             revision: 1,
             current_cursor: 12,
             retiring_revision: None,
@@ -192,6 +197,9 @@ mod tests {
         invalid = response.clone();
         invalid.current_cursor = -1;
         assert_unknown(request.validate_response(&invalid));
+        invalid = response.clone();
+        invalid.project = Some("project-a".to_owned());
+        assert_unknown(request.validate_response(&invalid));
         invalid = response;
         invalid.paused_reason = Some(" \t ".to_owned());
         assert_unknown(request.validate_response(&invalid));
@@ -202,6 +210,7 @@ mod tests {
         let request = RuleGetRequest::new("rule-1");
         let state = RuleStateView {
             id: "rule-1".to_owned(),
+            project: None,
             revision: 2,
             current_cursor: 18,
             retiring_revision: Some(1),

@@ -76,6 +76,11 @@ secrets. External Agents are observe-only until exact control attach. Native chi
 remain visible above controller fanout guards; limited children have no widened control
 or independent identity. `own_identity=false` is never owner authority.
 
+`Agent.project` is a descriptive label, not project authority. Project-scoped automation
+uses the owner-registered checkout and repository identity read back through Core
+[`ProjectRegistrationView`](../../crates/eliot-core/src/api/agent_views.rs); it never
+derives authorization from a later Agent-row label.
+
 The optional public `workspace_phase`, `branch`, `base_ref` and `base_oid` are read from
 the sole managed workspace row, including when another Agent shares its path. They are
 not duplicated Agent columns. No managed row means these projections are absent.

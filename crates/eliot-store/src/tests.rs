@@ -1,4 +1,4 @@
-use super::{BatchCommit, Store, contains_secret_marker};
+use super::{BatchCommit, ProjectRegistrationInput, Store, contains_secret_marker};
 use eliot_core::api::{ProviderClearHoldRequest, ProviderCorrectiveEvidence};
 use eliot_core::{
     AgentState, CommandState, EventCause, NativeEvent, NativeStoreBinding, ProviderHoldState,
@@ -143,6 +143,475 @@ fn ready_capacity_agent(store: &mut Store, project: &str, now: i64) -> (String, 
 }
 
 #[test]
+fn project_command_binding_is_captured_and_revalidated_before_dispatch() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let project = "project-binding";
+    let agent = ready_agent(&mut store, project, now);
+    let registration = ProjectRegistrationInput {
+        id: project.to_owned(),
+        checkout: "synthetic-workspace".to_owned(),
+        repo_common_dir: "synthetic-repository".to_owned(),
+        profiles: vec!["fake".to_owned()],
+        actions: vec!["stop".to_owned()],
+    };
+    let registered = store
+        .upsert_project_registration("owner", &registration, now + 1)
+        .expect("register project")
+        .value;
+    assert_eq!(registered.revision, 1);
+    assert_eq!(
+        store
+            .get_project_registration("owner", project)
+            .expect("read project registration"),
+        Some(registered.clone())
+    );
+    assert_eq!(
+        store
+            .list_project_registrations("owner", None, 10)
+            .expect("list project registrations"),
+        vec![registered.clone()]
+    );
+
+    let stop_id = Ulid::new().to_string();
+    store
+        .submit(
+            &format!("project:{project}"),
+            SubmitCommand {
+                id: stop_id.clone(),
+                target: Some(agent.clone()),
+                verb: "stop".to_owned(),
+                args: json!({}),
+                expected_generation: Some(1),
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now + 2,
+        )
+        .expect("admit project stop under the registered profile/action");
+    let binding: String = store
+        .connection
+        .query_row(
+            "SELECT project_binding FROM commands WHERE id = ?1",
+            [&stop_id],
+            |row| row.get(0),
+        )
+        .expect("persist frozen project binding");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&binding).expect("decode project binding")["registration_revision"],
+        json!(registered.revision)
+    );
+
+    assert!(
+        store
+            .reconcile_project_registrations("owner", &[], now + 3)
+            .expect("remove project registration")
+            .value
+            .is_empty()
+    );
+    let next = store
+        .upsert_project_registration("owner", &registration, now + 4)
+        .expect("re-register project")
+        .value;
+    assert!(next.revision > registered.revision);
+
+    let error = store
+        .dispatch(&stop_id, now + 5)
+        .expect_err("revoked project command must fail its dispatch fence");
+    assert_eq!(error.code, "not_allowed");
+    assert_eq!(
+        store
+            .get_command(&stop_id)
+            .expect("read admitted stop")
+            .expect("stop remains retained")
+            .state,
+        CommandState::Accepted,
+        "failed dispatch validation must not dispatch or consume the command"
+    );
+}
+
+#[test]
+fn project_stop_rejects_setup_ready_next_generation() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let project = "project-workspace-binding";
+    let start_id = Ulid::new().to_string();
+    let checkout = "/synthetic-owner";
+    let repo_common_dir = "/synthetic-owner/.git";
+    let worktree_path = "/synthetic-worktree";
+    let branch = "codex/project-binding";
+    let base_oid = "b".repeat(40);
+    let input = WorkspacePreparationInput {
+        project: checkout.to_owned(),
+        repo_path: checkout.to_owned(),
+        repo_common_dir: repo_common_dir.to_owned(),
+        requested_branch: branch.to_owned(),
+        base_ref: Some("HEAD".to_owned()),
+        base_oid: base_oid.clone(),
+        worktree_path: worktree_path.to_owned(),
+        frozen_setup: vec![eliot_core::WorkspaceSetup {
+            program: eliot_core::FrozenSetupFile {
+                canonical_path: std::env::temp_dir()
+                    .join("eliot-project-setup")
+                    .to_string_lossy()
+                    .into_owned(),
+                size: 1,
+                sha256: "a".repeat(64),
+            },
+            args: Vec::new(),
+            timeout_ms: 1_000,
+        }],
+    };
+    let launch = store
+        .submit_with_workspace(
+            "owner",
+            SubmitCommand {
+                id: start_id.clone(),
+                target: None,
+                verb: "launch".to_owned(),
+                args: json!({
+                    "project": checkout,
+                    "workspace": checkout,
+                    "worktree": branch,
+                    "harness": "fake",
+                    "profile": "fake",
+                    "profile_snapshot": {}
+                }),
+                expected_generation: Some(0),
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            input.clone(),
+            now,
+        )
+        .expect("admit managed project launch");
+    let agent = launch.command.target.expect("workspace Agent");
+    store
+        .settle_workspace_creation(
+            &start_id,
+            1,
+            WorkspaceCreationOutcome::Verified {
+                repo_path: input.repo_path.clone(),
+                repo_common_dir: input.repo_common_dir.clone(),
+                worktree_path: input.worktree_path.clone(),
+                branch: input.requested_branch.clone(),
+                head: input.base_oid.clone(),
+            },
+            now + 1,
+        )
+        .expect("verify L3 workspace with canonical checkout project");
+    let (workspace_phase, target_generation): (String, i64) = store
+        .connection
+        .query_row(
+            "SELECT phase, target_generation FROM workspaces WHERE agent = ?1",
+            [eliot_core::parse_agent_id(&agent).expect("valid Agent id")],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read L3 workspace phase");
+    assert_eq!(workspace_phase, "setup_ready");
+    assert_eq!(target_generation, 1);
+    assert_eq!(store.get_agent(&agent).unwrap().unwrap().generation, 0);
+    let registration = ProjectRegistrationInput {
+        id: project.to_owned(),
+        checkout: checkout.to_owned(),
+        repo_common_dir: repo_common_dir.to_owned(),
+        profiles: vec!["fake".to_owned()],
+        actions: vec!["stop".to_owned()],
+    };
+    store
+        .upsert_project_registration("owner", &registration, now + 2)
+        .expect("register project");
+    let stop_id = Ulid::new().to_string();
+    let event_count: i64 = store
+        .connection
+        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+        .expect("count events before denied stop");
+    let error = store
+        .submit(
+            &format!("project:{project}"),
+            SubmitCommand {
+                id: stop_id.clone(),
+                target: Some(agent),
+                verb: "stop".to_owned(),
+                args: json!({}),
+                expected_generation: Some(0),
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now + 3,
+        )
+        .expect_err("project stop cannot target setup in the next generation");
+    assert_eq!(error.code, "not_allowed");
+    assert!(
+        store
+            .get_command(&stop_id)
+            .expect("read denied stop")
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row
+                .get::<_, i64>(0))
+            .expect("count events after denied stop"),
+        event_count
+    );
+}
+
+#[test]
+fn project_stop_cannot_cancel_a_new_workspace_generation_after_dispatch_admission() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let project = "project-workspace-generation";
+    let checkout = "/synthetic-owner";
+    let repo_common_dir = "/synthetic-owner/.git";
+    let worktree_path = "/synthetic-worktree";
+    let branch = "codex/project-generation";
+    let base_oid = "c".repeat(40);
+    let input = WorkspacePreparationInput {
+        project: checkout.to_owned(),
+        repo_path: checkout.to_owned(),
+        repo_common_dir: repo_common_dir.to_owned(),
+        requested_branch: branch.to_owned(),
+        base_ref: Some("HEAD".to_owned()),
+        base_oid: base_oid.clone(),
+        worktree_path: worktree_path.to_owned(),
+        frozen_setup: Vec::new(),
+    };
+    let launch_id = Ulid::new().to_string();
+    let launch = store
+        .submit_with_workspace(
+            "owner",
+            SubmitCommand {
+                id: launch_id.clone(),
+                target: None,
+                verb: "launch".to_owned(),
+                args: json!({
+                    "project": checkout,
+                    "workspace": checkout,
+                    "worktree": branch,
+                    "harness": "codex",
+                    "profile": "project-profile",
+                    "profile_snapshot": {}
+                }),
+                expected_generation: Some(0),
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            input.clone(),
+            now,
+        )
+        .expect("admit managed Codex project launch");
+    let agent = launch.command.target.expect("workspace Agent");
+    store
+        .settle_workspace_creation(
+            &launch_id,
+            1,
+            WorkspaceCreationOutcome::Verified {
+                repo_path: input.repo_path.clone(),
+                repo_common_dir: input.repo_common_dir.clone(),
+                worktree_path: input.worktree_path.clone(),
+                branch: input.requested_branch.clone(),
+                head: input.base_oid.clone(),
+            },
+            now + 1,
+        )
+        .expect("verify managed project workspace");
+    store
+        .dispatch(&launch_id, now + 2)
+        .expect("dispatch launch");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "project-workspace-generation:ready".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ready".to_owned(),
+                    native_id: "project-workspace-generation:ready".to_owned(),
+                    data: json!({
+                        "command_id": launch_id,
+                        "native_scope": "project-workspace-generation:scope",
+                        "native_ref": "project-workspace-generation:thread"
+                    }),
+                }],
+                cursor: None,
+            },
+            now + 3,
+        )
+        .expect("commit Codex readiness");
+    store
+        .settle(&launch_id, CommandState::Applied, None, now + 4)
+        .expect("settle launch");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "project-workspace-generation:ended".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ended".to_owned(),
+                    native_id: "project-workspace-generation:ended".to_owned(),
+                    data: json!({}),
+                }],
+                cursor: None,
+            },
+            now + 5,
+        )
+        .expect("commit terminal session fact");
+    assert_eq!(
+        store
+            .get_agent(&agent)
+            .expect("read Agent")
+            .expect("Agent exists")
+            .state,
+        AgentState::Stopped
+    );
+
+    let registration = ProjectRegistrationInput {
+        id: project.to_owned(),
+        checkout: checkout.to_owned(),
+        repo_common_dir: repo_common_dir.to_owned(),
+        profiles: vec!["project-profile".to_owned()],
+        actions: vec!["stop".to_owned()],
+    };
+    store
+        .upsert_project_registration("owner", &registration, now + 6)
+        .expect("register project");
+    let stop_id = Ulid::new().to_string();
+    store
+        .submit(
+            &format!("project:{project}"),
+            SubmitCommand {
+                id: stop_id.clone(),
+                target: Some(agent.clone()),
+                verb: "stop".to_owned(),
+                args: json!({}),
+                expected_generation: Some(1),
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now + 6,
+        )
+        .expect("admit project stop against the ready current generation");
+    let binding: String = store
+        .connection
+        .query_row(
+            "SELECT project_binding FROM commands WHERE id = ?1",
+            [&stop_id],
+            |row| row.get(0),
+        )
+        .expect("persist frozen managed workspace binding");
+    let binding: serde_json::Value =
+        serde_json::from_str(&binding).expect("decode managed workspace binding");
+    assert_eq!(binding["workspace_phase"], "ready");
+    assert_eq!(binding["workspace_target_generation"], 1);
+
+    let resume_id = Ulid::new().to_string();
+    store
+        .submit_with_workspace(
+            "owner",
+            SubmitCommand {
+                id: resume_id.clone(),
+                target: Some(agent.clone()),
+                verb: "resume".to_owned(),
+                args: json!({}),
+                expected_generation: Some(1),
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            input,
+            now + 7,
+        )
+        .expect("admit next-generation workspace resume");
+    let workspace_before: (String, i64, String) = store
+        .connection
+        .query_row(
+            "SELECT phase, target_generation, outcome FROM workspaces WHERE agent = ?1",
+            [eliot_core::parse_agent_id(&agent).expect("valid Agent id")],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read next-generation workspace before stale stop dispatch");
+    assert_eq!(workspace_before.0, "creating");
+    assert_eq!(workspace_before.1, 2);
+    let event_count: i64 = store
+        .connection
+        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+        .expect("count events before stale stop dispatch");
+
+    let error = store
+        .dispatch(&stop_id, now + 8)
+        .expect_err("old project stop must not cancel the new workspace preparation");
+    assert_eq!(error.code, "not_allowed");
+    assert_eq!(
+        store
+            .get_command(&stop_id)
+            .expect("read project stop")
+            .expect("stop retained")
+            .state,
+        CommandState::Accepted
+    );
+    assert_eq!(
+        store
+            .get_command(&resume_id)
+            .expect("read resume")
+            .expect("resume retained")
+            .state,
+        CommandState::Accepted
+    );
+    let workspace_after: (String, i64, String) = store
+        .connection
+        .query_row(
+            "SELECT phase, target_generation, outcome FROM workspaces WHERE agent = ?1",
+            [eliot_core::parse_agent_id(&agent).expect("valid Agent id")],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read resumed workspace after stale stop dispatch");
+    assert_eq!(workspace_after, workspace_before);
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row
+                .get::<_, i64>(0))
+            .expect("count events after denied dispatch"),
+        event_count
+    );
+}
+
+#[test]
+fn project_registration_list_rejects_oversized_whole_value_without_truncation() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let profile_body = "p".repeat(470 * 1024);
+    for id in ["large-project-a", "large-project-b"] {
+        let registration = ProjectRegistrationInput {
+            id: id.to_owned(),
+            checkout: format!("/synthetic/{id}"),
+            repo_common_dir: format!("/synthetic/{id}/.git"),
+            profiles: vec![format!("{profile_body}-{id}")],
+            actions: vec!["stop".to_owned()],
+        };
+        store
+            .upsert_project_registration("owner", &registration, 0)
+            .expect("each registration fits by itself");
+    }
+
+    let error = store
+        .list_project_registrations("owner", None, 1_000)
+        .expect_err("the complete result exceeds the response bound");
+    assert_eq!(error.code, "frame_too_large");
+}
+
+#[test]
 fn session_end_keeps_dispatched_stop_pending_until_exact_reply() {
     let mut store = Store::open(Path::new(":memory:")).expect("open Store");
     let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
@@ -278,7 +747,7 @@ fn workspace_exceptions_stay_marker_bound_across_unknown_readback() {
     let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
     let start_id = Ulid::new().to_string();
     let input = WorkspacePreparationInput {
-        project: "workspace-transitions".to_owned(),
+        project: "/synthetic-owner".to_owned(),
         repo_path: "/synthetic-owner".to_owned(),
         repo_common_dir: "/synthetic-owner/.git".to_owned(),
         requested_branch: "codex/audit".to_owned(),
@@ -1868,7 +2337,7 @@ fn native_store_binding_preserves_workspace_readiness_and_cancellation_fences() 
     let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
     let mut request = native_store_request();
     let input = WorkspacePreparationInput {
-        project: "native-store-binding".to_owned(),
+        project: "/synthetic-owner".to_owned(),
         repo_path: "/synthetic-owner".to_owned(),
         repo_common_dir: "/synthetic-owner/.git".to_owned(),
         requested_branch: "codex/binding".to_owned(),
@@ -1877,6 +2346,7 @@ fn native_store_binding_preserves_workspace_readiness_and_cancellation_fences() 
         worktree_path: "/synthetic-worktree".to_owned(),
         frozen_setup: Vec::new(),
     };
+    request.args["project"] = json!(input.project);
     request.args["workspace"] = json!(input.repo_path);
     request.args["worktree"] = json!(input.requested_branch);
     let admitted = store
