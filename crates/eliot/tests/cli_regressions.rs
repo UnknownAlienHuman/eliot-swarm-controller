@@ -3400,25 +3400,34 @@ max_live = 1
         "--workspace",
         workspace.as_str(),
     ];
-    let first_reply = cli(&fixture.data, &first_args);
     // This named Fake profile has no credential-bearing fields. Mask fixture paths and
-    // bound stderr so a failure exposes its cause without leaking unrelated path data.
-    let data_path = fixture.data.to_string_lossy();
-    let workspace_path = fixture.workspace.to_string_lossy();
-    let safe_stderr = first_reply
-        .stderr
-        .replace(data_path.as_ref(), "[DATA]")
-        .replace(workspace_path.as_ref(), "[WORKSPACE]")
-        .chars()
-        .take(512)
-        .collect::<String>();
-    assert!(
-        first_reply.status.success(),
-        "first Fake launch failed with exit {:?}: {safe_stderr}",
-        first_reply.status.code()
-    );
-    let first: CoreCommand =
-        serde_json::from_str(&first_reply.stdout).expect("first named Fake launch JSON");
+    // bound/sanitize stderr so a failure exposes its phase without leaking path data.
+    let data_path = fixture.data.to_string_lossy().into_owned();
+    let workspace_path = workspace.clone();
+    let command_from_reply = |phase: &str, reply: support::Reply| -> CoreCommand {
+        let safe_stderr = reply
+            .stderr
+            .replace(&data_path, "[DATA]")
+            .replace(&workspace_path, "[WORKSPACE]")
+            .chars()
+            .take(512)
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect::<String>();
+        assert!(
+            reply.status.success(),
+            "{phase} failed with exit {:?}: {safe_stderr}",
+            reply.status.code()
+        );
+        serde_json::from_str(&reply.stdout)
+            .unwrap_or_else(|_| panic!("{phase} returned invalid CoreCommand JSON; stdout omitted"))
+    };
+    let first = command_from_reply("initial launch", cli(&fixture.data, &first_args));
     assert_eq!(first.id, first_id);
     assert_eq!(first.state, CommandState::Applied);
     let first_agent = first.target.clone().expect("first controlled Agent");
@@ -3454,8 +3463,10 @@ max_live = 1
     };
     let events_before_first_retry = fixture.events();
     assert_eq!(first_dispatches(&events_before_first_retry), 1);
-    let first_retry: CoreCommand =
-        serde_json::from_value(fixture.json(&first_args)).expect("typed retained launch result");
+    let first_retry = command_from_reply(
+        "same-ID replay while cap is full",
+        cli(&fixture.data, &first_args),
+    );
     assert_eq!(
         first_retry, first,
         "same-ID replay of an admitted launch did not return its retained result"
@@ -3544,8 +3555,10 @@ max_live = 1
     fixture.stop(false);
     fixture.start();
 
-    let first_after_restart: CoreCommand = serde_json::from_value(fixture.json(&first_args))
-        .expect("typed retained launch after restart");
+    let first_after_restart = command_from_reply(
+        "same-ID replay after restart",
+        cli(&fixture.data, &first_args),
+    );
     assert_eq!(
         first_after_restart, first,
         "restart changed the retained admitted launch result"

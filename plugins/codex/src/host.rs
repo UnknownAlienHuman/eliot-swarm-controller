@@ -321,11 +321,12 @@ impl CodexPlugin {
             }
         };
         let TargetEnvironment {
-            variables,
+            mut variables,
             mut secrets,
             mut metadata_secrets,
         } = target_environment(Some(environment), profile.get("pass_env"))?;
-        route.capture_client_secret(&variables, &mut secrets, &mut metadata_secrets)?;
+        route.capture_client_secret(&variables, &mut secrets, &mut metadata_secrets, false)?;
+        route.strip_client_key(&mut variables);
         if variables.iter().any(|(name, _)| {
             name.to_string_lossy()
                 .to_ascii_uppercase()
@@ -582,7 +583,7 @@ impl CodexPlugin {
             mut secrets,
             mut metadata_secrets,
         } = target_environment(params.target_environment.as_ref(), profile.get("pass_env"))?;
-        route.capture_client_secret(&environment, &mut secrets, &mut metadata_secrets)?;
+        route.capture_client_secret(&environment, &mut secrets, &mut metadata_secrets, true)?;
         secrets.push(initialized.credential.clone());
         metadata_secrets.push(initialized.credential.clone());
         let launch = NativeLaunch {
@@ -2761,7 +2762,7 @@ mod tests {
             launch
                 .environment
                 .iter()
-                .any(|(name, value)| { name == "LOCAL_CLIENT" && value == secret })
+                .all(|(name, _)| name != "LOCAL_CLIENT")
         );
         assert!(launch.args.iter().any(|arg| {
             arg.to_string_lossy()
@@ -2772,6 +2773,14 @@ mod tests {
                 .args
                 .iter()
                 .all(|arg| { !arg.to_string_lossy().contains(secret) })
+        );
+
+        let (missing_key_launch, _, _) = plugin.reader_launch(&profile, &json!({})).unwrap();
+        assert!(
+            missing_key_launch
+                .environment
+                .iter()
+                .all(|(name, _)| name != "LOCAL_CLIENT")
         );
     }
 

@@ -47,9 +47,11 @@ permissions = "workspace-write"
 pass_env = ["CODEX_HOME"]
 ```
 
-Use the exact model advertised by the installed account's `model/list`; unavailable Luna
-fails explicitly. [Codex](../harnesses/codex.md#first-useful-path) owns bring-up steps.
-Existing workspace and owner login suffice; no proxy/account registry is mandatory.
+The profile author supplies an exact model string. Eliot does not call `model/list`,
+check provider entitlement, or issue an inference probe to resolve it. An unavailable
+model fails explicitly; it does not trigger route or account fallback.
+[`Codex`](../harnesses/codex.md#first-useful-path) owns native bring-up steps. Existing
+workspace and owner login suffice; no proxy/account registry is mandatory.
 
 The first native profile also accepts `cmd` (one executable, not a shell command),
 `effort`, and `approval_policy` (`never`, the default, or `on-request`). `permissions`
@@ -214,8 +216,14 @@ database root or scope; native configuration can affect selection.
 For a new Codex launch, resolve the effective store only after the actual workspace is
 prepared, including setup. The owned read-only
 [`profile.store`](../../crates/eliot-plugin/src/protocol.rs) reader uses that workspace
-and the admitted inputs; it performs no native control or model request. In the launch
-dispatch transaction, [Store](../../crates/eliot-store/src/lib.rs) appends the verified
+and the admitted inputs. Eliot itself issues no model/list, entitlement or inference
+probe. Native app-server startup may make a vendor-owned read-only model-catalog GET,
+normally to the selected provider base URL. A supported absolute `model_catalog_url`
+can redirect that request to another host, potentially with native client authentication;
+route admission must pin it to the selected provider or suppress it before process birth.
+The metadata reader must not receive the client-key value; keep the resolved value in its
+secret-redaction policy. The controlled process still requires the explicitly configured
+client key. In the launch dispatch transaction, [Store](../../crates/eliot-store/src/lib.rs) appends the verified
 [`NativeStoreBinding`](../../crates/eliot-core/src/native_store.rs) once to
 `Agent.profile_snapshot.native_store_binding`. The admitted `Command.args` and its
 payload digest remain unchanged. A retained binding cannot be replaced by rediscovery.

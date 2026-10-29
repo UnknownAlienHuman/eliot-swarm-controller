@@ -40,14 +40,20 @@ exercise profile/account caps, but Fake has no proxy route.
 
 ## Codex wiring and limits
 
-The route uses the explicitly selected native executable's process-scoped configuration
-override and verifies the effective named provider before session start. It does not
-silently select another executable, provider or account. The owner's global Codex
-configuration is not rewritten. Only the optional client-key environment-variable name
-is frozen; its value is runtime-only.
+The route must use the explicitly selected native executable's process-scoped
+configuration override and verify the effective named provider before session start. It
+must not silently select another executable, provider or account or rewrite the owner's
+global Codex configuration. Only the optional client-key environment-variable name is
+frozen; its value is runtime-only.
 
-The readiness and effective-config checks establish those limited facts only. Runtime
-authentication, inference, billing, and auxiliary/subagent traffic remain unverified in
-this increment. No model/provider probe or automatic route/account fallback is part of
-the path. Provider holds and their management API are the next connected increment and
-remain `unsupported` here.
+Eliot itself does not call `model/list`, query provider entitlement, or send an inference
+probe. Native Codex app-server startup may make its own read-only model-catalog GET,
+normally against the selected provider base URL. A supported absolute
+`model_catalog_url` can direct that request to another host and may cause native client
+authentication to accompany it. The route must pin that URL to the selected provider
+or suppress the catalog refresh before process birth. This vendor-owned catalog read is
+not proof of entitlement or inference. The route must omit the client-key value from the
+metadata reader while retaining it in the reader's redaction policy; the controlled
+process still requires the explicitly configured key. Runtime authentication, inference, billing, and
+auxiliary/subagent traffic remain unverified. No automatic route/account fallback is
+permitted. Provider holds and their management API remain `unsupported` here.

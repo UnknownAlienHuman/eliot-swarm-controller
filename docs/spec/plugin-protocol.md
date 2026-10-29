@@ -96,11 +96,16 @@ normalized native family. Hooks never mirror lifecycle already supplied by the s
 | `shutdown` | none | close owned paths, drain, exit; never kill an adopted service |
 
 An optional shared Core `RouteBinding` travels inside the frozen profile snapshot; it
-does not add a service RPC or a new harness. The controlled Codex process applies the
-explicit named-provider override and reads back its effective configuration before
-starting a session. This does not mutate the owner's global Codex configuration or prove
+does not add a service RPC or a new harness. The controlled Codex process must apply the
+explicit named-provider override and read back its effective configuration before
+starting a session. It must not mutate the owner's global Codex configuration or claim
 provider authentication, inference, or auxiliary traffic. An adopted endpoint remains
 outside Agent custody and is never stopped by Agent or daemon shutdown.
+Eliot does not issue model/list or entitlement probes. The native app-server may issue a
+vendor-owned read-only catalog GET at startup; the route must pin its supported catalog
+URL to the selected provider or suppress it before process birth. The metadata reader
+must not receive the client-key value, while retaining it in its diagnostic redaction
+policy.
 
 Treat the returned binding as metadata: reject metadata-secret values in it. Redact
 reader errors and stderr with the broader diagnostic-secret set.

@@ -4,7 +4,7 @@
 //! only into the runtime redaction policies.
 use eliot_core::{Error, Result, RouteBinding, SecretPolicy};
 use serde_json::Value;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 
 pub(super) const CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 
@@ -68,10 +68,12 @@ impl CodexRoute {
         match self {
             Self::Direct => push_override(&mut args, "openai_base_url", quote(CHATGPT_BASE_URL)?),
             Self::Responses(binding) => {
+                let model_catalog_url = models_catalog_url(&binding.provider_base_url);
                 let mut provider = format!(
-                    "{{ name = {}, base_url = {}, wire_api = \"responses\", requires_openai_auth = false",
+                    "{{ name = {}, base_url = {}, model_catalog_url = {}, wire_api = \"responses\", requires_openai_auth = false",
                     quote(&binding.name)?,
                     quote(&binding.provider_base_url)?,
+                    quote(&model_catalog_url)?,
                 );
                 if let Some(name) = &binding.client_key_env_name {
                     provider.push_str(&format!(", env_key = {}", quote(name)?));
@@ -97,6 +99,7 @@ impl CodexRoute {
         variables: &[(OsString, OsString)],
         diagnostic_secrets: &mut Vec<String>,
         metadata_secrets: &mut Vec<String>,
+        required: bool,
     ) -> Result<()> {
         let Self::Responses(binding) = self else {
             return Ok(());
@@ -106,29 +109,34 @@ impl CodexRoute {
         };
         let matches: Vec<_> = variables
             .iter()
-            .filter(|(key, _)| {
-                key.to_str().is_some_and(|key| {
-                    if cfg!(windows) {
-                        key.eq_ignore_ascii_case(name)
-                    } else {
-                        key == name
-                    }
-                })
-            })
+            .filter(|(key, _)| env_name_matches(key, name))
             .collect();
-        if matches.len() != 1 {
+        let mut captured = 0;
+        for (_, value) in &matches {
+            if let Some(value) = value.to_str().filter(|value| !value.is_empty()) {
+                diagnostic_secrets.push(value.to_owned());
+                metadata_secrets.push(value.to_owned());
+                captured += 1;
+            }
+        }
+        if required && (matches.len() != 1 || captured != 1) {
             return Err(route_error(
-                "configured proxy client credential is unavailable or ambiguous",
+                "configured proxy client credential is unavailable, empty, or ambiguous",
             ));
         }
-        let value = matches[0]
-            .1
-            .to_str()
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| route_error("configured proxy client credential is unavailable"))?;
-        diagnostic_secrets.push(value.to_owned());
-        metadata_secrets.push(value.to_owned());
         Ok(())
+    }
+
+    /// Remove only the configured client-key variable from metadata readers.
+    /// The caller captures it into both secret policies before calling this.
+    pub(super) fn strip_client_key(&self, variables: &mut Vec<(OsString, OsString)>) {
+        let Self::Responses(binding) = self else {
+            return;
+        };
+        let Some(name) = &binding.client_key_env_name else {
+            return;
+        };
+        variables.retain(|(key, _)| !env_name_matches(key, name));
     }
 
     /// Check the flattened effective config returned by `config/read`.
@@ -164,9 +172,12 @@ impl CodexRoute {
                     Some(Value::String(name)) => binding.client_key_env_name.as_ref() == Some(name),
                     _ => false,
                 };
+                let expected_models_url = models_catalog_url(&binding.provider_base_url);
                 if provider.get("name").and_then(Value::as_str) != Some(binding.name.as_str())
                     || provider.get("base_url").and_then(Value::as_str)
                         != Some(binding.provider_base_url.as_str())
+                    || provider.get("model_catalog_url").and_then(Value::as_str)
+                        != Some(expected_models_url.as_str())
                     || provider.get("wire_api").and_then(Value::as_str) != Some("responses")
                     || provider
                         .get("requires_openai_auth")
@@ -220,9 +231,23 @@ impl CodexRoute {
     }
 }
 
+fn env_name_matches(actual: &OsStr, expected: &str) -> bool {
+    actual.to_str().is_some_and(|actual| {
+        if cfg!(windows) {
+            actual.eq_ignore_ascii_case(expected)
+        } else {
+            actual == expected
+        }
+    })
+}
+
 fn push_override(args: &mut Vec<OsString>, key: &str, value: String) {
     args.push(OsString::from("-c"));
     args.push(OsString::from(format!("{key}={value}")));
+}
+
+fn models_catalog_url(provider_base_url: &str) -> String {
+    format!("{}/models", provider_base_url.trim_end_matches('/'))
 }
 
 fn quote(value: &str) -> Result<String> {
@@ -257,6 +282,7 @@ mod tests {
         let mut provider = json!({
             "name":"corp_gateway",
             "base_url":"http://127.0.0.1:10300/v1",
+            "model_catalog_url":"http://127.0.0.1:10300/v1/models",
             "wire_api":"responses",
             "requires_openai_auth":false,
             "experimental_bearer_token":null,
@@ -323,6 +349,10 @@ mod tests {
         assert_eq!(provider_overrides.len(), 1);
         assert!(provider_overrides[0].contains("\"corp_gateway\" = { name = \"corp_gateway\""));
         assert!(provider_overrides[0].contains("wire_api = \"responses\""));
+        assert!(
+            provider_overrides[0]
+                .contains("model_catalog_url = \"http://127.0.0.1:10300/v1/models\"")
+        );
         assert!(provider_overrides[0].contains("requires_openai_auth = false"));
         assert!(provider_overrides[0].contains("env_key = \"LOCAL_CLIENT\""));
         assert_eq!(route.provider(), "corp_gateway");
@@ -339,7 +369,7 @@ mod tests {
         let mut diagnostic = Vec::new();
         let mut metadata = Vec::new();
         route
-            .capture_client_secret(&variables, &mut diagnostic, &mut metadata)
+            .capture_client_secret(&variables, &mut diagnostic, &mut metadata, false)
             .unwrap();
         assert_eq!(diagnostic, vec!["unusual-name-private-value".to_owned()]);
         assert_eq!(metadata, diagnostic);
@@ -354,11 +384,58 @@ mod tests {
         leaked["model_providers"]["corp_gateway"]["diagnostic"] =
             json!("unusual-name-private-value");
         assert!(route.verify_config(&leaked, &metadata).is_err());
+
+        let mut empty_diagnostic = Vec::new();
+        let mut empty_metadata = Vec::new();
+        route
+            .capture_client_secret(&[], &mut empty_diagnostic, &mut empty_metadata, false)
+            .unwrap();
+        assert!(empty_diagnostic.is_empty());
+        assert!(empty_metadata.is_empty());
         assert!(
             route
-                .capture_client_secret(&[], &mut Vec::new(), &mut Vec::new())
+                .capture_client_secret(&[], &mut Vec::new(), &mut Vec::new(), true)
                 .is_err()
         );
+        assert!(
+            route
+                .capture_client_secret(
+                    &[(OsString::from("LOCAL_CLIENT"), OsString::new())],
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                    true,
+                )
+                .is_err()
+        );
+        assert!(
+            route
+                .capture_client_secret(
+                    &[
+                        (OsString::from("LOCAL_CLIENT"), OsString::from("one")),
+                        (OsString::from("LOCAL_CLIENT"), OsString::from("two")),
+                    ],
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                    true,
+                )
+                .is_err()
+        );
+
+        let mut variables = vec![
+            (OsString::from("LOCAL_CLIENT"), secret),
+            (OsString::from("local_client"), OsString::from("case-alias")),
+            (OsString::from("OTHER_VALUE"), OsString::from("retained")),
+        ];
+        route.strip_client_key(&mut variables);
+        let expected = if cfg!(windows) {
+            vec![(OsString::from("OTHER_VALUE"), OsString::from("retained"))]
+        } else {
+            vec![
+                (OsString::from("local_client"), OsString::from("case-alias")),
+                (OsString::from("OTHER_VALUE"), OsString::from("retained")),
+            ]
+        };
+        assert_eq!(variables, expected);
     }
 
     #[test]
@@ -398,6 +475,10 @@ mod tests {
         for (field, value) in [
             ("name", json!("other")),
             ("wire_api", json!("chat")),
+            (
+                "model_catalog_url",
+                json!("https://foreign.example/catalog"),
+            ),
             ("requires_openai_auth", json!(true)),
             ("env_key", json!("UNADMITTED_CLIENT")),
         ] {

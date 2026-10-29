@@ -584,6 +584,7 @@ impl Router {
             let store = self.inner.store.lock().await;
             retained_launch_profile(&store, request)?
         } {
+            align_retained_workspace_alias(request, retained.workspace.as_ref());
             install_retained_profile(request, retained)?;
             return Ok(true);
         }
@@ -2990,6 +2991,46 @@ fn same_retained_workspace(requested: &str, stored: &str) -> bool {
     }
 }
 
+// Retained-ID hydration precedes normalize_launch. Resolve only mismatched
+// spellings of an existing workspace; the lexical fast path still works when
+// a previously admitted workspace has since been removed.
+fn align_retained_workspace_alias(request: &mut SubmitCommand, stored: Option<&Value>) {
+    let Some(stored) = stored.and_then(Value::as_str).map(str::to_owned) else {
+        return;
+    };
+    let Some(requested) = request
+        .args
+        .get("workspace")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    if same_retained_workspace(&requested, &stored) {
+        return;
+    }
+
+    let (Ok(requested_path), Ok(stored_path)) = (
+        std::fs::canonicalize(&requested),
+        std::fs::canonicalize(&stored),
+    ) else {
+        return;
+    };
+    let (Some(requested_path), Some(stored_path)) = (requested_path.to_str(), stored_path.to_str())
+    else {
+        return;
+    };
+    if !same_retained_workspace(requested_path, stored_path) {
+        return;
+    }
+
+    // normalize_launch stores the canonical path. Align an existing alias to
+    // that retained spelling so Store sees the original same-ID payload.
+    if let Some(args) = request.args.as_object_mut() {
+        args.insert("workspace".to_owned(), Value::String(stored));
+    }
+}
+
 fn reject_launch_derived_keys(args: &Value) -> Result<()> {
     let args = args
         .as_object()
@@ -3309,6 +3350,67 @@ mod tests {
             Arc::new(AsyncMutex::new(store)),
             Bus::new(16),
         )
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_launch_hydration_aligns_existing_8dot3_workspace_alias() {
+        let root = std::env::temp_dir().join(format!("eliot-retained-alias-{}", ulid::Ulid::new()));
+        let workspace = root.join("workspace with spaces");
+        std::fs::create_dir_all(&workspace).unwrap();
+        // cmd's %~sI asks Windows for the existing path's 8.3 spelling.
+        let short_path = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c"])
+            .arg(format!(
+                "for %I in (\"{}\") do @echo %~sI",
+                workspace.display()
+            ))
+            .output();
+        let Ok(short_path) = short_path else {
+            std::fs::remove_dir_all(&root).unwrap();
+            return;
+        };
+        if !short_path.status.success() {
+            std::fs::remove_dir_all(&root).unwrap();
+            return;
+        }
+        let requested = String::from_utf8_lossy(&short_path.stdout)
+            .trim()
+            .to_owned();
+        if requested.is_empty()
+            || !requested
+                .split(['\\', '/'])
+                .any(|component| component.contains('~'))
+        {
+            std::fs::remove_dir_all(&root).unwrap();
+            return;
+        }
+        if !std::path::Path::new(&requested).is_dir() {
+            std::fs::remove_dir_all(&root).unwrap();
+            return;
+        }
+        let stored = std::fs::canonicalize(&workspace)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+
+        if same_retained_workspace(&requested, &stored) {
+            std::fs::remove_dir_all(&root).unwrap();
+            return; // This Windows volume did not expose a distinct short spelling.
+        }
+
+        let mut request = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+        request.args = json!({"workspace":requested});
+        let retained_workspace = Value::String(stored.clone());
+        align_retained_workspace_alias(&mut request, Some(&retained_workspace));
+
+        assert_eq!(request.args["workspace"], stored);
+        assert!(same_retained_workspace(
+            request.args["workspace"].as_str().unwrap(),
+            &stored
+        ));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[tokio::test]
