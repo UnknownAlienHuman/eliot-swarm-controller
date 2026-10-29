@@ -32,6 +32,20 @@ fn rule_input(id: &str) -> RuleDefinitionInput {
     }
 }
 
+fn rule_input_with_action(id: &str, target: &str) -> RuleDefinitionInput {
+    let value = json!({
+        "id": id,
+        "enabled": true,
+        "action": {"verb": "stop", "target": target}
+    });
+    RuleDefinitionInput {
+        id: id.to_owned(),
+        canonical_definition: serde_json::to_string(&value).unwrap(),
+        definition_digest: canonical_json_sha256(&value).unwrap(),
+        enabled: true,
+    }
+}
+
 fn ensure_interval(
     store: &mut Store,
     id: &str,
@@ -57,6 +71,14 @@ fn ensure_interval(
             registration_ms,
         )
         .unwrap()
+}
+
+fn rule_revision(store: &Store, id: &str) -> i64 {
+    store
+        .get_rule_state("owner", id)
+        .unwrap()
+        .expect("timer rule state")
+        .revision
 }
 
 fn ready_agent(store: &mut Store, project: &str, now: i64) -> String {
@@ -283,10 +305,18 @@ fn manual_replay_precedes_current_gates_and_keeps_schedule_cursor() {
     let registration_ms = now_ms();
     let agent = ready_agent(&mut store, "timer-manual", registration_ms);
     let before = ensure_interval(&mut store, "manual-stop", registration_ms, 60_000);
+    let expected_rule_revision = rule_revision(&store, "manual-stop");
     let request = TimerRunRequest::new(Ulid::new().to_string(), "manual-stop");
     let action = stop_request(&agent);
     let first = store
-        .admit_manual_timer_run("owner", &request, &before, action, registration_ms)
+        .admit_manual_timer_run(
+            "owner",
+            &request,
+            &before,
+            expected_rule_revision,
+            action,
+            registration_ms,
+        )
         .unwrap();
     assert!(first.is_new);
     assert_eq!(first.parent.as_ref().unwrap().id, request.id);
@@ -309,6 +339,128 @@ fn manual_replay_precedes_current_gates_and_keeps_schedule_cursor() {
         .unwrap();
     assert_eq!(after.last_key, before.last_key);
     assert_eq!(after.next_due_at, before.next_due_at);
+}
+
+#[test]
+fn manual_run_revision_fences_new_admission_but_not_retained_replay() {
+    let mut store = store();
+    let registration_ms = now_ms();
+    let old_agent = ready_agent(&mut store, "timer-revision-old", registration_ms);
+    let new_agent = ready_agent(&mut store, "timer-revision-new", registration_ms);
+    let rule_id = "revisioned-manual-stop";
+    let old_definition = rule_input_with_action(rule_id, &old_agent);
+    let old_rule_state = store
+        .ensure_rule_state("owner", &old_definition, registration_ms)
+        .unwrap();
+    let period_ms = 60_000;
+    let timer_definition = TimerDefinitionInput {
+        id: rule_id.to_owned(),
+        schedule_revision: 1,
+        schedule: TimerSchedule::Interval {
+            period_ms,
+            anchor: None,
+        },
+        enabled: true,
+        initial_next_due_at: Some(registration_ms + period_ms),
+    };
+    let before = store
+        .ensure_timer_state("owner", &timer_definition, registration_ms)
+        .unwrap();
+    let old_revision = old_rule_state.revision;
+
+    let new_definition = rule_input_with_action(rule_id, &new_agent);
+    let reconciled = store
+        .reconcile_rule_definitions(
+            "owner",
+            std::slice::from_ref(&new_definition),
+            std::slice::from_ref(&timer_definition),
+            registration_ms + 1,
+        )
+        .unwrap();
+    let new_revision = reconciled.value[0].view.revision;
+    assert_eq!(new_revision, old_revision + 1);
+    let after = store.get_timer_state("owner", rule_id).unwrap().unwrap();
+    assert_eq!(after, before);
+
+    let request = TimerRunRequest::new(Ulid::new().to_string(), rule_id);
+    let old_action = stop_request(&old_agent);
+    let command_count_before: i64 = store
+        .connection
+        .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+        .unwrap();
+    let high_water_before = store.high_water().unwrap();
+    assert_eq!(
+        store
+            .admit_manual_timer_run(
+                "owner",
+                &request,
+                &before,
+                old_revision,
+                old_action.clone(),
+                registration_ms + 2,
+            )
+            .unwrap_err()
+            .code,
+        "bad_state"
+    );
+    let request_rows: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM commands WHERE id = ?1 OR parent_command = ?1",
+            [&request.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(request_rows, 0);
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        command_count_before
+    );
+    assert_eq!(store.high_water().unwrap(), high_water_before);
+    assert_eq!(
+        store.get_timer_state("owner", rule_id).unwrap(),
+        Some(before.clone())
+    );
+    assert_eq!(
+        store.get_rule_state("owner", rule_id).unwrap(),
+        Some(reconciled.value[0].view.clone())
+    );
+
+    let new_action = stop_request(&new_agent);
+    let admitted = store
+        .admit_manual_timer_run(
+            "owner",
+            &request,
+            &after,
+            new_revision,
+            new_action,
+            registration_ms + 3,
+        )
+        .unwrap();
+    assert!(admitted.is_new);
+    let child = admitted.child.as_ref().expect("new action child");
+    assert_eq!(child.target.as_deref(), Some(new_agent.as_str()));
+    assert_eq!(admitted.state, before);
+
+    let high_water_after_admission = store.high_water().unwrap();
+    let replay = store
+        .admit_manual_timer_run(
+            "owner",
+            &request,
+            &before,
+            old_revision,
+            old_action,
+            registration_ms + 4,
+        )
+        .unwrap();
+    assert!(!replay.is_new);
+    assert_eq!(replay.parent.as_ref().unwrap().id, request.id);
+    assert_eq!(replay.child.as_ref().unwrap().id, child.id);
+    assert_eq!(store.high_water().unwrap(), high_water_after_admission);
 }
 
 #[test]
@@ -337,8 +489,16 @@ fn once_at_registration_allows_manual_run_without_consuming_schedule() {
 
     let request = TimerRunRequest::new(Ulid::new().to_string(), rule_id);
     let action = stop_request(&agent);
+    let expected_rule_revision = rule_revision(&store, rule_id);
     let first = store
-        .admit_manual_timer_run("owner", &request, &timer, action.clone(), registration_ms)
+        .admit_manual_timer_run(
+            "owner",
+            &request,
+            &timer,
+            expected_rule_revision,
+            action.clone(),
+            registration_ms,
+        )
         .unwrap();
     assert!(first.is_new);
     assert_eq!(first.parent.as_ref().unwrap().id, request.id);
@@ -360,7 +520,14 @@ fn once_at_registration_allows_manual_run_without_consuming_schedule() {
         )
         .unwrap();
     let replay = store
-        .admit_manual_timer_run("owner", &request, &timer, action, registration_ms + 1)
+        .admit_manual_timer_run(
+            "owner",
+            &request,
+            &timer,
+            expected_rule_revision,
+            action,
+            registration_ms + 1,
+        )
         .unwrap();
     assert!(!replay.is_new);
     assert_eq!(replay.parent.as_ref().unwrap().id, request.id);

@@ -234,7 +234,7 @@ pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<StopActio
     if event
         .cause
         .as_ref()
-        .is_some_and(|cause| cause.depth > MAX_RULE_CAUSE_DEPTH)
+        .is_some_and(|cause| cause.depth >= MAX_RULE_CAUSE_DEPTH)
     {
         return Ok(None);
     }
@@ -861,18 +861,26 @@ do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${eve
     }
 
     #[test]
-    fn rule_cause_depth_above_five_skips_without_firing() {
+    fn depth_five_suppression_precedes_placeholder_validation() {
+        let missing_template =
+            RULE.replace("target = '${event.agent}'", "target = '${data.missing}'");
+        let rule = load(Cursor::new(missing_template)).unwrap().remove(0);
+        let mut exhausted_event = event();
+        exhausted_event.cause = Some(eliot_core::EventCause {
+            command_id: "stop-child".to_owned(),
+            rule: Some(rule.id.clone()),
+            depth: 5,
+        });
+        assert_eq!(evaluate(&rule, &exhausted_event).unwrap(), None);
+
         let rule = load(Cursor::new(RULE)).unwrap().remove(0);
         let mut event = event();
         event.cause = Some(eliot_core::EventCause {
-            command_id: "stop-child".to_owned(),
-            rule: Some(rule.id.clone()),
-            depth: 6,
+            command_id: "prior-command".to_owned(),
+            rule: Some("prior-rule".to_owned()),
+            depth: 4,
         });
-        assert_eq!(evaluate(&rule, &event).unwrap(), None);
-
-        event.cause.as_mut().unwrap().depth = 5;
-        assert!(evaluate(&rule, &event).unwrap().is_some());
+        assert_eq!(evaluate(&rule, &event).unwrap().unwrap().target, "a7");
     }
 
     #[test]

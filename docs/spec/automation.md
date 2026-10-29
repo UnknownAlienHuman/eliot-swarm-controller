@@ -133,10 +133,14 @@ child. A new manual run obeys those gates and does not change scheduled `last_ke
 `next_due_at`. Its external ULID remains the parent command ID and never becomes a
 scheduled `last_key`.
 
-Restart resumes unchanged schedules. The schedule-edit semantics above remain the
-target contract; startup changes to an existing schedule are rejected as unsupported in
-this slice. Schedule replacement and hot reload remain future work. The canonical timer
-wire types are in [Core `timers.rs`](../../crates/eliot-core/src/api/timers.rs).
+Restart resumes persisted schedules and retirement progress. A trigger, interval anchor,
+period, timezone or `catch_up` edit increments `schedule_revision` and selects the first
+slot strictly after the captured edit sample, preserving explicit interval phase without
+pre-edit debt. An action-only edit preserves `schedule_revision`, anchor, `last_key` and
+`next_due_at`; admitted commands keep their frozen inputs. Use the same one-current,
+one-retiring handoff above and defer a second semantic edit until retirement completes.
+An unknown or otherwise open timer action child blocks the next firing. The canonical
+timer wire types are in [Core `timers.rs`](../../crates/eliot-core/src/api/timers.rs).
 
 ## Connected event rules
 

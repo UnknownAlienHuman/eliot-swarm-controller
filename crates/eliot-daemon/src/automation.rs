@@ -77,7 +77,18 @@ pub(crate) async fn initialize_global_rules(
         Err(error) => return Err(error),
     };
     match apply_global_rule_snapshot(router, &snapshot, None, registration_now).await {
-        Ok(rules) => Ok(rules),
+        Ok(rules) => {
+            let active_definitions = rules
+                .iter()
+                .map(|rule| rule.definition.clone())
+                .collect::<Vec<_>>();
+            if rules.iter().any(|rule| rule.retiring.is_some())
+                && !snapshot.matches(&active_definitions)?
+            {
+                logging::record(policy, "daemon.rule_reload_deferred", &[], None);
+            }
+            Ok(rules)
+        }
         Err(error)
             if !prior.is_empty()
                 && matches!(
@@ -109,12 +120,11 @@ async fn apply_global_rule_snapshot(
         .initialize_global_rules(&effective.inputs, &timers, registration_now)
         .await?;
     let active = active_rules(router, states, previous, registration_now).await?;
-    router.install_global_rule_definitions(
-        &active
-            .iter()
-            .map(|rule| rule.definition.clone())
-            .collect::<Vec<_>>(),
-    );
+    let cached = active
+        .iter()
+        .map(|rule| (rule.state.revision, rule.definition.clone()))
+        .collect::<Vec<_>>();
+    router.install_global_rule_definitions(&cached);
     Ok(active)
 }
 

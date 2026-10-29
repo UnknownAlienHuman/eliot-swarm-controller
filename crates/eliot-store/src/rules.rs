@@ -179,10 +179,7 @@ impl<'a> RuleFiringKey<'a> {
     }
 
     fn command_cause(&self, command_id: &str) -> Result<core::EventCause> {
-        let depth = self
-            .trigger_cause
-            .as_ref()
-            .map_or(1, |cause| cause.depth.saturating_add(1));
+        let depth = next_rule_cause_depth(self.trigger_cause.as_ref());
         if depth > 5 {
             return Err(Error::new(
                 "bad_state",
@@ -215,6 +212,10 @@ impl<'a> RuleFiringKey<'a> {
             RuleFiringIdentity::Manual => parent.id == self.parent_id,
         }
     }
+}
+
+fn next_rule_cause_depth(trigger_cause: Option<&core::EventCause>) -> u8 {
+    trigger_cause.map_or(1, |cause| cause.depth.saturating_add(1))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -485,20 +486,14 @@ impl Store {
                     if code.trim().is_empty() || code.len() > 128 {
                         return Err(Error::new("invalid", "rule rejection code is invalid"));
                     }
-                    let trigger: Option<(String, Option<String>)> = tx
-                        .query_row(
-                            "SELECT kind, cause FROM events WHERE seq = ?1",
-                            [through],
-                            |row| Ok((row.get(0)?, row.get(1)?)),
-                        )
-                        .optional()
-                        .map_err(sql_error)?;
-                    let (kind, encoded_cause) = trigger.ok_or_else(|| {
-                        Error::new("not_found", "rejected rule event was not found")
-                    })?;
+                    let trigger = load_rule_trigger(&tx, through)?;
                     // A malformed rule-triggered bookkeeping event is consumed
                     // silently so a rule cannot generate an endless rejection chain.
-                    if !kind.starts_with("rule.") {
+                    // Also suppress a would-be sixth-level derivative before
+                    // writing the rejection marker; the cursor still commits below.
+                    if !trigger.kind.starts_with("rule.")
+                        && next_rule_cause_depth(trigger.cause.as_ref()) <= 5
+                    {
                         events.push(insert_rule_event_with_cause(
                             &tx,
                             now,
@@ -510,7 +505,7 @@ impl Store {
                                 "through_seq": through,
                                 "code": code,
                             }),
-                            decode_event_cause(encoded_cause.as_deref(), None),
+                            trigger.cause,
                         )?);
                     }
                 }
@@ -736,10 +731,7 @@ impl Store {
             ));
         }
 
-        let depth = trigger
-            .cause
-            .as_ref()
-            .map_or(1, |cause| cause.depth.saturating_add(1));
+        let depth = next_rule_cause_depth(trigger.cause.as_ref());
         if depth > 5 {
             let view = update_rule_cursor_tx(&tx, principal, &stored.view, event_seq, now)?;
             commit_transaction(tx, &self.write_faulted)?;
@@ -1094,11 +1086,19 @@ impl Store {
         principal: &str,
         request: &core::api::TimerRunRequest,
         state: &core::api::TimerStateView,
+        expected_rule_revision: i64,
         action: SubmitCommand,
         now: i64,
     ) -> Result<TimerSlotAdmission> {
         self.ensure_writer_healthy()?;
-        let result = self.admit_manual_timer_run_inner(principal, request, state, action, now);
+        let result = self.admit_manual_timer_run_inner(
+            principal,
+            request,
+            state,
+            expected_rule_revision,
+            action,
+            now,
+        );
         self.fault_on_persistence_error(&result);
         result
     }
@@ -1108,13 +1108,13 @@ impl Store {
         principal: &str,
         request: &core::api::TimerRunRequest,
         state: &core::api::TimerStateView,
+        expected_rule_revision: i64,
         action: SubmitCommand,
         now: i64,
     ) -> Result<TimerSlotAdmission> {
         require_nonempty(principal, "principal")?;
         request.validate()?;
         validate_ulid(&request.id)?;
-        state.validate()?;
         let digest = timer_run_digest(request)?;
         let tx = self
             .connection
@@ -1131,6 +1131,15 @@ impl Store {
                 blocked: false,
             });
         }
+        let rule = load_rule_state(&tx, principal, &request.rule)?
+            .ok_or_else(|| Error::new("not_found", "timer rule was not found"))?;
+        if rule.view.revision != expected_rule_revision {
+            return Err(Error::new(
+                "bad_state",
+                "timer rule definition changed before manual run admission",
+            ));
+        }
+        state.validate()?;
         if write_exists(&tx, &request.id)? {
             return Err(Error::new(
                 "id_conflict",
@@ -1147,8 +1156,6 @@ impl Store {
                 "timer state does not match the request",
             ));
         }
-        let rule = load_rule_state(&tx, principal, &request.rule)?
-            .ok_or_else(|| Error::new("not_found", "timer rule was not found"))?;
         let timer = load_timer_state(&tx, principal, &request.rule)?
             .ok_or_else(|| Error::new("not_found", "timer state was not found"))?;
         if timer.view != *state || !timer.view.enabled || !rule.view.enabled {
@@ -2181,13 +2188,14 @@ fn derived_manual_timer_id(principal: &str, rule: &str, mutation_id: &str) -> Re
 
 fn load_rule_trigger(tx: &Transaction<'_>, event_seq: i64) -> Result<StoredRuleTrigger> {
     tx.query_row(
-        "SELECT agent, generation, cause FROM events WHERE seq = ?1",
+        "SELECT kind, agent, generation, cause FROM events WHERE seq = ?1",
         [event_seq],
         |row| {
             Ok(StoredRuleTrigger {
-                agent: row.get(0)?,
-                generation: row.get(1)?,
-                encoded_cause: row.get(2)?,
+                kind: row.get(0)?,
+                agent: row.get(1)?,
+                generation: row.get(2)?,
+                encoded_cause: row.get(3)?,
                 cause: None,
             })
         },
@@ -2202,6 +2210,7 @@ fn load_rule_trigger(tx: &Transaction<'_>, event_seq: i64) -> Result<StoredRuleT
 }
 
 struct StoredRuleTrigger {
+    kind: String,
     agent: Option<i64>,
     generation: Option<i64>,
     encoded_cause: Option<String>,
@@ -2817,6 +2826,107 @@ mod tests {
         assert!(suppressed.child.is_none());
         assert!(suppressed.events.is_empty());
         assert_eq!(store.high_water().unwrap(), event_seq);
+    }
+
+    #[test]
+    fn rejected_cursor_suppresses_sixth_depth_and_rule_marker_quiesces() {
+        let mut store = store();
+        let (agent, _) = insert_test_agent(&mut store);
+        let state_five = store
+            .ensure_rule_state("owner", &definition("r5", true), 1)
+            .unwrap();
+        let cause_five = core::EventCause {
+            command_id: Ulid::new().to_string(),
+            rule: Some("upstream".to_owned()),
+            depth: 5,
+        };
+        let event_five =
+            insert_test_turn_completed_with_cause(&mut store, agent, 2, Some(cause_five));
+        let events_before = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        let commands_before = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+
+        let suppressed = store
+            .advance_rule_cursor(
+                "owner",
+                &state_five,
+                event_five,
+                RuleCursorOutcome::Rejected {
+                    code: "render_error".to_owned(),
+                },
+                3,
+            )
+            .unwrap();
+        assert_eq!(suppressed.value.current_cursor, event_five);
+        assert!(suppressed.events.is_empty());
+        assert_eq!(store.high_water().unwrap(), event_five);
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM events", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            events_before
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM commands", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            commands_before
+        );
+
+        let state_four = store
+            .ensure_rule_state("owner", &definition("r4", true), 4)
+            .unwrap();
+        let cause_four = core::EventCause {
+            command_id: Ulid::new().to_string(),
+            rule: Some("upstream".to_owned()),
+            depth: 4,
+        };
+        let event_four =
+            insert_test_turn_completed_with_cause(&mut store, agent, 5, Some(cause_four.clone()));
+        let rejected = store
+            .advance_rule_cursor(
+                "owner",
+                &state_four,
+                event_four,
+                RuleCursorOutcome::Rejected {
+                    code: "render_error".to_owned(),
+                },
+                6,
+            )
+            .unwrap();
+        assert_eq!(rejected.value.current_cursor, event_four);
+        assert_eq!(rejected.events.len(), 1);
+        assert_eq!(rejected.events[0].kind, "rule.rejected");
+        assert_eq!(rejected.events[0].cause, Some(cause_four));
+
+        let marker_seq = rejected.events[0].seq;
+        let marker = store
+            .advance_rule_cursor(
+                "owner",
+                &rejected.value,
+                marker_seq,
+                RuleCursorOutcome::Rejected {
+                    code: "render_error".to_owned(),
+                },
+                7,
+            )
+            .unwrap();
+        assert_eq!(marker.value.current_cursor, marker_seq);
+        assert!(marker.events.is_empty());
+        assert_eq!(store.high_water().unwrap(), marker_seq);
     }
 
     #[test]

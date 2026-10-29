@@ -73,7 +73,7 @@ struct RouterInner {
     agent_credentials: AgentCredentials,
     unknown_commands: UnknownCommands,
     unknown_causes: Mutex<HashMap<String, String>>,
-    global_rule_definitions: Mutex<HashMap<String, RuleDefinition>>,
+    global_rule_definitions: Mutex<HashMap<String, (i64, RuleDefinition)>>,
     plugin_host: PluginHost,
     monitoring: Monitoring,
     workspaces: WorkspaceManager,
@@ -830,7 +830,7 @@ impl Router {
         if !self.rule_firings_open() {
             return Err(Error::new("unavailable", "automation is draining"));
         }
-        let definition = self
+        let (expected_rule_revision, definition) = self
             .global_rule_definition(&request.rule)
             .ok_or_else(|| Error::new("not_found", "timer rule was not found"))?;
         if definition.schedule().is_none() {
@@ -874,7 +874,7 @@ impl Router {
             }
         };
         let Some(admission) = self
-            .admit_manual_timer_run(&request, &timer, prepared)
+            .admit_manual_timer_run(&request, &timer, expected_rule_revision, prepared)
             .await?
         else {
             if let Some(parent) = self.replay_timer_run(&request).await? {
@@ -910,6 +910,7 @@ impl Router {
         &self,
         request: &TimerRunRequest,
         state: &TimerStateView,
+        expected_rule_revision: i64,
         prepared: PreparedSubmission,
     ) -> Result<Option<TimerSlotAdmission>> {
         let PreparedSubmission {
@@ -928,8 +929,14 @@ impl Router {
             if !replay && self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
                 return Ok(None);
             }
-            let admission =
-                store.admit_manual_timer_run("owner", request, state, action, now_ms())?;
+            let admission = store.admit_manual_timer_run(
+                "owner",
+                request,
+                state,
+                expected_rule_revision,
+                action,
+                now_ms(),
+            )?;
             self.publish_locked(&admission.events);
             admission
         };
@@ -945,18 +952,15 @@ impl Router {
         Ok(Some(admission))
     }
 
-    pub(crate) fn install_global_rule_definitions(&self, definitions: &[RuleDefinition]) {
+    pub(crate) fn install_global_rule_definitions(&self, definitions: &[(i64, RuleDefinition)]) {
         let mut stored = self.inner.global_rule_definitions.lock_recover();
         stored.clear();
-        stored.extend(
-            definitions
-                .iter()
-                .cloned()
-                .map(|definition| (definition.id.clone(), definition)),
-        );
+        stored.extend(definitions.iter().map(|(revision, definition)| {
+            (definition.id.clone(), (*revision, definition.clone()))
+        }));
     }
 
-    fn global_rule_definition(&self, id: &str) -> Option<RuleDefinition> {
+    fn global_rule_definition(&self, id: &str) -> Option<(i64, RuleDefinition)> {
         self.inner
             .global_rule_definitions
             .lock_recover()
