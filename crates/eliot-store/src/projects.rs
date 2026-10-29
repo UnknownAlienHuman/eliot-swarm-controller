@@ -275,6 +275,12 @@ fn project_binding_for_agent_tx(
     generation: i64,
     action: &str,
 ) -> Result<ProjectCommandBinding> {
+    if !is_supported_project_action(action) {
+        return Err(Error::new(
+            "unsupported",
+            "project action is not implemented",
+        ));
+    }
     if !registration
         .actions
         .iter()
@@ -383,6 +389,15 @@ fn normalize_registration(input: &ProjectRegistrationInput) -> Result<ProjectReg
     let mut actions = input.actions.clone();
     normalize_allowset(&mut profiles, "project profiles")?;
     normalize_allowset(&mut actions, "project actions")?;
+    if actions
+        .iter()
+        .any(|action| !is_supported_project_action(action))
+    {
+        return Err(Error::new(
+            "unsupported",
+            "project registration contains an unimplemented action",
+        ));
+    }
     let view = core::api::ProjectRegistrationView {
         id: input.id.clone(),
         checkout: input.checkout.clone(),
@@ -399,6 +414,10 @@ fn normalize_registration(input: &ProjectRegistrationInput) -> Result<ProjectReg
         profiles,
         actions,
     })
+}
+
+fn is_supported_project_action(action: &str) -> bool {
+    matches!(action, "stop" | "send")
 }
 
 fn normalize_allowset(values: &mut [String], name: &str) -> Result<()> {

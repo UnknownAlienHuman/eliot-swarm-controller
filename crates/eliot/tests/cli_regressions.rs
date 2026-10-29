@@ -2153,6 +2153,68 @@ fn fault_dispatches(events: &[Value], id: &str) -> usize {
         .count()
 }
 
+fn wait_fake_send_turn_result(
+    fixture: &Fixture,
+    agent: &str,
+    generation: i64,
+    command: &CoreCommand,
+    expected_text: &str,
+) -> CoreTurn {
+    assert_eq!(command.verb, "send");
+    assert_eq!(command.target.as_deref(), Some(agent));
+    assert_eq!(command.expected_generation, Some(generation));
+    assert_eq!(command.generation, Some(generation));
+    let turn_id = command
+        .turn_id
+        .as_deref()
+        .expect("SEND child retains its exact turn ID");
+    let request = AgentResultRequest {
+        id: agent.to_owned(),
+        generation: Some(generation),
+        turn_id: Some(turn_id.to_owned()),
+        limit: 1,
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let events = fixture.events();
+        let terminal = events.iter().find(|event| {
+            event["kind"] == "turn.completed"
+                && event["agent"] == agent
+                && event["generation"] == generation
+                && event["data"]["command_id"] == command.id
+                && event["data"]["turn_id"] == turn_id
+        });
+        if terminal.is_some() {
+            let response: AgentResultResponse = serde_json::from_value(fixture.json(&[
+                "result",
+                agent,
+                "--generation",
+                &generation.to_string(),
+                "--turn-id",
+                turn_id,
+                "--limit",
+                "1",
+            ]))
+            .expect("typed exact SEND result");
+            request
+                .validate_response(&response)
+                .expect("SEND result remains bound to its command turn");
+            let [turn] = response.turns.as_slice() else {
+                panic!("exact SEND result did not return one turn");
+            };
+            assert_eq!(turn.state, TurnState::Completed);
+            assert_eq!(turn.final_text.as_deref(), Some(expected_text));
+            return turn.clone();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "SEND command {} did not produce its exact terminal turn",
+            command.id
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 fn send_fake_handoff(fixture: &Fixture, agent: &str, generation: i64, id: &str) -> CoreTurn {
     let turn: CoreTurn = serde_json::from_value(fixture.json(&[
         "--id",
@@ -5359,6 +5421,540 @@ fn cli_project_rule_catchup_enforces_scope_limit_and_replays_same_id() {
 }
 
 #[test]
+fn cli_project_rule_send_turn_echo_self_suppression_and_scope() {
+    const SEND_TEXT: &str = "project-rule-echo";
+
+    let mut fixture = Fixture::new("project rule send");
+    assert!(
+        fixture
+            .git(&["init", "--initial-branch=main"])
+            .status
+            .success()
+    );
+    fs::write(
+        fixture.workspace.join("seed.txt"),
+        "project SEND baseline\n",
+    )
+    .expect("write project baseline");
+    assert!(fixture.git(&["add", "--", "seed.txt"]).status.success());
+    assert!(
+        fixture
+            .git(&["commit", "-m", "Project SEND fixture"])
+            .status
+            .success()
+    );
+
+    let other_project = fixture.root.join("other repo");
+    fs::create_dir(&other_project).expect("create second registered checkout");
+    let mut init_other = Command::new("git");
+    init_other
+        .current_dir(&other_project)
+        .args(["init", "--initial-branch=main", "--quiet"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        )
+        .env("GIT_TERMINAL_PROMPT", "0");
+    for (name, _) in std::env::vars_os() {
+        if name
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            init_other.env_remove(name);
+        }
+    }
+    assert!(
+        run(init_other).status.success(),
+        "initialize second checkout"
+    );
+
+    // Initialize the private data root before installing owner project config.
+    fixture.start();
+    fixture.stop(false);
+    let config = format!(
+        concat!(
+            "[projects.approved]\n",
+            "path = {:?}\nprofiles = [\"fake\"]\nactions = [\"send\"]\n\n",
+            "[projects.other]\n",
+            "path = {:?}\nprofiles = [\"fake\"]\nactions = [\"send\"]\n",
+        ),
+        fixture.workspace.to_string_lossy(),
+        other_project.to_string_lossy(),
+    );
+    fs::write(fixture.data.join("config.toml"), config).expect("write owner project registrations");
+    let approved_rules = fixture.workspace.join(".eliot").join("rules");
+    let other_rules = other_project.join(".eliot").join("rules");
+    fs::create_dir_all(&approved_rules).expect("create approved project rules");
+    fs::create_dir_all(&other_rules).expect("create other project rules");
+
+    fixture.start();
+    let base = fixture.git(&["rev-parse", "--verify", "HEAD"]);
+    assert!(base.status.success());
+    let base = base.stdout.trim();
+    let launch = fixture.json(&[
+        "launch",
+        "--profile",
+        "fake",
+        "--workspace",
+        fixture.workspace.to_str().unwrap(),
+        "--worktree",
+        "codex/project-send-approved",
+        "--base",
+        base,
+    ]);
+    let agent = launch["target"].as_str().expect("Fake Agent").to_owned();
+    let generation = launch["generation"].as_i64().expect("Fake generation");
+    let generation_arg = generation.to_string();
+    let after_seq = fixture
+        .events()
+        .last()
+        .and_then(|event| event["seq"].as_i64())
+        .unwrap_or(0);
+
+    let seed_id = ulid::Ulid::new().to_string();
+    let seed_turn: CoreTurn = serde_json::from_value(fixture.json(&[
+        "--id",
+        &seed_id,
+        "send",
+        &agent,
+        "--generation",
+        &generation_arg,
+        "--wait",
+        "--timeout-seconds",
+        "10",
+        "--",
+        "project-send-seed",
+    ]))
+    .expect("typed Fake seed turn");
+    assert_eq!(seed_turn.agent, agent);
+    assert_eq!(seed_turn.generation, generation);
+    assert_eq!(seed_turn.state, TurnState::Completed);
+    let seed_history = fixture.events();
+    let seed_event = seed_history
+        .iter()
+        .find(|event| {
+            event["kind"] == "turn.completed"
+                && event["agent"] == agent
+                && event["generation"] == generation
+                && event["data"]["command_id"] == seed_id
+        })
+        .expect("exact Fake seed completion event");
+    assert_eq!(seed_event["subject"]["harness"], "fake");
+    let through_seq = seed_event["seq"]
+        .as_i64()
+        .expect("seed completion sequence");
+    assert!(through_seq > after_seq);
+
+    let rule_source = |rule_id: &str, command_id: Option<&str>, text: &str| {
+        let command_match = command_id.map_or_else(String::new, |command_id| {
+            format!(", \"event.data.command_id\" = \"{command_id}\"")
+        });
+        format!(
+            concat!(
+                "[[rule]]\n",
+                "id = \"{id}\"\n",
+                "on = {{ event = \"turn.completed\", match = {{ ",
+                "\"subject.harness\" = \"fake\", \"event.agent\" = \"{agent}\"{command_match} }} }}\n",
+                "do = [{{ action = \"send\", target = \"${{event.agent}}\", ",
+                "expected_generation = \"${{event.generation}}\", text = \"{text}\" }}]\n",
+            ),
+            id = rule_id,
+            agent = agent,
+            command_match = command_match,
+            text = text,
+        )
+    };
+    fs::write(
+        approved_rules.join("reply.toml"),
+        rule_source("project-send-echo", None, SEND_TEXT),
+    )
+    .expect("write project SEND rule without allow_self override");
+    fs::write(
+        other_rules.join("foreign.toml"),
+        rule_source("foreign-send", Some(&seed_id), "foreign-send-must-not-run"),
+    )
+    .expect("write physical-scope denial rule");
+
+    let wait_rule = |id: &str, project: &str| -> RuleStateView {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let reply = cli(&fixture.data, &["rule", "show", id, "--project", project]);
+            if reply.status.success() {
+                let state: RuleStateView =
+                    serde_json::from_str(&reply.stdout).expect("typed project SEND rule");
+                assert_eq!(state.id, id);
+                assert_eq!(state.project.as_deref(), Some(project));
+                return state;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "project SEND rule load deadline; bounded stderr={:?}",
+                reply.stderr.chars().take(4096).collect::<String>()
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    };
+    let initial = wait_rule("project-send-echo", "approved");
+    wait_rule("foreign-send", "other");
+    assert!(initial.current_cursor >= through_seq);
+
+    let after_arg = after_seq.to_string();
+    let through_arg = through_seq.to_string();
+    let denied_id = ulid::Ulid::new().to_string();
+    let denied = cli(
+        &fixture.data,
+        &[
+            "--id",
+            &denied_id,
+            "rule",
+            "catch-up",
+            "foreign-send",
+            "--after",
+            &after_arg,
+            "--through",
+            &through_arg,
+            "--project",
+            "other",
+        ],
+    );
+    assert_eq!(
+        denied.status.code(),
+        Some(3),
+        "foreign-project SEND must be denied; bounded stdout={:?}; bounded stderr={:?}",
+        denied.stdout.chars().take(4096).collect::<String>(),
+        denied.stderr.chars().take(4096).collect::<String>()
+    );
+    assert!(denied.stderr.contains("not_allowed"));
+    let missing_denial = cli(&fixture.data, &["cmd", "show", &denied_id]);
+    assert_eq!(missing_denial.status.code(), Some(1));
+    assert!(missing_denial.stderr.contains("not_found"));
+    assert_ne!(fixture.json(&["show", &agent])["state"], "stopped");
+    assert_eq!(fault_dispatches(&fixture.events(), &denied_id), 0);
+
+    let catchup_id = ulid::Ulid::new().to_string();
+    let catchup_args = [
+        "--id",
+        catchup_id.as_str(),
+        "rule",
+        "catch-up",
+        "project-send-echo",
+        "--after",
+        after_arg.as_str(),
+        "--through",
+        through_arg.as_str(),
+        "--project",
+        "approved",
+    ];
+    let catchup_reply = cli(&fixture.data, &catchup_args);
+    assert!(
+        catchup_reply.status.success(),
+        "approved project SEND catch-up failed; bounded stdout={:?}; bounded stderr={:?}",
+        catchup_reply.stdout.chars().take(4096).collect::<String>(),
+        catchup_reply.stderr.chars().take(4096).collect::<String>()
+    );
+    let catchup: CoreCommand =
+        serde_json::from_str(&catchup_reply.stdout).expect("typed approved SEND catch-up parent");
+    let child_ids: Vec<String> =
+        serde_json::from_value(catchup.outcome.as_ref().unwrap()["children"].clone())
+            .expect("fixed project SEND child set");
+    assert_eq!(child_ids.len(), 1);
+    let child_id = child_ids[0].clone();
+    let child: CoreCommand = serde_json::from_value(fixture.wait_command(&child_id, "applied"))
+        .expect("typed ordinary Router SEND child");
+    assert_eq!(child.verb, "send");
+    assert_eq!(child.target.as_deref(), Some(agent.as_str()));
+    assert_eq!(child.expected_generation, Some(generation));
+    let turn_id = child
+        .turn_id
+        .clone()
+        .expect("SEND child retains its exact turn");
+    assert_eq!(child.generation, Some(generation));
+
+    let result_request = AgentResultRequest {
+        id: agent.clone(),
+        generation: Some(generation),
+        turn_id: Some(turn_id.clone()),
+        limit: 1,
+    };
+    let result: AgentResultResponse = serde_json::from_value(fixture.json(&[
+        "result",
+        &agent,
+        "--generation",
+        &generation_arg,
+        "--turn-id",
+        &turn_id,
+        "--limit",
+        "1",
+    ]))
+    .expect("typed exact SEND turn result");
+    result_request
+        .validate_response(&result)
+        .expect("SEND child and result are bound to the exact turn");
+    assert_eq!(result.turns.len(), 1);
+    let turn = &result.turns[0];
+    assert_eq!(turn.turn_id, turn_id);
+    assert_eq!(turn.agent, agent);
+    assert_eq!(turn.generation, generation);
+    assert_eq!(turn.state, TurnState::Completed);
+    assert_eq!(turn.final_text.as_deref(), Some(SEND_TEXT));
+
+    let progress_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let (own_terminal_seq, events_after_self) = loop {
+        let events = fixture.events();
+        let own_terminal = events.iter().find(|event| {
+            event["kind"] == "turn.completed"
+                && event["agent"] == agent
+                && event["generation"] == generation
+                && event["data"]["command_id"] == child_id
+                && event["data"]["turn_id"] == turn_id
+        });
+        if let Some(own_terminal) = own_terminal {
+            let terminal_seq = own_terminal["seq"]
+                .as_i64()
+                .expect("rule SEND terminal seq");
+            let reply = cli(
+                &fixture.data,
+                &["rule", "show", "project-send-echo", "--project", "approved"],
+            );
+            if reply.status.success() {
+                let state: RuleStateView =
+                    serde_json::from_str(&reply.stdout).expect("typed project rule cursor");
+                if state.current_cursor >= terminal_seq {
+                    break (terminal_seq, events);
+                }
+            }
+        }
+        assert!(
+            std::time::Instant::now() < progress_deadline,
+            "project rule did not scan its own SEND terminal event"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    let fires: Vec<_> = events_after_self
+        .iter()
+        .filter(|event| {
+            event["kind"] == "rule.fired"
+                && event["data"]["rule"] == "project-send-echo"
+                && event["data"]["project"] == "approved"
+        })
+        .collect();
+    assert_eq!(
+        fires.len(),
+        1,
+        "default allow_self suppressed send feedback"
+    );
+    assert_eq!(fires[0]["data"]["event_seq"], through_seq);
+    assert_eq!(fires[0]["data"]["child_command"], child_id);
+    assert!(!events_after_self.iter().any(|event| {
+        event["kind"] == "rule.rejected"
+            && event["data"]["rule"] == "project-send-echo"
+            && event["data"]["project"] == "approved"
+            && event["data"]["event_seq"] == own_terminal_seq
+    }));
+
+    let replay: CoreCommand = serde_json::from_value(fixture.json(&catchup_args))
+        .expect("same-ID project SEND catch-up replay");
+    assert_eq!(replay, catchup);
+    let after_replay = fixture.events();
+    assert_eq!(
+        after_replay
+            .iter()
+            .filter(|event| {
+                event["kind"] == "rule.fired"
+                    && event["data"]["rule"] == "project-send-echo"
+                    && event["data"]["project"] == "approved"
+            })
+            .count(),
+        1
+    );
+    assert_eq!(fault_dispatches(&after_replay, &child_id), 1);
+
+    let stop_id = ulid::Ulid::new().to_string();
+    let cleanup: CommandSubmitResponse = serde_json::from_value(fixture.json(&[
+        "--id",
+        &stop_id,
+        "stop",
+        &agent,
+        "--generation",
+        &generation_arg,
+    ]))
+    .expect("owner stop for completed project SEND Agent");
+    fixture.wait_command(&cleanup.command_id, "applied");
+    fixture.stop(false);
+}
+
+#[test]
+fn cli_fake_rule_send_unknown_after_dispatch_is_not_replayed() {
+    let mut fixture = Fixture::new("rule send unknown");
+    fixture.start();
+    fixture.stop(false);
+    let rules = fixture.data.join("rules");
+    fs::create_dir_all(&rules).expect("create global rule directory");
+    fixture.start();
+
+    let launch = fixture.json(&[
+        "launch",
+        "--profile",
+        "fake",
+        "--workspace",
+        fixture.workspace.to_str().unwrap(),
+    ]);
+    let agent = launch["target"].as_str().expect("Fake Agent").to_owned();
+    let generation = launch["generation"].as_i64().expect("Fake generation");
+    let generation_arg = generation.to_string();
+    let after_seq = fixture
+        .events()
+        .last()
+        .and_then(|event| event["seq"].as_i64())
+        .unwrap_or(0);
+    let seed_id = ulid::Ulid::new().to_string();
+    let seed_text = "rule-unknown-seed";
+    let seed_turn: CoreTurn = serde_json::from_value(fixture.json(&[
+        "--id",
+        &seed_id,
+        "send",
+        &agent,
+        "--generation",
+        &generation_arg,
+        "--wait",
+        "--timeout-seconds",
+        "10",
+        "--",
+        seed_text,
+    ]))
+    .expect("typed Fake seed turn");
+    assert_eq!(seed_turn.agent, agent);
+    assert_eq!(seed_turn.generation, generation);
+    assert_eq!(seed_turn.state, TurnState::Completed);
+    let seed_event = fixture
+        .events()
+        .into_iter()
+        .find(|event| {
+            event["kind"] == "turn.completed"
+                && event["agent"] == agent
+                && event["generation"] == generation
+                && event["data"]["command_id"] == seed_id
+        })
+        .expect("exact Fake seed completion event");
+    let through_seq = seed_event["seq"]
+        .as_i64()
+        .expect("seed completion sequence");
+    assert!(through_seq > after_seq);
+
+    fs::write(
+        rules.join("unknown-send.toml"),
+        format!(
+            concat!(
+                "[[rule]]\n",
+                "id = \"unknown-send\"\n",
+                "on = {{ event = \"turn.completed\", match = {{ ",
+                "\"subject.harness\" = \"fake\", \"event.agent\" = \"{agent}\" }} }}\n",
+                "do = [{{ action = \"send\", target = \"${{event.agent}}\", ",
+                "expected_generation = \"${{event.generation}}\", ",
+                "text = \"[fake:malformed-after-dispatch]\" }}]\n",
+            ),
+            agent = agent,
+        ),
+    )
+    .expect("write rule using the existing Fake uncertain-after-dispatch input");
+
+    let load_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let reply = cli(&fixture.data, &["rule", "show", "unknown-send"]);
+        if reply.status.success() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < load_deadline,
+            "unknown-send rule load deadline; bounded stderr={:?}",
+            reply.stderr.chars().take(4096).collect::<String>()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let after_arg = after_seq.to_string();
+    let through_arg = through_seq.to_string();
+    let catchup_id = ulid::Ulid::new().to_string();
+    let catchup_args = [
+        "--id",
+        catchup_id.as_str(),
+        "rule",
+        "catch-up",
+        "unknown-send",
+        "--after",
+        after_arg.as_str(),
+        "--through",
+        through_arg.as_str(),
+    ];
+    let catchup_reply = cli(&fixture.data, &catchup_args);
+    assert!(
+        catchup_reply.status.success(),
+        "Fake unknown catch-up failed; bounded stdout={:?}; bounded stderr={:?}",
+        catchup_reply.stdout.chars().take(4096).collect::<String>(),
+        catchup_reply.stderr.chars().take(4096).collect::<String>()
+    );
+    let catchup: CoreCommand =
+        serde_json::from_str(&catchup_reply.stdout).expect("typed unknown-send catch-up parent");
+    let child_ids: Vec<String> =
+        serde_json::from_value(catchup.outcome.as_ref().unwrap()["children"].clone())
+            .expect("fixed unknown-send child set");
+    assert_eq!(child_ids.len(), 1);
+    let child_id = child_ids[0].clone();
+
+    let unknown_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let unknown: CoreCommand = loop {
+        let reply = cli(&fixture.data, &["cmd", "show", &child_id]);
+        if reply.status.success() {
+            let command: CoreCommand =
+                serde_json::from_str(&reply.stdout).expect("typed Fake child readback");
+            if command.state == CommandState::Unknown {
+                break command;
+            }
+            assert!(matches!(
+                command.state,
+                CommandState::Accepted | CommandState::Queued | CommandState::Dispatched
+            ));
+        }
+        assert!(
+            std::time::Instant::now() < unknown_deadline,
+            "Fake child did not settle to Unknown; bounded stderr={:?}",
+            reply.stderr.chars().take(4096).collect::<String>()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(unknown.id, child_id);
+    assert_eq!(unknown.target.as_deref(), Some(agent.as_str()));
+    assert_eq!(unknown.expected_generation, Some(generation));
+    assert_eq!(unknown.turn_id, None);
+    assert_eq!(fault_dispatches(&fixture.events(), &child_id), 1);
+
+    let replay: CoreCommand = serde_json::from_value(fixture.json(&catchup_args))
+        .expect("same-ID Unknown catch-up replay");
+    assert_eq!(replay, catchup);
+    let unknown_after_replay: CoreCommand =
+        serde_json::from_value(fixture.json(&["cmd", "show", &child_id]))
+            .expect("retained Unknown child after replay");
+    assert_eq!(unknown_after_replay, unknown);
+    let events_after_replay = fixture.events();
+    assert_eq!(fault_dispatches(&events_after_replay, &child_id), 1);
+    assert_eq!(
+        events_after_replay
+            .iter()
+            .filter(|event| {
+                event["kind"] == "rule.fired"
+                    && event["data"]["rule"] == "unknown-send"
+                    && event["data"]["parent_command"] == catchup_id
+            })
+            .count(),
+        1,
+        "same-ID Unknown replay did not repeat its firing"
+    );
+    fixture.stop(true);
+}
+
+#[test]
 fn cli_fake_history_catchup_dispatches_siblings_in_order_and_replays() {
     let mut fixture = Fixture::new("ordered rule catch-up");
     fixture.start();
@@ -5585,5 +6181,165 @@ fn cli_fake_history_catchup_dispatches_siblings_in_order_and_replays() {
     for child_id in &child_ids {
         assert_eq!(fault_dispatches(&after_replay, child_id), 1);
     }
+    fixture.stop(false);
+}
+
+#[test]
+fn cli_fake_timer_send_scheduled_and_manual_replay_keep_exact_turns() {
+    const SEND_TEXT: &str = "timer-send-echo";
+
+    let mut fixture = Fixture::new("timer send");
+    fixture.start();
+    fixture.stop(false);
+    let rules = fixture.data.join("rules");
+    fs::create_dir_all(&rules).expect("create timer rule directory");
+    fixture.start();
+
+    let launch = fixture.json(&[
+        "launch",
+        "--profile",
+        "fake",
+        "--workspace",
+        fixture.workspace.to_str().unwrap(),
+    ]);
+    let agent = launch["target"].as_str().expect("Fake Agent").to_owned();
+    let generation = launch["generation"].as_i64().expect("Fake generation");
+    let generation_arg = generation.to_string();
+
+    let period_ms = 60_000_i64;
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is after the Unix epoch")
+            .as_millis(),
+    )
+    .expect("epoch milliseconds fit signed range");
+    let anchor_ms = now_ms - period_ms + 12_000;
+    let rule_id = "periodic-send";
+    let rule_source = format!(
+        concat!(
+            "[[rule]]\n",
+            "id = \"{id}\"\n",
+            "on = {{ every = \"1m\", anchor = {anchor} }}\n",
+            "do = [{{ action = \"send\", target = \"{agent}\", ",
+            "expected_generation = {generation}, text = \"{text}\" }}]\n",
+        ),
+        id = rule_id,
+        anchor = anchor_ms,
+        agent = agent,
+        generation = generation,
+        text = SEND_TEXT,
+    );
+    fs::write(rules.join("periodic-send.toml"), rule_source)
+        .expect("write literal timer SEND action");
+
+    let load_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let timer_before: TimerStateView = loop {
+        let reply = cli(&fixture.data, &["timer", "show", rule_id]);
+        if reply.status.success() {
+            break serde_json::from_str(&reply.stdout).expect("typed scheduled SEND timer");
+        }
+        assert!(
+            std::time::Instant::now() < load_deadline,
+            "timer SEND load deadline; bounded stderr={:?}",
+            reply.stderr.chars().take(4096).collect::<String>()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(timer_before.id, rule_id);
+    assert_eq!(
+        timer_before.schedule,
+        TimerSchedule::Interval {
+            period_ms,
+            anchor: Some(anchor_ms),
+        }
+    );
+    assert_eq!(timer_before.last_key, None);
+    let first_due = timer_before.next_due_at.expect("scheduled SEND next due");
+    assert!(first_due > now_ms);
+
+    let manual_id = ulid::Ulid::new().to_string();
+    let manual_args = ["--id", manual_id.as_str(), "timer", "run", rule_id];
+    let manual_parent: CoreCommand =
+        serde_json::from_value(fixture.json(&manual_args)).expect("typed manual SEND timer parent");
+    assert_eq!(manual_parent.id, manual_id);
+    assert_eq!(manual_parent.verb, "timer.run");
+    assert_eq!(manual_parent.args["rule"], rule_id);
+    let manual_children: Vec<String> =
+        serde_json::from_value(manual_parent.outcome.as_ref().unwrap()["children"].clone())
+            .expect("manual SEND fixed child set");
+    assert_eq!(manual_children.len(), 1);
+    let manual_child_id = manual_children[0].clone();
+    let manual_child: CoreCommand =
+        serde_json::from_value(fixture.wait_command(&manual_child_id, "applied"))
+            .expect("applied manual SEND child");
+    let manual_turn =
+        wait_fake_send_turn_result(&fixture, &agent, generation, &manual_child, SEND_TEXT);
+    let manual_turn_id = manual_turn.turn_id.clone();
+
+    let replay: CoreCommand = serde_json::from_value(fixture.json(&manual_args))
+        .expect("same-ID manual SEND timer replay");
+    assert_eq!(replay, manual_parent);
+    assert_eq!(fault_dispatches(&fixture.events(), &manual_child_id), 1);
+    let timer_after_manual: TimerStateView =
+        serde_json::from_value(fixture.json(&["timer", "show", rule_id]))
+            .expect("timer state after manual SEND");
+    assert_eq!(timer_after_manual.last_key, timer_before.last_key);
+    assert_eq!(timer_after_manual.next_due_at, timer_before.next_due_at);
+
+    let scheduled_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let (timer_after_slot, scheduled_event) = loop {
+        let timer: TimerStateView =
+            serde_json::from_value(fixture.json(&["timer", "show", rule_id]))
+                .expect("scheduled SEND timer progress");
+        let event = fixture.events().into_iter().find(|event| {
+            event["kind"] == "rule.fired"
+                && event["data"]["rule"] == rule_id
+                && event["data"]["schedule_revision"] == timer.schedule_revision
+        });
+        if let (Some(_last_key), Some(event)) = (timer.last_key, event) {
+            break (timer, event);
+        }
+        assert!(
+            std::time::Instant::now() < scheduled_deadline,
+            "scheduled SEND slot deadline; first_due={first_due}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    let scheduled_at = scheduled_event["data"]["scheduled_at_ms"]
+        .as_i64()
+        .expect("scheduled SEND UTC slot");
+    assert_eq!(timer_after_slot.last_key, Some(scheduled_at));
+    assert!(
+        timer_after_slot
+            .next_due_at
+            .is_some_and(|next| next > scheduled_at)
+    );
+    let scheduled_child_id = scheduled_event["data"]["child_command"]
+        .as_str()
+        .expect("scheduled SEND child ID")
+        .to_owned();
+    assert_ne!(scheduled_child_id, manual_child_id);
+    let scheduled_child: CoreCommand =
+        serde_json::from_value(fixture.wait_command(&scheduled_child_id, "applied"))
+            .expect("applied scheduled SEND child");
+    let scheduled_turn =
+        wait_fake_send_turn_result(&fixture, &agent, generation, &scheduled_child, SEND_TEXT);
+    assert_ne!(scheduled_turn.turn_id, manual_turn_id);
+
+    let events = fixture.events();
+    assert_eq!(fault_dispatches(&events, &manual_child_id), 1);
+    assert_eq!(fault_dispatches(&events, &scheduled_child_id), 1);
+    let stop_id = ulid::Ulid::new().to_string();
+    let stop: CommandSubmitResponse = serde_json::from_value(fixture.json(&[
+        "--id",
+        &stop_id,
+        "stop",
+        &agent,
+        "--generation",
+        &generation_arg,
+    ]))
+    .expect("owner stop for completed timer SEND Agent");
+    fixture.wait_command(&stop.command_id, "applied");
     fixture.stop(false);
 }

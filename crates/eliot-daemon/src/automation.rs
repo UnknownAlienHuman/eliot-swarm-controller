@@ -6,7 +6,7 @@ pub(crate) use definition::RuleDefinition;
 
 use crate::{common::now_ms, logging, router::Router};
 use eliot_core::{
-    Error, Event, Result, SecretPolicy, SubmitCommand,
+    Error, Event, Result, SecretPolicy,
     api::{CatchUp, ProjectRegistrationView, RuleStateView, TimerSchedule, TimerStateView},
     canonical_json_sha256,
 };
@@ -1283,8 +1283,8 @@ async fn process_rule_cursor(
             if event.seq <= rule_cursor(rule, retiring).unwrap_or(through) {
                 continue;
             }
-            let stop = match definition::evaluate(&definition, &event) {
-                Ok(Some(stop)) => stop,
+            let action = match definition::evaluate(&definition, &event) {
+                Ok(Some(action)) => action,
                 Ok(None) => {
                     no_match_through = Some(event.seq);
                     continue;
@@ -1310,10 +1310,10 @@ async fn process_rule_cursor(
             let prepared_result = match rule.project.as_ref() {
                 Some(project) => {
                     router
-                        .prepare_project_rule_submission(stop_command(stop), project)
+                        .prepare_project_rule_submission(action, project)
                         .await
                 }
-                None => router.prepare_owner_submission(stop_command(stop)).await,
+                None => router.prepare_owner_submission(action).await,
             };
             let prepared = match prepared_result {
                 Ok(prepared) => prepared,
@@ -1332,7 +1332,7 @@ async fn process_rule_cursor(
                 Err(error) => return Err(error),
             };
             let Some(admission) = router
-                .admit_rule_stop(
+                .admit_rule_action(
                     &rule.principal,
                     rule.project.as_ref(),
                     &rule.state,
@@ -1485,16 +1485,13 @@ async fn reconcile_due_timers(router: &Router, rules: &mut [ActiveRule], now: i6
                         live_armed,
                     } => {
                         let prepared = match rule.definition.evaluate_timer() {
-                            Ok(stop) => match rule.project.as_ref() {
+                            Ok(action) => match rule.project.as_ref() {
                                 Some(project) => {
                                     router
-                                        .prepare_project_rule_submission(
-                                            stop_command(stop),
-                                            project,
-                                        )
+                                        .prepare_project_rule_submission(action, project)
                                         .await
                                 }
-                                None => router.prepare_owner_submission(stop_command(stop)).await,
+                                None => router.prepare_owner_submission(action).await,
                             },
                             Err(error) if deterministic_rejection(&error.code) => Err(error),
                             Err(error) => return Err(error),
@@ -1620,21 +1617,6 @@ fn timer_wake_delay(timer: &ActiveTimer, now: i64) -> Option<Duration> {
     ))
 }
 
-fn stop_command(stop: definition::StopAction) -> SubmitCommand {
-    // This unbound request ID is used only by Router preparation. The atomic
-    // Store rule admission assigns the deterministic rule/event child ID.
-    SubmitCommand {
-        id: String::new(),
-        target: Some(stop.target),
-        verb: "stop".to_owned(),
-        args: json!({}),
-        expected_generation: Some(stop.expected_generation),
-        expected_turn_id: None,
-        request_id: None,
-        probe: false,
-    }
-}
-
 pub(crate) async fn prepare_rule_catch_up_actions(
     router: &Router,
     definition: &RuleDefinition,
@@ -1643,8 +1625,8 @@ pub(crate) async fn prepare_rule_catch_up_actions(
 ) -> Result<Vec<eliot_store::RuleCatchUpAction>> {
     let mut rendered = Vec::new();
     for event in events {
-        if let Some(stop) = definition::evaluate(definition, event)? {
-            rendered.push((event.seq, stop_command(stop)));
+        if let Some(action) = definition::evaluate(definition, event)? {
+            rendered.push((event.seq, action));
         }
     }
     if let Some(project) = project {
@@ -1695,6 +1677,7 @@ fn deterministic_rejection(code: &str) -> bool {
 #[cfg(test)]
 mod timer_tests {
     use super::*;
+    use eliot_core::SubmitCommand;
 
     fn timer() -> ActiveTimer {
         ActiveTimer {

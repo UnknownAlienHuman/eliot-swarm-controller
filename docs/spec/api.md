@@ -133,6 +133,12 @@ admission. Same-ID replay returns that result before current gates without repea
 effect. See the exact range and retention semantics in
 [automation](automation.md#retention-and-bounded-backlog).
 
+A rule `send` child uses the ordinary Router SEND path. Its retained `Command` keeps the
+exact Agent generation and associated `turn_id`. For an event rule, target and generation
+must match the captured `Event.agent` and `Event.generation`; a project SEND also passes
+the registered workspace/profile/action fences. `applied` means association, not task
+completion. Read the result for that exact turn through `agent.result` or `turn.get`.
+
 `timer.get` uses `TimerGetRequest`/`TimerStateView` and reads the selected timer without
 advancing its schedule. `timer.run` accepts `TimerRunRequest { id, rule, project? }`,
 where `id` is the external ULID mutation ID and `rule` is the timer ID. An optional

@@ -717,9 +717,9 @@ impl Store {
         result
     }
 
-    /// Atomically admit one matched stop, its fixed parent/child link, rate
-    /// accounting, the event cursor, and committed rule/command events.
-    pub fn admit_rule_stop(
+    /// Atomically admit one matched rule action, its fixed parent/child link,
+    /// rate accounting, the event cursor, and committed rule/command events.
+    pub fn admit_rule_action(
         &mut self,
         principal: &str,
         state: &core::api::RuleStateView,
@@ -728,12 +728,12 @@ impl Store {
         now: i64,
     ) -> Result<RuleEventAdmission> {
         self.ensure_writer_healthy()?;
-        let result = self.admit_rule_stop_inner(principal, state, event_seq, request, now);
+        let result = self.admit_rule_action_inner(principal, state, event_seq, request, now);
         self.fault_on_persistence_error(&result);
         result
     }
 
-    fn admit_rule_stop_inner(
+    fn admit_rule_action_inner(
         &mut self,
         principal: &str,
         state: &core::api::RuleStateView,
@@ -831,9 +831,35 @@ impl Store {
                 is_new: true,
             });
         }
-        if let Some(code) = stop_binding_error(&trigger, &request) {
+        if let Some(code) = rule_action_binding_error(&trigger, &request) {
             request.id = key.child_id.clone();
             return reject_rule_event(tx, &self.write_faulted, &key, &code, now);
+        }
+        let canonical_definition = if retiring {
+            stored
+                .retiring_definition
+                .as_deref()
+                .ok_or_else(|| Error::new("source_integrity", "retiring definition is absent"))?
+        } else {
+            &stored.canonical_definition
+        };
+        if should_suppress_own_event_send_tx(
+            &tx,
+            principal,
+            &state.id,
+            canonical_definition,
+            &request,
+            trigger.cause.as_ref(),
+        )? {
+            let view = update_rule_cursor_tx(&tx, principal, &stored.view, event_seq, now)?;
+            commit_transaction(tx, &self.write_faulted)?;
+            return Ok(RuleEventAdmission {
+                state: view,
+                parent: None,
+                child: None,
+                events: Vec::new(),
+                is_new: true,
+            });
         }
         if let Err(error) = validate_project_rule_action_tx(&tx, principal, &request) {
             if deterministic_rule_rejection(&error) {
@@ -857,9 +883,9 @@ impl Store {
             return reject_rule_event(tx, &self.write_faulted, &key, "rate_limited", now);
         }
 
-        // submit_tx validates and admits the ordinary stop command. Its stop path
-        // performs all deterministic checks before inserting the child row; the
-        // surrounding transaction rolls every write back on persistence failure.
+        // submit_tx validates and admits the ordinary rule action. Its verb path
+        // performs the normal deterministic checks before inserting the child;
+        // the surrounding transaction rolls every write back on persistence failure.
         let (parent, child, events) = match admit_rule_action_tx(&tx, &key, request, now) {
             Ok(admission) => admission,
             Err(error) if deterministic_rule_rejection(&error) => {
@@ -993,7 +1019,7 @@ impl Store {
         Ok(timers)
     }
 
-    /// Commit one scheduled slot with its ordinary stop child, fixed parent,
+    /// Commit one scheduled slot with its ordinary rule-action child, fixed parent,
     /// action accounting, and numeric cursor in one writer transaction.
     pub fn commit_timer_slot(
         &mut self,
@@ -1121,7 +1147,7 @@ impl Store {
         let mut parent = None;
         let mut child = None;
         if let Some(action) = slot.action {
-            let rejected = if !valid_timer_stop_request(&action) {
+            let rejected = if !valid_rule_action_request(&action) {
                 Some("rule_action_binding_invalid".to_owned())
             } else {
                 match validate_project_rule_action_tx(&tx, principal, &action) {
@@ -1291,8 +1317,11 @@ impl Store {
             ));
         }
         validate_id_age(&request.id, now)?;
-        if !valid_timer_stop_request(&action) {
-            return Err(Error::new("invalid", "timer action is not a literal stop"));
+        if !valid_rule_action_request(&action) {
+            return Err(Error::new(
+                "invalid",
+                "timer action is not a valid rule action",
+            ));
         }
         validate_project_rule_action_tx(&tx, principal, &action)?;
         if state.id != request.rule {
@@ -2085,23 +2114,33 @@ fn validate_timer_slot(slot: &TimerSlotCommit, now: i64) -> Result<()> {
     Ok(())
 }
 
-fn valid_timer_stop_request(request: &SubmitCommand) -> bool {
-    let valid_args = request.args.as_object().is_some_and(|args| {
-        args.iter()
-            .all(|(key, value)| key == "force" && value == &Value::Bool(false))
-    });
-    request.verb == "stop"
-        && request
+fn valid_rule_action_request(request: &SubmitCommand) -> bool {
+    if request.validate().is_err()
+        || !request
             .target
             .as_deref()
             .is_some_and(|target| core::parse_agent_id(target).is_ok())
-        && request
+        || !request
             .expected_generation
             .is_some_and(|generation| generation >= 0)
-        && request.expected_turn_id.is_none()
-        && request.request_id.is_none()
-        && !request.probe
-        && valid_args
+        || request.expected_turn_id.is_some()
+        || request.request_id.is_some()
+        || request.probe
+    {
+        return false;
+    }
+
+    match request.verb.as_str() {
+        "stop" => request.args.as_object().is_some_and(|args| {
+            args.iter()
+                .all(|(key, value)| key == "force" && value == &Value::Bool(false))
+        }),
+        "send" => request
+            .args
+            .as_object()
+            .is_some_and(|args| args.len() == 1 && args.get("text").is_some_and(Value::is_string)),
+        _ => false,
+    }
 }
 
 /// Gate a rule-action child at the Store dispatch boundary. A held successor is
@@ -2668,24 +2707,72 @@ struct StoredRuleTrigger {
     cause: Option<core::EventCause>,
 }
 
-fn stop_binding_error(event: &StoredRuleTrigger, request: &SubmitCommand) -> Option<String> {
-    let agent_id = event.agent.map(format_agent_id);
-    let valid_args = request.args.as_object().is_some_and(|args| {
-        args.iter()
-            .all(|(key, value)| key == "force" && value == &Value::Bool(false))
-    });
-    if request.verb != "stop"
-        || request.target != agent_id
-        || request.expected_generation != event.generation
-        || request.expected_turn_id.is_some()
-        || request.request_id.is_some()
-        || request.probe
-        || !valid_args
-    {
-        Some("rule_action_binding_invalid".to_owned())
-    } else {
-        None
+fn rule_action_binding_error(event: &StoredRuleTrigger, request: &SubmitCommand) -> Option<String> {
+    if !valid_rule_action_request(request) {
+        return Some("rule_action_binding_invalid".to_owned());
     }
+    if request.target != event.agent.map(format_agent_id)
+        || request.expected_generation != event.generation
+    {
+        return Some("rule_action_binding_invalid".to_owned());
+    }
+    None
+}
+
+fn should_suppress_own_event_send_tx(
+    tx: &Transaction<'_>,
+    principal: &str,
+    rule: &str,
+    canonical_definition: &str,
+    request: &SubmitCommand,
+    trigger_cause: Option<&core::EventCause>,
+) -> Result<bool> {
+    if request.verb != "send" {
+        return Ok(false);
+    }
+    let definition: Value = serde_json::from_str(canonical_definition)
+        .map_err(|_| Error::new("source_integrity", "stored rule definition is invalid"))?;
+    if definition
+        .get("allow_self")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(false);
+    }
+    let Some(cause) = trigger_cause else {
+        return Ok(false);
+    };
+    let Some(verified) = command_cause_tx(tx, &cause.command_id)? else {
+        return Ok(false);
+    };
+    if verified.command_id != cause.command_id || verified.depth != cause.depth {
+        return Ok(false);
+    }
+
+    // Resolve the origin row, following its parent link for an action child.
+    // EventCause.rule is descriptive and is not authority for this check.
+    tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM commands origin
+             WHERE origin.id = ?1 AND origin.principal = ?2
+               AND (
+                   (origin.verb IN ('rule','timer.run','rule.catch_up')
+                    AND json_extract(origin.args, '$.rule') = ?3)
+                   OR EXISTS (
+                       SELECT 1 FROM commands parent
+                       WHERE parent.id = origin.parent_command
+                         AND origin.link_kind = 'rule_action'
+                         AND origin.ordinal IS NOT NULL
+                         AND parent.principal = ?2
+                         AND parent.verb IN ('rule','timer.run','rule.catch_up')
+                         AND json_extract(parent.args, '$.rule') = ?3
+                   )
+               )
+         )",
+        params![cause.command_id, principal, rule],
+        |row| row.get(0),
+    )
+    .map_err(sql_error)
 }
 
 fn rule_action_counts(
@@ -3257,7 +3344,7 @@ mod tests {
         assert_eq!(current.retiring_revision, Some(old_view.revision));
 
         let admission = store
-            .admit_rule_stop("owner", &current, event_seq, stop_request(&agent_id), 4)
+            .admit_rule_action("owner", &current, event_seq, stop_request(&agent_id), 4)
             .unwrap();
         let parent = admission.parent.expect("retiring rule parent");
         assert_eq!(parent.args["revision"], old_view.revision);
@@ -3410,7 +3497,7 @@ mod tests {
             insert_test_turn_completed_with_cause(&mut store, agent, 2, Some(trigger_cause));
 
         let suppressed = store
-            .admit_rule_stop("owner", &state, event_seq, stop_request(&agent_id), 3)
+            .admit_rule_action("owner", &state, event_seq, stop_request(&agent_id), 3)
             .unwrap();
         assert!(suppressed.is_new);
         assert_eq!(suppressed.state.current_cursor, event_seq);
@@ -3579,7 +3666,7 @@ mod tests {
             .unwrap();
         let event_seq = insert_test_turn_completed(&mut store, agent, now);
         let admission = store
-            .admit_rule_stop("owner", &state, event_seq, stop_request(&agent_id), now)
+            .admit_rule_action("owner", &state, event_seq, stop_request(&agent_id), now)
             .unwrap();
 
         assert!(admission.is_new);
@@ -3597,7 +3684,7 @@ mod tests {
         let rejected_parent_id = rejected_parent.id.clone();
 
         let replay = store
-            .admit_rule_stop("owner", &state, event_seq, stop_request(&agent_id), now)
+            .admit_rule_action("owner", &state, event_seq, stop_request(&agent_id), now)
             .unwrap();
         assert!(!replay.is_new);
         assert!(replay.child.is_none());
@@ -4465,6 +4552,428 @@ mod tests {
     }
 
     #[test]
+    fn send_self_suppression_uses_verified_principal_and_rule_identity() {
+        let mut store = store();
+        let now = 20_000;
+        let (agent, agent_id) = insert_test_agent(&mut store);
+        ensure_test_project_action_scope(&mut store, "project:alpha", agent, 1, now);
+
+        let owner_value = json!({"id": "same-rule", "enabled": true, "allow_self": false});
+        let owner_definition = RuleDefinitionInput {
+            id: "same-rule".to_owned(),
+            canonical_definition: serde_json::to_string(&owner_value).unwrap(),
+            definition_digest: core::canonical_json_sha256(&owner_value).unwrap(),
+            enabled: true,
+        };
+        let project_value = json!({
+            "id": "same-rule",
+            "enabled": true,
+            "allow_self": false,
+            "do": [{"action": "stop"}],
+        });
+        let project_definition = RuleDefinitionInput {
+            id: "same-rule".to_owned(),
+            canonical_definition: serde_json::to_string(&project_value).unwrap(),
+            definition_digest: core::canonical_json_sha256(&project_value).unwrap(),
+            enabled: true,
+        };
+        let owner_state = store
+            .ensure_rule_state("owner", &owner_definition, now)
+            .unwrap();
+        let project_state = store
+            .ensure_rule_state("project:alpha", &project_definition, now)
+            .unwrap();
+
+        let project_event = insert_test_turn_completed(&mut store, agent, now + 1);
+        let project_source = store
+            .admit_rule_action(
+                "project:alpha",
+                &project_state,
+                project_event,
+                stop_request(&agent_id),
+                now + 2,
+            )
+            .unwrap();
+        let project_child = project_source.child.as_ref().expect("project rule child");
+        let project_cause = command_cause_tx(&store.connection, &project_child.id)
+            .unwrap()
+            .expect("Store-verified project rule cause");
+        assert_eq!(project_cause.rule.as_deref(), Some("same-rule"));
+        assert_eq!(project_cause.depth, 1);
+        let project_origin: (String, String) = store
+            .connection
+            .query_row(
+                "SELECT parent.principal, json_extract(parent.args, '$.rule')
+                 FROM commands child JOIN commands parent ON parent.id = child.parent_command
+                 WHERE child.id = ?1",
+                [&project_child.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            project_origin,
+            ("project:alpha".to_owned(), "same-rule".to_owned())
+        );
+        store
+            .settle(
+                &project_child.id,
+                CommandState::Rejected,
+                Some(json!({"reason": "source fixture complete"})),
+                now + 3,
+            )
+            .unwrap();
+
+        let cross_namespace_event =
+            insert_test_turn_completed_with_cause(&mut store, agent, now + 4, Some(project_cause));
+        let mut cross_namespace_send = SubmitCommand::new(Ulid::new().to_string(), "send");
+        cross_namespace_send.target = Some(agent_id.clone());
+        cross_namespace_send.expected_generation = Some(1);
+        cross_namespace_send.args = json!({"text": "same rule ID from another namespace"});
+        let cross_namespace = store
+            .admit_rule_action(
+                "owner",
+                &owner_state,
+                cross_namespace_event,
+                cross_namespace_send,
+                now + 5,
+            )
+            .unwrap();
+        let foreign_send = cross_namespace
+            .child
+            .as_ref()
+            .expect("different principal is not a self send");
+        assert_eq!(foreign_send.verb, "send");
+        assert_eq!(
+            foreign_send.args["text"],
+            "same rule ID from another namespace"
+        );
+        store
+            .settle(
+                &foreign_send.id,
+                CommandState::Rejected,
+                Some(json!({"reason": "close namespace fixture"})),
+                now + 6,
+            )
+            .unwrap();
+
+        let owner_source_event = insert_test_turn_completed(&mut store, agent, now + 7);
+        let owner_source = store
+            .admit_rule_action(
+                "owner",
+                &cross_namespace.state,
+                owner_source_event,
+                stop_request(&agent_id),
+                now + 8,
+            )
+            .unwrap();
+        let owner_child = owner_source.child.as_ref().expect("owner rule child");
+        let owner_cause = command_cause_tx(&store.connection, &owner_child.id)
+            .unwrap()
+            .expect("Store-verified owner rule cause");
+        let owner_origin: (String, String) = store
+            .connection
+            .query_row(
+                "SELECT parent.principal, json_extract(parent.args, '$.rule')
+                 FROM commands child JOIN commands parent ON parent.id = child.parent_command
+                 WHERE child.id = ?1",
+                [&owner_child.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(owner_origin, ("owner".to_owned(), "same-rule".to_owned()));
+        store
+            .settle(
+                &owner_child.id,
+                CommandState::Rejected,
+                Some(json!({"reason": "verified origin fixture"})),
+                now + 9,
+            )
+            .unwrap();
+
+        let own_event =
+            insert_test_turn_completed_with_cause(&mut store, agent, now + 10, Some(owner_cause));
+        let mut own_send = SubmitCommand::new(Ulid::new().to_string(), "send");
+        own_send.target = Some(agent_id);
+        own_send.expected_generation = Some(1);
+        own_send.args = json!({"text": "verified self send"});
+        let commands_before_suppression: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+            .unwrap();
+        let high_water_before_suppression = store.high_water().unwrap();
+        let suppressed = store
+            .admit_rule_action("owner", &owner_source.state, own_event, own_send, now + 11)
+            .unwrap();
+        assert!(suppressed.is_new);
+        assert!(suppressed.parent.is_none());
+        assert!(suppressed.child.is_none());
+        assert!(suppressed.events.is_empty());
+        assert_eq!(suppressed.state.current_cursor, own_event);
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM commands", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            commands_before_suppression
+        );
+        assert_eq!(store.high_water().unwrap(), high_water_before_suppression);
+    }
+
+    #[test]
+    fn allow_self_send_permits_cause_depth_through_five_only() {
+        let mut store = store();
+        let (agent, agent_id) = insert_test_agent(&mut store);
+        let definition_value = json!({
+            "id": "bounded-send",
+            "enabled": true,
+            "allow_self": true,
+        });
+        let rule_definition = RuleDefinitionInput {
+            id: "bounded-send".to_owned(),
+            canonical_definition: serde_json::to_string(&definition_value).unwrap(),
+            definition_digest: core::canonical_json_sha256(&definition_value).unwrap(),
+            enabled: true,
+        };
+        let mut state = store
+            .ensure_rule_state("owner", &rule_definition, 10_000)
+            .unwrap();
+        let mut cause = None;
+        let mut now = 10_001;
+
+        for expected_depth in 1_u8..=4 {
+            let event_seq =
+                insert_test_turn_completed_with_cause(&mut store, agent, now, cause.clone());
+            let admission = store
+                .admit_rule_action("owner", &state, event_seq, stop_request(&agent_id), now + 1)
+                .unwrap();
+            let child = admission.child.expect("caused stop child");
+            let child_cause = command_cause_tx(&store.connection, &child.id)
+                .unwrap()
+                .expect("verified Store cause");
+            assert_eq!(child_cause.rule.as_deref(), Some("bounded-send"));
+            assert_eq!(child_cause.depth, expected_depth);
+            store
+                .settle(
+                    &child.id,
+                    CommandState::Rejected,
+                    Some(json!({"reason": "close bounded cause fixture"})),
+                    now + 2,
+                )
+                .unwrap();
+            state = admission.state;
+            cause = Some(child_cause);
+            now += 3;
+        }
+
+        let send_event = insert_test_turn_completed_with_cause(&mut store, agent, now, cause);
+        let mut send = SubmitCommand::new(Ulid::new().to_string(), "send");
+        send.target = Some(agent_id.clone());
+        send.expected_generation = Some(1);
+        send.args = json!({"text": "bounded self send"});
+        let admission = store
+            .admit_rule_action("owner", &state, send_event, send, now + 1)
+            .unwrap();
+        let send_child = admission
+            .child
+            .as_ref()
+            .expect("allow_self sends at depth five");
+        assert_eq!(send_child.verb, "send");
+        assert_eq!(send_child.args["text"], "bounded self send");
+        let send_cause = command_cause_tx(&store.connection, &send_child.id)
+            .unwrap()
+            .expect("verified depth-five send cause");
+        assert_eq!(send_cause.rule.as_deref(), Some("bounded-send"));
+        assert_eq!(send_cause.depth, 5);
+        store
+            .settle(
+                &send_child.id,
+                CommandState::Rejected,
+                Some(json!({"reason": "close bounded send fixture"})),
+                now + 2,
+            )
+            .unwrap();
+
+        let sixth_event =
+            insert_test_turn_completed_with_cause(&mut store, agent, now + 3, Some(send_cause));
+        let commands_before_suppression: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+            .unwrap();
+        let bounded = store
+            .admit_rule_action(
+                "owner",
+                &admission.state,
+                sixth_event,
+                SubmitCommand {
+                    id: Ulid::new().to_string(),
+                    target: Some(agent_id),
+                    verb: "send".to_owned(),
+                    args: json!({"text": "over depth bound"}),
+                    expected_generation: Some(1),
+                    expected_turn_id: None,
+                    request_id: None,
+                    probe: false,
+                },
+                now + 4,
+            )
+            .unwrap();
+        assert!(bounded.is_new);
+        assert!(bounded.parent.is_none());
+        assert!(bounded.child.is_none());
+        assert!(bounded.events.is_empty());
+        assert_eq!(bounded.state.current_cursor, sixth_event);
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM commands", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            commands_before_suppression
+        );
+    }
+
+    #[test]
+    fn unknown_send_is_not_replayed_by_live_history_or_recovery() {
+        let mut store = store();
+        let now = 30_000;
+        let (live_agent, live_agent_id) = insert_test_agent(&mut store);
+        let (history_agent, history_agent_id) = insert_test_agent(&mut store);
+        let live_definition = definition("live-unknown-send", true);
+        let live_state = store
+            .ensure_rule_state("owner", &live_definition, now)
+            .unwrap();
+        let live_event = insert_test_turn_completed(&mut store, live_agent, now + 1);
+        let mut live_send = SubmitCommand::new(Ulid::new().to_string(), "send");
+        live_send.target = Some(live_agent_id.clone());
+        live_send.expected_generation = Some(1);
+        live_send.args = json!({"text": "live uncertain send"});
+        let live_admission = store
+            .admit_rule_action("owner", &live_state, live_event, live_send.clone(), now + 2)
+            .unwrap();
+        let live_child = live_admission.child.as_ref().expect("live send child");
+        let live_child_id = live_child.id.clone();
+        assert_eq!(live_child.verb, "send");
+        store.dispatch(&live_child_id, now + 3).unwrap();
+        store
+            .settle(
+                &live_child_id,
+                CommandState::Unknown,
+                Some(json!({"reason": "fixture uncertain send"})),
+                now + 4,
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_command(&live_child_id).unwrap().unwrap().state,
+            CommandState::Unknown
+        );
+        let live_recovery = store.recover_rule_children(None, 100).unwrap();
+        assert!(
+            !live_recovery
+                .iter()
+                .any(|command| command.id == live_child_id)
+        );
+
+        let commands_before_live_replay: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+            .unwrap();
+        let events_before_live_replay = store.high_water().unwrap();
+        let live_replay = store
+            .admit_rule_action("owner", &live_state, live_event, live_send, now + 5)
+            .unwrap();
+        assert!(!live_replay.is_new);
+        assert_eq!(
+            live_replay.parent.unwrap().id,
+            live_admission.parent.unwrap().id
+        );
+        assert_eq!(live_replay.child.unwrap().id, live_child_id);
+        assert!(live_replay.events.is_empty());
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM commands", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            commands_before_live_replay
+        );
+        assert_eq!(store.high_water().unwrap(), events_before_live_replay);
+
+        let history_event = insert_test_turn_completed(&mut store, history_agent, now + 6);
+        let history_state = store
+            .ensure_rule_state("owner", &definition("history-unknown-send", true), now + 7)
+            .unwrap();
+        let history_id = Ulid::new();
+        let history_now = i64::try_from(history_id.timestamp_ms()).unwrap() + 1;
+        let history_request = core::api::RuleCatchUpRequest::new(
+            history_id.to_string(),
+            "history-unknown-send",
+            history_event - 1,
+            Some(history_state.current_cursor),
+        );
+        let mut history_send = SubmitCommand::new(Ulid::new().to_string(), "send");
+        history_send.target = Some(history_agent_id);
+        history_send.expected_generation = Some(1);
+        history_send.args = json!({"text": "history uncertain send"});
+        let history_actions = [RuleCatchUpAction {
+            event_seq: history_event,
+            request: history_send,
+        }];
+        let history_admission = store
+            .admit_rule_catch_up(
+                "owner",
+                &history_request,
+                &history_state,
+                history_state.current_cursor,
+                &history_actions,
+                history_now,
+            )
+            .unwrap();
+        assert_eq!(history_admission.children.len(), 1);
+        let history_child_id = history_admission.children[0].id.clone();
+        store.dispatch(&history_child_id, history_now + 1).unwrap();
+        store
+            .settle(
+                &history_child_id,
+                CommandState::Unknown,
+                Some(json!({"reason": "fixture uncertain history send"})),
+                history_now + 2,
+            )
+            .unwrap();
+        let commands_before_history_replay: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+            .unwrap();
+        let events_before_history_replay = store.high_water().unwrap();
+        let history_replay = store
+            .replay_rule_catch_up("owner", &history_request)
+            .unwrap()
+            .expect("retained catch-up parent");
+        assert!(!history_replay.is_new);
+        assert_eq!(history_replay.parent.id, history_request.id);
+        assert_eq!(history_replay.children.len(), 1);
+        assert_eq!(history_replay.children[0].id, history_child_id);
+        assert_eq!(history_replay.children[0].state, CommandState::Unknown);
+        assert!(history_replay.events.is_empty());
+
+        let recovered = store.recover_rule_children(None, 100).unwrap();
+        assert!(
+            !recovered
+                .iter()
+                .any(|command| { command.id == live_child_id || command.id == history_child_id })
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM commands", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            commands_before_history_replay
+        );
+        assert_eq!(store.high_water().unwrap(), events_before_history_replay);
+    }
+
+    #[test]
     fn per_agent_limit_is_scoped_by_principal_and_rule_across_generations() {
         let mut store = store();
         let now = 10_000;
@@ -4475,7 +4984,7 @@ mod tests {
             .unwrap();
         let owner_event = insert_test_turn_completed(&mut store, alpha_agent_num, now - 2);
         store
-            .admit_rule_stop(
+            .admit_rule_action(
                 "owner",
                 &owner_rule,
                 owner_event,
@@ -4572,7 +5081,7 @@ mod tests {
             .unwrap();
         let event_seq = insert_test_turn_completed(&mut store, agent, 2);
         let admission = store
-            .admit_rule_stop("owner", &state, event_seq, stop_request(&agent_id), 3)
+            .admit_rule_action("owner", &state, event_seq, stop_request(&agent_id), 3)
             .unwrap();
         let child = admission.child.unwrap();
         store
@@ -4614,7 +5123,7 @@ mod tests {
         for _ in 0..RULE_ACTION_LIMIT {
             let event_seq = insert_test_turn_completed(&mut store, agent_num, now);
             let admission = store
-                .admit_rule_stop("owner", &state, event_seq, stop_request(&agent_id), now)
+                .admit_rule_action("owner", &state, event_seq, stop_request(&agent_id), now)
                 .unwrap();
             assert!(admission.is_new);
             let child = admission.child.as_ref().expect("admitted stop child");
@@ -4688,7 +5197,7 @@ mod tests {
 
         let rate_event_seq = insert_test_turn_completed(&mut store, agent_num, now);
         let limited = store
-            .admit_rule_stop(
+            .admit_rule_action(
                 "owner",
                 &state,
                 rate_event_seq,

@@ -1,5 +1,8 @@
-use super::{BatchCommit, ProjectRegistrationInput, Store, contains_secret_marker};
-use eliot_core::api::{ProviderClearHoldRequest, ProviderCorrectiveEvidence};
+use super::{
+    BatchCommit, ProjectRegistrationInput, RuleCatchUpAction, RuleCatchUpAdmission,
+    RuleCursorOutcome, RuleDefinitionInput, RuleEventAdmission, Store, contains_secret_marker,
+};
+use eliot_core::api::{ProviderClearHoldRequest, ProviderCorrectiveEvidence, RuleCatchUpRequest};
 use eliot_core::{
     AgentState, CommandState, EventCause, NativeEvent, NativeStoreBinding, ProviderHoldState,
     ProviderRestrictionKind, SourceBatch, SourceGap, SubmitCommand, TurnState,
@@ -57,6 +60,181 @@ fn ready_agent(store: &mut Store, project: &str, now: i64) -> String {
         .settle(&launch_id, CommandState::Applied, None, now)
         .expect("settle launch");
     agent
+}
+
+fn ready_managed_codex_agent(
+    store: &mut Store,
+    checkout: &str,
+    profile: &str,
+    now: i64,
+) -> (String, WorkspacePreparationInput) {
+    let start_id = Ulid::new().to_string();
+    let suffix = Ulid::new().to_string().to_ascii_lowercase();
+    let branch = format!("codex/{profile}-{suffix}");
+    let worktree_path = format!("{checkout}-worktree-{suffix}");
+    let repo_common_dir = format!("{checkout}/.git");
+    let base_oid = "d".repeat(40);
+    let input = WorkspacePreparationInput {
+        project: checkout.to_owned(),
+        repo_path: checkout.to_owned(),
+        repo_common_dir: repo_common_dir.clone(),
+        requested_branch: branch.clone(),
+        base_ref: Some("HEAD".to_owned()),
+        base_oid: base_oid.clone(),
+        worktree_path: worktree_path.clone(),
+        frozen_setup: Vec::new(),
+    };
+    let launch = store
+        .submit_with_workspace(
+            "owner",
+            SubmitCommand {
+                id: start_id.clone(),
+                target: None,
+                verb: "launch".to_owned(),
+                args: json!({
+                    "project": checkout,
+                    "workspace": checkout,
+                    "worktree": branch,
+                    "harness": "codex",
+                    "profile": profile,
+                    "profile_snapshot": {}
+                }),
+                expected_generation: Some(0),
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            input.clone(),
+            now,
+        )
+        .expect("admit managed L3 launch");
+    let agent = launch.command.target.expect("managed Agent");
+    let native_scope = format!("{checkout}:{agent}:scope");
+    let native_ref = format!("{checkout}:{agent}:thread");
+    store
+        .settle_workspace_creation(
+            &start_id,
+            1,
+            WorkspaceCreationOutcome::Verified {
+                repo_path: input.repo_path.clone(),
+                repo_common_dir: input.repo_common_dir.clone(),
+                worktree_path: input.worktree_path.clone(),
+                branch: input.requested_branch.clone(),
+                head: input.base_oid.clone(),
+            },
+            now + 1,
+        )
+        .expect("verify managed L3 workspace");
+    store
+        .dispatch(&start_id, now + 2)
+        .expect("dispatch managed L3 launch");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: Ulid::new().to_string(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ready".to_owned(),
+                    native_id: Ulid::new().to_string(),
+                    data: json!({
+                        "command_id": start_id,
+                        "native_scope": native_scope,
+                        "native_ref": native_ref,
+                    }),
+                }],
+                cursor: None,
+            },
+            now + 3,
+        )
+        .expect("commit managed Codex session readiness");
+    store
+        .settle(&launch.command.id, CommandState::Applied, None, now + 4)
+        .expect("settle managed L3 launch");
+    (agent, input)
+}
+
+fn send_request(agent: &str, generation: i64, text: &str) -> SubmitCommand {
+    let mut request = SubmitCommand::new(Ulid::new().to_string(), "send");
+    request.target = Some(agent.to_owned());
+    request.args = json!({"text":text});
+    request.expected_generation = Some(generation);
+    request
+}
+
+fn project_send_rule_input(id: &str) -> RuleDefinitionInput {
+    let value = json!({
+        "id": id,
+        "enabled": true,
+        "on": {"event": "command.accepted"},
+        "do": [{
+            "action": "send",
+            "target": "${event.agent}",
+            "expected_generation": "${event.generation}"
+        }]
+    });
+    RuleDefinitionInput {
+        id: id.to_owned(),
+        canonical_definition: serde_json::to_string(&value).expect("encode send rule"),
+        definition_digest: eliot_core::canonical_json_sha256(&value).expect("digest send rule"),
+        enabled: true,
+    }
+}
+
+fn assert_no_rule_action_children(store: &Store, parent_id: &str) {
+    let children: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM commands
+             WHERE parent_command = ?1 AND link_kind = 'rule_action' AND ordinal IS NOT NULL",
+            [parent_id],
+            |row| row.get(0),
+        )
+        .expect("count rule-action children");
+    assert_eq!(children, 0);
+}
+
+fn assert_live_send_binding_rejection(
+    store: &Store,
+    admission: RuleEventAdmission,
+    event_seq: i64,
+) {
+    let parent = admission.parent.expect("rejected live-rule parent");
+    assert_eq!(parent.state, CommandState::Rejected);
+    assert_eq!(
+        parent.outcome.as_ref().unwrap()["code"],
+        "rule_action_binding_invalid"
+    );
+    assert_eq!(parent.outcome.as_ref().unwrap()["children"], json!([]));
+    assert!(admission.child.is_none());
+    assert_eq!(admission.state.current_cursor, event_seq);
+    assert!(admission.events.iter().any(|event| {
+        event.kind == "rule.rejected"
+            && event.data["event_seq"] == event_seq
+            && event.data["code"] == "rule_action_binding_invalid"
+    }));
+    assert_no_rule_action_children(store, &parent.id);
+}
+
+fn assert_history_send_binding_rejection(
+    store: &Store,
+    admission: RuleCatchUpAdmission,
+    event_seq: i64,
+) {
+    assert_eq!(admission.parent.state, CommandState::Applied);
+    assert_eq!(
+        admission.parent.outcome.as_ref().unwrap()["children"],
+        json!([])
+    );
+    assert!(admission.children.is_empty());
+    assert!(admission.events.iter().any(|event| {
+        event.kind == "rule.rejected"
+            && event.data["event_seq"] == event_seq
+            && event.data["code"] == "rule_action_binding_invalid"
+    }));
+    assert_no_rule_action_children(store, &admission.parent.id);
 }
 
 fn capacity_launch_request(
@@ -585,6 +763,386 @@ fn project_stop_cannot_cancel_a_new_workspace_generation_after_dispatch_admissio
                 .get::<_, i64>(0))
             .expect("count events after denied dispatch"),
         event_count
+    );
+}
+
+#[test]
+fn project_approved_send_uses_existing_store_admission_and_dispatch() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let project = "approved-send";
+    let profile = "project-send-profile";
+    let checkout = "/synthetic-approved-send";
+    let (agent, _) = ready_managed_codex_agent(&mut store, checkout, profile, now);
+    store
+        .upsert_project_registration(
+            "owner",
+            &ProjectRegistrationInput {
+                id: project.to_owned(),
+                checkout: checkout.to_owned(),
+                repo_common_dir: format!("{checkout}/.git"),
+                profiles: vec![profile.to_owned()],
+                actions: vec!["send".to_owned()],
+            },
+            now + 5,
+        )
+        .expect("register approved send action");
+
+    let send_id = Ulid::new().to_string();
+    let admission = store
+        .submit(
+            &format!("project:{project}"),
+            SubmitCommand {
+                id: send_id.clone(),
+                target: Some(agent),
+                verb: "send".to_owned(),
+                args: json!({"text":"project-scoped-send"}),
+                expected_generation: Some(1),
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now + 6,
+        )
+        .expect("admit through ordinary Store send path");
+    assert_eq!(admission.command.state, CommandState::Accepted);
+    assert_eq!(
+        store
+            .dispatch(&send_id, now + 7)
+            .expect("dispatch admitted send")
+            .value
+            .state,
+        CommandState::Dispatched
+    );
+}
+
+#[test]
+fn live_project_rule_send_rejects_other_valid_agent_at_same_generation() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let project = "live-event-binding";
+    let principal = format!("project:{project}");
+    let checkout = "/synthetic-live-event-binding";
+    let profile = "live-event-binding-profile";
+    let (event_agent, _) = ready_managed_codex_agent(&mut store, checkout, profile, now);
+    let (other_agent, _) = ready_managed_codex_agent(&mut store, checkout, profile, now + 10);
+    store
+        .upsert_project_registration(
+            "owner",
+            &ProjectRegistrationInput {
+                id: project.to_owned(),
+                checkout: checkout.to_owned(),
+                repo_common_dir: format!("{checkout}/.git"),
+                profiles: vec![profile.to_owned()],
+                actions: vec!["send".to_owned()],
+            },
+            now + 20,
+        )
+        .expect("register project SEND action");
+    let rule_id = "live-agent-binding";
+    let state = store
+        .ensure_rule_state(&principal, &project_send_rule_input(rule_id), now + 21)
+        .expect("seed project rule before trigger event");
+
+    let trigger = store
+        .submit(
+            "owner",
+            send_request(&event_agent, 1, "trigger-live-rule"),
+            now + 22,
+        )
+        .expect("admit trigger SEND on source Agent");
+    let event_seq = trigger
+        .events
+        .iter()
+        .find(|event| {
+            event.kind == "command.accepted" && event.data["command_id"] == trigger.command.id
+        })
+        .expect("persist source Agent accepted event")
+        .seq;
+    store
+        .settle(
+            &trigger.command.id,
+            CommandState::Rejected,
+            Some(json!({"reason":"not_dispatched"})),
+            now + 23,
+        )
+        .expect("withdraw undispatched trigger SEND");
+
+    let valid_other_agent_send = send_request(&other_agent, 1, "ordinary-valid-send");
+    let ordinary = store
+        .submit(&principal, valid_other_agent_send.clone(), now + 24)
+        .expect("same-generation project SEND to other Agent is ordinarily valid");
+    store
+        .settle(
+            &ordinary.command.id,
+            CommandState::Rejected,
+            Some(json!({"reason":"not_dispatched"})),
+            now + 25,
+        )
+        .expect("withdraw ordinary admission probe before dispatch");
+
+    let admission = store
+        .admit_rule_action(
+            &principal,
+            &state,
+            event_seq,
+            valid_other_agent_send,
+            now + 26,
+        )
+        .expect("binding mismatch is a deterministic live-rule rejection");
+    assert_live_send_binding_rejection(&store, admission, event_seq);
+}
+
+#[test]
+fn history_project_rule_send_rejects_rebinding_old_event_to_current_generation() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let project = "history-generation-binding";
+    let principal = format!("project:{project}");
+    let checkout = "/synthetic-history-generation-binding";
+    let profile = "history-generation-binding-profile";
+    let (agent, workspace) = ready_managed_codex_agent(&mut store, checkout, profile, now);
+    store
+        .upsert_project_registration(
+            "owner",
+            &ProjectRegistrationInput {
+                id: project.to_owned(),
+                checkout: checkout.to_owned(),
+                repo_common_dir: format!("{checkout}/.git"),
+                profiles: vec![profile.to_owned()],
+                actions: vec!["send".to_owned()],
+            },
+            now + 5,
+        )
+        .expect("register project SEND action");
+    let rule_id = "history-generation-binding";
+    let initial_state = store
+        .ensure_rule_state(&principal, &project_send_rule_input(rule_id), now + 6)
+        .expect("seed project rule before trigger event");
+    let after_seq = initial_state.current_cursor;
+
+    let trigger = store
+        .submit(
+            "owner",
+            send_request(&agent, 1, "trigger-history-rule"),
+            now + 7,
+        )
+        .expect("admit generation-1 trigger SEND");
+    let event_seq = trigger
+        .events
+        .iter()
+        .find(|event| event.kind == "command.accepted")
+        .expect("persist generation-1 accepted event")
+        .seq;
+    store
+        .settle(
+            &trigger.command.id,
+            CommandState::Rejected,
+            Some(json!({"reason":"not_dispatched"})),
+            now + 8,
+        )
+        .expect("withdraw undispatched trigger SEND");
+    let cursor = store
+        .advance_rule_cursor(
+            &principal,
+            &initial_state,
+            event_seq,
+            RuleCursorOutcome::NoMatch,
+            now + 9,
+        )
+        .expect("advance live lane over the retained trigger");
+    assert!(
+        cursor.events.is_empty(),
+        "no-match cursor writes are silent"
+    );
+
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "history-generation-binding:ended".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ended".to_owned(),
+                    native_id: "history-generation-binding:ended".to_owned(),
+                    data: json!({}),
+                }],
+                cursor: None,
+            },
+            now + 10,
+        )
+        .expect("commit generation-1 terminal session fact");
+    let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
+    resume.target = Some(agent.clone());
+    resume.expected_generation = Some(1);
+    let resume_id = resume.id.clone();
+    store
+        .submit_with_workspace("owner", resume, workspace.clone(), now + 11)
+        .expect("admit managed-workspace resume");
+    store
+        .settle_workspace_creation(
+            &resume_id,
+            2,
+            WorkspaceCreationOutcome::Verified {
+                repo_path: workspace.repo_path.clone(),
+                repo_common_dir: workspace.repo_common_dir.clone(),
+                worktree_path: workspace.worktree_path.clone(),
+                branch: workspace.requested_branch.clone(),
+                head: workspace.base_oid.clone(),
+            },
+            now + 12,
+        )
+        .expect("verify generation-2 managed workspace");
+    store
+        .dispatch(&resume_id, now + 13)
+        .expect("dispatch generation-2 resume");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "history-generation-binding:ready".to_owned(),
+                agent_id: agent.clone(),
+                generation: 2,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ready".to_owned(),
+                    native_id: "history-generation-binding:ready".to_owned(),
+                    data: json!({
+                        "command_id": resume_id,
+                        "native_scope": "history-generation-binding:scope-2",
+                        "native_ref": "history-generation-binding:thread-2"
+                    }),
+                }],
+                cursor: None,
+            },
+            now + 14,
+        )
+        .expect("commit generation-2 readiness");
+    store
+        .settle(&resume_id, CommandState::Applied, None, now + 15)
+        .expect("settle generation-2 resume");
+    let current = store
+        .get_agent(&agent)
+        .expect("read current Agent")
+        .expect("Agent exists");
+    assert_eq!(current.generation, 2);
+    assert_eq!(current.state, AgentState::Idle);
+
+    let valid_current_generation_send = send_request(&agent, 2, "ordinary-valid-generation-2");
+    let ordinary = store
+        .submit(&principal, valid_current_generation_send.clone(), now + 16)
+        .expect("generation-2 project SEND is ordinarily valid");
+    store
+        .settle(
+            &ordinary.command.id,
+            CommandState::Rejected,
+            Some(json!({"reason":"not_dispatched"})),
+            now + 17,
+        )
+        .expect("withdraw ordinary admission probe before dispatch");
+
+    let catch_up_request =
+        RuleCatchUpRequest::new(Ulid::new().to_string(), rule_id, after_seq, Some(event_seq))
+            .in_project(project);
+    let admission = store
+        .admit_rule_catch_up(
+            &principal,
+            &catch_up_request,
+            &cursor.value,
+            event_seq,
+            &[RuleCatchUpAction {
+                event_seq,
+                request: valid_current_generation_send,
+            }],
+            now + 18,
+        )
+        .expect("old-event rebinding is a deterministic history rejection");
+    assert_history_send_binding_rejection(&store, admission, event_seq);
+    assert_eq!(
+        store
+            .get_rule_state(&principal, rule_id)
+            .expect("read rule cursor")
+            .expect("rule remains")
+            .current_cursor,
+        event_seq,
+        "history rejection does not rewind or move the live cursor",
+    );
+}
+
+#[test]
+fn project_send_requires_the_approved_action_and_rejects_unknown_registration_actions() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let profile = "project-send-profile";
+    let checkout = "/synthetic-denied-send";
+    let (agent, _) = ready_managed_codex_agent(&mut store, checkout, profile, now);
+    let common = format!("{checkout}/.git");
+    let unsupported = store
+        .upsert_project_registration(
+            "owner",
+            &ProjectRegistrationInput {
+                id: "unsupported-project-action".to_owned(),
+                checkout: checkout.to_owned(),
+                repo_common_dir: common.clone(),
+                profiles: vec![profile.to_owned()],
+                actions: vec!["resume".to_owned()],
+            },
+            now + 5,
+        )
+        .expect_err("Store must reject unimplemented project actions");
+    assert_eq!(unsupported.code, "unsupported");
+
+    let project = "send-not-approved";
+    store
+        .upsert_project_registration(
+            "owner",
+            &ProjectRegistrationInput {
+                id: project.to_owned(),
+                checkout: checkout.to_owned(),
+                repo_common_dir: common,
+                profiles: vec![profile.to_owned()],
+                actions: vec!["stop".to_owned()],
+            },
+            now + 6,
+        )
+        .expect("register project with send denied");
+    let events_before: i64 = store
+        .connection
+        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+        .expect("count events before denied send");
+    let send_id = Ulid::new().to_string();
+    let error = store
+        .submit(
+            &format!("project:{project}"),
+            SubmitCommand {
+                id: send_id.clone(),
+                target: Some(agent),
+                verb: "send".to_owned(),
+                args: json!({"text":"denied-project-send"}),
+                expected_generation: Some(1),
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now + 7,
+        )
+        .expect_err("project cannot send without the owner's send allowlist");
+    assert_eq!(error.code, "not_allowed");
+    assert!(
+        store
+            .get_command(&send_id)
+            .expect("read denied send")
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row
+                .get::<_, i64>(0))
+            .expect("count events after denied send"),
+        events_before
     );
 }
 
