@@ -884,6 +884,9 @@ impl Store {
         if let Some(after) = after {
             validate_ulid(after)?;
         }
+        if self.write_faulted.get() {
+            return Ok(Vec::new());
+        }
         let mut statement = self
             .connection
             .prepare(
@@ -4748,5 +4751,66 @@ mod tests {
         assert!(pending_after_dispatch.iter().all(|command| {
             matches!(command.state, CommandState::Accepted | CommandState::Queued)
         }));
+    }
+
+    #[test]
+    fn faulted_writer_holds_rule_child_recovery_without_mutating_commands() {
+        let mut store = store();
+        let (_, agent_id) = insert_test_agent(&mut store);
+        insert_test_rule_action(&mut store, "owner", "faulted-recovery", &agent_id, 1, 100);
+        insert_test_rule_action(&mut store, "owner", "faulted-recovery", &agent_id, 1, 101);
+
+        let seeded = store.recover_rule_children(None, 10).unwrap();
+        assert_eq!(seeded.len(), 2);
+        assert!(
+            seeded
+                .iter()
+                .all(|command| command.state == CommandState::Accepted)
+        );
+        store
+            .connection
+            .execute(
+                // Seed both states accepted by recovery without building a predecessor chain.
+                "UPDATE commands SET state = 'queued' WHERE id = ?1",
+                [&seeded[0].id],
+            )
+            .unwrap();
+
+        let healthy = store.recover_rule_children(None, 10).unwrap();
+        assert_eq!(healthy.len(), 2);
+        assert!(
+            healthy
+                .iter()
+                .any(|command| command.state == CommandState::Accepted)
+        );
+        assert!(
+            healthy
+                .iter()
+                .any(|command| command.state == CommandState::Queued)
+        );
+
+        store.write_faulted.set(true);
+        assert!(store.recover_rule_children(None, 10).unwrap().is_empty());
+        assert!(store.is_write_faulted());
+
+        let accepted = healthy
+            .iter()
+            .find(|command| command.state == CommandState::Accepted)
+            .unwrap();
+        let error = store.dispatch(&accepted.id, 102).unwrap_err();
+        assert_eq!(error.code, "unavailable");
+        for command in &healthy {
+            let retained = store.get_command(&command.id).unwrap().unwrap();
+            assert_eq!(retained.state, command.state);
+        }
+        let dispatched: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind = 'command.dispatched'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dispatched, 0);
     }
 }

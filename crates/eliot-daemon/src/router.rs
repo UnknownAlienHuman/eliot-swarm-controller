@@ -3067,7 +3067,8 @@ impl Router {
         // This is only the local Store dispatch result, before any control RPC.
         // A plugin error with the same code still follows post-I/O C1 handling.
         if write_faulted {
-            self.note_unknown_id(id, "store_dispatch_outcome_unknown");
+            self.note_unknown_if_uncertain(id, "store_dispatch_outcome_unknown")
+                .await;
         } else if matches!(
             error.code.as_str(),
             "bad_state" | "stale_generation" | "not_found" | "provider_held"
@@ -3198,35 +3199,24 @@ impl Router {
 
     async fn reject_undispatched(&self, id: &str, reason: &str) {
         let outcome = json!({"reason": reason});
-        let (result, write_faulted, pre_settlement_state) = {
+        let (result, write_faulted) = {
             let mut store = self.inner.store.lock().await;
-            let (result, pre_settlement_state) = match store.get_command(id) {
+            let result = match store.get_command(id) {
                 Ok(Some(command))
                     if matches!(command.state, CommandState::Accepted | CommandState::Queued) =>
                 {
-                    let state = command.state;
-                    (
-                        store.settle(id, CommandState::Rejected, Some(outcome), now_ms()),
-                        Some(state),
-                    )
+                    store.settle(id, CommandState::Rejected, Some(outcome), now_ms())
                 }
                 Ok(_) => return,
-                Err(error) => (Err(error), None),
+                Err(error) => Err(error),
             };
             if let Ok(change) = &result {
                 self.publish_locked(&change.events);
             }
-            (result, store.is_write_faulted(), pre_settlement_state)
+            (result, store.is_write_faulted())
         };
-        self.finish_settlement(
-            id,
-            result,
-            write_faulted,
-            "store_settlement_failed",
-            pre_settlement_state,
-            false,
-        )
-        .await;
+        self.finish_settlement(id, result, write_faulted, "store_settlement_failed", false)
+            .await;
     }
 
     async fn settle_observe_attach(&self, id: &str, snapshot: Value) -> Option<Command> {
@@ -3251,7 +3241,7 @@ impl Router {
                 } else {
                     "observe_attach_settlement_failed"
                 };
-                self.note_unknown_id(id, cause);
+                self.note_unknown_if_uncertain(id, cause).await;
                 self.signal_progress();
                 None
             }
@@ -3280,7 +3270,7 @@ impl Router {
                 } else {
                     "observe_detach_settlement_failed"
                 };
-                self.note_unknown_id(id, cause);
+                self.note_unknown_if_uncertain(id, cause).await;
                 self.signal_progress();
                 None
             }
@@ -3385,45 +3375,25 @@ impl Router {
             .and_then(Value::as_str)
             .unwrap_or("store_settlement_failed")
             .to_owned();
-        let (result, write_faulted, pre_settlement_state) = {
+        let (result, write_faulted) = {
             let mut store = self.inner.store.lock().await;
             // A source batch may have settled this command after the error
             // handler's initial read. Retain that outcome under the writer lock.
-            let (result, pre_settlement_state) = match store.get_command(id) {
-                Ok(Some(command)) if command.state.is_terminal() => {
-                    let prior_state = command.state;
-                    (
-                        Ok(eliot_store::Change {
-                            value: command,
-                            events: Vec::new(),
-                        }),
-                        Some(prior_state),
-                    )
-                }
-                Ok(Some(command)) => {
-                    let prior_state = command.state;
-                    (
-                        store.settle(id, state, outcome, now_ms()),
-                        Some(prior_state),
-                    )
-                }
-                Ok(None) => (store.settle(id, state, outcome, now_ms()), None),
-                Err(error) => (Err(error), None),
+            let result = match store.get_command(id) {
+                Ok(Some(command)) if command.state.is_terminal() => Ok(eliot_store::Change {
+                    value: command,
+                    events: Vec::new(),
+                }),
+                Ok(_) => store.settle(id, state, outcome, now_ms()),
+                Err(error) => Err(error),
             };
             if let Ok(change) = &result {
                 self.publish_locked(&change.events);
             }
-            (result, store.is_write_faulted(), pre_settlement_state)
+            (result, store.is_write_faulted())
         };
-        self.finish_settlement(
-            id,
-            result,
-            write_faulted,
-            &persistence_cause,
-            pre_settlement_state,
-            true,
-        )
-        .await
+        self.finish_settlement(id, result, write_faulted, &persistence_cause, true)
+            .await
     }
 
     async fn finish_settlement(
@@ -3432,7 +3402,6 @@ impl Router {
         result: Result<eliot_store::Change<Command>>,
         write_faulted: bool,
         persistence_cause: &str,
-        pre_settlement_state: Option<CommandState>,
         external_effect_may_be_uncertain: bool,
     ) -> Option<Command> {
         match result {
@@ -3451,13 +3420,8 @@ impl Router {
                 Some(command)
             }
             Err(_) => {
-                let external_effect_is_uncertain = matches!(
-                    pre_settlement_state,
-                    Some(CommandState::Dispatched | CommandState::Unknown)
-                ) || pre_settlement_state.is_none()
-                    && external_effect_may_be_uncertain;
-                if write_faulted && external_effect_is_uncertain {
-                    self.note_unknown_id(id, persistence_cause);
+                if write_faulted && external_effect_may_be_uncertain {
+                    self.note_unknown_if_uncertain(id, persistence_cause).await;
                 }
                 self.signal_progress();
                 None
@@ -3508,6 +3472,22 @@ impl Router {
         let mut causes = self.inner.unknown_causes.lock_recover();
         unknown.insert(id.to_owned());
         causes.insert(id.to_owned(), cause.to_owned());
+    }
+
+    async fn note_unknown_if_uncertain(&self, id: &str, cause: &str) {
+        let store = self.inner.store.lock().await;
+        match store.get_command(id) {
+            Ok(Some(command))
+                if matches!(
+                    command.state,
+                    CommandState::Dispatched | CommandState::Unknown
+                ) =>
+            {
+                self.note_unknown_id(id, cause);
+            }
+            Err(_) => self.note_unknown_id(id, cause),
+            Ok(Some(_)) | Ok(None) => {}
+        }
     }
 
     fn clear_unknown_id(&self, id: &str) {
@@ -6296,9 +6276,12 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                     Err(Error::new("internal", "injected Store write failure")),
                     true,
                     "store_settlement_failed",
-                    Some(state),
-                    false,
+                    true,
                 )
+                .await;
+            let dispatch_error = Error::new("internal", "injected Store dispatch failure");
+            router
+                .settle_dispatch_error(id, &dispatch_error, true, false)
                 .await;
             let command: Command = serde_json::from_value(
                 router
@@ -6325,9 +6308,12 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 Err(Error::new("internal", "injected Store write failure")),
                 true,
                 "store_settlement_failed",
-                Some(CommandState::Dispatched),
                 true,
             )
+            .await;
+        let dispatch_error = Error::new("internal", "injected Store dispatch failure");
+        router
+            .settle_dispatch_error(&dispatched_id, &dispatch_error, true, false)
             .await;
         let persisted = router
             .inner
@@ -6349,7 +6335,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         assert!(router.unknown_ids().contains(&dispatched_id));
         assert_eq!(
             router.unknown_cause(&dispatched_id).as_deref(),
-            Some("store_settlement_failed")
+            Some("store_dispatch_outcome_unknown")
         );
 
         let applied = router
