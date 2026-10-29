@@ -7,6 +7,33 @@ use serde_json::{Map, Value};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct RuleGetRequest {
+    #[serde(deserialize_with = "required_id")]
+    pub id: String,
+}
+
+impl RuleGetRequest {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self { id: id.into() }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        validate_id(&self.id)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleStateView {
+    pub id: String,
+    pub revision: i64,
+    pub current_cursor: i64,
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommandGetRequest {
     #[serde(deserialize_with = "required_id")]
     pub id: String,
@@ -201,6 +228,28 @@ mod tests {
             assert_eq!(serde_json::to_value(&request).unwrap(), json!({"id":id}));
         }
         assert!(CommandGetRequest::new(" ").validate().is_err());
+    }
+
+    #[test]
+    fn rule_get_requires_exact_nonempty_id() {
+        let valid = json!({"id":"rule-1"});
+        let request: RuleGetRequest = serde_json::from_value(valid.clone()).unwrap();
+        assert_eq!(request, RuleGetRequest::new("rule-1"));
+        request.validate().unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), valid);
+
+        for invalid in [
+            json!({}),
+            json!({"id":null}),
+            json!({"id":1}),
+            json!({"id":false}),
+            json!({"id":""}),
+            json!({"id":" \t "}),
+            json!({"id":"rule-1","extra":0}),
+        ] {
+            assert!(serde_json::from_value::<RuleGetRequest>(invalid).is_err());
+        }
+        assert!(RuleGetRequest::new(" ").validate().is_err());
     }
 
     #[test]

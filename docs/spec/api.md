@@ -66,12 +66,13 @@ rule actions have bounded derived ids. No general receipt/floor framework.
 | `agent.git/edits` | current Git snapshot and paginated native-attributed edits |
 | `command.submit/get/children/resolve` | immutable admission, linked commands, child readback and constrained resolution |
 | `turn.get/resolve` | running/completed/unknown turn; constrained owner assertion |
+| `rule.get` | owner-only read of one startup-loaded global rule state |
 | `events.read/subscribe` | persisted replay plus bounded live delivery |
 | `agent.discover` | owner-only native metadata discovery, without creating Agents |
 | `agent.history` | owner-only bounded history of an exact observed subject |
 | `hook.event` | later exact request/deadline decision |
 | `mail.send/inbox/read/ack`, `var.*`, `who`, `claim.*` | later coordination |
-| `rule.*`, `timer.*`, `goal.*` | later automation; effects remain commands |
+| `rule.*` except `rule.get`, `timer.*`, `goal.*` | later automation; effects remain commands |
 
 Canonical public wire types are re-exported by
 [`eliot_core::api`](../../crates/eliot-core/src/api.rs). These DTOs and their validators
@@ -110,6 +111,11 @@ The seven view calls use the Core view DTOs linked above. `daemon.status` is own
 and accepts an empty object. Its bounded blocker/command lists retain truncation flags;
 unknown commands remain unknown. Agent list observations appear only when requested.
 Absent source cursors and sequence/acknowledgement values remain null.
+
+`rule.get` uses the typed Core `RuleGetRequest`/`RuleStateView`, is owner-only, and
+reads the current loaded rule state and durable cursor. It does not reload configuration
+or advance the cursor. The first connected event-rule subset is described in
+[automation](automation.md#first-connected-event-slice).
 
 `agent.get` includes the current generation's source rows and the managed workspace
 target generation's rows when it differs. If persisted state requires a live owner and
@@ -565,6 +571,7 @@ eliot history A --view subject|turns|items [--source native|rollout] [--turn-id 
 eliot detach A [--generation N]
 eliot provider holds [--after SCOPE] [--limit N]
 eliot provider clear-hold SCOPE --corrective-evidence credentials_updated|configuration_updated|owner_verified [--expected-probe-command ID]
+eliot rule show ID
 eliot plugin NAME | plugin-test ... | hook ... | mcp
 ```
 

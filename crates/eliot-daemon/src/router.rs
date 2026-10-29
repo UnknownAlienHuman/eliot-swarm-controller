@@ -18,8 +18,8 @@ use eliot_core::{
         EventsFilter, EventsReadRequest, EventsReadResponse, EventsSubscribeRequest,
         EventsSubscribeResponse, GitView, MAX_OBSERVATION_PAGE_BYTES, ObservationPage,
         ObservationQuery, ObservationView, ProcessPageCursor, ProviderClearHoldRequest,
-        ProviderHoldsRequest, ShutdownMode, SourceState, StatusBlocker, TurnGetRequest,
-        UnsettledCommandSummary, WorkspaceCustodyView,
+        ProviderHoldsRequest, RuleGetRequest, RuleStateView, ShutdownMode, SourceState,
+        StatusBlocker, TurnGetRequest, UnsettledCommandSummary, WorkspaceCustodyView,
     },
     classify_dispatched_error,
 };
@@ -89,6 +89,11 @@ struct EventFilter {
     agents: HashSet<String>,
     kinds: HashSet<String>,
     sources: HashSet<String>,
+}
+
+pub(crate) struct PreparedSubmission {
+    pub(crate) request: SubmitCommand,
+    pub(crate) workspace: Option<WorkspacePreparationInput>,
 }
 
 #[derive(serde::Deserialize)]
@@ -188,6 +193,7 @@ impl Router {
             "turn.get" => self.turn_get(&params, &principal).await,
             "events.read" => self.events_read(&params, &principal).await,
             "events.subscribe" => self.events_subscribe(&params, &principal).await,
+            "rule.get" => self.rule_get(&params, &principal).await,
             "provider.holds" => self.provider_holds(&params, &principal).await,
             "provider.clear_hold" => self.provider_clear_hold(&params, &principal).await,
             _ => Err(Error::new(
@@ -212,10 +218,12 @@ impl Router {
         self.signal_progress();
     }
 
-    pub(crate) fn request_force(&self) {
+    pub(crate) async fn request_force(&self) {
         self.inner.plugin_host.close_discovery_admission();
+        let _store = self.inner.store.lock().await;
         self.inner.mode.store(MODE_FORCE, Ordering::SeqCst);
         self.inner.shutdown_ready.store(true, Ordering::SeqCst);
+        drop(_store);
         self.signal_progress();
     }
 
@@ -273,7 +281,7 @@ impl Router {
                     })
                     .map(|linked| linked.id)
             };
-            tokio::spawn(self.clone().process_command(id, linked));
+            self.schedule_command(id, linked);
         }
         self.signal_progress();
         Ok(())
@@ -401,134 +409,13 @@ impl Router {
     }
 
     async fn submit(&self, params: &Value, principal: &Principal) -> Result<Value> {
-        let mut request: CommandSubmitRequest = serde_json::from_value(params.clone())
+        let request: CommandSubmitRequest = serde_json::from_value(params.clone())
             .map_err(|_| Error::new("invalid", "command.submit params are malformed"))?;
-        authorize_command(principal, &mut request)?;
-        if request.probe && request.verb != "send" {
-            return Err(Error::new(
-                "unsupported",
-                "only an explicit send may probe a provider hold",
-            ));
-        }
-        if matches!(request.verb.as_str(), "attach" | "detach") {
-            require_owner(principal)?;
-        }
-        if request.verb == "worktree.remove" {
-            require_owner(principal)?;
-        }
-        if is_native_control_verb(&request.verb)
-            && let Some(target) = request.target.as_deref()
-        {
-            let store = self.inner.store.lock().await;
-            // Preserve idempotent command retries; Store checks new controls
-            // transactionally after resolving an existing command binding.
-            if store.get_command(&request.id)?.is_none() {
-                let agent = store.get_agent(target)?.ok_or_else(|| {
-                    Error::new("not_found", format!("Agent {target} was not found"))
-                })?;
-                if agent.observe_only {
-                    return Err(Error::new(
-                        "not_allowed",
-                        "native control is unavailable for an observe-only Agent",
-                    ));
-                }
-            }
-        }
-        let mode = self.inner.mode.load(Ordering::SeqCst);
-        if mode == MODE_FORCE {
-            return Err(Error::new("unavailable", "daemon is forcing shutdown"));
-        }
-        if request.verb == "detach" {
-            self.hydrate_detach_generation(&mut request).await?;
-        }
-        if matches!(
-            request.verb.as_str(),
-            "launch" | "resume" | "send" | "attach"
-        ) && mode != MODE_OPEN
-        {
-            return Err(Error::new(
-                "unavailable",
-                "daemon is draining and rejects new launch, resume, send, or attach commands",
-            ));
-        }
-        let mut preparation = None;
-        if request.verb == "launch" {
-            reject_launch_derived_keys(&request.args)?;
-            if self.hydrate_retained_launch(&mut request).await? {
-                preparation = retained_preparation(&request.args)?;
-            } else {
-                let frozen = async {
-                    normalize_launch(&mut request)?;
-                    self.freeze_launch_admission(&mut request).await
-                }
-                .await;
-                preparation = match frozen {
-                    Ok(input) => input,
-                    Err(error) => {
-                        // Another identical admission can win while config/Git
-                        // readback is in flight. Reuse its original frozen input.
-                        if self.hydrate_retained_launch(&mut request).await? {
-                            retained_preparation(&request.args)?
-                        } else {
-                            return Err(error);
-                        }
-                    }
-                };
-            }
-        } else if request.verb == "attach" {
-            normalize_attach(&request)?;
-            if !self.hydrate_retained_attach(&mut request).await?
-                && let Err(error) = freeze_attach_profile(&self.inner.data_root, &mut request)
-                && !self.hydrate_retained_attach(&mut request).await?
-            {
-                return Err(error);
-            }
-        } else if request.verb == "resume" {
-            normalize_resume(&mut request)?;
-        } else if matches!(
-            request.verb.as_str(),
-            "send" | "steer" | "interrupt" | "approve" | "deny" | "answer"
-        ) {
-            validate_plugin_command_args(&request)?;
-        }
-        if contains_known_secret(&request.args, &self.inner.secrets) {
-            return Err(Error::new(
-                "secret_in_payload",
-                "durable command text contains a known credential",
-            ));
-        }
-        if let Some(input) = &preparation {
-            let metadata = serde_json::to_value(input)
-                .map_err(|_| Error::new("internal", "workspace input could not be encoded"))?;
-            if contains_known_secret(&metadata, &self.inner.secrets) {
-                return Err(Error::new(
-                    "secret_in_payload",
-                    "workspace input contains a known credential",
-                ));
-            }
-        }
-        if request.request_id.as_deref().is_some_and(|value| {
-            contains_known_secret(&Value::String(value.to_owned()), &self.inner.secrets)
-        }) || request.expected_turn_id.as_deref().is_some_and(|value| {
-            contains_known_secret(&Value::String(value.to_owned()), &self.inner.secrets)
-        }) {
-            return Err(Error::new(
-                "secret_in_payload",
-                "durable command binding contains a known credential",
-            ));
-        }
-        if matches!(request.verb.as_str(), "launch" | "resume" | "send")
-            && request
-                .args
-                .get("text")
-                .and_then(Value::as_str)
-                .is_some_and(|text| text.len() > MAX_EVENT_BYTES)
-        {
-            return Err(Error::new(
-                "frame_too_large",
-                "command text exceeds the 64 KiB persisted-text limit",
-            ));
-        }
+        let prepared = self.prepare_submission(request, principal).await?;
+        let PreparedSubmission {
+            mut request,
+            workspace: mut preparation,
+        } = prepared;
 
         let admission = {
             let mut store = self.inner.store.lock().await;
@@ -577,8 +464,7 @@ impl Router {
                 .linked_command
                 .as_ref()
                 .map(|command| command.id.clone());
-            let router = self.clone();
-            tokio::spawn(router.process_command(command_id, linked_id));
+            self.schedule_command(command_id, linked_id);
         }
         self.signal_progress();
         serde_json::to_value(submit_result(
@@ -586,6 +472,148 @@ impl Router {
             admission.linked_command.as_ref(),
         ))
         .map_err(|_| Error::new("internal", "command admission result could not be encoded"))
+    }
+
+    pub(crate) async fn prepare_owner_submission(
+        &self,
+        request: SubmitCommand,
+    ) -> Result<PreparedSubmission> {
+        self.prepare_submission(request, &Principal::Owner).await
+    }
+
+    async fn prepare_submission(
+        &self,
+        mut request: SubmitCommand,
+        principal: &Principal,
+    ) -> Result<PreparedSubmission> {
+        authorize_command(principal, &mut request)?;
+        if request.probe && request.verb != "send" {
+            return Err(Error::new(
+                "unsupported",
+                "only an explicit send may probe a provider hold",
+            ));
+        }
+        if matches!(request.verb.as_str(), "attach" | "detach") {
+            require_owner(principal)?;
+        }
+        if request.verb == "worktree.remove" {
+            require_owner(principal)?;
+        }
+        if is_native_control_verb(&request.verb)
+            && let Some(target) = request.target.as_deref()
+        {
+            let store = self.inner.store.lock().await;
+            // Preserve idempotent command retries; Store checks new controls
+            // transactionally after resolving an existing command binding.
+            if store.get_command(&request.id)?.is_none() {
+                let agent = store.get_agent(target)?.ok_or_else(|| {
+                    Error::new("not_found", format!("Agent {target} was not found"))
+                })?;
+                if agent.observe_only {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "native control is unavailable for an observe-only Agent",
+                    ));
+                }
+            }
+        }
+        let mode = self.inner.mode.load(Ordering::SeqCst);
+        if mode == MODE_FORCE {
+            return Err(Error::new("unavailable", "daemon is forcing shutdown"));
+        }
+        if request.verb == "detach" {
+            self.hydrate_detach_generation(&mut request).await?;
+        }
+        if matches!(
+            request.verb.as_str(),
+            "launch" | "resume" | "send" | "attach"
+        ) && mode != MODE_OPEN
+        {
+            return Err(Error::new(
+                "unavailable",
+                "daemon is draining and rejects new launch, resume, send, or attach commands",
+            ));
+        }
+        let mut workspace = None;
+        if request.verb == "launch" {
+            reject_launch_derived_keys(&request.args)?;
+            if self.hydrate_retained_launch(&mut request).await? {
+                workspace = retained_preparation(&request.args)?;
+            } else {
+                let frozen = async {
+                    normalize_launch(&mut request)?;
+                    self.freeze_launch_admission(&mut request).await
+                }
+                .await;
+                workspace = match frozen {
+                    Ok(input) => input,
+                    Err(error) => {
+                        // Another identical admission can win while config/Git
+                        // readback is in flight. Reuse its original frozen input.
+                        if self.hydrate_retained_launch(&mut request).await? {
+                            retained_preparation(&request.args)?
+                        } else {
+                            return Err(error);
+                        }
+                    }
+                };
+            }
+        } else if request.verb == "attach" {
+            normalize_attach(&request)?;
+            if !self.hydrate_retained_attach(&mut request).await?
+                && let Err(error) = freeze_attach_profile(&self.inner.data_root, &mut request)
+                && !self.hydrate_retained_attach(&mut request).await?
+            {
+                return Err(error);
+            }
+        } else if request.verb == "resume" {
+            normalize_resume(&mut request)?;
+        } else if matches!(
+            request.verb.as_str(),
+            "send" | "steer" | "interrupt" | "approve" | "deny" | "answer"
+        ) {
+            validate_plugin_command_args(&request)?;
+        }
+        if contains_known_secret(&request.args, &self.inner.secrets) {
+            return Err(Error::new(
+                "secret_in_payload",
+                "durable command text contains a known credential",
+            ));
+        }
+        if let Some(input) = &workspace {
+            let metadata = serde_json::to_value(input)
+                .map_err(|_| Error::new("internal", "workspace input could not be encoded"))?;
+            if contains_known_secret(&metadata, &self.inner.secrets) {
+                return Err(Error::new(
+                    "secret_in_payload",
+                    "workspace input contains a known credential",
+                ));
+            }
+        }
+        if request.request_id.as_deref().is_some_and(|value| {
+            contains_known_secret(&Value::String(value.to_owned()), &self.inner.secrets)
+        }) || request.expected_turn_id.as_deref().is_some_and(|value| {
+            contains_known_secret(&Value::String(value.to_owned()), &self.inner.secrets)
+        }) {
+            return Err(Error::new(
+                "secret_in_payload",
+                "durable command binding contains a known credential",
+            ));
+        }
+        if matches!(request.verb.as_str(), "launch" | "resume" | "send")
+            && request
+                .args
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.len() > MAX_EVENT_BYTES)
+        {
+            return Err(Error::new(
+                "frame_too_large",
+                "command text exceeds the 64 KiB persisted-text limit",
+            ));
+        }
+
+        Ok(PreparedSubmission { request, workspace })
     }
 
     async fn hydrate_retained_launch(&self, request: &mut SubmitCommand) -> Result<bool> {
@@ -736,6 +764,141 @@ impl Router {
         self.signal_progress();
         serde_json::to_value(change.value)
             .map_err(|_| Error::new("internal", "provider correction could not be encoded"))
+    }
+
+    async fn rule_get(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        require_owner(principal)?;
+        let request: RuleGetRequest = serde_json::from_value(params.clone())
+            .map_err(|_| Error::new("invalid", "rule.get params are invalid"))?;
+        request.validate()?;
+        let state = self
+            .inner
+            .store
+            .lock()
+            .await
+            .get_rule_state("owner", &request.id)?
+            .ok_or_else(|| Error::new("not_found", "rule was not found"))?;
+        request.validate_response(&state)?;
+        serde_json::to_value(state)
+            .map_err(|_| Error::new("internal", "rule state could not be encoded"))
+    }
+
+    pub(crate) async fn initialize_global_rules(
+        &self,
+        definitions: &[eliot_store::RuleDefinitionInput],
+    ) -> Result<Vec<RuleStateView>> {
+        let mut store = self.inner.store.lock().await;
+        let now = now_ms();
+        definitions
+            .iter()
+            .map(|definition| store.ensure_rule_state("owner", definition, now))
+            .collect()
+    }
+
+    pub(crate) fn subscribe_rule_events(&self) -> broadcast::Receiver<Event> {
+        self.inner.bus.subscribe()
+    }
+
+    pub(crate) async fn rule_high_water(&self) -> Result<i64> {
+        self.inner.store.lock().await.high_water()
+    }
+
+    pub(crate) async fn read_rule_events(
+        &self,
+        after: i64,
+        through: i64,
+        limit: usize,
+    ) -> Result<Vec<Event>> {
+        self.inner
+            .store
+            .lock()
+            .await
+            .read_events(after, limit, Some(through))
+    }
+
+    pub(crate) fn rule_firings_open(&self) -> bool {
+        self.inner.mode.load(Ordering::SeqCst) == MODE_OPEN
+    }
+
+    pub(crate) async fn advance_rule_cursor(
+        &self,
+        state: &RuleStateView,
+        through: i64,
+        outcome: eliot_store::RuleCursorOutcome,
+    ) -> Result<RuleStateView> {
+        let report = matches!(
+            &outcome,
+            eliot_store::RuleCursorOutcome::Rejected { .. }
+                | eliot_store::RuleCursorOutcome::Disabled
+        );
+        let change = {
+            let mut store = self.inner.store.lock().await;
+            let change = store.advance_rule_cursor("owner", state, through, outcome, now_ms())?;
+            if report {
+                self.publish_locked(&change.events);
+            }
+            change
+        };
+        if report && !change.events.is_empty() {
+            self.signal_progress();
+        }
+        Ok(change.value)
+    }
+
+    pub(crate) async fn admit_rule_stop(
+        &self,
+        state: &RuleStateView,
+        event_seq: i64,
+        prepared: PreparedSubmission,
+    ) -> Result<Option<eliot_store::RuleEventAdmission>> {
+        let PreparedSubmission { request, workspace } = prepared;
+        if request.verb != "stop" || workspace.is_some() {
+            return Err(Error::new(
+                "invalid",
+                "rule firing must contain one prepared stop command",
+            ));
+        }
+        let admission = {
+            let mut store = self.inner.store.lock().await;
+            if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
+                return Ok(None);
+            }
+            let admission = store.admit_rule_stop("owner", state, event_seq, request, now_ms())?;
+            self.publish_locked(&admission.events);
+            admission
+        };
+        if admission.is_new
+            && let Some(child) = &admission.child
+            && matches!(child.state, CommandState::Accepted | CommandState::Queued)
+        {
+            self.schedule_command(child.id.clone(), None);
+        }
+        self.signal_progress();
+        Ok(Some(admission))
+    }
+
+    pub(crate) async fn recover_rule_children(&self, limit: usize) -> Result<()> {
+        let mut after = None;
+        loop {
+            let children = {
+                let store = self.inner.store.lock().await;
+                store.recover_rule_children(after.as_deref(), limit)?
+            };
+            let page_len = children.len();
+            if page_len == 0 {
+                break;
+            }
+            for child in children {
+                after = Some(child.id.clone());
+                if matches!(child.state, CommandState::Accepted | CommandState::Queued) {
+                    self.schedule_command(child.id, None);
+                }
+            }
+            if page_len < limit {
+                break;
+            }
+        }
+        Ok(())
     }
 
     async fn command_get(&self, params: &Value, principal: &Principal) -> Result<Value> {
@@ -1595,7 +1758,7 @@ impl Router {
             .map_err(|_| Error::new("internal", "shutdown result could not be encoded"))?;
         let write = {
             let mut store = self.inner.store.lock().await;
-            match store.record_write(
+            let write = match store.record_write(
                 id,
                 &principal_name(principal),
                 "daemon.shutdown",
@@ -1606,7 +1769,19 @@ impl Router {
                 Ok(write) => Some(write.result),
                 Err(_error) if mode == ShutdownMode::Force && store.is_write_faulted() => None,
                 Err(error) => return Err(error),
-            }
+            };
+            // Rule admissions serialize their final mode check under this same
+            // writer guard, so no firing crosses the drain/force boundary.
+            self.inner.mode.fetch_max(
+                if mode == ShutdownMode::Force {
+                    MODE_FORCE
+                } else {
+                    MODE_DRAIN
+                },
+                Ordering::SeqCst,
+            );
+            self.inner.shutdown_ready.store(false, Ordering::SeqCst);
+            write
         };
         // Decode the retained receipt, never replace it with the newly computed
         // candidate. A bad receipt must not undo an already admitted shutdown.
@@ -1621,19 +1796,13 @@ impl Router {
             }),
         };
         self.inner.plugin_host.close_discovery_admission();
-        // Retried or in-flight drain requests must never reopen forcing admission.
-        self.inner.mode.fetch_max(
-            if mode == ShutdownMode::Force {
-                MODE_FORCE
-            } else {
-                MODE_DRAIN
-            },
-            Ordering::SeqCst,
-        );
-        self.inner.shutdown_ready.store(false, Ordering::SeqCst);
         self.signal_progress();
         serde_json::to_value(response?)
             .map_err(|_| Error::new("internal", "shutdown result could not be encoded"))
+    }
+
+    pub(crate) fn schedule_command(&self, id: String, linked_id: Option<String>) {
+        tokio::spawn(self.clone().process_command(id, linked_id));
     }
 
     fn process_command(self, id: String, linked_id: Option<String>) -> BoxFuture<'static, ()> {
@@ -1836,7 +2005,7 @@ impl Router {
                             .settle(&id, CommandState::Applied, Some(json!({"state": "ready"})))
                             .await;
                         if let Some(linked_id) = linked_id {
-                            tokio::spawn(self.clone().process_command(linked_id, None));
+                            self.schedule_command(linked_id, None);
                         }
                         Ok(value)
                     }

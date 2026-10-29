@@ -1,8 +1,28 @@
-//! Pure binding checks for the three implemented result-read callers.
+//! Pure binding checks for implemented read callers.
 //! These checks do not settle commands, repair replies, or interpret their state.
 
-use super::{AgentResultRequest, AgentResultResponse, CommandGetRequest, TurnGetRequest};
+use super::{
+    AgentResultRequest, AgentResultResponse, CommandGetRequest, RuleGetRequest, RuleStateView,
+    TurnGetRequest,
+};
 use crate::{Command, CommandState, Error, Result, Turn};
+
+impl RuleGetRequest {
+    pub fn validate_response(&self, response: &RuleStateView) -> Result<()> {
+        if self.validate().is_err()
+            || response.id != self.id
+            || response.revision < 0
+            || response.current_cursor < 0
+            || response
+                .paused_reason
+                .as_deref()
+                .is_some_and(|reason| reason.trim().is_empty())
+        {
+            return Err(binding_mismatch());
+        }
+        Ok(())
+    }
+}
 
 impl CommandGetRequest {
     pub fn validate_response(&self, response: &Command) -> Result<()> {
@@ -139,6 +159,47 @@ mod tests {
             started_at: Some(0),
             completed_at: None,
         }
+    }
+
+    #[test]
+    fn rule_get_response_binds_rule_and_validates_cursor_state() {
+        let request = RuleGetRequest::new("rule-1");
+        let response = RuleStateView {
+            id: "rule-1".to_owned(),
+            revision: 1,
+            current_cursor: 12,
+            enabled: true,
+            paused_reason: None,
+        };
+        request.validate_response(&response).unwrap();
+
+        let wire = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            wire,
+            json!({
+                "id":"rule-1",
+                "revision":1,
+                "current_cursor":12,
+                "enabled":true
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<RuleStateView>(wire).unwrap(),
+            response
+        );
+
+        let mut invalid = response.clone();
+        invalid.id = "rule-2".to_owned();
+        assert_unknown(request.validate_response(&invalid));
+        invalid = response.clone();
+        invalid.revision = -1;
+        assert_unknown(request.validate_response(&invalid));
+        invalid = response.clone();
+        invalid.current_cursor = -1;
+        assert_unknown(request.validate_response(&invalid));
+        invalid = response;
+        invalid.paused_reason = Some(" \t ".to_owned());
+        assert_unknown(request.validate_response(&invalid));
     }
 
     fn request(generation: Option<i64>, turn_id: Option<&str>, limit: usize) -> AgentResultRequest {

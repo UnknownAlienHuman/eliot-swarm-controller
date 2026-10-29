@@ -1,4 +1,5 @@
 use crate::{
+    automation,
     bus::Bus,
     common::now_ms,
     logging,
@@ -27,6 +28,7 @@ use ulid::Ulid;
 
 const MAX_RPC_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CLIENTS: usize = 128;
+const RULE_CHILD_RECOVERY_PAGE_SIZE: usize = 1_000;
 const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(35);
 
 /// Open the private local daemon, recover durable state without replaying any
@@ -74,6 +76,8 @@ async fn run_owned(
         events
     };
     router.note_events(&recovered);
+    // Parse global definitions and seed only new rules before publishing ready.
+    let global_rules = automation::initialize_global_rules(&router, data_dir.path()).await?;
 
     let mut listener = IpcListener::bind(data_dir, daemon_lock).await?;
     let info =
@@ -87,6 +91,20 @@ async fn run_owned(
     let mut recovery = JoinSet::new();
     let recovery_router = router.clone();
     recovery.spawn(async move { recovery_router.recover_workspaces().await });
+    let (automation_stop, automation_shutdown) = watch::channel(false);
+    let mut automation_tasks = JoinSet::new();
+    let rule_recovery_router = router.clone();
+    automation_tasks.spawn(async move {
+        rule_recovery_router
+            .recover_rule_children(RULE_CHILD_RECOVERY_PAGE_SIZE)
+            .await
+    });
+    if !global_rules.is_empty() {
+        let rule_router = router.clone();
+        automation_tasks.spawn(async move {
+            automation::run_global_rules(rule_router, global_rules, automation_shutdown).await
+        });
+    }
     let mut progress = router.progress_receiver();
     let mut connections = JoinSet::new();
     let outcome = loop {
@@ -148,6 +166,17 @@ async fn run_owned(
                     }
                 }
             }
+            joined = automation_tasks.join_next(), if !automation_tasks.is_empty() => {
+                match joined {
+                    Some(Ok(Err(error))) => {
+                        logging::record(&policy, "daemon.rule_worker_failed", &[], Some(&error));
+                    }
+                    Some(Err(_)) => {
+                        logging::record(&policy, "daemon.rule_worker_task_failed", &[], None);
+                    }
+                    _ => {}
+                }
+            }
             joined = connections.join_next(), if !connections.is_empty() => {
                 if matches!(joined, Some(Err(_))) {
                     logging::record(&policy, "daemon.connection_task_failed", &[], None);
@@ -162,13 +191,23 @@ async fn run_owned(
                     ));
                 }
                 logging::record(&policy, "daemon.force_requested", &[], None);
-                router.request_force();
+                router.request_force().await;
             }
         }
     };
 
     if outcome.is_err() {
-        router.request_force();
+        router.request_force().await;
+    }
+    automation_stop.send_replace(true);
+    while let Some(joined) = automation_tasks.join_next().await {
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                logging::record(&policy, "daemon.rule_worker_failed", &[], Some(&error));
+            }
+            Err(_) => logging::record(&policy, "daemon.rule_worker_task_failed", &[], None),
+        }
     }
     if router.is_force_requested() {
         router.force_owned_processes().await;

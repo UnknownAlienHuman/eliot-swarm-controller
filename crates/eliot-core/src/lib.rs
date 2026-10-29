@@ -381,6 +381,28 @@ impl Agent {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventSubject {
+    pub project: String,
+    pub harness: String,
+    pub profile: String,
+    pub state: AgentState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+}
+
+impl From<&Agent> for EventSubject {
+    fn from(agent: &Agent) -> Self {
+        Self {
+            project: agent.project.clone(),
+            harness: agent.harness.clone(),
+            profile: agent.profile.clone(),
+            state: agent.state,
+            workspace: agent.workspace.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandState {
@@ -430,6 +452,8 @@ pub struct Event {
     pub ts: i64,
     pub kind: String,
     pub agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<EventSubject>,
     pub generation: Option<i64>,
     pub source: String,
     pub native_id: Option<String>,
@@ -1033,6 +1057,42 @@ fn bad_state(event: &NativeEvent, message: &str) -> Error {
 mod live_wire_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn event_without_subject_preserves_legacy_wire_and_deserializes() {
+        let event = Event {
+            seq: 9,
+            ts: 10,
+            kind: "turn.completed".to_owned(),
+            agent: Some("agent-1".to_owned()),
+            subject: None,
+            generation: Some(3),
+            source: "core".to_owned(),
+            native_id: None,
+            data: json!({"status":"completed"}),
+        };
+        let legacy_wire = r#"{"seq":9,"ts":10,"kind":"turn.completed","agent":"agent-1","generation":3,"source":"core","native_id":null,"data":{"status":"completed"}}"#;
+        assert_eq!(serde_json::to_string(&event).unwrap(), legacy_wire);
+        assert_eq!(serde_json::from_str::<Event>(legacy_wire).unwrap(), event);
+    }
+
+    #[test]
+    fn event_subject_is_a_pure_agent_snapshot() {
+        let mut agent = Agent::new("agent-1", "project-1", "codex", "luna", 0);
+        agent.state = AgentState::Busy;
+        agent.workspace = Some("workspace-1".to_owned());
+
+        assert_eq!(
+            EventSubject::from(&agent),
+            EventSubject {
+                project: "project-1".to_owned(),
+                harness: "codex".to_owned(),
+                profile: "luna".to_owned(),
+                state: AgentState::Busy,
+                workspace: Some("workspace-1".to_owned()),
+            }
+        );
+    }
 
     #[test]
     fn native_timestamp_none_preserves_legacy_wire_and_event_array_digest() {

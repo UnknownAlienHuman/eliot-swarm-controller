@@ -2483,9 +2483,26 @@ fn capacity_migration_uses_commands_and_physical_facts_without_rewriting_snapsho
                  profile_snapshot TEXT NOT NULL
              );
              CREATE TABLE commands(
-                 id TEXT PRIMARY KEY, target INTEGER, verb TEXT,
-                 generation INTEGER, state TEXT
+                 id TEXT PRIMARY KEY, principal TEXT NOT NULL, method TEXT NOT NULL,
+                 payload_digest BLOB NOT NULL, target INTEGER REFERENCES agents(id),
+                 expected_generation INTEGER, generation INTEGER, expected_turn_id TEXT,
+                 parent_command TEXT REFERENCES commands(id), link_kind TEXT, ordinal INTEGER,
+                 turn_id TEXT, request_id TEXT, verb TEXT NOT NULL, args TEXT NOT NULL,
+                 state TEXT NOT NULL, outcome TEXT, created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL,
+                 CHECK((parent_command IS NULL AND link_kind IS NULL AND ordinal IS NULL)
+                    OR (parent_command IS NOT NULL AND link_kind IS NOT NULL
+                        AND ordinal IS NOT NULL AND ordinal >= 0))
              );
+             CREATE INDEX commands_target ON commands(target, created_at);
+             CREATE INDEX commands_open ON commands(state)
+                 WHERE state IN ('accepted', 'queued', 'dispatched', 'unknown');
+             CREATE UNIQUE INDEX commands_children
+                 ON commands(parent_command, ordinal)
+                 WHERE parent_command IS NOT NULL;
+             CREATE INDEX commands_request_open
+                 ON commands(target, generation, request_id, state)
+                 WHERE request_id IS NOT NULL;
              CREATE TABLE events(
                  agent INTEGER, generation INTEGER, family TEXT,
                  kind TEXT, source TEXT, data TEXT
@@ -2517,13 +2534,16 @@ fn capacity_migration_uses_commands_and_physical_facts_without_rewriting_snapsho
             .expect("insert v8 Agent");
         }
         old.execute(
-            "INSERT INTO commands(id, target, verb, generation, state)
-             VALUES ('pending-launch',1,'launch',0,'accepted'),
-                    ('rejected-launch',2,'launch',0,'rejected'),
-                    ('unknown-launch',3,'launch',1,'unknown'),
-                    ('rejected-dispatched-start',8,'launch',1,'rejected'),
-                    ('rejected-resume',9,'resume',1,'rejected'),
-                    ('pending-resume',10,'resume',1,'accepted')",
+            "INSERT INTO commands(
+                 id, principal, method, payload_digest, target, generation,
+                 verb, args, state, created_at, updated_at
+             ) VALUES
+                 ('pending-launch','owner','command.submit',zeroblob(32),1,0,'launch','{}','accepted',1,1),
+                 ('rejected-launch','owner','command.submit',zeroblob(32),2,0,'launch','{}','rejected',2,2),
+                 ('unknown-launch','owner','command.submit',zeroblob(32),3,1,'launch','{}','unknown',3,3),
+                 ('rejected-dispatched-start','owner','command.submit',zeroblob(32),8,1,'launch','{}','rejected',4,4),
+                 ('rejected-resume','owner','command.submit',zeroblob(32),9,1,'resume','{}','rejected',5,5),
+                 ('pending-resume','owner','command.submit',zeroblob(32),10,1,'resume','{}','accepted',6,6)",
             [],
         )
         .expect("insert retained start commands");
@@ -2729,4 +2749,97 @@ fn stop_and_source_closure_alone_do_not_release_capacity_or_fail_host_settlement
     assert!(events.iter().any(|event| event.kind == "capacity.released"));
     assert_eq!(capacity_generation(&store, &agent), None);
     assert!(numeric_agent > 0);
+}
+
+#[test]
+fn event_subject_is_persisted_at_write_time_without_changing_native_data_digest() {
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+    let project = "event-subject-snapshot";
+    let launch_id = Ulid::new().to_string();
+    let mut request = SubmitCommand::new(launch_id.clone(), "launch");
+    request.args = json!({"project":project, "workspace":"synthetic-workspace"});
+    request.expected_generation = Some(0);
+    let admission = store.submit("owner", request, now).unwrap();
+    let agent = admission.command.target.clone().unwrap();
+    let created = admission
+        .events
+        .iter()
+        .find(|event| event.kind == "agent.created")
+        .unwrap();
+    let created_subject = created.subject.as_ref().unwrap();
+    assert_eq!(created_subject.project, project);
+    assert_eq!(created_subject.harness, "fake");
+    assert_eq!(created_subject.state, AgentState::Created);
+
+    let dispatched = store.dispatch(&launch_id, now + 1).unwrap();
+    let starting = dispatched
+        .events
+        .iter()
+        .find(|event| event.kind == "agent.starting")
+        .unwrap();
+    assert_eq!(starting.generation, Some(1));
+    assert_eq!(
+        starting.subject.as_ref().unwrap().state,
+        AgentState::Starting
+    );
+
+    let native = NativeEvent {
+        kind: "session.ready".to_owned(),
+        native_id: format!("{project}:ready"),
+        data: json!({"command_id":launch_id}),
+        ts: None,
+    };
+    let batch = store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("{project}:ready"),
+                agent_id: agent,
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![native.clone()],
+                cursor: None,
+            },
+            now + 2,
+        )
+        .unwrap();
+    let ready = batch
+        .events
+        .iter()
+        .find(|event| event.kind == "session.ready")
+        .unwrap();
+    assert_eq!(ready.subject.as_ref().unwrap().state, AgentState::Idle);
+    assert_eq!(ready.data, native.data);
+    let ready_agent = ready.agent.as_deref().unwrap();
+    let ready_agent_num = eliot_core::parse_agent_id(ready_agent).unwrap();
+    let ready_generation = ready.generation.unwrap();
+    let ready_native_id = ready.native_id.as_deref().unwrap();
+    let stored_digest: Vec<u8> = store
+        .connection
+        .query_row(
+            "SELECT payload_digest FROM events WHERE seq = ?1 AND agent = ?2
+             AND generation = ?3 AND source = 'stream' AND native_id = ?4",
+            rusqlite::params![
+                ready.seq,
+                ready_agent_num,
+                ready_generation,
+                ready_native_id
+            ],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        stored_digest,
+        super::canonical::digest(&native.semantic_value()).unwrap()
+    );
+    store
+        .settle(&launch_id, CommandState::Applied, None, now + 3)
+        .unwrap();
+
+    let reread = store
+        .read_events(ready.seq - 1, 1, Some(ready.seq))
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(reread.subject, ready.subject);
 }
