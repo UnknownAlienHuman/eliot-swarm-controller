@@ -14,7 +14,7 @@ use eliot_core::api::{
     DaemonStatusResponse, DiscoverPage, EventsFilter, EventsReadRequest, EventsReadResponse,
     EventsSubscribeRequest, EventsSubscribeResponse, MAX_OBSERVATION_CURSOR_BYTES, ObservationPage,
     PROCESS_CURSOR_MAX_BYTES, ProviderClearHoldResponse, ProviderHoldsResponse, RuleStateView,
-    ShutdownMode, TurnGetRequest,
+    ShutdownMode, TimerSchedule, TimerStateView, TurnGetRequest,
 };
 use eliot_core::{
     AgentState, Command as CoreCommand, CommandState, ProviderHoldState, ProviderRestrictionKind,
@@ -4205,5 +4205,226 @@ do = [{ action = "stop", target = "${event.agent}", expected_generation = "${eve
     let stopped_after_restart: AgentGetResponse =
         serde_json::from_value(fixture.json(&["show", &agent])).expect("retained stopped Agent");
     assert_eq!(stopped_after_restart.agent.state, AgentState::Stopped);
+    fixture.stop(false);
+}
+
+#[test]
+fn cli_fake_timer_tick_and_manual_replay_survive_restart() {
+    let mut fixture = Fixture::new("timer restart");
+    fixture.start();
+    fixture.stop(false);
+
+    let rules = fixture.data.join("rules");
+    fs::create_dir_all(&rules).expect("create timers under initialized private data root");
+    let rule_config = concat!(
+        "[[rule]]\n",
+        "id = \"scheduled-stop\"\n",
+        "on = { every = \"10s\" }\n",
+        "do = [{ action = \"stop\", target = \"a1\", expected_generation = 1 }]\n\n",
+        "[[rule]]\n",
+        "id = \"manual-stop\"\n",
+        "on = { every = \"1h\" }\n",
+        "do = [{ action = \"stop\", target = \"a2\", expected_generation = 1 }]\n",
+    );
+    fs::write(rules.join("timers.toml"), rule_config)
+        .expect("write timer rules with literal Agent generations");
+
+    let epoch_ms = || {
+        i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock is after the Unix epoch")
+                .as_millis(),
+        )
+        .expect("current epoch milliseconds fit signed range")
+    };
+    let registration_started_ms = epoch_ms();
+    fixture.start();
+    let scheduled: TimerStateView =
+        serde_json::from_value(fixture.json(&["timer", "show", "scheduled-stop"]))
+            .expect("typed scheduled timer state");
+    let registration_readback_ms = epoch_ms();
+    assert_eq!(scheduled.id, "scheduled-stop");
+    assert!(scheduled.enabled);
+    assert!(
+        (registration_started_ms..=registration_readback_ms).contains(&scheduled.anchor),
+        "omitted anchor was not captured during timer registration"
+    );
+    assert_eq!(
+        scheduled.schedule,
+        TimerSchedule::Interval {
+            period_ms: 10_000,
+            anchor: None,
+        }
+    );
+    assert_eq!(scheduled.next_due_at, Some(scheduled.anchor + 10_000));
+    assert_eq!(scheduled.last_key, None);
+
+    let manual_before: TimerStateView =
+        serde_json::from_value(fixture.json(&["timer", "show", "manual-stop"]))
+            .expect("typed manual timer state");
+    assert_eq!(
+        manual_before.schedule,
+        TimerSchedule::Interval {
+            period_ms: 3_600_000,
+            anchor: None,
+        }
+    );
+    assert_eq!(
+        manual_before.next_due_at,
+        Some(manual_before.anchor + 3_600_000)
+    );
+    assert_eq!(manual_before.last_key, None);
+
+    let first = fixture.json(&[
+        "launch",
+        "--profile",
+        "fake",
+        "--workspace",
+        fixture.workspace.to_str().unwrap(),
+    ]);
+    let second = fixture.json(&[
+        "launch",
+        "--profile",
+        "fake",
+        "--workspace",
+        fixture.workspace.to_str().unwrap(),
+    ]);
+    assert_eq!(first["target"], "a1");
+    assert_eq!(first["generation"], 1);
+    assert_eq!(second["target"], "a2");
+    assert_eq!(second["generation"], 1);
+
+    let manual_id = ulid::Ulid::new().to_string();
+    let manual_parent: CoreCommand =
+        serde_json::from_value(fixture.json(&["--id", &manual_id, "timer", "run", "manual-stop"]))
+            .expect("typed manual timer parent");
+    assert_eq!(manual_parent.id, manual_id);
+    assert_eq!(manual_parent.args["rule"], "manual-stop");
+    let manual_children = manual_parent
+        .outcome
+        .as_ref()
+        .expect("manual parent child set")["children"]
+        .as_array()
+        .expect("manual parent children array");
+    assert_eq!(manual_children.len(), 1);
+    let manual_child_id = manual_children[0]
+        .as_str()
+        .expect("manual stop child id")
+        .to_owned();
+    let manual_child: CoreCommand =
+        serde_json::from_value(fixture.wait_command(&manual_child_id, "applied"))
+            .expect("applied manual stop child");
+    assert_eq!(manual_child.verb, "stop");
+    assert_eq!(manual_child.target.as_deref(), Some("a2"));
+    assert_eq!(manual_child.expected_generation, Some(1));
+    assert_eq!(manual_child.generation, Some(1));
+
+    let replayed_parent: CoreCommand =
+        serde_json::from_value(fixture.json(&["--id", &manual_id, "timer", "run", "manual-stop"]))
+            .expect("same-ID manual timer replay");
+    assert_eq!(replayed_parent, manual_parent);
+    let manual_after: TimerStateView =
+        serde_json::from_value(fixture.json(&["timer", "show", "manual-stop"]))
+            .expect("manual timer schedule after replay");
+    assert_eq!(manual_after.anchor, manual_before.anchor);
+    assert_eq!(manual_after.last_key, manual_before.last_key);
+    assert_eq!(manual_after.next_due_at, manual_before.next_due_at);
+
+    let stop_dispatches = |events: &[Value], agent: &str| {
+        events
+            .iter()
+            .filter(|event| {
+                event["kind"] == "command.dispatched"
+                    && event["agent"] == agent
+                    && event["generation"] == 1
+                    && event["data"]["verb"] == "stop"
+            })
+            .count()
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let (scheduled_after_fire, scheduled_stop_id) = loop {
+        let state: TimerStateView =
+            serde_json::from_value(fixture.json(&["timer", "show", "scheduled-stop"]))
+                .expect("scheduled timer readback");
+        let events = fixture.events();
+        let stop = events.iter().find(|event| {
+            event["kind"] == "command.dispatched"
+                && event["agent"] == "a1"
+                && event["generation"] == 1
+                && event["data"]["verb"] == "stop"
+        });
+        if let (Some(_), Some(stop)) = (state.last_key, stop) {
+            break (
+                state,
+                stop["data"]["command_id"]
+                    .as_str()
+                    .expect("scheduled stop command id")
+                    .to_owned(),
+            );
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "scheduled timer stop deadline"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(scheduled_after_fire.last_key.unwrap() >= scheduled.anchor + 10_000);
+    let scheduled_child: CoreCommand =
+        serde_json::from_value(fixture.wait_command(&scheduled_stop_id, "applied"))
+            .expect("applied scheduled stop child");
+    assert_eq!(scheduled_child.verb, "stop");
+    assert_eq!(scheduled_child.target.as_deref(), Some("a1"));
+    assert_eq!(scheduled_child.expected_generation, Some(1));
+    assert_eq!(scheduled_child.generation, Some(1));
+    let stopped_first: AgentGetResponse =
+        serde_json::from_value(fixture.json(&["show", "a1"])).expect("stopped scheduled Agent");
+    assert_eq!(stopped_first.agent.state, AgentState::Stopped);
+    let events_before_restart = fixture.events();
+    assert_eq!(stop_dispatches(&events_before_restart, "a1"), 1);
+    assert_eq!(stop_dispatches(&events_before_restart, "a2"), 1);
+
+    fixture.stop(false);
+    fixture.start();
+    let scheduled_after_restart: TimerStateView =
+        serde_json::from_value(fixture.json(&["timer", "show", "scheduled-stop"]))
+            .expect("scheduled timer state after restart");
+    assert_eq!(scheduled_after_restart.id, scheduled_after_fire.id);
+    assert_eq!(
+        scheduled_after_restart.schedule_revision,
+        scheduled_after_fire.schedule_revision
+    );
+    assert_eq!(
+        scheduled_after_restart.schedule,
+        scheduled_after_fire.schedule
+    );
+    assert_eq!(scheduled_after_restart.anchor, scheduled_after_fire.anchor);
+    assert_eq!(
+        scheduled_after_restart.enabled,
+        scheduled_after_fire.enabled
+    );
+    assert!(scheduled_after_restart.last_key.is_some());
+    assert!(
+        scheduled_after_restart.last_key.unwrap() >= scheduled_after_fire.last_key.unwrap(),
+        "restart rewound the scheduled UTC slot key"
+    );
+    let manual_after_restart: TimerStateView =
+        serde_json::from_value(fixture.json(&["timer", "show", "manual-stop"]))
+            .expect("manual timer state after restart");
+    assert_eq!(
+        manual_after_restart.schedule_revision,
+        manual_before.schedule_revision
+    );
+    assert_eq!(manual_after_restart.schedule, manual_before.schedule);
+    assert_eq!(manual_after_restart.anchor, manual_before.anchor);
+    assert_eq!(manual_after_restart.last_key, manual_before.last_key);
+    assert_eq!(manual_after_restart.next_due_at, manual_before.next_due_at);
+    let events_after_restart = fixture.events();
+    assert_eq!(stop_dispatches(&events_after_restart, "a1"), 1);
+    assert_eq!(stop_dispatches(&events_after_restart, "a2"), 1);
+    let scheduled_after_restart_command: CoreCommand =
+        serde_json::from_value(fixture.json(&["cmd", "show", &scheduled_stop_id]))
+            .expect("retained scheduled stop child");
+    assert_eq!(scheduled_after_restart_command, scheduled_child);
     fixture.stop(false);
 }

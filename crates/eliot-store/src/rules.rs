@@ -45,16 +45,31 @@ struct StoredRuleState {
     definition_digest: [u8; 32],
 }
 
-struct RuleEventKey<'a> {
+#[derive(Clone, Copy)]
+enum RuleFiringIdentity {
+    Event {
+        event_seq: i64,
+    },
+    Timer {
+        schedule_revision: i64,
+        slot_ms: i64,
+    },
+    Manual,
+}
+
+struct RuleFiringKey<'a> {
     principal: &'a str,
     state: &'a core::api::RuleStateView,
-    event_seq: i64,
+    identity: RuleFiringIdentity,
+    verb: &'static str,
+    args: Value,
+    parent_digest: Option<Vec<u8>>,
     parent_id: String,
     child_id: String,
 }
 
-impl<'a> RuleEventKey<'a> {
-    fn new(
+impl<'a> RuleFiringKey<'a> {
+    fn event(
         principal: &'a str,
         state: &'a core::api::RuleStateView,
         event_seq: i64,
@@ -62,11 +77,136 @@ impl<'a> RuleEventKey<'a> {
         Ok(Self {
             principal,
             state,
-            event_seq,
+            identity: RuleFiringIdentity::Event { event_seq },
+            verb: "rule",
+            args: json!({
+                "rule": state.id,
+                "revision": state.revision,
+                "event_seq": event_seq,
+            }),
+            parent_digest: None,
             parent_id: derived_rule_id("parent", principal, &state.id, state.revision, event_seq)?,
             child_id: derived_rule_id("action-0", principal, &state.id, state.revision, event_seq)?,
         })
     }
+
+    fn timer(
+        principal: &'a str,
+        state: &'a core::api::RuleStateView,
+        schedule_revision: i64,
+        slot_ms: i64,
+    ) -> Result<Self> {
+        let parent_id =
+            derived_timer_id("parent", principal, &state.id, schedule_revision, slot_ms)?;
+        let child_id =
+            derived_timer_id("action-0", principal, &state.id, schedule_revision, slot_ms)?;
+        Ok(Self {
+            principal,
+            state,
+            identity: RuleFiringIdentity::Timer {
+                schedule_revision,
+                slot_ms,
+            },
+            verb: "rule",
+            args: json!({
+                "rule": state.id,
+                "schedule_revision": schedule_revision,
+                "scheduled_at_ms": slot_ms,
+            }),
+            parent_digest: None,
+            parent_id,
+            child_id,
+        })
+    }
+
+    fn manual(
+        principal: &'a str,
+        state: &'a core::api::RuleStateView,
+        parent_id: &'a str,
+        parent_digest: Vec<u8>,
+    ) -> Result<Self> {
+        Ok(Self {
+            principal,
+            state,
+            identity: RuleFiringIdentity::Manual,
+            verb: "timer.run",
+            args: json!({"rule": state.id}),
+            parent_digest: Some(parent_digest),
+            parent_id: parent_id.to_owned(),
+            child_id: derived_manual_timer_id(principal, &state.id, parent_id)?,
+        })
+    }
+
+    fn command_event_data(&self, children: Vec<String>) -> Value {
+        let mut data = self.args.clone();
+        let object = data.as_object_mut().expect("firing args are an object");
+        object.insert("command_id".to_owned(), json!(self.parent_id));
+        object.insert("children".to_owned(), json!(children));
+        data
+    }
+
+    fn fired_data(&self, child_id: &str) -> Value {
+        let mut data = self.args.clone();
+        let object = data.as_object_mut().expect("firing args are an object");
+        object.insert("parent_command".to_owned(), json!(self.parent_id));
+        object.insert("child_command".to_owned(), json!(child_id));
+        data
+    }
+
+    fn rejected_data(&self, code: &str) -> Value {
+        let mut data = self.args.clone();
+        let object = data.as_object_mut().expect("firing args are an object");
+        object.insert("parent_command".to_owned(), json!(self.parent_id));
+        object.insert("code".to_owned(), json!(code));
+        data
+    }
+
+    fn matches_parent(&self, parent: &Command, principal: &str) -> bool {
+        if parent.principal != principal || parent.verb != self.verb || parent.args != self.args {
+            return false;
+        }
+        match self.identity {
+            RuleFiringIdentity::Event { event_seq } => {
+                parent.args.get("event_seq").and_then(Value::as_i64) == Some(event_seq)
+            }
+            RuleFiringIdentity::Timer {
+                schedule_revision,
+                slot_ms,
+            } => {
+                parent.args.get("schedule_revision").and_then(Value::as_i64)
+                    == Some(schedule_revision)
+                    && parent.args.get("scheduled_at_ms").and_then(Value::as_i64) == Some(slot_ms)
+            }
+            RuleFiringIdentity::Manual => parent.id == self.parent_id,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TimerDefinitionInput {
+    pub id: String,
+    pub schedule_revision: i64,
+    pub schedule: core::api::TimerSchedule,
+    pub enabled: bool,
+    pub initial_next_due_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TimerSlotCommit {
+    pub scheduled_at_ms: i64,
+    pub next_due_at_ms: Option<i64>,
+    pub action: Option<SubmitCommand>,
+    pub skip_code: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TimerSlotAdmission {
+    pub state: core::api::TimerStateView,
+    pub parent: Option<Command>,
+    pub child: Option<Command>,
+    pub events: Vec<Event>,
+    pub is_new: bool,
+    pub blocked: bool,
 }
 
 enum RuleParentOutcome<'a> {
@@ -296,14 +436,10 @@ impl Store {
             .map_err(sql_error)?;
         let stored = load_rule_state(&tx, principal, &state.id)?
             .ok_or_else(|| Error::new("not_found", "rule state was not found"))?;
-        let key = RuleEventKey::new(principal, state, event_seq)?;
+        let key = RuleFiringKey::event(principal, state, event_seq)?;
 
         if let Some(parent) = load_command(&tx, &key.parent_id)? {
-            if parent.principal != principal
-                || parent.verb != "rule"
-                || parent.args.get("rule").and_then(Value::as_str) != Some(state.id.as_str())
-                || parent.args.get("event_seq").and_then(Value::as_i64) != Some(event_seq)
-            {
+            if !key.matches_parent(&parent, principal) {
                 return Err(Error::new(
                     "source_integrity",
                     "derived rule parent id is bound to another action",
@@ -363,54 +499,14 @@ impl Store {
         // submit_tx validates and admits the ordinary stop command. Its stop path
         // performs all deterministic checks before inserting the child row; the
         // surrounding transaction rolls every write back on persistence failure.
-        let child_admission = match submit_tx(&tx, principal, request, None, now, true) {
+        let (parent, child, events) = match admit_rule_action_tx(&tx, &key, request, now) {
             Ok(admission) => admission,
             Err(error) if deterministic_rule_rejection(&error) => {
                 return reject_rule_event(tx, &self.write_faulted, &key, &error.code, now);
             }
             Err(error) => return Err(error),
         };
-        if !child_admission.is_new {
-            return Err(Error::new(
-                "source_integrity",
-                "rule child exists without its deterministic parent",
-            ));
-        }
-
-        let child = child_admission.command;
-        let (parent, parent_event) =
-            insert_rule_parent(&tx, &key, RuleParentOutcome::Admitted, now)?;
-        let linked = tx
-            .execute(
-                "UPDATE commands
-                 SET parent_command = ?1, link_kind = 'rule_action', ordinal = 0
-                 WHERE id = ?2 AND parent_command IS NULL
-                   AND link_kind IS NULL AND ordinal IS NULL",
-                params![key.parent_id, child.id],
-            )
-            .map_err(sql_error)?;
-        if linked != 1 {
-            return Err(Error::new(
-                "source_integrity",
-                "new rule child could not be bound to its parent",
-            ));
-        }
-
-        let mut events = child_admission.events;
-        events.push(parent_event);
-        events.push(insert_rule_event(
-            &tx,
-            now,
-            "rule.fired",
-            json!({
-                "rule": key.state.id,
-                "revision": key.state.revision,
-                "event_seq": key.event_seq,
-                "parent_command": key.parent_id,
-                "child_command": child.id,
-            }),
-        )?);
-        let view = update_rule_cursor_tx(&tx, key.principal, &stored.view, key.event_seq, now)?;
+        let view = update_rule_cursor_tx(&tx, key.principal, &stored.view, event_seq, now)?;
         commit_transaction(tx, &self.write_faulted)?;
 
         Ok(RuleEventAdmission {
@@ -450,6 +546,462 @@ impl Store {
         enforce_page_bytes(&mut commands)?;
         Ok(commands)
     }
+
+    /// Persist a timer's immutable schedule beside its owning rule state. The
+    /// daemon supplies calculations; Store captures an omitted interval anchor
+    /// exactly once and keeps the numeric UTC-millisecond cursor.
+    pub fn ensure_timer_state(
+        &mut self,
+        principal: &str,
+        input: &TimerDefinitionInput,
+        now: i64,
+    ) -> Result<core::api::TimerStateView> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            require_nonempty(&input.id, "timer id")?;
+            if input.schedule_revision <= 0 {
+                return Err(Error::new(
+                    "invalid",
+                    "timer schedule revision must be positive",
+                ));
+            }
+            input.schedule.validate()?;
+            let trigger = serde_json::to_string(&input.schedule)
+                .map_err(|_| Error::new("invalid", "timer schedule cannot be encoded"))?;
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let rule = load_rule_state(&tx, principal, &input.id)?
+                .ok_or_else(|| Error::new("not_found", "timer rule was not found"))?;
+            let catch_up = rule_catch_up(&rule)?;
+            if rule.view.enabled != input.enabled {
+                return Err(Error::new(
+                    "bad_state",
+                    "timer enabled state differs from its rule definition",
+                ));
+            }
+            if let Some(existing) = load_timer_state(&tx, principal, &input.id)? {
+                if existing.view.schedule_revision != input.schedule_revision
+                    || existing.trigger != trigger
+                    || existing.catch_up != catch_up
+                {
+                    return Err(Error::new(
+                        "unsupported",
+                        "timer schedule replacement is unsupported in this slice",
+                    ));
+                }
+                commit_transaction(tx, &self.write_faulted)?;
+                return Ok(existing.view);
+            }
+
+            validate_timer_definition(input, now)?;
+            let anchor = match &input.schedule {
+                core::api::TimerSchedule::Interval {
+                    anchor: Some(anchor),
+                    ..
+                } => *anchor,
+                core::api::TimerSchedule::Interval { anchor: None, .. } => now,
+                core::api::TimerSchedule::Cron { .. } | core::api::TimerSchedule::Once { .. } => {
+                    now
+                }
+            };
+            tx.execute(
+                "INSERT INTO timers(
+                     principal, rule, schedule_revision, trigger, anchor,
+                     last_key, next_due_at, catch_up
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)",
+                params![
+                    principal,
+                    input.id,
+                    input.schedule_revision,
+                    trigger,
+                    anchor,
+                    input.initial_next_due_at,
+                    catch_up_name(catch_up),
+                ],
+            )
+            .map_err(sql_error)?;
+            let view = core::api::TimerStateView {
+                id: input.id.clone(),
+                schedule_revision: input.schedule_revision,
+                schedule: input.schedule.clone(),
+                anchor,
+                last_key: None,
+                next_due_at: input.initial_next_due_at,
+                enabled: rule.view.enabled && rule.view.paused_reason.is_none(),
+            };
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(view)
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    pub fn get_timer_state(
+        &self,
+        principal: &str,
+        id: &str,
+    ) -> Result<Option<core::api::TimerStateView>> {
+        validate_principal_rule(principal, id)?;
+        Ok(load_timer_state(&self.connection, principal, id)?.map(|timer| timer.view))
+    }
+
+    /// Return a bounded page of persisted due timers. The caller computes the
+    /// selected slot outside the Store lock and supplies it to commit_timer_slot.
+    pub fn list_due_timer_states(
+        &self,
+        principal: &str,
+        after_id: Option<&str>,
+        due_by_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<core::api::TimerStateView>> {
+        require_nonempty(principal, "principal")?;
+        validate_limit(limit)?;
+        if let Some(after_id) = after_id {
+            require_nonempty(after_id, "timer cursor")?;
+        }
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT t.rule, t.schedule_revision, t.trigger, t.anchor,
+                        t.last_key, t.next_due_at, t.catch_up, r.enabled, r.paused_reason
+                 FROM timers t
+                 JOIN rule_state r ON r.principal = t.principal AND r.rule = t.rule
+                 WHERE t.principal = ?1 AND (?2 IS NULL OR t.rule > ?2)
+                   AND t.next_due_at IS NOT NULL AND t.next_due_at <= ?3
+                   AND r.enabled = 1 AND r.paused_reason IS NULL
+                 ORDER BY t.rule LIMIT ?4",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(
+                params![principal, after_id, due_by_ms, limit as i64],
+                timer_record_from_row,
+            )
+            .map_err(sql_error)?;
+        let mut timers = Vec::new();
+        for row in rows {
+            timers.push(timer_view_from_record(row.map_err(sql_error)?)?);
+        }
+        enforce_page_bytes(&mut timers)?;
+        Ok(timers)
+    }
+
+    /// Commit one scheduled slot with its ordinary stop child, fixed parent,
+    /// action accounting, and numeric cursor in one writer transaction.
+    pub fn commit_timer_slot(
+        &mut self,
+        principal: &str,
+        state: &core::api::TimerStateView,
+        slot: TimerSlotCommit,
+        now: i64,
+    ) -> Result<TimerSlotAdmission> {
+        self.ensure_writer_healthy()?;
+        let result = self.commit_timer_slot_inner(principal, state, slot, now);
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    fn commit_timer_slot_inner(
+        &mut self,
+        principal: &str,
+        state: &core::api::TimerStateView,
+        slot: TimerSlotCommit,
+        now: i64,
+    ) -> Result<TimerSlotAdmission> {
+        require_nonempty(principal, "principal")?;
+        state.validate()?;
+        validate_timer_slot(&slot, now)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let rule = load_rule_state(&tx, principal, &state.id)?
+            .ok_or_else(|| Error::new("not_found", "timer rule was not found"))?;
+        let stored = load_timer_state(&tx, principal, &state.id)?
+            .ok_or_else(|| Error::new("not_found", "timer state was not found"))?;
+        let key = RuleFiringKey::timer(
+            principal,
+            &rule.view,
+            state.schedule_revision,
+            slot.scheduled_at_ms,
+        )?;
+        if let Some(parent) = load_command(&tx, &key.parent_id)? {
+            if !key.matches_parent(&parent, principal) {
+                return Err(Error::new(
+                    "source_integrity",
+                    "timer parent id is bound to another scheduled slot",
+                ));
+            }
+            if stored
+                .view
+                .last_key
+                .is_none_or(|last| last < slot.scheduled_at_ms)
+            {
+                return Err(Error::new(
+                    "source_integrity",
+                    "timer parent exists before its slot cursor commit",
+                ));
+            }
+            let child = load_rule_child(&tx, &key.parent_id, &key.child_id)?;
+            commit_transaction(tx, &self.write_faulted)?;
+            return Ok(TimerSlotAdmission {
+                state: stored.view,
+                parent: Some(parent),
+                child,
+                events: Vec::new(),
+                is_new: false,
+                blocked: false,
+            });
+        }
+        if stored
+            .view
+            .last_key
+            .is_some_and(|last| slot.scheduled_at_ms < last)
+        {
+            return Err(Error::new(
+                "bad_state",
+                "timer slot is older than the persisted cursor",
+            ));
+        }
+        if stored.view.last_key == Some(slot.scheduled_at_ms) {
+            commit_transaction(tx, &self.write_faulted)?;
+            return Ok(TimerSlotAdmission {
+                state: stored.view,
+                parent: None,
+                child: None,
+                events: Vec::new(),
+                is_new: false,
+                blocked: false,
+            });
+        }
+        if stored.view != *state || !stored.view.enabled || !rule.view.enabled {
+            return Err(Error::new("bad_state", "timer state is stale or disabled"));
+        }
+        if stored.view.schedule_revision != state.schedule_revision
+            || stored
+                .view
+                .next_due_at
+                .is_none_or(|due| slot.scheduled_at_ms < due)
+        {
+            return Err(Error::new(
+                "bad_state",
+                "timer slot is not at or after the persisted next due time",
+            ));
+        }
+        if slot
+            .next_due_at_ms
+            .is_some_and(|next| next <= slot.scheduled_at_ms)
+        {
+            return Err(Error::new(
+                "invalid",
+                "next timer due time must be after its committed slot",
+            ));
+        }
+        if has_open_rule_actions_tx(&tx, principal, &state.id)? {
+            commit_transaction(tx, &self.write_faulted)?;
+            return Ok(TimerSlotAdmission {
+                state: stored.view,
+                parent: None,
+                child: None,
+                events: Vec::new(),
+                is_new: false,
+                blocked: true,
+            });
+        }
+
+        let mut events = Vec::new();
+        let mut parent = None;
+        let mut child = None;
+        if let Some(action) = slot.action {
+            let (per_rule, global) = rule_action_counts(&tx, principal, &state.id, now)?;
+            let rejected = if per_rule >= RULE_ACTION_LIMIT || global >= GLOBAL_RULE_ACTION_LIMIT {
+                Some("rate_limited".to_owned())
+            } else if !valid_timer_stop_request(&action) {
+                Some("rule_action_binding_invalid".to_owned())
+            } else {
+                None
+            };
+            if let Some(code) = rejected {
+                let (rejected_parent, event) = reject_timer_fire_tx(&tx, &key, &code, now)?;
+                parent = Some(rejected_parent);
+                events.extend(event);
+            } else {
+                match admit_rule_action_tx(&tx, &key, action, now) {
+                    Ok((admitted_parent, admitted_child, admitted_events)) => {
+                        parent = Some(admitted_parent);
+                        child = Some(admitted_child);
+                        events.extend(admitted_events);
+                    }
+                    Err(error) if deterministic_rule_rejection(&error) => {
+                        let (rejected_parent, rejected_events) =
+                            reject_timer_fire_tx(&tx, &key, &error.code, now)?;
+                        parent = Some(rejected_parent);
+                        events.extend(rejected_events);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        } else {
+            events.push(insert_rule_event(
+                &tx,
+                now,
+                "rule.skipped",
+                json!({
+                    "rule": state.id,
+                    "schedule_revision": state.schedule_revision,
+                    "scheduled_at_ms": slot.scheduled_at_ms,
+                    "reason": slot.skip_code,
+                }),
+            )?);
+        }
+
+        let next_state = update_timer_slot_tx(
+            &tx,
+            principal,
+            &stored,
+            slot.scheduled_at_ms,
+            slot.next_due_at_ms,
+        )?;
+        commit_transaction(tx, &self.write_faulted)?;
+        Ok(TimerSlotAdmission {
+            state: next_state,
+            parent,
+            child,
+            events,
+            is_new: true,
+            blocked: false,
+        })
+    }
+
+    /// Resolve a retained manual timer parent before the Router reevaluates
+    /// current timer, mode, or action gates.
+    pub fn replay_timer_run(
+        &self,
+        principal: &str,
+        request: &core::api::TimerRunRequest,
+    ) -> Result<Option<Command>> {
+        require_nonempty(principal, "principal")?;
+        request.validate()?;
+        validate_ulid(&request.id)?;
+        Ok(replay_timer_run_tx(&self.connection, principal, request)?.map(|(parent, _)| parent))
+    }
+
+    /// Atomically admit a manual run using the external mutation ULID as its
+    /// parent ID. It never advances the scheduled timer cursor.
+    pub fn admit_manual_timer_run(
+        &mut self,
+        principal: &str,
+        request: &core::api::TimerRunRequest,
+        state: &core::api::TimerStateView,
+        action: SubmitCommand,
+        now: i64,
+    ) -> Result<TimerSlotAdmission> {
+        self.ensure_writer_healthy()?;
+        let result = self.admit_manual_timer_run_inner(principal, request, state, action, now);
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    fn admit_manual_timer_run_inner(
+        &mut self,
+        principal: &str,
+        request: &core::api::TimerRunRequest,
+        state: &core::api::TimerStateView,
+        action: SubmitCommand,
+        now: i64,
+    ) -> Result<TimerSlotAdmission> {
+        require_nonempty(principal, "principal")?;
+        request.validate()?;
+        validate_ulid(&request.id)?;
+        state.validate()?;
+        let digest = timer_run_digest(request)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        if let Some((parent, child)) = replay_timer_run_tx(&tx, principal, request)? {
+            commit_transaction(tx, &self.write_faulted)?;
+            return Ok(TimerSlotAdmission {
+                state: state.clone(),
+                parent: Some(parent),
+                child,
+                events: Vec::new(),
+                is_new: false,
+                blocked: false,
+            });
+        }
+        if write_exists(&tx, &request.id)? {
+            return Err(Error::new(
+                "id_conflict",
+                "timer mutation id is already used",
+            ));
+        }
+        validate_id_age(&request.id, now)?;
+        if !valid_timer_stop_request(&action) {
+            return Err(Error::new("invalid", "timer action is not a literal stop"));
+        }
+        if state.id != request.rule {
+            return Err(Error::new(
+                "invalid",
+                "timer state does not match the request",
+            ));
+        }
+        let rule = load_rule_state(&tx, principal, &request.rule)?
+            .ok_or_else(|| Error::new("not_found", "timer rule was not found"))?;
+        let timer = load_timer_state(&tx, principal, &request.rule)?
+            .ok_or_else(|| Error::new("not_found", "timer state was not found"))?;
+        if timer.view != *state || !timer.view.enabled || !rule.view.enabled {
+            return Err(Error::new("bad_state", "timer is disabled or paused"));
+        }
+        if has_open_rule_actions_tx(&tx, principal, &request.rule)? {
+            commit_transaction(tx, &self.write_faulted)?;
+            return Ok(TimerSlotAdmission {
+                state: timer.view,
+                parent: None,
+                child: None,
+                events: Vec::new(),
+                is_new: false,
+                blocked: true,
+            });
+        }
+        let (per_rule, global) = rule_action_counts(&tx, principal, &request.rule, now)?;
+        if per_rule >= RULE_ACTION_LIMIT || global >= GLOBAL_RULE_ACTION_LIMIT {
+            return Err(Error::new(
+                "bad_state",
+                "timer action rate limit is reached",
+            ));
+        }
+
+        let key = RuleFiringKey::manual(principal, &rule.view, &request.id, digest)?;
+        match admit_rule_action_tx(&tx, &key, action, now) {
+            Ok((parent, child, events)) => {
+                commit_transaction(tx, &self.write_faulted)?;
+                Ok(TimerSlotAdmission {
+                    state: timer.view,
+                    parent: Some(parent),
+                    child: Some(child),
+                    events,
+                    is_new: true,
+                    blocked: false,
+                })
+            }
+            Err(error) if deterministic_rule_rejection(&error) => {
+                let (parent, events) = reject_timer_fire_tx(&tx, &key, &error.code, now)?;
+                commit_transaction(tx, &self.write_faulted)?;
+                Ok(TimerSlotAdmission {
+                    state: timer.view,
+                    parent: Some(parent),
+                    child: None,
+                    events,
+                    is_new: true,
+                    blocked: false,
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
 }
 
 fn validate_principal_rule(principal: &str, rule: &str) -> Result<()> {
@@ -483,6 +1035,307 @@ fn validate_definition_input(input: &RuleDefinitionInput) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+struct StoredTimerState {
+    view: core::api::TimerStateView,
+    trigger: String,
+    catch_up: core::api::CatchUp,
+}
+
+struct TimerRecord {
+    id: String,
+    schedule_revision: i64,
+    trigger: String,
+    anchor: i64,
+    last_key: Option<i64>,
+    next_due_at: Option<i64>,
+    catch_up: String,
+    enabled: bool,
+    paused_reason: Option<String>,
+}
+
+fn timer_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimerRecord> {
+    Ok(TimerRecord {
+        id: row.get(0)?,
+        schedule_revision: row.get(1)?,
+        trigger: row.get(2)?,
+        anchor: row.get(3)?,
+        last_key: row.get(4)?,
+        next_due_at: row.get(5)?,
+        catch_up: row.get(6)?,
+        enabled: row.get(7)?,
+        paused_reason: row.get(8)?,
+    })
+}
+
+fn timer_view_from_record(record: TimerRecord) -> Result<core::api::TimerStateView> {
+    parse_catch_up(&record.catch_up)?;
+    let schedule = serde_json::from_str(&record.trigger)
+        .map_err(|_| Error::new("source_integrity", "stored timer schedule is invalid"))?;
+    let view = core::api::TimerStateView {
+        id: record.id,
+        schedule_revision: record.schedule_revision,
+        schedule,
+        anchor: record.anchor,
+        last_key: record.last_key,
+        next_due_at: record.next_due_at,
+        enabled: record.enabled && record.paused_reason.is_none(),
+    };
+    view.validate()
+        .map_err(|_| Error::new("source_integrity", "stored timer state is invalid"))?;
+    Ok(view)
+}
+
+fn load_timer_state(
+    connection: &Connection,
+    principal: &str,
+    rule: &str,
+) -> Result<Option<StoredTimerState>> {
+    let record = connection
+        .query_row(
+            "SELECT t.rule, t.schedule_revision, t.trigger, t.anchor,
+                    t.last_key, t.next_due_at, t.catch_up, r.enabled, r.paused_reason
+             FROM timers t
+             JOIN rule_state r ON r.principal = t.principal AND r.rule = t.rule
+             WHERE t.principal = ?1 AND t.rule = ?2",
+            params![principal, rule],
+            timer_record_from_row,
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let Some(record) = record else {
+        return Ok(None);
+    };
+    let trigger = record.trigger.clone();
+    let catch_up = parse_catch_up(&record.catch_up)?;
+    let view = timer_view_from_record(record)?;
+    Ok(Some(StoredTimerState {
+        view,
+        trigger,
+        catch_up,
+    }))
+}
+
+fn parse_catch_up(value: &str) -> Result<core::api::CatchUp> {
+    match value {
+        "latest" => Ok(core::api::CatchUp::Latest),
+        "none" => Ok(core::api::CatchUp::None),
+        _ => Err(Error::new(
+            "source_integrity",
+            "stored timer catch_up is invalid",
+        )),
+    }
+}
+
+fn replay_timer_run_tx(
+    connection: &Connection,
+    principal: &str,
+    request: &core::api::TimerRunRequest,
+) -> Result<Option<(Command, Option<Command>)>> {
+    let digest = timer_run_digest(request)?;
+    let Some((old_principal, old_method, old_digest)) = command_binding(connection, &request.id)?
+    else {
+        return Ok(None);
+    };
+    if old_principal != principal || old_method != COMMAND_METHOD || old_digest != digest {
+        return Err(Error::new(
+            "id_conflict",
+            "timer mutation id is already bound to another request",
+        ));
+    }
+    let parent = load_command(connection, &request.id)?
+        .ok_or_else(|| Error::new("internal", "timer command binding has no command row"))?;
+    if parent.verb != "timer.run" || request.validate_response(&parent).is_err() {
+        return Err(Error::new(
+            "source_integrity",
+            "timer command binding does not match its retained parent",
+        ));
+    }
+    let child = load_linked_command(connection, &request.id)?;
+    Ok(Some((parent, child)))
+}
+
+fn timer_run_digest(request: &core::api::TimerRunRequest) -> Result<Vec<u8>> {
+    canonical::digest(&json!({
+        "target": null,
+        "verb": "timer.run",
+        "args": {"rule": request.rule},
+        "expected_generation": null,
+        "expected_turn_id": null,
+    }))
+}
+
+fn rule_catch_up(rule: &StoredRuleState) -> Result<core::api::CatchUp> {
+    let value: Value = serde_json::from_str(&rule.canonical_definition)
+        .map_err(|_| Error::new("source_integrity", "stored rule definition is invalid"))?;
+    match value.get("catch_up") {
+        None => Ok(core::api::CatchUp::None),
+        Some(Value::String(value)) => parse_catch_up(value),
+        Some(_) => Err(Error::new(
+            "source_integrity",
+            "stored rule catch_up is invalid",
+        )),
+    }
+}
+
+fn catch_up_name(catch_up: core::api::CatchUp) -> &'static str {
+    match catch_up {
+        core::api::CatchUp::Latest => "latest",
+        core::api::CatchUp::None => "none",
+    }
+}
+
+fn validate_timer_definition(input: &TimerDefinitionInput, registration_ms: i64) -> Result<()> {
+    require_nonempty(&input.id, "timer id")?;
+    if input.schedule_revision <= 0 {
+        return Err(Error::new(
+            "invalid",
+            "timer schedule revision must be positive",
+        ));
+    }
+    input.schedule.validate()?;
+    match &input.schedule {
+        core::api::TimerSchedule::Interval { period_ms, anchor } => {
+            let effective_anchor = anchor.unwrap_or(registration_ms);
+            let elapsed = i128::from(registration_ms) - i128::from(effective_anchor);
+            let periods = if elapsed < 0 {
+                1
+            } else {
+                elapsed / i128::from(*period_ms) + 1
+            };
+            let expected = i128::from(effective_anchor) + periods * i128::from(*period_ms);
+            let expected = i64::try_from(expected)
+                .map_err(|_| Error::new("invalid", "first timer slot overflows epoch millis"))?;
+            if input.initial_next_due_at != Some(expected) {
+                return Err(Error::new(
+                    "invalid",
+                    "interval timer first due time does not match its captured anchor",
+                ));
+            }
+        }
+        core::api::TimerSchedule::Once { at } => {
+            let expected = (*at > registration_ms).then_some(*at);
+            if input.initial_next_due_at != expected {
+                return Err(Error::new(
+                    "invalid",
+                    "once timer first due time does not match its UTC instant",
+                ));
+            }
+        }
+        core::api::TimerSchedule::Cron { .. } => {
+            if input
+                .initial_next_due_at
+                .is_some_and(|due| due <= registration_ms)
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "cron timer first due time must be after registration",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_timer_slot(slot: &TimerSlotCommit, now: i64) -> Result<()> {
+    if slot.scheduled_at_ms > now {
+        return Err(Error::new("invalid", "timer slot is in the future"));
+    }
+    match (&slot.action, &slot.skip_code) {
+        (Some(_), None) | (None, Some(_)) => {}
+        _ => {
+            return Err(Error::new(
+                "invalid",
+                "timer slot must contain either one action or one skip reason",
+            ));
+        }
+    }
+    if let Some(code) = &slot.skip_code
+        && (code.trim().is_empty() || code.len() > 128)
+    {
+        return Err(Error::new("invalid", "timer skip reason is invalid"));
+    }
+    Ok(())
+}
+
+fn valid_timer_stop_request(request: &SubmitCommand) -> bool {
+    let valid_args = request.args.as_object().is_some_and(|args| {
+        args.iter()
+            .all(|(key, value)| key == "force" && value == &Value::Bool(false))
+    });
+    request.verb == "stop"
+        && request
+            .target
+            .as_deref()
+            .is_some_and(|target| core::parse_agent_id(target).is_ok())
+        && request
+            .expected_generation
+            .is_some_and(|generation| generation >= 0)
+        && request.expected_turn_id.is_none()
+        && request.request_id.is_none()
+        && !request.probe
+        && valid_args
+}
+
+fn has_open_rule_actions_tx(tx: &Transaction<'_>, principal: &str, rule: &str) -> Result<bool> {
+    tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM commands child
+             JOIN commands parent ON parent.id = child.parent_command
+             WHERE child.link_kind = 'rule_action' AND child.ordinal = 0
+               AND child.state IN ('accepted','queued','dispatched','unknown')
+               AND parent.principal = ?1
+               AND json_extract(parent.args, '$.rule') = ?2
+         )",
+        params![principal, rule],
+        |row| row.get(0),
+    )
+    .map_err(sql_error)
+}
+
+fn update_timer_slot_tx(
+    tx: &Transaction<'_>,
+    principal: &str,
+    stored: &StoredTimerState,
+    slot_ms: i64,
+    next_due_at_ms: Option<i64>,
+) -> Result<core::api::TimerStateView> {
+    let changed = tx
+        .execute(
+            "UPDATE timers SET last_key = ?1, next_due_at = ?2
+             WHERE principal = ?3 AND rule = ?4 AND schedule_revision = ?5
+               AND last_key IS ?6 AND next_due_at IS ?7",
+            params![
+                slot_ms,
+                next_due_at_ms,
+                principal,
+                stored.view.id,
+                stored.view.schedule_revision,
+                stored.view.last_key,
+                stored.view.next_due_at,
+            ],
+        )
+        .map_err(sql_error)?;
+    if changed != 1 {
+        return Err(Error::new("bad_state", "timer cursor changed concurrently"));
+    }
+    let mut view = stored.view.clone();
+    view.last_key = Some(slot_ms);
+    view.next_due_at = next_due_at_ms;
+    Ok(view)
+}
+
+fn reject_timer_fire_tx(
+    tx: &Transaction<'_>,
+    key: &RuleFiringKey<'_>,
+    code: &str,
+    now: i64,
+) -> Result<(Command, Vec<Event>)> {
+    let (parent, parent_event) =
+        insert_rule_parent(tx, key, RuleParentOutcome::Rejected { code }, now)?;
+    let rejected = insert_rule_event(tx, now, "rule.rejected", key.rejected_data(code))?;
+    Ok((parent, vec![parent_event, rejected]))
 }
 
 fn load_rule_state(
@@ -619,6 +1472,41 @@ fn derived_rule_id(
     Ok(Ulid::from_bytes(bytes).to_string())
 }
 
+fn derived_timer_id(
+    purpose: &str,
+    principal: &str,
+    rule: &str,
+    schedule_revision: i64,
+    slot_ms: i64,
+) -> Result<String> {
+    let digest = canonical::digest(&json!({
+        "domain": RULE_COMMAND_ID_DOMAIN,
+        "purpose": purpose,
+        "principal": principal,
+        "rule": rule,
+        "schedule_revision": schedule_revision,
+        "scheduled_at_ms": slot_ms,
+    }))?;
+    let bytes: [u8; 16] = digest[..16]
+        .try_into()
+        .map_err(|_| Error::new("internal", "timer command digest is too short"))?;
+    Ok(Ulid::from_bytes(bytes).to_string())
+}
+
+fn derived_manual_timer_id(principal: &str, rule: &str, mutation_id: &str) -> Result<String> {
+    let digest = canonical::digest(&json!({
+        "domain": RULE_COMMAND_ID_DOMAIN,
+        "purpose": "action-0",
+        "principal": principal,
+        "rule": rule,
+        "mutation_id": mutation_id,
+    }))?;
+    let bytes: [u8; 16] = digest[..16]
+        .try_into()
+        .map_err(|_| Error::new("internal", "manual timer digest is too short"))?;
+    Ok(Ulid::from_bytes(bytes).to_string())
+}
+
 fn load_rule_trigger(tx: &Transaction<'_>, event_seq: i64) -> Result<StoredRuleTrigger> {
     tx.query_row(
         "SELECT kind, agent, generation FROM events WHERE seq = ?1",
@@ -709,7 +1597,7 @@ fn deterministic_rule_rejection(error: &Error) -> bool {
 
 fn insert_rule_parent(
     tx: &Transaction<'_>,
-    key: &RuleEventKey<'_>,
+    key: &RuleFiringKey<'_>,
     outcome_kind: RuleParentOutcome<'_>,
     now: i64,
 ) -> Result<(Command, Event)> {
@@ -720,21 +1608,20 @@ fn insert_rule_parent(
         RuleParentOutcome::Admitted => (vec![key.child_id.clone()], CommandState::Applied, None),
         RuleParentOutcome::Rejected { code } => (Vec::new(), CommandState::Rejected, Some(code)),
     };
-    let args = json!({
-        "rule": key.state.id,
-        "revision": key.state.revision,
-        "event_seq": key.event_seq,
-    });
+    let args = &key.args;
     let outcome = match rejection_code {
         Some(code) => json!({"children": child_ids, "code": code}),
         None => json!({"children": child_ids}),
     };
-    let digest = canonical::digest(&json!({
-        "principal": key.principal,
-        "verb": "rule",
-        "args": args,
-        "outcome": outcome,
-    }))?;
+    let digest = match &key.parent_digest {
+        Some(digest) => digest.clone(),
+        None => canonical::digest(&json!({
+            "principal": key.principal,
+            "verb": key.verb,
+            "args": args,
+            "outcome": outcome,
+        }))?,
+    };
     let command = CommandInsert {
         id: &key.parent_id,
         principal: key.principal,
@@ -750,34 +1637,24 @@ fn insert_rule_parent(
         turn_id: None,
         request_id: None,
         probe: false,
-        verb: "rule",
-        args: &args,
+        verb: key.verb,
+        args,
         state,
         outcome: Some(&outcome),
         created_at: now,
         updated_at: now,
     };
-    let event = admit_command(
-        tx,
-        &command,
-        json!({
-            "command_id": key.parent_id,
-            "rule": key.state.id,
-            "revision": key.state.revision,
-            "event_seq": key.event_seq,
-            "children": child_ids,
-        }),
-    )?;
+    let event = admit_command(tx, &command, key.command_event_data(child_ids.clone()))?;
     Ok((
         Command {
             id: key.parent_id.clone(),
             principal: key.principal.to_owned(),
             method: COMMAND_METHOD.to_owned(),
-            verb: "rule".to_owned(),
+            verb: key.verb.to_owned(),
             target: None,
             expected_generation: None,
             generation: None,
-            args,
+            args: (*args).clone(),
             state,
             turn_id: None,
             request_id: None,
@@ -790,23 +1667,63 @@ fn insert_rule_parent(
     ))
 }
 
-fn rule_rejected_data(key: &RuleEventKey<'_>, code: &str) -> Value {
-    json!({
-        "rule": key.state.id,
-        "revision": key.state.revision,
-        "event_seq": key.event_seq,
-        "parent_command": key.parent_id,
-        "code": code,
-    })
+fn admit_rule_action_tx(
+    tx: &Transaction<'_>,
+    key: &RuleFiringKey<'_>,
+    mut request: SubmitCommand,
+    now: i64,
+) -> Result<(Command, Command, Vec<Event>)> {
+    request.id = key.child_id.clone();
+    let child_admission = submit_tx(tx, key.principal, request, None, now, true)?;
+    if !child_admission.is_new {
+        return Err(Error::new(
+            "source_integrity",
+            "rule child exists without its deterministic parent",
+        ));
+    }
+
+    let child = child_admission.command;
+    let (parent, parent_event) = insert_rule_parent(tx, key, RuleParentOutcome::Admitted, now)?;
+    let linked = tx
+        .execute(
+            "UPDATE commands
+             SET parent_command = ?1, link_kind = 'rule_action', ordinal = 0
+             WHERE id = ?2 AND parent_command IS NULL
+               AND link_kind IS NULL AND ordinal IS NULL",
+            params![key.parent_id, child.id],
+        )
+        .map_err(sql_error)?;
+    if linked != 1 {
+        return Err(Error::new(
+            "source_integrity",
+            "new rule child could not be bound to its parent",
+        ));
+    }
+
+    let mut events = child_admission.events;
+    events.push(parent_event);
+    events.push(insert_rule_event(
+        tx,
+        now,
+        "rule.fired",
+        key.fired_data(&child.id),
+    )?);
+    Ok((parent, child, events))
 }
 
 fn reject_rule_event(
     tx: Transaction<'_>,
     write_faulted: &Cell<bool>,
-    key: &RuleEventKey<'_>,
+    key: &RuleFiringKey<'_>,
     code: &str,
     now: i64,
 ) -> Result<RuleEventAdmission> {
+    let RuleFiringIdentity::Event { event_seq } = key.identity else {
+        return Err(Error::new(
+            "internal",
+            "event rejection has a non-event key",
+        ));
+    };
     let (parent, parent_event) =
         insert_rule_parent(&tx, key, RuleParentOutcome::Rejected { code }, now)?;
     let mut events = vec![parent_event];
@@ -814,9 +1731,9 @@ fn reject_rule_event(
         &tx,
         now,
         "rule.rejected",
-        rule_rejected_data(key, code),
+        key.rejected_data(code),
     )?);
-    let view = update_rule_cursor_tx(&tx, key.principal, key.state, key.event_seq, now)?;
+    let view = update_rule_cursor_tx(&tx, key.principal, key.state, event_seq, now)?;
     commit_transaction(tx, write_faulted)?;
     Ok(RuleEventAdmission {
         state: view,

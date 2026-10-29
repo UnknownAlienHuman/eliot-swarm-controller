@@ -11,7 +11,8 @@ use eliot_core::{
         DaemonStatusResponse, DiscoverPage, EventsFilter, EventsReadRequest, EventsReadResponse,
         EventsSubscribeRequest, EventsSubscribeResponse, ObservationPage, ProviderClearHoldRequest,
         ProviderClearHoldResponse, ProviderCorrectiveEvidence, ProviderHoldsRequest,
-        ProviderHoldsResponse, RuleGetRequest, RuleStateView, ShutdownMode, TurnGetRequest,
+        ProviderHoldsResponse, RuleGetRequest, RuleStateView, ShutdownMode, TimerGetRequest,
+        TimerRunRequest, TimerStateView, TurnGetRequest,
     },
 };
 use serde_json::{Value, json};
@@ -90,6 +91,11 @@ enum CliCommand {
     Rule {
         #[command(subcommand)]
         command: RuleCommand,
+    },
+    /// Read or manually run a startup-loaded timer.
+    Timer {
+        #[command(subcommand)]
+        command: TimerCommand,
     },
     /// Discover one page of native sessions through an explicit profile.
     Discover {
@@ -390,6 +396,17 @@ enum RuleCommand {
 }
 
 #[derive(Subcommand)]
+enum TimerCommand {
+    /// Show the current timer schedule and durable UTC slot state.
+    Show { id: String },
+    /// Run one timer action using a durable mutation ID.
+    Run {
+        #[arg(value_name = "ID")]
+        rule: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum WorktreeCommand {
     /// Remove a terminal Agent's clean worktree while retaining its branch.
     Remove {
@@ -673,6 +690,28 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
         CliCommand::Rule {
             command: RuleCommand::Show { id },
         } => read_and_print!("rule.get", RuleGetRequest::new(id), RuleStateView),
+        CliCommand::Timer { command } => match command {
+            TimerCommand::Show { id } => {
+                read_and_print!("timer.get", TimerGetRequest::new(id), TimerStateView)
+            }
+            TimerCommand::Run { rule } => {
+                let request = TimerRunRequest::new(mutation_id(id)?, rule);
+                request
+                    .validate()
+                    .map_err(|error| Failure::from_core(error, true))?;
+                let response: CoreCommand =
+                    eliot_daemon::client_call_typed(&data_dir, "timer.run", &request)
+                        .await
+                        .map_err(|error| Failure::from_core(error, true))?;
+                request
+                    .validate_response(&response)
+                    .map_err(|error| Failure::from_core(error, true))?;
+                let exit_code = response_exit_code(response.state);
+                let value = command_value(response)?;
+                print_value(&value, json_output);
+                Ok(exit_code)
+            }
+        },
         CliCommand::Discover {
             profile,
             harness,
