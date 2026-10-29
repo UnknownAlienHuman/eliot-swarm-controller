@@ -1,7 +1,7 @@
 use super::{BatchCommit, Store, contains_secret_marker};
 use eliot_core::api::{ProviderClearHoldRequest, ProviderCorrectiveEvidence};
 use eliot_core::{
-    AgentState, CommandState, NativeEvent, NativeStoreBinding, ProviderHoldState,
+    AgentState, CommandState, EventCause, NativeEvent, NativeStoreBinding, ProviderHoldState,
     ProviderRestrictionKind, SourceBatch, SourceGap, SubmitCommand, TurnState,
 };
 use eliot_core::{
@@ -2842,4 +2842,176 @@ fn event_subject_is_persisted_at_write_time_without_changing_native_data_digest(
         .pop()
         .unwrap();
     assert_eq!(reread.subject, ready.subject);
+}
+
+#[test]
+fn typed_command_cause_updates_persisted_and_returned_event_without_legacy_backfill() {
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+    let agent = ready_agent(&mut store, "cause-annotation", now);
+    let mut request = SubmitCommand::new(Ulid::new().to_string(), "stop");
+    request.target = Some(agent);
+    request.expected_generation = Some(1);
+    let tx = store
+        .connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    let mut admission =
+        super::submit_tx(&tx, "owner", request.clone(), None, now + 1, false).unwrap();
+    let event_index = admission
+        .events
+        .iter()
+        .position(|event| {
+            event.kind == "command.accepted"
+                && event
+                    .data
+                    .get("command_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(request.id.as_str())
+        })
+        .unwrap();
+    let event_seq = admission.events[event_index].seq;
+    assert_eq!(
+        admission.events[event_index].cause,
+        Some(EventCause {
+            command_id: request.id.clone(),
+            rule: None,
+            depth: 0,
+        })
+    );
+
+    let cause = EventCause {
+        command_id: request.id.clone(),
+        rule: Some("stop-on-result".to_owned()),
+        depth: 1,
+    };
+    super::annotate_new_command_cause_tx(
+        &tx,
+        &request.id,
+        &mut admission.events[event_index],
+        cause.clone(),
+    )
+    .unwrap();
+    super::commit_transaction(tx, &store.write_faulted).unwrap();
+
+    assert_eq!(admission.events[event_index].cause, Some(cause.clone()));
+    assert_eq!(
+        super::command_cause_tx(&store.connection, &request.id).unwrap(),
+        Some(cause.clone())
+    );
+    let persisted = store
+        .read_events(event_seq - 1, 1, Some(event_seq))
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(persisted.cause, Some(cause.clone()));
+
+    store
+        .connection
+        .execute(
+            "UPDATE commands SET cause = ?1 WHERE id = ?2",
+            rusqlite::params!["legacy-untyped-command-cause", request.id.as_str()],
+        )
+        .unwrap();
+    assert_eq!(
+        super::command_cause_tx(&store.connection, &request.id).unwrap(),
+        None,
+        "unrecognized legacy command causes are unbound rather than fatal",
+    );
+    assert_eq!(
+        store
+            .read_events(event_seq - 1, 1, Some(event_seq))
+            .unwrap()
+            .pop()
+            .unwrap()
+            .cause,
+        Some(cause),
+        "event cause is not reconstructed from later command state",
+    );
+}
+
+#[test]
+fn native_turn_cause_uses_exact_verified_command_and_ignores_payload_cause() {
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+    let agent = ready_agent(&mut store, "cause-native-turn", now);
+    let send_id = Ulid::new().to_string();
+    let mut send = SubmitCommand::new(send_id.clone(), "send");
+    send.target = Some(agent.clone());
+    send.args = json!({"text":"hello"});
+    send.expected_generation = Some(1);
+    let admission = store.submit("owner", send, now + 1).unwrap();
+    let accepted = admission
+        .events
+        .iter()
+        .find(|event| event.kind == "command.accepted")
+        .unwrap();
+    assert_eq!(
+        accepted.cause,
+        Some(EventCause {
+            command_id: send_id.clone(),
+            rule: None,
+            depth: 0,
+        })
+    );
+    store.dispatch(&send_id, now + 2).unwrap();
+
+    let native = NativeEvent {
+        kind: "turn.started".to_owned(),
+        native_id: "cause-native-turn:started".to_owned(),
+        data: json!({
+            "command_id": send_id,
+            "turn_id": "cause-turn-1",
+            "cause": {"command_id":"forged","rule":"forged","depth":5},
+        }),
+        ts: None,
+    };
+    let batch = store
+        .put_batch(
+            SourceBatch {
+                batch_id: "cause-native-turn:batch".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![native.clone()],
+                cursor: None,
+            },
+            now + 3,
+        )
+        .unwrap();
+    let started = batch
+        .events
+        .iter()
+        .find(|event| event.kind == "turn.started")
+        .unwrap();
+    assert_eq!(
+        started.cause,
+        Some(EventCause {
+            command_id: send_id,
+            rule: None,
+            depth: 0,
+        })
+    );
+    assert_eq!(started.data, native.data);
+
+    let agent_num = eliot_core::parse_agent_id(&agent).unwrap();
+    let stored_digest: Vec<u8> = store
+        .connection
+        .query_row(
+            "SELECT payload_digest FROM events WHERE seq = ?1 AND agent = ?2
+             AND generation = 1 AND source = 'stream' AND native_id = ?3",
+            rusqlite::params![started.seq, agent_num, native.native_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        stored_digest,
+        super::canonical::digest(&native.semantic_value()).unwrap()
+    );
+    let reread = store
+        .read_events(started.seq - 1, 1, Some(started.seq))
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(reread.cause, started.cause);
 }

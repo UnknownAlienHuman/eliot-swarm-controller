@@ -391,7 +391,7 @@ enum ProviderCommand {
 
 #[derive(Subcommand)]
 enum RuleCommand {
-    /// Show the current loaded rule state and durable cursor.
+    /// Show the loaded rule state and current/retiring cursor progress.
     Show { id: String },
 }
 

@@ -446,6 +446,36 @@ pub struct Command {
     pub probe: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventCause {
+    pub command_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
+    pub depth: u8,
+}
+
+impl EventCause {
+    /// Checks the wire grammar only. Store owns proof that this command is the
+    /// verified cause and applies the depth suppression policy.
+    pub fn validate(&self) -> Result<()> {
+        if self.command_id.trim().is_empty() {
+            return Err(Error::new(
+                "invalid",
+                "event cause command_id must be nonempty",
+            ));
+        }
+        if self
+            .rule
+            .as_deref()
+            .is_some_and(|rule| rule.trim().is_empty())
+        {
+            return Err(Error::new("invalid", "event cause rule must be nonempty"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Event {
     pub seq: i64,
@@ -458,6 +488,8 @@ pub struct Event {
     pub source: String,
     pub native_id: Option<String>,
     pub data: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<EventCause>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1059,7 +1091,7 @@ mod live_wire_tests {
     use serde_json::json;
 
     #[test]
-    fn event_without_subject_preserves_legacy_wire_and_deserializes() {
+    fn event_without_subject_or_cause_preserves_legacy_wire_and_deserializes() {
         let event = Event {
             seq: 9,
             ts: 10,
@@ -1070,10 +1102,74 @@ mod live_wire_tests {
             source: "core".to_owned(),
             native_id: None,
             data: json!({"status":"completed"}),
+            cause: None,
         };
         let legacy_wire = r#"{"seq":9,"ts":10,"kind":"turn.completed","agent":"agent-1","generation":3,"source":"core","native_id":null,"data":{"status":"completed"}}"#;
         assert_eq!(serde_json::to_string(&event).unwrap(), legacy_wire);
         assert_eq!(serde_json::from_str::<Event>(legacy_wire).unwrap(), event);
+
+        let caused = Event {
+            cause: Some(EventCause {
+                command_id: "command-1".to_owned(),
+                rule: Some("stop-on-result".to_owned()),
+                depth: 1,
+            }),
+            ..event
+        };
+        let wire = serde_json::to_value(&caused).unwrap();
+        assert_eq!(
+            wire["cause"],
+            json!({"command_id":"command-1","rule":"stop-on-result","depth":1})
+        );
+        assert_eq!(serde_json::from_value::<Event>(wire).unwrap(), caused);
+    }
+
+    #[test]
+    fn event_cause_has_strict_typed_wire_and_leaves_depth_policy_to_store() {
+        let ordinary = EventCause {
+            command_id: "command-ordinary".to_owned(),
+            rule: None,
+            depth: 0,
+        };
+        ordinary.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(&ordinary).unwrap(),
+            json!({"command_id":"command-ordinary","depth":0})
+        );
+        assert_eq!(
+            serde_json::from_value::<EventCause>(
+                json!({"command_id":"command-ordinary","depth":0})
+            )
+            .unwrap(),
+            ordinary
+        );
+
+        let cause = EventCause {
+            command_id: "command-1".to_owned(),
+            rule: Some("stop-on-result".to_owned()),
+            depth: 6,
+        };
+        cause.validate().unwrap();
+        let wire = json!({
+            "command_id":"command-1",
+            "rule":"stop-on-result",
+            "depth":6
+        });
+        assert_eq!(serde_json::to_value(&cause).unwrap(), wire);
+        assert_eq!(serde_json::from_value::<EventCause>(wire).unwrap(), cause);
+
+        let blank_command: EventCause =
+            serde_json::from_value(json!({"command_id":" ","depth":0})).unwrap();
+        assert!(blank_command.validate().is_err());
+        let blank_rule: EventCause =
+            serde_json::from_value(json!({"command_id":"command-1","rule":" ","depth":0})).unwrap();
+        assert!(blank_rule.validate().is_err());
+        assert!(
+            serde_json::from_value::<EventCause>(
+                json!({"command_id":"command-1","depth":0,"extra":true})
+            )
+            .is_err()
+        );
     }
 
     #[test]

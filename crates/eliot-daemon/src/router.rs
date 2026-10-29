@@ -26,7 +26,7 @@ use eliot_core::{
     classify_dispatched_error,
 };
 use eliot_plugin::{MAX_EVENT_BYTES, sync::LockExt};
-use eliot_store::{TimerDefinitionInput, TimerSlotAdmission, TimerSlotCommit};
+use eliot_store::{RuleProcessingState, TimerDefinitionInput, TimerSlotAdmission, TimerSlotCommit};
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 use std::{
@@ -73,7 +73,7 @@ struct RouterInner {
     agent_credentials: AgentCredentials,
     unknown_commands: UnknownCommands,
     unknown_causes: Mutex<HashMap<String, String>>,
-    global_rule_definitions: Mutex<HashMap<String, RuleDefinition>>,
+    global_rule_definitions: Mutex<HashMap<String, (i64, RuleDefinition)>>,
     plugin_host: PluginHost,
     monitoring: Monitoring,
     workspaces: WorkspaceManager,
@@ -830,7 +830,7 @@ impl Router {
         if !self.rule_firings_open() {
             return Err(Error::new("unavailable", "automation is draining"));
         }
-        let definition = self
+        let (expected_rule_revision, definition) = self
             .global_rule_definition(&request.rule)
             .ok_or_else(|| Error::new("not_found", "timer rule was not found"))?;
         if definition.schedule().is_none() {
@@ -874,7 +874,7 @@ impl Router {
             }
         };
         let Some(admission) = self
-            .admit_manual_timer_run(&request, &timer, prepared)
+            .admit_manual_timer_run(&request, &timer, expected_rule_revision, prepared)
             .await?
         else {
             if let Some(parent) = self.replay_timer_run(&request).await? {
@@ -910,6 +910,7 @@ impl Router {
         &self,
         request: &TimerRunRequest,
         state: &TimerStateView,
+        expected_rule_revision: i64,
         prepared: PreparedSubmission,
     ) -> Result<Option<TimerSlotAdmission>> {
         let PreparedSubmission {
@@ -928,8 +929,14 @@ impl Router {
             if !replay && self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
                 return Ok(None);
             }
-            let admission =
-                store.admit_manual_timer_run("owner", request, state, action, now_ms())?;
+            let admission = store.admit_manual_timer_run(
+                "owner",
+                request,
+                state,
+                expected_rule_revision,
+                action,
+                now_ms(),
+            )?;
             self.publish_locked(&admission.events);
             admission
         };
@@ -945,18 +952,15 @@ impl Router {
         Ok(Some(admission))
     }
 
-    pub(crate) fn install_global_rule_definitions(&self, definitions: &[RuleDefinition]) {
+    pub(crate) fn install_global_rule_definitions(&self, definitions: &[(i64, RuleDefinition)]) {
         let mut stored = self.inner.global_rule_definitions.lock_recover();
         stored.clear();
-        stored.extend(
-            definitions
-                .iter()
-                .cloned()
-                .map(|definition| (definition.id.clone(), definition)),
-        );
+        stored.extend(definitions.iter().map(|(revision, definition)| {
+            (definition.id.clone(), (*revision, definition.clone()))
+        }));
     }
 
-    fn global_rule_definition(&self, id: &str) -> Option<RuleDefinition> {
+    fn global_rule_definition(&self, id: &str) -> Option<(i64, RuleDefinition)> {
         self.inner
             .global_rule_definitions
             .lock_recover()
@@ -967,14 +971,33 @@ impl Router {
     pub(crate) async fn initialize_global_rules(
         &self,
         definitions: &[eliot_store::RuleDefinitionInput],
+        timers: &[TimerDefinitionInput],
         registration_now: i64,
-    ) -> Result<Vec<RuleStateView>> {
+    ) -> Result<Vec<RuleProcessingState>> {
+        self.validate_global_rule_definitions(definitions).await?;
+
+        let change = {
+            let mut store = self.inner.store.lock().await;
+            let change =
+                store.reconcile_rule_definitions("owner", definitions, timers, registration_now)?;
+            self.publish_locked(&change.events);
+            change
+        };
+        if !change.events.is_empty() {
+            self.signal_progress();
+        }
+        self.global_rule_processing().await
+    }
+
+    pub(crate) async fn validate_global_rule_definitions(
+        &self,
+        definitions: &[eliot_store::RuleDefinitionInput],
+    ) -> Result<()> {
         // Check every canonical definition before the first durable seed. Rule
         // text is persisted by Store and must use the same known-secret policy
         // as command semantic data.
         for definition in definitions {
-            let value: Value = serde_json::from_str(&definition.canonical_definition)
-                .map_err(|_| Error::new("invalid", "canonical rule definition is invalid"))?;
+            let value = definition.validated_value()?;
             if contains_known_secret_including_keys(&value, &self.inner.secrets) {
                 return Err(Error::new(
                     "secret_in_payload",
@@ -982,28 +1005,69 @@ impl Router {
                 ));
             }
         }
+        for state in self.global_rule_processing().await? {
+            for canonical in
+                std::iter::once(&state.current_definition).chain(state.retiring_definition.iter())
+            {
+                let value: Value = serde_json::from_str(canonical).map_err(|_| {
+                    Error::new("source_integrity", "stored rule definition is invalid")
+                })?;
+                if contains_known_secret_including_keys(&value, &self.inner.secrets) {
+                    return Err(Error::new(
+                        "secret_in_payload",
+                        "stored rule definition contains a known credential",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 
-        let mut store = self.inner.store.lock().await;
-        definitions
-            .iter()
-            .map(|definition| store.ensure_rule_state("owner", definition, registration_now))
-            .collect()
+    pub(crate) async fn global_rule_processing(&self) -> Result<Vec<RuleProcessingState>> {
+        let mut after_id = None;
+        let mut states = Vec::new();
+        loop {
+            let page = self.inner.store.lock().await.list_rule_processing_states(
+                "owner",
+                after_id.as_deref(),
+                PAGE_MAX,
+            )?;
+            let page_len = page.len();
+            if page_len == 0 {
+                break;
+            }
+            for state in page {
+                after_id = Some(state.view.id.clone());
+                states.push(state);
+            }
+            if page_len < PAGE_MAX {
+                break;
+            }
+        }
+        Ok(states)
+    }
+
+    pub(crate) async fn settle_rule_backlog(
+        &self,
+        state: &RuleStateView,
+        through: i64,
+        max_events: i64,
+        now: i64,
+    ) -> Result<RuleProcessingState> {
+        let change = {
+            let mut store = self.inner.store.lock().await;
+            let change = store.settle_rule_backlog("owner", state, through, max_events, now)?;
+            self.publish_locked(&change.events);
+            change
+        };
+        if !change.events.is_empty() {
+            self.signal_progress();
+        }
+        Ok(change.value)
     }
 
     pub(crate) async fn get_global_timer(&self, id: &str) -> Result<Option<TimerStateView>> {
         self.inner.store.lock().await.get_timer_state("owner", id)
-    }
-
-    pub(crate) async fn initialize_global_timer(
-        &self,
-        input: &TimerDefinitionInput,
-        registration_now: i64,
-    ) -> Result<TimerStateView> {
-        self.inner
-            .store
-            .lock()
-            .await
-            .ensure_timer_state("owner", input, registration_now)
     }
 
     pub(crate) async fn list_due_global_timers(
@@ -3875,7 +3939,7 @@ mod tests {
             vec![secret_key_definition],
         ] {
             let error = router
-                .initialize_global_rules(&definitions, now_ms())
+                .initialize_global_rules(&definitions, &[], now_ms())
                 .await
                 .unwrap_err();
             assert_eq!(error.code, "secret_in_payload");
@@ -3918,8 +3982,10 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
 "#;
         std::fs::write(&rule_path, invalid).unwrap();
         let high_water = router.inner.store.lock().await.high_water().unwrap();
+        let policy = SecretPolicy::default();
 
-        let error = match crate::automation::initialize_global_rules(&router, &root).await {
+        let error = match crate::automation::initialize_global_rules(&router, &root, &policy).await
+        {
             Err(error) => error,
             Ok(_) => panic!("overflowing first timer slot should fail preflight"),
         };
@@ -3952,7 +4018,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             "on = { every = \"1s\" }",
         );
         std::fs::write(&rule_path, corrected).unwrap();
-        let initialized = crate::automation::initialize_global_rules(&router, &root)
+        let (initialized, _) = crate::automation::initialize_global_rules(&router, &root, &policy)
             .await
             .unwrap();
         assert_eq!(initialized.len(), 2);

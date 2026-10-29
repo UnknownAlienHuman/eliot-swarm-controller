@@ -9,7 +9,6 @@ const RULE_ACTION_WINDOW_MS: i64 = 60_000;
 const RULE_ACTION_LIMIT: i64 = 10;
 const GLOBAL_RULE_ACTION_LIMIT: i64 = 120;
 const RULE_COMMAND_ID_DOMAIN: &str = "eliot-rule-command-v1";
-const RULE_TRIGGER_EVENT: &str = "turn.completed";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuleDefinitionInput {
@@ -17,6 +16,36 @@ pub struct RuleDefinitionInput {
     pub canonical_definition: String,
     pub definition_digest: [u8; 32],
     pub enabled: bool,
+}
+
+impl RuleDefinitionInput {
+    pub fn validated_value(&self) -> Result<serde_json::Value> {
+        if self.canonical_definition.len() > 128 * 1024 {
+            return Err(Error::new(
+                "frame_too_large",
+                "canonical rule definition exceeds 128 KiB",
+            ));
+        }
+        let value: serde_json::Value = serde_json::from_str(&self.canonical_definition)
+            .map_err(|_| Error::new("invalid", "canonical rule definition is invalid JSON"))?;
+        let canonical = serde_json::to_string(&value)
+            .map_err(|_| Error::new("invalid", "canonical rule definition cannot be encoded"))?;
+        if canonical != self.canonical_definition {
+            return Err(Error::new(
+                "invalid",
+                "rule definition must use canonical JSON encoding",
+            ));
+        }
+        let digest = core::canonical_json_sha256(&value)
+            .map_err(|_| Error::new("invalid", "rule definition cannot be canonicalized"))?;
+        if digest != self.definition_digest {
+            return Err(Error::new(
+                "source_integrity",
+                "rule definition digest does not match its canonical content",
+            ));
+        }
+        Ok(value)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,10 +61,21 @@ pub enum RuleCursorOutcome {
 #[derive(Clone, Debug, PartialEq)]
 pub struct RuleEventAdmission {
     pub state: core::api::RuleStateView,
-    pub parent: Command,
+    /// Absent only for a cause-depth-suppressed event, which advances the
+    /// cursor without creating a parent or action command.
+    pub parent: Option<Command>,
     pub child: Option<Command>,
     pub events: Vec<Event>,
     pub is_new: bool,
+}
+
+/// Store-owned processing input for the daemon worker. The public Core view
+/// carries cursor progress; serialized definitions stay inside this Store API.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct RuleProcessingState {
+    pub view: core::api::RuleStateView,
+    pub current_definition: String,
+    pub retiring_definition: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -43,6 +83,7 @@ struct StoredRuleState {
     view: core::api::RuleStateView,
     canonical_definition: String,
     definition_digest: [u8; 32],
+    retiring_definition: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -60,6 +101,7 @@ enum RuleFiringIdentity {
 struct RuleFiringKey<'a> {
     principal: &'a str,
     state: &'a core::api::RuleStateView,
+    trigger_cause: Option<core::EventCause>,
     identity: RuleFiringIdentity,
     verb: &'static str,
     args: Value,
@@ -72,21 +114,24 @@ impl<'a> RuleFiringKey<'a> {
     fn event(
         principal: &'a str,
         state: &'a core::api::RuleStateView,
+        revision: i64,
         event_seq: i64,
+        trigger_cause: Option<core::EventCause>,
     ) -> Result<Self> {
         Ok(Self {
             principal,
             state,
+            trigger_cause,
             identity: RuleFiringIdentity::Event { event_seq },
             verb: "rule",
             args: json!({
                 "rule": state.id,
-                "revision": state.revision,
+                "revision": revision,
                 "event_seq": event_seq,
             }),
             parent_digest: None,
-            parent_id: derived_rule_id("parent", principal, &state.id, state.revision, event_seq)?,
-            child_id: derived_rule_id("action-0", principal, &state.id, state.revision, event_seq)?,
+            parent_id: derived_rule_id("parent", principal, &state.id, revision, event_seq)?,
+            child_id: derived_rule_id("action-0", principal, &state.id, revision, event_seq)?,
         })
     }
 
@@ -103,6 +148,7 @@ impl<'a> RuleFiringKey<'a> {
         Ok(Self {
             principal,
             state,
+            trigger_cause: None,
             identity: RuleFiringIdentity::Timer {
                 schedule_revision,
                 slot_ms,
@@ -128,6 +174,7 @@ impl<'a> RuleFiringKey<'a> {
         Ok(Self {
             principal,
             state,
+            trigger_cause: None,
             identity: RuleFiringIdentity::Manual,
             verb: "timer.run",
             args: json!({"rule": state.id}),
@@ -161,6 +208,21 @@ impl<'a> RuleFiringKey<'a> {
         data
     }
 
+    fn command_cause(&self, command_id: &str) -> Result<core::EventCause> {
+        let depth = next_rule_cause_depth(self.trigger_cause.as_ref());
+        if depth > 5 {
+            return Err(Error::new(
+                "bad_state",
+                "rule cause depth exceeds the firing limit",
+            ));
+        }
+        Ok(core::EventCause {
+            command_id: command_id.to_owned(),
+            rule: Some(self.state.id.clone()),
+            depth,
+        })
+    }
+
     fn matches_parent(&self, parent: &Command, principal: &str) -> bool {
         if parent.principal != principal || parent.verb != self.verb || parent.args != self.args {
             return false;
@@ -180,6 +242,10 @@ impl<'a> RuleFiringKey<'a> {
             RuleFiringIdentity::Manual => parent.id == self.parent_id,
         }
     }
+}
+
+fn next_rule_cause_depth(trigger_cause: Option<&core::EventCause>) -> u8 {
+    trigger_cause.map_or(1, |cause| cause.depth.saturating_add(1))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -215,8 +281,7 @@ enum RuleParentOutcome<'a> {
 }
 
 impl Store {
-    /// Create a rule at the transaction's event high-water, or read the unchanged
-    /// persisted definition. Semantic replacement is unsupported in this slice.
+    /// Create or reconcile one rule using the transaction's captured high-water.
     pub fn ensure_rule_state(
         &mut self,
         principal: &str,
@@ -226,50 +291,15 @@ impl Store {
         self.ensure_writer_healthy()?;
         let result = (|| {
             validate_principal_rule(principal, &input.id)?;
-            validate_definition_input(input)?;
+            input.validated_value()?;
             let tx = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
 
-            if let Some(existing) = load_rule_state(&tx, principal, &input.id)? {
-                if existing.canonical_definition != input.canonical_definition
-                    || existing.definition_digest != input.definition_digest
-                    || existing.view.enabled != input.enabled
-                {
-                    return Err(Error::new(
-                        "unsupported",
-                        "semantic rule edits are unsupported in this slice",
-                    ));
-                }
-                commit_transaction(tx, &self.write_faulted)?;
-                return Ok(existing.view);
-            }
-
-            let cursor = high_water_tx(&tx)?;
-            tx.execute(
-                "INSERT INTO rule_state(
-                     principal, rule, revision, current_definition, definition_digest,
-                     current_cursor, enabled, paused_reason, updated_at
-                 ) VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, NULL, ?7)",
-                params![
-                    principal,
-                    input.id,
-                    input.canonical_definition,
-                    input.definition_digest.as_slice(),
-                    cursor,
-                    input.enabled,
-                    now,
-                ],
-            )
-            .map_err(sql_error)?;
-            let view = core::api::RuleStateView {
-                id: input.id.clone(),
-                revision: 1,
-                current_cursor: cursor,
-                enabled: input.enabled,
-                paused_reason: None,
-            };
+            let high_water = high_water_tx(&tx)?;
+            let mut events = Vec::new();
+            let view = ensure_rule_state_tx(&tx, principal, input, high_water, now, &mut events)?;
             commit_transaction(tx, &self.write_faulted)?;
             Ok(view)
         })();
@@ -285,6 +315,112 @@ impl Store {
         require_nonempty(principal, "principal")?;
         require_nonempty(id, "rule id")?;
         Ok(load_rule_state(&self.connection, principal, id)?.map(|state| state.view))
+    }
+
+    /// Reconcile a startup or watcher snapshot. A single captured event high-water
+    /// fences every definition edit in this transaction; timer schedule inputs use
+    /// the same registration sample supplied by the daemon.
+    pub fn reconcile_rule_definitions(
+        &mut self,
+        principal: &str,
+        definitions: &[RuleDefinitionInput],
+        timers: &[TimerDefinitionInput],
+        now: i64,
+    ) -> Result<Change<Vec<RuleProcessingState>>> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            require_nonempty(principal, "principal")?;
+            let mut definition_ids = HashSet::new();
+            for definition in definitions {
+                validate_principal_rule(principal, &definition.id)?;
+                definition.validated_value()?;
+                if !definition_ids.insert(definition.id.as_str()) {
+                    return Err(Error::new("invalid", "rule IDs must be unique"));
+                }
+            }
+            let mut timer_ids = HashSet::new();
+            for timer in timers {
+                if !definition_ids.contains(timer.id.as_str())
+                    || !timer_ids.insert(timer.id.as_str())
+                {
+                    return Err(Error::new(
+                        "invalid",
+                        "timer inputs must name unique rules in the snapshot",
+                    ));
+                }
+            }
+
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let high_water = high_water_tx(&tx)?;
+            let mut events = Vec::new();
+            let existing_ids = rule_ids_tx(&tx, principal)?;
+            for id in existing_ids {
+                if !definition_ids.contains(id.as_str()) {
+                    disable_deleted_rule_tx(&tx, principal, &id, high_water, now, &mut events)?;
+                }
+            }
+
+            for definition in definitions {
+                ensure_rule_state_tx(&tx, principal, definition, high_water, now, &mut events)?;
+            }
+
+            for timer in timers {
+                let definition = definitions
+                    .iter()
+                    .find(|definition| definition.id == timer.id)
+                    .expect("timer IDs were checked against definitions");
+                let stored = load_rule_state(&tx, principal, &timer.id)?
+                    .ok_or_else(|| Error::new("internal", "reconciled rule state is absent"))?;
+                // A new edit is deferred while the previous revision retires. Do
+                // not apply its timer schedule until the matching definition does.
+                if stored.canonical_definition == definition.canonical_definition
+                    && stored.view.enabled == definition.enabled
+                {
+                    ensure_timer_state_tx(&tx, principal, timer, now)?;
+                }
+            }
+
+            for definition in definitions {
+                let stored = load_rule_state(&tx, principal, &definition.id)?
+                    .ok_or_else(|| Error::new("internal", "reconciled rule state is absent"))?;
+                if stored.canonical_definition == definition.canonical_definition
+                    && stored.view.enabled == definition.enabled
+                    && !timer_ids.contains(definition.id.as_str())
+                {
+                    tx.execute(
+                        "DELETE FROM timers WHERE principal = ?1 AND rule = ?2",
+                        params![principal, definition.id],
+                    )
+                    .map_err(sql_error)?;
+                }
+            }
+
+            let states = list_rule_processing_states_tx(&tx, principal, None, MAX_PAGE_ENTRIES)?;
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(Change {
+                value: states,
+                events,
+            })
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    pub fn list_rule_processing_states(
+        &self,
+        principal: &str,
+        after_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<RuleProcessingState>> {
+        require_nonempty(principal, "principal")?;
+        validate_limit(limit)?;
+        if let Some(after_id) = after_id {
+            require_nonempty(after_id, "rule cursor")?;
+        }
+        list_rule_processing_states_tx(&self.connection, principal, after_id, limit)
     }
 
     /// Advance a scanned event range. NoMatch is deliberately cursor-only so a
@@ -308,9 +444,17 @@ impl Store {
             let stored = load_rule_state(&tx, principal, &state.id)?
                 .ok_or_else(|| Error::new("not_found", "rule state was not found"))?;
 
+            let retiring = rule_cursor_is_retiring(&stored.view, through);
+            let cursor = if retiring {
+                stored.view.retiring_cursor.ok_or_else(|| {
+                    Error::new("source_integrity", "retiring cursor is incomplete")
+                })?
+            } else {
+                stored.view.current_cursor
+            };
             // A replay after a successful commit is a no-op. It must not emit a
-            // second skip/rejection event or move the cursor backwards.
-            if through <= stored.view.current_cursor {
+            // second skip/rejection event or move either lane backwards.
+            if through <= cursor {
                 commit_transaction(tx, &self.write_faulted)?;
                 return Ok(Change {
                     value: stored.view,
@@ -326,6 +470,19 @@ impl Store {
                     "rule cursor cannot advance past the captured event high-water",
                 ));
             }
+            if retiring && through > stored.view.retire_through.unwrap_or_default() {
+                return Err(Error::new(
+                    "invalid",
+                    "retiring rule cursor cannot advance past its captured boundary",
+                ));
+            }
+            let revision = if retiring {
+                stored.view.retiring_revision.ok_or_else(|| {
+                    Error::new("source_integrity", "retiring revision is incomplete")
+                })?
+            } else {
+                stored.view.revision
+            };
 
             let mut events = Vec::new();
             match outcome {
@@ -340,15 +497,15 @@ impl Store {
                     // Only record a range that contains trigger events. A range
                     // containing only rule bookkeeping is cursor-only, preventing
                     // disabled rules from amplifying their own skip metadata.
-                    if has_trigger_in_range(&tx, stored.view.current_cursor, through)? {
+                    if has_non_rule_event_in_range(&tx, cursor, through)? {
                         events.push(insert_rule_event(
                             &tx,
                             now,
                             "rule.skipped",
                             json!({
                                 "rule": state.id,
-                                "revision": state.revision,
-                                "from_seq": stored.view.current_cursor + 1,
+                                "revision": revision,
+                                "from_seq": cursor + 1,
                                 "through_seq": through,
                                 "reason": "disabled",
                             }),
@@ -359,37 +516,140 @@ impl Store {
                     if code.trim().is_empty() || code.len() > 128 {
                         return Err(Error::new("invalid", "rule rejection code is invalid"));
                     }
-                    let kind: String = tx
-                        .query_row("SELECT kind FROM events WHERE seq = ?1", [through], |row| {
-                            row.get(0)
-                        })
-                        .optional()
-                        .map_err(sql_error)?
-                        .ok_or_else(|| {
-                            Error::new("not_found", "rejected rule event was not found")
-                        })?;
-                    if kind != RULE_TRIGGER_EVENT {
-                        return Err(Error::new(
-                            "bad_state",
-                            "rule rejection bookkeeping is only for turn.completed events",
-                        ));
+                    let trigger = load_rule_trigger(&tx, through)?;
+                    // A malformed rule-triggered bookkeeping event is consumed
+                    // silently so a rule cannot generate an endless rejection chain.
+                    // Also suppress a would-be sixth-level derivative before
+                    // writing the rejection marker; the cursor still commits below.
+                    if !trigger.kind.starts_with("rule.")
+                        && next_rule_cause_depth(trigger.cause.as_ref()) <= 5
+                    {
+                        events.push(insert_rule_event_with_cause(
+                            &tx,
+                            now,
+                            "rule.rejected",
+                            json!({
+                                "rule": state.id,
+                                "revision": revision,
+                                "from_seq": cursor + 1,
+                                "through_seq": through,
+                                "code": code,
+                            }),
+                            trigger.cause,
+                        )?);
                     }
-                    events.push(insert_rule_event(
-                        &tx,
-                        now,
-                        "rule.rejected",
-                        json!({
-                            "rule": state.id,
-                            "revision": state.revision,
-                            "from_seq": stored.view.current_cursor + 1,
-                            "through_seq": through,
-                            "code": code,
-                        }),
-                    )?);
                 }
             }
 
             let view = update_rule_cursor_tx(&tx, principal, &stored.view, through, now)?;
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(Change {
+                value: view,
+                events,
+            })
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    /// Atomically discard an overlarge retained range, clear retirement, and
+    /// pause the rule. The caller supplies its captured high-water; Store counts
+    /// committed rows in the range rather than relying on sequence gaps.
+    pub fn settle_rule_backlog(
+        &mut self,
+        principal: &str,
+        state: &core::api::RuleStateView,
+        through: i64,
+        max_events: i64,
+        now: i64,
+    ) -> Result<Change<RuleProcessingState>> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            require_nonempty(principal, "principal")?;
+            state.validate()?;
+            if max_events < 0 {
+                return Err(Error::new("invalid", "maximum rule backlog is negative"));
+            }
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let stored = load_rule_state(&tx, principal, &state.id)?
+                .ok_or_else(|| Error::new("not_found", "rule state was not found"))?;
+            if stored.view != *state {
+                return Err(Error::new("bad_state", "rule backlog view is stale"));
+            }
+            let high_water = high_water_tx(&tx)?;
+            if through > high_water || through < state.current_cursor {
+                return Err(Error::new("invalid", "rule backlog boundary is invalid"));
+            }
+            let oldest = if state.enabled {
+                state
+                    .retiring_cursor
+                    .filter(|_| state.retire_through.is_some())
+                    .map_or(state.current_cursor, |retiring| {
+                        retiring.min(state.current_cursor)
+                    })
+            } else {
+                through
+            };
+            let retained: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE seq > ?1 AND seq <= ?2",
+                    params![oldest, through],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?;
+            let mut events = Vec::new();
+            let view = if state.enabled && state.paused_reason.is_none() && retained > max_events {
+                tx.execute(
+                    "UPDATE rule_state
+                     SET current_cursor = ?1, retiring_revision = NULL,
+                         retiring_definition = NULL, retiring_cursor = NULL,
+                         retire_through = NULL, paused_reason = 'backlog_exceeded',
+                         updated_at = ?2
+                     WHERE principal = ?3 AND rule = ?4 AND revision = ?5
+                       AND current_cursor = ?6
+                       AND retiring_revision IS ?7 AND retiring_cursor IS ?8
+                       AND retire_through IS ?9",
+                    params![
+                        through,
+                        now,
+                        principal,
+                        state.id,
+                        state.revision,
+                        state.current_cursor,
+                        state.retiring_revision,
+                        state.retiring_cursor,
+                        state.retire_through,
+                    ],
+                )
+                .map_err(sql_error)?;
+                if tx.changes() != 1 {
+                    return Err(Error::new(
+                        "bad_state",
+                        "rule backlog state changed concurrently",
+                    ));
+                }
+                if has_non_rule_event_in_range(&tx, oldest, through)? {
+                    events.push(insert_rule_event(
+                        &tx,
+                        now,
+                        "rule.skipped",
+                        json!({
+                            "rule": state.id,
+                            "revision": state.revision,
+                            "from_seq": oldest + 1,
+                            "through_seq": through,
+                            "reason": "backlog_exceeded",
+                        }),
+                    )?);
+                }
+                load_rule_processing_state(&tx, principal, &state.id)?
+                    .ok_or_else(|| Error::new("internal", "paused rule state disappeared"))?
+            } else {
+                RuleProcessingState::from(stored)
+            };
             commit_transaction(tx, &self.write_faulted)?;
             Ok(Change {
                 value: view,
@@ -436,7 +696,31 @@ impl Store {
             .map_err(sql_error)?;
         let stored = load_rule_state(&tx, principal, &state.id)?
             .ok_or_else(|| Error::new("not_found", "rule state was not found"))?;
-        let key = RuleFiringKey::event(principal, state, event_seq)?;
+        let trigger = load_rule_trigger(&tx, event_seq)?;
+        let retiring = rule_cursor_is_retiring(&stored.view, event_seq);
+        let cursor = if retiring {
+            stored
+                .view
+                .retiring_cursor
+                .ok_or_else(|| Error::new("source_integrity", "retiring cursor is incomplete"))?
+        } else {
+            stored.view.current_cursor
+        };
+        let revision = if retiring {
+            stored
+                .view
+                .retiring_revision
+                .ok_or_else(|| Error::new("source_integrity", "retiring revision is incomplete"))?
+        } else {
+            stored.view.revision
+        };
+        let key = RuleFiringKey::event(
+            principal,
+            &stored.view,
+            revision,
+            event_seq,
+            trigger.cause.clone(),
+        )?;
 
         if let Some(parent) = load_command(&tx, &key.parent_id)? {
             if !key.matches_parent(&parent, principal) {
@@ -445,7 +729,7 @@ impl Store {
                     "derived rule parent id is bound to another action",
                 ));
             }
-            if stored.view.current_cursor < event_seq {
+            if cursor < event_seq {
                 return Err(Error::new(
                     "source_integrity",
                     "rule parent exists before its event cursor commit",
@@ -455,13 +739,13 @@ impl Store {
             commit_transaction(tx, &self.write_faulted)?;
             return Ok(RuleEventAdmission {
                 state: stored.view,
-                parent,
+                parent: Some(parent),
                 child,
                 events: Vec::new(),
                 is_new: false,
             });
         }
-        if stored.view.current_cursor >= event_seq {
+        if cursor >= event_seq {
             return Err(Error::new(
                 "bad_state",
                 "rule event was already scanned without its deterministic parent",
@@ -477,14 +761,19 @@ impl Store {
             ));
         }
 
-        let event = load_rule_trigger(&tx, event_seq)?;
-        if event.kind != RULE_TRIGGER_EVENT {
-            return Err(Error::new(
-                "invalid",
-                "rule stop admission requires a turn.completed event",
-            ));
+        let depth = next_rule_cause_depth(trigger.cause.as_ref());
+        if depth > 5 {
+            let view = update_rule_cursor_tx(&tx, principal, &stored.view, event_seq, now)?;
+            commit_transaction(tx, &self.write_faulted)?;
+            return Ok(RuleEventAdmission {
+                state: view,
+                parent: None,
+                child: None,
+                events: Vec::new(),
+                is_new: true,
+            });
         }
-        let binding_error = stop_binding_error(&event, &request);
+        let binding_error = stop_binding_error(&trigger, &request);
         request.id = key.child_id.clone();
 
         if let Some(code) = binding_error {
@@ -511,7 +800,7 @@ impl Store {
 
         Ok(RuleEventAdmission {
             state: view,
-            parent,
+            parent: Some(parent),
             child: Some(child),
             events,
             is_new: true,
@@ -558,79 +847,11 @@ impl Store {
     ) -> Result<core::api::TimerStateView> {
         self.ensure_writer_healthy()?;
         let result = (|| {
-            require_nonempty(&input.id, "timer id")?;
-            if input.schedule_revision <= 0 {
-                return Err(Error::new(
-                    "invalid",
-                    "timer schedule revision must be positive",
-                ));
-            }
-            input.schedule.validate()?;
-            let trigger = serde_json::to_string(&input.schedule)
-                .map_err(|_| Error::new("invalid", "timer schedule cannot be encoded"))?;
             let tx = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
-            let rule = load_rule_state(&tx, principal, &input.id)?
-                .ok_or_else(|| Error::new("not_found", "timer rule was not found"))?;
-            let catch_up = rule_catch_up(&rule)?;
-            if rule.view.enabled != input.enabled {
-                return Err(Error::new(
-                    "bad_state",
-                    "timer enabled state differs from its rule definition",
-                ));
-            }
-            if let Some(existing) = load_timer_state(&tx, principal, &input.id)? {
-                if existing.view.schedule_revision != input.schedule_revision
-                    || existing.trigger != trigger
-                    || existing.catch_up != catch_up
-                {
-                    return Err(Error::new(
-                        "unsupported",
-                        "timer schedule replacement is unsupported in this slice",
-                    ));
-                }
-                commit_transaction(tx, &self.write_faulted)?;
-                return Ok(existing.view);
-            }
-
-            validate_timer_definition(input, now)?;
-            let anchor = match &input.schedule {
-                core::api::TimerSchedule::Interval {
-                    anchor: Some(anchor),
-                    ..
-                } => *anchor,
-                core::api::TimerSchedule::Interval { anchor: None, .. } => now,
-                core::api::TimerSchedule::Cron { .. } | core::api::TimerSchedule::Once { .. } => {
-                    now
-                }
-            };
-            tx.execute(
-                "INSERT INTO timers(
-                     principal, rule, schedule_revision, trigger, anchor,
-                     last_key, next_due_at, catch_up
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)",
-                params![
-                    principal,
-                    input.id,
-                    input.schedule_revision,
-                    trigger,
-                    anchor,
-                    input.initial_next_due_at,
-                    catch_up_name(catch_up),
-                ],
-            )
-            .map_err(sql_error)?;
-            let view = core::api::TimerStateView {
-                id: input.id.clone(),
-                schedule_revision: input.schedule_revision,
-                schedule: input.schedule.clone(),
-                anchor,
-                last_key: None,
-                next_due_at: input.initial_next_due_at,
-                enabled: rule.view.enabled && rule.view.paused_reason.is_none(),
-            };
+            let view = ensure_timer_state_tx(&tx, principal, input, now)?;
             commit_transaction(tx, &self.write_faulted)?;
             Ok(view)
         })();
@@ -895,11 +1116,19 @@ impl Store {
         principal: &str,
         request: &core::api::TimerRunRequest,
         state: &core::api::TimerStateView,
+        expected_rule_revision: i64,
         action: SubmitCommand,
         now: i64,
     ) -> Result<TimerSlotAdmission> {
         self.ensure_writer_healthy()?;
-        let result = self.admit_manual_timer_run_inner(principal, request, state, action, now);
+        let result = self.admit_manual_timer_run_inner(
+            principal,
+            request,
+            state,
+            expected_rule_revision,
+            action,
+            now,
+        );
         self.fault_on_persistence_error(&result);
         result
     }
@@ -909,13 +1138,13 @@ impl Store {
         principal: &str,
         request: &core::api::TimerRunRequest,
         state: &core::api::TimerStateView,
+        expected_rule_revision: i64,
         action: SubmitCommand,
         now: i64,
     ) -> Result<TimerSlotAdmission> {
         require_nonempty(principal, "principal")?;
         request.validate()?;
         validate_ulid(&request.id)?;
-        state.validate()?;
         let digest = timer_run_digest(request)?;
         let tx = self
             .connection
@@ -932,6 +1161,15 @@ impl Store {
                 blocked: false,
             });
         }
+        let rule = load_rule_state(&tx, principal, &request.rule)?
+            .ok_or_else(|| Error::new("not_found", "timer rule was not found"))?;
+        if rule.view.revision != expected_rule_revision {
+            return Err(Error::new(
+                "bad_state",
+                "timer rule definition changed before manual run admission",
+            ));
+        }
+        state.validate()?;
         if write_exists(&tx, &request.id)? {
             return Err(Error::new(
                 "id_conflict",
@@ -948,8 +1186,6 @@ impl Store {
                 "timer state does not match the request",
             ));
         }
-        let rule = load_rule_state(&tx, principal, &request.rule)?
-            .ok_or_else(|| Error::new("not_found", "timer rule was not found"))?;
         let timer = load_timer_state(&tx, principal, &request.rule)?
             .ok_or_else(|| Error::new("not_found", "timer state was not found"))?;
         if timer.view != *state || !timer.view.enabled || !rule.view.enabled {
@@ -1004,37 +1240,131 @@ impl Store {
     }
 }
 
+fn ensure_timer_state_tx(
+    tx: &Transaction<'_>,
+    principal: &str,
+    input: &TimerDefinitionInput,
+    registration_ms: i64,
+) -> Result<core::api::TimerStateView> {
+    require_nonempty(principal, "principal")?;
+    if input.schedule_revision <= 0 {
+        return Err(Error::new(
+            "invalid",
+            "timer schedule revision must be positive",
+        ));
+    }
+    input.schedule.validate()?;
+    let trigger = serde_json::to_string(&input.schedule)
+        .map_err(|_| Error::new("invalid", "timer schedule cannot be encoded"))?;
+    let rule = load_rule_state(tx, principal, &input.id)?
+        .ok_or_else(|| Error::new("not_found", "timer rule was not found"))?;
+    let catch_up = rule_catch_up(&rule)?;
+    if rule.view.enabled != input.enabled {
+        return Err(Error::new(
+            "bad_state",
+            "timer enabled state differs from its rule definition",
+        ));
+    }
+
+    if let Some(existing) = load_timer_state(tx, principal, &input.id)? {
+        if input.schedule_revision < existing.view.schedule_revision {
+            return Err(Error::new("bad_state", "timer schedule revision is stale"));
+        }
+        if input.schedule_revision == existing.view.schedule_revision {
+            if existing.trigger != trigger || existing.catch_up != catch_up {
+                return Err(Error::new(
+                    "bad_state",
+                    "timer schedule or catch_up changed without a new schedule revision",
+                ));
+            }
+            return Ok(existing.view);
+        }
+
+        validate_timer_definition(input, registration_ms)?;
+        let anchor = match &input.schedule {
+            core::api::TimerSchedule::Interval {
+                anchor: Some(anchor),
+                ..
+            } => *anchor,
+            core::api::TimerSchedule::Interval { anchor: None, .. }
+            | core::api::TimerSchedule::Cron { .. }
+            | core::api::TimerSchedule::Once { .. } => registration_ms,
+        };
+        let changed = tx
+            .execute(
+                "UPDATE timers
+                 SET schedule_revision = ?1, trigger = ?2, anchor = ?3,
+                     last_key = NULL, next_due_at = ?4, catch_up = ?5
+                 WHERE principal = ?6 AND rule = ?7 AND schedule_revision = ?8",
+                params![
+                    input.schedule_revision,
+                    trigger,
+                    anchor,
+                    input.initial_next_due_at,
+                    catch_up_name(catch_up),
+                    principal,
+                    input.id,
+                    existing.view.schedule_revision,
+                ],
+            )
+            .map_err(sql_error)?;
+        if changed != 1 {
+            return Err(Error::new(
+                "bad_state",
+                "timer schedule changed concurrently",
+            ));
+        }
+        return Ok(core::api::TimerStateView {
+            id: input.id.clone(),
+            schedule_revision: input.schedule_revision,
+            schedule: input.schedule.clone(),
+            anchor,
+            last_key: None,
+            next_due_at: input.initial_next_due_at,
+            enabled: rule.view.enabled && rule.view.paused_reason.is_none(),
+        });
+    }
+
+    validate_timer_definition(input, registration_ms)?;
+    let anchor = match &input.schedule {
+        core::api::TimerSchedule::Interval {
+            anchor: Some(anchor),
+            ..
+        } => *anchor,
+        core::api::TimerSchedule::Interval { anchor: None, .. }
+        | core::api::TimerSchedule::Cron { .. }
+        | core::api::TimerSchedule::Once { .. } => registration_ms,
+    };
+    tx.execute(
+        "INSERT INTO timers(
+             principal, rule, schedule_revision, trigger, anchor,
+             last_key, next_due_at, catch_up
+         ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)",
+        params![
+            principal,
+            input.id,
+            input.schedule_revision,
+            trigger,
+            anchor,
+            input.initial_next_due_at,
+            catch_up_name(catch_up),
+        ],
+    )
+    .map_err(sql_error)?;
+    Ok(core::api::TimerStateView {
+        id: input.id.clone(),
+        schedule_revision: input.schedule_revision,
+        schedule: input.schedule.clone(),
+        anchor,
+        last_key: None,
+        next_due_at: input.initial_next_due_at,
+        enabled: rule.view.enabled && rule.view.paused_reason.is_none(),
+    })
+}
+
 fn validate_principal_rule(principal: &str, rule: &str) -> Result<()> {
     require_nonempty(principal, "principal")?;
     require_nonempty(rule, "rule id")
-}
-
-fn validate_definition_input(input: &RuleDefinitionInput) -> Result<()> {
-    if input.canonical_definition.len() > 128 * 1024 {
-        return Err(Error::new(
-            "frame_too_large",
-            "canonical rule definition exceeds 128 KiB",
-        ));
-    }
-    let value: Value = serde_json::from_str(&input.canonical_definition)
-        .map_err(|_| Error::new("invalid", "canonical rule definition is invalid JSON"))?;
-    let canonical = serde_json::to_string(&value)
-        .map_err(|_| Error::new("invalid", "canonical rule definition cannot be encoded"))?;
-    if canonical != input.canonical_definition {
-        return Err(Error::new(
-            "invalid",
-            "rule definition must use canonical JSON encoding",
-        ));
-    }
-    let digest = core::canonical_json_sha256(&value)
-        .map_err(|_| Error::new("invalid", "rule definition cannot be canonicalized"))?;
-    if digest != input.definition_digest {
-        return Err(Error::new(
-            "source_integrity",
-            "rule definition digest does not match its canonical content",
-        ));
-    }
-    Ok(())
 }
 
 struct StoredTimerState {
@@ -1126,6 +1456,251 @@ fn parse_catch_up(value: &str) -> Result<core::api::CatchUp> {
             "stored timer catch_up is invalid",
         )),
     }
+}
+
+fn ensure_rule_state_tx(
+    tx: &Transaction<'_>,
+    principal: &str,
+    input: &RuleDefinitionInput,
+    high_water: i64,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<core::api::RuleStateView> {
+    if let Some(existing) = load_rule_state(tx, principal, &input.id)? {
+        if existing.canonical_definition == input.canonical_definition
+            && existing.definition_digest == input.definition_digest
+            && existing.view.enabled == input.enabled
+        {
+            return Ok(existing.view);
+        }
+
+        // Only one retiring revision is retained. Keep the old current
+        // definition until it drains; the daemon retries the latest snapshot.
+        if existing.view.retiring_revision.is_some() && input.enabled {
+            return Ok(existing.view);
+        }
+
+        let revision = existing
+            .view
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| Error::new("invalid", "rule revision overflows"))?;
+        let should_retire = existing.view.enabled && input.enabled;
+        let retiring = should_retire && existing.view.current_cursor < high_water;
+        let skipped_from = existing
+            .view
+            .retiring_cursor
+            .map_or(existing.view.current_cursor, |cursor| {
+                cursor.min(existing.view.current_cursor)
+            });
+
+        if existing.view.enabled
+            && !input.enabled
+            && skipped_from < high_water
+            && has_non_rule_event_in_range(tx, skipped_from, high_water)?
+        {
+            events.push(insert_rule_event(
+                tx,
+                now,
+                "rule.skipped",
+                json!({
+                    "rule": input.id,
+                    "revision": existing.view.revision,
+                    "from_seq": skipped_from + 1,
+                    "through_seq": high_water,
+                    "reason": "disabled",
+                }),
+            )?);
+        }
+
+        let changed = tx
+            .execute(
+                "UPDATE rule_state
+                 SET revision = ?1, current_definition = ?2, definition_digest = ?3,
+                     current_cursor = ?4, enabled = ?5,
+                     retiring_revision = ?6, retiring_definition = ?7,
+                     retiring_cursor = ?8, retire_through = ?9, updated_at = ?10
+                 WHERE principal = ?11 AND rule = ?12 AND revision = ?13
+                   AND current_cursor = ?14",
+                params![
+                    revision,
+                    input.canonical_definition,
+                    input.definition_digest.as_slice(),
+                    high_water,
+                    input.enabled,
+                    retiring.then_some(existing.view.revision),
+                    retiring.then_some(existing.canonical_definition.as_str()),
+                    retiring.then_some(existing.view.current_cursor),
+                    retiring.then_some(high_water),
+                    now,
+                    principal,
+                    input.id,
+                    existing.view.revision,
+                    existing.view.current_cursor,
+                ],
+            )
+            .map_err(sql_error)?;
+        if changed != 1 {
+            return Err(Error::new(
+                "bad_state",
+                "rule definition changed concurrently",
+            ));
+        }
+        return load_rule_state(tx, principal, &input.id)?
+            .map(|stored| stored.view)
+            .ok_or_else(|| Error::new("internal", "updated rule state disappeared"));
+    }
+
+    tx.execute(
+        "INSERT INTO rule_state(
+             principal, rule, revision, current_definition, definition_digest,
+             current_cursor, enabled, paused_reason, updated_at,
+             retiring_revision, retiring_definition, retiring_cursor, retire_through
+         ) VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, NULL, ?7, NULL, NULL, NULL, NULL)",
+        params![
+            principal,
+            input.id,
+            input.canonical_definition,
+            input.definition_digest.as_slice(),
+            high_water,
+            input.enabled,
+            now,
+        ],
+    )
+    .map_err(sql_error)?;
+    Ok(core::api::RuleStateView {
+        id: input.id.clone(),
+        revision: 1,
+        current_cursor: high_water,
+        retiring_revision: None,
+        retiring_cursor: None,
+        retire_through: None,
+        enabled: input.enabled,
+        paused_reason: None,
+    })
+}
+
+fn disable_deleted_rule_tx(
+    tx: &Transaction<'_>,
+    principal: &str,
+    id: &str,
+    high_water: i64,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    let Some(existing) = load_rule_state(tx, principal, id)? else {
+        return Ok(());
+    };
+    let oldest = existing
+        .view
+        .retiring_cursor
+        .map_or(existing.view.current_cursor, |retiring| {
+            retiring.min(existing.view.current_cursor)
+        });
+    if existing.view.enabled
+        && oldest < high_water
+        && has_non_rule_event_in_range(tx, oldest, high_water)?
+    {
+        events.push(insert_rule_event(
+            tx,
+            now,
+            "rule.skipped",
+            json!({
+                "rule": id,
+                "revision": existing.view.revision,
+                "from_seq": oldest + 1,
+                "through_seq": high_water,
+                "reason": "deleted",
+            }),
+        )?);
+    }
+    tx.execute(
+        "UPDATE rule_state
+         SET current_cursor = ?1, enabled = 0,
+             retiring_revision = NULL, retiring_definition = NULL,
+             retiring_cursor = NULL, retire_through = NULL, updated_at = ?2
+         WHERE principal = ?3 AND rule = ?4 AND revision = ?5
+           AND current_cursor = ?6
+           AND retiring_revision IS ?7 AND retiring_cursor IS ?8
+           AND retire_through IS ?9",
+        params![
+            high_water,
+            now,
+            principal,
+            id,
+            existing.view.revision,
+            existing.view.current_cursor,
+            existing.view.retiring_revision,
+            existing.view.retiring_cursor,
+            existing.view.retire_through,
+        ],
+    )
+    .map_err(sql_error)?;
+    if tx.changes() != 1 {
+        return Err(Error::new("bad_state", "deleted rule changed concurrently"));
+    }
+    Ok(())
+}
+
+fn rule_ids_tx(connection: &Connection, principal: &str) -> Result<Vec<String>> {
+    let mut statement = connection
+        .prepare("SELECT rule FROM rule_state WHERE principal = ?1 ORDER BY rule")
+        .map_err(sql_error)?;
+    let rows = statement
+        .query_map([principal], |row| row.get::<_, String>(0))
+        .map_err(sql_error)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(sql_error)
+}
+
+impl From<StoredRuleState> for RuleProcessingState {
+    fn from(stored: StoredRuleState) -> Self {
+        Self {
+            view: stored.view,
+            current_definition: stored.canonical_definition,
+            retiring_definition: stored.retiring_definition,
+        }
+    }
+}
+
+fn load_rule_processing_state(
+    connection: &Connection,
+    principal: &str,
+    id: &str,
+) -> Result<Option<RuleProcessingState>> {
+    Ok(load_rule_state(connection, principal, id)?.map(RuleProcessingState::from))
+}
+
+fn list_rule_processing_states_tx(
+    connection: &Connection,
+    principal: &str,
+    after_id: Option<&str>,
+    limit: usize,
+) -> Result<Vec<RuleProcessingState>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT rule FROM rule_state
+             WHERE principal = ?1 AND (?2 IS NULL OR rule > ?2)
+             ORDER BY rule LIMIT ?3",
+        )
+        .map_err(sql_error)?;
+    let rows = statement
+        .query_map(params![principal, after_id, limit as i64], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(sql_error)?;
+    let ids = rows
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(sql_error)?;
+    drop(statement);
+    let mut states = Vec::with_capacity(ids.len());
+    for id in ids {
+        let state = load_rule_processing_state(connection, principal, &id)?
+            .ok_or_else(|| Error::new("source_integrity", "listed rule state disappeared"))?;
+        states.push(state);
+    }
+    enforce_page_bytes(&mut states)?;
+    Ok(states)
 }
 
 fn replay_timer_run_tx(
@@ -1332,9 +1907,17 @@ fn reject_timer_fire_tx(
     code: &str,
     now: i64,
 ) -> Result<(Command, Vec<Event>)> {
-    let (parent, parent_event) =
+    let parent_cause = key.command_cause(&key.parent_id)?;
+    let (parent, mut parent_event) =
         insert_rule_parent(tx, key, RuleParentOutcome::Rejected { code }, now)?;
-    let rejected = insert_rule_event(tx, now, "rule.rejected", key.rejected_data(code))?;
+    annotate_new_command_cause_tx(tx, &parent.id, &mut parent_event, parent_cause.clone())?;
+    let rejected = insert_rule_event_with_cause(
+        tx,
+        now,
+        "rule.rejected",
+        key.rejected_data(code),
+        Some(parent_cause),
+    )?;
     Ok((parent, vec![parent_event, rejected]))
 }
 
@@ -1346,7 +1929,8 @@ fn load_rule_state(
     let row = connection
         .query_row(
             "SELECT revision, current_definition, definition_digest,
-                    current_cursor, enabled, paused_reason
+                    current_cursor, enabled, paused_reason, retiring_revision,
+                    retiring_definition, retiring_cursor, retire_through
              FROM rule_state WHERE principal = ?1 AND rule = ?2",
             params![principal, id],
             |row| {
@@ -1357,6 +1941,10 @@ fn load_rule_state(
                     row.get::<_, i64>(3)?,
                     row.get::<_, bool>(4)?,
                     row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
                 ))
             },
         )
@@ -1369,6 +1957,10 @@ fn load_rule_state(
         current_cursor,
         enabled,
         paused_reason,
+        retiring_revision,
+        retiring_definition,
+        retiring_cursor,
+        retire_through,
     )) = row
     else {
         return Ok(None);
@@ -1379,16 +1971,29 @@ fn load_rule_state(
             "stored rule digest has the wrong length",
         )
     })?;
+    let view = core::api::RuleStateView {
+        id: id.to_owned(),
+        revision,
+        current_cursor,
+        retiring_revision,
+        retiring_cursor,
+        retire_through,
+        enabled,
+        paused_reason,
+    };
+    view.validate()
+        .map_err(|_| Error::new("source_integrity", "stored rule cursor state is invalid"))?;
+    if view.retiring_revision.is_some() != retiring_definition.is_some() {
+        return Err(Error::new(
+            "source_integrity",
+            "stored retiring rule definition and cursor state disagree",
+        ));
+    }
     Ok(Some(StoredRuleState {
-        view: core::api::RuleStateView {
-            id: id.to_owned(),
-            revision,
-            current_cursor,
-            enabled,
-            paused_reason,
-        },
+        view,
         canonical_definition,
         definition_digest,
+        retiring_definition,
     }))
 }
 
@@ -1404,16 +2009,24 @@ fn high_water_tx(tx: &Transaction<'_>) -> Result<i64> {
     .map_err(sql_error)
 }
 
-fn has_trigger_in_range(tx: &Transaction<'_>, after: i64, through: i64) -> Result<bool> {
+fn has_non_rule_event_in_range(tx: &Transaction<'_>, after: i64, through: i64) -> Result<bool> {
     tx.query_row(
         "SELECT EXISTS(
              SELECT 1 FROM events
-             WHERE seq > ?1 AND seq <= ?2 AND kind = ?3
+             WHERE seq > ?1 AND seq <= ?2 AND kind NOT LIKE 'rule.%'
          )",
-        params![after, through, RULE_TRIGGER_EVENT],
+        params![after, through],
         |row| row.get(0),
     )
     .map_err(sql_error)
+}
+
+fn rule_cursor_is_retiring(state: &core::api::RuleStateView, through: i64) -> bool {
+    state
+        .retire_through
+        .is_some_and(|boundary| through <= boundary)
+        && state.retiring_revision.is_some()
+        && state.retiring_cursor.is_some()
 }
 
 fn update_rule_cursor_tx(
@@ -1423,12 +2036,51 @@ fn update_rule_cursor_tx(
     through: i64,
     now: i64,
 ) -> Result<core::api::RuleStateView> {
-    let changed = tx
-        .execute(
+    let retiring = rule_cursor_is_retiring(state, through);
+    let changed = if retiring {
+        let boundary = state
+            .retire_through
+            .ok_or_else(|| Error::new("source_integrity", "retiring boundary is incomplete"))?;
+        if through > boundary {
+            return Err(Error::new(
+                "invalid",
+                "retiring cursor cannot advance past its boundary",
+            ));
+        }
+        let complete = through == boundary;
+        tx.execute(
+            "UPDATE rule_state
+             SET
+                 retiring_revision = CASE WHEN ?2 THEN NULL ELSE retiring_revision END,
+                 retiring_definition = CASE WHEN ?2 THEN NULL ELSE retiring_definition END,
+                 retiring_cursor = CASE WHEN ?2 THEN NULL ELSE ?1 END,
+                 retire_through = CASE WHEN ?2 THEN NULL ELSE retire_through END,
+                 updated_at = ?3
+             WHERE principal = ?4 AND rule = ?5 AND revision = ?6
+               AND current_cursor = ?7 AND retiring_revision = ?8
+               AND retiring_cursor = ?9 AND retire_through = ?10",
+            params![
+                through,
+                complete,
+                now,
+                principal,
+                state.id,
+                state.revision,
+                state.current_cursor,
+                state.retiring_revision,
+                state.retiring_cursor,
+                state.retire_through,
+            ],
+        )
+        .map_err(sql_error)?
+    } else {
+        tx.execute(
             "UPDATE rule_state
              SET current_cursor = ?1, updated_at = ?2
              WHERE principal = ?3 AND rule = ?4 AND revision = ?5
-               AND current_cursor = ?6",
+               AND current_cursor = ?6
+               AND retiring_revision IS ?7 AND retiring_cursor IS ?8
+               AND retire_through IS ?9",
             params![
                 through,
                 now,
@@ -1436,19 +2088,48 @@ fn update_rule_cursor_tx(
                 state.id,
                 state.revision,
                 state.current_cursor,
+                state.retiring_revision,
+                state.retiring_cursor,
+                state.retire_through,
             ],
         )
-        .map_err(sql_error)?;
+        .map_err(sql_error)?
+    };
     if changed != 1 {
         return Err(Error::new("bad_state", "rule cursor changed concurrently"));
     }
     let mut next = state.clone();
-    next.current_cursor = through;
+    if retiring {
+        if through == state.retire_through.expect("retiring boundary was checked") {
+            next.retiring_revision = None;
+            next.retiring_cursor = None;
+            next.retire_through = None;
+        } else {
+            next.retiring_cursor = Some(through);
+        }
+    } else {
+        next.current_cursor = through;
+    }
     Ok(next)
 }
 
 fn insert_rule_event(tx: &Transaction<'_>, now: i64, kind: &str, data: Value) -> Result<Event> {
-    insert_daemon_event(tx, now, kind, "rule", None, None, data)
+    insert_rule_event_with_cause(tx, now, kind, data, None)
+}
+
+fn insert_rule_event_with_cause(
+    tx: &Transaction<'_>,
+    now: i64,
+    kind: &str,
+    data: Value,
+    cause: Option<core::EventCause>,
+) -> Result<Event> {
+    let input = DaemonEventInput::new(now, kind, "rule", None, None, data);
+    let input = match cause {
+        Some(cause) => input.with_cause(cause),
+        None => input,
+    };
+    insert_daemon_event_input(tx, input)
 }
 
 fn derived_rule_id(
@@ -1509,25 +2190,33 @@ fn derived_manual_timer_id(principal: &str, rule: &str, mutation_id: &str) -> Re
 
 fn load_rule_trigger(tx: &Transaction<'_>, event_seq: i64) -> Result<StoredRuleTrigger> {
     tx.query_row(
-        "SELECT kind, agent, generation FROM events WHERE seq = ?1",
+        "SELECT kind, agent, generation, cause FROM events WHERE seq = ?1",
         [event_seq],
         |row| {
             Ok(StoredRuleTrigger {
                 kind: row.get(0)?,
                 agent: row.get(1)?,
                 generation: row.get(2)?,
+                encoded_cause: row.get(3)?,
+                cause: None,
             })
         },
     )
     .optional()
     .map_err(sql_error)?
     .ok_or_else(|| Error::new("not_found", "rule trigger event was not found"))
+    .map(|mut trigger| {
+        trigger.cause = decode_event_cause(trigger.encoded_cause.as_deref(), None);
+        trigger
+    })
 }
 
 struct StoredRuleTrigger {
     kind: String,
     agent: Option<i64>,
     generation: Option<i64>,
+    encoded_cause: Option<String>,
+    cause: Option<core::EventCause>,
 }
 
 fn stop_binding_error(event: &StoredRuleTrigger, request: &SubmitCommand) -> Option<String> {
@@ -1673,8 +2362,10 @@ fn admit_rule_action_tx(
     mut request: SubmitCommand,
     now: i64,
 ) -> Result<(Command, Command, Vec<Event>)> {
+    let parent_cause = key.command_cause(&key.parent_id)?;
+    let child_cause = key.command_cause(&key.child_id)?;
     request.id = key.child_id.clone();
-    let child_admission = submit_tx(tx, key.principal, request, None, now, true)?;
+    let mut child_admission = submit_tx(tx, key.principal, request, None, now, true)?;
     if !child_admission.is_new {
         return Err(Error::new(
             "source_integrity",
@@ -1683,7 +2374,9 @@ fn admit_rule_action_tx(
     }
 
     let child = child_admission.command;
-    let (parent, parent_event) = insert_rule_parent(tx, key, RuleParentOutcome::Admitted, now)?;
+    annotate_rule_command_event(tx, &child.id, &mut child_admission.events, child_cause)?;
+    let (parent, mut parent_event) = insert_rule_parent(tx, key, RuleParentOutcome::Admitted, now)?;
+    annotate_new_command_cause_tx(tx, &parent.id, &mut parent_event, parent_cause.clone())?;
     let linked = tx
         .execute(
             "UPDATE commands
@@ -1702,13 +2395,32 @@ fn admit_rule_action_tx(
 
     let mut events = child_admission.events;
     events.push(parent_event);
-    events.push(insert_rule_event(
+    events.push(insert_rule_event_with_cause(
         tx,
         now,
         "rule.fired",
         key.fired_data(&child.id),
+        Some(parent_cause),
     )?);
     Ok((parent, child, events))
+}
+
+fn annotate_rule_command_event(
+    tx: &Transaction<'_>,
+    command_id: &str,
+    events: &mut [Event],
+    cause: core::EventCause,
+) -> Result<()> {
+    let event = events
+        .iter_mut()
+        .find(|event| event.data.get("command_id").and_then(Value::as_str) == Some(command_id))
+        .ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "new rule command has no matching returned command event",
+            )
+        })?;
+    annotate_new_command_cause_tx(tx, command_id, event, cause)
 }
 
 fn reject_rule_event(
@@ -1724,20 +2436,23 @@ fn reject_rule_event(
             "event rejection has a non-event key",
         ));
     };
-    let (parent, parent_event) =
+    let parent_cause = key.command_cause(&key.parent_id)?;
+    let (parent, mut parent_event) =
         insert_rule_parent(&tx, key, RuleParentOutcome::Rejected { code }, now)?;
+    annotate_new_command_cause_tx(&tx, &parent.id, &mut parent_event, parent_cause.clone())?;
     let mut events = vec![parent_event];
-    events.push(insert_rule_event(
+    events.push(insert_rule_event_with_cause(
         &tx,
         now,
         "rule.rejected",
         key.rejected_data(code),
+        Some(parent_cause),
     )?);
     let view = update_rule_cursor_tx(&tx, key.principal, key.state, event_seq, now)?;
     commit_transaction(tx, write_faulted)?;
     Ok(RuleEventAdmission {
         state: view,
-        parent,
+        parent: Some(parent),
         child: None,
         events,
         is_new: true,
@@ -1817,6 +2532,15 @@ mod tests {
     }
 
     fn insert_test_turn_completed(store: &mut Store, agent: i64, now: i64) -> i64 {
+        insert_test_turn_completed_with_cause(store, agent, now, None)
+    }
+
+    fn insert_test_turn_completed_with_cause(
+        store: &mut Store,
+        agent: i64,
+        now: i64,
+        cause: Option<core::EventCause>,
+    ) -> i64 {
         let tx = store
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1825,7 +2549,7 @@ mod tests {
             &tx,
             EventInsert {
                 ts: now,
-                kind: RULE_TRIGGER_EVENT,
+                kind: "turn.completed",
                 family: Some("turn"),
                 agent: Some(agent),
                 generation: Some(1),
@@ -1834,7 +2558,11 @@ mod tests {
                 cursor: None,
                 payload_digest: None,
                 subject: None,
-                data: json!({"status":"completed"}),
+                cause,
+                data: json!({
+                    "status": "completed",
+                    "cause": {"command_id": "forged", "depth": 5}
+                }),
             },
         )
         .unwrap();
@@ -1850,26 +2578,105 @@ mod tests {
     }
 
     #[test]
-    fn new_rule_seeds_once_and_changed_startup_definition_does_not_reseed() {
+    fn new_rule_seeds_once_and_changed_definition_retires_old_revision() {
         let mut store = store();
         let first_event = insert_test_event(&mut store, "fixture", 1);
         let first = definition("r1", true);
-        let view = store.ensure_rule_state("owner", &first, 2).unwrap();
+        let seeded = store
+            .reconcile_rule_definitions("owner", std::slice::from_ref(&first), &[], 2)
+            .unwrap();
+        let view = seeded.value[0].view.clone();
         assert_eq!(view.current_cursor, first_event);
 
         let later_event = insert_test_event(&mut store, "fixture", 3);
-        assert_eq!(store.ensure_rule_state("owner", &first, 4).unwrap(), view);
+        let unchanged = store
+            .reconcile_rule_definitions("owner", &[first], &[], 4)
+            .unwrap();
+        assert_eq!(unchanged.value[0].view, view);
 
         let changed = definition("r1", false);
+        let reconciled = store
+            .reconcile_rule_definitions("owner", std::slice::from_ref(&changed), &[], 5)
+            .unwrap();
+        let updated = reconciled.value[0].view.clone();
+        assert_eq!(updated.revision, view.revision + 1);
+        assert_eq!(updated.current_cursor, later_event);
+        assert!(!updated.enabled);
+        assert!(updated.retiring_revision.is_none());
+        assert_eq!(reconciled.events.len(), 1);
+        assert_eq!(reconciled.events[0].kind, "rule.skipped");
         assert_eq!(
             store
-                .ensure_rule_state("owner", &changed, 5)
-                .unwrap_err()
-                .code,
-            "unsupported"
+                .reconcile_rule_definitions("owner", &[changed], &[], 6)
+                .unwrap()
+                .value[0]
+                .view,
+            updated
         );
-        assert_eq!(store.get_rule_state("owner", "r1").unwrap().unwrap(), view);
         assert!(later_event > view.current_cursor);
+    }
+
+    #[test]
+    fn enabled_definition_edit_retires_through_captured_high_water() {
+        let mut store = store();
+        let first_event = insert_test_event(&mut store, "fixture", 1);
+        let old = definition("r1", true);
+        let old_view = store.ensure_rule_state("owner", &old, 2).unwrap();
+        let boundary = insert_test_event(&mut store, "fixture", 3);
+        let changed = RuleDefinitionInput {
+            canonical_definition: serde_json::to_string(
+                &json!({"id":"r1","enabled":true,"new":true}),
+            )
+            .unwrap(),
+            definition_digest: core::canonical_json_sha256(
+                &json!({"id":"r1","enabled":true,"new":true}),
+            )
+            .unwrap(),
+            ..old
+        };
+
+        let view = store.ensure_rule_state("owner", &changed, 4).unwrap();
+        assert_eq!(view.revision, old_view.revision + 1);
+        assert_eq!(view.current_cursor, boundary);
+        assert_eq!(view.retiring_revision, Some(old_view.revision));
+        assert_eq!(view.retiring_cursor, Some(first_event));
+        assert_eq!(view.retire_through, Some(boundary));
+
+        let advanced = store
+            .advance_rule_cursor("owner", &view, boundary, RuleCursorOutcome::NoMatch, 5)
+            .unwrap();
+        assert!(advanced.value.retiring_revision.is_none());
+        assert!(advanced.value.retiring_cursor.is_none());
+        assert!(advanced.value.retire_through.is_none());
+    }
+
+    #[test]
+    fn retiring_revision_admits_with_its_own_deterministic_key() {
+        let mut store = store();
+        let (agent, agent_id) = insert_test_agent(&mut store);
+        let old = definition("stop-rule", true);
+        let old_view = store.ensure_rule_state("owner", &old, 1).unwrap();
+        let event_seq = insert_test_turn_completed(&mut store, agent, 2);
+        let changed_value = json!({"id":"stop-rule","enabled":true,"matcher":"updated"});
+        let changed = RuleDefinitionInput {
+            canonical_definition: serde_json::to_string(&changed_value).unwrap(),
+            definition_digest: core::canonical_json_sha256(&changed_value).unwrap(),
+            ..old
+        };
+        let current = store.ensure_rule_state("owner", &changed, 3).unwrap();
+        assert_eq!(current.retiring_revision, Some(old_view.revision));
+
+        let admission = store
+            .admit_rule_stop("owner", &current, event_seq, stop_request(&agent_id), 4)
+            .unwrap();
+        let parent = admission.parent.expect("retiring rule parent");
+        assert_eq!(parent.args["revision"], old_view.revision);
+        assert_eq!(
+            parent.id,
+            derived_rule_id("parent", "owner", "stop-rule", old_view.revision, event_seq).unwrap()
+        );
+        assert!(admission.child.is_some());
+        assert!(admission.state.retiring_revision.is_none());
     }
 
     #[test]
@@ -1907,15 +2714,14 @@ mod tests {
         assert_eq!(skipped.events.len(), 1);
         assert_eq!(skipped.events[0].kind, "rule.skipped");
 
-        // The disabled marker itself is bookkeeping, so advancing through it
-        // cannot create another marker (or feed another disabled rule).
+        // A disabled consumer of the marker must not create another marker.
         let marker_seq = skipped.events[0].seq;
         let marker = store
             .advance_rule_cursor(
                 "owner",
                 &skipped.value,
                 marker_seq,
-                RuleCursorOutcome::NoMatch,
+                RuleCursorOutcome::Disabled,
                 7,
             )
             .unwrap();
@@ -1964,6 +2770,207 @@ mod tests {
     }
 
     #[test]
+    fn backlog_guard_counts_committed_rows_then_pauses_and_clears_retirement() {
+        let mut store = store();
+        let mut state = store
+            .ensure_rule_state("owner", &definition("r1", true), 1)
+            .unwrap();
+        let starting_cursor = state.current_cursor;
+        let first = insert_test_event(&mut store, "fixture", 2);
+        assert_eq!(first, starting_cursor + 1);
+        let deleted = insert_test_event(&mut store, "fixture", 3);
+        let third = insert_test_event(&mut store, "fixture", 4);
+        store
+            .connection
+            .execute("DELETE FROM events WHERE seq = ?1", [deleted])
+            .unwrap();
+
+        let below_limit = store
+            .settle_rule_backlog("owner", &state, third, 2, 5)
+            .unwrap();
+        assert_eq!(below_limit.value.view.current_cursor, state.current_cursor);
+        assert!(below_limit.value.view.paused_reason.is_none());
+
+        let fourth = insert_test_event(&mut store, "fixture", 6);
+        let over_limit = store
+            .settle_rule_backlog("owner", &state, fourth, 2, 7)
+            .unwrap();
+        state = over_limit.value.view.clone();
+        assert_eq!(state.current_cursor, fourth);
+        assert_eq!(state.paused_reason.as_deref(), Some("backlog_exceeded"));
+        assert!(state.retiring_revision.is_none());
+        assert_eq!(over_limit.events.len(), 1);
+        assert_eq!(over_limit.events[0].data["from_seq"], starting_cursor + 1);
+        assert_eq!(over_limit.events[0].data["through_seq"], fourth);
+    }
+
+    #[test]
+    fn verified_depth_suppresses_without_parent_child_or_event() {
+        let mut store = store();
+        let (agent, agent_id) = insert_test_agent(&mut store);
+        let state = store
+            .ensure_rule_state("owner", &definition("stop-rule", true), 1)
+            .unwrap();
+        let trigger_cause = core::EventCause {
+            command_id: Ulid::new().to_string(),
+            rule: Some("upstream".to_owned()),
+            depth: 5,
+        };
+        let event_seq =
+            insert_test_turn_completed_with_cause(&mut store, agent, 2, Some(trigger_cause));
+
+        let suppressed = store
+            .admit_rule_stop("owner", &state, event_seq, stop_request(&agent_id), 3)
+            .unwrap();
+        assert!(suppressed.is_new);
+        assert_eq!(suppressed.state.current_cursor, event_seq);
+        assert!(suppressed.parent.is_none());
+        assert!(suppressed.child.is_none());
+        assert!(suppressed.events.is_empty());
+        assert_eq!(store.high_water().unwrap(), event_seq);
+    }
+
+    #[test]
+    fn rejected_cursor_suppresses_sixth_depth_and_rule_marker_quiesces() {
+        let mut store = store();
+        let (agent, _) = insert_test_agent(&mut store);
+        let state_five = store
+            .ensure_rule_state("owner", &definition("r5", true), 1)
+            .unwrap();
+        let cause_five = core::EventCause {
+            command_id: Ulid::new().to_string(),
+            rule: Some("upstream".to_owned()),
+            depth: 5,
+        };
+        let event_five =
+            insert_test_turn_completed_with_cause(&mut store, agent, 2, Some(cause_five));
+        let events_before = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        let commands_before = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+
+        let suppressed = store
+            .advance_rule_cursor(
+                "owner",
+                &state_five,
+                event_five,
+                RuleCursorOutcome::Rejected {
+                    code: "render_error".to_owned(),
+                },
+                3,
+            )
+            .unwrap();
+        assert_eq!(suppressed.value.current_cursor, event_five);
+        assert!(suppressed.events.is_empty());
+        assert_eq!(store.high_water().unwrap(), event_five);
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM events", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            events_before
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM commands", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            commands_before
+        );
+
+        let state_four = store
+            .ensure_rule_state("owner", &definition("r4", true), 4)
+            .unwrap();
+        let cause_four = core::EventCause {
+            command_id: Ulid::new().to_string(),
+            rule: Some("upstream".to_owned()),
+            depth: 4,
+        };
+        let event_four =
+            insert_test_turn_completed_with_cause(&mut store, agent, 5, Some(cause_four.clone()));
+        let rejected = store
+            .advance_rule_cursor(
+                "owner",
+                &state_four,
+                event_four,
+                RuleCursorOutcome::Rejected {
+                    code: "render_error".to_owned(),
+                },
+                6,
+            )
+            .unwrap();
+        assert_eq!(rejected.value.current_cursor, event_four);
+        assert_eq!(rejected.events.len(), 1);
+        assert_eq!(rejected.events[0].kind, "rule.rejected");
+        assert_eq!(rejected.events[0].cause, Some(cause_four));
+
+        let marker_seq = rejected.events[0].seq;
+        let marker = store
+            .advance_rule_cursor(
+                "owner",
+                &rejected.value,
+                marker_seq,
+                RuleCursorOutcome::Rejected {
+                    code: "render_error".to_owned(),
+                },
+                7,
+            )
+            .unwrap();
+        assert_eq!(marker.value.current_cursor, marker_seq);
+        assert!(marker.events.is_empty());
+        assert_eq!(store.high_water().unwrap(), marker_seq);
+    }
+
+    #[test]
+    fn malformed_legacy_command_cause_is_unbound_not_a_read_failure() {
+        let mut store = store();
+        let (agent, agent_id) = insert_test_agent(&mut store);
+        let state = store
+            .ensure_rule_state("owner", &definition("stop-rule", true), 1)
+            .unwrap();
+        let event_seq = insert_test_turn_completed(&mut store, agent, 2);
+        let admission = store
+            .admit_rule_stop("owner", &state, event_seq, stop_request(&agent_id), 3)
+            .unwrap();
+        let child = admission.child.unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE commands SET cause = 'legacy-untyped-value' WHERE id = ?1",
+                [&child.id],
+            )
+            .unwrap();
+
+        assert_eq!(
+            command_cause_tx(&store.connection, &child.id).unwrap(),
+            None
+        );
+        assert!(
+            store
+                .get_rule_state("owner", "stop-rule")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            store
+                .list_rule_processing_states("owner", None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn stop_admission_counts_only_children_and_recovers_undispatched_children() {
         let mut store = store();
         let (agent_num, agent_id) = insert_test_agent(&mut store);
@@ -1980,18 +2987,70 @@ mod tests {
             assert!(admission.is_new);
             let child = admission.child.as_ref().expect("admitted stop child");
             assert_eq!(child.verb, "stop");
-            assert_eq!(admission.parent.state, CommandState::Applied);
+            let parent = admission.parent.as_ref().expect("admitted rule parent");
+            assert_eq!(parent.state, CommandState::Applied);
+            assert_eq!(parent.outcome.as_ref().unwrap()["children"][0], child.id);
+            let child_event = admission
+                .events
+                .iter()
+                .find(|event| {
+                    event.kind == "command.accepted"
+                        && event.data["command_id"].as_str() == Some(child.id.as_str())
+                })
+                .expect("child accepted event");
             assert_eq!(
-                admission.parent.outcome.as_ref().unwrap()["children"][0],
-                child.id
+                child_event.cause,
+                Some(core::EventCause {
+                    command_id: child.id.clone(),
+                    rule: Some("stop-rule".to_owned()),
+                    depth: 1,
+                })
+            );
+            assert_eq!(
+                command_cause_tx(&store.connection, &child.id)
+                    .unwrap()
+                    .as_ref(),
+                child_event.cause.as_ref()
+            );
+            let child_event_cause: Option<String> = store
+                .connection
+                .query_row(
+                    "SELECT cause FROM events WHERE seq = ?1",
+                    [child_event.seq],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                decode_event_cause(child_event_cause.as_deref(), Some(&child.id)).as_ref(),
+                child_event.cause.as_ref()
+            );
+            let parent_event = admission
+                .events
+                .iter()
+                .find(|event| event.data["command_id"].as_str() == Some(parent.id.as_str()))
+                .expect("parent command event");
+            assert_eq!(
+                parent_event.cause,
+                Some(core::EventCause {
+                    command_id: parent.id.clone(),
+                    rule: Some("stop-rule".to_owned()),
+                    depth: 1,
+                })
+            );
+            assert_eq!(
+                command_cause_tx(&store.connection, &parent.id)
+                    .unwrap()
+                    .as_ref(),
+                parent_event.cause.as_ref()
             );
             let fired = admission
                 .events
                 .iter()
                 .find(|event| event.kind == "rule.fired")
                 .expect("committed rule firing event");
-            assert_eq!(fired.data["parent_command"], admission.parent.id);
+            assert_eq!(fired.data["parent_command"], parent.id);
             assert_eq!(fired.data["child_command"], child.id);
+            assert_eq!(fired.cause.as_ref(), parent_event.cause.as_ref());
             state = admission.state;
         }
 
@@ -2007,20 +3066,27 @@ mod tests {
             .unwrap();
         assert!(limited.is_new);
         assert!(limited.child.is_none());
-        assert_eq!(limited.parent.state, CommandState::Rejected);
+        let rejected_parent = limited.parent.as_ref().expect("rejected rule parent");
+        assert_eq!(rejected_parent.state, CommandState::Rejected);
         assert_eq!(
-            limited.parent.outcome.as_ref().unwrap()["children"],
+            rejected_parent.outcome.as_ref().unwrap()["children"],
             json!([])
         );
         assert_eq!(
-            limited.parent.outcome.as_ref().unwrap()["code"],
+            rejected_parent.outcome.as_ref().unwrap()["code"],
             "rate_limited"
         );
-        assert!(
-            limited
-                .events
-                .iter()
-                .any(|event| event.kind == "rule.rejected")
+        let rejected = limited
+            .events
+            .iter()
+            .find(|event| event.kind == "rule.rejected")
+            .expect("committed rejection event");
+        assert_eq!(
+            rejected
+                .cause
+                .as_ref()
+                .map(|cause| cause.command_id.as_str()),
+            Some(rejected_parent.id.as_str())
         );
         assert_eq!(limited.state.current_cursor, rate_event_seq);
 

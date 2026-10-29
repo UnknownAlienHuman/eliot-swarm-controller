@@ -4428,3 +4428,396 @@ fn cli_fake_timer_tick_and_manual_replay_survive_restart() {
     assert_eq!(scheduled_after_restart_command, scheduled_child);
     fixture.stop(false);
 }
+
+#[test]
+fn cli_event_rule_matching_reload_and_invalid_retention_survive_restart() {
+    let mut fixture = Fixture::new("event rule reload");
+    fixture.start();
+    fixture.stop(false);
+
+    let send_ids = [
+        ulid::Ulid::new().to_string(),
+        ulid::Ulid::new().to_string(),
+        ulid::Ulid::new().to_string(),
+        ulid::Ulid::new().to_string(),
+    ];
+    let rule_source = |commands: &[&str], agents: &[&str]| {
+        let command_values = commands
+            .iter()
+            .map(|command| format!("\"{command}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let agent_values = agents
+            .iter()
+            .map(|agent| format!("\"{agent}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            concat!(
+                "[[rule]]\n",
+                "id = \"stop-applied-send\"\n",
+                "on = {{ event = \"command.applied\", match = {{ ",
+                "\"event.kind\" = \"glob:command.*\", ",
+                "\"event.data.state\" = \"re:^applied$\", ",
+                "\"event.data.command_id\" = {{ one_of = [{commands}] }}, ",
+                "\"event.agent\" = {{ one_of = [{agents}] }}, ",
+                "\"event.generation\" = {{ exists = true }}, ",
+                "\"subject.harness\" = \"fake\" }} }}\n",
+                "do = [{{ action = \"stop\", target = \"${{event.agent}}\", ",
+                "expected_generation = \"${{event.generation}}\" }}]\n",
+            ),
+            commands = command_values,
+            agents = agent_values,
+        )
+    };
+    let rule_id = "stop-applied-send";
+    let source_v1 = rule_source(&[send_ids[0].as_str()], &["a1"]);
+    let rule_path = fixture.data.join("rules").join("send-stop.toml");
+    fs::create_dir_all(rule_path.parent().unwrap()).expect("create private rule directory");
+    fs::write(&rule_path, &source_v1).expect("write initial committed-event rule");
+    fixture.start();
+
+    let read_rule = |fixture: &Fixture| -> RuleStateView {
+        serde_json::from_value(fixture.json(&["rule", "show", rule_id]))
+            .expect("typed current/retiring rule view")
+    };
+    let initial = read_rule(&fixture);
+    assert_eq!(initial.id, rule_id);
+    assert!(initial.enabled);
+    assert!(initial.retiring_revision.is_none());
+
+    let launch_fake = |fixture: &Fixture, expected_agent: &str| {
+        let launched = fixture.json(&[
+            "launch",
+            "--profile",
+            "fake",
+            "--workspace",
+            fixture.workspace.to_str().unwrap(),
+        ]);
+        assert_eq!(launched["target"], expected_agent);
+        assert_eq!(launched["generation"], 1);
+        fixture.wait_command(
+            launched["id"].as_str().expect("launch command id"),
+            "applied",
+        );
+    };
+    let submit_send = |fixture: &Fixture, id: &str, agent: &str, text: &str, wait: bool| {
+        let reply = if wait {
+            cli(
+                &fixture.data,
+                &[
+                    "--id",
+                    id,
+                    "send",
+                    agent,
+                    "--generation",
+                    "1",
+                    "--wait",
+                    "--timeout-seconds",
+                    "10",
+                    "--",
+                    text,
+                ],
+            )
+        } else {
+            cli(
+                &fixture.data,
+                &["--id", id, "send", agent, "--generation", "1", "--", text],
+            )
+        };
+        assert!(
+            reply.status.success(),
+            "Fake send was not admitted/completed"
+        );
+        fixture.wait_command(id, "applied");
+    };
+    let wait_applied_event = |fixture: &Fixture, command_id: &str| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(event) = fixture.events().into_iter().find(|event| {
+                event["kind"] == "command.applied" && event["data"]["command_id"] == command_id
+            }) {
+                return event["seq"].as_i64().expect("applied event sequence");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "command.applied event deadline"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    };
+    let wait_rule_cursor = |fixture: &Fixture, through: i64| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let state = read_rule(fixture);
+            if state.current_cursor >= through {
+                return state;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "rule event cursor deadline"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    };
+    let wait_firing = |fixture: &Fixture, event_seq: i64, revision: i64, agent: &str| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let events = fixture.events();
+            if let Some(firing) = events.iter().find(|event| {
+                event["kind"] == "rule.fired"
+                    && event["data"]["rule"] == rule_id
+                    && event["data"]["event_seq"] == event_seq
+            }) {
+                assert_eq!(firing["data"]["revision"], revision);
+                let parent_id = firing["data"]["parent_command"]
+                    .as_str()
+                    .expect("firing parent id");
+                let child_id = firing["data"]["child_command"]
+                    .as_str()
+                    .expect("firing child id");
+                let parent: CoreCommand =
+                    serde_json::from_value(fixture.json(&["cmd", "show", parent_id]))
+                        .expect("typed Store-only rule parent");
+                assert_eq!(parent.verb, "rule");
+                assert_eq!(parent.args["rule"], rule_id);
+                assert_eq!(
+                    parent.args["event_seq"], event_seq,
+                    "parent is bound to the triggering committed event"
+                );
+                assert_eq!(
+                    parent.outcome.as_ref().expect("fixed child set")["children"],
+                    json!([child_id])
+                );
+                let child: CoreCommand =
+                    serde_json::from_value(fixture.wait_command(child_id, "applied"))
+                        .expect("typed rule stop child");
+                assert_eq!(child.verb, "stop");
+                assert_eq!(child.target.as_deref(), Some(agent));
+                assert_eq!(child.expected_generation, Some(1));
+                assert_eq!(child.generation, Some(1));
+                assert_eq!(fault_dispatches(&fixture.events(), child_id), 1);
+                return (firing.clone(), child);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "rule firing event deadline"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    };
+    let stop_dispatches = |events: &[Value], agent: &str| {
+        events
+            .iter()
+            .filter(|event| {
+                event["kind"] == "command.dispatched"
+                    && event["agent"] == agent
+                    && event["generation"] == 1
+                    && event["data"]["verb"] == "stop"
+            })
+            .count()
+    };
+
+    launch_fake(&fixture, "a1");
+    let send1 = send_ids[0].as_str();
+    submit_send(&fixture, send1, "a1", "reload-v1-trigger", false);
+    let send1_seq = wait_applied_event(&fixture, send1);
+    let first = wait_firing(&fixture, send1_seq, initial.revision, "a1");
+    let stopped1: AgentGetResponse =
+        serde_json::from_value(fixture.json(&["show", "a1"])).expect("typed first stopped Agent");
+    assert_eq!(stopped1.agent.state, AgentState::Stopped);
+
+    launch_fake(&fixture, "a2");
+    let send2 = send_ids[1].as_str();
+    submit_send(&fixture, send2, "a2", "pre-boundary-trigger", true);
+    let send2_seq = wait_applied_event(&fixture, send2);
+    let old_state_through_boundary = wait_rule_cursor(&fixture, send2_seq);
+    let boundary = fixture
+        .events()
+        .last()
+        .and_then(|event| event["seq"].as_i64())
+        .expect("captured event high-water");
+    let state_at_high_water = wait_rule_cursor(&fixture, boundary);
+    let source_v2 = rule_source(
+        &[
+            send_ids[1].as_str(),
+            send_ids[2].as_str(),
+            send_ids[3].as_str(),
+        ],
+        &["a2", "a3", "a4"],
+    );
+    assert_eq!(old_state_through_boundary.revision, initial.revision);
+    assert_eq!(state_at_high_water.revision, initial.revision);
+    assert!(state_at_high_water.retiring_revision.is_none());
+    fs::write(&rule_path, &source_v2).expect("write semantic rule revision");
+
+    let reload_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let current_v2 = loop {
+        let state = read_rule(&fixture);
+        if let Some(retiring_revision) = state.retiring_revision {
+            assert_eq!(retiring_revision, initial.revision);
+            assert_eq!(state.retire_through, Some(boundary));
+            assert!(state.retiring_cursor.is_some());
+        }
+        if state.revision > initial.revision
+            && state.retiring_revision.is_none()
+            && state.current_cursor >= boundary
+        {
+            break state;
+        }
+        assert!(
+            std::time::Instant::now() < reload_deadline,
+            "semantic rule revision retirement deadline"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(current_v2.retire_through, None);
+    let events_after_boundary = fixture.events();
+    assert_eq!(stop_dispatches(&events_after_boundary, "a2"), 0);
+    assert!(
+        !events_after_boundary.iter().any(|event| {
+            event["kind"] == "rule.fired"
+                && event["data"]["rule"] == rule_id
+                && event["data"]["event_seq"] == send2_seq
+        }),
+        "new definition reinterpreted a pre-boundary event"
+    );
+    let still_running2: AgentGetResponse = serde_json::from_value(fixture.json(&["show", "a2"]))
+        .expect("typed second Agent before new-definition event");
+    assert_ne!(still_running2.agent.state, AgentState::Stopped);
+
+    launch_fake(&fixture, "a3");
+    let send3 = send_ids[2].as_str();
+    submit_send(&fixture, send3, "a3", "reload-v2-trigger", false);
+    let send3_seq = wait_applied_event(&fixture, send3);
+    let third = wait_firing(&fixture, send3_seq, current_v2.revision, "a3");
+
+    let log_path = fixture.data.join("logs/daemon.log");
+    let previous_log_lines = fs::read_to_string(&log_path)
+        .expect("read daemon log before invalid reload")
+        .lines()
+        .count();
+    let invalid_source = format!("{source_v2}\nextra_unknown_field = true\n");
+    fs::write(&rule_path, invalid_source).expect("write invalid rule revision");
+    let invalid_reload_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let reload_diagnostic = loop {
+        let log = fs::read_to_string(&log_path).expect("read bounded daemon diagnostics");
+        let diagnostic = log
+            .lines()
+            .skip(previous_log_lines)
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|record| {
+                record["error_code"] == "invalid"
+                    && record["code"].as_str().is_some_and(|code| {
+                        let code = code.to_ascii_lowercase();
+                        code.contains("rule") || code.contains("reload")
+                    })
+            });
+        if let Some(diagnostic) = diagnostic {
+            break diagnostic;
+        }
+        let retained = read_rule(&fixture);
+        assert_eq!(retained.revision, current_v2.revision);
+        assert!(retained.enabled);
+        assert!(retained.retiring_revision.is_none());
+        assert!(
+            std::time::Instant::now() < invalid_reload_deadline,
+            "invalid reload diagnostic deadline"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(reload_diagnostic["error_code"], "invalid");
+    let retained_v2 = read_rule(&fixture);
+    assert_eq!(retained_v2.revision, current_v2.revision);
+    assert!(retained_v2.enabled);
+    assert!(retained_v2.paused_reason.is_none());
+    assert!(retained_v2.retiring_revision.is_none());
+
+    launch_fake(&fixture, "a4");
+    let send4 = send_ids[3].as_str();
+    submit_send(
+        &fixture,
+        send4,
+        "a4",
+        "invalid-reload-keeps-last-valid",
+        false,
+    );
+    let send4_seq = wait_applied_event(&fixture, send4);
+    let fourth = wait_firing(&fixture, send4_seq, current_v2.revision, "a4");
+    fs::write(&rule_path, &source_v2).expect("restore last valid rule file before restart");
+
+    let events_before_restart = fixture.events();
+    let firings_before_restart: Vec<_> = events_before_restart
+        .iter()
+        .filter(|event| event["kind"] == "rule.fired" && event["data"]["rule"] == rule_id)
+        .cloned()
+        .collect();
+    assert_eq!(firings_before_restart.len(), 3);
+    for seq in [send1_seq, send3_seq, send4_seq] {
+        assert!(
+            firings_before_restart
+                .iter()
+                .any(|event| event["data"]["event_seq"] == seq)
+        );
+    }
+    assert!(
+        !firings_before_restart
+            .iter()
+            .any(|event| event["data"]["event_seq"] == send2_seq)
+    );
+    for agent in ["a1", "a3", "a4"] {
+        assert_eq!(stop_dispatches(&events_before_restart, agent), 1);
+        let view: AgentGetResponse = serde_json::from_value(fixture.json(&["show", agent]))
+            .expect("typed rule-stopped Agent before drain");
+        assert_eq!(view.agent.state, AgentState::Stopped);
+    }
+    assert_eq!(stop_dispatches(&events_before_restart, "a2"), 0);
+    let unmatched: AgentGetResponse = serde_json::from_value(fixture.json(&["show", "a2"]))
+        .expect("typed intentionally unmatched Agent");
+    assert_ne!(unmatched.agent.state, AgentState::Stopped);
+    let cleanup: CommandSubmitResponse =
+        serde_json::from_value(fixture.json(&["stop", "a2", "--generation", "1"]))
+            .expect("stop the exact unmatched test Agent before drain");
+    assert_eq!(cleanup.agent.as_deref(), Some("a2"));
+    assert_eq!(cleanup.generation, Some(1));
+    let cleanup_command: CoreCommand =
+        serde_json::from_value(fixture.wait_command(&cleanup.command_id, "applied"))
+            .expect("applied cleanup stop for unmatched Agent");
+    let stopped_unmatched: AgentGetResponse =
+        serde_json::from_value(fixture.json(&["show", "a2"])).expect("typed cleanup-stopped Agent");
+    assert_eq!(stopped_unmatched.agent.state, AgentState::Stopped);
+
+    fixture.stop(false);
+    fixture.start();
+    let resumed = read_rule(&fixture);
+    assert_eq!(resumed.revision, current_v2.revision);
+    assert!(resumed.retiring_revision.is_none());
+    assert!(resumed.current_cursor >= retained_v2.current_cursor);
+    let events_after_restart = fixture.events();
+    let firings_after_restart: Vec<_> = events_after_restart
+        .iter()
+        .filter(|event| event["kind"] == "rule.fired" && event["data"]["rule"] == rule_id)
+        .cloned()
+        .collect();
+    assert_eq!(firings_after_restart, firings_before_restart);
+    for agent in ["a1", "a3", "a4"] {
+        assert_eq!(stop_dispatches(&events_after_restart, agent), 1);
+    }
+    assert_eq!(stop_dispatches(&events_after_restart, "a2"), 1);
+    assert_eq!(
+        fault_dispatches(&events_after_restart, &cleanup.command_id),
+        1
+    );
+    for (child, expected_agent) in [(&first.1, "a1"), (&third.1, "a3"), (&fourth.1, "a4")] {
+        let retained: CoreCommand =
+            serde_json::from_value(fixture.json(&["cmd", "show", &child.id]))
+                .expect("retained rule stop child after restart");
+        assert_eq!(&retained, child);
+        assert_eq!(retained.target.as_deref(), Some(expected_agent));
+    }
+    let cleanup_after_restart: CoreCommand =
+        serde_json::from_value(fixture.json(&["cmd", "show", &cleanup.command_id]))
+            .expect("retained cleanup stop after restart");
+    assert_eq!(cleanup_after_restart, cleanup_command);
+    fixture.stop(false);
+}
