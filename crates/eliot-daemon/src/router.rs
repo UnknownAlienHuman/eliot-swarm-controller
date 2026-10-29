@@ -17,8 +17,9 @@ use eliot_core::{
         DaemonShutdownResponse, DaemonStatusRequest, DaemonStatusResponse, DiscoverPage,
         EventsFilter, EventsReadRequest, EventsReadResponse, EventsSubscribeRequest,
         EventsSubscribeResponse, GitView, MAX_OBSERVATION_PAGE_BYTES, ObservationPage,
-        ObservationQuery, ObservationView, ProcessPageCursor, ShutdownMode, SourceState,
-        StatusBlocker, TurnGetRequest, UnsettledCommandSummary, WorkspaceCustodyView,
+        ObservationQuery, ObservationView, ProcessPageCursor, ProviderClearHoldRequest,
+        ProviderHoldsRequest, ShutdownMode, SourceState, StatusBlocker, TurnGetRequest,
+        UnsettledCommandSummary, WorkspaceCustodyView,
     },
     classify_dispatched_error,
 };
@@ -187,6 +188,8 @@ impl Router {
             "turn.get" => self.turn_get(&params, &principal).await,
             "events.read" => self.events_read(&params, &principal).await,
             "events.subscribe" => self.events_subscribe(&params, &principal).await,
+            "provider.holds" => self.provider_holds(&params, &principal).await,
+            "provider.clear_hold" => self.provider_clear_hold(&params, &principal).await,
             _ => Err(Error::new(
                 "unsupported",
                 format!("daemon method {method} is not implemented"),
@@ -401,6 +404,12 @@ impl Router {
         let mut request: CommandSubmitRequest = serde_json::from_value(params.clone())
             .map_err(|_| Error::new("invalid", "command.submit params are malformed"))?;
         authorize_command(principal, &mut request)?;
+        if request.probe && request.verb != "send" {
+            return Err(Error::new(
+                "unsupported",
+                "only an explicit send may probe a provider hold",
+            ));
+        }
         if matches!(request.verb.as_str(), "attach" | "detach") {
             require_owner(principal)?;
         }
@@ -690,6 +699,43 @@ impl Router {
             .to_owned();
         install_frozen_profile(request, &harness, snapshot, true)?;
         Ok(false)
+    }
+
+    async fn provider_holds(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        require_owner(principal)?;
+        let request: ProviderHoldsRequest = serde_json::from_value(params.clone())
+            .map_err(|_| Error::new("invalid", "provider.holds params are invalid"))?;
+        request.validate()?;
+        let response = self
+            .inner
+            .store
+            .lock()
+            .await
+            .list_provider_holds(request.after.as_deref(), request.effective_limit())?;
+        serde_json::to_value(response)
+            .map_err(|_| Error::new("internal", "provider hold page could not be encoded"))
+    }
+
+    async fn provider_clear_hold(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        require_owner(principal)?;
+        if contains_known_secret_including_keys(params, &self.inner.secrets) {
+            return Err(Error::new(
+                "secret_in_payload",
+                "provider correction contains a known credential",
+            ));
+        }
+        let request: ProviderClearHoldRequest = serde_json::from_value(params.clone())
+            .map_err(|_| Error::new("invalid", "provider.clear_hold params are invalid"))?;
+        request.validate()?;
+        let change = {
+            let mut store = self.inner.store.lock().await;
+            let change = store.clear_provider_hold("owner", &request, now_ms())?;
+            self.publish_locked(&change.events);
+            change
+        };
+        self.signal_progress();
+        serde_json::to_value(change.value)
+            .map_err(|_| Error::new("internal", "provider correction could not be encoded"))
     }
 
     async fn command_get(&self, params: &Value, principal: &Principal) -> Result<Value> {
@@ -1700,11 +1746,12 @@ impl Router {
                     loop {
                         match receiver.recv().await {
                             Ok(event)
-                                if event.agent == target
-                                    && event.generation == generation
-                                    && (event.kind.starts_with("turn.")
-                                        || event.kind.starts_with("session.")
-                                        || event.kind.starts_with("request.")) =>
+                                if event.kind.starts_with("provider.")
+                                    || (event.agent == target
+                                        && event.generation == generation
+                                        && (event.kind.starts_with("turn.")
+                                            || event.kind.starts_with("session.")
+                                            || event.kind.starts_with("request."))) =>
                             {
                                 break;
                             }
@@ -2005,7 +2052,7 @@ impl Router {
             self.note_unknown_id(id, "store_dispatch_outcome_unknown");
         } else if matches!(
             error.code.as_str(),
-            "bad_state" | "stale_generation" | "not_found"
+            "bad_state" | "stale_generation" | "not_found" | "provider_held"
         ) || native_binding
             && matches!(
                 error.code.as_str(),
@@ -3249,6 +3296,11 @@ fn contains_known_secret(value: &Value, secrets: &SecretSet) -> bool {
     contains_secret_value(value, &secrets)
 }
 
+fn contains_known_secret_including_keys(value: &Value, secrets: &SecretSet) -> bool {
+    let secrets = secrets.lock_recover();
+    SecretPolicy::new(secrets.iter()).contains_value(value)
+}
+
 fn contains_secret_value(value: &Value, secrets: &HashSet<String>) -> bool {
     match value {
         Value::String(text) => secrets
@@ -3855,6 +3907,7 @@ mod tests {
                     expected_generation: Some(0),
                     expected_turn_id: None,
                     request_id: None,
+                    probe: false,
                 },
                 now_ms(),
             )
@@ -3878,6 +3931,7 @@ mod tests {
                 expected_generation: Some(1),
                 expected_turn_id: Some("turn-1".to_owned()),
                 request_id: None,
+                probe: false,
             };
             let principal = format!("agent:{agent}:1");
             store.submit(&principal, request.clone(), now_ms()).unwrap();
@@ -4117,6 +4171,161 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_hold_rpcs_are_owner_only_and_probe_uses_send_capability() {
+        let router = router();
+        let agent = Principal::Agent {
+            id: "a1".to_owned(),
+            generation: 1,
+        };
+        assert_eq!(
+            router
+                .provider_holds(&Value::Null, &agent)
+                .await
+                .unwrap_err()
+                .code,
+            "not_allowed"
+        );
+        assert_eq!(
+            router
+                .provider_clear_hold(&Value::Null, &agent)
+                .await
+                .unwrap_err()
+                .code,
+            "not_allowed"
+        );
+        router
+            .inner
+            .secrets
+            .lock_recover()
+            .insert("router-test-known-secret".to_owned());
+        assert_eq!(
+            router
+                .provider_clear_hold(
+                    &json!({"router-test-known-secret":"unknown field"}),
+                    &Principal::Owner,
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "secret_in_payload"
+        );
+        assert_eq!(
+            router
+                .provider_clear_hold(
+                    &json!({"id":"clear-id", "scope":"profile:fixture",
+                        "corrective_evidence":"owner_verified",
+                        "expected_probe_command":"router-test-known-secret"}),
+                    &Principal::Owner,
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "secret_in_payload"
+        );
+
+        let invalid_probe_id = ulid::Ulid::new().to_string();
+        assert_eq!(
+            router
+                .submit(
+                    &json!({"id":invalid_probe_id.clone(), "verb":"launch", "args":{}, "probe":true}),
+                    &Principal::Owner,
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "unsupported"
+        );
+
+        let own_probe_id = ulid::Ulid::new().to_string();
+        let mut own_probe = CommandSubmitRequest::new(own_probe_id.clone(), "send");
+        own_probe.probe = true;
+        authorize_command(&agent, &mut own_probe).unwrap();
+        assert_eq!(own_probe.target.as_deref(), Some("a1"));
+        assert_eq!(own_probe.expected_generation, Some(1));
+
+        let unrelated_probe_id = ulid::Ulid::new().to_string();
+        assert_eq!(
+            router
+                .submit(
+                    &json!({"id":unrelated_probe_id.clone(), "target":"a2", "verb":"send",
+                        "args":{"text":"probe"}, "expected_generation":1, "probe":true}),
+                    &agent,
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "not_allowed"
+        );
+        let stale_probe_id = ulid::Ulid::new().to_string();
+        assert_eq!(
+            router
+                .submit(
+                    &json!({"id":stale_probe_id.clone(), "target":"a1", "verb":"send",
+                        "args":{"text":"probe"}, "expected_generation":2, "probe":true}),
+                    &agent,
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "stale_generation"
+        );
+
+        let store = router.inner.store.lock().await;
+        assert_eq!(store.high_water().unwrap(), 0);
+        assert!(store.get_command(&invalid_probe_id).unwrap().is_none());
+        assert!(store.get_command(&own_probe_id).unwrap().is_none());
+        assert!(store.get_command(&unrelated_probe_id).unwrap().is_none());
+        assert!(store.get_command(&stale_probe_id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn local_provider_held_dispatch_failure_rejects_before_native_dispatch() {
+        let router = router();
+        let id = ulid::Ulid::new().to_string();
+        router
+            .inner
+            .store
+            .lock()
+            .await
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: id.clone(),
+                    target: None,
+                    verb: "launch".to_owned(),
+                    args: json!({"project":"provider-held", "workspace":"synthetic-workspace"}),
+                    expected_generation: Some(0),
+                    expected_turn_id: None,
+                    request_id: None,
+                    probe: false,
+                },
+                now_ms(),
+            )
+            .unwrap();
+
+        router
+            .settle_dispatch_error(
+                &id,
+                &Error::new("provider_held", "provider scope is held"),
+                false,
+                false,
+            )
+            .await;
+
+        let store = router.inner.store.lock().await;
+        let command = store.get_command(&id).unwrap().unwrap();
+        assert_eq!(command.state, CommandState::Rejected);
+        assert_eq!(command.outcome, Some(json!({"reason":"provider_held"})));
+        let events = store.read_events(0, 100, None).unwrap();
+        assert!(events.iter().any(|event| event.kind == "command.rejected"));
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.kind == "command.dispatched")
+        );
+    }
+
+    #[tokio::test]
     async fn typed_agent_views_reject_malformed_requests_and_keep_null_defaults() {
         let router = router();
         for method in [
@@ -4335,7 +4544,7 @@ mod tests {
             let id = store.submit_with_workspace("owner", SubmitCommand {
                 id:ulid::Ulid::new().to_string(), target:None, verb:"launch".to_owned(),
                 args:json!({"project":input.project, "workspace":input.repo_path, "worktree":input.requested_branch}),
-                expected_generation:Some(0), expected_turn_id:None, request_id:None,
+                expected_generation:Some(0), expected_turn_id:None, request_id:None, probe:false,
             }, input, now_ms()).unwrap().command.target.unwrap();
             store
                 .ensure_workspace_process_source(&id, 1, now_ms())
@@ -4649,7 +4858,7 @@ mod tests {
                 id:attach_id.clone(), target:None, verb:"attach".to_owned(),
                 args:json!({"profile":"fixture", "harness":"fake", "mode":"observe",
                     "native_scope":"fixture-scope", "native_ref":"fixture-ref", "profile_snapshot":{}}),
-                expected_generation:Some(0), expected_turn_id:None, request_id:None,
+                expected_generation:Some(0), expected_turn_id:None, request_id:None, probe:false,
             }, now_ms()).unwrap().command.target.unwrap();
             // Commit only the source fence; no PluginHost actor or process is started.
             store.dispatch(&attach_id, now_ms()).unwrap();
@@ -4731,6 +4940,7 @@ mod tests {
                     expected_generation: Some(0),
                     expected_turn_id: None,
                     request_id: None,
+                    probe: false,
                 },
                 now_ms(),
             )
@@ -4760,6 +4970,7 @@ mod tests {
                     expected_generation: Some(1),
                     expected_turn_id: None,
                     request_id: None,
+                    probe: false,
                 },
                 now_ms(),
             )
@@ -4881,6 +5092,7 @@ mod tests {
                         expected_generation: Some(1),
                         expected_turn_id: None,
                         request_id: None,
+                        probe: false,
                     },
                     now_ms(),
                 )
@@ -5000,6 +5212,7 @@ mod tests {
                         expected_generation: Some(1),
                         expected_turn_id: Some("turn-1".to_owned()),
                         request_id: None,
+                        probe: false,
                     },
                     now_ms(),
                 )

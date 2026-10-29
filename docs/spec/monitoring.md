@@ -389,23 +389,48 @@ never counts as no progress. No temporary index, `git add`, `write-tree` or obje
 
 ## Provider holds
 
-Provider limitation state is durable before queues restart:
+Provider holds are durable local coordination state. Their view and restriction shapes
+are the shared Core [`ProviderHold` and `ProviderRestriction` DTOs](../../crates/eliot-core/src/routing.rs);
+keep the serialized field catalog in Core. Derive scope only from the frozen profile snapshot: selected
+proxy name first, otherwise configured account name, otherwise profile name. Never infer
+a vendor account from credentials, endpoint responses or model metadata.
 
-```sql
-CREATE TABLE provider_holds (
-  scope TEXT PRIMARY KEY,
-  kind TEXT NOT NULL,
-  retry_after INTEGER,
-  probe_command TEXT,
-  state TEXT NOT NULL,
-  updated_at INTEGER NOT NULL
-);
-```
+Create or update a hold only from a structured restriction attached to the exact
+generation- and turn-bound controlled `turn.completed`. Generic failure, native error
+text, HTTP status, or a vendor-owned model-catalog response is not a restriction and
+does not create a hold.
 
-A hold blocks new provider-backed launch/send/Goal for that scope, not local readback,
-request replies, interrupt or stop. One explicit eligible command may claim a probe.
-Unknown probe remains reserved across restart; time alone does not clear it. Auth and
-model removal require explicit owner/configuration evidence.
+The pinned Codex 0.161 projection recognizes three exact structured codes:
+`rateLimitExceeded` maps to rate-limit, `usageLimitExceeded` to quota, and
+`unauthorized` to auth. Four typed `codexErrorInfo` variants map to rate-limit only
+when their typed `httpStatusCode` is 429: `httpConnectionFailed`,
+`responseStreamConnectionFailed`, `responseStreamDisconnected`, and
+`responseTooManyFailedAttempts`. A bare HTTP status is not enough; only these exact
+typed variants with `httpStatusCode:429` map to rate-limit. `ModelRemoved` remains a
+valid structured Core restriction kind exercised by the Fake policy fixture, but the
+Codex 0.161 classifier does not infer it from an unrecognized native variant, HTTP 404
+or message text.
+
+A hold is `Held` or `Probing`. It blocks new provider-backed launch/send work in that
+scope, including queued dispatch. A launch with linked input must reject before either
+effect; resume without new text, readback, request replies, interrupt and stop remain
+available. Resume with text is a linked send and remains gated.
+
+Rate-limit and quota holds permit at most one explicit eligible SEND probe claim per
+frozen provider scope in Store, acquired atomically by `probe=true` through the normal
+SEND path. The probe uses ordinary SEND authorization and target/scope/generation fences;
+it adds no owner-only modifier or parallel executor. `retry_after` controls probe
+eligibility only; its expiry never clears a hold. Only a successful exact-bound probe
+completion clears a rate-limit/quota hold. A known failed or interrupted probe leaves
+the hold and releases only its definitive probe claim. An unknown probe retains both
+hold and claim across restart; it is not retried automatically.
+
+Auth and ModelRemoved holds are not probe-eligible and do not expire automatically. An
+owner clears them with one of the closed corrective evidence values:
+`credentials_updated`, `configuration_updated` or `owner_verified`.
+Clear uses a same-scope compare-and-swap against the expected probe command, including
+explicit null; it cannot clear an unresolved probe. The mutation ID binds the clear
+request, so an exact retry returns the retained result and changed evidence conflicts.
 
 ## Liveness
 
@@ -420,7 +445,7 @@ plans, file edits and exact request/answer transitions.
 | process exited, source not drained | terminal pending; no loss inference yet |
 | source drained/gapped + exact Agent custody empty or shared session absent | session lost for that generation |
 | parent idle, child busy | parent idle; tree incomplete |
-| provider 429 | rate limit unless native evidence proves quota |
+| bare provider HTTP 429 | no restriction inferred without a typed native variant |
 | old generation fact | historical diagnostic only |
 
 ## Restart reconciliation

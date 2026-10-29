@@ -14,6 +14,7 @@
 //! DTOs only: no I/O, no process spawning, no config access.
 //! L2.2 control verbs (steer/interrupt/deltas) return with a real caller.
 
+use eliot_core::{ProviderRestriction, ProviderRestrictionKind};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -418,6 +419,41 @@ pub struct NativeTurnError {
     pub additional_details: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_error_info: Option<serde_json::Value>,
+}
+
+impl NativeTurnError {
+    /// Project only installed 0.161 structured restriction codes. Free text,
+    /// extra details, unrelated statuses and unknown future variants stay inert.
+    pub(crate) fn provider_restriction(&self) -> Option<ProviderRestriction> {
+        let error_info = self.codex_error_info.as_ref()?;
+        let kind = match error_info {
+            serde_json::Value::String(code) => match code.as_str() {
+                "rateLimitExceeded" => ProviderRestrictionKind::RateLimit,
+                "usageLimitExceeded" => ProviderRestrictionKind::Quota,
+                "unauthorized" => ProviderRestrictionKind::Auth,
+                _ => return None,
+            },
+            serde_json::Value::Object(variants) if variants.len() == 1 => {
+                let (variant, details) = variants.iter().next()?;
+                if !matches!(
+                    variant.as_str(),
+                    "httpConnectionFailed"
+                        | "responseStreamConnectionFailed"
+                        | "responseStreamDisconnected"
+                        | "responseTooManyFailedAttempts"
+                ) || details.as_object()?.get("httpStatusCode")?.as_u64() != Some(429)
+                {
+                    return None;
+                }
+                ProviderRestrictionKind::RateLimit
+            }
+            _ => return None,
+        };
+        Some(ProviderRestriction {
+            kind,
+            retry_after: None,
+        })
+    }
 }
 
 /// Minimal native turn (fresh `Turn`; required: id + items + status).

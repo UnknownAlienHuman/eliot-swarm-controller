@@ -4,6 +4,7 @@
 
 mod canonical;
 mod capacity;
+mod provider_holds;
 
 use eliot_core::{
     self as core, Agent, AgentEdit, AgentState, BatchAck, Command, CommandState, Effect, Event,
@@ -129,7 +130,7 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(sql_error)?;
-        if current > 9 {
+        if current > 10 {
             return Err(Error::new(
                 "unsupported",
                 format!("Store schema version {current} is newer than this binary"),
@@ -425,6 +426,29 @@ impl Store {
                 .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
+        if current < 10 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE commands ADD COLUMN probe INTEGER NOT NULL DEFAULT 0
+                     CHECK(probe IN (0,1));
+                 CREATE TABLE provider_holds (
+                     scope TEXT PRIMARY KEY CHECK(length(scope) > 0),
+                     kind TEXT NOT NULL CHECK(kind IN ('rate_limit','quota','auth','model_removed')),
+                     retry_after INTEGER CHECK(retry_after IS NULL OR retry_after >= 0),
+                     probe_command TEXT REFERENCES commands(id),
+                     state TEXT NOT NULL CHECK(state IN ('held','probing')),
+                     updated_at INTEGER NOT NULL,
+                     CHECK((state = 'held' AND probe_command IS NULL)
+                        OR (state = 'probing' AND probe_command IS NOT NULL))
+                 );
+                 INSERT INTO schema_migrations(version) VALUES (10);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
         Ok(())
     }
 
@@ -489,6 +513,12 @@ impl Store {
         if !request.args.is_object() {
             return Err(Error::new("invalid", "command args must be a JSON object"));
         }
+        if request.probe && request.verb != "send" {
+            return Err(Error::new(
+                "bad_state",
+                "provider probes are allowed only for SEND commands",
+            ));
+        }
         // Bound durable admission data here. Host checks the completed start
         // frame, including runtime environment and source state, before writing.
         if request.verb != "attach" && encode_json(&request)?.len() > MAX_FRAME_BYTES {
@@ -512,6 +542,9 @@ impl Store {
             "expected_generation": request.expected_generation,
             "expected_turn_id": request.expected_turn_id,
         });
+        if request.probe {
+            semantic_payload["probe"] = Value::Bool(true);
+        }
         if let Some(request_id) = request.request_id.as_deref() {
             let object = semantic_payload.as_object_mut().ok_or_else(|| {
                 Error::new("internal", "command semantic payload is not an object")
@@ -705,6 +738,9 @@ impl Store {
                 ));
                 let agent_num = tx.last_insert_rowid();
                 let agent_id = format_agent_id(agent_num);
+                let agent = load_agent_by_num(&tx, agent_num)?
+                    .ok_or_else(|| Error::new("internal", "new launch Agent disappeared"))?;
+                provider_holds::require_unheld_tx(&tx, &agent)?;
                 events.push(insert_daemon_event(
                         &tx,
                         now,
@@ -812,6 +848,11 @@ impl Store {
                         },
                         json!({"command_id": request.id, "verb": "send"}),
                     )?);
+                    if let Some(event) =
+                        provider_holds::admit_send_tx(&tx, &agent, &request.id, request.probe, now)?
+                    {
+                        events.push(event);
+                    }
                     None
                 } else {
                     if request
@@ -979,6 +1020,7 @@ impl Store {
                 if let Some(text) = &text {
                     require_nonempty(text, "args.text")?;
                     check_input(text)?;
+                    provider_holds::require_unheld_tx(&tx, &agent)?;
                 }
                 let next_generation = agent.generation.checked_add(1).ok_or_else(|| {
                     Error::new("bad_state", "Agent generation cannot be incremented")
@@ -1371,6 +1413,9 @@ impl Store {
         let command_generation = command.command.generation.unwrap_or(agent.generation);
         if !matches!(command.command.verb.as_str(), "attach" | "detach") {
             observer::require_controlled(&agent)?;
+        }
+        if matches!(command.command.verb.as_str(), "launch" | "send") {
+            provider_holds::require_dispatch_tx(&tx, &agent, &command.command)?;
         }
 
         match command.command.verb.as_str() {
@@ -2168,7 +2213,7 @@ impl Store {
             .prepare(
                 "SELECT id, principal, method, target, expected_generation, generation,
                         expected_turn_id, turn_id, request_id, verb, args, state, outcome,
-                        created_at, updated_at
+                        created_at, updated_at, probe
                  FROM commands
                  WHERE state IN ('accepted', 'queued', 'dispatched', 'unknown')
                    AND NOT (state = 'unknown' AND verb IN ('attach','detach')
@@ -5748,6 +5793,7 @@ struct CommandInsert<'a> {
     ordinal: Option<i64>,
     turn_id: Option<&'a str>,
     request_id: Option<&'a str>,
+    probe: bool,
     verb: &'a str,
     args: &'a Value,
     state: CommandState,
@@ -5778,6 +5824,7 @@ impl<'a> CommandInsert<'a> {
             ordinal: None,
             turn_id: None,
             request_id: None,
+            probe: request.probe,
             verb: &request.verb,
             args: &request.args,
             state: CommandState::Accepted,
@@ -5939,6 +5986,7 @@ fn command_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandR
         outcome: row.get(12)?,
         created_at: row.get(13)?,
         updated_at: row.get(14)?,
+        probe: row.get(15)?,
     })
 }
 
@@ -5958,6 +6006,7 @@ struct CommandRecordRaw {
     outcome: Option<String>,
     created_at: i64,
     updated_at: i64,
+    probe: bool,
 }
 
 fn command_from_raw(raw: CommandRecordRaw) -> Result<CommandRecord> {
@@ -5979,6 +6028,7 @@ fn command_from_raw(raw: CommandRecordRaw) -> Result<CommandRecord> {
             outcome: raw.outcome.as_deref().map(decode_json).transpose()?,
             created_at: raw.created_at,
             updated_at: raw.updated_at,
+            probe: raw.probe,
         },
         state,
         target,
@@ -5991,7 +6041,7 @@ fn load_command_record(connection: &Connection, id: &str) -> Result<Option<Comma
         .query_row(
             "SELECT id, principal, method, target, expected_generation,
                     generation, expected_turn_id, turn_id, request_id, verb, args,
-                    state, outcome, created_at, updated_at
+                    state, outcome, created_at, updated_at, probe
              FROM commands WHERE id = ?1",
             [id],
             command_record_from_row,
@@ -6144,9 +6194,9 @@ fn insert_command(tx: &Transaction<'_>, command: &CommandInsert<'_>) -> Result<(
         "INSERT INTO commands(
              id, principal, method, payload_digest, target, expected_generation,
              generation, expected_turn_id, parent_command, link_kind, ordinal,
-             turn_id, request_id, verb, args, state, outcome, created_at, updated_at
+             turn_id, request_id, verb, args, state, outcome, created_at, updated_at, probe
          ) VALUES (
-             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
+             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
          )",
         params![
             command.id,
@@ -6168,6 +6218,7 @@ fn insert_command(tx: &Transaction<'_>, command: &CommandInsert<'_>) -> Result<(
             outcome,
             command.created_at,
             command.updated_at,
+            command.probe,
         ],
     ));
     Ok(())
@@ -6195,7 +6246,8 @@ fn update_command_state(
             "command state transition is not allowed",
         ));
     }
-    write_command_state(tx, id, state, outcome, generation, now)
+    write_command_state(tx, id, state, outcome, generation, now)?;
+    provider_holds::command_terminal_tx(tx, id, previous, state, now)
 }
 
 fn write_command_state(
@@ -6624,8 +6676,9 @@ fn persist_effects(
     now: i64,
     native_event: &NativeEvent,
     next_agent: &Agent,
-) -> Result<Vec<Value>> {
+) -> Result<(Vec<Value>, Vec<Event>)> {
     let mut command_events = Vec::new();
+    let mut provider_events = Vec::new();
     for effect in effects {
         match effect {
             Effect::CommandTurnAssociated {
@@ -6993,10 +7046,19 @@ fn persist_effects(
                         "terminal turn retains pending requests in the Agent projection",
                     ));
                 }
+                if command_id.is_some() {
+                    provider_events.extend(provider_holds::terminal_tx(
+                        tx,
+                        next_agent,
+                        effect,
+                        native_event,
+                        now,
+                    )?);
+                }
             }
         }
     }
-    Ok(command_events)
+    Ok((command_events, provider_events))
 }
 
 fn require_effect_command(
@@ -8291,6 +8353,7 @@ impl Store {
 
         let mut committed_events = Vec::with_capacity(batch.events.len());
         let mut command_events = Vec::new();
+        let mut provider_events = Vec::new();
         for (index, native_event) in batch.events.iter().enumerate() {
             let (next, effects) = if expected_subject.is_some() {
                 observer_live::persist_turn_fact(&tx, &projection, native_event)?;
@@ -8318,7 +8381,7 @@ impl Store {
                     payload_digest: &event_digest,
                 },
             )?;
-            command_events.extend(persist_effects(
+            let (effects, hold_events) = persist_effects(
                 &tx,
                 &effects,
                 agent_num,
@@ -8326,7 +8389,9 @@ impl Store {
                 now,
                 native_event,
                 &next,
-            )?);
+            )?;
+            command_events.extend(effects);
+            provider_events.extend(hold_events);
             if next.is_terminal() {
                 terminalize_generation_commands(
                     &tx,
@@ -8373,6 +8438,8 @@ impl Store {
                 data,
             )?);
         }
+        committed_events.extend(provider_events);
+        committed_events.sort_by_key(|event| event.seq);
         let source_state = if projection.is_terminal() {
             "closed"
         } else {

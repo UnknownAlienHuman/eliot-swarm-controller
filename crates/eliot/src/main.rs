@@ -9,8 +9,9 @@ use eliot_core::{
         AgentResultResponse, AgentStatsRequest, AgentStatsResponse, CommandGetRequest,
         CommandSubmitResponse, DaemonShutdownRequest, DaemonShutdownResponse, DaemonStatusRequest,
         DaemonStatusResponse, DiscoverPage, EventsFilter, EventsReadRequest, EventsReadResponse,
-        EventsSubscribeRequest, EventsSubscribeResponse, ObservationPage, ShutdownMode,
-        TurnGetRequest,
+        EventsSubscribeRequest, EventsSubscribeResponse, ObservationPage, ProviderClearHoldRequest,
+        ProviderClearHoldResponse, ProviderCorrectiveEvidence, ProviderHoldsRequest,
+        ProviderHoldsResponse, ShutdownMode, TurnGetRequest,
     },
 };
 use serde_json::{Value, json};
@@ -80,6 +81,11 @@ enum CliCommand {
     Daemon(DaemonArgs),
     /// Read daemon state without starting a daemon.
     Status,
+    /// Inspect provider holds or clear one with owner corrective evidence.
+    Provider {
+        #[command(subcommand)]
+        command: ProviderCommand,
+    },
     /// Discover one page of native sessions through an explicit profile.
     Discover {
         #[arg(long, value_name = "PROFILE")]
@@ -131,6 +137,9 @@ enum CliCommand {
         text: String,
         #[arg(long)]
         wait: bool,
+        /// Explicitly claim one eligible provider-hold probe for this send.
+        #[arg(long)]
+        probe: bool,
         #[command(flatten)]
         generation: GenerationArgs,
         #[arg(long, default_value_t = DEFAULT_WAIT_SECONDS, value_name = "SECONDS")]
@@ -346,6 +355,30 @@ enum CmdCommand {
 }
 
 #[derive(Subcommand)]
+enum ProviderCommand {
+    /// Read one bounded page of durable provider holds.
+    Holds {
+        #[arg(long, value_name = "SCOPE")]
+        after: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Clear a provider hold with exact owner corrective evidence.
+    ClearHold {
+        #[arg(value_name = "SCOPE")]
+        scope: String,
+        #[arg(
+            long,
+            value_name = "EVIDENCE",
+            value_parser = ["credentials_updated", "configuration_updated", "owner_verified"]
+        )]
+        corrective_evidence: String,
+        #[arg(long, value_name = "ID")]
+        expected_probe_command: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum WorktreeCommand {
     /// Remove a terminal Agent's clean worktree while retaining its branch.
     Remove {
@@ -393,6 +426,7 @@ impl Failure {
                 | "not_found"
                 | "busy"
                 | "capacity_unavailable"
+                | "provider_held"
                 | "frame_too_large"
                 | "secret_in_payload"
                 | "id_conflict"
@@ -577,6 +611,54 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 DaemonStatusResponse
             )
         }
+        CliCommand::Provider { command } => match command {
+            ProviderCommand::Holds { after, limit } => {
+                let request = ProviderHoldsRequest { after, limit };
+                request
+                    .validate()
+                    .map_err(|error| Failure::from_core(error, false))?;
+                let response: ProviderHoldsResponse =
+                    eliot_daemon::client_call_typed(&data_dir, "provider.holds", &request)
+                        .await
+                        .map_err(|error| Failure::from_core(error, false))?;
+                request
+                    .validate_response(&response)
+                    .map_err(|_| Failure::new(4, "provider.holds response is invalid"))?;
+                let value = serde_json::to_value(response)
+                    .map_err(|_| Failure::new(4, "provider.holds response is invalid"))?;
+                print_value(&value, json_output);
+                Ok(0)
+            }
+            ProviderCommand::ClearHold {
+                scope,
+                corrective_evidence,
+                expected_probe_command,
+            } => {
+                let corrective_evidence: ProviderCorrectiveEvidence =
+                    serde_json::from_value(Value::String(corrective_evidence))
+                        .map_err(|_| Failure::new(2, "invalid provider corrective evidence"))?;
+                let request = ProviderClearHoldRequest {
+                    id: mutation_id(id)?,
+                    scope,
+                    corrective_evidence,
+                    expected_probe_command,
+                };
+                request
+                    .validate()
+                    .map_err(|error| Failure::from_core(error, true))?;
+                let response: ProviderClearHoldResponse =
+                    eliot_daemon::client_call_typed(&data_dir, "provider.clear_hold", &request)
+                        .await
+                        .map_err(|error| Failure::from_core(error, true))?;
+                request
+                    .validate_response(&response)
+                    .map_err(|_| Failure::new(4, "provider.clear_hold response is invalid"))?;
+                let value = serde_json::to_value(response)
+                    .map_err(|_| Failure::new(4, "provider.clear_hold response is invalid"))?;
+                print_value(&value, json_output);
+                Ok(0)
+            }
+        },
         CliCommand::Discover {
             profile,
             harness,
@@ -676,6 +758,7 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             agent,
             text,
             wait,
+            probe,
             generation: GenerationArgs { generation },
             timeout_seconds,
         } => {
@@ -687,6 +770,7 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             };
             let mut params = submit_request(id, Some(agent), "send", json!({ "text": text }))?;
             params.expected_generation = generation;
+            params.probe = probe;
             let submitted = submit_command(&data_dir, &params).await?;
             let submit_exit = response_exit_code(submitted.state);
             if matches!(submit_exit, 1 | 3 | 4) {

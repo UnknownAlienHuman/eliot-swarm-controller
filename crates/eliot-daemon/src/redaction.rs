@@ -144,6 +144,7 @@ mod tests {
                     expected_generation: Some(0),
                     expected_turn_id: None,
                     request_id: None,
+                    probe: false,
                 },
                 now,
             )

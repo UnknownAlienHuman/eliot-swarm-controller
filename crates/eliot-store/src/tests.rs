@@ -1,7 +1,8 @@
-use super::{Store, contains_secret_marker};
+use super::{BatchCommit, Store, contains_secret_marker};
+use eliot_core::api::{ProviderClearHoldRequest, ProviderCorrectiveEvidence};
 use eliot_core::{
-    AgentState, CommandState, NativeEvent, NativeStoreBinding, SourceBatch, SourceGap,
-    SubmitCommand,
+    AgentState, CommandState, NativeEvent, NativeStoreBinding, ProviderHoldState,
+    ProviderRestrictionKind, SourceBatch, SourceGap, SubmitCommand, TurnState,
 };
 use eliot_core::{
     WorkspaceCancelOutcome, WorkspaceCreationOutcome, WorkspacePhase, WorkspacePreparationInput,
@@ -27,6 +28,7 @@ fn ready_agent(store: &mut Store, project: &str, now: i64) -> String {
                 expected_generation: Some(0),
                 expected_turn_id: None,
                 request_id: None,
+                probe: false,
             },
             now,
         )
@@ -157,6 +159,7 @@ fn session_end_keeps_dispatched_stop_pending_until_exact_reply() {
                 expected_generation: Some(1),
                 expected_turn_id: None,
                 request_id: None,
+                probe: false,
             },
             now + 1,
         )
@@ -236,6 +239,7 @@ fn generic_generation_loss_keeps_dispatched_stop_unknown() {
                 expected_generation: Some(1),
                 expected_turn_id: None,
                 request_id: None,
+                probe: false,
             },
             now + 1,
         )
@@ -288,7 +292,7 @@ fn workspace_exceptions_stay_marker_bound_across_unknown_readback() {
         args: json!({"project":input.project,"workspace":input.repo_path,"worktree":input.requested_branch,
             "harness":"fake","profile":"fake",
             "profile_snapshot":{"capacity_scopes":[{"scope":"profile:fake","max_live":1}]}}),
-        expected_generation: Some(0), expected_turn_id: None, request_id: None,
+        expected_generation: Some(0), expected_turn_id: None, request_id: None, probe: false,
     }, input.clone(), now).expect("admit prepared launch");
     let agent = start.command.target.expect("workspace owner");
     assert_eq!(capacity_generation(&store, &agent), Some(1));
@@ -385,6 +389,7 @@ fn workspace_exceptions_stay_marker_bound_across_unknown_readback() {
                 expected_generation: Some(0),
                 expected_turn_id: None,
                 request_id: None,
+                probe: false,
             },
             now,
         )
@@ -470,6 +475,7 @@ fn send_association_emits_applied_once_with_native_batch_ack() {
                 expected_generation: Some(0),
                 expected_turn_id: None,
                 request_id: None,
+                probe: false,
             },
             now,
         )
@@ -509,6 +515,7 @@ fn send_association_emits_applied_once_with_native_batch_ack() {
                 expected_generation: Some(1),
                 expected_turn_id: None,
                 request_id: None,
+                probe: false,
             },
             now,
         )
@@ -641,6 +648,7 @@ fn secret_question_answer_is_rejected_before_command_persistence() {
                 expected_generation: Some(0),
                 expected_turn_id: None,
                 request_id: None,
+                probe: false,
             },
             now,
         )
@@ -694,6 +702,7 @@ fn secret_question_answer_is_rejected_before_command_persistence() {
                 expected_generation: Some(1),
                 expected_turn_id: None,
                 request_id: None,
+                probe: false,
             },
             now,
         )
@@ -758,6 +767,7 @@ fn secret_question_answer_is_rejected_before_command_persistence() {
                 expected_generation: None,
                 expected_turn_id: None,
                 request_id: None,
+                probe: false,
             },
             now,
         )
@@ -789,6 +799,7 @@ fn native_request_cleanup_does_not_acknowledge_reply() {
         expected_generation: None,
         expected_turn_id: None,
         request_id,
+        probe: false,
     };
     let launch = command(
         "launch",
@@ -1029,6 +1040,544 @@ fn native_store_binding() -> NativeStoreBinding {
         home: "/verified-home".to_owned(),
         root: "/verified-store".to_owned(),
         native_scope: "verified-scope".to_owned(),
+    }
+}
+
+fn provider_send_request(agent: &str, id: &str, probe: bool) -> SubmitCommand {
+    SubmitCommand {
+        id: id.to_owned(),
+        target: Some(agent.to_owned()),
+        verb: "send".to_owned(),
+        args: json!({"text":"synthetic provider hold input"}),
+        expected_generation: Some(1),
+        expected_turn_id: None,
+        request_id: None,
+        probe,
+    }
+}
+
+fn provider_native_event(
+    store: &mut Store,
+    agent: &str,
+    native_id: &str,
+    kind: &str,
+    data: serde_json::Value,
+    now: i64,
+) -> BatchCommit {
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("provider-batch-{native_id}"),
+                agent_id: agent.to_owned(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    kind: kind.to_owned(),
+                    native_id: native_id.to_owned(),
+                    data,
+                    ts: None,
+                }],
+                cursor: None,
+            },
+            now,
+        )
+        .expect("commit provider test event")
+}
+
+fn start_provider_turn(
+    store: &mut Store,
+    agent: &str,
+    command_id: &str,
+    probe: bool,
+    now: i64,
+) -> String {
+    let admission = store
+        .submit(
+            "owner",
+            provider_send_request(agent, command_id, probe),
+            now,
+        )
+        .expect("admit provider test send");
+    assert_eq!(admission.command.probe, probe);
+    store
+        .dispatch(command_id, now + 1)
+        .expect("dispatch provider test send");
+    let turn_id = format!("turn-{command_id}");
+    provider_native_event(
+        store,
+        agent,
+        &format!("{command_id}-started"),
+        "turn.started",
+        json!({"command_id":command_id,"turn_id":turn_id}),
+        now + 2,
+    );
+    turn_id
+}
+
+fn complete_provider_turn(
+    store: &mut Store,
+    agent: &str,
+    command_id: &str,
+    turn_id: &str,
+    status: &str,
+    restriction: Option<(ProviderRestrictionKind, Option<i64>)>,
+    now: i64,
+) -> BatchCommit {
+    let mut data = json!({"command_id":command_id,"turn_id":turn_id,"status":status});
+    if let Some((kind, retry_after)) = restriction {
+        data["provider_restriction"] = json!({
+            "kind": kind.as_str(),
+            "retry_after": retry_after,
+        });
+    }
+    provider_native_event(
+        store,
+        agent,
+        &format!("{command_id}-completed"),
+        "turn.completed",
+        data,
+        now,
+    )
+}
+
+fn clear_provider_hold_request(
+    scope: &str,
+    expected_probe_command: Option<String>,
+) -> ProviderClearHoldRequest {
+    ProviderClearHoldRequest {
+        id: Ulid::new().to_string(),
+        scope: scope.to_owned(),
+        corrective_evidence: ProviderCorrectiveEvidence::OwnerVerified,
+        expected_probe_command,
+    }
+}
+
+#[test]
+fn store_probe_false_preserves_legacy_digest_and_probe_toggle_conflicts() {
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+    let agent = ready_agent(&mut store, "provider-probe-digest", now);
+    let request = provider_send_request(&agent, &Ulid::new().to_string(), false);
+    let request_id = request.id.clone();
+    let admitted = store.submit("owner", request.clone(), now + 1).unwrap();
+    assert!(!admitted.command.probe);
+
+    let expected_payload = json!({
+        "target": request.target,
+        "verb": request.verb,
+        "args": request.args,
+        "expected_generation": request.expected_generation,
+        "expected_turn_id": request.expected_turn_id,
+    });
+    let expected_digest = super::canonical::digest(&expected_payload).unwrap();
+    let stored_digest: Vec<u8> = store
+        .connection
+        .query_row(
+            "SELECT payload_digest FROM commands WHERE id = ?1",
+            [&request_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored_digest, expected_digest);
+
+    let mut changed_probe = request;
+    changed_probe.probe = true;
+    assert_eq!(
+        store
+            .submit("owner", changed_probe, now + 2)
+            .unwrap_err()
+            .code,
+        "id_conflict"
+    );
+}
+
+#[test]
+fn provider_probe_claim_survives_reopen_and_exact_success_clears_hold() {
+    let path = capacity_store_path();
+    let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+    let (agent, probe_id, pending_agent, pending_send_id);
+    {
+        let mut store = Store::open(&path).unwrap();
+        agent = ready_agent(&mut store, "provider-probe-reopen", now);
+        pending_agent = ready_agent(&mut store, "provider-pending-dispatch", now + 1);
+
+        pending_send_id = Ulid::new().to_string();
+        store
+            .submit(
+                "owner",
+                provider_send_request(&pending_agent, &pending_send_id, false),
+                now + 2,
+            )
+            .expect("admit send before hold arrives");
+
+        let first_id = Ulid::new().to_string();
+        let first_turn = start_provider_turn(&mut store, &agent, &first_id, false, now + 3);
+        let restriction_batch = complete_provider_turn(
+            &mut store,
+            &agent,
+            &first_id,
+            &first_turn,
+            "failed",
+            Some((ProviderRestrictionKind::RateLimit, None)),
+            now + 6,
+        );
+        assert!(
+            restriction_batch
+                .events
+                .iter()
+                .any(|event| event.kind == "provider.hold_updated")
+        );
+        let blocked = store.dispatch(&pending_send_id, now + 7).unwrap_err();
+        assert_eq!(blocked.code, "provider_held");
+        assert_eq!(
+            store.get_command(&pending_send_id).unwrap().unwrap().state,
+            CommandState::Accepted
+        );
+
+        let rejected_id = Ulid::new().to_string();
+        assert_eq!(
+            store
+                .submit(
+                    "owner",
+                    provider_send_request(&agent, &rejected_id, false),
+                    now + 8,
+                )
+                .unwrap_err()
+                .code,
+            "provider_held"
+        );
+        assert!(store.get_command(&rejected_id).unwrap().is_none());
+
+        let count_before_launch = store.agent_count().unwrap();
+        let launch_id = Ulid::new().to_string();
+        let mut launch = SubmitCommand::new(launch_id, "launch");
+        launch.args =
+            json!({"project":"provider-held-launch", "workspace":"synthetic-held-launch"});
+        launch.expected_generation = Some(0);
+        assert_eq!(
+            store.submit("owner", launch, now + 9).unwrap_err().code,
+            "provider_held"
+        );
+        assert_eq!(store.agent_count().unwrap(), count_before_launch);
+
+        probe_id = Ulid::new().to_string();
+        let probe_request = provider_send_request(&agent, &probe_id, true);
+        let admitted = store
+            .submit("owner", probe_request.clone(), now + 10)
+            .expect("claim eligible provider probe");
+        assert!(admitted.command.probe);
+        assert!(
+            !store
+                .submit("owner", probe_request.clone(), now + 11)
+                .expect("retain duplicate probe admission")
+                .is_new
+        );
+        let mut changed_probe = probe_request;
+        changed_probe.probe = false;
+        assert_eq!(
+            store
+                .submit("owner", changed_probe, now + 11)
+                .unwrap_err()
+                .code,
+            "id_conflict"
+        );
+        assert!(store.get_command(&probe_id).unwrap().unwrap().probe);
+        store.dispatch(&probe_id, now + 12).unwrap();
+        store
+            .settle(&probe_id, CommandState::Unknown, None, now + 13)
+            .expect("unknown probe keeps its claim");
+
+        let clear = clear_provider_hold_request("profile:fake", Some(probe_id.clone()));
+        assert_eq!(
+            store
+                .clear_provider_hold("owner", &clear, now + 14)
+                .unwrap_err()
+                .code,
+            "bad_state"
+        );
+    }
+
+    {
+        let mut store = Store::open(&path).unwrap();
+        let hold = store
+            .list_provider_holds(None, 10)
+            .unwrap()
+            .holds
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(hold.state, ProviderHoldState::Probing);
+        assert_eq!(hold.probe_command.as_deref(), Some(probe_id.as_str()));
+
+        let turn_id = format!("turn-{probe_id}");
+        provider_native_event(
+            &mut store,
+            &agent,
+            &format!("{probe_id}-started"),
+            "turn.started",
+            json!({"command_id":probe_id,"turn_id":turn_id}),
+            now + 15,
+        );
+        let completed = complete_provider_turn(
+            &mut store,
+            &agent,
+            &probe_id,
+            &turn_id,
+            "completed",
+            None,
+            now + 16,
+        );
+        assert!(
+            completed
+                .events
+                .iter()
+                .any(|event| event.kind == "provider.hold_cleared")
+        );
+        assert!(
+            store
+                .list_provider_holds(None, 10)
+                .unwrap()
+                .holds
+                .is_empty()
+        );
+    }
+    remove_capacity_store_files(&path);
+}
+
+#[test]
+fn failed_probe_command_without_exact_terminal_keeps_probe_claim() {
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+    let agent = ready_agent(&mut store, "provider-probe-failed-command", now);
+    let first_id = Ulid::new().to_string();
+    let first_turn = start_provider_turn(&mut store, &agent, &first_id, false, now + 1);
+    complete_provider_turn(
+        &mut store,
+        &agent,
+        &first_id,
+        &first_turn,
+        "failed",
+        Some((ProviderRestrictionKind::RateLimit, None)),
+        now + 4,
+    );
+
+    let probe_id = Ulid::new().to_string();
+    store
+        .submit(
+            "owner",
+            provider_send_request(&agent, &probe_id, true),
+            now + 5,
+        )
+        .expect("admit probe");
+    store.dispatch(&probe_id, now + 6).unwrap();
+    store
+        .settle(
+            &probe_id,
+            CommandState::Failed,
+            Some(json!({"reason":"known failure may have partial effects"})),
+            now + 7,
+        )
+        .expect("retain known failed command result");
+
+    let command = store.get_command(&probe_id).unwrap().unwrap();
+    assert_eq!(command.state, CommandState::Failed);
+    assert!(command.probe);
+    let hold = store.list_provider_holds(None, 10).unwrap().holds.remove(0);
+    assert_eq!(hold.kind, ProviderRestrictionKind::RateLimit);
+    assert_eq!(hold.state, ProviderHoldState::Probing);
+    assert_eq!(hold.probe_command.as_deref(), Some(probe_id.as_str()));
+}
+
+#[test]
+fn applied_probe_with_running_turn_is_not_treated_as_terminal() {
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+    let agent = ready_agent(&mut store, "provider-probe-running-turn", now);
+    let first_id = Ulid::new().to_string();
+    let first_turn = start_provider_turn(&mut store, &agent, &first_id, false, now + 1);
+    complete_provider_turn(
+        &mut store,
+        &agent,
+        &first_id,
+        &first_turn,
+        "failed",
+        Some((ProviderRestrictionKind::RateLimit, None)),
+        now + 4,
+    );
+
+    let probe_id = Ulid::new().to_string();
+    let turn_id = start_provider_turn(&mut store, &agent, &probe_id, true, now + 5);
+    assert_eq!(
+        store.get_command(&probe_id).unwrap().unwrap().state,
+        CommandState::Applied
+    );
+    assert_eq!(
+        store.get_turn(&agent, 1, &turn_id).unwrap().unwrap().state,
+        TurnState::Running
+    );
+    assert_eq!(
+        store
+            .settle(
+                &probe_id,
+                CommandState::Failed,
+                Some(json!({"reason":"turn is still running"})),
+                now + 8,
+            )
+            .unwrap_err()
+            .code,
+        "bad_state"
+    );
+    let hold = store.list_provider_holds(None, 10).unwrap().holds.remove(0);
+    assert_eq!(hold.state, ProviderHoldState::Probing);
+    assert_eq!(hold.probe_command.as_deref(), Some(probe_id.as_str()));
+}
+
+#[test]
+fn same_scope_restriction_during_probe_survives_exact_probe_completion() {
+    for (index, (kind, expected_kind)) in [
+        (
+            ProviderRestrictionKind::Quota,
+            ProviderRestrictionKind::Quota,
+        ),
+        (ProviderRestrictionKind::Auth, ProviderRestrictionKind::Auth),
+        (
+            ProviderRestrictionKind::ModelRemoved,
+            ProviderRestrictionKind::ModelRemoved,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+        let agent_a = ready_agent(&mut store, &format!("provider-interleave-a-{index}"), now);
+        let agent_b = ready_agent(
+            &mut store,
+            &format!("provider-interleave-b-{index}"),
+            now + 1,
+        );
+        let agent_probe = ready_agent(
+            &mut store,
+            &format!("provider-interleave-p-{index}"),
+            now + 2,
+        );
+        let command_a = Ulid::new().to_string();
+        let turn_a = start_provider_turn(&mut store, &agent_a, &command_a, false, now + 3);
+        let command_b = Ulid::new().to_string();
+        let turn_b = start_provider_turn(&mut store, &agent_b, &command_b, false, now + 3);
+
+        complete_provider_turn(
+            &mut store,
+            &agent_a,
+            &command_a,
+            &turn_a,
+            "failed",
+            Some((ProviderRestrictionKind::RateLimit, None)),
+            now + 6,
+        );
+        let probe_id = Ulid::new().to_string();
+        let turn_probe = start_provider_turn(&mut store, &agent_probe, &probe_id, true, now + 7);
+        let probing_clear = clear_provider_hold_request("profile:fake", Some(probe_id.clone()));
+        assert_eq!(
+            store
+                .clear_provider_hold("owner", &probing_clear, now + 8)
+                .unwrap_err()
+                .code,
+            "bad_state"
+        );
+
+        complete_provider_turn(
+            &mut store,
+            &agent_b,
+            &command_b,
+            &turn_b,
+            "failed",
+            Some((kind, None)),
+            now + 9,
+        );
+        let during_probe = store.list_provider_holds(None, 10).unwrap().holds.remove(0);
+        assert_eq!(during_probe.kind, expected_kind);
+        assert_eq!(during_probe.state, ProviderHoldState::Probing);
+        assert_eq!(
+            during_probe.probe_command.as_deref(),
+            Some(probe_id.as_str())
+        );
+
+        complete_provider_turn(
+            &mut store,
+            &agent_probe,
+            &probe_id,
+            &turn_probe,
+            "completed",
+            None,
+            now + 10,
+        );
+        let after_probe = store.list_provider_holds(None, 10).unwrap().holds.remove(0);
+        assert_eq!(after_probe.kind, expected_kind);
+        assert_eq!(after_probe.state, ProviderHoldState::Held);
+        assert_eq!(after_probe.probe_command, None);
+        if matches!(
+            expected_kind,
+            ProviderRestrictionKind::Auth | ProviderRestrictionKind::ModelRemoved
+        ) {
+            let forbidden_probe = Ulid::new().to_string();
+            assert_eq!(
+                store
+                    .submit(
+                        "owner",
+                        provider_send_request(&agent_probe, &forbidden_probe, true),
+                        now + 11,
+                    )
+                    .unwrap_err()
+                    .code,
+                "provider_held"
+            );
+            assert!(store.get_command(&forbidden_probe).unwrap().is_none());
+        }
+
+        let clear = clear_provider_hold_request("profile:fake", None);
+        let cleared = store
+            .clear_provider_hold("owner", &clear, now + 12)
+            .unwrap();
+        assert!(cleared.value.cleared);
+        assert_eq!(cleared.events.len(), 1);
+        assert_eq!(cleared.events[0].kind, "provider.hold_cleared");
+        let replay = store
+            .clear_provider_hold("owner", &clear, now + 13)
+            .unwrap();
+        assert_eq!(replay.value, cleared.value);
+        assert!(replay.events.is_empty());
+        let stale_clear =
+            clear_provider_hold_request("profile:fake", Some("stale-probe-command".to_owned()));
+        let absent = store
+            .clear_provider_hold("owner", &stale_clear, now + 13)
+            .unwrap();
+        assert!(!absent.value.cleared);
+        assert!(absent.events.is_empty());
+
+        let renewed_id = Ulid::new().to_string();
+        let renewed_turn =
+            start_provider_turn(&mut store, &agent_probe, &renewed_id, false, now + 13);
+        complete_provider_turn(
+            &mut store,
+            &agent_probe,
+            &renewed_id,
+            &renewed_turn,
+            "failed",
+            Some((ProviderRestrictionKind::RateLimit, None)),
+            now + 16,
+        );
+        let stale_replay = store
+            .clear_provider_hold("owner", &clear, now + 17)
+            .unwrap();
+        assert_eq!(stale_replay.value, cleared.value);
+        assert!(stale_replay.events.is_empty());
+        let renewed_hold = store.list_provider_holds(None, 10).unwrap();
+        assert_eq!(renewed_hold.holds.len(), 1);
+        assert_eq!(
+            renewed_hold.holds[0].kind,
+            ProviderRestrictionKind::RateLimit
+        );
     }
 }
 
@@ -1995,6 +2544,7 @@ fn stop_and_source_closure_alone_do_not_release_capacity_or_fail_host_settlement
                 expected_generation: Some(1),
                 expected_turn_id: None,
                 request_id: None,
+                probe: false,
             },
             now + 2,
         )

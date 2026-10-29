@@ -13,9 +13,13 @@ use eliot_core::api::{
     CommandSubmitResponse, DaemonShutdownRequest, DaemonShutdownResponse, DaemonStatusRequest,
     DaemonStatusResponse, DiscoverPage, EventsFilter, EventsReadRequest, EventsReadResponse,
     EventsSubscribeRequest, EventsSubscribeResponse, MAX_OBSERVATION_CURSOR_BYTES, ObservationPage,
-    PROCESS_CURSOR_MAX_BYTES, ShutdownMode, TurnGetRequest,
+    PROCESS_CURSOR_MAX_BYTES, ProviderClearHoldResponse, ProviderHoldsResponse, ShutdownMode,
+    TurnGetRequest,
 };
-use eliot_core::{Command as CoreCommand, CommandState, Turn as CoreTurn, TurnState};
+use eliot_core::{
+    Command as CoreCommand, CommandState, ProviderHoldState, ProviderRestrictionKind,
+    Turn as CoreTurn, TurnState,
+};
 use serde_json::{Value, json};
 use std::time::Duration;
 use std::{collections::HashSet, fs, path::Path, process::Command};
@@ -3588,5 +3592,392 @@ max_live = 1
         serde_json::from_value(fixture.json(&["stop", &second_agent]))
             .expect("typed second stop submission");
     fixture.wait_command(&second_stop.command_id, "applied");
+    fixture.stop(false);
+}
+
+#[test]
+fn cli_provider_restrictions_gate_fake_work_and_owner_clear_permanent_holds() {
+    let mut fixture = Fixture::new("provider restriction CLI");
+    fixture.start();
+    fs::write(
+        fixture.data.join("config.toml"),
+        r#"
+[profiles.fake-provider]
+harness = "fake"
+account = "shared"
+
+[profiles.fake-next]
+harness = "fake"
+account = "shared"
+
+[accounts.shared]
+max_live = 3
+"#,
+    )
+    .expect("write named Fake provider-scope profiles");
+
+    let workspace = fixture.workspace.to_string_lossy().into_owned();
+    let data_path = fixture.data.to_string_lossy().into_owned();
+    let parse_command = |phase: &str, reply: support::Reply| -> CoreCommand {
+        let safe_stderr = reply
+            .stderr
+            .replace(&data_path, "[DATA]")
+            .replace(&workspace, "[WORKSPACE]")
+            .chars()
+            .take(512)
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect::<String>();
+        assert!(
+            reply.status.success(),
+            "{phase} failed with exit {:?}: {safe_stderr}",
+            reply.status.code()
+        );
+        serde_json::from_str(&reply.stdout)
+            .unwrap_or_else(|_| panic!("{phase} returned invalid CoreCommand JSON; stdout omitted"))
+    };
+    let data_dir = fixture.data.clone();
+    let assert_unadmitted = |id: &str| {
+        let missing = cli(&data_dir, &["cmd", "show", id]);
+        assert_eq!(missing.status.code(), Some(1));
+        assert!(missing.stderr.contains("not_found"));
+    };
+    let read_holds = |fixture: &Fixture| -> ProviderHoldsResponse {
+        serde_json::from_value(fixture.json(&["provider", "holds", "--limit", "10"]))
+            .expect("typed provider hold page")
+    };
+    let restriction_event_count =
+        |events: &[Value],
+         agent: &str,
+         generation: i64,
+         command: &str,
+         turn: &str,
+         kind: ProviderRestrictionKind| {
+            events
+                .iter()
+                .filter(|event| {
+                    event["kind"] == "turn.completed"
+                        && event["agent"].as_str() == Some(agent)
+                        && event["generation"].as_i64() == Some(generation)
+                        && event["data"]["command_id"].as_str() == Some(command)
+                        && event["data"]["turn_id"].as_str() == Some(turn)
+                        && event["data"]["provider_restriction"]["kind"].as_str()
+                            == Some(kind.as_str())
+                })
+                .count()
+        };
+    let has_command_event = |events: &[Value], command: &str| {
+        events
+            .iter()
+            .any(|event| event["data"]["command_id"].as_str() == Some(command))
+    };
+
+    let launch_id = ulid::Ulid::new().to_string();
+    let launch_args = [
+        "--id",
+        launch_id.as_str(),
+        "launch",
+        "--profile",
+        "fake-provider",
+        "--workspace",
+        workspace.as_str(),
+    ];
+    let launch = parse_command("initial Fake launch", cli(&fixture.data, &launch_args));
+    assert_eq!(launch.id, launch_id);
+    assert_eq!(launch.state, CommandState::Applied);
+    let agent = launch.target.clone().expect("controlled Fake Agent");
+    let generation = launch.generation.expect("Fake generation");
+    assert_eq!(generation, 1);
+    fixture.wait_command(&launch_id, "applied");
+
+    let generation_arg = generation.to_string();
+    let rate_id = ulid::Ulid::new().to_string();
+    let rate_marker = "[eliot_fake_provider_rate_limit]";
+    let rate_reply = cli(
+        &fixture.data,
+        &[
+            "--id",
+            &rate_id,
+            "send",
+            &agent,
+            "--generation",
+            &generation_arg,
+            "--wait",
+            "--timeout-seconds",
+            "10",
+            "--",
+            rate_marker,
+        ],
+    );
+    assert_eq!(rate_reply.status.code(), Some(1));
+    let rate_turn: CoreTurn =
+        serde_json::from_str(&rate_reply.stdout).expect("typed failed rate-limit turn");
+    assert_eq!(rate_turn.agent, agent);
+    assert_eq!(rate_turn.generation, generation);
+    assert_eq!(rate_turn.state, TurnState::Completed);
+    assert_eq!(rate_turn.status.as_deref(), Some("failed"));
+    assert!(rate_turn.final_text.is_none());
+    fixture.wait_command(&rate_id, "applied");
+    let rate_command: CoreCommand =
+        serde_json::from_value(fixture.json(&["cmd", "show", &rate_id]))
+            .expect("typed normal SEND command");
+    assert!(!rate_command.probe);
+    assert_eq!(rate_command.args, json!({"text":rate_marker}));
+    let events = fixture.events();
+    assert_eq!(
+        restriction_event_count(
+            &events,
+            &agent,
+            generation,
+            &rate_id,
+            &rate_turn.turn_id,
+            ProviderRestrictionKind::RateLimit,
+        ),
+        1,
+        "rate hold did not come from its exact structured turn completion"
+    );
+
+    let rate_page = read_holds(&fixture);
+    assert_eq!(rate_page.holds.len(), 1);
+    assert_eq!(rate_page.next.as_deref(), Some("account:shared"));
+    let terminal_rate_page: ProviderHoldsResponse = serde_json::from_value(fixture.json(&[
+        "provider",
+        "holds",
+        "--after",
+        "account:shared",
+        "--limit",
+        "10",
+    ]))
+    .expect("terminal provider hold page");
+    assert!(terminal_rate_page.holds.is_empty());
+    assert_eq!(terminal_rate_page.next, None);
+    assert_eq!(rate_page.holds[0].scope, "account:shared");
+    assert_eq!(rate_page.holds[0].kind, ProviderRestrictionKind::RateLimit);
+    assert_eq!(rate_page.holds[0].state, ProviderHoldState::Held);
+    assert_eq!(rate_page.holds[0].probe_command, None);
+
+    let blocked_send_id = ulid::Ulid::new().to_string();
+    let blocked_send = cli(
+        &fixture.data,
+        &[
+            "--id",
+            &blocked_send_id,
+            "send",
+            &agent,
+            "--generation",
+            &generation_arg,
+            "--",
+            "ordinary held input",
+        ],
+    );
+    assert_eq!(blocked_send.status.code(), Some(3));
+    assert!(blocked_send.stderr.contains("provider_held"));
+    assert_unadmitted(&blocked_send_id);
+
+    let blocked_launch_id = ulid::Ulid::new().to_string();
+    let blocked_launch = cli(
+        &fixture.data,
+        &[
+            "--id",
+            &blocked_launch_id,
+            "launch",
+            "--profile",
+            "fake-next",
+            "--workspace",
+            workspace.as_str(),
+        ],
+    );
+    assert_eq!(blocked_launch.status.code(), Some(3));
+    assert!(blocked_launch.stderr.contains("provider_held"));
+    assert_unadmitted(&blocked_launch_id);
+    assert_eq!(fixture.json(&["status"])["agents"], 1);
+    let events = fixture.events();
+    assert!(!has_command_event(&events, &blocked_send_id));
+    assert!(!has_command_event(&events, &blocked_launch_id));
+
+    let probe_id = ulid::Ulid::new().to_string();
+    let probe_text = "successful explicit rate-limit probe";
+    let probe_turn: CoreTurn = serde_json::from_value(fixture.json(&[
+        "--id",
+        &probe_id,
+        "send",
+        "--probe",
+        &agent,
+        "--generation",
+        &generation_arg,
+        "--wait",
+        "--timeout-seconds",
+        "10",
+        "--",
+        probe_text,
+    ]))
+    .expect("typed successful explicit probe turn");
+    assert_eq!(probe_turn.agent, agent);
+    assert_eq!(probe_turn.generation, generation);
+    assert_eq!(probe_turn.state, TurnState::Completed);
+    assert_eq!(probe_turn.status.as_deref(), Some("completed"));
+    assert_eq!(probe_turn.final_text.as_deref(), Some(probe_text));
+    fixture.wait_command(&probe_id, "applied");
+    let probe_command: CoreCommand =
+        serde_json::from_value(fixture.json(&["cmd", "show", &probe_id]))
+            .expect("typed probe command");
+    assert!(probe_command.probe);
+    assert_eq!(probe_command.args, json!({"text":probe_text}));
+    assert_eq!(
+        probe_command.turn_id.as_deref(),
+        Some(probe_turn.turn_id.as_str())
+    );
+    let cleared_rate = read_holds(&fixture);
+    assert!(cleared_rate.holds.is_empty());
+    assert_eq!(cleared_rate.next, None);
+
+    for (kind, marker, evidence, changed_evidence) in [
+        (
+            ProviderRestrictionKind::Auth,
+            "[eliot_fake_provider_auth]",
+            "credentials_updated",
+            "configuration_updated",
+        ),
+        (
+            ProviderRestrictionKind::ModelRemoved,
+            "[eliot_fake_provider_model_removed]",
+            "configuration_updated",
+            "owner_verified",
+        ),
+    ] {
+        let restriction_id = ulid::Ulid::new().to_string();
+        let restriction_reply = cli(
+            &fixture.data,
+            &[
+                "--id",
+                &restriction_id,
+                "send",
+                &agent,
+                "--generation",
+                &generation_arg,
+                "--wait",
+                "--timeout-seconds",
+                "10",
+                "--",
+                marker,
+            ],
+        );
+        assert_eq!(restriction_reply.status.code(), Some(1));
+        let restriction_turn: CoreTurn = serde_json::from_str(&restriction_reply.stdout)
+            .expect("typed failed permanent-restriction turn");
+        assert_eq!(restriction_turn.agent, agent);
+        assert_eq!(restriction_turn.generation, generation);
+        assert_eq!(restriction_turn.state, TurnState::Completed);
+        assert_eq!(restriction_turn.status.as_deref(), Some("failed"));
+        fixture.wait_command(&restriction_id, "applied");
+        let events = fixture.events();
+        assert_eq!(
+            restriction_event_count(
+                &events,
+                &agent,
+                generation,
+                &restriction_id,
+                &restriction_turn.turn_id,
+                kind,
+            ),
+            1,
+            "permanent hold did not come from its exact structured turn completion"
+        );
+        let hold_page = read_holds(&fixture);
+        assert_eq!(hold_page.holds.len(), 1);
+        assert_eq!(hold_page.holds[0].scope, "account:shared");
+        assert_eq!(hold_page.holds[0].kind, kind);
+        assert_eq!(hold_page.holds[0].state, ProviderHoldState::Held);
+        assert_eq!(hold_page.holds[0].probe_command, None);
+
+        let blocked_probe_id = ulid::Ulid::new().to_string();
+        let blocked_probe = cli(
+            &fixture.data,
+            &[
+                "--id",
+                &blocked_probe_id,
+                "send",
+                "--probe",
+                &agent,
+                "--generation",
+                &generation_arg,
+                "--",
+                "permanent holds are not probe eligible",
+            ],
+        );
+        assert_eq!(blocked_probe.status.code(), Some(3));
+        assert!(blocked_probe.stderr.contains("provider_held"));
+        assert_unadmitted(&blocked_probe_id);
+
+        let stale_clear_id = ulid::Ulid::new().to_string();
+        let stale_probe_id = ulid::Ulid::new().to_string();
+        let stale_clear = cli(
+            &fixture.data,
+            &[
+                "--id",
+                &stale_clear_id,
+                "provider",
+                "clear-hold",
+                "account:shared",
+                "--corrective-evidence",
+                evidence,
+                "--expected-probe-command",
+                &stale_probe_id,
+            ],
+        );
+        assert!(
+            !stale_clear.status.success(),
+            "permanent hold accepted a mismatched probe CAS"
+        );
+        let still_held = read_holds(&fixture);
+        assert_eq!(still_held.holds.len(), 1);
+        assert_eq!(still_held.holds[0].kind, kind);
+        assert_eq!(still_held.holds[0].probe_command, None);
+
+        let clear_id = ulid::Ulid::new().to_string();
+        let clear_args = [
+            "--id",
+            clear_id.as_str(),
+            "provider",
+            "clear-hold",
+            "account:shared",
+            "--corrective-evidence",
+            evidence,
+        ];
+        let cleared: ProviderClearHoldResponse = serde_json::from_value(fixture.json(&clear_args))
+            .expect("typed owner corrective clear");
+        assert_eq!(cleared.id, clear_id);
+        assert_eq!(cleared.scope, "account:shared");
+        assert!(cleared.cleared);
+        let repeated: ProviderClearHoldResponse = serde_json::from_value(fixture.json(&clear_args))
+            .expect("idempotent owner corrective clear");
+        assert_eq!(repeated, cleared);
+
+        let changed_clear = cli(
+            &fixture.data,
+            &[
+                "--id",
+                &clear_id,
+                "provider",
+                "clear-hold",
+                "account:shared",
+                "--corrective-evidence",
+                changed_evidence,
+            ],
+        );
+        assert_eq!(changed_clear.status.code(), Some(3));
+        assert!(changed_clear.stderr.contains("id_conflict"));
+        assert!(read_holds(&fixture).holds.is_empty());
+    }
+
+    let stop: CommandSubmitResponse =
+        serde_json::from_value(fixture.json(&["stop", &agent, "--generation", &generation_arg]))
+            .expect("typed Fake stop submission");
+    fixture.wait_command(&stop.command_id, "applied");
     fixture.stop(false);
 }

@@ -24,7 +24,10 @@ pub use diagnostics::{
 };
 pub use ids::parse_agent_id;
 pub use native_store::NativeStoreBinding;
-pub use routing::{CapacityScope, RouteBinding};
+pub use routing::{
+    CapacityScope, ProviderHold, ProviderHoldState, ProviderRestriction, ProviderRestrictionKind,
+    RouteBinding, frozen_provider_scope,
+};
 pub use secrets::SecretPolicy;
 pub use source_handoff::{SourceHandoff, SourceHandoffAck, SourceHandoffGap};
 
@@ -34,6 +37,10 @@ use std::fmt::{self, Display, Formatter};
 
 fn empty_object() -> Value {
     Value::Object(serde_json::Map::new())
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -413,6 +420,8 @@ pub struct Command {
     pub outcome: Option<Value>,
     pub created_at: i64,
     pub updated_at: i64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub probe: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -459,6 +468,8 @@ pub struct SubmitCommand {
     pub expected_turn_id: Option<String>,
     #[serde(default)]
     pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub probe: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

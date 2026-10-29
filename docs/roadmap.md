@@ -50,8 +50,7 @@ per-task report packets or another status registry.
       help/version smoke commands on Windows/Ubuntu. No empty framework crates or
       test platform.
 
-**Next:** L3.4 provider holds. The adopted route and configured-capacity path is one
-connected slice; L3.4 remains unchecked until provider holds are implemented.
+**Next:** L4.1 rules/timers.
 
 ## L1 — Core, Store, bus and one fake command path
 
@@ -123,7 +122,7 @@ sections, and [OpenCodex](harnesses/opencodex.md) only for the proxy task.
       exact-subject attach; gap-backed `observe` to `transcript` handoff and bounded
       reconciliation. Commit ownership/cursor boundaries before publication; keep
       private history private and never replay an uncertain external effect.
-- [ ] **L3.4 Proxy/capacity.** First attach to an already-running OpenCodex endpoint.
+- [x] **L3.4 Proxy/capacity.** First attach to an already-running OpenCodex endpoint.
       Add managed service launch only when actually needed. Add account/proxy caps and
       persistent provider holds with that route; freeze admitted nonsecret route/store
       selectors across daemon replacement. No automatic model/account fallback.

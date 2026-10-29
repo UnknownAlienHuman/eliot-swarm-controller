@@ -10,8 +10,8 @@ use crate::{
     },
 };
 use eliot_core::{
-    BatchAck, Error as CoreError, NativeEvent, SecretPolicy, SourceBatch, SourceHandoff,
-    SourceHandoffGap, SourceHealthUpdate,
+    BatchAck, Error as CoreError, NativeEvent, ProviderRestriction, ProviderRestrictionKind,
+    SecretPolicy, SourceBatch, SourceHandoff, SourceHandoffGap, SourceHealthUpdate,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -35,6 +35,10 @@ const DISCOVERY_SCOPE: &str = "fake:discovery";
 const DISCOVERY_SUBJECTS: usize = 3;
 const MALFORMED_AFTER_DISPATCH: &str = "[fake:malformed-after-dispatch]";
 const NATIVE_ERROR_FIXTURE_INPUT: &str = "[fake:native-turn-error]";
+const PROVIDER_RATE_LIMIT_FIXTURE_INPUT: &str = "[eliot_fake_provider_rate_limit]";
+const PROVIDER_QUOTA_FIXTURE_INPUT: &str = "[eliot_fake_provider_quota]";
+const PROVIDER_AUTH_FIXTURE_INPUT: &str = "[eliot_fake_provider_auth]";
+const PROVIDER_MODEL_REMOVED_FIXTURE_INPUT: &str = "[eliot_fake_provider_model_removed]";
 const HANDOFF_FIXTURE_INPUT: &str = "[fake:source-handoff]";
 const LIVE_OBSERVER_SUBJECT: &str = "fake-discovered-2";
 const LIVE_OBSERVER_TS: i64 = 1_730_000_000_000;
@@ -875,7 +879,7 @@ fn handle_snapshot(raw_params: &Value, state: &FakeState) -> Result<Value, RpcEr
     }
 
     let last_turn = state.last_turn.as_ref().map(|turn| {
-        let failed = turn.text == NATIVE_ERROR_FIXTURE_INPUT;
+        let failed = fake_turn_failed(&turn.text);
         json!({
             "command_id": turn.command_id,
             "turn_id": turn.turn_id,
@@ -922,16 +926,23 @@ fn send_batch(params: &AgentCommandParams, turn_id: &str, text: &str) -> SourceB
         "fake:{}:{}:{}",
         params.agent_id, params.generation, params.command_id
     );
-    let failed = text == NATIVE_ERROR_FIXTURE_INPUT;
+    let restriction = fake_provider_restriction(text);
+    let failed = text == NATIVE_ERROR_FIXTURE_INPUT || restriction.is_some();
     let mut completion = json!({
         "command_id": params.command_id,
         "turn_id": turn_id,
         "status": if failed { "failed" } else { "completed" }
     });
-    if failed {
+    if text == NATIVE_ERROR_FIXTURE_INPUT {
         completion["native_error"] = json!({
             "message": "fake native request failed (HTTP 401)",
             "truncated": false
+        });
+    }
+    if let Some(restriction) = restriction {
+        completion["provider_restriction"] = json!({
+            "kind": restriction.kind.as_str(),
+            "retry_after": restriction.retry_after
         });
     }
     SourceBatch {
@@ -968,6 +979,24 @@ fn send_batch(params: &AgentCommandParams, turn_id: &str, text: &str) -> SourceB
         .collect(),
         cursor: None,
     }
+}
+
+fn fake_provider_restriction(text: &str) -> Option<ProviderRestriction> {
+    let kind = match text {
+        PROVIDER_RATE_LIMIT_FIXTURE_INPUT => ProviderRestrictionKind::RateLimit,
+        PROVIDER_QUOTA_FIXTURE_INPUT => ProviderRestrictionKind::Quota,
+        PROVIDER_AUTH_FIXTURE_INPUT => ProviderRestrictionKind::Auth,
+        PROVIDER_MODEL_REMOVED_FIXTURE_INPUT => ProviderRestrictionKind::ModelRemoved,
+        _ => return None,
+    };
+    Some(ProviderRestriction {
+        kind,
+        retry_after: None,
+    })
+}
+
+fn fake_turn_failed(text: &str) -> bool {
+    text == NATIVE_ERROR_FIXTURE_INPUT || fake_provider_restriction(text).is_some()
 }
 
 fn session_ended_batch(agent_id: &str, generation: i64) -> SourceBatch {
@@ -1422,4 +1451,69 @@ struct LastTurn {
     command_id: String,
     turn_id: String,
     text: String,
+}
+
+#[cfg(test)]
+mod provider_hold_tests {
+    use super::*;
+
+    fn command(text: &str) -> AgentCommandParams {
+        AgentCommandParams {
+            agent_id: "fake-agent".to_owned(),
+            generation: 1,
+            command_id: "send-1".to_owned(),
+            verb: "send".to_owned(),
+            args: json!({"text": text}),
+            turn_id: None,
+            request_id: None,
+        }
+    }
+
+    fn completion(text: &str) -> (Value, Vec<NativeEvent>) {
+        let batch = send_batch(&command(text), "turn-1", text);
+        let completed = batch
+            .events
+            .iter()
+            .find(|event| event.kind == "turn.completed")
+            .expect("terminal turn event")
+            .data
+            .clone();
+        (completed, batch.events)
+    }
+
+    #[test]
+    fn fake_provider_markers_emit_only_structured_failed_terminal_restrictions() {
+        for (marker, expected_kind) in [
+            (PROVIDER_RATE_LIMIT_FIXTURE_INPUT, "rate_limit"),
+            (PROVIDER_QUOTA_FIXTURE_INPUT, "quota"),
+            (PROVIDER_AUTH_FIXTURE_INPUT, "auth"),
+            (PROVIDER_MODEL_REMOVED_FIXTURE_INPUT, "model_removed"),
+        ] {
+            let (completed, events) = completion(marker);
+            assert_eq!(completed["status"], "failed");
+            assert_eq!(
+                completed["provider_restriction"],
+                json!({"kind": expected_kind, "retry_after": null})
+            );
+            assert!(completed.get("native_error").is_none());
+            assert!(!events.iter().any(|event| event.kind == "message.completed"));
+        }
+    }
+
+    #[test]
+    fn fake_http_401_stays_failure_only_and_normal_probe_send_completes() {
+        let (unauthorized, _) = completion(NATIVE_ERROR_FIXTURE_INPUT);
+        assert_eq!(unauthorized["status"], "failed");
+        assert!(unauthorized.get("native_error").is_some());
+        assert!(unauthorized.get("provider_restriction").is_none());
+
+        let (probe, events) = completion("ordinary probe send");
+        assert_eq!(probe["status"], "completed");
+        assert!(probe.get("provider_restriction").is_none());
+        assert!(events.iter().any(|event| event.kind == "message.completed"));
+
+        let (non_exact, _) = completion("[eliot_fake_provider_rate_limit] extra text");
+        assert_eq!(non_exact["status"], "completed");
+        assert!(non_exact.get("provider_restriction").is_none());
+    }
 }

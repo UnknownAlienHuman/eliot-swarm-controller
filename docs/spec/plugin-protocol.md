@@ -354,6 +354,13 @@ batch/readback does not publish another `command.applied`. The event means the i
 associated with its exact turn; it is not the turn's terminal result. Final text precedes
 the terminal turn; process exit or silence is not a turn result. Cumulative usage replaces
 its prior scope value rather than being summed.
+
+On a failed terminal event, preserve its exact command/turn binding, status and structured
+provider restriction before optional final text. If final text exceeds the event budget,
+omit it rather than publish a truncated string as complete; add
+`final_text_unavailable:"event_budget"` when that marker fits. The full raw text remains
+only in private native history. A Core `Turn.final_text` of `None` means public final
+text is unavailable, not empty or successful.
 Requested route/settings are not proof of effective values; unavailable readback is
 reported as such. The host owns queued-send FIFO and unknown gates.
 
@@ -363,6 +370,11 @@ encoded JSON to 4 KiB and the remaining event-data budget; omit it if it cannot 
 Never invent unavailable text or alter terminal settlement, bindings, status, final
 text or input acknowledgement for diagnostics. Raw vendor detail maps stay private;
 message text never determines error classification.
+
+An optional `turn.completed.data.provider_restriction` is the shared Core
+[`ProviderRestriction` DTO](../../crates/eliot-core/src/routing.rs) and is actionable only for that exact controlled Agent,
+generation, command and turn binding. A separate provider event, generic failure,
+native-error message, or HTTP status alone does not create or clear a hold.
 
 `failed` means a known unsuccessful completed operation, which may have partial side
 effects; it does not mean rollback. `rejected` proves no native I/O. Missing authoritative

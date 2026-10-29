@@ -98,6 +98,7 @@ mod tests {
             expected_generation: None,
             expected_turn_id: None,
             request_id: None,
+            probe: false,
         }
     }
 

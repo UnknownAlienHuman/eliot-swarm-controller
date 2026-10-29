@@ -142,8 +142,23 @@ before controlled dispatch. An
 omitted `max_live` is unlimited and zero disables that scope. These are Eliot workload
 limits, not vendor entitlement or quota. Reservations survive restart when closure is
 uncertain and release only after the owned generation is proven closed. Provider holds
-remain a later increment and are unsupported here; route changes never silently fall
-back to another provider or account.
+are durable local scope state, separate from capacity caps and vendor entitlement. The
+canonical Core types (`ProviderRestrictionKind`, `ProviderRestriction`,
+`ProviderHoldState`, `ProviderHold`) in
+[`routing.rs`](../../crates/eliot-core/src/routing.rs) define their shared shapes.
+A hold is created only from an optional structured restriction on an exact
+generation/turn-bound controlled `turn.completed`; generic errors, native-error text,
+HTTP status, and vendor catalog metadata are not restriction evidence.
+RateLimit and Quota may use the explicit probe path; Auth and ModelRemoved require owner
+correction and cannot be cleared by a probe or elapsed time. Native Codex classification
+is limited to the three pinned structured codes and four typed 429 variants in
+[monitoring](monitoring.md#provider-holds); there is no 404 or message-text model-removal
+classification.
+
+`SubmitCommand` and persisted `Command` carry probe intent as a default-false field.
+False is omitted from serialization so legacy request bytes and digests remain unchanged.
+True is valid only for SEND and is not added to native text or arguments. The Store
+persists the intent in the new command column with default 0.
 
 ## Events and authoritative sources
 

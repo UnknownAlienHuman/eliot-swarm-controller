@@ -273,6 +273,7 @@ mod tests {
                     expected_generation: None,
                     expected_turn_id: None,
                     request_id: None,
+                    probe: false,
                 },
                 now,
             )
@@ -707,6 +708,7 @@ mod tests {
                     expected_generation: Some(1),
                     expected_turn_id: None,
                     request_id: None,
+                    probe: false,
                 },
                 now + 4,
             )
@@ -744,6 +746,7 @@ mod tests {
                     expected_generation: None,
                     expected_turn_id: None,
                     request_id: None,
+                    probe: false,
                 },
                 now + 6,
             )

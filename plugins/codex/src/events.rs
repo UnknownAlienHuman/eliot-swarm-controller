@@ -1,4 +1,4 @@
-use eliot_core::{Error, NativeEvent, Result, SecretPolicy, SourceBatch};
+use eliot_core::{Error, NativeEvent, ProviderRestriction, Result, SecretPolicy, SourceBatch};
 use eliot_plugin::{CommitSink, MAX_EVENT_BYTES, PeerClient, protocol::MAX_COMMAND_ID_BYTES};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1204,19 +1204,27 @@ impl EventProcessor {
             .active_command_id
             .clone()
             .ok_or_else(|| Error::new("unknown", "Codex terminal turn has no Eliot command"))?;
+        let provider_restriction = terminal_provider_restriction(&self.status, &notification);
+        let secrets = SecretPolicy::new(self.secrets.iter().cloned());
         let mut data = json!({
             "command_id": command_id.clone(),
             "turn_id": notification.turn.id,
             "status": status_text,
         });
+        // The semantic hold signal gets first claim on the bounded terminal data.
+        let restriction_attached = provider_restriction.is_some_and(|restriction| {
+            attach_provider_restriction(&mut data, restriction, &secrets)
+        });
         if let Some(text) = self.final_text.as_ref() {
-            data["final_text"] = Value::String(text.clone());
+            attach_final_text(
+                &mut data,
+                text,
+                &notification.turn.status,
+                restriction_attached,
+                &secrets,
+            );
         }
-        attach_native_error(
-            &mut data,
-            notification.turn.error.as_ref(),
-            &SecretPolicy::new(self.secrets.iter().cloned()),
-        );
+        attach_native_error(&mut data, notification.turn.error.as_ref(), &secrets);
         let native_id = event_id(
             self.status.thread_id.as_deref().unwrap_or_default(),
             &notification.turn.id,
@@ -1623,9 +1631,270 @@ fn turn_status(status: &NativeTurnStatus) -> String {
     }
 }
 
+fn terminal_provider_restriction(
+    status: &EventStatus,
+    notification: &NativeTurnCompletedNotification,
+) -> Option<ProviderRestriction> {
+    if notification.turn.status != NativeTurnStatus::Failed
+        || status.thread_id.as_deref() != Some(notification.thread_id.as_str())
+        || status.active_turn_id.as_deref() != Some(notification.turn.id.as_str())
+        || status.active_command_id.is_none()
+    {
+        return None;
+    }
+    notification
+        .turn
+        .error
+        .as_ref()
+        .and_then(NativeTurnError::provider_restriction)
+}
+
+fn attach_provider_restriction(
+    data: &mut Value,
+    restriction: ProviderRestriction,
+    policy: &SecretPolicy,
+) -> bool {
+    let Ok(value) = serde_json::to_value(restriction) else {
+        return false;
+    };
+    // The key and actual value define immutable semantics and may not be redacted.
+    if policy.contains_text("provider_restriction")
+        || policy.contains_value(&value)
+        || data
+            .as_object()
+            .is_none_or(|fields| fields.contains_key("provider_restriction"))
+    {
+        return false;
+    }
+    let mut candidate = data.clone();
+    let Some(fields) = candidate.as_object_mut() else {
+        return false;
+    };
+    fields.insert("provider_restriction".to_owned(), value.clone());
+    if serde_json::to_vec(&candidate).map_or(true, |encoded| encoded.len() > MAX_EVENT_BYTES) {
+        return false;
+    }
+    if let Some(fields) = data.as_object_mut() {
+        fields.insert("provider_restriction".to_owned(), value);
+        return true;
+    }
+    false
+}
+
+fn attach_final_text(
+    data: &mut Value,
+    final_text: &str,
+    status: &NativeTurnStatus,
+    restriction_attached: bool,
+    policy: &SecretPolicy,
+) {
+    let mut candidate = data.clone();
+    let Some(fields) = candidate.as_object_mut() else {
+        return;
+    };
+    fields.insert(
+        "final_text".to_owned(),
+        Value::String(final_text.to_owned()),
+    );
+    let exceeds_event_bound =
+        serde_json::to_vec(&candidate).map_or(true, |encoded| encoded.len() > MAX_EVENT_BYTES);
+    if restriction_attached && *status == NativeTurnStatus::Failed && exceeds_event_bound {
+        attach_final_text_unavailable(data, policy);
+        return;
+    }
+    *data = candidate;
+}
+
+fn attach_final_text_unavailable(data: &mut Value, policy: &SecretPolicy) {
+    if ["final_text_unavailable", "event_budget"]
+        .iter()
+        .any(|literal| policy.contains_text(literal))
+        || data
+            .as_object()
+            .is_none_or(|fields| fields.contains_key("final_text_unavailable"))
+    {
+        return;
+    }
+    let mut candidate = data.clone();
+    let Some(fields) = candidate.as_object_mut() else {
+        return;
+    };
+    fields.insert(
+        "final_text_unavailable".to_owned(),
+        Value::String("event_budget".to_owned()),
+    );
+    if serde_json::to_vec(&candidate).map_or(true, |encoded| encoded.len() > MAX_EVENT_BYTES) {
+        return;
+    }
+    if let Some(fields) = data.as_object_mut() {
+        fields.insert(
+            "final_text_unavailable".to_owned(),
+            Value::String("event_budget".to_owned()),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eliot_core::ProviderRestrictionKind;
+
+    fn native_error(error_info: Option<Value>, message: &str) -> NativeTurnError {
+        NativeTurnError {
+            message: message.to_owned(),
+            additional_details: Some("usageLimitExceeded 401 HTTP 429".to_owned()),
+            codex_error_info: error_info,
+        }
+    }
+
+    fn rate_limit() -> ProviderRestriction {
+        ProviderRestriction {
+            kind: ProviderRestrictionKind::RateLimit,
+            retry_after: None,
+        }
+    }
+
+    #[test]
+    fn provider_restriction_uses_only_installed_codex_error_info() {
+        assert_eq!(
+            native_error(Some(json!("rateLimitExceeded")), "ignored").provider_restriction(),
+            Some(rate_limit())
+        );
+        assert_eq!(
+            native_error(Some(json!("usageLimitExceeded")), "ignored").provider_restriction(),
+            Some(ProviderRestriction {
+                kind: ProviderRestrictionKind::Quota,
+                retry_after: None,
+            })
+        );
+        assert_eq!(
+            native_error(Some(json!("unauthorized")), "ignored").provider_restriction(),
+            Some(ProviderRestriction {
+                kind: ProviderRestrictionKind::Auth,
+                retry_after: None,
+            })
+        );
+        for variant in [
+            "httpConnectionFailed",
+            "responseStreamConnectionFailed",
+            "responseStreamDisconnected",
+            "responseTooManyFailedAttempts",
+        ] {
+            assert_eq!(
+                native_error(Some(json!({variant: {"httpStatusCode":429}})), "ignored")
+                    .provider_restriction(),
+                Some(rate_limit())
+            );
+        }
+
+        for error_info in [
+            None,
+            Some(json!("other")),
+            Some(json!("rate_limit")),
+            Some(json!("modelRemoved")),
+            Some(json!({"httpConnectionFailed":{"httpStatusCode":401}})),
+            Some(json!({"httpConnectionFailed":{"httpStatusCode":404}})),
+            Some(json!({"httpConnectionFailed":{"httpStatusCode":"429"}})),
+            Some(json!({"unknownVariant":{"httpStatusCode":429}})),
+            Some(json!({
+                "httpConnectionFailed":{"httpStatusCode":429},
+                "unauthorized":null
+            })),
+        ] {
+            assert_eq!(
+                native_error(error_info, "HTTP 401 rateLimitExceeded usageLimitExceeded")
+                    .provider_restriction(),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn provider_restriction_requires_the_exact_bound_failed_turn() {
+        let notification: NativeTurnCompletedNotification = serde_json::from_value(json!({
+            "threadId":"thread-1",
+            "turn":{
+                "id":"turn-1",
+                "items":[],
+                "status":"failed",
+                "error":{"message":"ignored","codexErrorInfo":"rateLimitExceeded"}
+            }
+        }))
+        .unwrap();
+        let mut status = EventStatus {
+            thread_id: Some("thread-1".to_owned()),
+            active_turn_id: Some("turn-1".to_owned()),
+            active_command_id: Some("send-1".to_owned()),
+            ..EventStatus::default()
+        };
+        assert_eq!(
+            terminal_provider_restriction(&status, &notification),
+            Some(rate_limit())
+        );
+
+        status.active_turn_id = Some("other-turn".to_owned());
+        assert_eq!(terminal_provider_restriction(&status, &notification), None);
+        status.active_turn_id = Some("turn-1".to_owned());
+        status.active_command_id = None;
+        assert_eq!(terminal_provider_restriction(&status, &notification), None);
+        status.active_command_id = Some("send-1".to_owned());
+        let mut successful = notification;
+        successful.turn.status = NativeTurnStatus::Completed;
+        assert_eq!(terminal_provider_restriction(&status, &successful), None);
+    }
+
+    #[test]
+    fn provider_restriction_omits_secret_collisions_without_mutating_terminal_data() {
+        let restriction = rate_limit();
+        let mut data = json!({"command_id":"send-1", "status":"failed"});
+        assert!(attach_provider_restriction(
+            &mut data,
+            restriction.clone(),
+            &SecretPolicy::default()
+        ));
+        assert_eq!(
+            data["provider_restriction"],
+            json!({"kind":"rate_limit", "retry_after":null})
+        );
+
+        for secret in ["provider_restriction", "kind", "retry_after", "rate_limit"] {
+            let original = json!({"command_id":"send-1", "status":"failed"});
+            let mut data = original.clone();
+            assert!(!attach_provider_restriction(
+                &mut data,
+                restriction.clone(),
+                &SecretPolicy::new([secret]),
+            ));
+            assert_eq!(data, original);
+        }
+    }
+
+    #[test]
+    fn failed_terminal_reserves_restriction_and_marks_unavailable_final_text() {
+        let mut data = json!({
+            "command_id":"send-1",
+            "turn_id":"turn-1",
+            "status":"failed"
+        });
+        let attached =
+            attach_provider_restriction(&mut data, rate_limit(), &SecretPolicy::default());
+        assert!(attached);
+        attach_final_text(
+            &mut data,
+            &"x".repeat(MAX_EVENT_BYTES),
+            &NativeTurnStatus::Failed,
+            attached,
+            &SecretPolicy::default(),
+        );
+
+        assert_eq!(data["command_id"], "send-1");
+        assert_eq!(data["turn_id"], "turn-1");
+        assert_eq!(data["status"], "failed");
+        assert_eq!(data["provider_restriction"]["kind"], "rate_limit");
+        assert_eq!(data["final_text_unavailable"], "event_budget");
+        assert!(data.get("final_text").is_none());
+        assert!(serde_json::to_vec(&data).unwrap().len() <= MAX_EVENT_BYTES);
+    }
 
     #[test]
     fn native_error_omits_secret_keys_without_changing_terminal_data() {
