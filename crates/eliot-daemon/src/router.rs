@@ -679,7 +679,8 @@ impl Router {
         }
 
         let profile_name = required_text(&request.args, "profile")?;
-        let snapshot = crate::config::resolve_profile(&self.inner.data_root, profile_name)?;
+        let mut snapshot = crate::config::resolve_profile(&self.inner.data_root, profile_name)?;
+        crate::config::capture_native_store_inputs(&mut snapshot, |name| std::env::var_os(name))?;
         let harness = snapshot
             .get("harness")
             .and_then(Value::as_str)
@@ -2348,13 +2349,14 @@ fn normalize_attach(request: &SubmitCommand) -> Result<()> {
 fn freeze_attach_profile(data_root: &std::path::Path, request: &mut SubmitCommand) -> Result<()> {
     let profile_name = required_text(&request.args, "profile")?;
     let harness = required_text(&request.args, "harness")?.to_owned();
-    let snapshot = crate::config::resolve_profile(data_root, profile_name)?;
+    let mut snapshot = crate::config::resolve_profile(data_root, profile_name)?;
     if snapshot.get("harness").and_then(Value::as_str) != Some(harness.as_str()) {
         return Err(Error::new(
             "invalid",
             "attach harness does not match the selected profile",
         ));
     }
+    crate::config::capture_native_store_inputs(&mut snapshot, |name| std::env::var_os(name))?;
     install_frozen_profile(request, &harness, snapshot, true)
 }
 
@@ -3167,6 +3169,128 @@ mod tests {
             Arc::new(AsyncMutex::new(store)),
             Bus::new(16),
         )
+    }
+
+    #[tokio::test]
+    async fn native_store_inputs_retained_hydration_survives_store_reopen() {
+        let root = std::env::temp_dir().join(format!("eliot-store-inputs-{}", ulid::Ulid::new()));
+        std::fs::create_dir(&root).unwrap();
+        let db = root.join("state.sqlite");
+        let original_cwd = root.join("original-parent").join("workspace");
+        let replacement_cwd = root.join("replacement-parent").join("workspace");
+        let mut snapshot = json!({"harness":"codex", "pass_env":["CODEX_HOME", "CODEX_SQLITE_HOME", "EPHEMERAL_TOKEN"]});
+        crate::config::capture_native_store_inputs(&mut snapshot, |name| match name {
+            "CODEX_HOME" => Some("../original-home".into()),
+            "CODEX_SQLITE_HOME" => None,
+            _ => panic!("ephemeral credentials are not admission inputs"),
+        })
+        .unwrap();
+        let mut replacement = snapshot.clone();
+        crate::config::capture_native_store_inputs(&mut replacement, |name| {
+            Some(replacement_cwd.join(name).into_os_string())
+        })
+        .unwrap();
+        assert_ne!(replacement["pass_env_values"], snapshot["pass_env_values"]);
+        let launch_id = ulid::Ulid::new().to_string();
+        let attach_id = ulid::Ulid::new().to_string();
+        let legacy_id = ulid::Ulid::new().to_string();
+        let mut launch = SubmitCommand::new(&launch_id, "launch");
+        launch.args = json!({"project":original_cwd.to_str().unwrap(), "workspace":original_cwd.to_str().unwrap(),
+            "profile":"missing-current-config", "harness":"codex", "profile_snapshot":snapshot});
+        let mut attach = SubmitCommand::new(&attach_id, "attach");
+        attach.args = json!({"profile":"missing-current-config", "harness":"codex", "mode":"observe",
+            "native_scope":"retained-scope", "native_ref":"retained-reference", "profile_snapshot":snapshot});
+        let mut legacy = launch.clone();
+        legacy.id = legacy_id;
+        legacy.args["profile_snapshot"]
+            .as_object_mut()
+            .unwrap()
+            .remove("pass_env_values");
+        {
+            let mut store = eliot_store::Store::open(&db).unwrap();
+            for request in [&launch, &attach, &legacy] {
+                assert!(
+                    store
+                        .submit("owner", request.clone(), now_ms())
+                        .unwrap()
+                        .is_new
+                );
+            }
+        }
+        let store = eliot_store::Store::open(&db).unwrap();
+        let router = Router::new(
+            root.join("no-current-config"),
+            "owner-credential".to_owned(),
+            Arc::new(AsyncMutex::new(store)),
+            Bus::new(16),
+        );
+        let before = router.inner.store.lock().await.high_water().unwrap();
+        for original in [&launch, &legacy] {
+            let mut retry = original.clone();
+            retry.args.as_object_mut().unwrap().remove("harness");
+            retry
+                .args
+                .as_object_mut()
+                .unwrap()
+                .remove("profile_snapshot");
+            // A retained ID must return before current config or selector capture.
+            assert!(router.freeze_launch_profile(&mut retry).await.unwrap());
+            assert_eq!(retry.args, original.args);
+            let mut store = router.inner.store.lock().await;
+            assert!(!store.submit("owner", retry, now_ms()).unwrap().is_new);
+        }
+        let mut retry = attach.clone();
+        retry
+            .args
+            .as_object_mut()
+            .unwrap()
+            .remove("profile_snapshot");
+        assert!(router.hydrate_retained_attach(&mut retry).await.unwrap());
+        assert_eq!(retry.args, attach.args);
+        {
+            let mut store = router.inner.store.lock().await;
+            assert!(!store.submit("owner", retry, now_ms()).unwrap().is_new);
+            assert_eq!(store.high_water().unwrap(), before);
+            assert_eq!(
+                store.get_command(&launch_id).unwrap().unwrap().args["profile_snapshot"],
+                snapshot
+            );
+            assert!(
+                store.get_command(&legacy.id).unwrap().unwrap().args["profile_snapshot"]
+                    .get("pass_env_values")
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            snapshot["pass_env_values"]["CODEX_HOME"],
+            "../original-home"
+        );
+        assert!(
+            std::path::Path::new(snapshot["pass_env_values"]["CODEX_HOME"].as_str().unwrap())
+                .is_relative()
+        );
+        drop(router);
+        std::fs::remove_file(db).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn native_store_inputs_augmented_snapshot_uses_existing_admission_bound() {
+        let mut snapshot = json!({"harness":"codex", "pass_env":["CODEX_HOME"]});
+        crate::config::capture_native_store_inputs(&mut snapshot, |_| {
+            Some("\u{1}".repeat(eliot_plugin::MAX_FRAME_BYTES / 6 + 1).into())
+        })
+        .unwrap();
+        let mut request = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+        request.args = json!({"project":"bounded", "workspace":"synthetic-workspace", "harness":"codex",
+            "profile":"fixture", "profile_snapshot":snapshot});
+        let mut store = eliot_store::Store::open(std::path::Path::new(":memory:")).unwrap();
+        assert_eq!(
+            store.submit("owner", request, now_ms()).unwrap_err().code,
+            "frame_too_large"
+        );
+        assert_eq!(store.high_water().unwrap(), 0);
+        assert_eq!(store.agent_count().unwrap(), 0);
     }
 
     fn admit(store: &mut eliot_store::Store) -> Vec<Event> {

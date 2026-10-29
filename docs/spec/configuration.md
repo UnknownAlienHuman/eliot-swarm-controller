@@ -99,8 +99,8 @@ is the verified worktree. These checks cover explicit entry files, not imported 
 an executable-provenance graph. The workspace coordinator owns the committed running
 marker, process custody, deadlines and unknown/no-replay behavior.
 
-Setup uses the same minimal baseline and `pass_env` name handling as the native process.
-Execution-time values remain in memory. It adds `ELIOT_AGENT_ID` and target
+Setup uses the native process's minimal baseline, `pass_env` name handling and captured
+native-store selector inputs. It adds `ELIOT_AGENT_ID` and target
 `ELIOT_AGENT_GENERATION`, without an Agent token. Managed identity names cannot be supplied
 through `pass_env`; nested Eliot calls therefore see incomplete Agent credentials and
 cannot silently fall back to owner authority. Stdin is closed and stdout/stderr piped.
@@ -181,8 +181,24 @@ packet or per-command profile ceremony.
 ## Frozen profile and route binding
 
 Admission captures the resolved nonsecret profile once. Running and queued work do not
-follow reload. Resume uses the stored profile unless the owner explicitly selects a new
-one for a generation-changing operation.
+follow reload. Resume uses the stored profile. Explicit profile replacement for a
+generation-changing operation remains part of the final contract; the current resume
+command has no profile override.
+
+New launch/attach admissions [capture](../../crates/eliot-daemon/src/config.rs) only
+the nonsecret `CODEX_HOME` and `CODEX_SQLITE_HOME` inputs in
+`profile_snapshot.pass_env_values`. Each selector is explicitly `null` when not
+selected by `pass_env` or unset; a selected empty string remains distinct. Preserve raw
+values without trimming or path normalization. Names compare case-insensitively on
+Windows and exactly elsewhere. [Environment construction](../../crates/eliot-daemon/src/plugin_host/host.rs)
+uses these captured inputs instead of looking them up again. This selector capture
+leaves other `pass_env` resolution unchanged.
+
+Retained mutation IDs hydrate their stored snapshot before any new capture. Existing
+admitted snapshots are neither rewritten nor backfilled: an absent capture is a legacy
+snapshot, not captured null/unset, and keeps the established execution-time lookup.
+Such legacy inputs are not frozen. Capture proves only the supplied inputs, not the
+effective native home, database root or scope; native configuration can affect selection.
 
 ```text
 ProfileSnapshot {
@@ -213,9 +229,8 @@ A script importing mutable dependencies is not fully reproducible merely because
 entry-file digest matches. Use a normal pinned package environment when that project
 requires dependency reproducibility; do not invent an artifact platform in Eliot.
 
-Account/store selectors such as `CODEX_HOME` are frozen nonsecret values. Credentials
-are execution-time references. Adopted proxy freezes endpoint/health/base URLs/key name;
-managed proxy also freezes launch argv and referenced files. Service reuse requires
+Credentials are execution-time references. Adopted proxy freezes endpoint/health/base
+URLs/key name; managed proxy also freezes launch argv and referenced files. Service reuse requires
 matching `(name,config_digest)` and exact endpoint/custody. Config reload never mutates
 or kills a service still used by old snapshots; conflicting endpoint reuse fails clearly.
 
