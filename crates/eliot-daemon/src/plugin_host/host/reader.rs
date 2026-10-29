@@ -18,6 +18,11 @@ use tokio::{
     time::{Instant, timeout_at},
 };
 
+// Covers shutdown/input close (2s), leader waits (2s + 5s), Windows Job
+// waits (2s + 5s), request drain (2s), and stderr drain (2s). Unix uses a
+// single 5s process-group check, so its worst case is 18s.
+pub(super) const READER_CLOSE_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
 pub(super) struct ReaderTransport {
     pub child: OwnedChild,
     pub client: PluginClient,
@@ -34,6 +39,20 @@ pub(super) struct ReaderClose {
     pub stderr: StderrSnapshot,
 }
 
+pub(super) struct ReaderOpen {
+    pub result: Result<ReaderTransport>,
+    pub cleanup_confirmed: bool,
+}
+
+impl ReaderOpen {
+    fn failed_spawn(error: Error) -> Self {
+        Self {
+            result: Err(error),
+            cleanup_confirmed: false,
+        }
+    }
+}
+
 impl PluginHost {
     pub(super) async fn open_reader(
         &self,
@@ -43,7 +62,28 @@ impl PluginHost {
         environment: &Value,
         observation: Option<&Agent>,
     ) -> Result<ReaderTransport> {
-        let (instance_dir, credential) = self.create_instance_dir(key)?;
+        self.open_reader_with_cleanup(key, harness, profile, environment, observation)
+            .await
+            .result
+    }
+
+    pub(super) async fn open_reader_with_cleanup(
+        &self,
+        key: &AgentKey,
+        harness: &str,
+        profile: &Value,
+        environment: &Value,
+        observation: Option<&Agent>,
+    ) -> ReaderOpen {
+        let (instance_dir, credential) = match self.create_instance_dir(key) {
+            Ok(instance) => instance,
+            Err(error) => {
+                return ReaderOpen {
+                    result: Err(error),
+                    cleanup_confirmed: true,
+                };
+            }
+        };
         let secrets = source_secret_snapshot(
             profile,
             environment,
@@ -53,7 +93,7 @@ impl PluginHost {
             Ok(child) => child,
             Err(error) => {
                 let _ = std::fs::remove_dir(&instance_dir);
-                return Err(error);
+                return ReaderOpen::failed_spawn(error);
             }
         };
         let observer = child.observer().ok();
@@ -62,15 +102,42 @@ impl PluginHost {
         else {
             // OwnedChild retains its original Job/group authority on this path.
             let _ = child.terminate();
-            let _ = timeout_at(Instant::now() + STOP_GRACE, child.wait()).await;
+            let reaped = matches!(
+                timeout_at(Instant::now() + STOP_GRACE, child.wait()).await,
+                Ok(Ok(_))
+            );
             #[cfg(windows)]
-            let _ = child.wait_family_empty(STOP_GRACE).await;
+            let empty = matches!(child.wait_family_empty(STOP_GRACE).await, Ok(true));
+            #[cfg(unix)]
+            let empty = {
+                let until = Instant::now() + STOP_GRACE;
+                loop {
+                    match observer
+                        .as_ref()
+                        .map(CustodyObserver::known_process_group_empty)
+                    {
+                        Some(Ok(true)) => break true,
+                        Some(Ok(false)) if Instant::now() < until => {
+                            tokio::time::sleep_until(
+                                (Instant::now() + Duration::from_millis(10)).min(until),
+                            )
+                            .await;
+                        }
+                        _ => break false,
+                    }
+                }
+            };
+            #[cfg(not(any(unix, windows)))]
+            let empty = false;
             drop(child);
             let _ = std::fs::remove_dir(&instance_dir);
-            return Err(Error::new(
-                "process_pipes",
-                "reader plugin pipes are unavailable",
-            ));
+            return ReaderOpen {
+                result: Err(Error::new(
+                    "process_pipes",
+                    "reader plugin pipes are unavailable",
+                )),
+                cleanup_confirmed: reaped && empty,
+            };
         };
         let stderr = spawn_stderr(stderr, Arc::new(SecretPolicy::new(secrets.iter())));
         let mut connection = PluginConnection::new(stdout, stdin);
@@ -109,16 +176,19 @@ impl PluginHost {
             })
         };
         self.state.secrets.lock_recover().insert(credential.clone());
-        Ok(ReaderTransport {
-            child,
-            client,
-            secrets,
-            credential,
-            instance_dir,
-            observer,
-            requests,
-            stderr,
-        })
+        ReaderOpen {
+            result: Ok(ReaderTransport {
+                child,
+                client,
+                secrets,
+                credential,
+                instance_dir,
+                observer,
+                requests,
+                stderr,
+            }),
+            cleanup_confirmed: false,
+        }
     }
 }
 
@@ -161,35 +231,55 @@ impl ReaderTransport {
         monitoring.attach(agent, observer).await
     }
 
-    pub(super) async fn close(mut self, host: &PluginHost, agent: Option<&Agent>) -> ReaderClose {
-        let shutdown = Instant::now() + RPC_GRACE;
+    pub(super) async fn close(self, host: &PluginHost, agent: Option<&Agent>) -> ReaderClose {
+        self.close_until(host, agent, Instant::now() + READER_CLOSE_BUDGET)
+            .await
+    }
+
+    pub(super) async fn close_until(
+        mut self,
+        host: &PluginHost,
+        agent: Option<&Agent>,
+        close_until: Instant,
+    ) -> ReaderClose {
+        let shutdown = bounded_deadline(close_until, RPC_GRACE);
         let _ = self.client.call("shutdown", json!({}), shutdown).await;
         let _ = self.client.close_input(shutdown).await;
         #[cfg(unix)]
         let _ = self.child.terminate();
         let mut reaped = matches!(
-            timeout_at(Instant::now() + RPC_GRACE, self.child.wait()).await,
+            timeout_at(bounded_deadline(close_until, RPC_GRACE), self.child.wait()).await,
             Ok(Ok(_))
         );
         if !reaped {
             let _ = self.child.terminate();
             reaped = matches!(
-                timeout_at(Instant::now() + STOP_GRACE, self.child.wait()).await,
+                timeout_at(bounded_deadline(close_until, STOP_GRACE), self.child.wait()).await,
                 Ok(Ok(_))
             );
         }
         #[cfg(windows)]
         let empty = {
-            let mut empty = matches!(self.child.wait_family_empty(RPC_GRACE).await, Ok(true));
+            let mut empty = matches!(
+                self.child
+                    .wait_family_empty(remaining(bounded_deadline(close_until, RPC_GRACE)))
+                    .await,
+                Ok(true)
+            );
             if !empty {
                 let _ = self.child.terminate();
-                empty = matches!(self.child.wait_family_empty(STOP_GRACE).await, Ok(true));
+                empty = matches!(
+                    self.child
+                        .wait_family_empty(remaining(bounded_deadline(close_until, STOP_GRACE)))
+                        .await,
+                    Ok(true)
+                );
             }
             empty
         };
         #[cfg(unix)]
         let empty = {
-            let until = Instant::now() + STOP_GRACE;
+            let until = bounded_deadline(close_until, STOP_GRACE);
             loop {
                 match self
                     .observer
@@ -198,7 +288,10 @@ impl ReaderTransport {
                 {
                     Some(Ok(true)) => break true,
                     Some(Ok(false)) if Instant::now() < until => {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        tokio::time::sleep_until(
+                            (Instant::now() + Duration::from_millis(10)).min(until),
+                        )
+                        .await;
                     }
                     _ => break false,
                 }
@@ -210,7 +303,7 @@ impl ReaderTransport {
             let _ = host.state.monitoring.sample_generation(agent).await;
         }
         let drained = matches!(
-            timeout_at(Instant::now() + RPC_GRACE, &mut self.requests).await,
+            timeout_at(bounded_deadline(close_until, RPC_GRACE), &mut self.requests).await,
             Ok(Ok(()))
         );
         self.requests.abort();
@@ -218,12 +311,40 @@ impl ReaderTransport {
             let _ = self.requests.await;
         }
         drop(self.child);
-        let stderr = self.stderr.finish(Instant::now() + RPC_GRACE).await;
+        let stderr = self
+            .stderr
+            .finish(bounded_deadline(close_until, RPC_GRACE))
+            .await;
         host.remove_plugin_secret(&self.credential);
         let _ = std::fs::remove_dir(&self.instance_dir);
         ReaderClose {
             closed: reaped && empty && drained,
             stderr,
         }
+    }
+}
+
+fn bounded_deadline(close_until: Instant, budget: std::time::Duration) -> Instant {
+    (Instant::now() + budget).min(close_until)
+}
+
+fn remaining(until: Instant) -> std::time::Duration {
+    let now = Instant::now();
+    if until > now {
+        until - now
+    } else {
+        std::time::Duration::ZERO
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spawn_error_does_not_confirm_reader_cleanup() {
+        let opened = ReaderOpen::failed_spawn(Error::new("platform_io", "ambiguous spawn failure"));
+        assert!(!opened.cleanup_confirmed);
+        assert!(matches!(opened.result, Err(error) if error.code == "platform_io"));
     }
 }

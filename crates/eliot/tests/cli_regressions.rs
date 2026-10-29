@@ -104,6 +104,119 @@ fn assert_public_mutation_grammar(fixture: &Fixture, runtime: &tokio::runtime::R
     assert_eq!(fixture.json(&["status"])["admission"], "open");
 }
 
+#[test]
+fn cli_launch_rejects_selector_credential_collision_before_persistence() {
+    let fixture = Fixture::new("native store selector credential collision");
+    let credential = format!("test-selector-credential-{}", ulid::Ulid::new());
+    fs::create_dir_all(&fixture.data).expect("create fixture data root");
+    fs::write(
+        fixture.data.join("config.toml"),
+        r#"
+[profiles.privacy-audit]
+harness = "codex"
+model = "test-model"
+pass_env = ["CODEX_HOME", "CODEX_SQLITE_HOME", "EPHEMERAL_TOKEN"]
+"#,
+    )
+    .expect("write privacy regression profile");
+
+    let mut data_argument = fixture.data.as_os_str().to_os_string();
+    data_argument.push(std::path::MAIN_SEPARATOR_STR);
+    let mut daemon_command = Command::new(CLI);
+    daemon_command
+        .arg("--data-dir")
+        .arg(data_argument)
+        .args(["daemon", "--foreground"])
+        .env("CODEX_HOME", credential.as_str())
+        .env("CODEX_SQLITE_HOME", credential.as_str())
+        .env("EPHEMERAL_TOKEN", credential.as_str());
+    let mut daemon = Captured::spawn(daemon_command);
+    let startup_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(
+            daemon
+                .child
+                .try_wait()
+                .expect("foreground daemon status")
+                .is_none(),
+            "foreground daemon exited during startup"
+        );
+        let status = cli(&fixture.data, &["status"]);
+        if status.status.success() {
+            assert_eq!(status.json()["state"], "running");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < startup_deadline,
+            "foreground daemon readiness deadline"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let mut launch = Command::new(CLI);
+    launch
+        .arg("--data-dir")
+        .arg(&fixture.data)
+        .args([
+            "--json",
+            "launch",
+            "--profile",
+            "privacy-audit",
+            "--workspace",
+        ])
+        .arg(&fixture.workspace);
+    let reply = run(launch);
+    assert_eq!(reply.status.code(), Some(3), "launch must be rejected");
+    assert!(
+        reply
+            .stderr
+            .contains("native store selector input contains a known credential"),
+        "launch did not report the credential rejection"
+    );
+    assert!(!reply.stdout.contains(&credential));
+    assert!(!reply.stderr.contains(&credential));
+
+    assert_eq!(fixture.json(&["status"])["agents"], 0);
+    assert!(fixture.events().is_empty(), "rejected launch wrote events");
+
+    let stop = cli(&fixture.data, &["daemon", "stop", "--force"]);
+    assert!(
+        matches!(stop.status.code(), Some(0 | 6)),
+        "daemon cleanup request failed"
+    );
+    assert!(
+        daemon
+            .wait(Duration::from_secs(20))
+            .expect("owned daemon shutdown deadline")
+            .success(),
+        "owned daemon returned nonzero"
+    );
+    let (_, daemon_stderr) = daemon.output(Duration::from_secs(2));
+    assert!(!daemon_stderr.contains("panicked"), "daemon panicked");
+
+    let secret_bytes = credential.as_bytes();
+    assert!(
+        fixture.data.join("eliot.db").is_file(),
+        "daemon Store was not created"
+    );
+    for path in [
+        fixture.data.join("eliot.db"),
+        fixture.data.join("eliot.db-wal"),
+        fixture.data.join("eliot.db-shm"),
+        fixture.data.join("logs/daemon.log"),
+    ] {
+        if path.is_file() {
+            let bytes = fs::read(path).expect("read persisted fixture file");
+            assert!(
+                !bytes
+                    .windows(secret_bytes.len())
+                    .any(|window| window == secret_bytes),
+                "test credential was persisted"
+            );
+        }
+    }
+}
+
 fn retained_submission(
     fixture: &Fixture,
     runtime: &tokio::runtime::Runtime,

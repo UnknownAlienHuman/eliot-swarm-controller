@@ -87,7 +87,11 @@ normalized native family. Hooks never mirror lifecycle already supplied by the s
 | `agent.attach` | exact subject, generation, observe/control, profile/environment, source plan/cursors | attach only to that subject; otherwise not found/unsupported |
 | `agent.detach` | exact observed subject/generation and command id | close only its reader; never end the native session |
 | `discover` | frozen profile, target environment without Agent identity, optional exact scope/cursor, bounded limit | read-only native-subject metadata page |
+| `profile.store` (L3) | shared [`ProfileStoreParams`](../../crates/eliot-plugin/src/protocol.rs) | Return the effective [`NativeStoreBinding`](../../crates/eliot-core/src/native_store.rs) using the caller's actual prepared workspace and a bounded, owned metadata reader; success requires confirmed reader cleanup. It creates no model or thread, performs no native control and publishes no Agent events. This is outside the L1/L2 first-harness subset. |
 | `shutdown` | none | close owned paths, drain, exit; never kill an adopted service |
+
+Treat the returned binding as metadata: reject metadata-secret values in it. Redact
+reader errors and stderr with the broader diagnostic-secret set.
 
 `resume_from={native_scope,native_ref}` is an `agent.start` option, not replay of the
 old input. `initial={command_id,text}` is supplied only for a harness that requires

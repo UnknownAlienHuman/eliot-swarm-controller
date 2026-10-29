@@ -1,13 +1,18 @@
 //! A bounded read-only plugin instance, independent of every Agent identity.
+use super::reader::READER_CLOSE_BUDGET;
 use super::{
-    AgentKey, PluginHost, RPC_GRACE, STOP_GRACE, build_process_environment,
-    metadata_secret_snapshot, redact_native_error, signal_progress,
+    AgentKey, PluginHost, build_process_environment, metadata_secret_snapshot, redact_native_error,
+    signal_progress,
 };
 use eliot_core::{Error, NativeStoreBinding, Result, SecretPolicy, StderrSource};
 use eliot_plugin::protocol::ProfileStoreParams;
 use eliot_plugin::{DiscoverPage, sync::LockExt};
 use serde_json::{Value, json};
-use std::{collections::HashSet, sync::atomic::Ordering, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Mutex, atomic::Ordering},
+    time::Duration,
+};
 use tokio::{sync::watch, time::Instant};
 use ulid::Ulid;
 
@@ -17,8 +22,20 @@ const MAX_CURSOR_BYTES: usize = 16 * 1024;
 const MAX_PAGE_BYTES: usize = 900 * 1024;
 
 pub(super) struct Reader {
-    stop: watch::Sender<bool>,
-    done: watch::Receiver<bool>,
+    stop: watch::Sender<Option<Instant>>,
+    done: watch::Receiver<ReaderCleanup>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReaderCleanup {
+    Pending,
+    Confirmed,
+    Unknown,
+}
+
+struct MetadataRead<T> {
+    result: Result<T>,
+    cleanup: ReaderCleanup,
 }
 
 impl PluginHost {
@@ -30,12 +47,13 @@ impl PluginHost {
     }
 
     pub(crate) fn reader_count(&self) -> usize {
-        let discoveries = self.state.readers.lock_recover().len();
+        let discoveries = metadata_reader_count(&self.state.readers);
         discoveries + self.observer_count()
     }
 
-    pub(crate) async fn cancel_discoveries(&self) {
-        let readers: Vec<_> = {
+    pub(crate) async fn cancel_discoveries(&self) -> bool {
+        let close_until = Instant::now() + READER_CLOSE_BUDGET;
+        let readers = {
             let readers = self.state.readers.lock_recover();
             self.state.discovery_closed.store(true, Ordering::SeqCst);
             readers
@@ -43,13 +61,7 @@ impl PluginHost {
                 .map(|reader| (reader.stop.clone(), reader.done.clone()))
                 .collect()
         };
-        for (stop, _) in &readers {
-            stop.send_replace(true);
-        }
-        let limit = Instant::now() + STOP_GRACE + RPC_GRACE * 4;
-        for (_, mut done) in readers {
-            let _ = tokio::time::timeout_at(limit, done.wait_for(|done| *done)).await;
-        }
+        cancel_metadata_readers(readers, close_until).await
     }
 
     pub(crate) async fn discover(
@@ -90,11 +102,11 @@ impl PluginHost {
         // and reap its scoped process. Daemon force shutdown can cancel it.
         let (reply, response) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            let result = host
+            let completion = host
                 .read_subject_page(profile, environment, native_scope, cursor, limit, stop_rx)
                 .await;
-            host.finish_metadata_reader(&id, done_tx);
-            let _ = reply.send(result);
+            host.finish_metadata_reader(&id, done_tx, completion.cleanup);
+            let _ = reply.send(completion.result);
         });
         response
             .await
@@ -134,9 +146,9 @@ impl PluginHost {
         let host = self.clone();
         let (reply, response) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            let result = host.read_profile_store(params, stop_rx).await;
-            host.finish_metadata_reader(&id, done_tx);
-            let _ = reply.send(result);
+            let completion = host.read_profile_store(params, stop_rx).await;
+            host.finish_metadata_reader(&id, done_tx, completion.cleanup);
+            let _ = reply.send(completion.result);
         });
         response
             .await
@@ -145,10 +157,14 @@ impl PluginHost {
 
     fn register_metadata_reader(
         &self,
-    ) -> Result<(String, watch::Receiver<bool>, watch::Sender<bool>)> {
+    ) -> Result<(
+        String,
+        watch::Receiver<Option<Instant>>,
+        watch::Sender<ReaderCleanup>,
+    )> {
         let id = Ulid::new().to_string();
-        let (stop_tx, stop_rx) = watch::channel(false);
-        let (done_tx, done_rx) = watch::channel(false);
+        let (stop_tx, stop_rx) = watch::channel(None);
+        let (done_tx, done_rx) = watch::channel(ReaderCleanup::Pending);
         let mut readers = self.state.readers.lock_recover();
         if self.state.discovery_closed.load(Ordering::SeqCst) {
             return Err(Error::new("unavailable", "discovery admission is closed"));
@@ -169,28 +185,38 @@ impl PluginHost {
         Ok((id, stop_rx, done_tx))
     }
 
-    fn finish_metadata_reader(&self, id: &str, done: watch::Sender<bool>) {
-        self.state.readers.lock_recover().remove(id);
-        done.send_replace(true);
+    fn finish_metadata_reader(
+        &self,
+        id: &str,
+        done: watch::Sender<ReaderCleanup>,
+        cleanup: ReaderCleanup,
+    ) {
+        settle_metadata_reader(&self.state.readers, id, done, cleanup);
         signal_progress(&self.state);
     }
 
     async fn read_profile_store(
         &self,
         params: ProfileStoreParams,
-        mut stop: watch::Receiver<bool>,
-    ) -> Result<NativeStoreBinding> {
-        if *stop.borrow() {
-            return Err(Error::new(
-                "cancelled",
-                "profile.store was cancelled before spawn",
-            ));
+        mut stop: watch::Receiver<Option<Instant>>,
+    ) -> MetadataRead<NativeStoreBinding> {
+        if stop.borrow().is_some() {
+            return MetadataRead {
+                result: Err(Error::new(
+                    "cancelled",
+                    "profile.store was cancelled before spawn",
+                )),
+                cleanup: ReaderCleanup::Confirmed,
+            };
         }
-        let harness = params.profile["harness"]
-            .as_str()
-            .ok_or_else(|| Error::new("invalid", "missing harness"))?;
-        let mut reader = self
-            .open_reader(
+        let Some(harness) = params.profile["harness"].as_str() else {
+            return MetadataRead {
+                result: Err(Error::new("invalid", "missing harness")),
+                cleanup: ReaderCleanup::Confirmed,
+            };
+        };
+        let opened = self
+            .open_reader_with_cleanup(
                 &AgentKey {
                     id: "profile-store".to_owned(),
                     generation: 0,
@@ -200,7 +226,13 @@ impl PluginHost {
                 &params.target_environment,
                 None,
             )
-            .await?;
+            .await;
+        let mut reader = match opened.result {
+            Ok(reader) => reader,
+            Err(error) => {
+                return failed_metadata_open(error, opened.cleanup_confirmed, "profile.store");
+            }
+        };
         let mut known: Vec<_> = self.state.secrets.lock_recover().iter().cloned().collect();
         known.extend([self.state.owner_token.clone(), reader.credential.clone()]);
         let metadata_secrets =
@@ -239,16 +271,10 @@ impl PluginHost {
             _ = stop.changed() => Err(Error::new("cancelled", "profile.store was cancelled")),
         };
         let secrets = reader.secrets.clone();
-        let closure = reader.close(self, None).await;
-        let result = if closure.closed {
-            result
-        } else {
-            Err(Error::new(
-                "unavailable",
-                "profile.store reader cleanup is unconfirmed",
-            ))
-        };
-        result.map_err(|error| {
+        let close_until = metadata_reader_close_deadline(&stop);
+        let closure = reader.close_until(self, None, close_until).await;
+        let result = require_reader_cleanup(result, closure.closed, "profile.store");
+        let result = result.map_err(|error| {
             let error = redact_native_error(
                 error.with_stderr(StderrSource::Plugin, closure.stderr),
                 &secrets,
@@ -260,7 +286,11 @@ impl PluginHost {
                 Some(&error),
             );
             error
-        })
+        });
+        MetadataRead {
+            result,
+            cleanup: cleanup_state(closure.closed),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -271,19 +301,25 @@ impl PluginHost {
         native_scope: Option<String>,
         cursor: Option<String>,
         limit: usize,
-        mut stop: watch::Receiver<bool>,
-    ) -> Result<Value> {
-        if *stop.borrow() {
-            return Err(Error::new(
-                "cancelled",
-                "discovery was cancelled before spawn",
-            ));
+        mut stop: watch::Receiver<Option<Instant>>,
+    ) -> MetadataRead<Value> {
+        if stop.borrow().is_some() {
+            return MetadataRead {
+                result: Err(Error::new(
+                    "cancelled",
+                    "discovery was cancelled before spawn",
+                )),
+                cleanup: ReaderCleanup::Confirmed,
+            };
         }
-        let harness = profile["harness"]
-            .as_str()
-            .ok_or_else(|| Error::new("invalid", "missing harness"))?;
-        let mut reader = self
-            .open_reader(
+        let Some(harness) = profile["harness"].as_str() else {
+            return MetadataRead {
+                result: Err(Error::new("invalid", "missing harness")),
+                cleanup: ReaderCleanup::Confirmed,
+            };
+        };
+        let opened = self
+            .open_reader_with_cleanup(
                 &AgentKey {
                     id: "discovery".to_owned(),
                     generation: 0,
@@ -293,7 +329,13 @@ impl PluginHost {
                 &environment,
                 None,
             )
-            .await?;
+            .await;
+        let mut reader = match opened.result {
+            Ok(reader) => reader,
+            Err(error) => {
+                return failed_metadata_open(error, opened.cleanup_confirmed, "discovery");
+            }
+        };
         let until = Instant::now() + READER_DEADLINE;
         let read = async {
             let manifest = reader.initialize(harness, until).await?;
@@ -330,16 +372,10 @@ impl PluginHost {
             _ = stop.changed() => Err(Error::new("cancelled", "discovery was cancelled")),
         };
         let secrets = reader.secrets.clone();
-        let closure = reader.close(self, None).await;
-        let result = if !closure.closed {
-            Err(Error::new(
-                "unavailable",
-                "discovery reader cleanup is unconfirmed",
-            ))
-        } else {
-            result
-        };
-        match result {
+        let close_until = metadata_reader_close_deadline(&stop);
+        let closure = reader.close_until(self, None, close_until).await;
+        let result = require_reader_cleanup(result, closure.closed, "discovery");
+        let result = match result {
             Ok(mut value) => {
                 if crate::redaction::redact_value(&mut value, &secrets) {
                     Err(Error::new(
@@ -363,8 +399,92 @@ impl PluginHost {
                 );
                 Err(error)
             }
+        };
+        MetadataRead {
+            result,
+            cleanup: cleanup_state(closure.closed),
         }
     }
+}
+
+fn metadata_reader_close_deadline(stop: &watch::Receiver<Option<Instant>>) -> Instant {
+    (*stop.borrow()).unwrap_or_else(|| Instant::now() + READER_CLOSE_BUDGET)
+}
+
+fn failed_metadata_open<T>(
+    error: Error,
+    cleanup_confirmed: bool,
+    operation: &str,
+) -> MetadataRead<T> {
+    MetadataRead {
+        result: require_reader_cleanup(Err(error), cleanup_confirmed, operation),
+        cleanup: cleanup_state(cleanup_confirmed),
+    }
+}
+
+fn require_reader_cleanup<T>(
+    result: Result<T>,
+    cleanup_confirmed: bool,
+    operation: &str,
+) -> Result<T> {
+    if cleanup_confirmed {
+        result
+    } else {
+        Err(Error::new(
+            "unavailable",
+            format!("{operation} reader cleanup is unconfirmed"),
+        ))
+    }
+}
+
+fn cleanup_state(cleanup_confirmed: bool) -> ReaderCleanup {
+    if cleanup_confirmed {
+        ReaderCleanup::Confirmed
+    } else {
+        ReaderCleanup::Unknown
+    }
+}
+
+fn metadata_reader_count(readers: &Mutex<HashMap<String, Reader>>) -> usize {
+    readers.lock_recover().len()
+}
+
+fn settle_metadata_reader(
+    readers: &Mutex<HashMap<String, Reader>>,
+    id: &str,
+    done: watch::Sender<ReaderCleanup>,
+    cleanup: ReaderCleanup,
+) {
+    if cleanup == ReaderCleanup::Confirmed {
+        readers.lock_recover().remove(id);
+    }
+    done.send_replace(cleanup);
+}
+
+async fn cancel_metadata_readers(
+    readers: Vec<(
+        watch::Sender<Option<Instant>>,
+        watch::Receiver<ReaderCleanup>,
+    )>,
+    close_until: Instant,
+) -> bool {
+    for (stop, _) in &readers {
+        stop.send_replace(Some(close_until));
+    }
+
+    let mut all_confirmed = true;
+    for (_, mut done) in readers {
+        match tokio::time::timeout_at(
+            close_until,
+            done.wait_for(|cleanup| *cleanup != ReaderCleanup::Pending),
+        )
+        .await
+        {
+            Ok(Ok(cleanup)) if *cleanup == ReaderCleanup::Confirmed => {}
+            _ => all_confirmed = false,
+        }
+    }
+    all_confirmed
 }
 
 fn validate_page(
@@ -419,4 +539,62 @@ fn validate_page(
 
 fn valid_text(value: &str, max: usize) -> bool {
     !value.is_empty() && value.len() <= max && !value.chars().any(char::is_control)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{sync::Arc, time::Duration};
+
+    async fn cancel_after_cleanup(cleanup: ReaderCleanup) -> (bool, usize) {
+        let readers = Arc::new(Mutex::new(HashMap::new()));
+        let (stop_tx, mut stop_rx) = watch::channel(None);
+        let (done_tx, done_rx) = watch::channel(ReaderCleanup::Pending);
+        readers.lock_recover().insert(
+            "reader".to_owned(),
+            Reader {
+                stop: stop_tx.clone(),
+                done: done_rx.clone(),
+            },
+        );
+        let owner_readers = Arc::clone(&readers);
+        let owner = tokio::spawn(async move {
+            let _ = stop_rx.changed().await;
+            settle_metadata_reader(&owner_readers, "reader", done_tx, cleanup);
+        });
+
+        let confirmed = cancel_metadata_readers(
+            vec![(stop_tx, done_rx)],
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await;
+        owner.await.expect("reader owner task");
+        (confirmed, metadata_reader_count(&readers))
+    }
+
+    #[tokio::test]
+    async fn metadata_reader_cancel_retains_unknown_blocker_and_releases_confirmed() {
+        let (confirmed, blockers) = cancel_after_cleanup(cleanup_state(false)).await;
+        assert!(!confirmed);
+        assert_eq!(blockers, 1);
+
+        let (confirmed, blockers) = cancel_after_cleanup(cleanup_state(true)).await;
+        assert!(confirmed);
+        assert_eq!(blockers, 0);
+
+        let readers = Mutex::new(HashMap::new());
+        let (stop_tx, _stop_rx) = watch::channel(None);
+        let (done_tx, done_rx) = watch::channel(ReaderCleanup::Pending);
+        readers.lock_recover().insert(
+            "timed-out-reader".to_owned(),
+            Reader {
+                stop: stop_tx.clone(),
+                done: done_rx.clone(),
+            },
+        );
+        let timed_out = cancel_metadata_readers(vec![(stop_tx, done_rx)], Instant::now()).await;
+        assert!(!timed_out);
+        assert_eq!(metadata_reader_count(&readers), 1);
+        drop(done_tx);
+    }
 }

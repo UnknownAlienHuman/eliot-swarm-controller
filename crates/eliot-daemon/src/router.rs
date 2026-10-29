@@ -3427,17 +3427,37 @@ mod tests {
         let original_cwd = root.join("original-parent").join("workspace");
         let replacement_cwd = root.join("replacement-parent").join("workspace");
         let mut snapshot = json!({"harness":"codex", "pass_env":["CODEX_HOME", "CODEX_SQLITE_HOME", "EPHEMERAL_TOKEN"]});
-        crate::config::capture_native_store_inputs(&mut snapshot, |name| match name {
-            "CODEX_HOME" => Some("../original-home".into()),
-            "CODEX_SQLITE_HOME" => None,
-            _ => panic!("ephemeral credentials are not admission inputs"),
-        })
+        let credential = "retained-test-credential";
+        crate::config::capture_native_store_inputs_with_lookups(
+            &mut snapshot,
+            |name| match name {
+                "CODEX_HOME" => Some("../original-home".into()),
+                "CODEX_SQLITE_HOME" => None,
+                _ => panic!("unexpected selector lookup: {name}"),
+            },
+            |name| match name {
+                "EPHEMERAL_TOKEN" => Some(credential.into()),
+                _ => panic!("unexpected credential lookup: {name}"),
+            },
+        )
         .unwrap();
+        assert_eq!(
+            snapshot["pass_env_values"],
+            json!({"CODEX_HOME":"../original-home", "CODEX_SQLITE_HOME":null})
+        );
+        assert!(!snapshot.to_string().contains(credential));
         let mut replacement = snapshot.clone();
-        crate::config::capture_native_store_inputs(&mut replacement, |name| {
-            Some(replacement_cwd.join(name).into_os_string())
-        })
+        crate::config::capture_native_store_inputs_with_lookups(
+            &mut replacement,
+            |name| Some(replacement_cwd.join(name).into_os_string()),
+            |name| match name {
+                "EPHEMERAL_TOKEN" => Some(credential.into()),
+                _ => panic!("unexpected credential lookup: {name}"),
+            },
+        )
         .unwrap();
+        assert_eq!(replacement["pass_env_values"].as_object().unwrap().len(), 2);
+        assert!(!replacement.to_string().contains(credential));
         assert_ne!(replacement["pass_env_values"], snapshot["pass_env_values"]);
         let launch_id = ulid::Ulid::new().to_string();
         let attach_id = ulid::Ulid::new().to_string();

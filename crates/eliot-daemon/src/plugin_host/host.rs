@@ -551,7 +551,14 @@ impl PluginHost {
     }
 
     pub(crate) async fn force_all(&self) {
-        self.cancel_discoveries().await;
+        if !self.cancel_discoveries().await {
+            crate::logging::record(
+                &SecretPolicy::default(),
+                "daemon.metadata_reader_cleanup_unconfirmed",
+                &[("source", "discovery")],
+                None,
+            );
+        }
         self.cancel_observers().await;
         let entries: Vec<_> = self
             .state
