@@ -77,7 +77,7 @@ async fn run_owned(
     };
     router.note_events(&recovered);
     // Parse global definitions and seed only new rules before publishing ready.
-    let global_rules =
+    let (global_rules, initial_deferred_notice) =
         automation::initialize_global_rules(&router, data_dir.path(), &policy).await?;
 
     let mut listener = IpcListener::bind(data_dir, daemon_lock).await?;
@@ -109,6 +109,7 @@ async fn run_owned(
             global_rules,
             rule_data_root,
             rule_policy,
+            initial_deferred_notice,
             automation_shutdown,
         )
         .await

@@ -4019,7 +4019,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             "on = { every = \"1s\" }",
         );
         std::fs::write(&rule_path, corrected).unwrap();
-        let initialized = crate::automation::initialize_global_rules(&router, &root, &policy)
+        let (initialized, _) = crate::automation::initialize_global_rules(&router, &root, &policy)
             .await
             .unwrap();
         assert_eq!(initialized.len(), 2);
