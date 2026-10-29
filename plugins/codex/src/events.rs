@@ -1212,17 +1212,11 @@ impl EventProcessor {
             "status": status_text,
         });
         // The semantic hold signal gets first claim on the bounded terminal data.
-        let restriction_attached = provider_restriction.is_some_and(|restriction| {
-            attach_provider_restriction(&mut data, restriction, &secrets)
-        });
+        if let Some(restriction) = provider_restriction {
+            attach_provider_restriction(&mut data, restriction, &secrets);
+        }
         if let Some(text) = self.final_text.as_ref() {
-            attach_final_text(
-                &mut data,
-                text,
-                &notification.turn.status,
-                restriction_attached,
-                &secrets,
-            );
+            attach_final_text(&mut data, text, &notification.turn.status, &secrets);
         }
         attach_native_error(&mut data, notification.turn.error.as_ref(), &secrets);
         let native_id = event_id(
@@ -1685,7 +1679,6 @@ fn attach_final_text(
     data: &mut Value,
     final_text: &str,
     status: &NativeTurnStatus,
-    restriction_attached: bool,
     policy: &SecretPolicy,
 ) {
     let mut candidate = data.clone();
@@ -1698,7 +1691,7 @@ fn attach_final_text(
     );
     let exceeds_event_bound =
         serde_json::to_vec(&candidate).map_or(true, |encoded| encoded.len() > MAX_EVENT_BYTES);
-    if restriction_attached && *status == NativeTurnStatus::Failed && exceeds_event_bound {
+    if *status == NativeTurnStatus::Failed && exceeds_event_bound {
         attach_final_text_unavailable(data, policy);
         return;
     }
@@ -1876,14 +1869,15 @@ mod tests {
             "turn_id":"turn-1",
             "status":"failed"
         });
-        let attached =
-            attach_provider_restriction(&mut data, rate_limit(), &SecretPolicy::default());
-        assert!(attached);
+        assert!(attach_provider_restriction(
+            &mut data,
+            rate_limit(),
+            &SecretPolicy::default()
+        ));
         attach_final_text(
             &mut data,
             &"x".repeat(MAX_EVENT_BYTES),
             &NativeTurnStatus::Failed,
-            attached,
             &SecretPolicy::default(),
         );
 
@@ -1891,6 +1885,29 @@ mod tests {
         assert_eq!(data["turn_id"], "turn-1");
         assert_eq!(data["status"], "failed");
         assert_eq!(data["provider_restriction"]["kind"], "rate_limit");
+        assert_eq!(data["final_text_unavailable"], "event_budget");
+        assert!(data.get("final_text").is_none());
+        assert!(serde_json::to_vec(&data).unwrap().len() <= MAX_EVENT_BYTES);
+    }
+
+    #[test]
+    fn failed_terminal_without_restriction_marks_unavailable_final_text_at_event_budget() {
+        let mut data = json!({
+            "command_id":"send-2",
+            "turn_id":"turn-2",
+            "status":"failed"
+        });
+        attach_final_text(
+            &mut data,
+            &"x".repeat(MAX_EVENT_BYTES),
+            &NativeTurnStatus::Failed,
+            &SecretPolicy::default(),
+        );
+
+        assert_eq!(data["command_id"], "send-2");
+        assert_eq!(data["turn_id"], "turn-2");
+        assert_eq!(data["status"], "failed");
+        assert!(data.get("provider_restriction").is_none());
         assert_eq!(data["final_text_unavailable"], "event_budget");
         assert!(data.get("final_text").is_none());
         assert!(serde_json::to_vec(&data).unwrap().len() <= MAX_EVENT_BYTES);

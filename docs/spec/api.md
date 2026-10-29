@@ -250,9 +250,10 @@ and `Agent` models. IDs never pass through a mutation call and cannot submit or 
 work. Richer command/usage/resolution metadata remains deferred. `agent.result` requires
 an array of turn objects and an object for Agent metadata, not positional records.
 
-For failed terminal turns, status and exact command/turn binding remain authoritative
-when final text exceeds the event budget. The event omits oversized final text rather
-than exposing a truncated string as complete, and includes
+For every failed terminal turn, with or without a structured provider restriction, status
+and exact command/turn binding remain authoritative when final text exceeds the event
+budget. The event omits oversized final text rather than exposing a truncated string as
+complete, and includes
 `final_text_unavailable:"event_budget"` when representable. `Turn.final_text = None`
 means the public final text is unavailable; full native text remains private history.
 

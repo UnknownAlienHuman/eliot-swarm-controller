@@ -356,8 +356,10 @@ the terminal turn; process exit or silence is not a turn result. Cumulative usag
 its prior scope value rather than being summed.
 
 On a failed terminal event, preserve its exact command/turn binding, status and structured
-provider restriction before optional final text. If final text exceeds the event budget,
-omit it rather than publish a truncated string as complete; add
+provider restriction before optional final text. The following final-text budget rule
+applies to every failed terminal event, whether or not it has a structured provider
+restriction. If final text exceeds the event budget, omit it rather than publish a
+truncated string as complete; add
 `final_text_unavailable:"event_budget"` when that marker fits. The full raw text remains
 only in private native history. A Core `Turn.final_text` of `None` means public final
 text is unavailable, not empty or successful.

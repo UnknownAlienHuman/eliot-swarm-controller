@@ -411,10 +411,12 @@ valid structured Core restriction kind exercised by the Fake policy fixture, but
 Codex 0.161 classifier does not infer it from an unrecognized native variant, HTTP 404
 or message text.
 
-A hold is `Held` or `Probing`. It blocks new provider-backed launch/send work in that
-scope, including queued dispatch. A launch with linked input must reject before either
-effect; resume without new text, readback, request replies, interrupt and stop remain
-available. Resume with text is a linked send and remains gated.
+A hold is `Held` or `Probing`. It blocks new provider-backed launch/send/steer work in
+that scope, including queued dispatch. Future Goal work that admits provider-backed
+commands uses the same gate. A launch with linked input must reject before either effect;
+resume without new text, readback, request replies, interrupt and stop remain available.
+Resume with text is a linked send and remains gated. Steer remains bound to its exact
+active turn and generation.
 
 Rate-limit and quota holds permit at most one explicit eligible SEND probe claim per
 frozen provider scope in Store, acquired atomically by `probe=true` through the normal

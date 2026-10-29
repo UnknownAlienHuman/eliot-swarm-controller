@@ -1152,6 +1152,44 @@ fn clear_provider_hold_request(
     }
 }
 
+fn ready_steer_agent(store: &mut Store, project: &str, now: i64) -> String {
+    let launch = capacity_launch_request(project, "steer-profile", json!([]));
+    let launch_id = launch.id.clone();
+    let admission = store
+        .submit("owner", launch, now)
+        .expect("admit Codex steer test Agent");
+    let agent = admission.command.target.expect("steer test Agent id");
+    store
+        .dispatch(&launch_id, now)
+        .expect("dispatch Codex steer test Agent");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("{project}:ready"),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    kind: "session.ready".to_owned(),
+                    native_id: format!("{project}:ready"),
+                    data: json!({
+                        "command_id": launch_id,
+                        "native_scope": format!("provider-steer:{project}"),
+                        "native_ref": format!("provider-thread:{project}"),
+                    }),
+                    ts: None,
+                }],
+                cursor: None,
+            },
+            now,
+        )
+        .expect("commit Codex steer test readiness");
+    store
+        .settle(&launch_id, CommandState::Applied, None, now)
+        .expect("settle Codex steer test launch");
+    agent
+}
+
 #[test]
 fn store_probe_false_preserves_legacy_digest_and_probe_toggle_conflicts() {
     let mut store = Store::open(Path::new(":memory:")).unwrap();
@@ -1430,6 +1468,96 @@ fn applied_probe_with_running_turn_is_not_treated_as_terminal() {
     let hold = store.list_provider_holds(None, 10).unwrap().holds.remove(0);
     assert_eq!(hold.state, ProviderHoldState::Probing);
     assert_eq!(hold.probe_command.as_deref(), Some(probe_id.as_str()));
+}
+
+#[test]
+fn provider_hold_gates_steer_at_admission_and_dispatch_only() {
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+    let busy_agent = ready_steer_agent(&mut store, "provider-steer-busy", now);
+    let hold_agent = ready_steer_agent(&mut store, "provider-steer-hold", now + 1);
+    let active_send = Ulid::new().to_string();
+    let turn_id = start_provider_turn(&mut store, &busy_agent, &active_send, false, now + 2);
+
+    let accepted_steer_id = Ulid::new().to_string();
+    let mut accepted_steer = SubmitCommand::new(accepted_steer_id.clone(), "steer");
+    accepted_steer.target = Some(busy_agent.clone());
+    accepted_steer.args = json!({"text":"synthetic steer"});
+    accepted_steer.expected_generation = Some(1);
+    accepted_steer.expected_turn_id = Some(turn_id.clone());
+    store
+        .submit("owner", accepted_steer, now + 5)
+        .expect("admit steer before scope becomes held");
+
+    let restriction_send = Ulid::new().to_string();
+    let restriction_turn =
+        start_provider_turn(&mut store, &hold_agent, &restriction_send, false, now + 6);
+    complete_provider_turn(
+        &mut store,
+        &hold_agent,
+        &restriction_send,
+        &restriction_turn,
+        "failed",
+        Some((ProviderRestrictionKind::RateLimit, None)),
+        now + 9,
+    );
+
+    let rejected_steer_id = Ulid::new().to_string();
+    let mut rejected_steer = SubmitCommand::new(rejected_steer_id.clone(), "steer");
+    rejected_steer.target = Some(busy_agent.clone());
+    rejected_steer.args = json!({"text":"synthetic steer"});
+    rejected_steer.expected_generation = Some(1);
+    rejected_steer.expected_turn_id = Some(turn_id.clone());
+    let before_rejected_steer = store.high_water().unwrap();
+    assert_eq!(
+        store
+            .submit("owner", rejected_steer, now + 10)
+            .unwrap_err()
+            .code,
+        "provider_held"
+    );
+    assert!(store.get_command(&rejected_steer_id).unwrap().is_none());
+    assert_eq!(store.high_water().unwrap(), before_rejected_steer);
+
+    let before_blocked_dispatch = store.high_water().unwrap();
+    assert_eq!(
+        store
+            .dispatch(&accepted_steer_id, now + 11)
+            .unwrap_err()
+            .code,
+        "provider_held"
+    );
+    assert_eq!(store.high_water().unwrap(), before_blocked_dispatch);
+    let retained_steer = store.get_command(&accepted_steer_id).unwrap().unwrap();
+    assert_eq!(retained_steer.state, CommandState::Accepted);
+    assert_eq!(retained_steer.expected_generation, Some(1));
+    assert_eq!(retained_steer.turn_id.as_deref(), Some(turn_id.as_str()));
+
+    let mut interrupt = SubmitCommand::new(Ulid::new().to_string(), "interrupt");
+    interrupt.target = Some(busy_agent);
+    interrupt.expected_generation = Some(1);
+    interrupt.expected_turn_id = Some(turn_id.clone());
+    let interrupt_id = interrupt.id.clone();
+    store
+        .submit("owner", interrupt, now + 12)
+        .expect("interrupt remains available under a provider hold");
+    assert_eq!(
+        store.dispatch(&interrupt_id, now + 12).unwrap().value.state,
+        CommandState::Dispatched
+    );
+
+    let clear = clear_provider_hold_request("profile:steer-profile", None);
+    store
+        .clear_provider_hold("owner", &clear, now + 13)
+        .unwrap();
+    assert_eq!(
+        store
+            .dispatch(&accepted_steer_id, now + 14)
+            .unwrap()
+            .value
+            .state,
+        CommandState::Dispatched
+    );
 }
 
 #[test]

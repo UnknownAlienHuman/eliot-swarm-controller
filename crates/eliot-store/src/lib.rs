@@ -1181,6 +1181,7 @@ impl Store {
                 if request.verb == "steer" {
                     let text = required_string(&request.args, "text")?;
                     check_input(&text)?;
+                    provider_holds::require_unheld_tx(&tx, &agent)?;
                 }
                 let mut params = json!({
                     "agent_id": agent.id,
@@ -1414,7 +1415,7 @@ impl Store {
         if !matches!(command.command.verb.as_str(), "attach" | "detach") {
             observer::require_controlled(&agent)?;
         }
-        if matches!(command.command.verb.as_str(), "launch" | "send") {
+        if matches!(command.command.verb.as_str(), "launch" | "send" | "steer") {
             provider_holds::require_dispatch_tx(&tx, &agent, &command.command)?;
         }
 
