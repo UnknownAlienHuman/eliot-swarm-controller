@@ -584,6 +584,7 @@ impl Router {
             let store = self.inner.store.lock().await;
             retained_launch_profile(&store, request)?
         } {
+            align_retained_workspace_alias(request, retained.workspace.as_ref());
             install_retained_profile(request, retained)?;
             return Ok(true);
         }
@@ -1609,46 +1610,67 @@ impl Router {
             self.signal_progress();
             return;
         }
-        let launch_binding = if command.verb == "launch" {
-            let agent = match self.accepted_launch_agent(&id).await {
-                Ok(Some(agent)) => agent,
+        let launch_agent = if command.verb == "launch" {
+            match self.accepted_launch_agent(&id).await {
+                Ok(Some(agent)) => Some(agent),
                 Ok(None) => return, // A retained/settled command cannot acquire new I/O.
                 Err(error) => {
                     self.reject_undispatched(&id, &error.code).await;
                     return;
                 }
-            };
-            if agent.harness == "codex" {
-                let resolved = async {
-                    let workspace = agent
-                        .workspace
-                        .as_deref()
-                        .ok_or_else(|| Error::new("invalid", "launch workspace is missing"))?;
-                    self.inner
-                        .plugin_host
-                        .profile_store(agent.profile_snapshot.clone(), workspace)
-                        .await
+            }
+        } else {
+            None
+        };
+        let (resume_profile, resume_source_state) = if command.verb == "resume" {
+            match self.capture_resume_source_state(&id).await {
+                Ok((profile, source_state)) => (Some(profile), Some(source_state)),
+                Err(error) => {
+                    self.reject_undispatched(&id, &error.code).await;
+                    return;
                 }
-                .await;
-                match resolved {
-                    Ok(binding) => Some((agent, binding)),
+            }
+        } else {
+            (None, None)
+        };
+        let controlled_profile = launch_agent
+            .as_ref()
+            .map(|agent| &agent.profile_snapshot)
+            .or(resume_profile.as_ref());
+        if let Some(profile) = controlled_profile
+            && profile.get("route_binding").is_some()
+            && let Err(error) = crate::proxy::check_profile_ready(profile).await
+        {
+            self.reject_undispatched(&id, &error.code).await;
+            return;
+        }
+        let launch_binding = if let Some(agent) = launch_agent {
+            if agent.harness == "codex" {
+                let workspace = match agent.workspace.as_deref() {
+                    Some(workspace) => workspace,
+                    None => {
+                        self.reject_undispatched(&id, "invalid").await;
+                        return;
+                    }
+                };
+                let binding = match self
+                    .inner
+                    .plugin_host
+                    .profile_store(agent.profile_snapshot.clone(), workspace)
+                    .await
+                {
+                    Ok(binding) => binding,
                     Err(error) => {
                         self.reject_undispatched(&id, &error.code).await;
                         return;
                     }
-                }
+                };
+                Some((agent, binding))
             } else {
                 None // Fake retains its ordinary dispatch; no metadata filesystem I/O.
             }
         } else {
             None
-        };
-        let resume_source_state = match self.capture_resume_source_state(&id).await {
-            Ok(source_state) => source_state,
-            Err(error) => {
-                self.reject_undispatched(&id, &error.code).await;
-                return;
-            }
         };
         let dispatched = loop {
             let change = {
@@ -2026,14 +2048,14 @@ impl Router {
         Ok(Some(agent))
     }
 
-    async fn capture_resume_source_state(&self, command_id: &str) -> Result<Option<Value>> {
-        let (generation, source, latest_turn) = {
+    async fn capture_resume_source_state(&self, command_id: &str) -> Result<(Value, Value)> {
+        let (profile, generation, source, latest_turn) = {
             let store = self.inner.store.lock().await;
             let command = store
                 .get_command(command_id)?
                 .ok_or_else(|| Error::new("not_found", "resume command was not found"))?;
             if command.verb != "resume" {
-                return Ok(None);
+                return Err(Error::new("bad_state", "command is not a resume"));
             }
             if command.state != CommandState::Accepted {
                 return Err(Error::new(
@@ -2098,7 +2120,7 @@ impl Router {
                         "completed_at": turn.completed_at,
                     })
                 });
-            (generation, source, latest_turn)
+            (agent.profile_snapshot, generation, source, latest_turn)
         };
         let mut source_state = json!({
             "retained_generation": generation,
@@ -2106,7 +2128,7 @@ impl Router {
             "current_turn": latest_turn,
         });
         self.redact_native_value(&mut source_state);
-        Ok(Some(source_state))
+        Ok((profile, source_state))
     }
 
     async fn reject_undispatched(&self, id: &str, reason: &str) {
@@ -2969,6 +2991,46 @@ fn same_retained_workspace(requested: &str, stored: &str) -> bool {
     }
 }
 
+// Retained-ID hydration precedes normalize_launch. Resolve only mismatched
+// spellings of an existing workspace; the lexical fast path still works when
+// a previously admitted workspace has since been removed.
+fn align_retained_workspace_alias(request: &mut SubmitCommand, stored: Option<&Value>) {
+    let Some(stored) = stored.and_then(Value::as_str).map(str::to_owned) else {
+        return;
+    };
+    let Some(requested) = request
+        .args
+        .get("workspace")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    if same_retained_workspace(&requested, &stored) {
+        return;
+    }
+
+    let (Ok(requested_path), Ok(stored_path)) = (
+        std::fs::canonicalize(&requested),
+        std::fs::canonicalize(&stored),
+    ) else {
+        return;
+    };
+    let (Some(requested_path), Some(stored_path)) = (requested_path.to_str(), stored_path.to_str())
+    else {
+        return;
+    };
+    if !same_retained_workspace(requested_path, stored_path) {
+        return;
+    }
+
+    // normalize_launch stores the canonical path. Align an existing alias to
+    // that retained spelling so Store sees the original same-ID payload.
+    if let Some(args) = request.args.as_object_mut() {
+        args.insert("workspace".to_owned(), Value::String(stored));
+    }
+}
+
 fn reject_launch_derived_keys(args: &Value) -> Result<()> {
     let args = args
         .as_object()
@@ -3288,6 +3350,189 @@ mod tests {
             Arc::new(AsyncMutex::new(store)),
             Bus::new(16),
         )
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_launch_hydration_aligns_existing_8dot3_workspace_alias() {
+        let root = std::env::temp_dir().join(format!("eliot-retained-alias-{}", ulid::Ulid::new()));
+        let workspace = root.join("workspace with spaces");
+        std::fs::create_dir_all(&workspace).unwrap();
+        // cmd's %~sI asks Windows for the existing path's 8.3 spelling.
+        let short_path = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c"])
+            .arg(format!(
+                "for %I in (\"{}\") do @echo %~sI",
+                workspace.display()
+            ))
+            .output();
+        let Ok(short_path) = short_path else {
+            std::fs::remove_dir_all(&root).unwrap();
+            return;
+        };
+        if !short_path.status.success() {
+            std::fs::remove_dir_all(&root).unwrap();
+            return;
+        }
+        let requested = String::from_utf8_lossy(&short_path.stdout)
+            .trim()
+            .to_owned();
+        if requested.is_empty()
+            || !requested
+                .split(['\\', '/'])
+                .any(|component| component.contains('~'))
+        {
+            std::fs::remove_dir_all(&root).unwrap();
+            return;
+        }
+        if !std::path::Path::new(&requested).is_dir() {
+            std::fs::remove_dir_all(&root).unwrap();
+            return;
+        }
+        let stored = std::fs::canonicalize(&workspace)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+
+        if same_retained_workspace(&requested, &stored) {
+            std::fs::remove_dir_all(&root).unwrap();
+            return; // This Windows volume did not expose a distinct short spelling.
+        }
+
+        let mut request = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+        request.args = json!({"workspace":requested});
+        let retained_workspace = Value::String(stored.clone());
+        align_retained_workspace_alias(&mut request, Some(&retained_workspace));
+
+        assert_eq!(request.args["workspace"], stored);
+        assert!(same_retained_workspace(
+            request.args["workspace"].as_str().unwrap(),
+            &stored
+        ));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unready_frozen_route_rejects_before_profile_store_and_dispatch() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 512];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).await.unwrap();
+                if read == 0 || request.len().saturating_add(read) > 8 * 1024 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let body = b"{\"status\":\"starting\"}";
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+            String::from_utf8_lossy(&request).to_ascii_lowercase()
+        });
+
+        let router = router();
+        let id = ulid::Ulid::new().to_string();
+        let mut request = SubmitCommand::new(&id, "launch");
+        request.args = json!({
+            "project":"route-preflight",
+            "workspace":"synthetic-workspace",
+            "profile":"codex-opencodex",
+            "harness":"codex",
+            "profile_snapshot":{
+                "harness":"codex",
+                "pass_env":[],
+                "pass_env_values":{"CODEX_HOME":null,"CODEX_SQLITE_HOME":null},
+                "route_binding":{
+                    "name":"opencodex",
+                    "endpoint":endpoint,
+                    "readiness_path":"/readyz",
+                    "provider_base_url":format!("{endpoint}/v1"),
+                    "client_key_env_name":null
+                },
+                "capacity_scopes":[
+                    {"scope":"profile:codex-opencodex","max_live":1},
+                    {"scope":"proxy:opencodex","max_live":1}
+                ]
+            }
+        });
+        {
+            let mut store = router.inner.store.lock().await;
+            assert!(
+                store
+                    .submit("owner", request.clone(), now_ms())
+                    .unwrap()
+                    .is_new
+            );
+        }
+
+        router.clone().process_command_inner(id.clone(), None).await;
+        let request_line = tokio::time::timeout(std::time::Duration::from_secs(3), server)
+            .await
+            .expect("readiness GET deadline")
+            .unwrap();
+        assert!(request_line.starts_with("get /readyz http/1.1\r\n"));
+
+        let store = router.inner.store.lock().await;
+        let rejected = store.get_command(&id).unwrap().unwrap();
+        assert_eq!(rejected.state, CommandState::Rejected);
+        assert_eq!(rejected.outcome.as_ref().unwrap()["reason"], "unavailable");
+        let failed = store
+            .get_agent(rejected.target.as_deref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.generation, 0);
+        assert_eq!(failed.state, AgentState::Failed);
+        assert_eq!(router.inner.plugin_host.live_count(), 0);
+        assert!(
+            store
+                .read_events(0, 1000, None)
+                .unwrap()
+                .iter()
+                .all(|event| event.kind != "command.dispatched")
+        );
+        drop(store);
+
+        let status = router.status().await.unwrap();
+        assert_eq!(status["unsettled_commands_count"], 0);
+        assert!(router.status_blockers().await.unwrap().is_empty());
+
+        request.id = ulid::Ulid::new().to_string();
+        request.args["project"] = json!("route-preflight-capacity-release");
+        request.args["workspace"] = json!("synthetic-workspace-after-reject");
+        let second_id = request.id.clone();
+        assert!(
+            router
+                .inner
+                .store
+                .lock()
+                .await
+                .submit("owner", request, now_ms())
+                .unwrap()
+                .is_new
+        );
+        router.reject_undispatched(&second_id, "test_cleanup").await;
+        let drained = router
+            .shutdown(
+                &json!({"id":ulid::Ulid::new().to_string(), "mode":"drain"}),
+                &Principal::Owner,
+            )
+            .await
+            .unwrap();
+        assert_eq!(drained["state"], "applied");
+        assert_eq!(drained["blockers"], json!([]));
     }
 
     #[tokio::test]

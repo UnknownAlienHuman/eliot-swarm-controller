@@ -21,6 +21,7 @@ ulid.workspace = true
 sha2.workspace = true
 libc.workspace = true
 notify.workspace = true
+reqwest.workspace = true
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",

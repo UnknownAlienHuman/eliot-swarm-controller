@@ -14,6 +14,7 @@ use crate::{
         },
     },
     observe::ObserverSession,
+    route::CodexRoute,
 };
 use eliot_core::{Error, NativeStoreBinding, ProcessRecord, ProcessState, Result, SecretPolicy};
 use eliot_plugin::{
@@ -44,7 +45,6 @@ const MAX_TURN_PAGES: usize = 16;
 const ITEM_PAGE_SIZE: u32 = 1000;
 const MAX_ITEM_PAGES: usize = 16;
 const MAX_CONTROL_COMMANDS: usize = 32;
-const OPENAI_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 
 #[derive(Default)]
 struct CodexPlugin {
@@ -115,6 +115,12 @@ struct TargetEnvironment {
     variables: Vec<(OsString, OsString)>,
     secrets: Vec<String>,
     metadata_secrets: Vec<String>,
+}
+
+struct NativeStartContext<'a> {
+    route: &'a CodexRoute,
+    store: &'a NativeStoreBinding,
+    metadata_secrets: &'a [String],
 }
 
 struct ResumeSubject {
@@ -291,6 +297,7 @@ impl CodexPlugin {
         environment: &Value,
     ) -> Result<(NativeLaunch, Vec<String>, Vec<String>)> {
         let initialized = self.initialized.as_ref().ok_or_else(not_initialized)?;
+        let route = CodexRoute::from_profile(profile)?;
         let profile = profile.as_object().ok_or_else(|| {
             Error::new(
                 "profile_error",
@@ -314,10 +321,12 @@ impl CodexPlugin {
             }
         };
         let TargetEnvironment {
-            variables,
+            mut variables,
             mut secrets,
             mut metadata_secrets,
         } = target_environment(Some(environment), profile.get("pass_env"))?;
+        route.capture_client_secret(&variables, &mut secrets, &mut metadata_secrets, false)?;
+        route.strip_client_key(&mut variables);
         if variables.iter().any(|(name, _)| {
             name.to_string_lossy()
                 .to_ascii_uppercase()
@@ -332,10 +341,7 @@ impl CodexPlugin {
         metadata_secrets.push(initialized.credential.clone());
         let launch = NativeLaunch {
             program,
-            args: ["app-server", "--listen", "stdio://"]
-                .into_iter()
-                .map(OsString::from)
-                .collect(),
+            args: route.args()?,
             cwd: PathBuf::from(&initialized.instance_dir),
             environment: variables,
         };
@@ -487,10 +493,12 @@ impl CodexPlugin {
                 error
             })?;
         validate_source_plan(params.source_plan.as_ref())?;
-        let profile = params
+        let frozen_profile = params
             .profile
             .as_ref()
-            .and_then(Value::as_object)
+            .ok_or_else(|| Error::new("profile_error", "Codex requires a frozen profile object"))?;
+        let profile = frozen_profile
+            .as_object()
             .ok_or_else(|| Error::new("profile_error", "Codex requires a frozen profile object"))?;
         if profile.get("harness").and_then(Value::as_str) != Some("codex") {
             return Err(Error::new(
@@ -498,6 +506,7 @@ impl CodexPlugin {
                 "Codex plugin received a profile for another harness",
             ));
         }
+        let route = CodexRoute::from_profile(frozen_profile)?;
         let frozen_store = frozen_store_binding(profile)?;
         let requested_model = profile
             .get("model")
@@ -574,11 +583,12 @@ impl CodexPlugin {
             mut secrets,
             mut metadata_secrets,
         } = target_environment(params.target_environment.as_ref(), profile.get("pass_env"))?;
+        route.capture_client_secret(&environment, &mut secrets, &mut metadata_secrets, true)?;
         secrets.push(initialized.credential.clone());
         metadata_secrets.push(initialized.credential.clone());
         let launch = NativeLaunch {
             program,
-            args: app_server_args(),
+            args: route.args()?,
             cwd: workspace.clone(),
             environment,
         };
@@ -662,8 +672,11 @@ impl CodexPlugin {
             &requested_model,
             requested_effort.as_deref(),
             collaboration_mode.is_some(),
-            &frozen_store,
-            &metadata_secrets,
+            NativeStartContext {
+                route: &route,
+                store: &frozen_store,
+                metadata_secrets: &metadata_secrets,
+            },
         )
         .await
         {
@@ -729,7 +742,7 @@ impl CodexPlugin {
                 thread_id: subject.native_ref.clone(),
                 exclude_turns: true,
                 model: Some(requested_model.clone()),
-                model_provider: Some("openai".to_owned()),
+                model_provider: Some(route.provider().to_owned()),
                 cwd: Some(workspace.to_string_lossy().into_owned()),
                 sandbox: Some(sandbox_mode),
                 approval_policy: Some(json!(approval_policy.clone())),
@@ -750,7 +763,7 @@ impl CodexPlugin {
             let params = NativeThreadStartParams {
                 cwd: Some(workspace.to_string_lossy().into_owned()),
                 model: Some(requested_model.clone()),
-                model_provider: Some("openai".to_owned()),
+                model_provider: Some(route.provider().to_owned()),
                 sandbox: Some(sandbox_mode),
                 approval_policy: Some(json!(approval_policy.clone())),
                 config: Some(NativeThreadConfigOverrides {
@@ -858,10 +871,11 @@ impl CodexPlugin {
                 "Codex thread/resume did not prove the resumed thread idle; no input was sent",
             ));
         }
-        let effort_verified = readback
-            .reasoning_effort
-            .as_deref()
-            .is_some_and(|effort| effort == selected_effort);
+        let effort_verified = route.requires_chatgpt()
+            && readback
+                .reasoning_effort
+                .as_deref()
+                .is_some_and(|effort| effort == selected_effort);
         let effective = json!({
             "model": readback.model.clone(),
             "model_provider": readback.model_provider.clone(),
@@ -872,7 +886,7 @@ impl CodexPlugin {
             "effort_verified": effort_verified,
         });
         let settings_match = readback.model == requested_model
-            && readback.model_provider == "openai"
+            && readback.model_provider == route.provider()
             && paths_equal(Path::new(&readback.cwd), &workspace)
             && sandbox_matches(&readback.sandbox, &permissions, &workspace)
             && readback_approval_matches(&readback.approval_policy, &approval_policy)
@@ -944,8 +958,7 @@ impl CodexPlugin {
         requested_model: &str,
         requested_effort: Option<&str>,
         experimental_api: bool,
-        frozen_store: &NativeStoreBinding,
-        metadata_secrets: &[String],
+        context: NativeStartContext<'_>,
     ) -> Result<(String, String)> {
         let init_params = NativeInitializeParams {
             client_info: NativeClientInfo {
@@ -1002,34 +1015,36 @@ impl CodexPlugin {
         crate::discovery::verify_initialized_store(
             client,
             &initialized,
-            frozen_store,
+            context.store,
             workspace,
-            metadata_secrets,
+            context.metadata_secrets,
             Instant::now() + RPC_TIMEOUT,
         )
         .await?;
-        let native_scope = frozen_store.native_scope.clone();
+        let native_scope = context.store.native_scope.clone();
 
-        let account = client
-            .call(
-                "account/read",
-                json!({"refreshToken": false}),
-                Instant::now() + RPC_TIMEOUT,
-            )
-            .await
-            .map_err(|error| {
-                contextual_error(error, "profile_error", "Codex account/read failed")
-            })?;
-        if account
-            .get("account")
-            .and_then(|value| value.get("type"))
-            .and_then(Value::as_str)
-            != Some("chatgpt")
-        {
-            return Err(Error::new(
-                "profile_error",
-                "Codex profile requires an authenticated ChatGPT account",
-            ));
+        if context.route.requires_chatgpt() {
+            let account = client
+                .call(
+                    "account/read",
+                    json!({"refreshToken": false}),
+                    Instant::now() + RPC_TIMEOUT,
+                )
+                .await
+                .map_err(|error| {
+                    contextual_error(error, "profile_error", "Codex account/read failed")
+                })?;
+            if account
+                .get("account")
+                .and_then(|value| value.get("type"))
+                .and_then(Value::as_str)
+                != Some("chatgpt")
+            {
+                return Err(Error::new(
+                    "profile_error",
+                    "Codex profile requires an authenticated ChatGPT account",
+                ));
+            }
         }
 
         let config = client
@@ -1055,18 +1070,14 @@ impl CodexPlugin {
                 "Codex config/read omitted effective config",
             )
         })?;
-        if effective_config
-            .get("model_provider")
-            .and_then(Value::as_str)
-            != Some("openai")
-            || effective_config
-                .get("openai_base_url")
-                .and_then(Value::as_str)
-                != Some(OPENAI_CHATGPT_BASE_URL)
-        {
-            return Err(Error::new(
-                "profile_error",
-                "Codex per-process provider and ChatGPT base URL did not match the required route",
+        context
+            .route
+            .verify_config(effective_config, context.metadata_secrets)?;
+
+        if !context.route.requires_chatgpt() {
+            return Ok((
+                context.route.explicit_effort(requested_effort)?,
+                native_scope,
             ));
         }
 
@@ -2587,21 +2598,6 @@ fn frozen_store_binding(profile: &serde_json::Map<String, Value>) -> Result<Nati
     })
 }
 
-fn app_server_args() -> Vec<OsString> {
-    [
-        "-c",
-        "model_provider=\"openai\"",
-        "-c",
-        "openai_base_url=\"https://chatgpt.com/backend-api/codex\"",
-        "app-server",
-        "--listen",
-        "stdio://",
-    ]
-    .into_iter()
-    .map(OsString::from)
-    .collect()
-}
-
 pub(crate) fn native_scope(codex_home: &str) -> String {
     let mut hash = 0xcbf29ce484222325u64;
     let canonical_home = if cfg!(windows) {
@@ -2659,7 +2655,7 @@ fn codex_manifest() -> PluginManifest {
             ("controlled".to_owned(), controlled),
             ("observed".to_owned(), observed),
         ]),
-        proxy: "none".to_owned(),
+        proxy: "responses".to_owned(),
     }
 }
 
@@ -2674,7 +2670,7 @@ fn not_initialized() -> Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        CodexPlugin, Initialized, NativeLaunch, app_server_args, frozen_store_binding,
+        CodexPlugin, CodexRoute, Initialized, NativeLaunch, codex_manifest, frozen_store_binding,
         target_environment, validate_resume_preflight,
     };
     use eliot_core::SecretPolicy;
@@ -2736,6 +2732,64 @@ mod tests {
     }
 
     #[test]
+    fn reader_launch_routes_named_provider_and_captures_opaque_client_key() {
+        let secret = "opaque-client-value";
+        let profile = json!({
+            "harness":"codex",
+            "pass_env":[],
+            "route_binding":{
+                "name":"corp_gateway",
+                "endpoint":"http://127.0.0.1:10300",
+                "readiness_path":"/readyz",
+                "provider_base_url":"http://127.0.0.1:10300/v1",
+                "client_key_env_name":"LOCAL_CLIENT"
+            }
+        });
+        let plugin = CodexPlugin {
+            initialized: Some(Initialized {
+                credential: "instance-credential".to_owned(),
+                instance_dir: "private-instance".to_owned(),
+            }),
+            ..CodexPlugin::default()
+        };
+
+        let (launch, diagnostic_secrets, metadata_secrets) = plugin
+            .reader_launch(&profile, &json!({"LOCAL_CLIENT":secret}))
+            .unwrap();
+        assert!(SecretPolicy::new(&diagnostic_secrets).contains_text(secret));
+        assert!(SecretPolicy::new(&metadata_secrets).contains_text(secret));
+        assert!(
+            launch
+                .environment
+                .iter()
+                .all(|(name, _)| name != "LOCAL_CLIENT")
+        );
+        assert!(launch.args.iter().any(|arg| {
+            arg.to_string_lossy()
+                .contains("model_provider=\"corp_gateway\"")
+        }));
+        assert!(
+            launch
+                .args
+                .iter()
+                .all(|arg| { !arg.to_string_lossy().contains(secret) })
+        );
+
+        let (missing_key_launch, _, _) = plugin.reader_launch(&profile, &json!({})).unwrap();
+        assert!(
+            missing_key_launch
+                .environment
+                .iter()
+                .all(|(name, _)| name != "LOCAL_CLIENT")
+        );
+    }
+
+    #[test]
+    fn codex_manifest_advertises_responses_proxy_capability() {
+        assert_eq!(codex_manifest().proxy, "responses");
+    }
+
+    #[test]
     fn controlled_start_requires_an_admitted_binding_without_legacy_reselection() {
         for profile in [
             json!({"pass_env_values": {"CODEX_HOME": null, "CODEX_SQLITE_HOME": null}}),
@@ -2766,7 +2820,10 @@ mod tests {
         let binding = frozen_store_binding(profile.as_object().unwrap()).unwrap();
         let launch = NativeLaunch {
             program: OsString::from("codex-not-executed"),
-            args: app_server_args(),
+            args: CodexRoute::from_profile(&json!({"harness":"codex"}))
+                .unwrap()
+                .args()
+                .unwrap(),
             cwd: PathBuf::from(home),
             environment: vec![
                 (

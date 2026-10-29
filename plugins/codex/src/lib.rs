@@ -6,6 +6,7 @@ mod host;
 mod live_recovery;
 mod native;
 mod observe;
+mod route;
 
 pub async fn run_codex() -> eliot_core::Result<()> {
     host::run().await

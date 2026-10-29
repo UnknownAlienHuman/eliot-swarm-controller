@@ -92,6 +92,13 @@ Errors include
 `busy`, `unavailable`, `capacity_unavailable`, `history_gap`, `source_integrity`,
 `secret_in_payload`, `frame_too_large`, `mailbox_full`, `internal`.
 
+`capacity_unavailable` is a pre-effect rejection from a configured Eliot `max_live`
+scope, not a vendor quota or entitlement result. A full-cap request is not admitted:
+there is no command row to read back, and the same ID may be submitted again once the
+scope frees. Once a command is admitted, its same-ID readback returns the retained result
+and never retries the native effect. Provider-hold and service-management APIs are not
+implemented in this increment; those requests remain `unsupported`.
+
 [`Error.code`](../../crates/eliot-core/src/lib.rs) is an open string, not a closed wire
 enum; plugin-specific codes may be preserved. Unfamiliar post-I/O error codes classify
 as `Unknown` under [Core policy](../../crates/eliot-core/src/command.rs), never proof
@@ -514,7 +521,6 @@ eliot discover --profile P [--harness H] [--scope S] [--cursor C] [--limit N]
 eliot attach --profile P --harness H --scope S --ref R [--project LABEL]
 eliot history A --view subject|turns|items [--source native|rollout] [--turn-id ID] [--cursor C] [--limit N]
 eliot detach A [--generation N]
-eliot service list|stop | hold list|clear | doctor
 eliot plugin NAME | plugin-test ... | hook ... | mcp
 ```
 

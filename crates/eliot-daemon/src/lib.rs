@@ -10,6 +10,7 @@ pub(crate) mod logging;
 mod monitor;
 mod platform;
 mod plugin_host;
+mod proxy;
 mod redaction;
 mod router;
 mod setup;

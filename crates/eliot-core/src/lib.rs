@@ -9,6 +9,7 @@ mod command;
 mod diagnostics;
 mod ids;
 mod native_store;
+mod routing;
 mod secrets;
 mod source_handoff;
 
@@ -23,6 +24,7 @@ pub use diagnostics::{
 };
 pub use ids::parse_agent_id;
 pub use native_store::NativeStoreBinding;
+pub use routing::{CapacityScope, RouteBinding};
 pub use secrets::SecretPolicy;
 pub use source_handoff::{SourceHandoff, SourceHandoffAck, SourceHandoffGap};
 

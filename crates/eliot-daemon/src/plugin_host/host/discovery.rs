@@ -2,7 +2,7 @@
 use super::reader::READER_CLOSE_BUDGET;
 use super::{
     AgentKey, PluginHost, build_process_environment, metadata_secret_snapshot, redact_native_error,
-    signal_progress,
+    require_proxy_capability, signal_progress,
 };
 use eliot_core::{Error, NativeStoreBinding, Result, SecretPolicy, StderrSource};
 use eliot_plugin::protocol::ProfileStoreParams;
@@ -239,7 +239,8 @@ impl PluginHost {
             metadata_secret_snapshot(&params.profile, &params.target_environment, known);
         let until = Instant::now() + READER_DEADLINE;
         let read = async {
-            reader.initialize(harness, until).await?;
+            let manifest = reader.initialize(harness, until).await?;
+            require_proxy_capability(&params.profile, &manifest)?;
             let request = serde_json::to_value(&params)
                 .map_err(|_| Error::new("internal", "cannot encode profile.store params"))?;
             let value = reader.client.call("profile.store", request, until).await?;
@@ -339,6 +340,7 @@ impl PluginHost {
         let until = Instant::now() + READER_DEADLINE;
         let read = async {
             let manifest = reader.initialize(harness, until).await?;
+            require_proxy_capability(&profile, &manifest)?;
             if !manifest.features.discover {
                 return Err(Error::new(
                     "unsupported",

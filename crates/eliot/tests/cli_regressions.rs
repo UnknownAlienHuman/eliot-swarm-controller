@@ -166,11 +166,10 @@ pass_env = ["CODEX_HOME", "CODEX_SQLITE_HOME", "EPHEMERAL_TOKEN"]
         .arg(&fixture.workspace);
     let reply = run(launch);
     assert_eq!(reply.status.code(), Some(3), "launch must be rejected");
+    let diagnostic = reply.stderr.to_ascii_lowercase();
     assert!(
-        reply
-            .stderr
-            .contains("native store selector input contains a known credential"),
-        "launch did not report the credential rejection"
+        diagnostic.contains("secret_in_payload") && diagnostic.contains("credential"),
+        "launch did not report a secret-payload credential rejection"
     );
     assert!(!reply.stdout.contains(&credential));
     assert!(!reply.stderr.contains(&credential));
@@ -3367,4 +3366,227 @@ fn background_startup_releases_capture_before_daemon_exit() {
     );
     assert_eq!(held.wait(Duration::from_secs(15)).unwrap(), Some(0));
     fixture.retain_data = false;
+}
+
+#[test]
+fn cli_named_fake_account_capacity_rejects_without_admission_then_reuses_id_after_release() {
+    let mut fixture = Fixture::new("named fake account capacity");
+    fixture.start();
+    fs::write(
+        fixture.data.join("config.toml"),
+        r#"
+[profiles.fake-first]
+harness = "fake"
+account = "shared"
+
+[profiles.fake-second]
+harness = "fake"
+account = "shared"
+
+[accounts.shared]
+max_live = 1
+"#,
+    )
+    .expect("write named Fake account-cap profiles");
+
+    let workspace = fixture.workspace.to_str().unwrap().to_owned();
+    let first_id = ulid::Ulid::new().to_string();
+    let first_args = [
+        "--id",
+        first_id.as_str(),
+        "launch",
+        "--profile",
+        "fake-first",
+        "--workspace",
+        workspace.as_str(),
+    ];
+    // This named Fake profile has no credential-bearing fields. Mask fixture paths and
+    // bound/sanitize stderr so a failure exposes its phase without leaking path data.
+    let data_path = fixture.data.to_string_lossy().into_owned();
+    let workspace_path = workspace.clone();
+    let command_from_reply = |phase: &str, reply: support::Reply| -> CoreCommand {
+        let safe_stderr = reply
+            .stderr
+            .replace(&data_path, "[DATA]")
+            .replace(&workspace_path, "[WORKSPACE]")
+            .chars()
+            .take(512)
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect::<String>();
+        assert!(
+            reply.status.success(),
+            "{phase} failed with exit {:?}: {safe_stderr}",
+            reply.status.code()
+        );
+        serde_json::from_str(&reply.stdout)
+            .unwrap_or_else(|_| panic!("{phase} returned invalid CoreCommand JSON; stdout omitted"))
+    };
+    let first = command_from_reply("initial launch", cli(&fixture.data, &first_args));
+    assert_eq!(first.id, first_id);
+    assert_eq!(first.state, CommandState::Applied);
+    let first_agent = first.target.clone().expect("first controlled Agent");
+    let first_generation = first.generation.expect("first generation");
+    assert_eq!(first_generation, 1);
+    fixture.wait_command(&first_id, "applied");
+    let first_readback: CoreCommand =
+        serde_json::from_value(fixture.json(&["cmd", "show", &first_id]))
+            .expect("typed first command readback");
+    assert_eq!(first_readback, first);
+
+    let stable_agent = |view: &AgentGetResponse| {
+        (
+            view.agent.id.clone(),
+            view.agent.generation,
+            view.agent.profile.clone(),
+            view.agent.native_ref.clone(),
+            view.agent.profile_snapshot.clone(),
+        )
+    };
+    let first_agent_before_retry: AgentGetResponse =
+        serde_json::from_value(fixture.json(&["show", &first_agent]))
+            .expect("typed first Agent view");
+    let stable_first_agent = stable_agent(&first_agent_before_retry);
+
+    let first_dispatches = |events: &[Value]| {
+        events
+            .iter()
+            .filter(|event| {
+                event["kind"] == "command.dispatched" && event["data"]["command_id"] == first_id
+            })
+            .count()
+    };
+    let events_before_first_retry = fixture.events();
+    assert_eq!(first_dispatches(&events_before_first_retry), 1);
+    let first_retry = command_from_reply(
+        "same-ID replay while cap is full",
+        cli(&fixture.data, &first_args),
+    );
+    assert_eq!(
+        first_retry, first,
+        "same-ID replay of an admitted launch did not return its retained result"
+    );
+    assert_eq!(
+        first_dispatches(&fixture.events()),
+        1,
+        "same-ID replay dispatched the admitted launch again"
+    );
+    let first_agent_after_retry: AgentGetResponse =
+        serde_json::from_value(fixture.json(&["show", &first_agent]))
+            .expect("typed Agent view after retained retry");
+    assert_eq!(
+        stable_agent(&first_agent_after_retry),
+        stable_first_agent,
+        "same-ID replay changed stable Agent identity or frozen profile fields"
+    );
+
+    let blocked_id = ulid::Ulid::new().to_string();
+    let blocked_args = [
+        "--id",
+        blocked_id.as_str(),
+        "launch",
+        "--profile",
+        "fake-second",
+        "--workspace",
+        workspace.as_str(),
+    ];
+    let blocked = cli(&fixture.data, &blocked_args);
+    assert_eq!(
+        blocked.status.code(),
+        Some(3),
+        "full account cap must reject before dispatch"
+    );
+    assert!(
+        blocked.stderr.contains("capacity_unavailable"),
+        "full account cap did not return capacity_unavailable"
+    );
+    let missing = cli(&fixture.data, &["cmd", "show", &blocked_id]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(
+        missing.stderr.contains("not_found"),
+        "cap-rejected request unexpectedly has a command row"
+    );
+    assert_eq!(fixture.json(&["status"])["agents"], 1);
+    let events_after_rejection = fixture.events();
+    assert!(
+        events_after_rejection
+            .iter()
+            .all(|event| event["data"]["command_id"] != blocked_id),
+        "unadmitted cap rejection wrote a command event"
+    );
+    assert_eq!(
+        first_dispatches(&events_after_rejection),
+        1,
+        "unadmitted cap rejection changed the admitted launch dispatch count"
+    );
+
+    let generation = first_generation.to_string();
+    let stop: CommandSubmitResponse =
+        serde_json::from_value(fixture.json(&["stop", &first_agent, "--generation", &generation]))
+            .expect("typed first stop submission");
+    fixture.wait_command(&stop.command_id, "applied");
+    assert_eq!(fixture.json(&["show", &first_agent])["state"], "stopped");
+    // Fake has one known owned root; this bounded page verifies that root only.
+    let processes = fixture.json(&[
+        "processes",
+        &first_agent,
+        "--generation",
+        &generation,
+        "--limit",
+        "1000",
+    ]);
+    let processes = processes["processes"]
+        .as_array()
+        .expect("stopped generation process page");
+    assert!(
+        !processes.is_empty(),
+        "Fake launch had no owned process evidence"
+    );
+    assert!(
+        processes.iter().all(|process| process["state"] == "exited"),
+        "known Fake root was not exited before cap release"
+    );
+
+    fixture.stop(false);
+    fixture.start();
+
+    let first_after_restart = command_from_reply(
+        "same-ID replay after restart",
+        cli(&fixture.data, &first_args),
+    );
+    assert_eq!(
+        first_after_restart, first,
+        "restart changed the retained admitted launch result"
+    );
+    let first_readback_after_restart: CoreCommand =
+        serde_json::from_value(fixture.json(&["cmd", "show", &first_id]))
+            .expect("typed command readback after restart");
+    assert_eq!(
+        first_readback_after_restart, first_readback,
+        "restart changed the admitted launch command readback"
+    );
+    assert_eq!(fixture.json(&["show", &first_agent])["state"], "stopped");
+    assert_eq!(
+        first_dispatches(&fixture.events()),
+        1,
+        "restart replayed the admitted launch"
+    );
+
+    // This ID was rejected before admission, so it has no retained command binding
+    // and may be submitted after the proven closed generation releases its slot.
+    let second: CoreCommand =
+        serde_json::from_value(fixture.json(&blocked_args)).expect("typed second launch");
+    assert_eq!(second.id, blocked_id);
+    assert_eq!(second.state, CommandState::Applied);
+    let second_agent = second.target.clone().expect("second controlled Agent");
+    let second_stop: CommandSubmitResponse =
+        serde_json::from_value(fixture.json(&["stop", &second_agent]))
+            .expect("typed second stop submission");
+    fixture.wait_command(&second_stop.command_id, "applied");
+    fixture.stop(false);
 }
