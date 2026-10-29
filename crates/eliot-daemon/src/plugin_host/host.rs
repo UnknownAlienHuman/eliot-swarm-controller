@@ -1995,9 +1995,42 @@ fn source_secret_snapshot(
 }
 
 pub(crate) fn build_process_environment(profile: &Value) -> Result<Map<String, Value>> {
+    build_process_environment_with(profile, |name| std::env::var_os(name))
+}
+
+fn build_process_environment_with(
+    profile: &Value,
+    mut lookup: impl FnMut(&str) -> Option<OsString>,
+) -> Result<Map<String, Value>> {
+    let captured = match profile.get("pass_env_values") {
+        None => None, // Legacy snapshots retain their established mutable lookup.
+        Some(value) => {
+            let values = value
+                .as_object()
+                .filter(|values| {
+                    values.len() == 2
+                        && values
+                            .values()
+                            .all(|value| value.is_null() || value.is_string())
+                        && ["CODEX_HOME", "CODEX_SQLITE_HOME"]
+                            .into_iter()
+                            .all(|selector| {
+                                values
+                                    .keys()
+                                    .filter(|name| {
+                                        crate::config::native_store_selector(name) == Some(selector)
+                                    })
+                                    .count()
+                                    == 1
+                            })
+                })
+                .ok_or_else(|| Error::new("invalid", "frozen native store inputs are malformed"))?;
+            Some(values)
+        }
+    };
     let mut environment = Map::new();
     for name in BASE_ENVIRONMENT_NAMES {
-        if let Some(value) = std::env::var_os(name) {
+        if let Some(value) = lookup(name) {
             let value = value.into_string().map_err(|_| {
                 Error::new(
                     "invalid",
@@ -2038,7 +2071,23 @@ pub(crate) fn build_process_environment(profile: &Value) -> Result<Map<String, V
                     "frozen profile pass_env cannot override Eliot Agent identity variables",
                 ));
             }
-            if let Some(value) = std::env::var_os(name) {
+            if let Some(selector) = crate::config::native_store_selector(name)
+                && let Some(captured) = captured
+            {
+                let value = captured
+                    .iter()
+                    .find_map(|(name, value)| {
+                        (crate::config::native_store_selector(name) == Some(selector))
+                            .then_some(value)
+                    })
+                    .expect("captured selector map was validated");
+                if let Some(value) = value.as_str() {
+                    insert_environment(&mut environment, selector, value.to_owned());
+                }
+                // A captured null suppresses future ambient values. Empty stays empty.
+                continue;
+            }
+            if let Some(value) = lookup(name) {
                 let value = value.into_string().map_err(|_| {
                     Error::new(
                         "invalid",
@@ -2402,6 +2451,73 @@ mod tests {
     const SECRET: &str = "__payload_guard_secret__";
     const SECRET_ERROR: &str =
         "native source payload contains a known secret in immutable metadata";
+
+    #[test]
+    fn native_store_inputs_runtime_uses_capture_and_final_secret_environment() {
+        let mut profile =
+            json!({"pass_env":["CODEX_HOME", "CODEX_SQLITE_HOME", "EPHEMERAL_TOKEN"]});
+        crate::config::capture_native_store_inputs(&mut profile, |name| match name {
+            "CODEX_HOME" => Some(OsString::from("../original-home")),
+            "CODEX_SQLITE_HOME" => None,
+            _ => panic!("only selectors may be captured"),
+        })
+        .unwrap();
+        for current in ["credential-before-rotation", "credential-after-rotation"] {
+            let environment = Value::Object(
+                build_process_environment_with(&profile, |name| {
+                    assert!(
+                        crate::config::native_store_selector(name).is_none(),
+                        "captured selectors must not be reread"
+                    );
+                    (name == "EPHEMERAL_TOKEN").then(|| OsString::from(current))
+                })
+                .unwrap(),
+            );
+            assert_eq!(environment["CODEX_HOME"], "../original-home");
+            assert!(environment.get("CODEX_SQLITE_HOME").is_none());
+            assert_eq!(environment["EPHEMERAL_TOKEN"], current);
+            let secrets = source_secret_snapshot(&profile, &environment, Vec::new());
+            assert!(secrets.iter().any(|value| value == current));
+            assert!(secrets.iter().any(|value| value == "../original-home"));
+            assert!(!profile.to_string().contains(current));
+        }
+        profile["pass_env_values"]["CODEX_HOME"] = json!("");
+        let environment = build_process_environment_with(&profile, |name| {
+            assert!(crate::config::native_store_selector(name).is_none());
+            None
+        })
+        .unwrap();
+        assert_eq!(environment["CODEX_HOME"], "");
+    }
+
+    #[test]
+    fn native_store_inputs_malformed_capture_is_not_legacy() {
+        for capture in [
+            Value::Null,
+            json!([]),
+            json!({}),
+            json!({"CODEX_HOME":"x"}),
+            json!({"CODEX_HOME":false,"CODEX_SQLITE_HOME":null}),
+            json!({"CODEX_HOME":null,"CODEX_SQLITE_HOME":null,"EPHEMERAL_TOKEN":"never durable"}),
+        ] {
+            let profile = json!({"pass_env":["CODEX_HOME"],"pass_env_values":capture});
+            assert_eq!(
+                build_process_environment_with(&profile, |_| panic!(
+                    "malformed capture must reject before lookup"
+                ))
+                .unwrap_err()
+                .code,
+                "invalid"
+            );
+        }
+        let legacy = json!({"pass_env":["CODEX_HOME"]});
+        let environment = build_process_environment_with(&legacy, |name| {
+            (name == "CODEX_HOME").then(|| OsString::from("current-legacy-home"))
+        })
+        .unwrap();
+        assert_eq!(environment["CODEX_HOME"], "current-legacy-home");
+        assert!(legacy.get("pass_env_values").is_none());
+    }
 
     fn batch() -> SourceBatch {
         SourceBatch {

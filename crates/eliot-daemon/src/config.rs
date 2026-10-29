@@ -9,13 +9,14 @@
 //! Returns a bounded nonsecret snapshot object with the keys harness, cmd,
 //! model, effort, collaboration_mode, permissions, approval_policy, pass_env,
 //! raw setup and normalized relative scratch directories.
-//! pass_env carries admitted environment variable names only; secret values are never
-//! resolved or copied into the snapshot. The parent daemon calls resolve_profile
-//! before Store admission.
+//! pass_env carries admitted environment variable names. Only the two nonsecret
+//! native-store selector inputs are captured before admission; all other values
+//! remain execution-time references and are never copied into the snapshot.
 use eliot_core as core;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::io::Read;
 use std::path::Path;
 const MAX_CONFIG_BYTES: usize = 128 * 1024;
@@ -32,6 +33,50 @@ const APPROVAL_POLICY_ON_REQUEST: &str = "on-request";
 const PERMISSION_READ_ONLY: &str = "read-only";
 const PERMISSION_WORKSPACE_WRITE: &str = "workspace-write";
 const PERMISSION_DANGER_FULL_ACCESS: &str = "danger-full-access";
+
+pub(crate) fn native_store_selector(name: &str) -> Option<&'static str> {
+    ["CODEX_HOME", "CODEX_SQLITE_HOME"]
+        .into_iter()
+        .find(|selector| {
+            if cfg!(windows) {
+                name.eq_ignore_ascii_case(selector)
+            } else {
+                name == *selector
+            }
+        })
+}
+
+/// Called only for a newly resolved launch/attach profile, after retained-ID miss.
+pub(crate) fn capture_native_store_inputs(
+    profile: &mut Value,
+    mut lookup: impl FnMut(&str) -> Option<OsString>,
+) -> core::Result<()> {
+    let names = profile
+        .get("pass_env")
+        .and_then(Value::as_array)
+        .ok_or_else(|| core::Error::new("invalid", "resolved profile pass_env must be an array"))?;
+    let mut values = serde_json::Map::new();
+    for selector in ["CODEX_HOME", "CODEX_SQLITE_HOME"] {
+        let selected = names
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|name| native_store_selector(name) == Some(selector));
+        let value = selected
+            .and_then(&mut lookup)
+            .map(|value| {
+                value.into_string().map(Value::String).map_err(|_| {
+                    core::Error::new("invalid", "native store selector is not valid Unicode")
+                })
+            })
+            .transpose()?
+            .unwrap_or(Value::Null);
+        values.insert(selector.to_owned(), value);
+    }
+    profile["pass_env_values"] = Value::Object(values);
+    // The augmented snapshot is bounded by the existing Store admission/frame
+    // checks. This capture proves inputs, never an effective native root/scope.
+    Ok(())
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
@@ -666,6 +711,68 @@ fn is_unsupported_field(field: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_store_inputs_capture_only_selected_raw_values() {
+        let mut profile =
+            json!({"pass_env":["CODEX_HOME", "CODEX_SQLITE_HOME", "EPHEMERAL_TOKEN"]});
+        let raw = " ../original-home ";
+        capture_native_store_inputs(&mut profile, |name| match name {
+            "CODEX_HOME" => Some(OsString::from(raw)),
+            "CODEX_SQLITE_HOME" => None,
+            _ => panic!("credentials must not be read during capture"),
+        })
+        .unwrap();
+        assert_eq!(
+            profile["pass_env_values"],
+            json!({"CODEX_HOME":raw, "CODEX_SQLITE_HOME":null})
+        );
+        let mut unselected = json!({"pass_env":[]});
+        capture_native_store_inputs(&mut unselected, |_| {
+            panic!("unselected variables must not be read")
+        })
+        .unwrap();
+        assert_eq!(
+            unselected["pass_env_values"],
+            json!({"CODEX_HOME":null, "CODEX_SQLITE_HOME":null})
+        );
+        let mut empty = json!({"pass_env":["CODEX_HOME"]});
+        capture_native_store_inputs(&mut empty, |_| Some(OsString::new())).unwrap();
+        assert_eq!(empty["pass_env_values"]["CODEX_HOME"], "");
+        let mut alias = json!({"pass_env":["cOdEx_HoMe"]});
+        capture_native_store_inputs(&mut alias, |_| Some(OsString::from(raw))).unwrap();
+        assert_eq!(
+            alias["pass_env_values"]["CODEX_HOME"],
+            if cfg!(windows) {
+                json!(raw)
+            } else {
+                Value::Null
+            }
+        );
+
+        #[cfg(windows)]
+        let invalid = {
+            use std::os::windows::ffi::OsStringExt;
+            OsString::from_wide(&[0xd800])
+        };
+        #[cfg(unix)]
+        let invalid = {
+            use std::os::unix::ffi::OsStringExt;
+            OsString::from_vec(vec![0xff])
+        };
+        #[cfg(any(windows, unix))]
+        {
+            let mut profile = json!({"pass_env":["CODEX_HOME"]});
+            let original = profile.clone();
+            assert_eq!(
+                capture_native_store_inputs(&mut profile, |_| Some(invalid.clone()))
+                    .unwrap_err()
+                    .code,
+                "invalid"
+            );
+            assert_eq!(profile, original);
+        }
+    }
 
     fn config_error(source: &str) -> core::Error {
         let error = match toml::from_str::<FileConfig>(source) {
