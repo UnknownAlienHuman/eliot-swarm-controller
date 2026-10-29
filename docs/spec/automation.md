@@ -13,9 +13,9 @@ bounded daemon diagnostics.
 
 ```toml
 [[rule]]
-id = "stop-on-fake-result"
+id = "reply-on-fake-result"
 on = { event = "turn.completed", match = { "subject.harness" = "fake" } }
-do = [{ action = "stop", target = "${event.agent}", expected_generation = "${event.generation}" }]
+do = [{ action = "send", target = "${event.agent}", expected_generation = "${event.generation}", text = "rule-send-echo" }]
 limit = { max = 3, per = "agent", window = "1h" }
 ```
 
@@ -109,16 +109,21 @@ only edits preserve the schedule. Reconcile timers from stored state on restart.
 
 Global and registered-project timers use their namespace's startup-loaded rule files and
 the existing command router. The connected subset supports interval, once, five-field
-cron and owner-triggered manual runs, each with one ordinary `stop` action. Other action
-verbs remain future work.
+cron and owner-triggered manual runs with one ordinary `stop` or `send` action. Other
+action verbs remain future work.
 
 ```toml
 [[rule]]
-id = "periodic-stop"
+id = "periodic-send"
 on = { every = "30m", anchor = 1800000000000 }
 catch_up = "none"
-do = [{ action = "stop", target = "a1", expected_generation = 1 }]
+do = [{ action = "send", target = "a1", expected_generation = 1, text = "scheduled echo" }]
 ```
+
+`eliot timer run periodic-send` manually invokes the same SEND action with a generated
+external ULID; `eliot --id ULID timer run periodic-send` supplies one explicitly.
+Scheduled and manual timer actions have no event or subject context, so target, generation
+and SEND text are literal values.
 
 An interval `every` value uses the humantime duration grammar and must be positive with
 whole-millisecond precision; it is normalized to signed `period_ms`. An explicit interval
@@ -192,11 +197,15 @@ do = [{ action = "stop", target = "${event.agent}", expected_generation = "${eve
 ```
 
 Whole-value rendering preserves JSON type. Templates cannot choose the action, action
-name, executable, environment, credential or authority. For this supported stop action,
-the target and `expected_generation` must match the triggering event's Agent and
-generation; a different binding is rejected. An unresolved placeholder fails admission.
-One firing atomically admits its Store-only parent and ordinary stop child; the parent's
-fixed child set is durable, and `applied` means admission rather than completion.
+name, executable, environment, credential or authority. For event-triggered `stop` and
+`send`, the rendered target and `expected_generation` must exactly match the captured
+`Event.agent` and `Event.generation`; an absent or different binding is rejected before
+action-child admission. SEND text is rendered and frozen from that event, with no later
+Agent-row lookup to fill or retarget the command. An unresolved placeholder fails
+admission.
+One firing atomically admits its Store-only parent and ordinary `stop` or `send` child;
+the parent's fixed child set is durable, and `applied` means admission rather than task
+completion.
 
 Each committed event retains its event-time subject snapshot (or absence) and any
 Store-verified cause. Depth 0 denotes a proven ordinary controller command; rule, timer
@@ -216,9 +225,13 @@ Disabled rules advance their skipped range without firing.
 
 Backlog, explicit history catch-up, and rate-limit semantics are defined in
 [Retention and bounded backlog](#retention-and-bounded-backlog). This connected event-rule
-subset supports one ordinary `stop` action; other action verbs, scripts, Goals, and
-project configuration overlays remain unsupported. Cause-depth suppression is silent and
-does not emit an endlessly retriggerable rejection event.
+subset supports ordinary `stop` and `send` commands. SEND uses the existing Router path,
+keeps its exact target generation and turn association, and `applied` does not assert task
+completion. `allow_self` defaults to false, suppressing a rule's own causal SEND result;
+set it true only to opt into feedback, still subject to cause-depth and rate limits. Other
+action verbs, scripts, Goals, and project configuration overlays remain unsupported.
+Cause-depth suppression is silent and does not emit an endlessly retriggerable rejection
+event.
 
 ## Matching and rendering
 
@@ -384,7 +397,10 @@ Only Store-verified causes control depth; a rule never trusts native `data.cause
 reconstructs old provenance from a current Agent row. Cause depth above 5 silently
 advances the cursor without a parent/action command or a new event, so suppression is
 quiescent. Default per-rule limit is 10/minute, global
-120 actions/minute; configured windows must fit retained accounting history. Own-event
-send/steer/inject requires `allow_self=true`. Draining or paused automation admits no new
-firings. Every action uses normal router checks. These are execution limits, not a task
-approval process.
+120 actions/minute; configured windows must fit retained accounting history. SEND
+self-triggering defaults off. Store suppresses only when the originating command/parent
+rows prove the same principal and rule; `EventCause.rule` alone is not authority.
+`allow_self=true` opts a rule into its own SEND feedback, still subject to cause-depth
+and rate limits.
+Draining or paused automation admits no new firings. Every action uses normal router
+checks. These are execution limits, not a task approval process.

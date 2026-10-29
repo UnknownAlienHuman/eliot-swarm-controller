@@ -1,13 +1,15 @@
 use eliot_core::{
-    Error, Event,
+    Error, Event, SubmitCommand,
     api::{CatchUp, RuleLimit, RuleLimitScope, TimerSchedule},
-    canonical_json_sha256, parse_agent_id,
+    canonical_json_sha256,
+    limits::MAX_EVENT_BYTES,
+    parse_agent_id,
 };
 use globset::{Glob, GlobMatcher};
 use regex::Regex;
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     borrow::Cow,
     collections::{BTreeMap, HashSet},
@@ -28,7 +30,7 @@ pub struct RuleDefinition {
     #[serde(rename = "on")]
     trigger: TriggerDefinition,
     #[serde(rename = "do")]
-    actions: Vec<StopActionDefinition>,
+    actions: Vec<ActionDefinition>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -68,11 +70,17 @@ struct TriggerDefinition {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StopActionDefinition {
-    action: String,
-    target: Value,
-    expected_generation: Value,
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+enum ActionDefinition {
+    Stop {
+        target: Value,
+        expected_generation: Value,
+    },
+    Send {
+        target: Value,
+        expected_generation: Value,
+        text: Value,
+    },
 }
 
 #[derive(Deserialize)]
@@ -111,10 +119,32 @@ impl CompiledMatch {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StopAction {
-    pub target: String,
-    pub expected_generation: i64,
+impl ActionDefinition {
+    fn target(&self) -> &Value {
+        match self {
+            Self::Stop { target, .. } | Self::Send { target, .. } => target,
+        }
+    }
+
+    fn expected_generation(&self) -> &Value {
+        match self {
+            Self::Stop {
+                expected_generation,
+                ..
+            }
+            | Self::Send {
+                expected_generation,
+                ..
+            } => expected_generation,
+        }
+    }
+
+    fn verb(&self) -> &'static str {
+        match self {
+            Self::Stop { .. } => "stop",
+            Self::Send { .. } => "send",
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -250,13 +280,13 @@ impl RuleDefinition {
         &self.catch_up
     }
 
-    /// Render the frozen literal stop action. Lifecycle and admission gates are
+    /// Render the frozen literal Agent command. Lifecycle and admission gates are
     /// enforced by the caller before invoking this projection.
-    pub fn evaluate_timer(&self) -> Result<StopAction, Error> {
+    pub fn evaluate_timer(&self) -> Result<SubmitCommand, Error> {
         if self.schedule.is_none() {
             return Err(Error::new("unsupported", "rule is not a timer"));
         }
-        timer_stop_action(self)
+        timer_action(self)
     }
 }
 
@@ -270,10 +300,10 @@ impl TriggerDefinition {
     }
 }
 
-/// Matches `Event.subject`, the captured event-time subject, and renders the stop action.
+/// Matches a committed event and renders its one bound Agent command.
 /// `None` means disabled, a different event, or no exact match. The caller advances
 /// disabled/no-match cursors and settles rate-limit skips with the event transaction.
-pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<StopAction>, Error> {
+pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<SubmitCommand>, Error> {
     if !rule.enabled || rule.trigger.event.as_deref() != Some(event.kind.as_str()) {
         return Ok(None);
     }
@@ -303,25 +333,45 @@ pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<StopActio
     let action = rule
         .actions
         .first()
-        .ok_or_else(|| Error::new("invalid", "rule has no stop action"))?;
+        .ok_or_else(|| Error::new("invalid", "rule has no action"))?;
     let roots = TemplateRoots {
         event: &event_value,
         subject,
         data: &event.data,
     };
-    let target = render_agent_target(&action.target, &roots)?;
+    let target = render_agent_target(action.target(), &roots)?;
     parse_agent_id(&target)
-        .map_err(|_| Error::new("invalid", "stop target is not a canonical Agent id"))?;
-    let generation = render_generation(&action.expected_generation, &roots)?;
+        .map_err(|_| Error::new("invalid", "action target is not a canonical Agent id"))?;
+    let generation = render_generation(action.expected_generation(), &roots)?;
     let generation = generation
         .as_i64()
         .filter(|generation| *generation >= 0)
-        .ok_or_else(|| Error::new("invalid", "stop generation did not render to an integer"))?;
+        .ok_or_else(|| Error::new("invalid", "action generation did not render to an integer"))?;
+    let event_target = event
+        .agent
+        .as_deref()
+        .ok_or_else(|| Error::new("invalid", "rule action requires an event-time Agent"))?;
+    let event_generation = event
+        .generation
+        .filter(|generation| *generation >= 0)
+        .ok_or_else(|| Error::new("invalid", "rule action requires an event-time generation"))?;
+    if target != event_target || generation != event_generation {
+        return Err(Error::new(
+            "invalid",
+            "rule action must match the event-time Agent and generation",
+        ));
+    }
+    let args = match action {
+        ActionDefinition::Stop { .. } => json!({}),
+        ActionDefinition::Send { text, .. } => json!({"text": render_text(text, &roots)?}),
+    };
 
-    Ok(Some(StopAction {
+    Ok(Some(submit_command(
+        action.verb(),
         target,
-        expected_generation: generation,
-    }))
+        generation,
+        args,
+    )))
 }
 
 /// Inspect only known later-slice knobs before typed deserialization so they get an
@@ -354,10 +404,22 @@ fn reject_unimplemented_options(raw: &toml::Value) -> Result<(), Error> {
                         .is_some_and(|action| action.contains_key("selector"))
                 })
             });
-    if has_unsupported_trigger || has_unsupported_selector {
+    let has_unsupported_action =
+        rule.get("do")
+            .and_then(toml::Value::as_array)
+            .is_some_and(|actions| {
+                actions.iter().any(|action| {
+                    action
+                        .as_table()
+                        .and_then(|action| action.get("action"))
+                        .and_then(toml::Value::as_str)
+                        .is_some_and(|action| !matches!(action, "stop" | "send"))
+                })
+            });
+    if has_unsupported_trigger || has_unsupported_selector || has_unsupported_action {
         return Err(Error::new(
             "unsupported",
-            "rule uses a trigger or option not supported in this increment",
+            "rule uses a trigger, action or option not supported in this increment",
         ));
     }
     Ok(())
@@ -379,13 +441,6 @@ fn validate_rule(rule: &mut RuleDefinition) -> Result<(), Error> {
         ));
     }
     let action = &rule.actions[0];
-    if action.action != "stop" {
-        return Err(Error::new(
-            "unsupported",
-            "only the stop action is supported",
-        ));
-    }
-
     if let Some(event) = rule.trigger.event.clone() {
         if rule.trigger.has_timer_fields() {
             return Err(Error::new(
@@ -434,7 +489,7 @@ fn validate_rule(rule: &mut RuleDefinition) -> Result<(), Error> {
     };
     schedule.validate()?;
     rule.schedule = Some(schedule);
-    timer_stop_action(rule)?;
+    timer_action(rule)?;
     Ok(())
 }
 
@@ -500,19 +555,19 @@ fn is_match_scalar(value: &Value) -> bool {
     )
 }
 
-fn validate_event_action(action: &StopActionDefinition) -> Result<(), Error> {
+fn validate_event_action(action: &ActionDefinition) -> Result<(), Error> {
     let target = action
-        .target
+        .target()
         .as_str()
-        .ok_or_else(|| Error::new("invalid", "stop action requires a string target"))?;
+        .ok_or_else(|| Error::new("invalid", "Agent action requires a string target"))?;
     validate_template(target, true)?;
-    match &action.expected_generation {
+    match action.expected_generation() {
         Value::String(value) => {
-            validate_template(value, false)?;
-            if !is_whole_template(value) {
+            let parts = parse_template(value)?;
+            if !is_whole_template(&parts) {
                 return Err(Error::new(
                     "invalid",
-                    "stop generation must be a nonnegative integer or whole-value template",
+                    "action generation must be a nonnegative integer or whole-value template",
                 ));
             }
         }
@@ -520,86 +575,146 @@ fn validate_event_action(action: &StopActionDefinition) -> Result<(), Error> {
         _ => {
             return Err(Error::new(
                 "invalid",
-                "stop generation must be nonnegative or a whole-value template",
+                "action generation must be nonnegative or a whole-value template",
             ));
         }
+    }
+    if let ActionDefinition::Send { text, .. } = action {
+        validate_text_template(text, true)?;
     }
     Ok(())
 }
 
-fn timer_stop_action(rule: &RuleDefinition) -> Result<StopAction, Error> {
+fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
     let action = rule
         .actions
         .first()
-        .ok_or_else(|| Error::new("invalid", "rule has no stop action"))?;
+        .ok_or_else(|| Error::new("invalid", "rule has no action"))?;
     let target = action
-        .target
+        .target()
         .as_str()
-        .ok_or_else(|| Error::new("invalid", "timer stop target must be a string"))?;
-    if target.contains("${") || target.contains('}') {
+        .ok_or_else(|| Error::new("invalid", "timer action target must be a string"))?;
+    if has_templates(&parse_template(target)?) {
         return Err(Error::new(
             "invalid",
-            "timer stop target cannot use templates without event data",
+            "timer action target cannot use templates without event data",
         ));
     }
     ensure_agent_id_capacity(target.len())?;
     parse_agent_id(target)
-        .map_err(|_| Error::new("invalid", "timer stop target is not a canonical Agent id"))?;
+        .map_err(|_| Error::new("invalid", "timer action target is not a canonical Agent id"))?;
     let expected_generation = action
-        .expected_generation
+        .expected_generation()
         .as_i64()
         .filter(|generation| *generation >= 0)
         .ok_or_else(|| {
             Error::new(
                 "invalid",
-                "timer stop generation must be a nonnegative integer without templates",
+                "timer action generation must be a nonnegative integer without templates",
             )
         })?;
-    Ok(StopAction {
-        target: target.to_owned(),
+    let args = match action {
+        ActionDefinition::Stop { .. } => json!({}),
+        ActionDefinition::Send { text, .. } => {
+            validate_text_template(text, false)?;
+            json!({"text": text.as_str().expect("validated send text")})
+        }
+    };
+    Ok(submit_command(
+        action.verb(),
+        target.to_owned(),
         expected_generation,
-    })
+        args,
+    ))
+}
+
+fn submit_command(verb: &str, target: String, generation: i64, args: Value) -> SubmitCommand {
+    SubmitCommand {
+        id: String::new(),
+        target: Some(target),
+        verb: verb.to_owned(),
+        args,
+        expected_generation: Some(generation),
+        expected_turn_id: None,
+        request_id: None,
+        probe: false,
+    }
+}
+
+fn validate_text_template(value: &Value, allow_templates: bool) -> Result<(), Error> {
+    let text = value
+        .as_str()
+        .ok_or_else(|| Error::new("invalid", "send action text must be a string"))?;
+    if text.len() > MAX_EVENT_BYTES {
+        return Err(Error::new(
+            "invalid",
+            "send action text exceeds the 64 KiB persisted-text bound",
+        ));
+    }
+    let parts = parse_template(text)?;
+    if !allow_templates && has_templates(&parts) {
+        Err(Error::new(
+            "invalid",
+            "timer send text cannot use templates without event data",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_template(value: &str, embedded: bool) -> Result<(), Error> {
-    if value.matches("${").count() != value.matches('}').count() {
+    let parts = parse_template(value)?;
+    if !embedded && has_templates(&parts) && !is_whole_template(&parts) {
         return Err(Error::new(
             "invalid",
-            "rule template has an unmatched delimiter",
-        ));
-    }
-    let mut rest = value;
-    let mut found = false;
-    while let Some(start) = rest.find("${") {
-        found = true;
-        let after = &rest[start + 2..];
-        let Some(end) = after.find('}') else {
-            return Err(Error::new("invalid", "rule template is unterminated"));
-        };
-        let path = &after[..end];
-        validate_path(path)?;
-        rest = &after[end + 1..];
-    }
-    if value.contains('}') && !found {
-        return Err(Error::new(
-            "invalid",
-            "rule template has an unmatched delimiter",
-        ));
-    }
-    if found && !embedded && !is_whole_template(value) {
-        return Err(Error::new(
-            "invalid",
-            "stop generation templates must occupy the whole value",
+            "generation templates must occupy the whole value",
         ));
     }
     Ok(())
 }
 
-fn is_whole_template(value: &str) -> bool {
-    value
-        .strip_prefix("${")
-        .and_then(|inner| inner.strip_suffix('}'))
-        .is_some_and(|path| !path.is_empty() && !path.contains('{') && !path.contains('}'))
+#[derive(Clone, Copy, Debug)]
+enum TemplatePart<'a> {
+    Literal(&'a str),
+    Placeholder(&'a str),
+}
+
+fn parse_template(value: &str) -> Result<Vec<TemplatePart<'_>>, Error> {
+    let mut parts = Vec::new();
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        if start > 0 {
+            parts.push(TemplatePart::Literal(&rest[..start]));
+        }
+        let after = &rest[start + 2..];
+        let end = after
+            .find('}')
+            .ok_or_else(|| Error::new("invalid", "rule template is unterminated"))?;
+        let path = &after[..end];
+        if path.contains("${") {
+            return Err(Error::new(
+                "invalid",
+                "rule template cannot nest placeholders",
+            ));
+        }
+        validate_path(path)?;
+        parts.push(TemplatePart::Placeholder(path));
+        rest = &after[end + 1..];
+    }
+    if !rest.is_empty() {
+        parts.push(TemplatePart::Literal(rest));
+    }
+    Ok(parts)
+}
+
+fn has_templates(parts: &[TemplatePart<'_>]) -> bool {
+    parts
+        .iter()
+        .any(|part| matches!(part, TemplatePart::Placeholder(_)))
+}
+
+fn is_whole_template(parts: &[TemplatePart<'_>]) -> bool {
+    matches!(parts, [TemplatePart::Placeholder(_)])
 }
 
 fn validate_path(path: &str) -> Result<(), Error> {
@@ -682,35 +797,32 @@ fn lookup<'a>(
 fn render_agent_target(value: &Value, roots: &TemplateRoots<'_>) -> Result<String, Error> {
     let source = value
         .as_str()
-        .ok_or_else(|| Error::new("invalid", "stop action requires a string target"))?;
-    if is_whole_template(source) {
-        let path = &source[2..source.len() - 1];
+        .ok_or_else(|| Error::new("invalid", "Agent action requires a string target"))?;
+    let parts = parse_template(source)?;
+    if let [TemplatePart::Placeholder(path)] = parts.as_slice() {
         let target = lookup(path, roots.event, roots.subject, roots.data)
             .and_then(Value::as_str)
-            .ok_or_else(|| Error::new("invalid", "stop target template is unavailable"))?;
+            .ok_or_else(|| Error::new("invalid", "action target template is unavailable"))?;
         ensure_agent_id_capacity(target.len())?;
         return Ok(target.to_owned());
     }
-    if !source.contains("${") {
+    if !has_templates(&parts) {
         ensure_agent_id_capacity(source.len())?;
         return Ok(source.to_owned());
     }
 
     let mut rendered = String::new();
-    let mut rest = source;
-    while let Some(start) = rest.find("${") {
-        push_agent_id_fragment(&mut rendered, &rest[..start])?;
-        let after = &rest[start + 2..];
-        let end = after
-            .find('}')
-            .ok_or_else(|| Error::new("invalid", "rule template is unterminated"))?;
-        let value = lookup(&after[..end], roots.event, roots.subject, roots.data)
-            .ok_or_else(|| Error::new("invalid", "rule template value is unavailable"))?;
-        let text = scalar_text(value)?;
-        push_agent_id_fragment(&mut rendered, text.as_ref())?;
-        rest = &after[end + 1..];
+    for part in parts {
+        match part {
+            TemplatePart::Literal(text) => push_agent_id_fragment(&mut rendered, text)?,
+            TemplatePart::Placeholder(path) => {
+                let value = lookup(path, roots.event, roots.subject, roots.data)
+                    .ok_or_else(|| Error::new("invalid", "rule template value is unavailable"))?;
+                let text = scalar_text(value)?;
+                push_agent_id_fragment(&mut rendered, text.as_ref())?;
+            }
+        }
     }
-    push_agent_id_fragment(&mut rendered, rest)?;
     Ok(rendered)
 }
 
@@ -718,7 +830,7 @@ fn ensure_agent_id_capacity(length: usize) -> Result<(), Error> {
     if length > MAX_AGENT_ID_BYTES {
         return Err(Error::new(
             "invalid",
-            "rendered stop target exceeds Agent id bounds",
+            "rendered action target exceeds Agent id bounds",
         ));
     }
     Ok(())
@@ -728,24 +840,11 @@ fn push_agent_id_fragment(target: &mut String, fragment: &str) -> Result<(), Err
     if fragment.len() > MAX_AGENT_ID_BYTES.saturating_sub(target.len()) {
         return Err(Error::new(
             "invalid",
-            "rendered stop target exceeds Agent id bounds",
+            "rendered action target exceeds Agent id bounds",
         ));
     }
     target.push_str(fragment);
     Ok(())
-}
-
-fn render_generation(value: &Value, roots: &TemplateRoots<'_>) -> Result<Value, Error> {
-    let Some(source) = value.as_str() else {
-        return Ok(value.clone());
-    };
-    let path = source
-        .strip_prefix("${")
-        .and_then(|inner| inner.strip_suffix('}'))
-        .ok_or_else(|| Error::new("invalid", "stop generation template is malformed"))?;
-    lookup(path, roots.event, roots.subject, roots.data)
-        .cloned()
-        .ok_or_else(|| Error::new("invalid", "stop generation template is unavailable"))
 }
 
 fn scalar_text(value: &Value) -> Result<Cow<'_, str>, Error> {
@@ -761,6 +860,74 @@ fn scalar_text(value: &Value) -> Result<Cow<'_, str>, Error> {
     }
 }
 
+fn render_generation(value: &Value, roots: &TemplateRoots<'_>) -> Result<Value, Error> {
+    let Some(source) = value.as_str() else {
+        return Ok(value.clone());
+    };
+    let parts = parse_template(source)?;
+    let [TemplatePart::Placeholder(path)] = parts.as_slice() else {
+        return Err(Error::new(
+            "invalid",
+            "action generation template must occupy the whole value",
+        ));
+    };
+    lookup(path, roots.event, roots.subject, roots.data)
+        .cloned()
+        .ok_or_else(|| Error::new("invalid", "action generation template is unavailable"))
+}
+
+fn render_text(value: &Value, roots: &TemplateRoots<'_>) -> Result<String, Error> {
+    let source = value
+        .as_str()
+        .ok_or_else(|| Error::new("invalid", "send action text must be a string"))?;
+    let parts = parse_template(source)?;
+    if let [TemplatePart::Placeholder(path)] = parts.as_slice() {
+        let text = lookup(path, roots.event, roots.subject, roots.data)
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                Error::new(
+                    "invalid",
+                    "send text template is unavailable or not a string",
+                )
+            })?;
+        if text.len() > MAX_EVENT_BYTES {
+            return Err(Error::new(
+                "invalid",
+                "rendered send text exceeds the 64 KiB persisted-text bound",
+            ));
+        }
+        return Ok(text.to_owned());
+    }
+
+    let mut rendered = String::new();
+    for part in parts {
+        let fragment = match part {
+            TemplatePart::Literal(text) => text,
+            TemplatePart::Placeholder(path) => lookup(path, roots.event, roots.subject, roots.data)
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    Error::new(
+                        "invalid",
+                        "send text template is unavailable or not a string",
+                    )
+                })?,
+        };
+        push_bounded_text(&mut rendered, fragment)?;
+    }
+    Ok(rendered)
+}
+
+fn push_bounded_text(target: &mut String, fragment: &str) -> Result<(), Error> {
+    if fragment.len() > MAX_EVENT_BYTES.saturating_sub(target.len()) {
+        return Err(Error::new(
+            "invalid",
+            "rendered send text exceeds the 64 KiB persisted-text bound",
+        ));
+    }
+    target.push_str(fragment);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -772,6 +939,13 @@ mod tests {
 id = 'stop-on-result'
 on = { event = 'turn.completed', match = { 'subject.harness' = 'fake' } }
 do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${event.generation}' }]
+"#;
+
+    const SEND_RULE: &str = r#"
+[[rule]]
+id = 'send-on-result'
+on = { event = 'turn.completed' }
+do = [{ action = 'send', target = '${event.agent}', expected_generation = '${event.generation}', text = 'Result: ${data.status}' }]
 "#;
 
     const INTERVAL_TIMER: &str = r#"
@@ -840,7 +1014,7 @@ do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${eve
         );
 
         let unsupported = [
-            RULE.replace("action = 'stop'", "action = 'send'"),
+            RULE.replace("action = 'stop'", "action = 'run'"),
             RULE.replace("'subject.harness' = 'fake'", "'subject.labels.role' = 'writer'"),
             RULE.replace("'subject.harness' = 'fake'", "'event.parent' = 'command-id'"),
             RULE.replace(
@@ -852,6 +1026,12 @@ do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${eve
             let error = load(Cursor::new(source)).expect_err("unsupported rule shape");
             assert_eq!(error.code, "unsupported");
         }
+
+        let missing_send_text = RULE.replace("action = 'stop'", "action = 'send'");
+        assert_eq!(
+            load(Cursor::new(missing_send_text)).unwrap_err().code,
+            "invalid"
+        );
 
         let unknown = RULE.replace(
             "id = 'stop-on-result'",
@@ -881,11 +1061,192 @@ do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${eve
     #[test]
     fn whole_generation_template_keeps_integer_type() {
         let rule = load(Cursor::new(RULE)).unwrap().remove(0);
-        let action = evaluate(&rule, &event())
+        let command = evaluate(&rule, &event())
             .unwrap()
             .expect("matching stop action");
-        assert_eq!(action.target, "a7");
-        assert_eq!(action.expected_generation, 3);
+        assert_eq!(command.id, "");
+        assert_eq!(command.verb, "stop");
+        assert_eq!(command.target.as_deref(), Some("a7"));
+        assert_eq!(command.expected_generation, Some(3));
+        assert_eq!(command.args, json!({}));
+        assert_eq!(command.expected_turn_id, None);
+        assert_eq!(command.request_id, None);
+        assert!(!command.probe);
+    }
+
+    #[test]
+    fn send_action_renders_bounded_text_with_exact_event_binding() {
+        let rule = load(Cursor::new(SEND_RULE)).unwrap().remove(0);
+        let command = evaluate(&rule, &event())
+            .unwrap()
+            .expect("matching send action");
+        assert_eq!(command.id, "");
+        assert_eq!(command.verb, "send");
+        assert_eq!(command.target.as_deref(), Some("a7"));
+        assert_eq!(command.expected_generation, Some(3));
+        assert_eq!(command.args, json!({"text":"Result: completed"}));
+        assert_eq!(command.expected_turn_id, None);
+        assert_eq!(command.request_id, None);
+
+        let exact = SEND_RULE.replace("text = 'Result: ${data.status}'", "text = '${data.large}'");
+        let exact = load(Cursor::new(exact)).unwrap().remove(0);
+        let mut event = event();
+        event.data["large"] = Value::String("é".repeat(MAX_EVENT_BYTES / 2));
+        let command = evaluate(&exact, &event).unwrap().unwrap();
+        assert_eq!(
+            command.args["text"].as_str().unwrap().len(),
+            MAX_EVENT_BYTES
+        );
+
+        let oversized =
+            SEND_RULE.replace("text = 'Result: ${data.status}'", "text = 'x${data.large}'");
+        let oversized = load(Cursor::new(oversized)).unwrap().remove(0);
+        let error = evaluate(&oversized, &event).unwrap_err();
+        assert_eq!(error.code, "invalid");
+        assert_eq!(
+            error.message,
+            "rendered send text exceeds the 64 KiB persisted-text bound"
+        );
+    }
+
+    #[test]
+    fn event_and_timer_literal_text_use_the_utf8_persisted_text_bound() {
+        let at_limit = "é".repeat(MAX_EVENT_BYTES / 2);
+        let over_limit = format!("{at_limit}é");
+
+        let event_at_limit = SEND_RULE.replace(
+            "text = 'Result: ${data.status}'",
+            &format!("text = '{at_limit}'"),
+        );
+        assert!(load(Cursor::new(event_at_limit)).is_ok());
+        let event_over_limit = SEND_RULE.replace(
+            "text = 'Result: ${data.status}'",
+            &format!("text = '{over_limit}'"),
+        );
+        assert_eq!(
+            load(Cursor::new(event_over_limit)).unwrap_err().code,
+            "invalid"
+        );
+
+        let timer_at_limit = INTERVAL_TIMER.replace(
+            "action = 'stop'",
+            &format!("action = 'send', text = '{at_limit}'"),
+        );
+        assert!(load(Cursor::new(timer_at_limit)).is_ok());
+        let timer_over_limit = INTERVAL_TIMER.replace(
+            "action = 'stop'",
+            &format!("action = 'send', text = '{over_limit}'"),
+        );
+        assert_eq!(
+            load(Cursor::new(timer_over_limit)).unwrap_err().code,
+            "invalid"
+        );
+    }
+
+    #[test]
+    fn plain_json_braces_are_literal_for_event_timer_and_saved_rules() {
+        let event_source = SEND_RULE.replace(
+            "text = 'Result: ${data.status}'",
+            "text = 'Return JSON: {}'",
+        );
+        let event_rule = load(Cursor::new(event_source)).unwrap().remove(0);
+        let event_saved = serde_json::to_string(&event_rule).unwrap();
+        let restored_event = RuleDefinition::deserialize_saved(&event_saved).unwrap();
+        assert_eq!(
+            restored_event.semantic_digest().unwrap(),
+            event_rule.semantic_digest().unwrap()
+        );
+        assert_eq!(
+            evaluate(&restored_event, &event()).unwrap().unwrap().args,
+            json!({"text":"Return JSON: {}"})
+        );
+
+        let timer_source = INTERVAL_TIMER.replace(
+            "action = 'stop'",
+            "action = 'send', text = 'Return JSON: {}'",
+        );
+        let timer_rule = load(Cursor::new(timer_source)).unwrap().remove(0);
+        let timer_saved = serde_json::to_string(&timer_rule).unwrap();
+        let restored_timer = RuleDefinition::deserialize_saved(&timer_saved).unwrap();
+        assert_eq!(
+            restored_timer.semantic_digest().unwrap(),
+            timer_rule.semantic_digest().unwrap()
+        );
+        assert_eq!(
+            restored_timer.evaluate_timer().unwrap().args,
+            json!({"text":"Return JSON: {}"})
+        );
+    }
+
+    #[test]
+    fn malformed_or_unknown_placeholders_remain_invalid() {
+        let unterminated = SEND_RULE.replace(
+            "text = 'Result: ${data.status}'",
+            "text = 'Result: ${data.status'",
+        );
+        assert_eq!(load(Cursor::new(unterminated)).unwrap_err().code, "invalid");
+
+        let unknown_root = SEND_RULE.replace(
+            "text = 'Result: ${data.status}'",
+            "text = '${agent.turn_id}'",
+        );
+        assert_eq!(load(Cursor::new(unknown_root)).unwrap_err().code, "invalid");
+    }
+
+    #[test]
+    fn action_templates_keep_json_types_and_require_event_time_binding() {
+        let numeric_text = SEND_RULE.replace(
+            "text = 'Result: ${data.status}'",
+            "text = '${event.generation}'",
+        );
+        let numeric_text = load(Cursor::new(numeric_text)).unwrap().remove(0);
+        assert_eq!(
+            evaluate(&numeric_text, &event()).unwrap_err().code,
+            "invalid"
+        );
+
+        let numeric_target = RULE.replace(
+            "target = '${event.agent}'",
+            "target = 'a${event.generation}'",
+        );
+        let numeric_target = load(Cursor::new(numeric_target)).unwrap().remove(0);
+        let mut target_event = event();
+        target_event.agent = Some("a1".to_owned());
+        target_event.generation = Some(1);
+        let command = evaluate(&numeric_target, &target_event).unwrap().unwrap();
+        assert_eq!(command.target.as_deref(), Some("a1"));
+        assert_eq!(command.expected_generation, Some(1));
+
+        let string_generation = RULE.replace(
+            "expected_generation = '${event.generation}'",
+            "expected_generation = '${data.generation}'",
+        );
+        let string_generation = load(Cursor::new(string_generation)).unwrap().remove(0);
+        let mut generation_event = event();
+        generation_event.data["generation"] = Value::String("3".to_owned());
+        assert_eq!(
+            evaluate(&string_generation, &generation_event)
+                .unwrap_err()
+                .code,
+            "invalid"
+        );
+
+        let mismatched_target = RULE.replace("target = '${event.agent}'", "target = 'a8'");
+        let mismatched_target = load(Cursor::new(mismatched_target)).unwrap().remove(0);
+        assert_eq!(
+            evaluate(&mismatched_target, &event()).unwrap_err().code,
+            "invalid"
+        );
+
+        let mismatched_generation = RULE.replace(
+            "expected_generation = '${event.generation}'",
+            "expected_generation = 4",
+        );
+        let mismatched_generation = load(Cursor::new(mismatched_generation)).unwrap().remove(0);
+        assert_eq!(
+            evaluate(&mismatched_generation, &event()).unwrap_err().code,
+            "invalid"
+        );
     }
 
     #[test]
@@ -902,11 +1263,12 @@ do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${eve
         command_event.kind = "command.applied".to_owned();
         command_event.agent = Some("a2".to_owned());
         command_event.data = json!({"verb":"launch"});
-        let stop = evaluate(&restored, &command_event)
+        let command = evaluate(&restored, &command_event)
             .unwrap()
             .expect("all exact/glob/regex/one_of/exists conditions match");
-        assert_eq!(stop.target, "a2");
-        assert_eq!(stop.expected_generation, 3);
+        assert_eq!(command.target.as_deref(), Some("a2"));
+        assert_eq!(command.expected_generation, Some(3));
+        assert_eq!(command.verb, "stop");
 
         let bad_regex = OPERATOR_RULE.replace("re:^launch$", "re:[");
         assert_eq!(load(Cursor::new(bad_regex)).unwrap_err().code, "invalid");
@@ -948,7 +1310,10 @@ do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${eve
             rule: Some("prior-rule".to_owned()),
             depth: 4,
         });
-        assert_eq!(evaluate(&rule, &event).unwrap().unwrap().target, "a7");
+        assert_eq!(
+            evaluate(&rule, &event).unwrap().unwrap().target.as_deref(),
+            Some("a7")
+        );
     }
 
     #[test]
@@ -967,7 +1332,7 @@ do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${eve
         assert_eq!(error.code, "invalid");
         assert_eq!(
             error.message,
-            "rendered stop target exceeds Agent id bounds"
+            "rendered action target exceeds Agent id bounds"
         );
     }
 
@@ -987,7 +1352,37 @@ do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${eve
     }
 
     #[test]
-    fn timer_on_forms_parse_to_core_schedules_and_literal_stop() {
+    fn saved_stop_action_json_and_semantic_digest_stay_compatible() {
+        let definition = load(Cursor::new(RULE)).unwrap().remove(0);
+        let value = serde_json::to_value(&definition).unwrap();
+        assert_eq!(
+            value["do"][0],
+            json!({
+                "action":"stop",
+                "target":"${event.agent}",
+                "expected_generation":"${event.generation}"
+            })
+        );
+        let digest = definition.semantic_digest().unwrap();
+        let digest = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            digest,
+            "b68d1cf0d2b630f1cf20eb5e4df911c58412d4265c4723bba494978f2a121d5f"
+        );
+
+        let saved = serde_json::to_string(&definition).unwrap();
+        let restored = RuleDefinition::deserialize_saved(&saved).unwrap();
+        assert_eq!(
+            restored.semantic_digest().unwrap(),
+            definition.semantic_digest().unwrap()
+        );
+    }
+
+    #[test]
+    fn timer_on_forms_parse_to_core_schedules_and_literal_commands() {
         let interval = load(Cursor::new(INTERVAL_TIMER)).unwrap().remove(0);
         assert_eq!(
             interval.schedule(),
@@ -997,13 +1392,20 @@ do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${eve
             })
         );
         assert_eq!(interval.catch_up(), &CatchUp::None);
-        assert_eq!(
-            interval.evaluate_timer().unwrap(),
-            StopAction {
-                target: "a7".to_owned(),
-                expected_generation: 3,
-            }
-        );
+        let command = interval.evaluate_timer().unwrap();
+        assert_eq!(command.verb, "stop");
+        assert_eq!(command.target.as_deref(), Some("a7"));
+        assert_eq!(command.expected_generation, Some(3));
+        assert_eq!(command.args, json!({}));
+
+        let timer_send =
+            INTERVAL_TIMER.replace("action = 'stop'", "action = 'send', text = 'timer is due'");
+        let timer_send = load(Cursor::new(timer_send)).unwrap().remove(0);
+        let command = timer_send.evaluate_timer().unwrap();
+        assert_eq!(command.verb, "send");
+        assert_eq!(command.target.as_deref(), Some("a7"));
+        assert_eq!(command.expected_generation, Some(3));
+        assert_eq!(command.args, json!({"text":"timer is due"}));
 
         let cron = load(Cursor::new(CRON_TIMER)).unwrap().remove(0);
         assert!(matches!(
@@ -1075,6 +1477,15 @@ do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${eve
     fn timer_rejects_unresolved_templates_and_mixed_trigger_forms() {
         let templated = INTERVAL_TIMER.replace("target = 'a7'", "target = '${event.agent}'");
         assert_eq!(load(Cursor::new(templated)).unwrap_err().code, "invalid");
+
+        let templated_text = INTERVAL_TIMER.replace(
+            "action = 'stop'",
+            "action = 'send', text = '${data.message}'",
+        );
+        assert_eq!(
+            load(Cursor::new(templated_text)).unwrap_err().code,
+            "invalid"
+        );
 
         let mixed = INTERVAL_TIMER.replace("every = '30m'", "every = '30m', cron = '0 12 * * *'");
         assert_eq!(load(Cursor::new(mixed)).unwrap_err().code, "invalid");

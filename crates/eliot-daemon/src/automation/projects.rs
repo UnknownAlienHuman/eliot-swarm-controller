@@ -9,6 +9,7 @@ use crate::{
     workspace_git::WorkspaceGit,
 };
 use eliot_core::{Error, Result};
+use serde_json::Value;
 use std::{fs, io::ErrorKind, path::Path};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,20 +57,46 @@ pub(super) async fn load_project_rules(
     reject_links(&checkout.join(".eliot").join("rules"))?;
     let snapshot = super::reload::load_project(checkout)?;
     verify_registration(data_root, &registration).await?;
-    if !snapshot.definitions.is_empty()
-        && !registration.actions.iter().any(|action| action == "stop")
-    {
-        return Err(Error::new(
-            "not_allowed",
-            "project rules require owner approval for the stop action",
-        ));
-    }
+    validate_project_rule_actions(&snapshot.inputs, &registration)?;
 
     Ok(LoadedProjectRules {
         principal: format!("project:{}", registration.id),
         registration,
         snapshot,
     })
+}
+
+fn validate_project_rule_actions(
+    inputs: &[eliot_store::RuleDefinitionInput],
+    registration: &RegistrationSnapshot,
+) -> Result<()> {
+    for input in inputs {
+        let definition: Value = serde_json::from_str(&input.canonical_definition)
+            .map_err(|_| Error::new("source_integrity", "project rule definition is invalid"))?;
+        let actions = definition
+            .get("do")
+            .and_then(Value::as_array)
+            .ok_or_else(|| Error::new("source_integrity", "project rule actions are missing"))?;
+        for action in actions {
+            let action_name = action
+                .get("action")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    Error::new("source_integrity", "project rule action kind is missing")
+                })?;
+            if !registration
+                .actions
+                .iter()
+                .any(|approved| approved == action_name)
+            {
+                return Err(Error::new(
+                    "not_allowed",
+                    "project rule action is not approved by its registration",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Re-read owner policy and Git identity before registration-dependent dispatch.
@@ -324,6 +351,65 @@ mod tests {
             verify_registration(&fixture.data_root, &approved)
                 .await
                 .expect_err("action approval changes must invalidate the snapshot")
+                .code,
+            "not_allowed"
+        );
+    }
+
+    #[test]
+    fn project_action_config_allows_send_and_rejects_unimplemented_actions() {
+        let fixture = ProjectFixture::new();
+        let checkout = fixture.root.join("registered");
+        fs::create_dir(&checkout).expect("create config checkout placeholder");
+        fixture.write_registration(&checkout, Some(&["fake"]), Some(&["send"]));
+
+        let configured = config::load_project_registration_config(&fixture.data_root)
+            .expect("send is an implemented project action");
+        assert_eq!(configured[0].actions, ["send"]);
+
+        fixture.write_registration(&checkout, Some(&["fake"]), Some(&["sendfile"]));
+        assert_eq!(
+            config::load_project_registration_config(&fixture.data_root)
+                .expect_err("unimplemented sendfile must not be granted")
+                .code,
+            "profile_error"
+        );
+    }
+
+    #[test]
+    fn project_rule_loader_allows_approved_send_and_denies_unapproved_actions() {
+        let registration = RegistrationSnapshot {
+            id: "app".to_owned(),
+            checkout: "C:/registered".to_owned(),
+            repo_common_dir: "C:/registered/.git".to_owned(),
+            profiles: vec!["fake".to_owned()],
+            actions: vec!["send".to_owned()],
+        };
+        let input = |action: &str| eliot_store::RuleDefinitionInput {
+            id: "send-rule".to_owned(),
+            canonical_definition: serde_json::to_string(&serde_json::json!({
+                "do": [{ "action": action }]
+            }))
+            .expect("encode canonical rule actions"),
+            definition_digest: [0; 32],
+            enabled: true,
+        };
+
+        validate_project_rule_actions(&[input("send")], &registration)
+            .expect("owner-approved send action is permitted");
+        let unapproved_send = RegistrationSnapshot {
+            actions: vec!["stop".to_owned()],
+            ..registration.clone()
+        };
+        assert_eq!(
+            validate_project_rule_actions(&[input("send")], &unapproved_send)
+                .expect_err("send without owner approval is denied")
+                .code,
+            "not_allowed"
+        );
+        assert_eq!(
+            validate_project_rule_actions(&[input("sendfile")], &registration)
+                .expect_err("unimplemented sendfile action is denied")
                 .code,
             "not_allowed"
         );

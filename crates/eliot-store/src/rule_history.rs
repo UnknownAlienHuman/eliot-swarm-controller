@@ -208,8 +208,19 @@ impl Store {
                 suppressed.push(action.event_seq);
                 continue;
             }
-            if let Some(code) = stop_binding_error(&trigger, &action.request) {
+            if let Some(code) = rule_action_binding_error(&trigger, &action.request) {
                 rejected.push((action.event_seq, code));
+                continue;
+            }
+            if should_suppress_own_event_send_tx(
+                &tx,
+                principal,
+                &request.rule,
+                &stored.canonical_definition,
+                &action.request,
+                trigger.cause.as_ref(),
+            )? {
+                suppressed.push(action.event_seq);
                 continue;
             }
             if let Err(error) = validate_project_rule_action_tx(&tx, principal, &action.request) {
@@ -220,7 +231,7 @@ impl Store {
                 return Err(error);
             }
             let target = action.request.target.as_deref().ok_or_else(|| {
-                Error::new("invalid", "rule catch-up stop has no frozen Agent target")
+                Error::new("invalid", "rule catch-up action has no frozen Agent target")
             })?;
             let (scoped_count, global_count) =
                 rule_action_counts(&tx, principal, &request.rule, Some(target), &limit, now)?;
@@ -250,8 +261,8 @@ impl Store {
                     "a deterministic rule action for this event already exists",
                 ));
             }
-            let mut stop = action.request.clone();
-            stop.id = child_id.clone();
+            let mut child_request = action.request.clone();
+            child_request.id = child_id.clone();
             let cause = core::EventCause {
                 command_id: child_id.clone(),
                 rule: Some(request.rule.clone()),
@@ -260,7 +271,7 @@ impl Store {
             planned.push(PlannedAction {
                 event_seq: action.event_seq,
                 child_id,
-                request: stop,
+                request: child_request,
                 cause,
             });
             *scoped_added.entry(bucket).or_default() += 1;

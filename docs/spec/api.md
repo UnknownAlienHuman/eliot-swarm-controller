@@ -133,6 +133,11 @@ admission. Same-ID replay returns that result before current gates without repea
 effect. See the exact range and retention semantics in
 [automation](automation.md#retention-and-bounded-backlog).
 
+For a rule `send`, the retained Core `Command.turn_id` identifies the exact associated
+turn; read its result with `agent.result` or `turn.get`. Trigger-specific target binding,
+project fences and `applied` semantics are defined in
+[Connected event rules](automation.md#connected-event-rules).
+
 `timer.get` uses `TimerGetRequest`/`TimerStateView` and reads the selected timer without
 advancing its schedule. `timer.run` accepts `TimerRunRequest { id, rule, project? }`,
 where `id` is the external ULID mutation ID and `rule` is the timer ID. An optional

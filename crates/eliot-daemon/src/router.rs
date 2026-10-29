@@ -542,7 +542,7 @@ impl Router {
                 prepared_request.request.target.as_deref(),
                 prepared_request.request.expected_generation,
             ) {
-                self.verify_project_stop_target(registration, target, generation)
+                self.verify_project_rule_target(registration, target, generation)
                     .await?;
             }
             prepared.push(prepared_request);
@@ -550,7 +550,7 @@ impl Router {
         Ok(prepared)
     }
 
-    async fn verify_project_stop_target(
+    async fn verify_project_rule_target(
         &self,
         registration: &ProjectRegistrationView,
         target: &str,
@@ -1183,17 +1183,7 @@ impl Router {
             return Err(Error::new("unavailable", "automation is draining"));
         }
 
-        let stop = definition.evaluate_timer()?;
-        let command = SubmitCommand {
-            id: String::new(),
-            target: Some(stop.target),
-            verb: "stop".to_owned(),
-            args: json!({}),
-            expected_generation: Some(stop.expected_generation),
-            expected_turn_id: None,
-            request_id: None,
-            probe: false,
-        };
+        let command = definition.evaluate_timer()?;
         let prepared_result = match project_view.as_ref() {
             Some(project) => self.prepare_project_rule_submission(command, project).await,
             None => self.prepare_owner_submission(command).await,
@@ -1267,10 +1257,10 @@ impl Router {
             request: action,
             workspace,
         } = prepared;
-        if action.verb != "stop" || workspace.is_some() {
+        if !matches!(action.verb.as_str(), "stop" | "send") || workspace.is_some() {
             return Err(Error::new(
                 "invalid",
-                "timer firing must contain one prepared stop command",
+                "timer firing must contain one prepared stop or send command",
             ));
         }
         let admission = {
@@ -1574,7 +1564,7 @@ impl Router {
         Ok(change.value)
     }
 
-    pub(crate) async fn admit_rule_stop(
+    pub(crate) async fn admit_rule_action(
         &self,
         principal: &str,
         project: Option<&ProjectRegistrationView>,
@@ -1583,10 +1573,10 @@ impl Router {
         prepared: PreparedSubmission,
     ) -> Result<Option<eliot_store::RuleEventAdmission>> {
         let PreparedSubmission { request, workspace } = prepared;
-        if request.verb != "stop" || workspace.is_some() {
+        if !matches!(request.verb.as_str(), "stop" | "send") || workspace.is_some() {
             return Err(Error::new(
                 "invalid",
-                "rule firing must contain one prepared stop command",
+                "rule firing must contain one prepared stop or send command",
             ));
         }
         let admission = {
@@ -1606,7 +1596,7 @@ impl Router {
                 }
             }
             let admission =
-                store.admit_rule_stop(principal, state, event_seq, request, now_ms())?;
+                store.admit_rule_action(principal, state, event_seq, request, now_ms())?;
             self.publish_locked(&admission.events);
             admission
         };
@@ -2637,7 +2627,7 @@ impl Router {
                 self.reject_undispatched(&id, &error.code).await;
                 return;
             }
-            if command.verb == "stop" {
+            if matches!(command.verb.as_str(), "stop" | "send") {
                 let (Some(target), Some(generation)) =
                     (command.target.as_deref(), command.generation)
                 else {
@@ -2645,7 +2635,7 @@ impl Router {
                     return;
                 };
                 if let Err(error) = self
-                    .verify_project_stop_target(&registration, target, generation)
+                    .verify_project_rule_target(&registration, target, generation)
                     .await
                 {
                     self.reject_undispatched(&id, &error.code).await;
@@ -4273,7 +4263,12 @@ fn is_native_control_verb(verb: &str) -> bool {
 
 fn authorize_command(principal: &Principal, request: &mut SubmitCommand) -> Result<()> {
     if let Principal::ProjectRule { registration } = principal {
-        if request.verb != "stop" || !registration.actions.iter().any(|action| action == "stop") {
+        if !matches!(request.verb.as_str(), "stop" | "send")
+            || !registration
+                .actions
+                .iter()
+                .any(|action| action == &request.verb)
+        {
             return Err(Error::new(
                 "not_allowed",
                 "project rule is not approved for this action",
@@ -4282,7 +4277,7 @@ fn authorize_command(principal: &Principal, request: &mut SubmitCommand) -> Resu
         if request.target.is_none() || request.expected_generation.is_none() {
             return Err(Error::new(
                 "invalid",
-                "project stop requires its frozen Agent and generation",
+                "project action requires its frozen Agent and generation",
             ));
         }
         return Ok(());
@@ -6366,6 +6361,187 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             blocker,
             StatusBlocker::CommandUnsettled { command_id, .. } if command_id == &dispatched_id
         )));
+    }
+
+    #[tokio::test]
+    async fn rule_send_uses_normal_router_preparation_and_dispatch() {
+        let router = router();
+        let mut committed = router.subscribe_rule_events();
+        let rule_id = "send-after-turn";
+        let definition = json!({
+            "id":rule_id,
+            "enabled":true,
+            "allow_self":true,
+            "on":{"event":"turn.completed"},
+            "do":[{"action":"send", "target":"${event.agent}",
+                "expected_generation":"${event.generation}", "text":"follow-up"}],
+        });
+        let input = eliot_store::RuleDefinitionInput {
+            id: rule_id.to_owned(),
+            canonical_definition: serde_json::to_string(&definition).unwrap(),
+            definition_digest: eliot_core::canonical_json_sha256(&definition).unwrap(),
+            enabled: true,
+        };
+
+        let (agent, state) = {
+            let mut store = router.inner.store.lock().await;
+            let launch_id = ulid::Ulid::new().to_string();
+            let mut launch = SubmitCommand::new(launch_id.clone(), "launch");
+            launch.args = json!({
+                "project":"rule-send",
+                "workspace":"synthetic-rule-send-workspace",
+                "harness":"codex",
+                "profile":"synthetic",
+                "profile_snapshot":{},
+            });
+            launch.expected_generation = Some(0);
+            let agent = store
+                .submit("owner", launch, now_ms())
+                .unwrap()
+                .command
+                .target
+                .unwrap();
+            store.dispatch(&launch_id, now_ms()).unwrap();
+            read_fixture_event(
+                &mut store,
+                &agent,
+                "session.ready",
+                json!({"native_scope":"rule-send-scope", "native_ref":"rule-send-ref"}),
+            );
+            store
+                .settle(&launch_id, CommandState::Applied, None, now_ms())
+                .unwrap();
+            let state = store.ensure_rule_state("owner", &input, now_ms()).unwrap();
+            (agent, state)
+        };
+
+        let (trigger_id, event) = {
+            let mut store = router.inner.store.lock().await;
+            let trigger_id = ulid::Ulid::new().to_string();
+            store
+                .submit(
+                    "owner",
+                    SubmitCommand {
+                        id: trigger_id.clone(),
+                        target: Some(agent.clone()),
+                        verb: "send".to_owned(),
+                        args: json!({"text":"source input"}),
+                        expected_generation: Some(1),
+                        expected_turn_id: None,
+                        request_id: None,
+                        probe: false,
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            store.dispatch(&trigger_id, now_ms()).unwrap();
+            read_fixture_event(
+                &mut store,
+                &agent,
+                "turn.started",
+                json!({"command_id":trigger_id, "turn_id":"turn-rule-send"}),
+            );
+            read_fixture_event(
+                &mut store,
+                &agent,
+                "turn.completed",
+                json!({
+                    "command_id":trigger_id,
+                    "turn_id":"turn-rule-send",
+                    "status":"completed",
+                }),
+            );
+            if store
+                .get_command(&trigger_id)
+                .unwrap()
+                .is_some_and(|command| command.state == CommandState::Dispatched)
+            {
+                store
+                    .settle(
+                        &trigger_id,
+                        CommandState::Applied,
+                        Some(json!({"turn_id":"turn-rule-send"})),
+                        now_ms(),
+                    )
+                    .unwrap();
+            }
+            let event = store
+                .read_events(0, 1_000, None)
+                .unwrap()
+                .into_iter()
+                .find(|event| {
+                    event.kind == "turn.completed"
+                        && event.data.get("command_id").and_then(Value::as_str)
+                            == Some(trigger_id.as_str())
+                })
+                .unwrap();
+            (trigger_id, event)
+        };
+        let action = SubmitCommand {
+            id: String::new(),
+            target: event.agent.clone(),
+            verb: "send".to_owned(),
+            args: json!({"text":"follow-up"}),
+            expected_generation: event.generation,
+            expected_turn_id: None,
+            request_id: None,
+            probe: false,
+        };
+        assert_eq!(action.verb, "send");
+        assert_eq!(action.target.as_deref(), Some(agent.as_str()));
+        assert_eq!(action.expected_generation, Some(1));
+        assert_eq!(action.args, json!({"text":"follow-up"}));
+
+        let prepared = router.prepare_owner_submission(action).await.unwrap();
+        let admission = router
+            .admit_rule_action("owner", None, &state, event.seq, prepared)
+            .await
+            .unwrap()
+            .expect("the rule SEND is admitted");
+        assert!(admission.is_new);
+        let child = admission.child.expect("the admitted firing has one child");
+        assert_eq!(child.verb, "send");
+        assert_eq!(child.target.as_deref(), Some(agent.as_str()));
+        assert_eq!(child.generation, Some(1));
+        assert_eq!(child.args, json!({"text":"follow-up"}));
+
+        let mut saw_dispatch = false;
+        loop {
+            let event = committed.recv().await.expect("router event bus stays open");
+            if event.data.get("command_id").and_then(Value::as_str) != Some(child.id.as_str()) {
+                continue;
+            }
+            if event.kind == "command.dispatched" {
+                saw_dispatch = true;
+            }
+            if event.kind == "command.unknown" {
+                break;
+            }
+        }
+        assert!(saw_dispatch);
+        let stored = router
+            .inner
+            .store
+            .lock()
+            .await
+            .get_command(&child.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, CommandState::Unknown);
+        assert_eq!(stored.verb, "send");
+        assert_eq!(stored.args, json!({"text":"follow-up"}));
+        assert_eq!(
+            router
+                .inner
+                .store
+                .lock()
+                .await
+                .get_command(&trigger_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            CommandState::Applied
+        );
     }
 
     #[tokio::test]
