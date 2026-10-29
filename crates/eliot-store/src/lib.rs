@@ -7209,26 +7209,16 @@ fn transition_lost_tx(
             json!({"command_id": command_id, "reason": reason}),
         )?);
     }
-    let pending = pending_command_ids(tx, agent_num, generation)?;
-    for command_id in pending {
-        let outcome = json!({"reason": "generation_lost"});
-        update_command_state(
+    for command_id in pending_command_ids(tx, agent_num, generation)? {
+        cancel_pending_command_tx(
             tx,
+            agent_num,
+            generation,
             &command_id,
-            CommandState::Cancelled,
-            Some(&outcome),
-            None,
+            "generation_lost",
             now,
+            events,
         )?;
-        events.push(insert_daemon_event(
-            tx,
-            now,
-            "command.cancelled",
-            "command",
-            Some(agent_num),
-            Some(generation),
-            json!({"command_id": command_id, "reason": "generation_lost"}),
-        )?);
     }
 
     if let Some(turn_id) = agent.active_turn.as_deref() {
@@ -7310,24 +7300,7 @@ fn fail_start_tx(
         return Ok(());
     }
     for pending_id in pending_command_ids(tx, agent_num, generation)? {
-        let outcome = json!({"reason": reason});
-        update_command_state(
-            tx,
-            &pending_id,
-            CommandState::Cancelled,
-            Some(&outcome),
-            None,
-            now,
-        )?;
-        events.push(insert_daemon_event(
-            tx,
-            now,
-            "command.cancelled",
-            "command",
-            Some(agent_num),
-            Some(generation),
-            json!({"command_id": pending_id, "reason": reason}),
-        )?);
+        cancel_pending_command_tx(tx, agent_num, generation, &pending_id, reason, now, events)?;
     }
     db!(tx.execute(
         "UPDATE agents SET state = 'failed', active_turn = NULL, pending = '[]',
@@ -7353,6 +7326,36 @@ fn fail_start_tx(
         Some(agent_num),
         Some(generation),
         json!({"agent_id": agent.id, "command_id": command_id, "reason": reason}),
+    )?);
+    Ok(())
+}
+
+fn cancel_pending_command_tx(
+    tx: &Transaction<'_>,
+    agent: i64,
+    generation: i64,
+    command_id: &str,
+    reason: &str,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    let outcome = json!({"reason": reason});
+    update_command_state(
+        tx,
+        command_id,
+        CommandState::Cancelled,
+        Some(&outcome),
+        None,
+        now,
+    )?;
+    events.push(insert_daemon_event(
+        tx,
+        now,
+        "command.cancelled",
+        "command",
+        Some(agent),
+        Some(generation),
+        json!({"command_id": command_id, "reason": reason}),
     )?);
     Ok(())
 }
@@ -7500,24 +7503,15 @@ fn stop_agent_tx(
         if pending_id == command_id {
             continue;
         }
-        let outcome = json!({"reason": "generation_stopped"});
-        update_command_state(
+        cancel_pending_command_tx(
             tx,
+            agent_num,
+            generation,
             &pending_id,
-            CommandState::Cancelled,
-            Some(&outcome),
-            None,
+            "generation_stopped",
             now,
+            events,
         )?;
-        events.push(insert_daemon_event(
-            tx,
-            now,
-            "command.cancelled",
-            "command",
-            Some(agent_num),
-            Some(generation),
-            json!({"command_id": pending_id, "reason": "generation_stopped"}),
-        )?);
     }
     if let Some(turn_id) = agent.active_turn.as_deref() {
         db!(tx.execute(
