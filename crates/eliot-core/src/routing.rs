@@ -1,7 +1,7 @@
 //! Frozen nonsecret route and capacity inputs shared by the daemon and plugins.
 //! Validation is pure; credentials are referenced only by environment-variable name.
 
-use crate::{Error, Result};
+use crate::{Agent, Error, Result};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -71,6 +71,124 @@ impl CapacityScope {
         }
         Ok(())
     }
+}
+
+/// Structured provider restriction facts accepted from an exact native result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderRestrictionKind {
+    RateLimit,
+    Quota,
+    Auth,
+    ModelRemoved,
+}
+
+impl ProviderRestrictionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RateLimit => "rate_limit",
+            Self::Quota => "quota",
+            Self::Auth => "auth",
+            Self::ModelRemoved => "model_removed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderRestriction {
+    pub kind: ProviderRestrictionKind,
+    pub retry_after: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderHoldState {
+    Held,
+    Probing,
+}
+
+impl ProviderHoldState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Held => "held",
+            Self::Probing => "probing",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderHold {
+    pub scope: String,
+    pub kind: ProviderRestrictionKind,
+    pub retry_after: Option<i64>,
+    pub probe_command: Option<String>,
+    pub state: ProviderHoldState,
+    pub updated_at: i64,
+}
+
+impl ProviderHold {
+    pub fn validate(&self) -> Result<()> {
+        CapacityScope {
+            scope: self.scope.clone(),
+            max_live: None,
+        }
+        .validate()?;
+        if self.probe_command.as_ref().is_some_and(|command| {
+            command.trim().is_empty()
+                || command.len() > crate::limits::MAX_COMMAND_ID_BYTES
+                || command.chars().any(char::is_control)
+        }) || matches!(self.state, ProviderHoldState::Probing) != self.probe_command.is_some()
+        {
+            return Err(Error::new("invalid", "invalid provider hold state"));
+        }
+        Ok(())
+    }
+}
+
+/// Resolve the hold scope from the Agent's frozen route/account/profile only.
+pub fn frozen_provider_scope(agent: &Agent) -> Result<String> {
+    let snapshot = agent
+        .profile_snapshot
+        .as_object()
+        .ok_or_else(invalid_provider_scope)?;
+
+    let scope = if let Some(binding) = snapshot.get("route_binding") {
+        let binding: RouteBinding =
+            serde_json::from_value(binding.clone()).map_err(|_| invalid_provider_scope())?;
+        binding.validate().map_err(|_| invalid_provider_scope())?;
+        if snapshot
+            .get("proxy")
+            .is_some_and(|proxy| proxy.as_str() != Some(binding.name.as_str()))
+        {
+            return Err(invalid_provider_scope());
+        }
+        format!("proxy:{}", binding.name)
+    } else {
+        if snapshot.contains_key("proxy") {
+            return Err(invalid_provider_scope());
+        }
+        match snapshot.get("account") {
+            Some(account) => format!(
+                "account:{}",
+                account.as_str().ok_or_else(invalid_provider_scope)?
+            ),
+            None => format!("profile:{}", agent.profile),
+        }
+    };
+
+    CapacityScope {
+        scope: scope.clone(),
+        max_live: None,
+    }
+    .validate()
+    .map_err(|_| invalid_provider_scope())?;
+    Ok(scope)
+}
+
+fn invalid_provider_scope() -> Error {
+    Error::new("invalid", "frozen provider scope is invalid")
 }
 
 fn validate_http_url(value: &str) -> std::result::Result<Url, ()> {
@@ -163,7 +281,11 @@ fn invalid_capacity_scope() -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{CapacityScope, RouteBinding};
+    use super::{
+        CapacityScope, ProviderHold, ProviderHoldState, ProviderRestriction,
+        ProviderRestrictionKind, RouteBinding, frozen_provider_scope,
+    };
+    use crate::Agent;
     use serde_json::json;
 
     fn route() -> RouteBinding {
@@ -281,5 +403,101 @@ mod tests {
         assert!(
             serde_json::from_value::<CapacityScope>(json!({"scope":"proxy:x","other":1})).is_err()
         );
+    }
+
+    #[test]
+    fn provider_scope_uses_only_frozen_route_account_then_profile() {
+        let mut agent = Agent::new("a1", "project", "codex", "codex-luna", 0);
+        let binding = route();
+        agent.profile_snapshot = json!({
+            "proxy":"opencodex",
+            "account":"main",
+            "route_binding":binding
+        });
+        assert_eq!(frozen_provider_scope(&agent).unwrap(), "proxy:opencodex");
+
+        agent.profile_snapshot = json!({"account":"main"});
+        assert_eq!(frozen_provider_scope(&agent).unwrap(), "account:main");
+
+        agent.profile_snapshot = json!({});
+        assert_eq!(frozen_provider_scope(&agent).unwrap(), "profile:codex-luna");
+
+        agent.profile_snapshot = json!({"proxy":"opencodex"});
+        assert!(frozen_provider_scope(&agent).is_err());
+    }
+
+    #[test]
+    fn provider_restrictions_and_holds_are_closed_and_probe_bound() {
+        assert_eq!(
+            serde_json::to_value(ProviderRestrictionKind::RateLimit).unwrap(),
+            "rate_limit"
+        );
+        assert_eq!(
+            serde_json::from_value::<ProviderRestrictionKind>(json!("auth")).unwrap(),
+            ProviderRestrictionKind::Auth
+        );
+        assert_eq!(
+            serde_json::from_value::<ProviderRestrictionKind>(json!("model_removed")).unwrap(),
+            ProviderRestrictionKind::ModelRemoved
+        );
+        assert!(
+            serde_json::from_value::<ProviderRestrictionKind>(json!("billing_disabled")).is_err()
+        );
+
+        let restriction = ProviderRestriction {
+            kind: ProviderRestrictionKind::Quota,
+            retry_after: Some(123),
+        };
+        assert_eq!(
+            serde_json::from_value::<ProviderRestriction>(
+                serde_json::to_value(restriction).unwrap()
+            )
+            .unwrap()
+            .retry_after,
+            Some(123)
+        );
+
+        let probing = ProviderHold {
+            scope: "proxy:opencodex".to_owned(),
+            kind: ProviderRestrictionKind::RateLimit,
+            retry_after: Some(123),
+            probe_command: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
+            state: ProviderHoldState::Probing,
+            updated_at: 456,
+        };
+        probing.validate().unwrap();
+        let mut long_probe = probing.clone();
+        long_probe.probe_command = Some("p".repeat(crate::limits::MAX_COMMAND_ID_BYTES + 1));
+        assert!(long_probe.validate().is_err());
+        let mut inconsistent = probing;
+        inconsistent.probe_command = None;
+        assert!(inconsistent.validate().is_err());
+
+        for kind in [
+            ProviderRestrictionKind::Auth,
+            ProviderRestrictionKind::ModelRemoved,
+        ] {
+            let transitional = ProviderHold {
+                scope: "account:main".to_owned(),
+                kind,
+                retry_after: None,
+                probe_command: Some("probe-id".to_owned()),
+                state: ProviderHoldState::Probing,
+                updated_at: 789,
+            };
+            // A stronger native restriction can arrive while the claimed probe is
+            // still unresolved. Transaction policy prevents starting a new one.
+            transitional.validate().unwrap();
+        }
+
+        let removed_probe = ProviderHold {
+            scope: "account:main".to_owned(),
+            kind: ProviderRestrictionKind::ModelRemoved,
+            retry_after: None,
+            probe_command: Some("probe-id".to_owned()),
+            state: ProviderHoldState::Probing,
+            updated_at: 789,
+        };
+        removed_probe.validate().unwrap();
     }
 }

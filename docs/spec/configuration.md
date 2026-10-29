@@ -310,10 +310,13 @@ reservation across daemon replacement. These limits describe Eliot's admitted wo
 not vendor entitlements, account permissions or provider quotas. Fake profiles may use
 named profile/account caps; Fake does not acquire a proxy route.
 
-Provider rate/quota holds and billing/usage discovery are the next connected increment.
-They are not implemented here; hold-management requests remain `unsupported`. Readiness
-and configured capacity do not prove authentication or inference success. No automatic
-provider/model/account fallback is permitted.
+Provider holds are durable Eliot state over the named local scope derived from the frozen
+route, account or profile. They do not infer vendor account identity, entitlement or
+quota. A held scope blocks new launch/send and queued dispatch without native effects;
+plain resume, reads, request replies, interrupt and stop remain available. Resume with
+new text is gated as a linked send. Rate/quota probe and auth/model-removal correction rules are in
+[monitoring](monitoring.md#provider-holds). Holds never trigger automatic route, model
+or account fallback. Billing and usage discovery remain unsupported.
 
 ## Plugins
 

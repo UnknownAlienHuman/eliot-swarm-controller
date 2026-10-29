@@ -52,8 +52,11 @@ normally against the selected provider base URL. A supported absolute
 `model_catalog_url` can direct that request to another host and may cause native client
 authentication to accompany it. The route must pin that URL to the selected provider
 or suppress the catalog refresh before process birth. This vendor-owned catalog read is
-not proof of entitlement or inference. The route must omit the client-key value from the
-metadata reader while retaining it in the reader's redaction policy; the controlled
-process still requires the explicitly configured key. Runtime authentication, inference, billing, and
-auxiliary/subagent traffic remain unverified. No automatic route/account fallback is
-permitted. Provider holds and their management API remain `unsupported` here.
+not proof of entitlement or inference and does not create a provider hold; holds require
+the structured restriction on an exact-bound completed turn. The route must omit the
+client-key value from the metadata reader while retaining it in the reader's redaction
+policy; the controlled process still requires the explicitly configured key. Runtime
+authentication, inference, billing, and auxiliary/subagent traffic remain unverified.
+Provider holds use local Eliot scopes as described in
+[monitoring](../spec/monitoring.md#provider-holds). No automatic route/account fallback
+is permitted.

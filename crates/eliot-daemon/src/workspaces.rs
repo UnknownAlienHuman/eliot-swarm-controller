@@ -847,6 +847,7 @@ impl WorkspaceManager {
                     expected_generation: Some(agent.generation),
                     expected_turn_id: None,
                     request_id: None,
+                    probe: false,
                 };
                 let Ok(admission) = store.submit("owner", request, now_ms()) else {
                     continue;

@@ -110,7 +110,22 @@ mod tests {
             outcome: Some(serde_json::to_value(diagnostic).unwrap()),
             created_at: 0,
             updated_at: 0,
+            probe: false,
         }
+    }
+
+    #[test]
+    fn command_probe_false_keeps_legacy_wire_shape() {
+        let command = command();
+        assert!(!command.probe);
+        let legacy = serde_json::to_value(&command).unwrap();
+        assert!(legacy.get("probe").is_none());
+
+        let decoded: Command = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(!decoded.probe);
+        let mut probe = decoded;
+        probe.probe = true;
+        assert_eq!(serde_json::to_value(probe).unwrap()["probe"], true);
     }
 
     fn turn(agent: &str, generation: i64, id: &str) -> Turn {

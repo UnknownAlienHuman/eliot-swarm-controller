@@ -18,6 +18,7 @@ impl CommandSubmitRequest {
             expected_generation: None,
             expected_turn_id: None,
             request_id: None,
+            probe: false,
         }
     }
 
@@ -26,6 +27,12 @@ impl CommandSubmitRequest {
     pub fn validate(&self) -> Result<()> {
         if !self.args.is_object() {
             return Err(Error::new("invalid", "command args must be a JSON object"));
+        }
+        if self.probe && self.verb != "send" {
+            return Err(Error::new(
+                "unsupported",
+                "provider probes are supported only for send",
+            ));
         }
         Ok(())
     }
@@ -111,7 +118,7 @@ pub struct DaemonShutdownResponse {
     pub store_write_faulted: Option<bool>,
 }
 
-fn nullable<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+pub(super) fn nullable<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
     deserializer: D,
 ) -> std::result::Result<Option<T>, D::Error> {
     Option::<T>::deserialize(deserializer)
@@ -156,6 +163,7 @@ fn present_write_faulted<'de, D: serde::Deserializer<'de>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::canonical_json_sha256;
     use serde_json::json;
 
     #[test]
@@ -182,6 +190,55 @@ mod tests {
     }
 
     #[test]
+    fn probe_false_preserves_legacy_wire_and_digest_and_true_is_send_only() {
+        let request = CommandSubmitRequest::new("raw-id", "send");
+        let legacy_wire = json!({
+            "id":"raw-id",
+            "target":null,
+            "verb":"send",
+            "args":{},
+            "expected_generation":null,
+            "expected_turn_id":null,
+            "request_id":null
+        });
+        let serialized = serde_json::to_value(&request).unwrap();
+        assert_eq!(serialized, legacy_wire);
+        assert_eq!(
+            canonical_json_sha256(&serialized).unwrap(),
+            canonical_json_sha256(&legacy_wire).unwrap()
+        );
+        let explicit_false: CommandSubmitRequest = serde_json::from_value(json!({
+            "id":"raw-id", "verb":"send", "probe":false
+        }))
+        .unwrap();
+        assert_eq!(serde_json::to_value(explicit_false).unwrap(), legacy_wire);
+
+        let mut probe = request.clone();
+        probe.probe = true;
+        probe.validate().unwrap();
+        let probe_wire = serde_json::to_value(&probe).unwrap();
+        assert_eq!(probe_wire["probe"], true);
+        assert_ne!(
+            canonical_json_sha256(&probe_wire).unwrap(),
+            canonical_json_sha256(&legacy_wire).unwrap()
+        );
+
+        for verb in ["launch", "resume", "interrupt", "stop"] {
+            let mut invalid = CommandSubmitRequest::new("raw-id", verb);
+            invalid.probe = true;
+            assert_eq!(invalid.validate().unwrap_err().code, "unsupported");
+        }
+        for bad in [Value::Null, json!("true"), json!(1)] {
+            assert!(
+                serde_json::from_value::<CommandSubmitRequest>(json!({
+                    "id":"raw-id", "verb":"send", "probe":bad
+                }))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn submit_rejects_wrong_field_types_and_unknown_public_members() {
         for field in ["id", "verb"] {
             let mut request = json!({"id":"id","verb":"send"});
@@ -202,6 +259,14 @@ mod tests {
                     .is_err()
                 );
             }
+        }
+        for bad in [Value::Null, json!("true"), json!(1), json!([]), json!({})] {
+            assert!(
+                serde_json::from_value::<CommandSubmitRequest>(json!({
+                    "id":"id", "verb":"send", "probe":bad
+                }))
+                .is_err()
+            );
         }
         for bad in [
             json!(true),
@@ -251,6 +316,19 @@ mod tests {
             let error = request.validate().unwrap_err();
             assert_eq!(error.code, "invalid");
             assert_eq!(error.message, "command args must be a JSON object");
+        }
+    }
+
+    #[test]
+    fn true_probe_is_supported_only_for_send() {
+        let mut send = CommandSubmitRequest::new("id", "send");
+        send.probe = true;
+        send.validate().unwrap();
+
+        for verb in ["launch", "resume", "interrupt", "stop"] {
+            let mut request = CommandSubmitRequest::new("id", verb);
+            request.probe = true;
+            assert_eq!(request.validate().unwrap_err().code, "unsupported");
         }
     }
 

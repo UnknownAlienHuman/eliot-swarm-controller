@@ -754,7 +754,7 @@ mod tests {
             id: command_id.clone(), target: None, verb: "launch".to_owned(),
             args: json!({"project":"synthetic-handoff", "harness":harness, "profile":profile,
                 "profile_snapshot":{}, "workspace":"synthetic-handoff-workspace"}),
-            expected_generation: Some(0), expected_turn_id: None, request_id: None,
+            expected_generation: Some(0), expected_turn_id: None, request_id: None, probe: false,
         }, now).unwrap();
         let agent = admitted.command.target.unwrap();
         store.dispatch(&command_id, now).unwrap();
@@ -816,6 +816,7 @@ mod tests {
                     expected_generation: Some(1),
                     expected_turn_id: None,
                     request_id: None,
+                    probe: false,
                 },
                 now,
             )
@@ -1529,6 +1530,7 @@ mod tests {
                     expected_generation: Some(1),
                     expected_turn_id: None,
                     request_id: None,
+                    probe: false,
                 },
                 now + 3,
             )

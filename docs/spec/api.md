@@ -89,15 +89,15 @@ authentication precedes method parameter validation.
 
 Errors include
 `not_found`, `unsupported`, `not_allowed`, `bad_state`, `stale_generation`, `invalid`,
-`busy`, `unavailable`, `capacity_unavailable`, `history_gap`, `source_integrity`,
+`busy`, `unavailable`, `capacity_unavailable`, `provider_held`, `history_gap`, `source_integrity`,
 `secret_in_payload`, `frame_too_large`, `mailbox_full`, `internal`.
 
 `capacity_unavailable` is a pre-effect rejection from a configured Eliot `max_live`
 scope, not a vendor quota or entitlement result. A full-cap request is not admitted:
 there is no command row to read back, and the same ID may be submitted again once the
 scope frees. Once a command is admitted, its same-ID readback returns the retained result
-and never retries the native effect. Provider-hold and service-management APIs are not
-implemented in this increment; those requests remain `unsupported`.
+and never retries the native effect. Provider-hold methods are defined below;
+service-management APIs remain `unsupported` in this increment.
 
 [`Error.code`](../../crates/eliot-core/src/lib.rs) is an open string, not a closed wire
 enum; plugin-specific codes may be preserved. Unfamiliar post-I/O error codes classify
@@ -186,10 +186,11 @@ generation at dispatch, so the response generation is not universally equal to
 `expected_generation`. Interactive calls may omit expectations; delayed automation
 supplies its captured expectations.
 
-The current request does not accept `selector` or `probe`; unknown request fields are
-`invalid`. These remain deferred `command.submit` extensions (`selector?`, `probe? [false]`),
-not fields to send to the current API. The future selector contract is below; probe
-semantics remain with its future owning feature and are not inferred here.
+The current request does not accept `selector`; unknown request fields are `invalid`.
+The optional `probe` intent defaults to false; false is omitted on the wire, and true is
+valid only for `send`. It is control metadata, never native input text or arguments.
+`provider_held` is a pre-effect rejection (CLI exit 3); queued sends also recheck the
+hold at dispatch before native I/O.
 
 The current `command.submit` request has no `wait_ms`, and the daemon does not expose an
 `agent.wait` method. CLI `--wait` follows command and turn readbacks with a bounded client
@@ -249,6 +250,13 @@ and `Agent` models. IDs never pass through a mutation call and cannot submit or 
 work. Richer command/usage/resolution metadata remains deferred. `agent.result` requires
 an array of turn objects and an object for Agent metadata, not positional records.
 
+For every failed terminal turn, with or without a structured provider restriction, status
+and exact command/turn binding remain authoritative when final text exceeds the event
+budget. The event omits oversized final text rather than exposing a truncated string as
+complete, and includes
+`final_text_unavailable:"event_budget"` when representable. `Turn.final_text = None`
+means the public final text is unavailable; full native text remains private history.
+
 Required IDs must be strings whose trimmed value is nonempty. Validation does not trim,
 normalize or impose a new length limit on them. `turn.get` requires a nonnegative integer
 generation. For `agent.result`, omitted `generation` selects the current generation;
@@ -303,6 +311,40 @@ reason}`; it records an owner assertion, never a native receipt, and releases on
 relevant hold. `turn.resolve` likewise takes a mutation id, Agent/generation/turn,
 terminal status and reason; it cannot bypass the inactive/terminal precondition.
 Known failure can include partial effects; it never implies rollback or automatic retry.
+
+## Provider holds
+
+`provider.holds` is owner-only and returns a bounded page ordered by local scope.
+Optional `after` and `limit` select the page; the response provides `holds` and
+`next`. The canonical Core `ProviderHoldsRequest`/`ProviderHoldsResponse` DTOs own
+the wire shape.
+`provider.clear_hold` is an owner-only idempotent write using
+`ProviderClearHoldRequest`/`ProviderClearHoldResponse`. The corrective evidence is a
+closed enum: `credentials_updated`, `configuration_updated`, or `owner_verified`;
+free text is invalid. Its expected-probe binding is compare-and-swap, including explicit
+null to mean no probe claim; a mismatch or unresolved probe cannot be cleared. See the canonical
+[Core API DTOs](../../crates/eliot-core/src/api/provider.rs) rather than duplicating
+their field list.
+
+A provider scope comes from the frozen route, selected account, or profile, in that
+order; Eliot never guesses a vendor account. A held scope rejects new launch/send before
+native I/O and is rechecked when queued work dispatches. Launch with linked input and
+resume with new text are gated as sends. Plain resume, reads, request replies, interrupt
+and stop remain available. At initial admission, `provider_held` rejects before binding
+and creates no command row; that ID may be submitted again after the hold is resolved.
+An already queued command that becomes held is rejected at dispatch under its existing
+binding, before native I/O.
+
+Only an explicit `send --probe` can claim an eligible rate-limit/quota hold. It uses the
+ordinary SEND authorization and target/scope/generation checks; it grants no owner
+authority and adds no role flag. The Store atomically allows one claim per frozen
+provider scope through the normal send path. Future bounded automation must use that
+same path, not a parallel probe executor. The flag defaults false and does not enter
+native input. Time makes a probe eligible but never clears a hold. A successful
+exact-bound terminal probe clears rate-limit/quota holds; failed or interrupted probes
+retain them, while unknown probes retain their claim across restart. Auth and ModelRemoved
+holds require owner correction and are not probe-eligible. Provider restriction facts
+are defined in [monitoring](monitoring.md#provider-holds).
 
 ## Waiting
 
@@ -502,7 +544,7 @@ eliot processes A [--scope agent|workspace] [--generation N] [--after CURSOR] [-
 eliot stats A [--generation N]
 eliot git-status A [--generation N]
 eliot edits A [--generation N] [--after PATH] [--limit N]
-eliot send A TEXT [--wait] [--generation N]
+eliot send A TEXT [--probe] [--wait] [--generation N]
 eliot steer|inject A TEXT [--generation N] [--turn ID]
 eliot interrupt|abort A [--generation N] [--turn ID]
 eliot stop A [--force] [--tree] [--generation N]
@@ -521,6 +563,8 @@ eliot discover --profile P [--harness H] [--scope S] [--cursor C] [--limit N]
 eliot attach --profile P --harness H --scope S --ref R [--project LABEL]
 eliot history A --view subject|turns|items [--source native|rollout] [--turn-id ID] [--cursor C] [--limit N]
 eliot detach A [--generation N]
+eliot provider holds [--after SCOPE] [--limit N]
+eliot provider clear-hold SCOPE --corrective-evidence credentials_updated|configuration_updated|owner_verified [--expected-probe-command ID]
 eliot plugin NAME | plugin-test ... | hook ... | mcp
 ```
 
