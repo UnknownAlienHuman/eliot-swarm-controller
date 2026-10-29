@@ -575,6 +575,7 @@ impl Router {
                 registration,
                 &workspace,
                 target_workspace,
+                generation,
             )
             .await
         } else if target_workspace == registration.checkout {
@@ -1647,10 +1648,10 @@ impl Router {
             admission
         };
         if admission.is_new {
-            for child in &admission.children {
-                if matches!(child.state, CommandState::Accepted | CommandState::Queued) {
-                    self.schedule_command(child.id.clone(), None);
-                }
+            if let Some(child) = admission.children.first()
+                && matches!(child.state, CommandState::Accepted | CommandState::Queued)
+            {
+                self.schedule_command(child.id.clone(), None);
             }
             self.signal_progress();
         }
@@ -2760,6 +2761,13 @@ impl Router {
                         }
                     }
                 }
+                Ok(change) if change.value.state.is_terminal() => {
+                    // Store may durably cancel a terminal predecessor's
+                    // successor at this dispatch gate; never pass it to a native
+                    // plugin after that result.
+                    self.signal_progress();
+                    return;
+                }
                 Ok(change) => break change.value,
                 Err(error) => {
                     self.settle_dispatch_error(&id, &error, change.1, launch_binding.is_some())
@@ -2768,6 +2776,13 @@ impl Router {
                 }
             }
         };
+
+        // Only a Store-confirmed dispatch may reach a plugin. Queued/held,
+        // terminal, unknown, and any future non-dispatched state are not effects.
+        if dispatched.state != CommandState::Dispatched {
+            self.signal_progress();
+            return;
+        }
 
         let target = match dispatched.target.as_deref() {
             Some(target) => target.to_owned(),
@@ -3176,7 +3191,24 @@ impl Router {
 
     async fn reject_undispatched(&self, id: &str, reason: &str) {
         let outcome = json!({"reason": reason});
-        let _ = self.settle(id, CommandState::Rejected, Some(outcome)).await;
+        let (result, write_faulted) = {
+            let mut store = self.inner.store.lock().await;
+            let result = match store.get_command(id) {
+                Ok(Some(command))
+                    if matches!(command.state, CommandState::Accepted | CommandState::Queued) =>
+                {
+                    store.settle(id, CommandState::Rejected, Some(outcome), now_ms())
+                }
+                Ok(_) => return,
+                Err(error) => Err(error),
+            };
+            if let Ok(change) = &result {
+                self.publish_locked(&change.events);
+            }
+            (result, store.is_write_faulted())
+        };
+        self.finish_settlement(id, result, write_faulted, "store_settlement_failed")
+            .await;
     }
 
     async fn settle_observe_attach(&self, id: &str, snapshot: Value) -> Option<Command> {
@@ -3352,6 +3384,17 @@ impl Router {
             }
             (result, store.is_write_faulted())
         };
+        self.finish_settlement(id, result, write_faulted, &persistence_cause)
+            .await
+    }
+
+    async fn finish_settlement(
+        &self,
+        id: &str,
+        result: Result<eliot_store::Change<Command>>,
+        write_faulted: bool,
+        persistence_cause: &str,
+    ) -> Option<Command> {
         match result {
             Ok(change) => {
                 self.note_unknown(&change.events);
@@ -3367,7 +3410,7 @@ impl Router {
             }
             Err(_) => {
                 if write_faulted {
-                    self.note_unknown_id(id, &persistence_cause);
+                    self.note_unknown_id(id, persistence_cause);
                 }
                 self.signal_progress();
                 None
@@ -5625,6 +5668,67 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 .iter()
                 .any(|event| event.kind == "command.dispatched")
         );
+    }
+
+    #[tokio::test]
+    async fn stale_pre_dispatch_rejection_preserves_dispatched_winner() {
+        let router = router();
+        let id = ulid::Ulid::new().to_string();
+        {
+            let mut store = router.inner.store.lock().await;
+            let (agent, _) = result_fixture(&mut store);
+            store
+                .submit(
+                    "owner",
+                    SubmitCommand {
+                        id: id.clone(),
+                        target: Some(agent),
+                        verb: "interrupt".to_owned(),
+                        args: json!({}),
+                        expected_generation: Some(1),
+                        expected_turn_id: Some("turn-1".to_owned()),
+                        request_id: None,
+                        probe: false,
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            let dispatched = store.dispatch(&id, now_ms()).unwrap();
+            assert_eq!(dispatched.value.state, CommandState::Dispatched);
+            router.publish_locked(&dispatched.events);
+        }
+
+        // A losing preflight must not overwrite the command after the winning
+        // processor has committed its dispatch decision.
+        router.reject_undispatched(&id, "preflight_failed").await;
+        {
+            let store = router.inner.store.lock().await;
+            assert_eq!(
+                store.get_command(&id).unwrap().unwrap().state,
+                CommandState::Dispatched
+            );
+            assert!(
+                !store
+                    .read_events(0, 100, None)
+                    .unwrap()
+                    .iter()
+                    .any(|event| {
+                        event.kind == "command.rejected"
+                            && event.data.get("command_id").and_then(Value::as_str)
+                                == Some(id.as_str())
+                    })
+            );
+        }
+
+        let applied = router
+            .settle(
+                &id,
+                CommandState::Applied,
+                Some(json!({"command_id":id.clone(), "turn_id":"turn-1"})),
+            )
+            .await
+            .expect("the dispatched winner settles");
+        assert_eq!(applied.state, CommandState::Applied);
     }
 
     #[tokio::test]

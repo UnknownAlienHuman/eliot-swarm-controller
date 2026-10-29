@@ -28,7 +28,6 @@ use ulid::Ulid;
 
 const MAX_RPC_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CLIENTS: usize = 128;
-const RULE_CHILD_RECOVERY_PAGE_SIZE: usize = 1_000;
 const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(35);
 
 /// Open the private local daemon, recover durable state without replaying any
@@ -97,12 +96,6 @@ async fn run_owned(
     recovery.spawn(async move { recovery_router.recover_workspaces().await });
     let (automation_stop, automation_shutdown) = watch::channel(false);
     let mut automation_tasks = JoinSet::new();
-    let rule_recovery_router = router.clone();
-    automation_tasks.spawn(async move {
-        rule_recovery_router
-            .recover_rule_children(RULE_CHILD_RECOVERY_PAGE_SIZE)
-            .await
-    });
     let rule_router = router.clone();
     let rule_data_root = data_dir.path().to_path_buf();
     let rule_policy = Arc::clone(&policy);

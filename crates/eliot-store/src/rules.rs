@@ -97,6 +97,13 @@ pub struct RuleEventAdmission {
     pub is_new: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RuleActionDispatchGate {
+    Ready,
+    Held,
+    Cancelled,
+}
+
 /// Store-owned processing input for the daemon worker. The public Core view
 /// carries cursor progress; serialized definitions stay inside this Store API.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -886,6 +893,13 @@ impl Store {
                  FROM commands
                  WHERE link_kind = 'rule_action' AND ordinal IS NOT NULL
                    AND state IN ('accepted','queued')
+                   AND NOT EXISTS (
+                       SELECT 1 FROM commands earlier
+                       WHERE earlier.parent_command = commands.parent_command
+                         AND earlier.link_kind = 'rule_action'
+                         AND earlier.ordinal < commands.ordinal
+                         AND earlier.state IN ('accepted','queued','dispatched','unknown')
+                   )
                    AND (?1 IS NULL OR id > ?1)
                  ORDER BY id LIMIT ?2",
             )
@@ -2085,6 +2099,203 @@ fn valid_timer_stop_request(request: &SubmitCommand) -> bool {
         && request.request_id.is_none()
         && !request.probe
         && valid_args
+}
+
+/// Gate a rule-action child at the Store dispatch boundary. A held successor is
+/// durably queued; a failed predecessor cancels every later undispatched sibling.
+pub(super) fn gate_rule_action_dispatch_tx(
+    tx: &Transaction<'_>,
+    command_id: &str,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<RuleActionDispatchGate> {
+    let link: Option<(Option<String>, Option<String>, Option<i64>)> = tx
+        .query_row(
+            "SELECT parent_command, link_kind, ordinal FROM commands WHERE id = ?1",
+            [command_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let Some((parent_id, link_kind, ordinal)) = link else {
+        return Err(Error::new(
+            "not_found",
+            "rule-action dispatch command was not found",
+        ));
+    };
+    if link_kind.as_deref() != Some("rule_action") {
+        return Ok(RuleActionDispatchGate::Ready);
+    }
+    let (Some(parent_id), Some(ordinal)) = (parent_id, ordinal) else {
+        return Err(Error::new(
+            "source_integrity",
+            "rule-action child has incomplete parent ordering metadata",
+        ));
+    };
+    if ordinal < 0 {
+        return Err(Error::new(
+            "source_integrity",
+            "rule-action ordinal is negative",
+        ));
+    }
+    let parent = load_command_record(tx, &parent_id)?
+        .ok_or_else(|| Error::new("source_integrity", "rule-action parent is missing"))?;
+    if !matches!(
+        parent.command.verb.as_str(),
+        "rule" | "timer.run" | "rule.catch_up"
+    ) {
+        return Err(Error::new(
+            "source_integrity",
+            "rule-action parent has an unsupported verb",
+        ));
+    }
+    let expected_children = parent
+        .command
+        .outcome
+        .as_ref()
+        .and_then(|outcome| outcome.get("children"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "rule-action parent has no fixed child set",
+            )
+        })?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| Error::new("source_integrity", "rule-action child ID is invalid"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut statement = tx
+        .prepare(
+            "SELECT id, principal, ordinal, state, target, generation, expected_generation
+             FROM commands
+             WHERE parent_command = ?1 AND link_kind = 'rule_action' AND ordinal IS NOT NULL
+             ORDER BY ordinal",
+        )
+        .map_err(sql_error)?;
+    let rows = statement
+        .query_map([&parent_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+            ))
+        })
+        .map_err(sql_error)?;
+    let sibling_rows = rows
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(sql_error)?;
+    drop(statement);
+    let child_ids = sibling_rows
+        .iter()
+        .map(|(id, _, _, _, _, _, _)| id.clone())
+        .collect::<Vec<_>>();
+    if child_ids != expected_children {
+        return Err(Error::new(
+            "source_integrity",
+            "rule-action child rows differ from the parent's fixed child set",
+        ));
+    }
+    let current_index = usize::try_from(ordinal)
+        .map_err(|_| Error::new("source_integrity", "rule-action ordinal is invalid"))?;
+    if current_index >= sibling_rows.len()
+        || sibling_rows[current_index].0 != command_id
+        || sibling_rows.iter().enumerate().any(|(index, row)| {
+            i64::try_from(index).ok() != Some(row.2) || row.1 != parent.command.principal
+        })
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "rule-action sibling ordering is inconsistent",
+        ));
+    }
+    if current_index == 0 {
+        return Ok(RuleActionDispatchGate::Ready);
+    }
+
+    let mut failed_predecessor = None;
+    for (index, row) in sibling_rows.iter().take(current_index).enumerate() {
+        match parse_enum::<CommandState>(&row.3, "command state")? {
+            CommandState::Applied => {}
+            CommandState::Rejected | CommandState::Failed | CommandState::Cancelled => {
+                failed_predecessor = Some(index);
+                break;
+            }
+            CommandState::Accepted
+            | CommandState::Queued
+            | CommandState::Dispatched
+            | CommandState::Unknown => {
+                let current = load_command_record(tx, command_id)?.ok_or_else(|| {
+                    Error::new("source_integrity", "rule-action child disappeared")
+                })?;
+                if current.state == CommandState::Accepted {
+                    let target = current.target.ok_or_else(|| {
+                        Error::new("source_integrity", "rule-action child has no target")
+                    })?;
+                    let generation = current
+                        .command
+                        .generation
+                        .or(current.command.expected_generation)
+                        .ok_or_else(|| {
+                            Error::new("source_integrity", "rule-action child has no generation")
+                        })?;
+                    update_command_state(tx, command_id, CommandState::Queued, None, None, now)?;
+                    events.push(insert_daemon_command_event(
+                        tx,
+                        now,
+                        "command.queued",
+                        Some(target),
+                        Some(generation),
+                        command_id,
+                        json!({
+                            "command_id": command_id,
+                            "reason": "rule_action_predecessor_pending",
+                        }),
+                    )?);
+                }
+                return Ok(RuleActionDispatchGate::Held);
+            }
+        }
+    }
+    let Some(failed_index) = failed_predecessor else {
+        return Ok(RuleActionDispatchGate::Ready);
+    };
+    for row in sibling_rows.iter().skip(failed_index + 1) {
+        let sibling_state: CommandState = parse_enum(&row.3, "command state")?;
+        if !matches!(sibling_state, CommandState::Accepted | CommandState::Queued) {
+            continue;
+        }
+        let target = row.4.ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "undispatched rule-action child has no target",
+            )
+        })?;
+        let generation = row.5.or(row.6).ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "undispatched rule-action child has no generation",
+            )
+        })?;
+        cancel_pending_command_tx(
+            tx,
+            target,
+            generation,
+            &row.0,
+            "rule_action_predecessor_terminal",
+            now,
+            events,
+        )?;
+    }
+    Ok(RuleActionDispatchGate::Cancelled)
 }
 
 fn has_open_rule_actions_tx(tx: &Transaction<'_>, principal: &str, rule: &str) -> Result<bool> {
@@ -3911,6 +4122,343 @@ mod tests {
                 .unwrap(),
             current_state
         );
+    }
+
+    #[test]
+    fn catch_up_children_wait_for_predecessor_before_recovery_or_dispatch() {
+        let mut store = store();
+        let request_id = Ulid::new();
+        let now = i64::try_from(request_id.timestamp_ms()).unwrap() + 1;
+        let (first_agent, first_target) = insert_test_agent(&mut store);
+        let (second_agent, second_target) = insert_test_agent(&mut store);
+        let first_event = insert_test_turn_completed(&mut store, first_agent, now - 1);
+        let second_event = insert_test_turn_completed(&mut store, second_agent, now - 1);
+
+        let mut rule_definition = definition("ordered-rule", true);
+        let mut canonical_definition: Value =
+            serde_json::from_str(&rule_definition.canonical_definition).unwrap();
+        canonical_definition["limit"] = json!({
+            "max": 2,
+            "per": "rule",
+            "window_ms": RULE_ACTION_WINDOW_MS,
+        });
+        rule_definition.canonical_definition =
+            serde_json::to_string(&canonical_definition).unwrap();
+        rule_definition.definition_digest =
+            core::canonical_json_sha256(&canonical_definition).unwrap();
+        let state = store
+            .ensure_rule_state("owner", &rule_definition, now)
+            .unwrap();
+        let captured_through = state.current_cursor;
+        assert!(second_event <= captured_through);
+
+        let request = core::api::RuleCatchUpRequest::new(
+            request_id.to_string(),
+            "ordered-rule",
+            first_event - 1,
+            Some(captured_through),
+        );
+        let actions = [
+            RuleCatchUpAction {
+                event_seq: first_event,
+                request: stop_request(&first_target),
+            },
+            RuleCatchUpAction {
+                event_seq: second_event,
+                request: stop_request(&second_target),
+            },
+        ];
+        let admission = store
+            .admit_rule_catch_up("owner", &request, &state, captured_through, &actions, now)
+            .unwrap();
+        assert!(admission.is_new);
+        assert_eq!(admission.children.len(), 2);
+        assert_ne!(admission.children[0].target, admission.children[1].target);
+
+        let first_child_id = admission.children[0].id.clone();
+        let second_child_id = admission.children[1].id.clone();
+        let first_link: (String, i64) = store
+            .connection
+            .query_row(
+                "SELECT parent_command, ordinal FROM commands WHERE id = ?1",
+                [&first_child_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let second_link: (String, i64) = store
+            .connection
+            .query_row(
+                "SELECT parent_command, ordinal FROM commands WHERE id = ?1",
+                [&second_child_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(first_link, (admission.parent.id.clone(), 0));
+        assert_eq!(second_link, (admission.parent.id.clone(), 1));
+
+        for (step, predecessor_state) in ["accepted", "queued", "dispatched", "unknown"]
+            .into_iter()
+            .enumerate()
+        {
+            match predecessor_state {
+                "accepted" => {}
+                "queued" => {
+                    assert_eq!(
+                        store
+                            .connection
+                            .execute(
+                                "UPDATE commands SET state = 'queued' WHERE id = ?1",
+                                [&first_child_id],
+                            )
+                            .unwrap(),
+                        1
+                    );
+                }
+                "dispatched" => {
+                    assert_eq!(
+                        store
+                            .dispatch(&first_child_id, now + 10 + step as i64)
+                            .unwrap()
+                            .value
+                            .state,
+                        CommandState::Dispatched
+                    );
+                }
+                "unknown" => {
+                    assert_eq!(
+                        store
+                            .settle(
+                                &first_child_id,
+                                CommandState::Unknown,
+                                Some(json!({"reason": "fixture uncertainty"})),
+                                now + 10 + step as i64,
+                            )
+                            .unwrap()
+                            .value
+                            .state,
+                        CommandState::Unknown
+                    );
+                }
+                _ => unreachable!(),
+            }
+
+            let expected_state = match predecessor_state {
+                "accepted" => CommandState::Accepted,
+                "queued" => CommandState::Queued,
+                "dispatched" => CommandState::Dispatched,
+                "unknown" => CommandState::Unknown,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                store.get_command(&first_child_id).unwrap().unwrap().state,
+                expected_state
+            );
+
+            let recoverable = store.recover_rule_children(None, 100).unwrap();
+            assert!(
+                !recoverable
+                    .iter()
+                    .any(|command| command.id == second_child_id),
+                "child 2 became recoverable while child 1 was {predecessor_state}"
+            );
+            let held = store
+                .dispatch(&second_child_id, now + 20 + step as i64)
+                .unwrap();
+            assert_eq!(
+                held.value.state,
+                CommandState::Queued,
+                "child 2 was not held while child 1 was {predecessor_state}"
+            );
+            assert!(
+                !held
+                    .events
+                    .iter()
+                    .any(|event| event.kind == "command.dispatched")
+            );
+            if predecessor_state == "accepted" {
+                let queued = held
+                    .events
+                    .iter()
+                    .find(|event| event.kind == "command.queued")
+                    .expect("held child emits its queued transition");
+                assert_eq!(queued.data["reason"], "rule_action_predecessor_pending");
+            } else {
+                assert!(held.events.is_empty());
+            }
+            assert_eq!(
+                store.get_command(&second_child_id).unwrap().unwrap().state,
+                CommandState::Queued
+            );
+            let child_two_dispatches: i64 = store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM events
+                     WHERE kind = 'command.dispatched'
+                       AND json_extract(data, '$.command_id') = ?1",
+                    [&second_child_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(child_two_dispatches, 0);
+        }
+
+        assert_eq!(
+            store
+                .settle(
+                    &first_child_id,
+                    CommandState::Applied,
+                    Some(json!({"result": "stopped"})),
+                    now + 30,
+                )
+                .unwrap()
+                .value
+                .state,
+            CommandState::Applied
+        );
+        let recoverable = store.recover_rule_children(None, 100).unwrap();
+        assert!(
+            recoverable
+                .iter()
+                .any(|command| command.id == second_child_id)
+        );
+        assert_eq!(
+            store
+                .dispatch(&second_child_id, now + 31)
+                .unwrap()
+                .value
+                .state,
+            CommandState::Dispatched
+        );
+    }
+
+    #[test]
+    fn catch_up_terminal_predecessor_cancels_unstarted_sibling() {
+        for terminal_predecessor in ["failed", "rejected", "cancelled"] {
+            let mut store = store();
+            let request_id = Ulid::new();
+            let now = i64::try_from(request_id.timestamp_ms()).unwrap() + 1;
+            let (first_agent, first_target) = insert_test_agent(&mut store);
+            let (second_agent, second_target) = insert_test_agent(&mut store);
+            let first_event = insert_test_turn_completed(&mut store, first_agent, now - 1);
+            let second_event = insert_test_turn_completed(&mut store, second_agent, now - 1);
+
+            let mut rule_definition = definition("ordered-rule", true);
+            let mut canonical_definition: Value =
+                serde_json::from_str(&rule_definition.canonical_definition).unwrap();
+            canonical_definition["limit"] = json!({
+                "max": 2,
+                "per": "rule",
+                "window_ms": RULE_ACTION_WINDOW_MS,
+            });
+            rule_definition.canonical_definition =
+                serde_json::to_string(&canonical_definition).unwrap();
+            rule_definition.definition_digest =
+                core::canonical_json_sha256(&canonical_definition).unwrap();
+            let state = store
+                .ensure_rule_state("owner", &rule_definition, now)
+                .unwrap();
+            let captured_through = state.current_cursor;
+            assert!(second_event <= captured_through);
+
+            let request = core::api::RuleCatchUpRequest::new(
+                request_id.to_string(),
+                "ordered-rule",
+                first_event - 1,
+                Some(captured_through),
+            );
+            let actions = [
+                RuleCatchUpAction {
+                    event_seq: first_event,
+                    request: stop_request(&first_target),
+                },
+                RuleCatchUpAction {
+                    event_seq: second_event,
+                    request: stop_request(&second_target),
+                },
+            ];
+            let admission = store
+                .admit_rule_catch_up("owner", &request, &state, captured_through, &actions, now)
+                .unwrap();
+            assert_eq!(admission.children.len(), 2);
+            let first_child_id = admission.children[0].id.clone();
+            let second_child_id = admission.children[1].id.clone();
+
+            let expected_predecessor_state = match terminal_predecessor {
+                "failed" => {
+                    store.dispatch(&first_child_id, now + 1).unwrap();
+                    store
+                        .settle(
+                            &first_child_id,
+                            CommandState::Failed,
+                            Some(json!({"reason": "fixture failure"})),
+                            now + 2,
+                        )
+                        .unwrap();
+                    CommandState::Failed
+                }
+                "rejected" => {
+                    store
+                        .settle(
+                            &first_child_id,
+                            CommandState::Rejected,
+                            Some(json!({"reason": "fixture rejection"})),
+                            now + 1,
+                        )
+                        .unwrap();
+                    CommandState::Rejected
+                }
+                "cancelled" => {
+                    store.mark_lost(&first_target, 1, now + 1).unwrap();
+                    CommandState::Cancelled
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                store.get_command(&first_child_id).unwrap().unwrap().state,
+                expected_predecessor_state
+            );
+
+            let recoverable = store.recover_rule_children(None, 100).unwrap();
+            assert!(
+                recoverable
+                    .iter()
+                    .any(|command| command.id == second_child_id),
+                "Store recovery must surface the terminal follower for cancellation"
+            );
+            let cancelled = store.dispatch(&second_child_id, now + 3).unwrap();
+            assert_eq!(cancelled.value.state, CommandState::Cancelled);
+            let cancelled_event = cancelled
+                .events
+                .iter()
+                .find(|event| event.kind == "command.cancelled")
+                .expect("Store gate cancels the unstarted follower");
+            assert_eq!(
+                cancelled_event.data["reason"],
+                "rule_action_predecessor_terminal"
+            );
+            let recoverable_after_cancel = store.recover_rule_children(None, 100).unwrap();
+            assert!(
+                !recoverable_after_cancel
+                    .iter()
+                    .any(|command| command.id == second_child_id)
+            );
+            assert_eq!(
+                store.get_command(&second_child_id).unwrap().unwrap().state,
+                CommandState::Cancelled,
+                "child 2 was not cancelled after child 1 became {terminal_predecessor}"
+            );
+            let child_two_dispatches: i64 = store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM events
+                     WHERE kind = 'command.dispatched'
+                       AND json_extract(data, '$.command_id') = ?1",
+                    [&second_child_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(child_two_dispatches, 0);
+        }
     }
 
     #[test]

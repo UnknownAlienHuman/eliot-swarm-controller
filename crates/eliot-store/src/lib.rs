@@ -1517,6 +1517,7 @@ impl Store {
                 ),
             ));
         }
+        let mut events = Vec::new();
         if native_store.is_some() && command.command.verb != "launch" {
             return Err(Error::new(
                 "bad_state",
@@ -1526,7 +1527,6 @@ impl Store {
         let agent_num = command.target.ok_or_else(|| {
             Error::new("bad_state", "L1 dispatch requires a concrete Agent target")
         })?;
-        let mut events = Vec::new();
         let agent = load_agent_by_num(&tx, agent_num)?
             .ok_or_else(|| Error::new("not_found", "command target Agent was not found"))?;
         projects::validate_project_command_dispatch_tx(&tx, &command)?;
@@ -1536,6 +1536,18 @@ impl Store {
         }
         if matches!(command.command.verb.as_str(), "launch" | "send" | "steer") {
             provider_holds::require_dispatch_tx(&tx, &agent, &command.command)?;
+        }
+        match rules::gate_rule_action_dispatch_tx(&tx, id, now, &mut events)? {
+            rules::RuleActionDispatchGate::Ready => {}
+            rules::RuleActionDispatchGate::Held | rules::RuleActionDispatchGate::Cancelled => {
+                let command = load_command(&tx, id)?
+                    .ok_or_else(|| Error::new("internal", "gated command disappeared"))?;
+                commit_transaction(tx, &self.write_faulted)?;
+                return Ok(Change {
+                    value: command,
+                    events,
+                });
+            }
         }
 
         match command.command.verb.as_str() {
@@ -5594,6 +5606,11 @@ fn request_workspace_cancel_tx(
             "unknown",
             "cancellation was already requested; read back instead of replaying stop",
         ));
+    }
+    if rules::gate_rule_action_dispatch_tx(tx, stop_id, now, events)?
+        != rules::RuleActionDispatchGate::Ready
+    {
+        return Ok(());
     }
     let old = workspace.clone();
     let outcome = workspace.outcome.get_or_insert_with(|| json!({}));

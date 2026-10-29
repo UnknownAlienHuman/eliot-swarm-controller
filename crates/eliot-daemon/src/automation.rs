@@ -25,6 +25,7 @@ use tokio::sync::{broadcast, watch};
 
 pub(crate) const RULE_EVENT_PAGE_SIZE: usize = 128;
 const TIMER_PAGE_SIZE: usize = 128;
+const RULE_CHILD_RECOVERY_PAGE_SIZE: usize = 1_000;
 const RULE_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -338,12 +339,14 @@ pub(crate) async fn verify_managed_project_workspace(
     registration: &ProjectRegistrationView,
     workspace: &eliot_core::WorkspacePreparation,
     target_workspace: &str,
+    expected_generation: i64,
 ) -> Result<()> {
     registration.validate()?;
     projects::verify_managed_workspace_identity(
         &project_registration_snapshot(registration),
         workspace,
         target_workspace,
+        expected_generation,
     )
     .await
 }
@@ -872,6 +875,7 @@ pub(crate) async fn run_global_rules(
     let mut owner_config_notices = ReloadNoticeContext::default();
     let mut max_event_backlog = initial_max_event_backlog;
     let mut last_applied_inputs = None;
+    let mut recover_rule_children = true;
     match crate::config::load_automation_config(&data_root) {
         Ok(config) => {
             max_event_backlog = config.max_event_backlog;
@@ -934,51 +938,64 @@ pub(crate) async fn run_global_rules(
         }
     }
     loop {
-        if *shutdown.borrow() || !router.rule_firings_open() {
+        if *shutdown.borrow() {
             return Ok(());
         }
-        let high_water = router.rule_high_water().await?;
-        if !reconcile_event_rules(&router, &mut rules, high_water, now_ms(), max_event_backlog)
-            .await?
-        {
-            return Ok(());
+        if recover_rule_children {
+            router
+                .recover_rule_children(RULE_CHILD_RECOVERY_PAGE_SIZE)
+                .await?;
+            recover_rule_children = false;
         }
-        for namespace in &mut project_rules {
-            if namespace.registration_current
-                && !reconcile_event_rules(
-                    &router,
-                    &mut namespace.rules,
-                    high_water,
-                    now_ms(),
-                    max_event_backlog,
-                )
+        let firing_open = router.rule_firings_open();
+        if firing_open {
+            let high_water = router.rule_high_water().await?;
+            if !reconcile_event_rules(&router, &mut rules, high_water, now_ms(), max_event_backlog)
                 .await?
             {
                 return Ok(());
             }
-        }
+            for namespace in &mut project_rules {
+                if namespace.registration_current
+                    && !reconcile_event_rules(
+                        &router,
+                        &mut namespace.rules,
+                        high_water,
+                        now_ms(),
+                        max_event_backlog,
+                    )
+                    .await?
+                {
+                    return Ok(());
+                }
+            }
 
-        if !reconcile_due_timers(&router, &mut rules, now_ms()).await? {
-            return Ok(());
-        }
-        for namespace in &mut project_rules {
-            if namespace.registration_current
-                && !reconcile_due_timers(&router, &mut namespace.rules, now_ms()).await?
-            {
+            if !reconcile_due_timers(&router, &mut rules, now_ms()).await? {
                 return Ok(());
+            }
+            for namespace in &mut project_rules {
+                if namespace.registration_current
+                    && !reconcile_due_timers(&router, &mut namespace.rules, now_ms()).await?
+                {
+                    return Ok(());
+                }
             }
         }
 
         let now = now_ms();
-        let timer_wait = std::iter::once(next_timer_wait(&rules, now))
-            .chain(
-                project_rules
-                    .iter()
-                    .filter(|namespace| namespace.registration_current)
-                    .map(|namespace| next_timer_wait(&namespace.rules, now)),
-            )
-            .flatten()
-            .min();
+        let timer_wait = if firing_open {
+            std::iter::once(next_timer_wait(&rules, now))
+                .chain(
+                    project_rules
+                        .iter()
+                        .filter(|namespace| namespace.registration_current)
+                        .map(|namespace| next_timer_wait(&namespace.rules, now)),
+                )
+                .flatten()
+                .min()
+        } else {
+            None
+        };
         let mut reload_requested = false;
         tokio::select! {
             changed = shutdown.changed() => {
@@ -987,12 +1004,15 @@ pub(crate) async fn run_global_rules(
                 }
             }
             changed = progress.changed() => {
-                if changed.is_err() || !router.rule_firings_open() {
+                if changed.is_err() {
                     return Ok(());
                 }
+                recover_rule_children = true;
             }
             received = events.recv() => match received {
-                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                    recover_rule_children = true;
+                }
                 Err(broadcast::error::RecvError::Closed) => {
                     return Err(Error::new("unavailable", "event bus is closed"));
                 }
@@ -1013,6 +1033,12 @@ pub(crate) async fn run_global_rules(
                     std::future::pending::<()>().await;
                 }
             } => {}
+        }
+        if recover_rule_children {
+            router
+                .recover_rule_children(RULE_CHILD_RECOVERY_PAGE_SIZE)
+                .await?;
+            recover_rule_children = false;
         }
         for rule in &mut rules {
             if let Some(timer) = &mut rule.timer {

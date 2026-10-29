@@ -23,6 +23,8 @@ struct ProjectCommandBinding {
     workspace: Option<String>,
     repo_path: Option<String>,
     repo_common_dir: Option<String>,
+    workspace_phase: Option<WorkspacePhase>,
+    workspace_target_generation: Option<i64>,
 }
 
 struct ProjectRegistrationRow {
@@ -202,6 +204,8 @@ pub(super) fn capture_project_command_binding_tx(
             workspace: None,
             repo_path: None,
             repo_common_dir: None,
+            workspace_phase: None,
+            workspace_target_generation: None,
         }
     };
     encode_json(&binding).map(Some)
@@ -306,38 +310,50 @@ fn project_binding_for_agent_tx(
         .ok_or_else(|| Error::new("not_allowed", "project Agent has no frozen workspace"))?;
     // L3 stores the canonical checkout path in WorkspacePreparation.project,
     // independently of the Agent.project label.
-    let (repo_path, repo_common_dir) = match load_workspace(tx, agent_num)? {
-        Some(workspace)
-            if workspace.project == registration.checkout
-                && workspace.repo_path == registration.checkout
-                && workspace.repo_common_dir == registration.repo_common_dir
-                && workspace.worktree_path == workspace_path =>
-        {
-            (workspace.repo_path, workspace.repo_common_dir)
-        }
-        Some(_) => {
-            return Err(Error::new(
-                "not_allowed",
-                "managed Agent workspace does not match its registered repository",
-            ));
-        }
-        None if workspace_path == registration.checkout => (
-            registration.checkout.clone(),
-            registration.repo_common_dir.clone(),
-        ),
-        None => {
-            return Err(Error::new(
-                "not_allowed",
-                "project Agent workspace is not the registered checkout",
-            ));
-        }
-    };
+    let (repo_path, repo_common_dir, workspace_phase, workspace_target_generation) =
+        match load_workspace(tx, agent_num)? {
+            Some(workspace)
+                if workspace.project == registration.checkout
+                    && workspace.repo_path == registration.checkout
+                    && workspace.repo_common_dir == registration.repo_common_dir
+                    && workspace.worktree_path == workspace_path
+                    && workspace.phase == WorkspacePhase::Ready
+                    && workspace.target_generation == generation =>
+            {
+                (
+                    workspace.repo_path,
+                    workspace.repo_common_dir,
+                    Some(workspace.phase),
+                    Some(workspace.target_generation),
+                )
+            }
+            Some(_) => {
+                return Err(Error::new(
+                    "not_allowed",
+                    "managed Agent workspace is not ready at this generation or its repository identity changed",
+                ));
+            }
+            None if workspace_path == registration.checkout => (
+                registration.checkout.clone(),
+                registration.repo_common_dir.clone(),
+                None,
+                None,
+            ),
+            None => {
+                return Err(Error::new(
+                    "not_allowed",
+                    "project Agent workspace is not the registered checkout",
+                ));
+            }
+        };
     Ok(ProjectCommandBinding {
         registration_revision: registration.revision,
         profile: Some(agent.profile),
         workspace: Some(workspace_path.to_owned()),
         repo_path: Some(repo_path),
         repo_common_dir: Some(repo_common_dir),
+        workspace_phase,
+        workspace_target_generation,
     })
 }
 

@@ -5357,3 +5357,233 @@ fn cli_project_rule_catchup_enforces_scope_limit_and_replays_same_id() {
     assert!(resumed.current_cursor >= initial.current_cursor);
     fixture.stop(false);
 }
+
+#[test]
+fn cli_fake_history_catchup_dispatches_siblings_in_order_and_replays() {
+    let mut fixture = Fixture::new("ordered rule catch-up");
+    fixture.start();
+    fixture.stop(false);
+
+    let rules = fixture.data.join("rules");
+    fs::create_dir_all(&rules).expect("create global rule directory");
+    let second_workspace = fixture.root.join("second workspace");
+    fs::create_dir(&second_workspace).expect("create second Fake workspace");
+    fixture.start();
+
+    let workspaces = [fixture.workspace.clone(), second_workspace];
+    let mut agents = Vec::new();
+    for workspace in &workspaces {
+        let launched = fixture.json(&[
+            "launch",
+            "--profile",
+            "fake",
+            "--workspace",
+            workspace.to_str().unwrap(),
+        ]);
+        agents.push((
+            launched["target"].as_str().expect("Fake Agent").to_owned(),
+            launched["generation"].as_i64().expect("Fake generation"),
+        ));
+    }
+    assert_ne!(agents[0].0, agents[1].0);
+    let after_seq = fixture
+        .events()
+        .last()
+        .and_then(|event| event["seq"].as_i64())
+        .unwrap_or(0);
+
+    let send_ids = [ulid::Ulid::new().to_string(), ulid::Ulid::new().to_string()];
+    for (index, (agent, generation)) in agents.iter().enumerate() {
+        let text = format!("ordered-history-{index}");
+        let turn: CoreTurn = serde_json::from_value(fixture.json(&[
+            "--id",
+            &send_ids[index],
+            "send",
+            agent,
+            "--generation",
+            &generation.to_string(),
+            "--wait",
+            "--timeout-seconds",
+            "10",
+            "--",
+            &text,
+        ]))
+        .expect("typed ordered-history Fake turn");
+        assert_eq!(turn.agent, *agent);
+        assert_eq!(turn.generation, *generation);
+        assert_eq!(turn.state, TurnState::Completed);
+    }
+
+    let history = fixture.events();
+    let send_events: Vec<_> = history
+        .iter()
+        .filter(|event| {
+            event["kind"] == "command.applied"
+                && send_ids
+                    .iter()
+                    .any(|id| event["data"]["command_id"] == id.as_str())
+        })
+        .collect();
+    assert_eq!(send_events.len(), 2);
+    for (index, event) in send_events.iter().enumerate() {
+        assert_eq!(event["agent"], agents[index].0);
+        assert_eq!(event["generation"], agents[index].1);
+        assert_eq!(event["subject"]["harness"], "fake");
+    }
+    let through_seq = send_events
+        .iter()
+        .filter_map(|event| event["seq"].as_i64())
+        .max()
+        .expect("finite ordered-history range end");
+    assert!(through_seq > after_seq);
+
+    let command_values = send_ids
+        .iter()
+        .map(|id| format!("\"{id}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let agent_values = agents
+        .iter()
+        .map(|(agent, _)| format!("\"{agent}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let source = format!(
+        concat!(
+            "[[rule]]\n",
+            "id = \"ordered-stop\"\n",
+            "on = {{ event = \"command.applied\", match = {{ ",
+            "\"event.data.command_id\" = {{ one_of = [{commands}] }}, ",
+            "\"event.agent\" = {{ one_of = [{agents}] }}, ",
+            "\"event.generation\" = {{ exists = true }}, ",
+            "\"subject.harness\" = \"fake\" }} }}\n",
+            "limit = {{ max = 2, per = \"rule\", window = \"1h\" }}\n",
+            "do = [{{ action = \"stop\", target = \"${{event.agent}}\", ",
+            "expected_generation = \"${{event.generation}}\" }}]\n",
+        ),
+        commands = command_values,
+        agents = agent_values,
+    );
+    fs::write(rules.join("ordered-stop.toml"), source).expect("write ordered sibling history rule");
+
+    let load_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let state: RuleStateView = loop {
+        let reply = cli(&fixture.data, &["rule", "show", "ordered-stop"]);
+        if reply.status.success() {
+            break serde_json::from_str(&reply.stdout).expect("typed ordered rule state");
+        }
+        assert!(
+            std::time::Instant::now() < load_deadline,
+            "ordered history rule load deadline; stderr: {}",
+            reply.stderr
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(state.current_cursor >= through_seq);
+
+    let after_arg = after_seq.to_string();
+    let through_arg = through_seq.to_string();
+    let catchup_id = ulid::Ulid::new().to_string();
+    let catchup_args = [
+        "--id",
+        catchup_id.as_str(),
+        "rule",
+        "catch-up",
+        "ordered-stop",
+        "--after",
+        after_arg.as_str(),
+        "--through",
+        through_arg.as_str(),
+    ];
+    let catchup_reply = cli(&fixture.data, &catchup_args);
+    assert!(
+        catchup_reply.status.success(),
+        "ordered sibling catch-up failed; bounded stdout={:?}; bounded stderr={:?}",
+        catchup_reply.stdout.chars().take(4096).collect::<String>(),
+        catchup_reply.stderr.chars().take(4096).collect::<String>()
+    );
+    let catchup: CoreCommand =
+        serde_json::from_str(&catchup_reply.stdout).expect("typed ordered catch-up parent");
+    assert_eq!(catchup.id, catchup_id);
+    assert_eq!(catchup.args["rule"], "ordered-stop");
+    assert_eq!(catchup.args["after_seq"], after_seq);
+    assert_eq!(catchup.args["through_seq"], through_seq);
+    assert_eq!(catchup.args["revision"], state.revision);
+    let child_ids: Vec<String> =
+        serde_json::from_value(catchup.outcome.as_ref().unwrap()["children"].clone())
+            .expect("fixed ordered catch-up child IDs");
+    assert_eq!(child_ids.len(), 2, "both ordered stops were admitted");
+
+    let mut children = Vec::new();
+    for child_id in &child_ids {
+        let child: CoreCommand = serde_json::from_value(fixture.wait_command(child_id, "applied"))
+            .expect("typed completed ordered stop child");
+        children.push(child);
+    }
+    for (index, child) in children.iter().enumerate() {
+        assert_eq!(child.id, child_ids[index]);
+        assert_eq!(child.state, CommandState::Applied);
+        assert_eq!(child.target.as_deref(), Some(agents[index].0.as_str()));
+        assert_eq!(child.expected_generation, Some(agents[index].1));
+    }
+
+    let events = fixture.events();
+    let mut fired: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event["kind"] == "rule.fired"
+                && event["data"]["rule"] == "ordered-stop"
+                && event["data"]["parent_command"] == catchup_id
+        })
+        .collect();
+    fired.sort_by_key(|event| event["data"]["event_seq"].as_i64().unwrap_or(i64::MAX));
+    assert_eq!(fired.len(), 2);
+    for index in 0..2 {
+        assert_eq!(fired[index]["data"]["event_seq"], send_events[index]["seq"]);
+        assert_eq!(fired[index]["data"]["child_command"], child_ids[index]);
+        assert_eq!(fault_dispatches(&events, &child_ids[index]), 1);
+        let stopped: AgentGetResponse =
+            serde_json::from_value(fixture.json(&["show", &agents[index].0]))
+                .expect("typed stopped Fake Agent");
+        assert_eq!(stopped.agent.state, AgentState::Stopped);
+        assert_eq!(stopped.agent.generation, agents[index].1);
+    }
+    let first_applied_seq = events
+        .iter()
+        .find(|event| {
+            event["kind"] == "command.applied" && event["data"]["command_id"] == child_ids[0]
+        })
+        .and_then(|event| event["seq"].as_i64())
+        .expect("first stop applied event");
+    let second_dispatched_seq = events
+        .iter()
+        .find(|event| {
+            event["kind"] == "command.dispatched" && event["data"]["command_id"] == child_ids[1]
+        })
+        .and_then(|event| event["seq"].as_i64())
+        .expect("second stop dispatched event");
+    assert!(
+        second_dispatched_seq > first_applied_seq,
+        "second sibling dispatched at {second_dispatched_seq} before predecessor applied at {first_applied_seq}"
+    );
+
+    let replay: CoreCommand = serde_json::from_value(fixture.json(&catchup_args))
+        .expect("same-ID ordered catch-up replay");
+    assert_eq!(replay, catchup);
+    let after_replay = fixture.events();
+    assert_eq!(
+        after_replay
+            .iter()
+            .filter(|event| {
+                event["kind"] == "rule.fired"
+                    && event["data"]["rule"] == "ordered-stop"
+                    && event["data"]["parent_command"] == catchup_id
+            })
+            .count(),
+        2,
+        "same-ID replay did not duplicate firing markers"
+    );
+    for child_id in &child_ids {
+        assert_eq!(fault_dispatches(&after_replay, child_id), 1);
+    }
+    fixture.stop(false);
+}

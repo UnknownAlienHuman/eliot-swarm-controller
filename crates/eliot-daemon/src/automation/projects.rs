@@ -101,11 +101,14 @@ pub(super) async fn verify_managed_workspace_identity(
     registration: &RegistrationSnapshot,
     workspace: &eliot_core::WorkspacePreparation,
     target_workspace: &str,
+    expected_generation: i64,
 ) -> Result<()> {
     if workspace.project != registration.checkout
         || workspace.repo_path != registration.checkout
         || workspace.repo_common_dir != registration.repo_common_dir
         || workspace.worktree_path != target_workspace
+        || workspace.phase != eliot_core::WorkspacePhase::Ready
+        || workspace.target_generation != expected_generation
     {
         return Err(Error::new(
             "not_allowed",
@@ -449,9 +452,40 @@ mod tests {
             updated_at: 0,
         };
 
-        verify_managed_workspace_identity(&registration, &workspace, &workspace.worktree_path)
+        verify_managed_workspace_identity(&registration, &workspace, &workspace.worktree_path, 1)
             .await
             .expect("accept original managed worktree identity");
+
+        let mut setup_ready_next_generation = workspace.clone();
+        setup_ready_next_generation.phase = eliot_core::WorkspacePhase::SetupReady;
+        setup_ready_next_generation.target_generation = 2;
+        assert_eq!(
+            verify_managed_workspace_identity(
+                &registration,
+                &setup_ready_next_generation,
+                &setup_ready_next_generation.worktree_path,
+                1,
+            )
+            .await
+            .expect_err("SetupReady next-generation workspace is not dispatch-ready")
+            .code,
+            "not_allowed"
+        );
+
+        let mut ready_wrong_generation = workspace.clone();
+        ready_wrong_generation.target_generation = 2;
+        assert_eq!(
+            verify_managed_workspace_identity(
+                &registration,
+                &ready_wrong_generation,
+                &ready_wrong_generation.worktree_path,
+                1,
+            )
+            .await
+            .expect_err("Ready workspace for another generation must be rejected")
+            .code,
+            "not_allowed"
+        );
 
         fixture.run_git(
             &checkout,
@@ -481,10 +515,15 @@ mod tests {
         assert_eq!(replacement_root, canonical_worktree);
         assert_ne!(replacement_common_dir, registered_common_dir);
         assert_eq!(
-            verify_managed_workspace_identity(&registration, &workspace, &workspace.worktree_path,)
-                .await
-                .expect_err("changed common directory must fail closed")
-                .code,
+            verify_managed_workspace_identity(
+                &registration,
+                &workspace,
+                &workspace.worktree_path,
+                1,
+            )
+            .await
+            .expect_err("changed common directory must fail closed")
+            .code,
             "not_allowed"
         );
     }
