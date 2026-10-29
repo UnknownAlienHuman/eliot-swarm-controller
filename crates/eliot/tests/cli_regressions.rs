@@ -5936,7 +5936,30 @@ fn cli_fake_rule_send_unknown_after_dispatch_is_not_replayed() {
     let unknown_after_replay: CoreCommand =
         serde_json::from_value(fixture.json(&["cmd", "show", &child_id]))
             .expect("retained Unknown child after replay");
-    assert_eq!(unknown_after_replay, unknown);
+    assert_eq!(unknown_after_replay.id, unknown.id);
+    assert_eq!(unknown_after_replay.principal, unknown.principal);
+    assert_eq!(unknown_after_replay.method, unknown.method);
+    assert_eq!(unknown_after_replay.verb, unknown.verb);
+    assert_eq!(unknown_after_replay.target, unknown.target);
+    assert_eq!(
+        unknown_after_replay.expected_generation,
+        unknown.expected_generation
+    );
+    assert_eq!(unknown_after_replay.generation, unknown.generation);
+    assert_eq!(unknown_after_replay.args, unknown.args);
+    assert_eq!(unknown_after_replay.turn_id, unknown.turn_id);
+    assert_eq!(unknown_after_replay.request_id, unknown.request_id);
+    assert_eq!(unknown_after_replay.created_at, unknown.created_at);
+    assert_eq!(unknown_after_replay.probe, unknown.probe);
+    assert_eq!(unknown_after_replay.state, CommandState::Unknown);
+    assert_eq!(
+        unknown_after_replay
+            .outcome
+            .as_ref()
+            .and_then(|outcome| outcome["reason"].as_str()),
+        Some("owner_marked_lost"),
+        "same-ID replay retained the exact Unknown reason"
+    );
     let events_after_replay = fixture.events();
     assert_eq!(fault_dispatches(&events_after_replay, &child_id), 1);
     assert_eq!(

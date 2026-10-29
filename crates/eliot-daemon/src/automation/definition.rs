@@ -2,7 +2,7 @@ use eliot_core::{
     Error, Event, SubmitCommand,
     api::{CatchUp, RuleLimit, RuleLimitScope, TimerSchedule},
     canonical_json_sha256,
-    limits::MAX_TEXT_BYTES,
+    limits::MAX_EVENT_BYTES,
     parse_agent_id,
 };
 use globset::{Glob, GlobMatcher};
@@ -562,8 +562,8 @@ fn validate_event_action(action: &ActionDefinition) -> Result<(), Error> {
     validate_template(target, true)?;
     match action.expected_generation() {
         Value::String(value) => {
-            validate_template(value, false)?;
-            if !is_whole_template(value) {
+            let parts = parse_template(value)?;
+            if !is_whole_template(&parts) {
                 return Err(Error::new(
                     "invalid",
                     "action generation must be a nonnegative integer or whole-value template",
@@ -593,7 +593,7 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
         .target()
         .as_str()
         .ok_or_else(|| Error::new("invalid", "timer action target must be a string"))?;
-    if target.contains("${") || target.contains('}') {
+    if has_templates(&parse_template(target)?) {
         return Err(Error::new(
             "invalid",
             "timer action target cannot use templates without event data",
@@ -644,15 +644,14 @@ fn validate_text_template(value: &Value, allow_templates: bool) -> Result<(), Er
     let text = value
         .as_str()
         .ok_or_else(|| Error::new("invalid", "send action text must be a string"))?;
-    if text.len() > MAX_TEXT_BYTES {
+    if text.len() > MAX_EVENT_BYTES {
         return Err(Error::new(
             "invalid",
-            "send action text exceeds the 512 KiB bound",
+            "send action text exceeds the 64 KiB persisted-text bound",
         ));
     }
-    if allow_templates {
-        validate_template(text, true)
-    } else if text.contains("${") || text.contains('}') {
+    let parts = parse_template(text)?;
+    if !allow_templates && has_templates(&parts) {
         Err(Error::new(
             "invalid",
             "timer send text cannot use templates without event data",
@@ -663,31 +662,8 @@ fn validate_text_template(value: &Value, allow_templates: bool) -> Result<(), Er
 }
 
 fn validate_template(value: &str, embedded: bool) -> Result<(), Error> {
-    if value.matches("${").count() != value.matches('}').count() {
-        return Err(Error::new(
-            "invalid",
-            "rule template has an unmatched delimiter",
-        ));
-    }
-    let mut rest = value;
-    let mut found = false;
-    while let Some(start) = rest.find("${") {
-        found = true;
-        let after = &rest[start + 2..];
-        let Some(end) = after.find('}') else {
-            return Err(Error::new("invalid", "rule template is unterminated"));
-        };
-        let path = &after[..end];
-        validate_path(path)?;
-        rest = &after[end + 1..];
-    }
-    if value.contains('}') && !found {
-        return Err(Error::new(
-            "invalid",
-            "rule template has an unmatched delimiter",
-        ));
-    }
-    if found && !embedded && !is_whole_template(value) {
+    let parts = parse_template(value)?;
+    if !embedded && has_templates(&parts) && !is_whole_template(&parts) {
         return Err(Error::new(
             "invalid",
             "generation templates must occupy the whole value",
@@ -696,11 +672,48 @@ fn validate_template(value: &str, embedded: bool) -> Result<(), Error> {
     Ok(())
 }
 
-fn is_whole_template(value: &str) -> bool {
-    value
-        .strip_prefix("${")
-        .and_then(|inner| inner.strip_suffix('}'))
-        .is_some_and(|path| !path.is_empty() && !path.contains('{') && !path.contains('}'))
+#[derive(Clone, Copy, Debug)]
+enum TemplatePart<'a> {
+    Literal(&'a str),
+    Placeholder(&'a str),
+}
+
+fn parse_template(value: &str) -> Result<Vec<TemplatePart<'_>>, Error> {
+    let mut parts = Vec::new();
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        if start > 0 {
+            parts.push(TemplatePart::Literal(&rest[..start]));
+        }
+        let after = &rest[start + 2..];
+        let end = after
+            .find('}')
+            .ok_or_else(|| Error::new("invalid", "rule template is unterminated"))?;
+        let path = &after[..end];
+        if path.contains("${") {
+            return Err(Error::new(
+                "invalid",
+                "rule template cannot nest placeholders",
+            ));
+        }
+        validate_path(path)?;
+        parts.push(TemplatePart::Placeholder(path));
+        rest = &after[end + 1..];
+    }
+    if !rest.is_empty() {
+        parts.push(TemplatePart::Literal(rest));
+    }
+    Ok(parts)
+}
+
+fn has_templates(parts: &[TemplatePart<'_>]) -> bool {
+    parts
+        .iter()
+        .any(|part| matches!(part, TemplatePart::Placeholder(_)))
+}
+
+fn is_whole_template(parts: &[TemplatePart<'_>]) -> bool {
+    matches!(parts, [TemplatePart::Placeholder(_)])
 }
 
 fn validate_path(path: &str) -> Result<(), Error> {
@@ -784,36 +797,31 @@ fn render_agent_target(value: &Value, roots: &TemplateRoots<'_>) -> Result<Strin
     let source = value
         .as_str()
         .ok_or_else(|| Error::new("invalid", "Agent action requires a string target"))?;
-    if is_whole_template(source) {
-        let path = &source[2..source.len() - 1];
+    let parts = parse_template(source)?;
+    if let [TemplatePart::Placeholder(path)] = parts.as_slice() {
         let target = lookup(path, roots.event, roots.subject, roots.data)
             .and_then(Value::as_str)
             .ok_or_else(|| Error::new("invalid", "action target template is unavailable"))?;
         ensure_agent_id_capacity(target.len())?;
         return Ok(target.to_owned());
     }
-    if !source.contains("${") {
+    if !has_templates(&parts) {
         ensure_agent_id_capacity(source.len())?;
         return Ok(source.to_owned());
     }
 
     let mut rendered = String::new();
-    let mut rest = source;
-    while let Some(start) = rest.find("${") {
-        push_agent_id_fragment(&mut rendered, &rest[..start])?;
-        let after = &rest[start + 2..];
-        let end = after
-            .find('}')
-            .ok_or_else(|| Error::new("invalid", "rule template is unterminated"))?;
-        let value = lookup(&after[..end], roots.event, roots.subject, roots.data)
-            .ok_or_else(|| Error::new("invalid", "rule template value is unavailable"))?;
-        let text = value.as_str().ok_or_else(|| {
-            Error::new("invalid", "embedded rule template values must be strings")
-        })?;
-        push_agent_id_fragment(&mut rendered, text)?;
-        rest = &after[end + 1..];
+    for part in parts {
+        let fragment = match part {
+            TemplatePart::Literal(text) => text,
+            TemplatePart::Placeholder(path) => lookup(path, roots.event, roots.subject, roots.data)
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    Error::new("invalid", "embedded rule template values must be strings")
+                })?,
+        };
+        push_agent_id_fragment(&mut rendered, fragment)?;
     }
-    push_agent_id_fragment(&mut rendered, rest)?;
     Ok(rendered)
 }
 
@@ -842,10 +850,13 @@ fn render_generation(value: &Value, roots: &TemplateRoots<'_>) -> Result<Value, 
     let Some(source) = value.as_str() else {
         return Ok(value.clone());
     };
-    let path = source
-        .strip_prefix("${")
-        .and_then(|inner| inner.strip_suffix('}'))
-        .ok_or_else(|| Error::new("invalid", "action generation template is malformed"))?;
+    let parts = parse_template(source)?;
+    let [TemplatePart::Placeholder(path)] = parts.as_slice() else {
+        return Err(Error::new(
+            "invalid",
+            "action generation template must occupy the whole value",
+        ));
+    };
     lookup(path, roots.event, roots.subject, roots.data)
         .cloned()
         .ok_or_else(|| Error::new("invalid", "action generation template is unavailable"))
@@ -855,8 +866,8 @@ fn render_text(value: &Value, roots: &TemplateRoots<'_>) -> Result<String, Error
     let source = value
         .as_str()
         .ok_or_else(|| Error::new("invalid", "send action text must be a string"))?;
-    if is_whole_template(source) {
-        let path = &source[2..source.len() - 1];
+    let parts = parse_template(source)?;
+    if let [TemplatePart::Placeholder(path)] = parts.as_slice() {
         let text = lookup(path, roots.event, roots.subject, roots.data)
             .and_then(Value::as_str)
             .ok_or_else(|| {
@@ -865,43 +876,38 @@ fn render_text(value: &Value, roots: &TemplateRoots<'_>) -> Result<String, Error
                     "send text template is unavailable or not a string",
                 )
             })?;
-        if text.len() > MAX_TEXT_BYTES {
+        if text.len() > MAX_EVENT_BYTES {
             return Err(Error::new(
                 "invalid",
-                "rendered send text exceeds the 512 KiB bound",
+                "rendered send text exceeds the 64 KiB persisted-text bound",
             ));
         }
         return Ok(text.to_owned());
     }
 
     let mut rendered = String::new();
-    let mut rest = source;
-    while let Some(start) = rest.find("${") {
-        push_bounded_text(&mut rendered, &rest[..start])?;
-        let after = &rest[start + 2..];
-        let end = after
-            .find('}')
-            .ok_or_else(|| Error::new("invalid", "rule template is unterminated"))?;
-        let text = lookup(&after[..end], roots.event, roots.subject, roots.data)
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                Error::new(
-                    "invalid",
-                    "send text template is unavailable or not a string",
-                )
-            })?;
-        push_bounded_text(&mut rendered, text)?;
-        rest = &after[end + 1..];
+    for part in parts {
+        let fragment = match part {
+            TemplatePart::Literal(text) => text,
+            TemplatePart::Placeholder(path) => lookup(path, roots.event, roots.subject, roots.data)
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    Error::new(
+                        "invalid",
+                        "send text template is unavailable or not a string",
+                    )
+                })?,
+        };
+        push_bounded_text(&mut rendered, fragment)?;
     }
-    push_bounded_text(&mut rendered, rest)?;
     Ok(rendered)
 }
 
 fn push_bounded_text(target: &mut String, fragment: &str) -> Result<(), Error> {
-    if fragment.len() > MAX_TEXT_BYTES.saturating_sub(target.len()) {
+    if fragment.len() > MAX_EVENT_BYTES.saturating_sub(target.len()) {
         return Err(Error::new(
             "invalid",
-            "rendered send text exceeds the 512 KiB bound",
+            "rendered send text exceeds the 64 KiB persisted-text bound",
         ));
     }
     target.push_str(fragment);
@@ -1068,17 +1074,109 @@ do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${eve
         assert_eq!(command.expected_turn_id, None);
         assert_eq!(command.request_id, None);
 
-        let oversized =
-            SEND_RULE.replace("text = 'Result: ${data.status}'", "text = '${data.large}'");
-        let oversized = load(Cursor::new(oversized)).unwrap().remove(0);
+        let exact = SEND_RULE.replace("text = 'Result: ${data.status}'", "text = '${data.large}'");
+        let exact = load(Cursor::new(exact)).unwrap().remove(0);
         let mut event = event();
-        event.data["large"] = Value::String("x".repeat(MAX_TEXT_BYTES + 1));
+        event.data["large"] = Value::String("é".repeat(MAX_EVENT_BYTES / 2));
+        let command = evaluate(&exact, &event).unwrap().unwrap();
+        assert_eq!(
+            command.args["text"].as_str().unwrap().len(),
+            MAX_EVENT_BYTES
+        );
+
+        let oversized =
+            SEND_RULE.replace("text = 'Result: ${data.status}'", "text = 'x${data.large}'");
+        let oversized = load(Cursor::new(oversized)).unwrap().remove(0);
         let error = evaluate(&oversized, &event).unwrap_err();
         assert_eq!(error.code, "invalid");
         assert_eq!(
             error.message,
-            "rendered send text exceeds the 512 KiB bound"
+            "rendered send text exceeds the 64 KiB persisted-text bound"
         );
+    }
+
+    #[test]
+    fn event_and_timer_literal_text_use_the_utf8_persisted_text_bound() {
+        let at_limit = "é".repeat(MAX_EVENT_BYTES / 2);
+        let over_limit = format!("{at_limit}é");
+
+        let event_at_limit = SEND_RULE.replace(
+            "text = 'Result: ${data.status}'",
+            &format!("text = '{at_limit}'"),
+        );
+        assert!(load(Cursor::new(event_at_limit)).is_ok());
+        let event_over_limit = SEND_RULE.replace(
+            "text = 'Result: ${data.status}'",
+            &format!("text = '{over_limit}'"),
+        );
+        assert_eq!(
+            load(Cursor::new(event_over_limit)).unwrap_err().code,
+            "invalid"
+        );
+
+        let timer_at_limit = INTERVAL_TIMER.replace(
+            "action = 'stop'",
+            &format!("action = 'send', text = '{at_limit}'"),
+        );
+        assert!(load(Cursor::new(timer_at_limit)).is_ok());
+        let timer_over_limit = INTERVAL_TIMER.replace(
+            "action = 'stop'",
+            &format!("action = 'send', text = '{over_limit}'"),
+        );
+        assert_eq!(
+            load(Cursor::new(timer_over_limit)).unwrap_err().code,
+            "invalid"
+        );
+    }
+
+    #[test]
+    fn plain_json_braces_are_literal_for_event_timer_and_saved_rules() {
+        let event_source = SEND_RULE.replace(
+            "text = 'Result: ${data.status}'",
+            "text = 'Return JSON: {}'",
+        );
+        let event_rule = load(Cursor::new(event_source)).unwrap().remove(0);
+        let event_saved = serde_json::to_string(&event_rule).unwrap();
+        let restored_event = RuleDefinition::deserialize_saved(&event_saved).unwrap();
+        assert_eq!(
+            restored_event.semantic_digest().unwrap(),
+            event_rule.semantic_digest().unwrap()
+        );
+        assert_eq!(
+            evaluate(&restored_event, &event()).unwrap().unwrap().args,
+            json!({"text":"Return JSON: {}"})
+        );
+
+        let timer_source = INTERVAL_TIMER.replace(
+            "action = 'stop'",
+            "action = 'send', text = 'Return JSON: {}'",
+        );
+        let timer_rule = load(Cursor::new(timer_source)).unwrap().remove(0);
+        let timer_saved = serde_json::to_string(&timer_rule).unwrap();
+        let restored_timer = RuleDefinition::deserialize_saved(&timer_saved).unwrap();
+        assert_eq!(
+            restored_timer.semantic_digest().unwrap(),
+            timer_rule.semantic_digest().unwrap()
+        );
+        assert_eq!(
+            restored_timer.evaluate_timer().unwrap().args,
+            json!({"text":"Return JSON: {}"})
+        );
+    }
+
+    #[test]
+    fn malformed_or_unknown_placeholders_remain_invalid() {
+        let unterminated = SEND_RULE.replace(
+            "text = 'Result: ${data.status}'",
+            "text = 'Result: ${data.status'",
+        );
+        assert_eq!(load(Cursor::new(unterminated)).unwrap_err().code, "invalid");
+
+        let unknown_root = SEND_RULE.replace(
+            "text = 'Result: ${data.status}'",
+            "text = '${agent.turn_id}'",
+        );
+        assert_eq!(load(Cursor::new(unknown_root)).unwrap_err().code, "invalid");
     }
 
     #[test]
