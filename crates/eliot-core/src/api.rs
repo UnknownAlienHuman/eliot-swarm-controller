@@ -496,6 +496,7 @@ mod tests {
                 source: "fixture".to_owned(),
                 native_id: None,
                 data: json!({"private_fixture":"must not enter an error"}),
+                cause: None,
             })
             .collect();
         [

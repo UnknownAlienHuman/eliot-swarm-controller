@@ -1,25 +1,30 @@
 mod definition;
+mod reload;
 mod schedule;
 pub(crate) use definition::RuleDefinition;
 
-use crate::{common::now_ms, router::Router};
+use crate::{common::now_ms, logging, router::Router};
 use eliot_core::{
-    Error, Result, SubmitCommand,
+    Error, Result, SecretPolicy, SubmitCommand,
     api::{CatchUp, RuleStateView, TimerSchedule, TimerStateView},
 };
-use eliot_store::{RuleCursorOutcome, RuleDefinitionInput, TimerDefinitionInput, TimerSlotCommit};
+use eliot_store::{
+    RuleCursorOutcome, RuleDefinitionInput, RuleProcessingState, TimerDefinitionInput,
+    TimerSlotCommit,
+};
 use serde_json::json;
 use std::{
-    collections::HashSet,
-    fs::{self, File},
-    io::ErrorKind,
+    collections::HashMap,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 use tokio::sync::{broadcast, watch};
 
 const RULE_EVENT_PAGE_SIZE: usize = 128;
 const TIMER_PAGE_SIZE: usize = 128;
+const MAX_RULE_EVENT_BACKLOG: i64 = 100_000;
+const RULE_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 
 enum TimerDecision {
     NotDue,
@@ -38,7 +43,15 @@ enum TimerDecision {
 pub(crate) struct ActiveRule {
     definition: RuleDefinition,
     state: RuleStateView,
+    retiring: Option<RetiringRule>,
     timer: Option<ActiveTimer>,
+}
+
+struct RetiringRule {
+    definition: RuleDefinition,
+    revision: i64,
+    cursor: i64,
+    through: i64,
 }
 
 struct ActiveTimer {
@@ -51,72 +64,252 @@ struct ActiveTimer {
 pub(crate) async fn initialize_global_rules(
     router: &Router,
     data_root: &Path,
+    policy: &SecretPolicy,
 ) -> Result<Vec<ActiveRule>> {
-    let (definitions, inputs) = load_global_rules(data_root)?;
-    // One sample anchors every initial calculation and the Store seed. Preflight
-    // every timer before rule initialization can persist any definition.
+    let prior = router.global_rule_processing().await?;
     let registration_now = now_ms();
-    let mut timer_seeds: Vec<Option<(Option<TimerStateView>, Option<i64>)>> =
-        Vec::with_capacity(definitions.len());
-    for definition in &definitions {
-        let seed = if let Some(schedule) = definition.schedule() {
-            let existing = router.get_global_timer(&definition.id).await?;
-            let next_due = match &existing {
-                Some(timer) => timer.next_due_at,
-                None => initial_next_due_at(schedule, registration_now)?,
+    let snapshot = match reload::load(data_root) {
+        Ok(snapshot) => snapshot,
+        Err(error) if !prior.is_empty() => {
+            logging::record(policy, "daemon.rule_reload_rejected", &[], Some(&error));
+            reload::from_processing(&prior)?
+        }
+        Err(error) => return Err(error),
+    };
+    match apply_global_rule_snapshot(router, &snapshot, None, registration_now).await {
+        Ok(rules) => Ok(rules),
+        Err(error)
+            if !prior.is_empty()
+                && matches!(
+                    error.code.as_str(),
+                    "frame_too_large" | "invalid" | "secret_in_payload" | "unsupported"
+                ) =>
+        {
+            logging::record(policy, "daemon.rule_reload_rejected", &[], Some(&error));
+            let saved = reload::from_processing(&prior)?;
+            apply_global_rule_snapshot(router, &saved, None, registration_now).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn apply_global_rule_snapshot(
+    router: &Router,
+    snapshot: &reload::RuleSnapshot,
+    previous: Option<&[ActiveRule]>,
+    registration_now: i64,
+) -> Result<Vec<ActiveRule>> {
+    router
+        .validate_global_rule_definitions(&snapshot.inputs)
+        .await?;
+    let prior = router.global_rule_processing().await?;
+    let effective = defer_retiring_edits(snapshot, &prior)?;
+    let timers = timer_inputs(router, &effective, &prior, registration_now).await?;
+    let states = router
+        .initialize_global_rules(&effective.inputs, &timers, registration_now)
+        .await?;
+    let active = active_rules(router, states, previous, registration_now).await?;
+    router.install_global_rule_definitions(
+        &active
+            .iter()
+            .map(|rule| rule.definition.clone())
+            .collect::<Vec<_>>(),
+    );
+    Ok(active)
+}
+
+fn defer_retiring_edits(
+    snapshot: &reload::RuleSnapshot,
+    prior: &[RuleProcessingState],
+) -> Result<reload::RuleSnapshot> {
+    let mut definitions: HashMap<String, RuleDefinition> = snapshot
+        .definitions
+        .iter()
+        .cloned()
+        .map(|definition| (definition.id.clone(), definition))
+        .collect();
+    let mut inputs: HashMap<String, RuleDefinitionInput> = snapshot
+        .inputs
+        .iter()
+        .cloned()
+        .map(|input| (input.id.clone(), input))
+        .collect();
+
+    for state in prior
+        .iter()
+        .filter(|state| state.view.retiring_revision.is_some())
+    {
+        let stored = reload::from_canonical(&state.current_definition)?;
+        let changed = definitions
+            .get(&state.view.id)
+            .map(|candidate| {
+                Ok(candidate.enabled != stored.enabled
+                    || candidate.semantic_digest()? != stored.semantic_digest()?)
+            })
+            .transpose()?
+            .unwrap_or(true);
+        if !changed {
+            continue;
+        }
+        let definition_digest = stored.semantic_digest()?;
+        inputs.insert(
+            state.view.id.clone(),
+            RuleDefinitionInput {
+                id: state.view.id.clone(),
+                canonical_definition: state.current_definition.clone(),
+                definition_digest,
+                enabled: stored.enabled,
+            },
+        );
+        definitions.insert(state.view.id.clone(), stored);
+    }
+
+    let mut ids = definitions.keys().cloned().collect::<Vec<_>>();
+    ids.sort();
+    let definitions = ids.iter().filter_map(|id| definitions.remove(id)).collect();
+    let inputs = ids.iter().filter_map(|id| inputs.remove(id)).collect();
+    Ok(reload::RuleSnapshot {
+        definitions,
+        inputs,
+    })
+}
+
+async fn timer_inputs(
+    router: &Router,
+    snapshot: &reload::RuleSnapshot,
+    prior: &[RuleProcessingState],
+    registration_now: i64,
+) -> Result<Vec<TimerDefinitionInput>> {
+    let prior_by_id: HashMap<_, _> = prior
+        .iter()
+        .map(|state| (state.view.id.as_str(), state))
+        .collect();
+    let mut inputs = Vec::new();
+    for definition in &snapshot.definitions {
+        let Some(schedule) = definition.schedule() else {
+            continue;
+        };
+        let old_definition = prior_by_id
+            .get(definition.id.as_str())
+            .map(|state| reload::from_canonical(&state.current_definition))
+            .transpose()?;
+        let schedule_changed = old_definition
+            .as_ref()
+            .map(RuleDefinition::schedule_digest)
+            .transpose()?
+            != Some(definition.schedule_digest()?);
+        let existing = router.get_global_timer(&definition.id).await?;
+        let schedule_revision =
+            match &existing {
+                Some(timer) if schedule_changed => timer
+                    .schedule_revision
+                    .checked_add(1)
+                    .ok_or_else(|| Error::new("invalid", "timer schedule revision overflows"))?,
+                Some(timer) => timer.schedule_revision,
+                None => prior_by_id
+                    .get(definition.id.as_str())
+                    .map_or(Ok(1), |state| {
+                        state.view.revision.checked_add(1).ok_or_else(|| {
+                            Error::new("invalid", "timer schedule revision overflows")
+                        })
+                    })?,
             };
-            Some((existing, next_due))
+        let initial_next_due_at = match (&existing, schedule_changed) {
+            (Some(timer), false) => timer.next_due_at,
+            _ => initial_next_due_at(schedule, registration_now)?,
+        };
+        inputs.push(TimerDefinitionInput {
+            id: definition.id.clone(),
+            schedule_revision,
+            schedule: schedule.clone(),
+            enabled: definition.enabled,
+            initial_next_due_at,
+        });
+    }
+    Ok(inputs)
+}
+
+async fn active_rules(
+    router: &Router,
+    states: Vec<RuleProcessingState>,
+    previous: Option<&[ActiveRule]>,
+    armed_at: i64,
+) -> Result<Vec<ActiveRule>> {
+    let mut active = Vec::with_capacity(states.len());
+    for processing in states {
+        let definition = reload::from_canonical(&processing.current_definition)?;
+        if definition.id != processing.view.id {
+            return Err(Error::new(
+                "source_integrity",
+                "stored rule definition does not match its state ID",
+            ));
+        }
+        let retiring = match processing.retiring_definition {
+            Some(canonical) => {
+                let definition = reload::from_canonical(&canonical)?;
+                let (Some(revision), Some(cursor), Some(through)) = (
+                    processing.view.retiring_revision,
+                    processing.view.retiring_cursor,
+                    processing.view.retire_through,
+                ) else {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "retiring rule definition has incomplete cursor state",
+                    ));
+                };
+                Some(RetiringRule {
+                    definition,
+                    revision,
+                    cursor,
+                    through,
+                })
+            }
+            None => {
+                if processing.view.retiring_revision.is_some()
+                    || processing.view.retiring_cursor.is_some()
+                    || processing.view.retire_through.is_some()
+                {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "retiring rule cursor has no stored definition",
+                    ));
+                }
+                None
+            }
+        };
+        let timer = if definition.schedule().is_some() {
+            let state = router
+                .get_global_timer(&definition.id)
+                .await?
+                .ok_or_else(|| Error::new("source_integrity", "timer rule has no timer state"))?;
+            let old_timer = previous
+                .and_then(|rules| {
+                    rules
+                        .iter()
+                        .find(|rule| rule.definition.id == definition.id)
+                })
+                .and_then(|rule| rule.timer.as_ref());
+            let unchanged_schedule = old_timer.is_some_and(|old| {
+                old.state.schedule_revision == state.schedule_revision
+                    && old.state.schedule == state.schedule
+            });
+            Some(ActiveTimer {
+                armed_due_at_ms: if unchanged_schedule {
+                    old_timer.and_then(|old| old.armed_due_at_ms)
+                } else {
+                    state.next_due_at.filter(|due| *due >= armed_at)
+                },
+                state,
+                catch_up: *definition.catch_up(),
+                blocked: unchanged_schedule && old_timer.is_some_and(|old| old.blocked),
+            })
         } else {
             None
         };
-        timer_seeds.push(seed);
-    }
-
-    let states = router
-        .initialize_global_rules(&inputs, registration_now)
-        .await?;
-    if definitions.len() != states.len() {
-        return Err(Error::new(
-            "internal",
-            "global rule initialization returned an incomplete state set",
-        ));
-    }
-    router.install_global_rule_definitions(&definitions);
-    let mut active = Vec::with_capacity(definitions.len());
-    for ((definition, state), timer_seed) in definitions.into_iter().zip(states).zip(timer_seeds) {
-        let timer = match (definition.schedule(), timer_seed) {
-            (Some(schedule), Some((existing, initial_next_due_at))) => {
-                let schedule_revision = existing
-                    .as_ref()
-                    .map_or(state.revision, |timer| timer.schedule_revision);
-                let input = TimerDefinitionInput {
-                    id: definition.id.clone(),
-                    schedule_revision,
-                    schedule: schedule.clone(),
-                    enabled: definition.enabled,
-                    initial_next_due_at,
-                };
-                let state = router
-                    .initialize_global_timer(&input, registration_now)
-                    .await?;
-                Some(ActiveTimer {
-                    armed_due_at_ms: state.next_due_at.filter(|due| *due >= registration_now),
-                    state,
-                    catch_up: *definition.catch_up(),
-                    blocked: false,
-                })
-            }
-            (None, None) => None,
-            _ => {
-                return Err(Error::new(
-                    "internal",
-                    "global rule timer preflight did not match its definition",
-                ));
-            }
-        };
         active.push(ActiveRule {
             definition,
-            state,
+            state: processing.view,
+            retiring,
             timer,
         });
     }
@@ -126,120 +319,48 @@ pub(crate) async fn initialize_global_rules(
 pub(crate) async fn run_global_rules(
     router: Router,
     mut rules: Vec<ActiveRule>,
+    data_root: PathBuf,
+    policy: Arc<SecretPolicy>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    if rules.is_empty() {
-        return Ok(());
-    }
-
     // Bus messages are wake hints; durable Store pages remain authoritative.
     // Register before the first high-water read so no event can fall between them.
     let mut events = router.subscribe_rule_events();
     let mut progress = router.progress_receiver();
+    let mut watcher = match reload::RuleWatcher::watch(&data_root) {
+        Ok(watcher) => Some(watcher),
+        Err(error) => {
+            logging::record(&policy, "daemon.rule_watch_unavailable", &[], Some(&error));
+            None
+        }
+    };
+    let mut reconcile = tokio::time::interval(RULE_RECONCILE_INTERVAL);
+    reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_reload_error: Option<(String, String)> = None;
+    let mut deferred_inputs: Option<Vec<RuleDefinitionInput>> = None;
+    let mut rejected_inputs: Option<Vec<RuleDefinitionInput>> = None;
+    let mut last_applied_inputs = None;
+    if let Ok(snapshot) = reload::load(&data_root) {
+        let current = rules
+            .iter()
+            .map(|rule| rule.definition.clone())
+            .collect::<Vec<_>>();
+        if snapshot.matches(&current).unwrap_or(false) {
+            last_applied_inputs = Some(snapshot.inputs);
+        } else if rules
+            .iter()
+            .any(|rule| rule.state.retiring_revision.is_some())
+        {
+            deferred_inputs = Some(snapshot.inputs);
+        }
+    }
     loop {
         if *shutdown.borrow() || !router.rule_firings_open() {
             return Ok(());
         }
         let high_water = router.rule_high_water().await?;
-
-        for rule in &mut rules {
-            if rule.state.current_cursor > high_water {
-                return Err(Error::new(
-                    "source_integrity",
-                    "rule cursor is above the event high-water mark",
-                ));
-            }
-            if rule.state.current_cursor == high_water {
-                continue;
-            }
-            if rule.state.paused_reason.is_some() && rule.state.enabled {
-                continue;
-            }
-            if !rule.state.enabled || !rule.definition.enabled {
-                // One silent skipped range; cursor-only updates never feed the Bus.
-                rule.state = router
-                    .advance_rule_cursor(&rule.state, high_water, RuleCursorOutcome::Disabled)
-                    .await?;
-                continue;
-            }
-
-            while rule.state.current_cursor < high_water {
-                if *shutdown.borrow() || !router.rule_firings_open() {
-                    return Ok(());
-                }
-                let page = router
-                    .read_rule_events(rule.state.current_cursor, high_water, RULE_EVENT_PAGE_SIZE)
-                    .await?;
-                if page.is_empty() {
-                    return Err(Error::new(
-                        "history_gap",
-                        "rule cursor is behind unavailable event history",
-                    ));
-                }
-
-                let mut no_match_through = None;
-                for event in page {
-                    if event.seq <= rule.state.current_cursor {
-                        continue;
-                    }
-                    if event.kind != "turn.completed" {
-                        no_match_through = Some(event.seq);
-                        continue;
-                    }
-
-                    let stop = match definition::evaluate(&rule.definition, &event) {
-                        Ok(Some(stop)) => stop,
-                        Ok(None) => {
-                            no_match_through = Some(event.seq);
-                            continue;
-                        }
-                        Err(error) => {
-                            flush_no_match(&router, rule, &mut no_match_through).await?;
-                            rule.state = router
-                                .advance_rule_cursor(
-                                    &rule.state,
-                                    event.seq,
-                                    RuleCursorOutcome::Rejected { code: error.code },
-                                )
-                                .await?;
-                            continue;
-                        }
-                    };
-
-                    flush_no_match(&router, rule, &mut no_match_through).await?;
-                    if !router.rule_firings_open() {
-                        return Ok(());
-                    }
-                    let request = stop_command(stop);
-                    let prepared = match router.prepare_owner_submission(request).await {
-                        Ok(prepared) => prepared,
-                        Err(_) if !router.rule_firings_open() => return Ok(()),
-                        Err(error) if deterministic_rejection(&error.code) => {
-                            rule.state = router
-                                .advance_rule_cursor(
-                                    &rule.state,
-                                    event.seq,
-                                    RuleCursorOutcome::Rejected { code: error.code },
-                                )
-                                .await?;
-                            continue;
-                        }
-                        Err(error) => return Err(error),
-                    };
-
-                    let Some(admission) = router
-                        .admit_rule_stop(&rule.state, event.seq, prepared)
-                        .await?
-                    else {
-                        // Shutdown won the shared Store-lock ordering. Leave the
-                        // cursor at this event; a later open daemon can process it.
-                        return Ok(());
-                    };
-                    rule.state = admission.state;
-                    // Router schedules only a new child after the commit lock drops.
-                }
-                flush_no_match(&router, rule, &mut no_match_through).await?;
-            }
+        if !reconcile_event_rules(&router, &mut rules, high_water, now_ms()).await? {
+            return Ok(());
         }
 
         if !reconcile_due_timers(&router, &mut rules, now_ms()).await? {
@@ -247,6 +368,7 @@ pub(crate) async fn run_global_rules(
         }
 
         let timer_wait = next_timer_wait(&rules, now_ms());
+        let mut reload_requested = false;
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -264,6 +386,14 @@ pub(crate) async fn run_global_rules(
                     return Err(Error::new("unavailable", "event bus is closed"));
                 }
             },
+            _ = reconcile.tick() => reload_requested = true,
+            _ = async {
+                if let Some(watcher) = &mut watcher {
+                    let _ = watcher.changed().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => reload_requested = true,
             _ = async {
                 if let Some(wait) = timer_wait {
                     tokio::time::sleep(wait).await;
@@ -277,6 +407,317 @@ pub(crate) async fn run_global_rules(
                 timer.blocked = false;
             }
         }
+        if !reload_requested {
+            continue;
+        }
+
+        let snapshot = match reload::load(&data_root) {
+            Ok(snapshot) => {
+                last_reload_error = None;
+                snapshot
+            }
+            Err(error) => {
+                let signature = (error.code.clone(), error.message.clone());
+                if last_reload_error.as_ref() != Some(&signature) {
+                    logging::record(&policy, "daemon.rule_reload_rejected", &[], Some(&error));
+                }
+                last_reload_error = Some(signature);
+                continue;
+            }
+        };
+        if last_applied_inputs.as_ref() == Some(&snapshot.inputs) {
+            rejected_inputs = None;
+            continue;
+        }
+        if rejected_inputs.as_ref() == Some(&snapshot.inputs)
+            && !rules
+                .iter()
+                .any(|rule| rule.state.retiring_revision.is_some())
+        {
+            continue;
+        }
+        let current_definitions = rules
+            .iter()
+            .map(|rule| rule.definition.clone())
+            .collect::<Vec<_>>();
+        if snapshot.matches(&current_definitions)? {
+            last_applied_inputs = Some(snapshot.inputs.clone());
+            rejected_inputs = None;
+            deferred_inputs = None;
+            continue;
+        }
+        let retirement_pending = rules
+            .iter()
+            .any(|rule| rule.state.retiring_revision.is_some());
+        if retirement_pending && deferred_inputs.as_ref() == Some(&snapshot.inputs) {
+            continue;
+        }
+        match apply_global_rule_snapshot(&router, &snapshot, Some(&rules), now_ms()).await {
+            Ok(updated) => {
+                let updated_definitions = updated
+                    .iter()
+                    .map(|rule| rule.definition.clone())
+                    .collect::<Vec<_>>();
+                let deferred = updated
+                    .iter()
+                    .any(|rule| rule.state.retiring_revision.is_some())
+                    && !snapshot.matches(&updated_definitions)?;
+                if deferred {
+                    if deferred_inputs.as_ref() != Some(&snapshot.inputs) {
+                        logging::record(&policy, "daemon.rule_reload_deferred", &[], None);
+                    }
+                    deferred_inputs = Some(snapshot.inputs.clone());
+                } else {
+                    last_applied_inputs = Some(snapshot.inputs.clone());
+                    rejected_inputs = None;
+                    deferred_inputs = None;
+                }
+                rules = updated;
+            }
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    "frame_too_large" | "invalid" | "secret_in_payload" | "unsupported"
+                ) =>
+            {
+                let signature = (error.code.clone(), error.message.clone());
+                if last_reload_error.as_ref() != Some(&signature) {
+                    logging::record(&policy, "daemon.rule_reload_rejected", &[], Some(&error));
+                }
+                last_reload_error = Some(signature);
+                rejected_inputs = Some(snapshot.inputs.clone());
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn reconcile_event_rules(
+    router: &Router,
+    rules: &mut [ActiveRule],
+    high_water: i64,
+    now: i64,
+) -> Result<bool> {
+    for rule in rules {
+        if rule.state.paused_reason.as_deref() == Some("backlog_exceeded") {
+            continue;
+        }
+        if rule.state.current_cursor > high_water
+            || rule
+                .state
+                .retiring_cursor
+                .is_some_and(|cursor| cursor > high_water)
+        {
+            return Err(Error::new(
+                "source_integrity",
+                "rule cursor is above the event high-water mark",
+            ));
+        }
+        refresh_retiring(rule)?;
+        let oldest_needed = [
+            rule.state.enabled.then_some(rule.state.current_cursor),
+            rule.retiring
+                .as_ref()
+                .filter(|retiring| retiring.definition.enabled)
+                .map(|retiring| retiring.cursor),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        if oldest_needed
+            .is_some_and(|cursor| high_water.saturating_sub(cursor) > MAX_RULE_EVENT_BACKLOG)
+        {
+            let processing = router
+                .settle_rule_backlog(&rule.state, high_water, MAX_RULE_EVENT_BACKLOG, now)
+                .await?;
+            rule.state = processing.view;
+            refresh_retiring(rule)?;
+            if rule.state.paused_reason.as_deref() == Some("backlog_exceeded") {
+                continue;
+            }
+        }
+
+        if let Some(retiring) = &rule.retiring {
+            if retiring.definition.enabled && rule.state.paused_reason.is_none() {
+                let through = retiring.through.min(high_water);
+                if retiring.cursor < through
+                    && !process_rule_cursor(router, rule, true, through).await?
+                {
+                    return Ok(false);
+                }
+            } else if retiring.cursor < retiring.through.min(high_water) {
+                advance_rule_cursor(
+                    router,
+                    rule,
+                    true,
+                    retiring.through.min(high_water),
+                    RuleCursorOutcome::NoMatch,
+                )
+                .await?;
+            }
+        }
+
+        if rule.state.current_cursor < high_water {
+            if rule.state.paused_reason.is_some() {
+                continue;
+            }
+            if !rule.state.enabled || !rule.definition.enabled {
+                advance_rule_cursor(router, rule, false, high_water, RuleCursorOutcome::Disabled)
+                    .await?;
+            } else if !process_rule_cursor(router, rule, false, high_water).await? {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+async fn process_rule_cursor(
+    router: &Router,
+    rule: &mut ActiveRule,
+    retiring: bool,
+    through: i64,
+) -> Result<bool> {
+    let definition = if retiring {
+        rule.retiring
+            .as_ref()
+            .ok_or_else(|| Error::new("source_integrity", "retiring definition is absent"))?
+            .definition
+            .clone()
+    } else {
+        rule.definition.clone()
+    };
+    while let Some(cursor) = rule_cursor(rule, retiring) {
+        if cursor >= through {
+            break;
+        }
+        let page = router
+            .read_rule_events(cursor, through, RULE_EVENT_PAGE_SIZE)
+            .await?;
+        if page.is_empty() {
+            return Err(Error::new(
+                "history_gap",
+                "rule cursor is behind unavailable event history",
+            ));
+        }
+        let mut no_match_through = None;
+        for event in page {
+            if event.seq <= rule_cursor(rule, retiring).unwrap_or(through) {
+                continue;
+            }
+            let stop = match definition::evaluate(&definition, &event) {
+                Ok(Some(stop)) => stop,
+                Ok(None) => {
+                    no_match_through = Some(event.seq);
+                    continue;
+                }
+                Err(error) => {
+                    flush_rule_no_match(router, rule, retiring, &mut no_match_through).await?;
+                    advance_rule_cursor(
+                        router,
+                        rule,
+                        retiring,
+                        event.seq,
+                        RuleCursorOutcome::Rejected { code: error.code },
+                    )
+                    .await?;
+                    continue;
+                }
+            };
+
+            flush_rule_no_match(router, rule, retiring, &mut no_match_through).await?;
+            if !router.rule_firings_open() {
+                return Ok(false);
+            }
+            let prepared = match router.prepare_owner_submission(stop_command(stop)).await {
+                Ok(prepared) => prepared,
+                Err(_) if !router.rule_firings_open() => return Ok(false),
+                Err(error) if deterministic_rejection(&error.code) => {
+                    advance_rule_cursor(
+                        router,
+                        rule,
+                        retiring,
+                        event.seq,
+                        RuleCursorOutcome::Rejected { code: error.code },
+                    )
+                    .await?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let Some(admission) = router
+                .admit_rule_stop(&rule.state, event.seq, prepared)
+                .await?
+            else {
+                return Ok(false);
+            };
+            rule.state = admission.state;
+            refresh_retiring(rule)?;
+            // Router schedules only a new child after Store commit and lock release.
+        }
+        flush_rule_no_match(router, rule, retiring, &mut no_match_through).await?;
+    }
+    Ok(true)
+}
+
+fn rule_cursor(rule: &ActiveRule, retiring: bool) -> Option<i64> {
+    if retiring {
+        rule.retiring.as_ref().map(|state| state.cursor)
+    } else {
+        Some(rule.state.current_cursor)
+    }
+}
+
+async fn advance_rule_cursor(
+    router: &Router,
+    rule: &mut ActiveRule,
+    _retiring: bool,
+    through: i64,
+    outcome: RuleCursorOutcome,
+) -> Result<()> {
+    rule.state = router
+        .advance_rule_cursor(&rule.state, through, outcome)
+        .await?;
+    refresh_retiring(rule)
+}
+
+async fn flush_rule_no_match(
+    router: &Router,
+    rule: &mut ActiveRule,
+    retiring: bool,
+    through: &mut Option<i64>,
+) -> Result<()> {
+    if let Some(through) = through.take()
+        && through > rule_cursor(rule, retiring).unwrap_or(through)
+    {
+        advance_rule_cursor(router, rule, retiring, through, RuleCursorOutcome::NoMatch).await?;
+    }
+    Ok(())
+}
+
+fn refresh_retiring(rule: &mut ActiveRule) -> Result<()> {
+    match (
+        rule.state.retiring_revision,
+        rule.state.retiring_cursor,
+        rule.state.retire_through,
+        rule.retiring.as_mut(),
+    ) {
+        (None, None, None, None) => Ok(()),
+        (None, None, None, Some(_)) => {
+            rule.retiring = None;
+            Ok(())
+        }
+        (Some(revision), Some(cursor), Some(through), Some(retiring))
+            if revision == retiring.revision =>
+        {
+            retiring.cursor = cursor;
+            retiring.through = through;
+            Ok(())
+        }
+        _ => Err(Error::new(
+            "source_integrity",
+            "retiring definition and cursor state do not match",
+        )),
     }
 }
 
@@ -465,79 +906,6 @@ fn timer_wake_delay(timer: &ActiveTimer, now: i64) -> Option<Duration> {
     Some(Duration::from_millis(
         u64::try_from(delay_ms).unwrap_or(u64::MAX),
     ))
-}
-
-async fn flush_no_match(
-    router: &Router,
-    rule: &mut ActiveRule,
-    through: &mut Option<i64>,
-) -> Result<()> {
-    if let Some(through) = through.take()
-        && through > rule.state.current_cursor
-    {
-        rule.state = router
-            .advance_rule_cursor(&rule.state, through, RuleCursorOutcome::NoMatch)
-            .await?;
-    }
-    Ok(())
-}
-
-fn load_global_rules(
-    data_root: &Path,
-) -> Result<(Vec<definition::RuleDefinition>, Vec<RuleDefinitionInput>)> {
-    let directory = data_root.join("rules");
-    let entries = match fs::read_dir(&directory) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
-        Err(_) => return Err(Error::new("unavailable", "cannot enumerate global rules")),
-    };
-
-    let mut paths = Vec::<PathBuf>::new();
-    for entry in entries {
-        let entry =
-            entry.map_err(|_| Error::new("unavailable", "cannot read global rule entry"))?;
-        let file_type = entry
-            .file_type()
-            .map_err(|_| Error::new("unavailable", "cannot inspect global rule entry"))?;
-        let path = entry.path();
-        if file_type.is_file()
-            && path
-                .extension()
-                .is_some_and(|extension| extension == "toml")
-        {
-            paths.push(path);
-        }
-    }
-    paths.sort();
-
-    let mut ids = HashSet::new();
-    let mut definitions = Vec::new();
-    let mut inputs = Vec::new();
-    for path in paths {
-        let file = File::open(&path)
-            .map_err(|_| Error::new("unavailable", "cannot open global rule file"))?;
-        for definition in definition::load(file)? {
-            if !ids.insert(definition.id.clone()) {
-                return Err(Error::new(
-                    "invalid",
-                    "global rule files contain duplicate IDs",
-                ));
-            }
-            let canonical_value = serde_json::to_value(&definition)
-                .map_err(|_| Error::new("invalid", "rule definition cannot be encoded"))?;
-            let canonical_definition = serde_json::to_string(&canonical_value)
-                .map_err(|_| Error::new("invalid", "rule definition cannot be canonicalized"))?;
-            let definition_digest = definition.semantic_digest()?;
-            inputs.push(RuleDefinitionInput {
-                id: definition.id.clone(),
-                canonical_definition,
-                definition_digest,
-                enabled: definition.enabled,
-            });
-            definitions.push(definition);
-        }
-    }
-    Ok((definitions, inputs))
 }
 
 fn stop_command(stop: definition::StopAction) -> SubmitCommand {

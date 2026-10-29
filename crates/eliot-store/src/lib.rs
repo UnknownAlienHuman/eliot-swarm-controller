@@ -8,8 +8,8 @@ mod provider_holds;
 mod rules;
 
 pub use rules::{
-    RuleCursorOutcome, RuleDefinitionInput, RuleEventAdmission, TimerDefinitionInput,
-    TimerSlotAdmission, TimerSlotCommit,
+    RuleCursorOutcome, RuleDefinitionInput, RuleEventAdmission, RuleProcessingState,
+    TimerDefinitionInput, TimerSlotAdmission, TimerSlotCommit,
 };
 
 use eliot_core::{
@@ -136,7 +136,7 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(sql_error)?;
-        if current > 12 {
+        if current > 13 {
             return Err(Error::new(
                 "unsupported",
                 format!("Store schema version {current} is newer than this binary"),
@@ -508,6 +508,26 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
+        if current < 13 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE events ADD COLUMN cause TEXT;
+                 ALTER TABLE commands ADD COLUMN cause TEXT;
+                 ALTER TABLE rule_state ADD COLUMN retiring_revision INTEGER
+                     CHECK(retiring_revision IS NULL OR retiring_revision > 0);
+                 ALTER TABLE rule_state ADD COLUMN retiring_definition TEXT;
+                 ALTER TABLE rule_state ADD COLUMN retiring_cursor INTEGER
+                     CHECK(retiring_cursor IS NULL OR retiring_cursor >= 0);
+                 ALTER TABLE rule_state ADD COLUMN retire_through INTEGER
+                     CHECK(retire_through IS NULL OR retire_through >= 0);
+                 INSERT INTO schema_migrations(version) VALUES (13);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
         Ok(())
     }
 
@@ -814,20 +834,33 @@ fn submit_tx(
             let agent = load_agent_by_num(tx, agent_num)?
                 .ok_or_else(|| Error::new("internal", "new launch Agent disappeared"))?;
             provider_holds::require_unheld_tx(tx, &agent)?;
-            events.push(insert_daemon_event(
+            let command =
+                CommandInsert::admitted(principal, &request, &payload_digest, (agent_num, 0), now);
+            let cause = ordinary_command_cause(command.id);
+            insert_command(tx, &command, &cause)?;
+            events.push(insert_daemon_event_for_command(
                     tx,
+                    command.id,
+                    DaemonEventInput::new(
+                        now,
+                        "agent.created",
+                        "agent",
+                        Some(agent_num),
+                        Some(0),
+                        json!({"agent_id": agent_id, "project": project, "harness": harness, "profile": profile}),
+                    ),
+                )?);
+            events.push(insert_daemon_event_input(
+                tx,
+                DaemonEventInput::new(
                     now,
-                    "agent.created",
-                    "agent",
+                    "command.accepted",
+                    "command",
                     Some(agent_num),
                     Some(0),
-                    json!({"agent_id": agent_id, "project": project, "harness": harness, "profile": profile}),
-                )?);
-
-            events.push(admit_command(
-                tx,
-                &CommandInsert::admitted(principal, &request, &payload_digest, (agent_num, 0), now),
-                json!({"command_id": request.id, "verb": "launch"}),
+                    json!({"command_id": request.id, "verb": "launch"}),
+                )
+                .with_cause(cause),
             )?);
 
             if let Some(text) = text {
@@ -1511,22 +1544,25 @@ impl Store {
                 }
                 install_initial_source_plan(&tx, agent_num, 1, &agent.harness, now)?;
                 update_command_state(&tx, id, CommandState::Dispatched, None, Some(1), now)?;
-                events.push(insert_daemon_event(
+                events.push(insert_daemon_event_for_command(
                     &tx,
-                    now,
-                    "agent.starting",
-                    "agent",
-                    Some(agent_num),
-                    Some(1),
-                    json!({"agent_id": agent.id, "command_id": id}),
+                    id,
+                    DaemonEventInput::new(
+                        now,
+                        "agent.starting",
+                        "agent",
+                        Some(agent_num),
+                        Some(1),
+                        json!({"agent_id": agent.id, "command_id": id}),
+                    ),
                 )?);
-                events.push(insert_daemon_event(
+                events.push(insert_daemon_command_event(
                     &tx,
                     now,
                     "command.dispatched",
-                    "command",
                     Some(agent_num),
                     Some(1),
+                    id,
                     json!({"command_id": id, "verb": "launch"}),
                 )?);
             }
@@ -1586,13 +1622,13 @@ impl Store {
                         None,
                         now,
                     )?;
-                    events.push(insert_daemon_event(
+                    events.push(insert_daemon_command_event(
                         &tx,
                         now,
                         "command.cancelled",
-                        "command",
                         Some(agent_num),
                         Some(agent.generation),
+                        &old_id,
                         json!({"command_id": old_id, "reason": "generation_resumed"}),
                     )?);
                 }
@@ -1639,29 +1675,32 @@ impl Store {
                     Some(next_generation),
                     now,
                 )?;
-                events.push(insert_daemon_event(
+                events.push(insert_daemon_event_for_command(
                     &tx,
-                    now,
-                    "agent.starting",
-                    "agent",
-                    Some(agent_num),
-                    Some(next_generation),
-                    json!({
-                        "agent_id": agent.id,
-                        "command_id": id,
-                        "resume_from": {
-                            "native_scope": native_scope,
-                            "native_ref": native_ref
-                        }
-                    }),
+                    id,
+                    DaemonEventInput::new(
+                        now,
+                        "agent.starting",
+                        "agent",
+                        Some(agent_num),
+                        Some(next_generation),
+                        json!({
+                            "agent_id": agent.id,
+                            "command_id": id,
+                            "resume_from": {
+                                "native_scope": native_scope,
+                                "native_ref": native_ref
+                            }
+                        }),
+                    ),
                 )?);
-                events.push(insert_daemon_event(
+                events.push(insert_daemon_command_event(
                     &tx,
                     now,
                     "command.dispatched",
-                    "command",
                     Some(agent_num),
                     Some(next_generation),
+                    id,
                     json!({"command_id": id, "verb": "resume"}),
                 )?);
             }
@@ -1691,13 +1730,13 @@ impl Store {
                 persist_workspace(&tx, &old, &workspace)?;
                 update_command_state(&tx, id, CommandState::Dispatched, None, None, now)?;
                 events.push(workspace_event(&tx, &workspace, now)?);
-                events.push(insert_daemon_event(
+                events.push(insert_daemon_command_event(
                     &tx,
                     now,
                     "command.dispatched",
-                    "command",
                     Some(agent_num),
                     Some(agent.generation),
+                    id,
                     json!({"command_id": id, "verb": "worktree.remove"}),
                 )?);
             }
@@ -1732,13 +1771,13 @@ impl Store {
                 if !ready || earliest.as_deref().is_some_and(|first| first != id) {
                     if command.state == CommandState::Accepted {
                         update_command_state(&tx, id, CommandState::Queued, None, None, now)?;
-                        events.push(insert_daemon_event(
+                        events.push(insert_daemon_command_event(
                             &tx,
                             now,
                             "command.queued",
-                            "command",
                             Some(agent_num),
                             Some(agent.generation),
+                            id,
                             json!({"command_id": id, "verb": "send"}),
                         )?);
                     }
@@ -1761,13 +1800,13 @@ impl Store {
                     }),
                 )?;
                 update_command_state(&tx, id, CommandState::Dispatched, None, None, now)?;
-                events.push(insert_daemon_event(
+                events.push(insert_daemon_command_event(
                     &tx,
                     now,
                     "command.dispatched",
-                    "command",
                     Some(agent_num),
                     Some(agent.generation),
+                    id,
                     json!({"command_id": id, "verb": "send"}),
                 )?);
             }
@@ -1801,13 +1840,13 @@ impl Store {
                     }),
                 )?;
                 update_command_state(&tx, id, CommandState::Dispatched, None, None, now)?;
-                events.push(insert_daemon_event(
+                events.push(insert_daemon_command_event(
                     &tx,
                     now,
                     "command.dispatched",
-                    "command",
                     Some(agent_num),
                     Some(agent.generation),
+                    id,
                     json!({"command_id": id, "verb": "stop"}),
                 )?);
             }
@@ -1904,13 +1943,13 @@ impl Store {
                 }
                 check_rpc_frame("agent.command", &params)?;
                 update_command_state(&tx, id, CommandState::Dispatched, None, None, now)?;
-                events.push(insert_daemon_event(
+                events.push(insert_daemon_command_event(
                     &tx,
                     now,
                     "command.dispatched",
-                    "command",
                     Some(agent_num),
                     Some(agent.generation),
+                    id,
                     json!({
                         "command_id": id,
                         "verb": command.command.verb,
@@ -2116,13 +2155,13 @@ impl Store {
         update_command_state(&tx, id, state, outcome.as_ref(), None, now)?;
         let mut events = Vec::new();
         let state_name = command_state_name(state);
-        events.push(insert_daemon_event(
+        events.push(insert_daemon_command_event(
             &tx,
             now,
             &format!("command.{state_name}"),
-            "command",
             target,
             generation,
+            id,
             json!({"command_id": id, "state": state_name, "outcome": outcome}),
         )?);
 
@@ -2353,7 +2392,7 @@ impl Store {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT seq, ts, kind, agent, generation, source, native_id, data, subject
+                "SELECT seq, ts, kind, agent, generation, source, native_id, data, subject, cause
                  FROM events
                  WHERE seq > ?1 AND (?2 IS NULL OR seq <= ?2)
                  ORDER BY seq LIMIT ?3",
@@ -2446,13 +2485,13 @@ impl Store {
                 None,
                 now,
             )?;
-            events.push(insert_daemon_event(
+            events.push(insert_daemon_command_event(
                 &tx,
                 now,
                 "command.unknown",
-                "command",
                 target,
                 generation,
+                &command_id,
                 json!({"command_id": command_id, "reason": "daemon_restart"}),
             )?);
         }
@@ -3837,7 +3876,7 @@ fn scan_git_hints(
     }
     let mut statement = connection
         .prepare(
-            "SELECT seq, ts, kind, agent, generation, source, native_id, data, subject
+            "SELECT seq, ts, kind, agent, generation, source, native_id, data, subject, cause
          FROM events WHERE seq > ?1 AND seq <= ?2 ORDER BY seq LIMIT ?3",
         )
         .map_err(sql_error)?;
@@ -3872,7 +3911,7 @@ fn load_native_git_hint(
 ) -> Result<Event> {
     let record = connection
         .query_row(
-            "SELECT e.seq, e.ts, e.kind, e.agent, e.generation, e.source, e.native_id, e.data, e.subject
+            "SELECT e.seq, e.ts, e.kind, e.agent, e.generation, e.source, e.native_id, e.data, e.subject, e.cause
          FROM events e
          WHERE e.seq = ?1 AND e.agent = ?2 AND e.generation = ?3 AND e.family = 'tool'
            AND e.source NOT IN ('git', 'os', 'daemon') AND e.native_id IS NOT NULL",
@@ -4131,6 +4170,7 @@ fn insert_git_event(
             cursor: None,
             payload_digest: None,
             subject: event_subject_for_generation(tx, agent, generation)?,
+            cause: None,
             data,
         },
     )
@@ -4781,13 +4821,13 @@ fn cancel_workspace_input(
             None,
             now,
         )?;
-        events.push(insert_daemon_event(
+        events.push(insert_daemon_command_event(
             tx,
             now,
             "command.cancelled",
-            "command",
             linked.target.as_deref().map(parse_agent_id).transpose()?,
             linked.generation,
+            &linked.id,
             json!({"command_id": linked.id, "reason": "workspace_preparation"}),
         )?);
     }
@@ -4836,13 +4876,13 @@ fn settle_preparation_command(
     if matches!(state, CommandState::Failed | CommandState::Cancelled) {
         cancel_workspace_input(tx, &command.command.id, now, events)?;
     }
-    events.push(insert_daemon_event(
+    events.push(insert_daemon_command_event(
         tx,
         now,
         &format!("command.{}", command_state_name(state)),
-        "command",
         Some(parse_agent_id(&agent.id)?),
         Some(agent.generation),
+        &command.command.id,
         json!({"command_id": command.command.id, "outcome": outcome}),
     )?);
     Ok(())
@@ -5228,8 +5268,15 @@ impl Store {
                                 None,
                                 now,
                             )?;
-                            events.push(insert_daemon_event(&tx, now, "command.accepted", "command", Some(agent_num), command.command.generation,
-                                json!({"command_id": command_id, "reason": "exact_workspace_creation_readback"}))?);
+                            events.push(insert_daemon_command_event(
+                                &tx,
+                                now,
+                                "command.accepted",
+                                Some(agent_num),
+                                command.command.generation,
+                                command_id,
+                                json!({"command_id": command_id, "reason": "exact_workspace_creation_readback"}),
+                            )?);
                         }
                     }
                     WorkspaceCreationOutcome::Failed { .. } => {
@@ -5404,13 +5451,13 @@ impl Store {
                     }
                 };
                 update_command_state(&tx, command_id, state, Some(&marker), None, now)?;
-                events.push(insert_daemon_event(
+                events.push(insert_daemon_command_event(
                     &tx,
                     now,
                     &format!("command.{}", command_state_name(state)),
-                    "command",
                     Some(agent_num),
                     command.command.generation,
+                    command_id,
                     json!({"command_id": command_id, "outcome": marker}),
                 )?);
             }
@@ -5424,13 +5471,13 @@ impl Store {
         if let Some((stop_id, state)) = stop_result {
             let outcome = json!({"stage": "workspace_cancel", "start_command_id": workspace.start_command_id, "target_generation": target, "detail": workspace.outcome});
             update_command_state(&tx, &stop_id, state, Some(&outcome), None, now)?;
-            events.push(insert_daemon_event(
+            events.push(insert_daemon_command_event(
                 &tx,
                 now,
                 &format!("command.{}", command_state_name(state)),
-                "command",
                 Some(agent_num),
                 command.command.generation,
+                &stop_id,
                 json!({"command_id": stop_id, "outcome": outcome}),
             )?);
         }
@@ -5533,13 +5580,13 @@ fn request_workspace_cancel_tx(
         now,
     )?;
     events.push(workspace_event(tx, workspace, now)?);
-    events.push(insert_daemon_event(
+    events.push(insert_daemon_command_event(
         tx,
         now,
         "command.dispatched",
-        "command",
         start.target,
         Some(agent.generation),
+        stop_id,
         json!({"command_id": stop_id, "outcome": result}),
     )?);
     Ok(())
@@ -5668,6 +5715,7 @@ fn insert_process_event(
             cursor: None,
             payload_digest: None,
             subject: event_subject_for_generation(tx, agent, generation)?,
+            cause: None,
             data: json!(record),
         },
     )
@@ -5904,6 +5952,12 @@ struct EventRecord {
     native_id: Option<String>,
     data: String,
     subject: Option<String>,
+    cause: Option<String>,
+}
+
+struct PendingCommandEvent {
+    command_id: String,
+    data: Value,
 }
 
 struct EventInsert<'a> {
@@ -5917,7 +5971,44 @@ struct EventInsert<'a> {
     cursor: Option<&'a str>,
     payload_digest: Option<&'a [u8]>,
     subject: Option<EventSubject>,
+    cause: Option<core::EventCause>,
     data: Value,
+}
+
+struct DaemonEventInput<'a> {
+    ts: i64,
+    kind: &'a str,
+    family: &'a str,
+    agent: Option<i64>,
+    generation: Option<i64>,
+    data: Value,
+    cause: Option<core::EventCause>,
+}
+
+impl<'a> DaemonEventInput<'a> {
+    fn new(
+        ts: i64,
+        kind: &'a str,
+        family: &'a str,
+        agent: Option<i64>,
+        generation: Option<i64>,
+        data: Value,
+    ) -> Self {
+        Self {
+            ts,
+            kind,
+            family,
+            agent,
+            generation,
+            data,
+            cause: None,
+        }
+    }
+
+    fn with_cause(mut self, cause: core::EventCause) -> Self {
+        self.cause = Some(cause);
+        self
+    }
 }
 
 struct NativeEventInsert<'a> {
@@ -5930,6 +6021,7 @@ struct NativeEventInsert<'a> {
     cursor: Option<&'a str>,
     payload_digest: &'a [u8],
     subject: Option<EventSubject>,
+    cause: Option<core::EventCause>,
 }
 
 struct TurnInsert<'a> {
@@ -6128,6 +6220,19 @@ fn command_binding(connection: &Connection, id: &str) -> Result<Option<(String, 
         .map_err(sql_error)
 }
 
+fn command_cause_tx(connection: &Connection, command_id: &str) -> Result<Option<core::EventCause>> {
+    let encoded: Option<String> = connection
+        .query_row(
+            "SELECT cause FROM commands WHERE id = ?1",
+            [command_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?
+        .flatten();
+    Ok(decode_event_cause(encoded.as_deref(), Some(command_id)))
+}
+
 fn has_open_request_reply(
     connection: &Connection,
     agent: i64,
@@ -6192,16 +6297,152 @@ fn admit_command(
     command: &CommandInsert<'_>,
     event_data: Value,
 ) -> Result<Event> {
-    insert_command(tx, command)?;
-    insert_daemon_event(
+    if event_data.get("command_id").and_then(Value::as_str) != Some(command.id) {
+        return Err(Error::new(
+            "source_integrity",
+            "command admission event does not match its command row",
+        ));
+    }
+    let cause = ordinary_command_cause(command.id);
+    insert_command(tx, command, &cause)?;
+    insert_daemon_event_input(
         tx,
-        command.created_at,
-        &format!("command.{}", command_state_name(command.state)),
-        "command",
-        command.target,
-        command.generation,
-        event_data,
+        DaemonEventInput::new(
+            command.created_at,
+            &format!("command.{}", command_state_name(command.state)),
+            "command",
+            command.target,
+            command.generation,
+            event_data,
+        )
+        .with_cause(cause),
     )
+}
+
+fn ordinary_command_cause(command_id: &str) -> core::EventCause {
+    core::EventCause {
+        command_id: command_id.to_owned(),
+        rule: None,
+        depth: 0,
+    }
+}
+
+fn annotate_new_command_cause_tx(
+    tx: &Transaction<'_>,
+    command_id: &str,
+    command_event: &mut Event,
+    cause: core::EventCause,
+) -> Result<()> {
+    validate_event_cause_shape(&cause, Some(command_id))?;
+    if cause.depth > 5 {
+        return Err(Error::new(
+            "bad_state",
+            "rule cause depth exceeds the firing limit",
+        ));
+    }
+    if command_event.source != "daemon"
+        || !command_event.kind.starts_with("command.")
+        || command_event.data.get("command_id").and_then(Value::as_str) != Some(command_id)
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "command cause annotation does not match its new command event",
+        ));
+    }
+
+    let default_cause = core::EventCause {
+        command_id: command_id.to_owned(),
+        rule: None,
+        depth: 0,
+    };
+    let default_json = encode_json(&default_cause)?;
+    let cause_json = encode_json(&cause)?;
+    let changed = tx
+        .execute(
+            "UPDATE commands SET cause = ?1 WHERE id = ?2 AND cause = ?3",
+            params![cause_json, command_id, default_json],
+        )
+        .map_err(sql_error)?;
+    if changed != 1 && command_cause_tx(tx, command_id)?.as_ref() != Some(&cause) {
+        return Err(Error::new(
+            "source_integrity",
+            "new command cause could not be bound to its exact command",
+        ));
+    }
+
+    let changed = tx
+        .execute(
+            "UPDATE events SET cause = ?1
+             WHERE seq = ?2 AND source = 'daemon' AND kind = ?3 AND cause = ?4
+               AND json_extract(data, '$.command_id') = ?5",
+            params![
+                cause_json,
+                command_event.seq,
+                command_event.kind,
+                default_json,
+                command_id
+            ],
+        )
+        .map_err(sql_error)?;
+    if changed != 1 {
+        let stored: Option<String> = tx
+            .query_row(
+                "SELECT cause FROM events WHERE seq = ?1",
+                [command_event.seq],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?
+            .flatten();
+        if decode_event_cause(stored.as_deref(), Some(command_id)).as_ref() != Some(&cause) {
+            return Err(Error::new(
+                "source_integrity",
+                "new command event cause could not be bound to its exact command",
+            ));
+        }
+    }
+    command_event.cause = Some(cause);
+    Ok(())
+}
+
+fn annotate_new_event_cause_tx(
+    tx: &Transaction<'_>,
+    event: &mut Event,
+    cause: core::EventCause,
+) -> Result<()> {
+    validate_event_cause_shape(&cause, None)?;
+    if event.source != "daemon" {
+        return Err(Error::new(
+            "source_integrity",
+            "only a newly committed daemon event can inherit a controller cause",
+        ));
+    }
+    let encoded = encode_json(&cause)?;
+    let changed = tx
+        .execute(
+            "UPDATE events SET cause = ?1 WHERE seq = ?2 AND source = 'daemon' AND cause IS NULL",
+            params![encoded, event.seq],
+        )
+        .map_err(sql_error)?;
+    if changed != 1 {
+        let stored: Option<String> = tx
+            .query_row(
+                "SELECT cause FROM events WHERE seq = ?1",
+                [event.seq],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?
+            .flatten();
+        if decode_event_cause(stored.as_deref(), None).as_ref() != Some(&cause) {
+            return Err(Error::new(
+                "source_integrity",
+                "event cause could not be bound to its newly committed event",
+            ));
+        }
+    }
+    event.cause = Some(cause);
+    Ok(())
 }
 
 fn admit_linked_send(
@@ -6249,16 +6490,28 @@ fn admit_linked_send(
     Ok((request.id, event))
 }
 
-fn insert_command(tx: &Transaction<'_>, command: &CommandInsert<'_>) -> Result<()> {
+fn insert_command(
+    tx: &Transaction<'_>,
+    command: &CommandInsert<'_>,
+    cause: &core::EventCause,
+) -> Result<()> {
+    validate_event_cause_shape(cause, Some(command.id))?;
+    if cause.depth != 0 || cause.rule.is_some() {
+        return Err(Error::new(
+            "invalid",
+            "ordinary command admission must start at cause depth zero",
+        ));
+    }
     let args = encode_json(command.args)?;
     let outcome = command.outcome.map(encode_json).transpose()?;
+    let cause = encode_json(cause)?;
     db!(tx.execute(
         "INSERT INTO commands(
              id, principal, method, payload_digest, target, expected_generation,
              generation, expected_turn_id, parent_command, link_kind, ordinal,
-             turn_id, request_id, verb, args, state, outcome, created_at, updated_at, probe
+             turn_id, request_id, verb, args, state, outcome, created_at, updated_at, probe, cause
          ) VALUES (
-             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
+             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21
          )",
         params![
             command.id,
@@ -6281,6 +6534,7 @@ fn insert_command(tx: &Transaction<'_>, command: &CommandInsert<'_>) -> Result<(
             command.created_at,
             command.updated_at,
             command.probe,
+            cause,
         ],
     ));
     Ok(())
@@ -6339,26 +6593,86 @@ fn insert_daemon_event(
     generation: Option<i64>,
     data: Value,
 ) -> Result<Event> {
-    let subject = match (agent, generation) {
+    insert_daemon_event_input(
+        tx,
+        DaemonEventInput::new(ts, kind, family, agent, generation, data),
+    )
+}
+
+fn insert_daemon_event_input(tx: &Transaction<'_>, event: DaemonEventInput<'_>) -> Result<Event> {
+    let subject = match (event.agent, event.generation) {
         (Some(agent), Some(generation)) => event_subject_for_generation(tx, agent, generation)?,
         _ => None,
     };
     insert_event(
         tx,
         EventInsert {
-            ts,
-            kind,
-            family: Some(family),
-            agent,
-            generation,
+            ts: event.ts,
+            kind: event.kind,
+            family: Some(event.family),
+            agent: event.agent,
+            generation: event.generation,
             source: "daemon",
             native_id: None,
             cursor: None,
             payload_digest: None,
             subject,
-            data,
+            cause: event.cause,
+            data: event.data,
         },
     )
+}
+
+fn insert_daemon_command_event(
+    tx: &Transaction<'_>,
+    ts: i64,
+    kind: &str,
+    agent: Option<i64>,
+    generation: Option<i64>,
+    command_id: &str,
+    data: Value,
+) -> Result<Event> {
+    insert_daemon_event_for_command(
+        tx,
+        command_id,
+        DaemonEventInput::new(ts, kind, "command", agent, generation, data),
+    )
+}
+
+fn insert_daemon_event_for_command(
+    tx: &Transaction<'_>,
+    command_id: &str,
+    mut event: DaemonEventInput<'_>,
+) -> Result<Event> {
+    if event
+        .data
+        .get("command_id")
+        .and_then(Value::as_str)
+        .is_some_and(|event_command_id| event_command_id != command_id)
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "daemon event command id differs from its verified producer",
+        ));
+    }
+    let command = load_command_record(tx, command_id)?.ok_or_else(|| {
+        Error::new(
+            "source_integrity",
+            "daemon command event references a missing command",
+        )
+    })?;
+    let bound = !event
+        .agent
+        .is_some_and(|agent| command.target != Some(agent))
+        && !event
+            .generation
+            .is_some_and(|generation| command.command.generation != Some(generation));
+    event.cause = if bound {
+        command_cause_tx(tx, command_id)?
+    } else {
+        None
+    };
+    insert_daemon_event_input(tx, event)
 }
 
 fn event_subject_for_generation(
@@ -6389,6 +6703,7 @@ fn insert_native_event(tx: &Transaction<'_>, event: NativeEventInsert<'_>) -> Re
             cursor: event.cursor,
             payload_digest: Some(event.payload_digest),
             subject: event.subject,
+            cause: event.cause,
             data: event.native_event.data.clone(),
         },
     )
@@ -6403,10 +6718,14 @@ fn insert_event(tx: &Transaction<'_>, event: EventInsert<'_>) -> Result<Event> {
         ));
     }
     let subject_json = event.subject.as_ref().map(encode_json).transpose()?;
+    if let Some(cause) = &event.cause {
+        validate_event_cause_shape(cause, None)?;
+    }
+    let cause_json = event.cause.as_ref().map(encode_json).transpose()?;
     db!(tx.execute(
         "INSERT INTO events(ts, kind, family, agent, generation, source, native_id,
-                            cursor, payload_digest, data, subject)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                            cursor, payload_digest, data, subject, cause)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             event.ts,
             event.kind,
@@ -6419,6 +6738,7 @@ fn insert_event(tx: &Transaction<'_>, event: EventInsert<'_>) -> Result<Event> {
             event.payload_digest,
             data_json,
             subject_json,
+            cause_json,
         ],
     ));
     let seq = tx.last_insert_rowid();
@@ -6432,6 +6752,7 @@ fn insert_event(tx: &Transaction<'_>, event: EventInsert<'_>) -> Result<Event> {
         native_id: event.native_id.map(ToOwned::to_owned),
         data: event.data,
         subject: event.subject,
+        cause: event.cause,
     })
 }
 
@@ -6446,6 +6767,7 @@ fn event_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRecor
         native_id: row.get(6)?,
         data: row.get(7)?,
         subject: row.get(8)?,
+        cause: row.get(9)?,
     })
 }
 
@@ -6460,6 +6782,7 @@ fn event_from_record(record: EventRecord) -> Result<Event> {
                 .map_err(|error| Error::new("internal", error.to_string()))
         })
         .transpose()?;
+    let cause = decode_event_cause(record.cause.as_deref(), None);
     Ok(Event {
         seq: record.seq,
         ts: record.ts,
@@ -6470,7 +6793,31 @@ fn event_from_record(record: EventRecord) -> Result<Event> {
         native_id: record.native_id,
         data: decode_json(&record.data)?,
         subject,
+        cause,
     })
+}
+
+fn validate_event_cause_shape(
+    cause: &core::EventCause,
+    expected_command_id: Option<&str>,
+) -> Result<()> {
+    cause.validate()?;
+    if expected_command_id.is_some_and(|expected| expected != cause.command_id) {
+        return Err(Error::new(
+            "source_integrity",
+            "event cause binding is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn decode_event_cause(
+    encoded: Option<&str>,
+    expected_command_id: Option<&str>,
+) -> Option<core::EventCause> {
+    let cause = serde_json::from_str::<core::EventCause>(encoded?).ok()?;
+    validate_event_cause_shape(&cause, expected_command_id).ok()?;
+    Some(cause)
 }
 
 fn turn_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnRecord> {
@@ -6773,7 +7120,7 @@ fn persist_effects(
     now: i64,
     native_event: &NativeEvent,
     next_agent: &Agent,
-) -> Result<(Vec<Value>, Vec<Event>)> {
+) -> Result<(Vec<PendingCommandEvent>, Vec<Event>)> {
     let mut command_events = Vec::new();
     let mut provider_events = Vec::new();
     for effect in effects {
@@ -6829,9 +7176,12 @@ fn persist_effects(
                                          updated_at = ?3 WHERE id = ?4",
                     params![turn_id, encode_json(&outcome)?, now, command_id],
                 ));
-                command_events.push(json!({
-                    "command_id": command_id, "state": "applied", "outcome": outcome,
-                }));
+                command_events.push(PendingCommandEvent {
+                    command_id: command_id.clone(),
+                    data: json!({
+                        "command_id": command_id, "state": "applied", "outcome": outcome,
+                    }),
+                });
             }
             Effect::RequestPending {
                 request_id,
@@ -7158,6 +7508,212 @@ fn persist_effects(
     Ok((command_events, provider_events))
 }
 
+fn verified_native_event_cause_tx(
+    tx: &Transaction<'_>,
+    previous_agent: &Agent,
+    agent_num: i64,
+    generation: i64,
+    native_event: &NativeEvent,
+    effects: &[Effect],
+) -> Result<Option<core::EventCause>> {
+    if native_event.kind == "session.ready"
+        && let Some(command_id) = native_event.data.get("command_id").and_then(Value::as_str)
+    {
+        let Some(command) = load_command_record(tx, command_id)? else {
+            return Ok(None);
+        };
+        let bound = command.target == Some(agent_num)
+            && command.command.generation == Some(generation)
+            && command.command.verb == "launch"
+            && matches!(
+                command.state,
+                CommandState::Dispatched | CommandState::Unknown
+            );
+        return if bound {
+            command_cause_tx(tx, command_id)
+        } else {
+            Ok(None)
+        };
+    }
+    if native_event.kind == "session.ended"
+        && let Some(command_id) = native_event.data.get("command_id").and_then(Value::as_str)
+        && let Some(command) = load_command_record(tx, command_id)?
+    {
+        let bound = command.target == Some(agent_num)
+            && command.command.generation == Some(generation)
+            && command.command.verb == "stop"
+            && matches!(
+                command.state,
+                CommandState::Dispatched | CommandState::Unknown | CommandState::Applied
+            );
+        if bound {
+            return command_cause_tx(tx, command_id);
+        }
+    }
+
+    // core::apply currently emits at most one effect for a native event. Refuse
+    // a future multi-effect fact until its causal command selection is explicit.
+    if effects.len() > 1 {
+        return Err(Error::new(
+            "source_integrity",
+            "native event has multiple reducer effects for causal attribution",
+        ));
+    }
+    if let Some(effect) = effects.first() {
+        match effect {
+            Effect::CommandTurnAssociated {
+                command_id,
+                turn_id,
+            } => {
+                let Some(command) = load_command_record(tx, command_id)? else {
+                    return Ok(None);
+                };
+                let bound = command.target == Some(agent_num)
+                    && command.command.generation == Some(generation)
+                    && command.command.verb == "send"
+                    && matches!(
+                        command.command.state,
+                        CommandState::Dispatched | CommandState::Unknown
+                    )
+                    && command.command.turn_id.is_none()
+                    && command
+                        .expected_turn_id
+                        .as_deref()
+                        .is_none_or(|expected| expected == turn_id);
+                return if bound {
+                    command_cause_tx(tx, command_id)
+                } else {
+                    Ok(None)
+                };
+            }
+            Effect::MessageCompleted {
+                command_id,
+                turn_id,
+                ..
+            }
+            | Effect::TurnTerminal {
+                command_id: Some(command_id),
+                turn_id,
+                ..
+            } => {
+                let Some(command) = load_command_record(tx, command_id)? else {
+                    return Ok(None);
+                };
+                let bound = command.target == Some(agent_num)
+                    && command.command.generation == Some(generation)
+                    && command.command.verb == "send"
+                    && command.command.turn_id.as_deref() == Some(turn_id.as_str())
+                    && command.command.state == CommandState::Applied;
+                return if bound {
+                    command_cause_tx(tx, command_id)
+                } else {
+                    Ok(None)
+                };
+            }
+            Effect::RequestPending {
+                request_id,
+                turn_id,
+                pending: false,
+                ..
+            } => {
+                return verified_request_reply_cause_tx(
+                    tx,
+                    agent_num,
+                    generation,
+                    native_event,
+                    request_id,
+                    turn_id,
+                );
+            }
+            Effect::RequestPending { turn_id, .. }
+            | Effect::RequestClosed { turn_id, .. }
+            | Effect::TurnTerminal { turn_id, .. } => {
+                return command_cause_for_turn_tx(tx, agent_num, generation, turn_id);
+            }
+        }
+    }
+
+    let family = family_for_kind(&native_event.kind)?;
+    if matches!(family, "turn" | "tool" | "message" | "request")
+        && let Some(turn_id) = previous_agent.active_turn.as_deref()
+        && native_event.data.get("turn_id").and_then(Value::as_str) == Some(turn_id)
+    {
+        return command_cause_for_turn_tx(tx, agent_num, generation, turn_id);
+    }
+    Ok(None)
+}
+
+fn verified_request_reply_cause_tx(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    generation: i64,
+    native_event: &NativeEvent,
+    request_id: &str,
+    turn_id: &str,
+) -> Result<Option<core::EventCause>> {
+    if native_event.kind != "request.resolved"
+        || native_event.data.get("request_id").and_then(Value::as_str) != Some(request_id)
+        || native_event.data.get("turn_id").and_then(Value::as_str) != Some(turn_id)
+    {
+        return Ok(None);
+    }
+    let Some(command_id) = native_event.data.get("command_id").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let Some(command) = load_command_record(tx, command_id)? else {
+        return Ok(None);
+    };
+    let bound = command.target == Some(agent_num)
+        && command.command.generation == Some(generation)
+        && matches!(command.command.verb.as_str(), "approve" | "deny" | "answer")
+        && command.command.request_id.as_deref() == Some(request_id)
+        && command.command.turn_id.as_deref() == Some(turn_id)
+        && matches!(
+            command.state,
+            CommandState::Dispatched
+                | CommandState::Unknown
+                | CommandState::Applied
+                | CommandState::Failed
+        );
+    if bound {
+        command_cause_tx(tx, command_id)
+    } else {
+        Ok(None)
+    }
+}
+
+fn command_cause_for_turn_tx(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    generation: i64,
+    turn_id: &str,
+) -> Result<Option<core::EventCause>> {
+    if load_turn(tx, agent_num, generation, turn_id)?.is_none() {
+        return Ok(None);
+    }
+    let mut statement = tx
+        .prepare(
+            "SELECT id FROM commands
+             WHERE target = ?1 AND generation = ?2 AND turn_id = ?3
+               AND verb = 'send' AND state = 'applied'
+             ORDER BY id LIMIT 2",
+        )
+        .map_err(sql_error)?;
+    let rows = statement
+        .query_map(params![agent_num, generation, turn_id], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(sql_error)?;
+    let mut ids = Vec::with_capacity(2);
+    for row in rows {
+        ids.push(row.map_err(sql_error)?);
+    }
+    match ids.as_slice() {
+        [command_id] => command_cause_tx(tx, command_id),
+        _ => Ok(None),
+    }
+}
+
 fn require_effect_command(
     command: &CommandRecord,
     agent: i64,
@@ -7295,13 +7851,13 @@ fn transition_lost_tx(
             None,
             now,
         )?;
-        events.push(insert_daemon_event(
+        events.push(insert_daemon_command_event(
             tx,
             now,
             "command.unknown",
-            "command",
             Some(agent_num),
             Some(generation),
+            &command_id,
             json!({"command_id": command_id, "reason": reason}),
         )?);
     }
@@ -7340,15 +7896,20 @@ fn transition_lost_tx(
                 },
             )?;
         }
-        events.push(insert_daemon_event(
-            tx,
+        let cause = command_cause_for_turn_tx(tx, agent_num, generation, turn_id)?;
+        let event = DaemonEventInput::new(
             now,
             "turn.unknown",
             "turn",
             Some(agent_num),
             Some(generation),
             json!({"turn_id": turn_id, "reason": reason}),
-        )?);
+        );
+        let event = match cause {
+            Some(cause) => event.with_cause(cause),
+            None => event,
+        };
+        events.push(insert_daemon_event_input(tx, event)?);
     }
 
     db!(tx.execute(
@@ -7414,14 +7975,17 @@ fn fail_start_tx(
          WHERE agent = ?2 AND generation = ?3 AND source NOT IN ('os', 'git', 'workspace_process')",
         params![now, agent_num, generation],
     ));
-    events.push(insert_daemon_event(
+    events.push(insert_daemon_event_for_command(
         tx,
-        now,
-        "agent.failed",
-        "agent",
-        Some(agent_num),
-        Some(generation),
-        json!({"agent_id": agent.id, "command_id": command_id, "reason": reason}),
+        command_id,
+        DaemonEventInput::new(
+            now,
+            "agent.failed",
+            "agent",
+            Some(agent_num),
+            Some(generation),
+            json!({"agent_id": agent.id, "command_id": command_id, "reason": reason}),
+        ),
     )?);
     Ok(())
 }
@@ -7444,13 +8008,13 @@ fn cancel_pending_command_tx(
         None,
         now,
     )?;
-    events.push(insert_daemon_event(
+    events.push(insert_daemon_command_event(
         tx,
         now,
         "command.cancelled",
-        "command",
         Some(agent),
         Some(generation),
+        command_id,
         json!({"command_id": command_id, "reason": reason}),
     )?);
     Ok(())
@@ -7499,18 +8063,21 @@ fn fail_unstarted_launch_tx(
             "initial launch Agent changed before failure settlement",
         ));
     }
-    events.push(insert_daemon_event(
+    events.push(insert_daemon_event_for_command(
         tx,
-        now,
-        "agent.failed",
-        "agent",
-        Some(agent_num),
-        Some(0),
-        json!({
-            "agent_id": agent.id,
-            "command_id": command_id,
-            "reason": "launch_not_dispatched"
-        }),
+        command_id,
+        DaemonEventInput::new(
+            now,
+            "agent.failed",
+            "agent",
+            Some(agent_num),
+            Some(0),
+            json!({
+                "agent_id": agent.id,
+                "command_id": command_id,
+                "reason": "launch_not_dispatched"
+            }),
+        ),
     )?);
     Ok(())
 }
@@ -7545,13 +8112,13 @@ fn cancel_unstarted_launch_input(
         None,
         now,
     )?;
-    events.push(insert_daemon_event(
+    events.push(insert_daemon_command_event(
         tx,
         now,
         "command.cancelled",
-        "command",
         Some(agent_num),
         linked.command.generation,
+        &linked.command.id,
         json!({"command_id": linked.command.id, "outcome": outcome}),
     )?);
     Ok(())
@@ -7585,13 +8152,13 @@ fn stop_agent_tx(
             None,
             now,
         )?;
-        events.push(insert_daemon_event(
+        events.push(insert_daemon_command_event(
             tx,
             now,
             "command.unknown",
-            "command",
             Some(agent_num),
             Some(generation),
+            &dispatched_id,
             json!({"command_id": dispatched_id, "reason": "generation_stopped"}),
         )?);
     }
@@ -7615,14 +8182,17 @@ fn stop_agent_tx(
              WHERE agent = ?2 AND generation = ?3 AND turn_id = ?4",
             params![now, agent_num, generation, turn_id],
         ));
-        events.push(insert_daemon_event(
+        events.push(insert_daemon_event_for_command(
             tx,
-            now,
-            "turn.unknown",
-            "turn",
-            Some(agent_num),
-            Some(generation),
-            json!({"turn_id": turn_id, "reason": "stopped_without_terminal_result"}),
+            command_id,
+            DaemonEventInput::new(
+                now,
+                "turn.unknown",
+                "turn",
+                Some(agent_num),
+                Some(generation),
+                json!({"turn_id": turn_id, "reason": "stopped_without_terminal_result"}),
+            ),
         )?);
     }
     db!(tx.execute(
@@ -7641,14 +8211,17 @@ fn stop_agent_tx(
          WHERE agent = ?2 AND generation = ?3 AND source NOT IN ('os', 'git', 'workspace_process')",
         params![now, agent_num, generation],
     ));
-    events.push(insert_daemon_event(
+    events.push(insert_daemon_event_for_command(
         tx,
-        now,
-        "agent.stopped",
-        "agent",
-        Some(agent_num),
-        Some(generation),
-        json!({"agent_id": agent.id, "command_id": command_id}),
+        command_id,
+        DaemonEventInput::new(
+            now,
+            "agent.stopped",
+            "agent",
+            Some(agent_num),
+            Some(generation),
+            json!({"agent_id": agent.id, "command_id": command_id}),
+        ),
     )?);
     Ok(())
 }
@@ -8454,6 +9027,18 @@ impl Store {
             };
             let family = family_for_kind(&native_event.kind)?;
             let event_digest = canonical::digest(&native_event.semantic_value())?;
+            let cause = if expected_subject.is_none() {
+                verified_native_event_cause_tx(
+                    &tx,
+                    &projection,
+                    agent_num,
+                    batch.generation,
+                    native_event,
+                    &effects,
+                )?
+            } else {
+                None
+            };
             let cursor = if index + 1 == batch.events.len() {
                 batch.cursor.as_deref()
             } else {
@@ -8471,6 +9056,7 @@ impl Store {
                     cursor,
                     payload_digest: &event_digest,
                     subject: Some(EventSubject::from(&next)),
+                    cause: cause.clone(),
                 },
             )?;
             let (effects, hold_events) = persist_effects(
@@ -8483,7 +9069,14 @@ impl Store {
                 &next,
             )?;
             command_events.extend(effects);
-            provider_events.extend(hold_events);
+            if let Some(cause) = cause.as_ref() {
+                for mut event in hold_events {
+                    annotate_new_event_cause_tx(&tx, &mut event, cause.clone())?;
+                    provider_events.push(event);
+                }
+            } else {
+                provider_events.extend(hold_events);
+            }
             if next.is_terminal() {
                 terminalize_generation_commands(
                     &tx,
@@ -8519,15 +9112,15 @@ impl Store {
             .ok_or_else(|| Error::new("internal", "non-empty batch stored no events"))?;
         // Keep native batch ACKs scoped to native rows; the associated command
         // event follows those rows but commits in the same transaction.
-        for data in command_events {
-            committed_events.push(insert_daemon_event(
+        for command_event in command_events {
+            committed_events.push(insert_daemon_command_event(
                 &tx,
                 now,
                 "command.applied",
-                "command",
                 Some(agent_num),
                 Some(batch.generation),
-                data,
+                &command_event.command_id,
+                command_event.data,
             )?);
         }
         committed_events.extend(provider_events);

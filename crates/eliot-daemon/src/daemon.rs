@@ -77,7 +77,8 @@ async fn run_owned(
     };
     router.note_events(&recovered);
     // Parse global definitions and seed only new rules before publishing ready.
-    let global_rules = automation::initialize_global_rules(&router, data_dir.path()).await?;
+    let global_rules =
+        automation::initialize_global_rules(&router, data_dir.path(), &policy).await?;
 
     let mut listener = IpcListener::bind(data_dir, daemon_lock).await?;
     let info =
@@ -99,12 +100,19 @@ async fn run_owned(
             .recover_rule_children(RULE_CHILD_RECOVERY_PAGE_SIZE)
             .await
     });
-    if !global_rules.is_empty() {
-        let rule_router = router.clone();
-        automation_tasks.spawn(async move {
-            automation::run_global_rules(rule_router, global_rules, automation_shutdown).await
-        });
-    }
+    let rule_router = router.clone();
+    let rule_data_root = data_dir.path().to_path_buf();
+    let rule_policy = Arc::clone(&policy);
+    automation_tasks.spawn(async move {
+        automation::run_global_rules(
+            rule_router,
+            global_rules,
+            rule_data_root,
+            rule_policy,
+            automation_shutdown,
+        )
+        .await
+    });
     let mut progress = router.progress_receiver();
     let mut connections = JoinSet::new();
     let outcome = loop {

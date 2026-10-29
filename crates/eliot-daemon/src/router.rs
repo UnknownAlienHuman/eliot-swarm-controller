@@ -26,7 +26,7 @@ use eliot_core::{
     classify_dispatched_error,
 };
 use eliot_plugin::{MAX_EVENT_BYTES, sync::LockExt};
-use eliot_store::{TimerDefinitionInput, TimerSlotAdmission, TimerSlotCommit};
+use eliot_store::{RuleProcessingState, TimerDefinitionInput, TimerSlotAdmission, TimerSlotCommit};
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 use std::{
@@ -967,8 +967,28 @@ impl Router {
     pub(crate) async fn initialize_global_rules(
         &self,
         definitions: &[eliot_store::RuleDefinitionInput],
+        timers: &[TimerDefinitionInput],
         registration_now: i64,
-    ) -> Result<Vec<RuleStateView>> {
+    ) -> Result<Vec<RuleProcessingState>> {
+        self.validate_global_rule_definitions(definitions).await?;
+
+        let change = {
+            let mut store = self.inner.store.lock().await;
+            let change =
+                store.reconcile_rule_definitions("owner", definitions, timers, registration_now)?;
+            self.publish_locked(&change.events);
+            change
+        };
+        if !change.events.is_empty() {
+            self.signal_progress();
+        }
+        self.global_rule_processing().await
+    }
+
+    pub(crate) async fn validate_global_rule_definitions(
+        &self,
+        definitions: &[eliot_store::RuleDefinitionInput],
+    ) -> Result<()> {
         // Check every canonical definition before the first durable seed. Rule
         // text is persisted by Store and must use the same known-secret policy
         // as command semantic data.
@@ -982,28 +1002,69 @@ impl Router {
                 ));
             }
         }
+        for state in self.global_rule_processing().await? {
+            for canonical in
+                std::iter::once(&state.current_definition).chain(state.retiring_definition.iter())
+            {
+                let value: Value = serde_json::from_str(canonical).map_err(|_| {
+                    Error::new("source_integrity", "stored rule definition is invalid")
+                })?;
+                if contains_known_secret_including_keys(&value, &self.inner.secrets) {
+                    return Err(Error::new(
+                        "secret_in_payload",
+                        "stored rule definition contains a known credential",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 
-        let mut store = self.inner.store.lock().await;
-        definitions
-            .iter()
-            .map(|definition| store.ensure_rule_state("owner", definition, registration_now))
-            .collect()
+    pub(crate) async fn global_rule_processing(&self) -> Result<Vec<RuleProcessingState>> {
+        let mut after_id = None;
+        let mut states = Vec::new();
+        loop {
+            let page = self.inner.store.lock().await.list_rule_processing_states(
+                "owner",
+                after_id.as_deref(),
+                PAGE_MAX,
+            )?;
+            let page_len = page.len();
+            if page_len == 0 {
+                break;
+            }
+            for state in page {
+                after_id = Some(state.view.id.clone());
+                states.push(state);
+            }
+            if page_len < PAGE_MAX {
+                break;
+            }
+        }
+        Ok(states)
+    }
+
+    pub(crate) async fn settle_rule_backlog(
+        &self,
+        state: &RuleStateView,
+        through: i64,
+        max_events: i64,
+        now: i64,
+    ) -> Result<RuleProcessingState> {
+        let change = {
+            let mut store = self.inner.store.lock().await;
+            let change = store.settle_rule_backlog("owner", state, through, max_events, now)?;
+            self.publish_locked(&change.events);
+            change
+        };
+        if !change.events.is_empty() {
+            self.signal_progress();
+        }
+        Ok(change.value)
     }
 
     pub(crate) async fn get_global_timer(&self, id: &str) -> Result<Option<TimerStateView>> {
         self.inner.store.lock().await.get_timer_state("owner", id)
-    }
-
-    pub(crate) async fn initialize_global_timer(
-        &self,
-        input: &TimerDefinitionInput,
-        registration_now: i64,
-    ) -> Result<TimerStateView> {
-        self.inner
-            .store
-            .lock()
-            .await
-            .ensure_timer_state("owner", input, registration_now)
     }
 
     pub(crate) async fn list_due_global_timers(
@@ -3875,7 +3936,7 @@ mod tests {
             vec![secret_key_definition],
         ] {
             let error = router
-                .initialize_global_rules(&definitions, now_ms())
+                .initialize_global_rules(&definitions, &[], now_ms())
                 .await
                 .unwrap_err();
             assert_eq!(error.code, "secret_in_payload");
@@ -3918,8 +3979,10 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
 "#;
         std::fs::write(&rule_path, invalid).unwrap();
         let high_water = router.inner.store.lock().await.high_water().unwrap();
+        let policy = SecretPolicy::default();
 
-        let error = match crate::automation::initialize_global_rules(&router, &root).await {
+        let error = match crate::automation::initialize_global_rules(&router, &root, &policy).await
+        {
             Err(error) => error,
             Ok(_) => panic!("overflowing first timer slot should fail preflight"),
         };
@@ -3952,7 +4015,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             "on = { every = \"1s\" }",
         );
         std::fs::write(&rule_path, corrected).unwrap();
-        let initialized = crate::automation::initialize_global_rules(&router, &root)
+        let initialized = crate::automation::initialize_global_rules(&router, &root, &policy)
             .await
             .unwrap();
         assert_eq!(initialized.len(), 2);

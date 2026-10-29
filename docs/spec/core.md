@@ -191,8 +191,14 @@ replay it unchanged; a missing subject remains missing. Its canonical type is
 [`EventSubject`](../../crates/eliot-core/src/lib.rs), while event identity is carried by
 [`Event.agent` and `Event.generation`](../../crates/eliot-core/src/lib.rs). Never look up
 a later Agent row to replace the captured subject. Future hierarchy or labels require
-real L5 sources and callers before they are added to this projection. `cause` carries
-command/rule/Goal correlation and loop depth.
+real L5 sources and callers before they are added to this projection. The optional
+[`Event.cause`](../../crates/eliot-core/src/lib.rs) uses canonical `EventCause`. Store
+persists it only from verified command provenance; arbitrary native `data.cause` is
+ignored, and historical events are never reconstructed from a later Agent row. Ordinary
+proven controller commands start at depth 0. Rule, timer and manual-timer commands use
+their own command identity and depth 1 when no triggering cause exists, or one greater
+than the verified triggering cause. The existing `commands.cause` storage carries typed
+cause JSON for rule parents and children, each bound to that row's own command ID.
 
 Native families are session/turn/message/tool/request/child/goal/usage/provider/edit.
 Exactly one source owns each implemented family per Agent generation. Daemon-owned

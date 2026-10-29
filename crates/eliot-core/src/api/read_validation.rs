@@ -9,15 +9,7 @@ use crate::{Command, CommandState, Error, Result, Turn};
 
 impl RuleGetRequest {
     pub fn validate_response(&self, response: &RuleStateView) -> Result<()> {
-        if self.validate().is_err()
-            || response.id != self.id
-            || response.revision < 0
-            || response.current_cursor < 0
-            || response
-                .paused_reason
-                .as_deref()
-                .is_some_and(|reason| reason.trim().is_empty())
-        {
+        if self.validate().is_err() || response.id != self.id || response.validate().is_err() {
             return Err(binding_mismatch());
         }
         Ok(())
@@ -168,6 +160,9 @@ mod tests {
             id: "rule-1".to_owned(),
             revision: 1,
             current_cursor: 12,
+            retiring_revision: None,
+            retiring_cursor: None,
+            retire_through: None,
             enabled: true,
             paused_reason: None,
         };
@@ -199,6 +194,40 @@ mod tests {
         assert_unknown(request.validate_response(&invalid));
         invalid = response;
         invalid.paused_reason = Some(" \t ".to_owned());
+        assert_unknown(request.validate_response(&invalid));
+    }
+
+    #[test]
+    fn rule_get_validates_complete_retirement_readback_and_keeps_absent_wire_legacy() {
+        let request = RuleGetRequest::new("rule-1");
+        let state = RuleStateView {
+            id: "rule-1".to_owned(),
+            revision: 2,
+            current_cursor: 18,
+            retiring_revision: Some(1),
+            retiring_cursor: Some(7),
+            retire_through: Some(12),
+            enabled: true,
+            paused_reason: None,
+        };
+        request.validate_response(&state).unwrap();
+        let wire = serde_json::to_value(&state).unwrap();
+        assert_eq!(wire["retiring_revision"], 1);
+        assert_eq!(wire["retiring_cursor"], 7);
+        assert_eq!(wire["retire_through"], 12);
+        assert_eq!(
+            serde_json::from_value::<RuleStateView>(wire).unwrap(),
+            state
+        );
+
+        let mut invalid = state.clone();
+        invalid.retiring_cursor = None;
+        assert_unknown(request.validate_response(&invalid));
+        invalid = state.clone();
+        invalid.retiring_cursor = Some(13);
+        assert_unknown(request.validate_response(&invalid));
+        invalid = state;
+        invalid.retiring_revision = Some(2);
         assert_unknown(request.validate_response(&invalid));
     }
 

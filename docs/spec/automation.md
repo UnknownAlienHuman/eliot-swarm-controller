@@ -8,7 +8,8 @@ Task/review engine, second executor or generic run/action graph.
 
 Global rules: `<data_dir>/rules/*.toml`. Project rules: the registered checkout's
 `.eliot/rules/*.toml`, with project-scoped authority and approved profiles/actions.
-Invalid reload keeps the last valid definition and reports the error.
+Connected global event rules watch these files for changes. Invalid reload keeps the last
+valid definition and reports the error through bounded daemon diagnostics.
 
 ```toml
 [[rule]]
@@ -137,52 +138,80 @@ target contract; startup changes to an existing schedule are rejected as unsuppo
 this slice. Schedule replacement and hot reload remain future work. The canonical timer
 wire types are in [Core `timers.rs`](../../crates/eliot-core/src/api/timers.rs).
 
-## First connected event slice
+## Connected event rules
 
-The initial L4.1 path loads owner-approved global rules from
-`<data_dir>/rules/*.toml` at daemon startup. It supports only the persisted
-`turn.completed` trigger, exact equality match, and one ordinary `stop` action. The
-match uses the event-time `subject`, not a later Agent read:
+Global rules load from `<data_dir>/rules/*.toml` at startup and use committed events;
+the connected event-rule worker watches the same files for semantic updates. Ephemeral
+samples never trigger actions. `on.event` is a literal static committed event kind,
+including kinds beyond `turn.completed`. Matching uses the event-time `subject`
+persisted with the event, never a later Agent-row lookup. The canonical event and subject
+shapes remain in [Core](../../crates/eliot-core/src/lib.rs).
+
+Scalar `match` values compare exactly. String values prefixed `glob:` or `re:` use bounded
+glob or regex matching; `{ one_of = [...] }` accepts a list of scalar values, and
+`{ exists = true|false }` checks path presence. Conditions combine with AND. A missing
+field does not match an ordinary condition; `exists = false` explicitly matches absence.
+For example:
 
 ```toml
 [[rule]]
-id = "stop-on-result"
-on = { event = "turn.completed", match = { "subject.harness" = "fake" } }
+id = "stop-on-launch"
+on = { event = "command.applied", match = { "event.kind" = "glob:command.*", "event.data.state" = "re:^applied$", "event.agent" = { one_of = ["a1", "a2"] }, "event.generation" = { exists = true } } }
 do = [{ action = "stop", target = "${event.agent}", expected_generation = "${event.generation}" }]
 ```
 
-Whole-value rendering preserves the source JSON type, so `expected_generation` remains
-an integer. Templates cannot choose the action, action name, executable, environment or
-authority. The stop target and `expected_generation` must equal the triggering event's
-`agent` and `generation`; another Agent or generation is rejected. A firing atomically
-admits one Store-only parent and one ordinary stop child;
-the parent's fixed child set is durable, and `applied` means admission rather than
-completion. A new rule's captured high-water cursor is seeded atomically with its state.
-Restart keeps the stored definition and cursor for an unchanged definition. A changed
-valid definition for an existing rule is rejected as unsupported, leaving the stored
-definition and cursor in force; backlog is never reinterpreted. Disabled rules advance
-the skipped range without firing.
+Whole-value rendering preserves JSON type. Templates cannot choose the action, action
+name, executable, environment, credential or authority. For this supported stop action,
+the target and `expected_generation` must match the triggering event's Agent and
+generation; a different binding is rejected. An unresolved placeholder fails admission.
+One firing atomically admits its Store-only parent and ordinary stop child; the parent's
+fixed child set is durable, and `applied` means admission rather than completion.
 
-The default per-rule limit is 10 firings/minute and the global limit is 120 actions/minute.
-Rate accounting counts each already admitted ordinary rule-action child command once and
-excludes Store-only admission parents. Both limits are enforced atomically with command
-admission and cursor advancement. A limit hit records the deterministic skip in a
-Store-only rejected parent and advances without admitting an action child. Explicit
-custom `limit` and `catch_up` values are unsupported here and must be rejected rather
-than ignored.
+Each committed event retains its event-time subject snapshot (or absence) and any
+Store-verified cause. Depth 0 denotes a proven ordinary controller command; rule, timer
+and manual-timer commands carry depth 1 or one greater than their triggering verified cause. Native
+`data.cause` is not trusted and old events are never reconstructed from current Agent
+state. A verified cause depth above 5 silently advances the cursor without admitting a
+parent/action or emitting another event, so suppression cannot create a cause loop.
 
-Other event triggers, project rules, non-exact match operators, multiple actions,
-scripts, Goals and hot reload remain unsupported. This stop-only action cannot create a
-new turn event, so the current slice cannot loop on its own `turn.completed`; the target
-cause-depth guard remains required before adding actions that can produce their own
-triggering events. The L4.1 target contract above remains in force.
+New rules seed their cursor at captured event high-water `H` in the same transaction as
+the definition insert. A semantic edit captures `H`, retires the current definition
+through `H`, and starts the new revision after `H`. Keep at most one current and one
+retiring definition. Defer another semantic edit until retirement completes, then reread
+the latest valid file. Identical reload is a no-op. An invalid reload retains the last
+valid definition and reports the error. Each event's match/validation result and cursor
+advance commit atomically with any admitted command set; Store failure commits neither.
+Disabled rules advance their skipped range without firing.
+
+Enabled current/retiring cursors pin events until consumed. At
+`automation.max_event_backlog` (default 100,000), atomically record the skipped range,
+advance to captured high-water, clear retirement and pause with `backlog_exceeded`.
+Existing commands continue. This increment does not add project overlays or explicit
+history catch-up.
+
+The default per-rule limit remains 10 firings/minute and the global limit 120
+actions/minute. Count admitted action children once, excluding Store-only parents, and
+enforce limits with cursor/admission. A rate skip records its deterministic result in a
+Store-only rejected parent without an action child. Event rule files cannot override
+these limits with custom `limit` or `catch_up` values.
+
+This increment still supports one ordinary `stop` action. Other actions, selectors,
+scripts, Goals, project rules and schedule replacement remain future work. Cause-depth
+suppression is silent; it does not emit an endlessly retriggerable rejection event.
 
 ## Matching and rendering
 
-The only template roots are `{event, subject, data}`. `subject` may be absent for
-non-Agent facts. Exact, `glob:`, `re:`, one-of and `exists` matches combine with AND.
-Missing required fields do not match; an unresolved action placeholder fails admission.
-There is no undocumented `agent.*` alias.
+`on.event` names a literal static committed event kind; ephemeral samples are not
+triggers. Match paths resolve only against `{event, subject, data}` using the persisted
+event-time snapshot. `subject` may be absent for non-Agent facts, and there is no
+undocumented `agent.*` alias.
+
+Scalar values compare exactly. String values beginning `glob:` use glob matching and
+strings beginning `re:` use regex matching. `{ one_of = [...] }` accepts scalar choices;
+`{ exists = true|false }` tests whether a path is present. Conditions combine with AND.
+Missing paths do not match ordinary conditions; `exists = false` is the explicit missing
+path check. Invalid regex/glob syntax rejects the file. An unresolved action placeholder
+fails admission.
 
 Substitution fills argument values, never executable/action kind, option name,
 environment name, credential or authority scope. Workspace/ref/remote substitutions
@@ -330,7 +359,10 @@ ordinary action child command rows once; Store-only admission parents are exclud
 
 ## Guardrails
 
-Cause depth above 5 suppresses firing. Default per-rule limit is 10/minute, global
+Only Store-verified causes control depth; a rule never trusts native `data.cause` or
+reconstructs old provenance from a current Agent row. Cause depth above 5 silently
+advances the cursor without a parent/action command or a new event, so suppression is
+quiescent. Default per-rule limit is 10/minute, global
 120 actions/minute; configured windows must fit retained accounting history. Own-event
 send/steer/inject requires `allow_self=true`. Draining or paused automation admits no new
 firings. Every action uses normal router checks. These are execution limits, not a task

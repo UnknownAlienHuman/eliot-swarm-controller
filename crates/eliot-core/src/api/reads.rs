@@ -27,9 +27,53 @@ pub struct RuleStateView {
     pub id: String,
     pub revision: i64,
     pub current_cursor: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retiring_revision: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retiring_cursor: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retire_through: Option<i64>,
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused_reason: Option<String>,
+}
+
+impl RuleStateView {
+    pub fn validate(&self) -> Result<()> {
+        validate_id(&self.id)?;
+        if self.revision < 0 || self.current_cursor < 0 {
+            return Err(Error::new(
+                "invalid",
+                "rule revision and cursor must be nonnegative",
+            ));
+        }
+        if self
+            .paused_reason
+            .as_deref()
+            .is_some_and(|reason| reason.trim().is_empty())
+        {
+            return Err(Error::new("invalid", "paused_reason must be nonempty"));
+        }
+        match (
+            self.retiring_revision,
+            self.retiring_cursor,
+            self.retire_through,
+        ) {
+            (None, None, None) => Ok(()),
+            (Some(revision), Some(cursor), Some(through))
+                if revision >= 0
+                    && revision < self.revision
+                    && cursor >= 0
+                    && through >= cursor =>
+            {
+                Ok(())
+            }
+            _ => Err(Error::new(
+                "invalid",
+                "rule retirement progress must be a complete, ordered tuple",
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

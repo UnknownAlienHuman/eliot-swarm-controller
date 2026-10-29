@@ -3,6 +3,8 @@ use eliot_core::{
     api::{CatchUp, TimerSchedule},
     canonical_json_sha256, parse_agent_id,
 };
+use globset::{Glob, GlobMatcher};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -14,9 +16,9 @@ use std::{
 const MAX_RULE_FILE_BYTES: usize = 128 * 1024;
 // Canonical Agent IDs are `a` plus at most 19 positive-i64 decimal digits.
 const MAX_AGENT_ID_BYTES: usize = 20;
-const SUPPORTED_EVENT: &str = "turn.completed";
+const MAX_RULE_CAUSE_DEPTH: u8 = 5;
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuleDefinition {
     pub id: String,
@@ -26,6 +28,8 @@ pub struct RuleDefinition {
     trigger: TriggerDefinition,
     #[serde(rename = "do")]
     actions: Vec<StopActionDefinition>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_self: bool,
     #[serde(
         default = "default_catch_up",
         skip_serializing_if = "is_default_catch_up"
@@ -35,7 +39,7 @@ pub struct RuleDefinition {
     schedule: Option<TimerSchedule>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TriggerDefinition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -52,14 +56,41 @@ struct TriggerDefinition {
     tz: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     at: Option<String>,
+    #[serde(skip)]
+    compiled_matches: BTreeMap<String, CompiledMatch>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StopActionDefinition {
     action: String,
     target: Value,
     expected_generation: Value,
+}
+
+#[derive(Clone, Debug)]
+enum CompiledMatch {
+    Exact(Value),
+    Glob(GlobMatcher),
+    Regex(Regex),
+    OneOf(Vec<Value>),
+    Exists(bool),
+}
+
+impl CompiledMatch {
+    fn matches(&self, actual: Option<&Value>) -> bool {
+        match self {
+            Self::Exact(expected) => actual == Some(expected),
+            Self::Glob(pattern) => actual
+                .and_then(Value::as_str)
+                .is_some_and(|value| pattern.is_match(value)),
+            Self::Regex(pattern) => actual
+                .and_then(Value::as_str)
+                .is_some_and(|value| pattern.is_match(value)),
+            Self::OneOf(choices) => actual.is_some_and(|value| choices.contains(value)),
+            Self::Exists(expected) => actual.is_some() == *expected,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,6 +107,10 @@ struct RuleFile {
 
 fn enabled_by_default() -> bool {
     true
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 fn default_catch_up() -> CatchUp {
@@ -135,6 +170,32 @@ impl RuleDefinition {
             .map_err(|_| Error::new("invalid", "rule definition cannot be canonicalized"))
     }
 
+    /// Digest the normalized schedule and catch-up policy, excluding action-only edits.
+    pub fn schedule_digest(&self) -> Result<Option<[u8; 32]>, Error> {
+        let Some(schedule) = &self.schedule else {
+            return Ok(None);
+        };
+        let value = serde_json::to_value((schedule, &self.catch_up))
+            .map_err(|_| Error::new("invalid", "timer schedule cannot be encoded"))?;
+        canonical_json_sha256(&value)
+            .map(Some)
+            .map_err(|_| Error::new("invalid", "timer schedule cannot be canonicalized"))
+    }
+
+    /// Restore a previously validated canonical definition and rebuild skipped caches.
+    pub fn deserialize_saved(source: &str) -> Result<Self, Error> {
+        if source.len() > MAX_RULE_FILE_BYTES {
+            return Err(Error::new(
+                "invalid",
+                "saved rule definition exceeds the 128 KiB bound",
+            ));
+        }
+        let mut definition: Self = serde_json::from_str(source)
+            .map_err(|_| Error::new("invalid", "saved rule definition is malformed"))?;
+        validate_rule(&mut definition)?;
+        Ok(definition)
+    }
+
     pub fn schedule(&self) -> Option<&TimerSchedule> {
         self.schedule.as_ref()
     }
@@ -167,9 +228,13 @@ impl TriggerDefinition {
 /// `None` means disabled, a different event, or no exact match. The caller advances
 /// disabled/no-match cursors and settles rate-limit skips with the event transaction.
 pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<StopAction>, Error> {
-    if !rule.enabled
-        || event.kind != SUPPORTED_EVENT
-        || rule.trigger.event.as_deref() != Some(event.kind.as_str())
+    if !rule.enabled || rule.trigger.event.as_deref() != Some(event.kind.as_str()) {
+        return Ok(None);
+    }
+    if event
+        .cause
+        .as_ref()
+        .is_some_and(|cause| cause.depth > MAX_RULE_CAUSE_DEPTH)
     {
         return Ok(None);
     }
@@ -183,11 +248,8 @@ pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<StopActio
         .transpose()
         .map_err(|_| Error::new("invalid", "rule subject cannot be encoded"))?;
     let subject = subject_value.as_ref();
-    for (path, expected) in &rule.trigger.matches {
-        let Some(actual) = lookup(path, &event_value, subject, &event.data) else {
-            return Ok(None);
-        };
-        if actual != expected {
+    for (path, matcher) in &rule.trigger.compiled_matches {
+        if !matcher.matches(lookup(path, &event_value, subject, &event.data)) {
             return Ok(None);
         }
     }
@@ -222,9 +284,7 @@ fn reject_unimplemented_options(raw: &toml::Value) -> Result<(), Error> {
     let Some(rule) = raw.as_table() else {
         return Ok(());
     };
-    let has_unsupported_rule_option = ["limit", "allow_self"]
-        .iter()
-        .any(|key| rule.contains_key(*key));
+    let has_unsupported_rule_option = ["limit"].iter().any(|key| rule.contains_key(*key));
     let has_unsupported_trigger = rule
         .get("on")
         .and_then(toml::Value::as_table)
@@ -271,23 +331,23 @@ fn validate_rule(rule: &mut RuleDefinition) -> Result<(), Error> {
         ));
     }
 
-    if let Some(event) = rule.trigger.event.as_deref() {
+    if let Some(event) = rule.trigger.event.clone() {
         if rule.trigger.has_timer_fields() {
             return Err(Error::new(
                 "invalid",
                 "rule on cannot mix event and timer triggers",
             ));
         }
-        if event != SUPPORTED_EVENT {
+        if event.trim().is_empty() || event.contains("${") {
             return Err(Error::new(
-                "unsupported",
-                "only turn.completed event rules are supported",
+                "invalid",
+                "event trigger must be a nonempty literal event kind",
             ));
         }
         if !is_default_catch_up(&rule.catch_up) {
             return Err(Error::new("invalid", "catch_up requires a timer trigger"));
         }
-        validate_event_matches(&rule.trigger.matches)?;
+        validate_event_matches(&mut rule.trigger)?;
         validate_event_action(action)?;
         rule.schedule = None;
         return Ok(());
@@ -323,26 +383,66 @@ fn validate_rule(rule: &mut RuleDefinition) -> Result<(), Error> {
     Ok(())
 }
 
-fn validate_event_matches(matches: &BTreeMap<String, Value>) -> Result<(), Error> {
-    for (path, expected) in matches {
+fn validate_event_matches(trigger: &mut TriggerDefinition) -> Result<(), Error> {
+    let mut compiled = BTreeMap::new();
+    for (path, expected) in &trigger.matches {
         validate_path(path)?;
-        match expected {
-            Value::String(value) if value.starts_with("glob:") || value.starts_with("re:") => {
-                return Err(Error::new(
-                    "unsupported",
-                    "only exact rule matches are supported",
-                ));
-            }
-            Value::String(_) | Value::Number(_) | Value::Bool(_) => {}
-            Value::Null | Value::Array(_) | Value::Object(_) => {
-                return Err(Error::new(
-                    "unsupported",
-                    "only exact scalar rule matches are supported",
-                ));
+        compiled.insert(path.clone(), compile_match(expected)?);
+    }
+    trigger.compiled_matches = compiled;
+    Ok(())
+}
+
+fn compile_match(value: &Value) -> Result<CompiledMatch, Error> {
+    match value {
+        Value::String(value) if let Some(pattern) = value.strip_prefix("glob:") => {
+            let glob = Glob::new(pattern)
+                .map_err(|_| Error::new("invalid", "rule glob pattern is invalid"))?;
+            Ok(CompiledMatch::Glob(glob.compile_matcher()))
+        }
+        Value::String(value) if let Some(pattern) = value.strip_prefix("re:") => {
+            Regex::new(pattern)
+                .map(CompiledMatch::Regex)
+                .map_err(|_| Error::new("invalid", "rule regex pattern is invalid"))
+        }
+        Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null => {
+            Ok(CompiledMatch::Exact(value.clone()))
+        }
+        Value::Object(operators) if operators.len() == 1 => {
+            let Some((operator, operand)) = operators.iter().next() else {
+                return Err(Error::new("invalid", "rule match operator is missing"));
+            };
+            match (operator.as_str(), operand) {
+                ("one_of", Value::Array(choices))
+                    if !choices.is_empty() && choices.iter().all(is_match_scalar) =>
+                {
+                    Ok(CompiledMatch::OneOf(choices.clone()))
+                }
+                ("one_of", _) => Err(Error::new(
+                    "invalid",
+                    "one_of must contain a nonempty array of scalar values",
+                )),
+                ("exists", Value::Bool(expected)) => Ok(CompiledMatch::Exists(*expected)),
+                ("exists", _) => Err(Error::new("invalid", "exists must be a boolean")),
+                _ => Err(Error::new("unsupported", "unknown rule match operator")),
             }
         }
+        Value::Object(_) => Err(Error::new(
+            "invalid",
+            "match values must contain exactly one operator",
+        )),
+        Value::Array(_) => Err(Error::new(
+            "invalid",
+            "one-of matches must use an inline one_of table",
+        )),
     }
-    Ok(())
+}
+
+fn is_match_scalar(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null
+    )
 }
 
 fn validate_event_action(action: &StopActionDefinition) -> Result<(), Error> {
@@ -468,6 +568,9 @@ fn validate_path(path: &str) -> Result<(), Error> {
         "event" => match field {
             "data" => true,
             "subject" => remaining.len() == 1 && is_subject_field(remaining[0]),
+            "cause" => {
+                remaining.len() == 1 && matches!(remaining[0], "command_id" | "rule" | "depth")
+            }
             "seq" | "ts" | "kind" | "agent" | "generation" | "source" | "native_id" => {
                 remaining.is_empty()
             }
@@ -637,12 +740,20 @@ on = { at = '1970-01-01T00:00:01Z' }
 do = [{ action = 'stop', target = 'a7', expected_generation = 3 }]
 "#;
 
+    const OPERATOR_RULE: &str = r#"
+[[rule]]
+id = 'command-launch'
+on = { event = 'command.applied', match = { 'event.kind' = 'glob:command.*', 'event.data.verb' = 're:^launch$', 'event.agent' = { one_of = ['a1', 'a2'] }, 'event.generation' = { exists = true } } }
+do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${event.generation}' }]
+"#;
+
     fn event() -> Event {
         Event {
             seq: 7,
             ts: 100,
             kind: "turn.completed".to_owned(),
             agent: Some("a7".to_owned()),
+            cause: None,
             subject: Some(eliot_core::EventSubject {
                 project: "project-test".to_owned(),
                 harness: "fake".to_owned(),
@@ -662,7 +773,6 @@ do = [{ action = 'stop', target = 'a7', expected_generation = 3 }]
         let unsupported = [
             RULE.replace("do =", "limit = { max = 2 }\ndo ="),
             RULE.replace("action = 'stop'", "action = 'send'"),
-            RULE.replace("'subject.harness' = 'fake'", "'subject.harness' = ['fake']"),
             RULE.replace("'subject.harness' = 'fake'", "'subject.labels.role' = 'writer'"),
             RULE.replace("'subject.harness' = 'fake'", "'event.parent' = 'command-id'"),
             RULE.replace(
@@ -680,6 +790,9 @@ do = [{ action = 'stop', target = 'a7', expected_generation = 3 }]
             "id = 'stop-on-result'\nextra = true",
         );
         assert_eq!(load(Cursor::new(unknown)).unwrap_err().code, "invalid");
+        let direct_array =
+            RULE.replace("'subject.harness' = 'fake'", "'subject.harness' = ['fake']");
+        assert_eq!(load(Cursor::new(direct_array)).unwrap_err().code, "invalid");
         let duplicate = format!("{RULE}\n{RULE}");
         assert_eq!(load(Cursor::new(duplicate)).unwrap_err().code, "invalid");
         let mixed = RULE.replace(
@@ -705,6 +818,61 @@ do = [{ action = 'stop', target = 'a7', expected_generation = 3 }]
             .expect("matching stop action");
         assert_eq!(action.target, "a7");
         assert_eq!(action.expected_generation, 3);
+    }
+
+    #[test]
+    fn committed_event_match_operators_compile_and_survive_saved_decode() {
+        let rule = load(Cursor::new(OPERATOR_RULE)).unwrap().remove(0);
+        let saved_json = serde_json::to_string(&rule).unwrap();
+        let restored = RuleDefinition::deserialize_saved(&saved_json).unwrap();
+        assert_eq!(
+            restored.semantic_digest().unwrap(),
+            rule.semantic_digest().unwrap()
+        );
+
+        let mut command_event = event();
+        command_event.kind = "command.applied".to_owned();
+        command_event.agent = Some("a2".to_owned());
+        command_event.data = json!({"verb":"launch"});
+        let stop = evaluate(&restored, &command_event)
+            .unwrap()
+            .expect("all exact/glob/regex/one_of/exists conditions match");
+        assert_eq!(stop.target, "a2");
+        assert_eq!(stop.expected_generation, 3);
+
+        let bad_regex = OPERATOR_RULE.replace("re:^launch$", "re:[");
+        assert_eq!(load(Cursor::new(bad_regex)).unwrap_err().code, "invalid");
+    }
+
+    #[test]
+    fn exists_false_matches_only_a_missing_path() {
+        let source = OPERATOR_RULE.replace(
+            "'event.kind' = 'glob:command.*', 'event.data.verb' = 're:^launch$', 'event.agent' = { one_of = ['a1', 'a2'] }, 'event.generation' = { exists = true }",
+            "'data.absent' = { exists = false }",
+        );
+        let rule = load(Cursor::new(source)).unwrap().remove(0);
+        let mut command_event = event();
+        command_event.kind = "command.applied".to_owned();
+        command_event.data = json!({});
+        assert!(evaluate(&rule, &command_event).unwrap().is_some());
+
+        command_event.data["absent"] = Value::Null;
+        assert_eq!(evaluate(&rule, &command_event).unwrap(), None);
+    }
+
+    #[test]
+    fn rule_cause_depth_above_five_skips_without_firing() {
+        let rule = load(Cursor::new(RULE)).unwrap().remove(0);
+        let mut event = event();
+        event.cause = Some(eliot_core::EventCause {
+            command_id: "stop-child".to_owned(),
+            rule: Some(rule.id.clone()),
+            depth: 6,
+        });
+        assert_eq!(evaluate(&rule, &event).unwrap(), None);
+
+        event.cause.as_mut().unwrap().depth = 5;
+        assert!(evaluate(&rule, &event).unwrap().is_some());
     }
 
     #[test]

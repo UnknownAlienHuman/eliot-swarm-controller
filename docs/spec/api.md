@@ -115,9 +115,9 @@ unknown commands remain unknown. Agent list observations appear only when reques
 Absent source cursors and sequence/acknowledgement values remain null.
 
 `rule.get` uses the typed Core `RuleGetRequest`/`RuleStateView`, is owner-only, and
-reads the current loaded rule state and durable cursor. It does not reload configuration
-or advance the cursor. The first connected event-rule subset is described in
-[automation](automation.md#first-connected-event-slice).
+reads the loaded definition's current cursor and any retiring definition's cursor/boundary.
+It does not reload configuration or advance either cursor. The event-rule behavior is
+described in [automation](automation.md#event-cursor-and-compact-definition-handoff).
 
 `timer.get` uses `TimerGetRequest`/`TimerStateView` and reads one startup-loaded global
 timer without advancing its schedule. `timer.run` accepts `TimerRunRequest { id, rule }`,
