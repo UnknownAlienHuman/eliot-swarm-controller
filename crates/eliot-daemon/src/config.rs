@@ -49,7 +49,24 @@ pub(crate) fn native_store_selector(name: &str) -> Option<&'static str> {
 /// Called only for a newly resolved launch/attach profile, after retained-ID miss.
 pub(crate) fn capture_native_store_inputs(
     profile: &mut Value,
-    mut lookup: impl FnMut(&str) -> Option<OsString>,
+    selector_lookup: impl FnMut(&str) -> Option<OsString>,
+) -> core::Result<()> {
+    capture_native_store_inputs_inner(profile, selector_lookup, |name| std::env::var_os(name))
+}
+
+#[cfg(test)]
+pub(crate) fn capture_native_store_inputs_with_lookups(
+    profile: &mut Value,
+    selector_lookup: impl FnMut(&str) -> Option<OsString>,
+    credential_lookup: impl FnMut(&str) -> Option<OsString>,
+) -> core::Result<()> {
+    capture_native_store_inputs_inner(profile, selector_lookup, credential_lookup)
+}
+
+fn capture_native_store_inputs_inner(
+    profile: &mut Value,
+    mut selector_lookup: impl FnMut(&str) -> Option<OsString>,
+    mut credential_lookup: impl FnMut(&str) -> Option<OsString>,
 ) -> core::Result<()> {
     let names = profile
         .get("pass_env")
@@ -62,7 +79,7 @@ pub(crate) fn capture_native_store_inputs(
             .filter_map(Value::as_str)
             .find(|name| native_store_selector(name) == Some(selector));
         let value = selected
-            .and_then(&mut lookup)
+            .and_then(&mut selector_lookup)
             .map(|value| {
                 value.into_string().map(Value::String).map_err(|_| {
                     core::Error::new("invalid", "native store selector is not valid Unicode")
@@ -72,7 +89,22 @@ pub(crate) fn capture_native_store_inputs(
             .unwrap_or(Value::Null);
         values.insert(selector.to_owned(), value);
     }
-    profile["pass_env_values"] = Value::Object(values);
+    let captured = Value::Object(values);
+    let credentials = names
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|name| native_store_selector(name).is_none())
+        .filter_map(&mut credential_lookup)
+        .filter_map(|value| value.into_string().ok())
+        .collect::<Vec<_>>();
+    let policy = core::SecretPolicy::new(credentials.iter().map(String::as_str));
+    if policy.contains_value(&captured) {
+        return Err(core::Error::new(
+            "secret_in_payload",
+            "native store selector input contains a known credential",
+        ));
+    }
+    profile["pass_env_values"] = captured;
     // The augmented snapshot is bounded by the existing Store admission/frame
     // checks. This capture proves inputs, never an effective native root/scope.
     Ok(())
@@ -717,11 +749,18 @@ mod tests {
         let mut profile =
             json!({"pass_env":["CODEX_HOME", "CODEX_SQLITE_HOME", "EPHEMERAL_TOKEN"]});
         let raw = " ../original-home ";
-        capture_native_store_inputs(&mut profile, |name| match name {
-            "CODEX_HOME" => Some(OsString::from(raw)),
-            "CODEX_SQLITE_HOME" => None,
-            _ => panic!("credentials must not be read during capture"),
-        })
+        capture_native_store_inputs_with_lookups(
+            &mut profile,
+            |name| match name {
+                "CODEX_HOME" => Some(OsString::from(raw)),
+                "CODEX_SQLITE_HOME" => None,
+                _ => panic!("unexpected selector lookup: {name}"),
+            },
+            |name| match name {
+                "EPHEMERAL_TOKEN" => Some(OsString::from("temporary-credential")),
+                _ => panic!("unexpected credential lookup: {name}"),
+            },
+        )
         .unwrap();
         assert_eq!(
             profile["pass_env_values"],
@@ -740,7 +779,12 @@ mod tests {
         capture_native_store_inputs(&mut empty, |_| Some(OsString::new())).unwrap();
         assert_eq!(empty["pass_env_values"]["CODEX_HOME"], "");
         let mut alias = json!({"pass_env":["cOdEx_HoMe"]});
-        capture_native_store_inputs(&mut alias, |_| Some(OsString::from(raw))).unwrap();
+        capture_native_store_inputs_with_lookups(
+            &mut alias,
+            |_| Some(OsString::from(raw)),
+            |_| None,
+        )
+        .unwrap();
         assert_eq!(
             alias["pass_env_values"]["CODEX_HOME"],
             if cfg!(windows) {
@@ -749,6 +793,8 @@ mod tests {
                 Value::Null
             }
         );
+
+        assert_eq!(alias["pass_env_values"].as_object().unwrap().len(), 2);
 
         #[cfg(windows)]
         let invalid = {
@@ -772,6 +818,27 @@ mod tests {
             );
             assert_eq!(profile, original);
         }
+    }
+
+    #[test]
+    fn native_store_inputs_reject_non_selector_credential_collisions() {
+        let mut profile = json!({"pass_env":["CODEX_HOME", "EPHEMERAL_TOKEN"]});
+        let original = profile.clone();
+        let error = capture_native_store_inputs_with_lookups(
+            &mut profile,
+            |name| match name {
+                "CODEX_HOME" => Some(OsString::from("native-home/session-credential")),
+                _ => panic!("unexpected selector lookup: {name}"),
+            },
+            |name| match name {
+                "EPHEMERAL_TOKEN" => Some(OsString::from("session-credential")),
+                _ => panic!("unexpected credential lookup: {name}"),
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "secret_in_payload");
+        assert_eq!(profile, original);
     }
 
     fn config_error(source: &str) -> core::Error {

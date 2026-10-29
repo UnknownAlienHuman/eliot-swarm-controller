@@ -196,9 +196,14 @@ leaves other `pass_env` resolution unchanged.
 
 Retained mutation IDs hydrate their stored snapshot before any new capture. Admitted
 selector inputs are neither rewritten nor backfilled: an absent capture is a legacy
-snapshot, not captured null/unset, and keeps the established execution-time lookup.
-Such legacy inputs are not frozen. Capture proves only the supplied inputs, not the
-effective native home, database root or scope; native configuration can affect selection.
+snapshot, distinct from captured null/unset. Existing legacy environment construction
+may retain its established execution-time `pass_env` lookup; that compatibility does
+not authorize ambient native-store selection. A recovered accepted controlled Codex
+launch without captured selector inputs refuses before native control. The controller
+neither backfills those inputs nor reselects the store from ambient selectors. Resume
+requires the retained effective `native_store_binding` and verifies it before native
+control. Capture proves only the supplied inputs, not the effective native home,
+database root or scope; native configuration can affect selection.
 
 For a new Codex launch, resolve the effective store only after the actual workspace is
 prepared, including setup. The owned read-only
