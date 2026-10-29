@@ -18,15 +18,18 @@ use eliot_core::{
         DaemonShutdownResponse, DaemonStatusRequest, DaemonStatusResponse, DiscoverPage,
         EventsFilter, EventsReadRequest, EventsReadResponse, EventsSubscribeRequest,
         EventsSubscribeResponse, GitView, MAX_OBSERVATION_PAGE_BYTES, ObservationPage,
-        ObservationQuery, ObservationView, ProcessPageCursor, ProviderClearHoldRequest,
-        ProviderHoldsRequest, RuleGetRequest, RuleStateView, ShutdownMode, SourceState,
-        StatusBlocker, TimerGetRequest, TimerRunRequest, TimerStateView, TurnGetRequest,
-        UnsettledCommandSummary, WorkspaceCustodyView,
+        ObservationQuery, ObservationView, ProcessPageCursor, ProjectRegistrationView,
+        ProviderClearHoldRequest, ProviderHoldsRequest, RuleCatchUpRequest, RuleGetRequest,
+        RuleStateView, ShutdownMode, SourceState, StatusBlocker, TimerGetRequest, TimerRunRequest,
+        TimerStateView, TurnGetRequest, UnsettledCommandSummary, WorkspaceCustodyView,
     },
     classify_dispatched_error,
 };
 use eliot_plugin::{MAX_EVENT_BYTES, sync::LockExt};
-use eliot_store::{RuleProcessingState, TimerDefinitionInput, TimerSlotAdmission, TimerSlotCommit};
+use eliot_store::{
+    ProjectRegistrationInput, RuleCatchUpAction, RuleCatchUpAdmission, RuleProcessingState,
+    TimerDefinitionInput, TimerSlotAdmission, TimerSlotCommit,
+};
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 use std::{
@@ -73,7 +76,7 @@ struct RouterInner {
     agent_credentials: AgentCredentials,
     unknown_commands: UnknownCommands,
     unknown_causes: Mutex<HashMap<String, String>>,
-    global_rule_definitions: Mutex<HashMap<String, (i64, RuleDefinition)>>,
+    rule_definitions: Mutex<HashMap<(String, String), (i64, RuleDefinition)>>,
     plugin_host: PluginHost,
     monitoring: Monitoring,
     workspaces: WorkspaceManager,
@@ -86,7 +89,13 @@ struct RouterInner {
 #[derive(Clone)]
 enum Principal {
     Owner,
-    Agent { id: String, generation: i64 },
+    Agent {
+        id: String,
+        generation: i64,
+    },
+    ProjectRule {
+        registration: ProjectRegistrationView,
+    },
 }
 
 struct EventFilter {
@@ -99,6 +108,16 @@ pub(crate) struct PreparedSubmission {
     pub(crate) request: SubmitCommand,
     pub(crate) workspace: Option<WorkspacePreparationInput>,
 }
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectGetRequest {
+    id: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectListRequest {}
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -158,7 +177,7 @@ impl Router {
                 agent_credentials,
                 unknown_commands,
                 unknown_causes: Mutex::new(HashMap::new()),
-                global_rule_definitions: Mutex::new(HashMap::new()),
+                rule_definitions: Mutex::new(HashMap::new()),
                 plugin_host,
                 monitoring,
                 workspaces,
@@ -198,7 +217,10 @@ impl Router {
             "turn.get" => self.turn_get(&params, &principal).await,
             "events.read" => self.events_read(&params, &principal).await,
             "events.subscribe" => self.events_subscribe(&params, &principal).await,
+            "project.get" => self.project_get(&params, &principal).await,
+            "project.list" => self.project_list(&params, &principal).await,
             "rule.get" => self.rule_get(&params, &principal).await,
+            "rule.catch_up" => self.rule_catch_up(&params, &principal).await,
             "timer.get" => self.timer_get(&params, &principal).await,
             "timer.run" => self.timer_run(&params, &principal).await,
             "provider.holds" => self.provider_holds(&params, &principal).await,
@@ -488,6 +510,84 @@ impl Router {
         self.prepare_submission(request, &Principal::Owner).await
     }
 
+    pub(crate) async fn prepare_project_rule_submission(
+        &self,
+        request: SubmitCommand,
+        registration: &ProjectRegistrationView,
+    ) -> Result<PreparedSubmission> {
+        self.prepare_project_rule_submissions(vec![request], registration)
+            .await?
+            .pop()
+            .ok_or_else(|| Error::new("internal", "project preparation omitted its command"))
+    }
+
+    pub(crate) async fn prepare_project_rule_submissions(
+        &self,
+        requests: Vec<SubmitCommand>,
+        registration: &ProjectRegistrationView,
+    ) -> Result<Vec<PreparedSubmission>> {
+        registration.validate()?;
+        crate::automation::verify_project_registration(&self.inner.data_root, registration).await?;
+        let principal = Principal::ProjectRule {
+            registration: registration.clone(),
+        };
+        let mut prepared = Vec::with_capacity(requests.len());
+        for request in requests {
+            let prepared_request = self.prepare_submission(request, &principal).await?;
+            if let (Some(target), Some(generation)) = (
+                prepared_request.request.target.as_deref(),
+                prepared_request.request.expected_generation,
+            ) {
+                self.verify_project_stop_target(registration, target, generation)
+                    .await?;
+            }
+            prepared.push(prepared_request);
+        }
+        Ok(prepared)
+    }
+
+    async fn verify_project_stop_target(
+        &self,
+        registration: &ProjectRegistrationView,
+        target: &str,
+        generation: i64,
+    ) -> Result<()> {
+        let (agent, workspace) = {
+            let store = self.inner.store.lock().await;
+            let agent = store
+                .get_agent(target)?
+                .ok_or_else(|| Error::new("not_found", "project action Agent was not found"))?;
+            if agent.generation != generation {
+                return Err(Error::new(
+                    "stale_generation",
+                    "project action generation is stale",
+                ));
+            }
+            let workspace = store.get_workspace(target)?;
+            (agent, workspace)
+        };
+        let target_workspace = agent
+            .workspace
+            .as_deref()
+            .ok_or_else(|| Error::new("not_allowed", "project action Agent has no workspace"))?;
+        if let Some(workspace) = workspace {
+            crate::automation::verify_managed_project_workspace(
+                registration,
+                &workspace,
+                target_workspace,
+            )
+            .await
+        } else if target_workspace == registration.checkout {
+            crate::automation::verify_project_registration(&self.inner.data_root, registration)
+                .await
+        } else {
+            Err(Error::new(
+                "not_allowed",
+                "project action workspace is not the registered checkout",
+            ))
+        }
+    }
+
     async fn prepare_submission(
         &self,
         mut request: SubmitCommand,
@@ -773,19 +873,232 @@ impl Router {
             .map_err(|_| Error::new("internal", "provider correction could not be encoded"))
     }
 
-    async fn rule_get(&self, params: &Value, principal: &Principal) -> Result<Value> {
+    async fn project_get(&self, params: &Value, principal: &Principal) -> Result<Value> {
         require_owner(principal)?;
-        let request: RuleGetRequest = serde_json::from_value(params.clone())
-            .map_err(|_| Error::new("invalid", "rule.get params are invalid"))?;
+        let request: ProjectGetRequest = serde_json::from_value(params.clone())
+            .map_err(|_| Error::new("invalid", "project.get params are invalid"))?;
+        if request.id.trim().is_empty() {
+            return Err(Error::new("invalid", "project id must be nonempty"));
+        }
+        let registration = self
+            .inner
+            .store
+            .lock()
+            .await
+            .get_project_registration("owner", &request.id)?
+            .ok_or_else(|| Error::new("not_found", "project registration was not found"))?;
+        registration.validate()?;
+        serde_json::to_value(registration)
+            .map_err(|_| Error::new("internal", "project registration could not be encoded"))
+    }
+
+    async fn project_list(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        require_owner(principal)?;
+        let _: ProjectListRequest = serde_json::from_value(params.clone())
+            .map_err(|_| Error::new("invalid", "project.list params are invalid"))?;
+        let registrations = self
+            .inner
+            .store
+            .lock()
+            .await
+            .list_project_registrations("owner", None, PAGE_MAX)?;
+        for registration in &registrations {
+            registration.validate()?;
+        }
+        serde_json::to_value(registrations)
+            .map_err(|_| Error::new("internal", "project registrations could not be encoded"))
+    }
+
+    async fn rule_catch_up(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        require_owner(principal)?;
+        let request: RuleCatchUpRequest = serde_json::from_value(params.clone())
+            .map_err(|_| Error::new("invalid", "rule.catch_up params are invalid"))?;
         request.validate()?;
+        let rule_principal = rule_principal(request.project.as_deref());
+        if let Some(parent) = self
+            .retained_rule_catch_up(&rule_principal, &request)
+            .await?
+        {
+            return serde_json::to_value(parent)
+                .map_err(|_| Error::new("internal", "rule.catch_up result could not be encoded"));
+        }
+        if contains_known_secret_including_keys(params, &self.inner.secrets) {
+            return Err(Error::new(
+                "secret_in_payload",
+                "rule.catch_up request contains a known credential",
+            ));
+        }
+        if !self.rule_firings_open() {
+            if let Some(parent) = self
+                .retained_rule_catch_up(&rule_principal, &request)
+                .await?
+            {
+                return serde_json::to_value(parent).map_err(|_| {
+                    Error::new("internal", "rule.catch_up result could not be encoded")
+                });
+            }
+            return Err(Error::new("unavailable", "automation is draining"));
+        }
+
+        let project = match request.project.as_deref() {
+            Some(id) => Some(
+                self.inner
+                    .store
+                    .lock()
+                    .await
+                    .get_project_registration("owner", id)?
+                    .ok_or_else(|| {
+                        Error::new("not_allowed", "project registration is not active")
+                    })?,
+            ),
+            None => None,
+        };
+        if let Some(project) = &project {
+            crate::automation::verify_project_registration(&self.inner.data_root, project).await?;
+        }
+        let (expected_revision, definition) = self
+            .rule_definition(&rule_principal, &request.rule)
+            .ok_or_else(|| Error::new("not_found", "rule was not found"))?;
+        if definition.schedule().is_some() {
+            return Err(Error::new(
+                "unsupported",
+                "timer rules have no event history",
+            ));
+        }
         let state = self
             .inner
             .store
             .lock()
             .await
-            .get_rule_state("owner", &request.id)?
+            .get_rule_state(&rule_principal, &request.rule)?
             .ok_or_else(|| Error::new("not_found", "rule was not found"))?;
-        request.validate_response(&state)?;
+        if state.project != request.project || state.revision != expected_revision {
+            return Err(Error::new(
+                "bad_state",
+                "rule definition changed before catch-up preparation",
+            ));
+        }
+        if !state.enabled || state.paused_reason.is_some() || state.retiring_revision.is_some() {
+            return Err(Error::new("bad_state", "rule is not eligible for catch-up"));
+        }
+
+        let high_water = self.rule_high_water().await?;
+        let through = request.through_seq.unwrap_or(high_water);
+        if through > high_water || through > state.current_cursor {
+            return Err(Error::new(
+                "bad_state",
+                "catch-up boundary must be at or behind the live rule cursor",
+            ));
+        }
+        if through < request.after_seq {
+            return Err(Error::new(
+                "invalid",
+                "catch-up boundary precedes after_seq",
+            ));
+        }
+        let events = self
+            .read_rule_catch_up_events(request.after_seq, through)
+            .await?;
+        let actions = crate::automation::prepare_rule_catch_up_actions(
+            self,
+            &definition,
+            &events,
+            project.as_ref(),
+        )
+        .await?;
+        let Some(admission) = self
+            .admit_rule_catch_up(
+                &rule_principal,
+                project.as_ref(),
+                &request,
+                &state,
+                through,
+                &actions,
+            )
+            .await?
+        else {
+            if let Some(parent) = self
+                .retained_rule_catch_up(&rule_principal, &request)
+                .await?
+            {
+                return serde_json::to_value(parent).map_err(|_| {
+                    Error::new("internal", "rule.catch_up result could not be encoded")
+                });
+            }
+            return Err(Error::new("unavailable", "automation is draining"));
+        };
+        request.validate_response(&admission.parent)?;
+        serde_json::to_value(admission.parent)
+            .map_err(|_| Error::new("internal", "rule.catch_up result could not be encoded"))
+    }
+
+    async fn retained_rule_catch_up(
+        &self,
+        principal: &str,
+        request: &RuleCatchUpRequest,
+    ) -> Result<Option<Command>> {
+        Ok(self
+            .inner
+            .store
+            .lock()
+            .await
+            .replay_rule_catch_up(principal, request)?
+            .map(|admission| admission.parent))
+    }
+
+    async fn read_rule_catch_up_events(&self, after: i64, through: i64) -> Result<Vec<Event>> {
+        let mut cursor = after;
+        let mut events = Vec::new();
+        while cursor < through {
+            let page = self
+                .read_rule_events(cursor, through, crate::automation::RULE_EVENT_PAGE_SIZE)
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            let page_len = page.len();
+            for event in page {
+                if event.seq <= cursor {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "rule history page did not advance",
+                    ));
+                }
+                cursor = event.seq;
+                events.push(event);
+                if events.len() > EVENT_SCAN_MAX {
+                    return Err(Error::new(
+                        "frame_too_large",
+                        "rule.catch_up range exceeds the bounded event scan",
+                    ));
+                }
+            }
+            if page_len < crate::automation::RULE_EVENT_PAGE_SIZE {
+                break;
+            }
+        }
+        Ok(events)
+    }
+
+    async fn rule_get(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        require_owner(principal)?;
+        let request: RuleGetRequest = serde_json::from_value(params.clone())
+            .map_err(|_| Error::new("invalid", "rule.get params are invalid"))?;
+        request.validate()?;
+        let rule_principal = rule_principal(request.project.as_deref());
+        let state = self
+            .inner
+            .store
+            .lock()
+            .await
+            .get_rule_state(&rule_principal, &request.id)?
+            .ok_or_else(|| Error::new("not_found", "rule was not found"))?;
+        if state.validate().is_err() || state.id != request.id || state.project != request.project {
+            return Err(Error::new(
+                "source_integrity",
+                "stored rule namespace differs from the request",
+            ));
+        }
         serde_json::to_value(state)
             .map_err(|_| Error::new("internal", "rule state could not be encoded"))
     }
@@ -795,12 +1108,13 @@ impl Router {
         let request: TimerGetRequest = serde_json::from_value(params.clone())
             .map_err(|_| Error::new("invalid", "timer.get params are invalid"))?;
         request.validate()?;
+        let rule_principal = rule_principal(request.project.as_deref());
         let state = self
             .inner
             .store
             .lock()
             .await
-            .get_timer_state("owner", &request.id)?
+            .get_timer_state(&rule_principal, &request.id)?
             .ok_or_else(|| Error::new("not_found", "timer was not found"))?;
         request.validate_response(&state)?;
         serde_json::to_value(state)
@@ -812,6 +1126,15 @@ impl Router {
         let request: TimerRunRequest = serde_json::from_value(params.clone())
             .map_err(|_| Error::new("invalid", "timer.run params are invalid"))?;
         request.validate()?;
+        let rule_principal = rule_principal(request.project.as_deref());
+
+        // An exact external-ID replay is returned before current timer, mode,
+        // or target-generation gates are evaluated again.
+        if let Some(parent) = self.replay_timer_run(&rule_principal, &request).await? {
+            request.validate_response(&parent)?;
+            return serde_json::to_value(parent)
+                .map_err(|_| Error::new("internal", "timer.run result could not be encoded"));
+        }
         if contains_known_secret_including_keys(params, &self.inner.secrets) {
             return Err(Error::new(
                 "secret_in_payload",
@@ -819,19 +1142,24 @@ impl Router {
             ));
         }
 
-        // An exact external-ID replay is returned before current timer, mode,
-        // or target-generation gates are evaluated again.
-        if let Some(parent) = self.replay_timer_run(&request).await? {
-            request.validate_response(&parent)?;
-            return serde_json::to_value(parent)
-                .map_err(|_| Error::new("internal", "timer.run result could not be encoded"));
-        }
-
         if !self.rule_firings_open() {
             return Err(Error::new("unavailable", "automation is draining"));
         }
+        let project_view = match request.project.as_deref() {
+            Some(project) => Some(
+                self.inner
+                    .store
+                    .lock()
+                    .await
+                    .get_project_registration("owner", project)?
+                    .ok_or_else(|| {
+                        Error::new("not_allowed", "project registration is not active")
+                    })?,
+            ),
+            None => None,
+        };
         let (expected_rule_revision, definition) = self
-            .global_rule_definition(&request.rule)
+            .rule_definition(&rule_principal, &request.rule)
             .ok_or_else(|| Error::new("not_found", "timer rule was not found"))?;
         if definition.schedule().is_none() {
             return Err(Error::new("unsupported", "rule is not a timer"));
@@ -841,7 +1169,7 @@ impl Router {
             .store
             .lock()
             .await
-            .get_timer_state("owner", &request.rule)?
+            .get_timer_state(&rule_principal, &request.rule)?
             .ok_or_else(|| Error::new("not_found", "timer was not found"))?;
         if !timer.enabled {
             return Err(Error::new("bad_state", "timer is disabled or paused"));
@@ -861,10 +1189,14 @@ impl Router {
             request_id: None,
             probe: false,
         };
-        let prepared = match self.prepare_owner_submission(command).await {
+        let prepared_result = match project_view.as_ref() {
+            Some(project) => self.prepare_project_rule_submission(command, project).await,
+            None => self.prepare_owner_submission(command).await,
+        };
+        let prepared = match prepared_result {
             Ok(prepared) => prepared,
             Err(error) => {
-                if let Some(parent) = self.replay_timer_run(&request).await? {
+                if let Some(parent) = self.replay_timer_run(&rule_principal, &request).await? {
                     request.validate_response(&parent)?;
                     return serde_json::to_value(parent).map_err(|_| {
                         Error::new("internal", "timer.run result could not be encoded")
@@ -874,10 +1206,17 @@ impl Router {
             }
         };
         let Some(admission) = self
-            .admit_manual_timer_run(&request, &timer, expected_rule_revision, prepared)
+            .admit_manual_timer_run(
+                &rule_principal,
+                project_view.as_ref(),
+                &request,
+                &timer,
+                expected_rule_revision,
+                prepared,
+            )
             .await?
         else {
-            if let Some(parent) = self.replay_timer_run(&request).await? {
+            if let Some(parent) = self.replay_timer_run(&rule_principal, &request).await? {
                 request.validate_response(&parent)?;
                 return serde_json::to_value(parent)
                     .map_err(|_| Error::new("internal", "timer.run result could not be encoded"));
@@ -898,16 +1237,22 @@ impl Router {
             .map_err(|_| Error::new("internal", "timer.run result could not be encoded"))
     }
 
-    async fn replay_timer_run(&self, request: &TimerRunRequest) -> Result<Option<Command>> {
+    async fn replay_timer_run(
+        &self,
+        principal: &str,
+        request: &TimerRunRequest,
+    ) -> Result<Option<Command>> {
         self.inner
             .store
             .lock()
             .await
-            .replay_timer_run("owner", request)
+            .replay_timer_run(principal, request)
     }
 
     async fn admit_manual_timer_run(
         &self,
+        principal: &str,
+        project: Option<&ProjectRegistrationView>,
         request: &TimerRunRequest,
         state: &TimerStateView,
         expected_rule_revision: i64,
@@ -925,12 +1270,23 @@ impl Router {
         }
         let admission = {
             let mut store = self.inner.store.lock().await;
-            let replay = store.replay_timer_run("owner", request)?.is_some();
+            let replay = store.replay_timer_run(principal, request)?.is_some();
             if !replay && self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
                 return Ok(None);
             }
+            if !replay && let Some(expected) = project {
+                let current = store
+                    .get_project_registration("owner", &expected.id)?
+                    .ok_or_else(|| Error::new("not_allowed", "project registration was removed"))?;
+                if &current != expected {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "project registration changed before timer admission",
+                    ));
+                }
+            }
             let admission = store.admit_manual_timer_run(
-                "owner",
+                principal,
                 request,
                 state,
                 expected_rule_revision,
@@ -952,45 +1308,59 @@ impl Router {
         Ok(Some(admission))
     }
 
-    pub(crate) fn install_global_rule_definitions(&self, definitions: &[(i64, RuleDefinition)]) {
-        let mut stored = self.inner.global_rule_definitions.lock_recover();
-        stored.clear();
+    pub(crate) fn install_rule_definitions(
+        &self,
+        principal: &str,
+        definitions: &[(i64, RuleDefinition)],
+    ) {
+        let mut stored = self.inner.rule_definitions.lock_recover();
+        stored.retain(|(stored_principal, _), _| stored_principal != principal);
         stored.extend(definitions.iter().map(|(revision, definition)| {
-            (definition.id.clone(), (*revision, definition.clone()))
+            (
+                (principal.to_owned(), definition.id.clone()),
+                (*revision, definition.clone()),
+            )
         }));
     }
 
-    fn global_rule_definition(&self, id: &str) -> Option<(i64, RuleDefinition)> {
+    fn rule_definition(&self, principal: &str, id: &str) -> Option<(i64, RuleDefinition)> {
         self.inner
-            .global_rule_definitions
+            .rule_definitions
             .lock_recover()
-            .get(id)
+            .get(&(principal.to_owned(), id.to_owned()))
             .cloned()
     }
 
-    pub(crate) async fn initialize_global_rules(
+    pub(crate) async fn initialize_rules(
         &self,
+        principal: &str,
         definitions: &[eliot_store::RuleDefinitionInput],
         timers: &[TimerDefinitionInput],
         registration_now: i64,
     ) -> Result<Vec<RuleProcessingState>> {
-        self.validate_global_rule_definitions(definitions).await?;
+        self.validate_rule_definitions(principal, definitions)
+            .await?;
 
         let change = {
             let mut store = self.inner.store.lock().await;
-            let change =
-                store.reconcile_rule_definitions("owner", definitions, timers, registration_now)?;
+            let change = store.reconcile_rule_definitions(
+                principal,
+                definitions,
+                timers,
+                registration_now,
+            )?;
             self.publish_locked(&change.events);
             change
         };
         if !change.events.is_empty() {
             self.signal_progress();
         }
-        self.global_rule_processing().await
+        self.rule_processing(principal).await
     }
 
-    pub(crate) async fn validate_global_rule_definitions(
+    pub(crate) async fn validate_rule_definitions(
         &self,
+        principal: &str,
         definitions: &[eliot_store::RuleDefinitionInput],
     ) -> Result<()> {
         // Check every canonical definition before the first durable seed. Rule
@@ -1005,7 +1375,7 @@ impl Router {
                 ));
             }
         }
-        for state in self.global_rule_processing().await? {
+        for state in self.rule_processing(principal).await? {
             for canonical in
                 std::iter::once(&state.current_definition).chain(state.retiring_definition.iter())
             {
@@ -1023,12 +1393,31 @@ impl Router {
         Ok(())
     }
 
-    pub(crate) async fn global_rule_processing(&self) -> Result<Vec<RuleProcessingState>> {
+    pub(crate) async fn reconcile_project_registrations(
+        &self,
+        inputs: &[ProjectRegistrationInput],
+    ) -> Result<Vec<ProjectRegistrationView>> {
+        let change = {
+            let mut store = self.inner.store.lock().await;
+            let change = store.reconcile_project_registrations("owner", inputs, now_ms())?;
+            self.publish_locked(&change.events);
+            change
+        };
+        if !change.events.is_empty() {
+            self.signal_progress();
+        }
+        Ok(change.value)
+    }
+
+    pub(crate) async fn rule_processing(
+        &self,
+        principal: &str,
+    ) -> Result<Vec<RuleProcessingState>> {
         let mut after_id = None;
         let mut states = Vec::new();
         loop {
             let page = self.inner.store.lock().await.list_rule_processing_states(
-                "owner",
+                principal,
                 after_id.as_deref(),
                 PAGE_MAX,
             )?;
@@ -1049,6 +1438,7 @@ impl Router {
 
     pub(crate) async fn settle_rule_backlog(
         &self,
+        principal: &str,
         state: &RuleStateView,
         through: i64,
         max_events: i64,
@@ -1056,7 +1446,7 @@ impl Router {
     ) -> Result<RuleProcessingState> {
         let change = {
             let mut store = self.inner.store.lock().await;
-            let change = store.settle_rule_backlog("owner", state, through, max_events, now)?;
+            let change = store.settle_rule_backlog(principal, state, through, max_events, now)?;
             self.publish_locked(&change.events);
             change
         };
@@ -1066,12 +1456,17 @@ impl Router {
         Ok(change.value)
     }
 
-    pub(crate) async fn get_global_timer(&self, id: &str) -> Result<Option<TimerStateView>> {
-        self.inner.store.lock().await.get_timer_state("owner", id)
+    pub(crate) async fn get_rule_timer(
+        &self,
+        principal: &str,
+        id: &str,
+    ) -> Result<Option<TimerStateView>> {
+        self.inner.store.lock().await.get_timer_state(principal, id)
     }
 
-    pub(crate) async fn list_due_global_timers(
+    pub(crate) async fn list_due_rule_timers(
         &self,
+        principal: &str,
         after_id: Option<&str>,
         due_by_ms: i64,
         limit: usize,
@@ -1080,11 +1475,13 @@ impl Router {
             .store
             .lock()
             .await
-            .list_due_timer_states("owner", after_id, due_by_ms, limit)
+            .list_due_timer_states(principal, after_id, due_by_ms, limit)
     }
 
-    pub(crate) async fn commit_global_timer_slot(
+    pub(crate) async fn commit_rule_timer_slot(
         &self,
+        principal: &str,
+        project: Option<&ProjectRegistrationView>,
         state: &TimerStateView,
         slot: TimerSlotCommit,
         now: i64,
@@ -1094,7 +1491,18 @@ impl Router {
             if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
                 return Ok(None);
             }
-            let admission = store.commit_timer_slot("owner", state, slot, now)?;
+            if let Some(expected) = project {
+                let current = store
+                    .get_project_registration("owner", &expected.id)?
+                    .ok_or_else(|| Error::new("not_allowed", "project registration was removed"))?;
+                if &current != expected {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "project registration changed before timer admission",
+                    ));
+                }
+            }
+            let admission = store.commit_timer_slot(principal, state, slot, now)?;
             self.publish_locked(&admission.events);
             admission
         };
@@ -1137,6 +1545,7 @@ impl Router {
 
     pub(crate) async fn advance_rule_cursor(
         &self,
+        principal: &str,
         state: &RuleStateView,
         through: i64,
         outcome: eliot_store::RuleCursorOutcome,
@@ -1148,7 +1557,7 @@ impl Router {
         );
         let change = {
             let mut store = self.inner.store.lock().await;
-            let change = store.advance_rule_cursor("owner", state, through, outcome, now_ms())?;
+            let change = store.advance_rule_cursor(principal, state, through, outcome, now_ms())?;
             if report {
                 self.publish_locked(&change.events);
             }
@@ -1162,6 +1571,8 @@ impl Router {
 
     pub(crate) async fn admit_rule_stop(
         &self,
+        principal: &str,
+        project: Option<&ProjectRegistrationView>,
         state: &RuleStateView,
         event_seq: i64,
         prepared: PreparedSubmission,
@@ -1178,7 +1589,19 @@ impl Router {
             if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
                 return Ok(None);
             }
-            let admission = store.admit_rule_stop("owner", state, event_seq, request, now_ms())?;
+            if let Some(expected) = project {
+                let current = store
+                    .get_project_registration("owner", &expected.id)?
+                    .ok_or_else(|| Error::new("not_allowed", "project registration was removed"))?;
+                if &current != expected {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "project registration changed before rule admission",
+                    ));
+                }
+            }
+            let admission =
+                store.admit_rule_stop(principal, state, event_seq, request, now_ms())?;
             self.publish_locked(&admission.events);
             admission
         };
@@ -1189,6 +1612,48 @@ impl Router {
             self.schedule_command(child.id.clone(), None);
         }
         self.signal_progress();
+        Ok(Some(admission))
+    }
+
+    async fn admit_rule_catch_up(
+        &self,
+        principal: &str,
+        project: Option<&ProjectRegistrationView>,
+        request: &RuleCatchUpRequest,
+        state: &RuleStateView,
+        through: i64,
+        actions: &[RuleCatchUpAction],
+    ) -> Result<Option<RuleCatchUpAdmission>> {
+        let admission = {
+            let mut store = self.inner.store.lock().await;
+            let retained = store.get_command(&request.id)?.is_some();
+            if !retained && self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
+                return Ok(None);
+            }
+            if !retained && let Some(expected) = project {
+                let current = store
+                    .get_project_registration("owner", &expected.id)?
+                    .ok_or_else(|| Error::new("not_allowed", "project registration was removed"))?;
+                if &current != expected {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "project registration changed before catch-up admission",
+                    ));
+                }
+            }
+            let admission =
+                store.admit_rule_catch_up(principal, request, state, through, actions, now_ms())?;
+            self.publish_locked(&admission.events);
+            admission
+        };
+        if admission.is_new {
+            for child in &admission.children {
+                if matches!(child.state, CommandState::Accepted | CommandState::Queued) {
+                    self.schedule_command(child.id.clone(), None);
+                }
+            }
+            self.signal_progress();
+        }
         Ok(Some(admission))
     }
 
@@ -1650,6 +2115,12 @@ impl Router {
                 Principal::Agent { id, .. } => {
                     store.get_agent(id)?.into_iter().collect::<Vec<Agent>>()
                 }
+                Principal::ProjectRule { .. } => {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "project rule authority cannot list Agents",
+                    ));
+                }
             }
         };
         if observations {
@@ -1679,6 +2150,7 @@ impl Router {
             let next = match principal {
                 Principal::Owner => rows.last().map(|row| row.agent.id.clone()),
                 Principal::Agent { .. } => None,
+                Principal::ProjectRule { .. } => None,
             };
             return serde_json::to_value(AgentListResponse { agents: rows, next })
                 .map_err(|_| Error::new("internal", "Agent list could not be encoded"));
@@ -1686,6 +2158,7 @@ impl Router {
         let next = match principal {
             Principal::Owner => agents.last().map(|agent| agent.id.clone()),
             Principal::Agent { .. } => None,
+            Principal::ProjectRule { .. } => None,
         };
         serde_json::to_value(AgentListResponse {
             agents: agents
@@ -2133,6 +2606,45 @@ impl Router {
                 _ => return,
             }
         };
+        if let Some(project_id) = command.principal.strip_prefix("project:") {
+            let registration = {
+                let store = self.inner.store.lock().await;
+                store.get_project_registration("owner", project_id)
+            };
+            let registration = match registration {
+                Ok(Some(registration)) => registration,
+                Ok(None) => {
+                    self.reject_undispatched(&id, "not_allowed").await;
+                    return;
+                }
+                Err(error) => {
+                    self.reject_undispatched(&id, &error.code).await;
+                    return;
+                }
+            };
+            if let Err(error) =
+                crate::automation::verify_project_registration(&self.inner.data_root, &registration)
+                    .await
+            {
+                self.reject_undispatched(&id, &error.code).await;
+                return;
+            }
+            if command.verb == "stop" {
+                let (Some(target), Some(generation)) =
+                    (command.target.as_deref(), command.generation)
+                else {
+                    self.reject_undispatched(&id, "invalid").await;
+                    return;
+                };
+                if let Err(error) = self
+                    .verify_project_stop_target(&registration, target, generation)
+                    .await
+                {
+                    self.reject_undispatched(&id, &error.code).await;
+                    return;
+                }
+            }
+        }
         if matches!(command.verb.as_str(), "launch" | "resume")
             && let Err(error) = self.inner.workspaces.prepare(&id).await
         {
@@ -3649,6 +4161,21 @@ fn is_native_control_verb(verb: &str) -> bool {
 }
 
 fn authorize_command(principal: &Principal, request: &mut SubmitCommand) -> Result<()> {
+    if let Principal::ProjectRule { registration } = principal {
+        if request.verb != "stop" || !registration.actions.iter().any(|action| action == "stop") {
+            return Err(Error::new(
+                "not_allowed",
+                "project rule is not approved for this action",
+            ));
+        }
+        if request.target.is_none() || request.expected_generation.is_none() {
+            return Err(Error::new(
+                "invalid",
+                "project stop requires its frozen Agent and generation",
+            ));
+        }
+        return Ok(());
+    }
     let Principal::Agent { id, generation } = principal else {
         return Ok(());
     };
@@ -3682,6 +4209,12 @@ fn authorize_command(principal: &Principal, request: &mut SubmitCommand) -> Resu
 }
 
 fn authorize_command_read(principal: &Principal, command: &Command) -> Result<()> {
+    if matches!(principal, Principal::ProjectRule { .. }) {
+        return Err(Error::new(
+            "not_allowed",
+            "project rule authority cannot read commands",
+        ));
+    }
     if let Principal::Agent { id, generation } = principal
         && (command.target.as_deref() != Some(id.as_str())
             || command
@@ -3697,6 +4230,12 @@ fn authorize_command_read(principal: &Principal, command: &Command) -> Result<()
 }
 
 fn authorize_agent_read(principal: &Principal, id: &str, generation: Option<i64>) -> Result<()> {
+    if matches!(principal, Principal::ProjectRule { .. }) {
+        return Err(Error::new(
+            "not_allowed",
+            "project rule authority cannot read Agents",
+        ));
+    }
     if let Principal::Agent {
         id: own_id,
         generation: own_generation,
@@ -3726,7 +4265,15 @@ fn principal_name(principal: &Principal) -> String {
     match principal {
         Principal::Owner => "owner".to_owned(),
         Principal::Agent { id, generation } => format!("agent:{id}:{generation}"),
+        Principal::ProjectRule { registration } => format!("project:{}", registration.id),
     }
+}
+
+fn rule_principal(project: Option<&str>) -> String {
+    project.map_or_else(
+        || "owner".to_owned(),
+        |project| format!("project:{project}"),
+    )
 }
 
 fn submit_result(command: &Command, linked: Option<&Command>) -> CommandSubmitResponse {
@@ -3939,7 +4486,7 @@ mod tests {
             vec![secret_key_definition],
         ] {
             let error = router
-                .initialize_global_rules(&definitions, &[], now_ms())
+                .initialize_rules("owner", &definitions, &[], now_ms())
                 .await
                 .unwrap_err();
             assert_eq!(error.code, "secret_in_payload");
@@ -3959,6 +4506,127 @@ mod tests {
             assert_eq!(store.high_water().unwrap(), before_high_water);
             assert_eq!(store.read_events(0, 100, None).unwrap(), before_events);
         }
+    }
+
+    #[tokio::test]
+    async fn rule_catch_up_commits_empty_range_once_without_advancing_live_cursor() {
+        let root =
+            std::env::temp_dir().join(format!("eliot-rule-catch-up-empty-{}", ulid::Ulid::new()));
+        let rules_dir = root.join("rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        std::fs::write(
+            rules_dir.join("catch-up.toml"),
+            r#"
+[[rule]]
+id = "catch-up-empty"
+on = { event = "turn.completed" }
+do = [{ action = "stop", target = "a1", expected_generation = 1 }]
+"#,
+        )
+        .unwrap();
+        let router = router_with_data_root(root.clone());
+        let policy = SecretPolicy::default();
+        crate::automation::initialize_global_rules(&router, &root, &policy)
+            .await
+            .unwrap();
+        let request_id = ulid::Ulid::new().to_string();
+        let request = json!({
+            "id":request_id,
+            "rule":"catch-up-empty",
+            "after_seq":0,
+        });
+
+        let first: Command = serde_json::from_value(
+            router
+                .rule_catch_up(&request, &Principal::Owner)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first.verb, "rule.catch_up");
+        assert_eq!(first.state, CommandState::Applied);
+        assert_eq!(first.args["through_seq"], 0);
+        assert_eq!(first.args["revision"], 1);
+        assert_eq!(first.outcome.as_ref().unwrap()["children"], json!([]));
+
+        let explicit_bound = json!({
+            "id":request_id,
+            "rule":"catch-up-empty",
+            "after_seq":0,
+            "through_seq":0,
+        });
+        assert_eq!(
+            router
+                .rule_catch_up(&explicit_bound, &Principal::Owner)
+                .await
+                .unwrap_err()
+                .code,
+            "id_conflict"
+        );
+
+        let explicit_id = ulid::Ulid::new().to_string();
+        let explicit_request = json!({
+            "id":explicit_id,
+            "rule":"catch-up-empty",
+            "after_seq":0,
+            "through_seq":0,
+        });
+        let explicit_parent: Command = serde_json::from_value(
+            router
+                .rule_catch_up(&explicit_request, &Principal::Owner)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let omitted_bound = json!({
+            "id":explicit_id,
+            "rule":"catch-up-empty",
+            "after_seq":0,
+        });
+        assert_eq!(
+            router
+                .rule_catch_up(&omitted_bound, &Principal::Owner)
+                .await
+                .unwrap_err()
+                .code,
+            "id_conflict"
+        );
+
+        std::fs::write(
+            rules_dir.join("catch-up.toml"),
+            r#"
+[[rule]]
+id = "catch-up-empty"
+on = { event = "turn.started" }
+do = [{ action = "stop", target = "a1", expected_generation = 1 }]
+"#,
+        )
+        .unwrap();
+        crate::automation::initialize_global_rules(&router, &root, &policy)
+            .await
+            .unwrap();
+        let replay: Command = serde_json::from_value(
+            router
+                .rule_catch_up(&request, &Principal::Owner)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(replay, first);
+        assert_eq!(replay.args["revision"], 1);
+        assert_eq!(explicit_parent.args["revision"], 1);
+        let state = router
+            .inner
+            .store
+            .lock()
+            .await
+            .get_rule_state("owner", "catch-up-empty")
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.revision, 2);
+        assert!(state.retiring_revision.is_some());
+        assert_eq!(state.current_cursor, 2);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

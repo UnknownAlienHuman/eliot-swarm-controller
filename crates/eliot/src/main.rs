@@ -9,10 +9,11 @@ use eliot_core::{
         AgentResultResponse, AgentStatsRequest, AgentStatsResponse, CommandGetRequest,
         CommandSubmitResponse, DaemonShutdownRequest, DaemonShutdownResponse, DaemonStatusRequest,
         DaemonStatusResponse, DiscoverPage, EventsFilter, EventsReadRequest, EventsReadResponse,
-        EventsSubscribeRequest, EventsSubscribeResponse, ObservationPage, ProviderClearHoldRequest,
-        ProviderClearHoldResponse, ProviderCorrectiveEvidence, ProviderHoldsRequest,
-        ProviderHoldsResponse, RuleGetRequest, RuleStateView, ShutdownMode, TimerGetRequest,
-        TimerRunRequest, TimerStateView, TurnGetRequest,
+        EventsSubscribeRequest, EventsSubscribeResponse, ObservationPage, ProjectRegistrationView,
+        ProviderClearHoldRequest, ProviderClearHoldResponse, ProviderCorrectiveEvidence,
+        ProviderHoldsRequest, ProviderHoldsResponse, RuleCatchUpRequest, RuleGetRequest,
+        RuleStateView, ShutdownMode, TimerGetRequest, TimerRunRequest, TimerStateView,
+        TurnGetRequest,
     },
 };
 use serde_json::{Value, json};
@@ -87,7 +88,12 @@ enum CliCommand {
         #[command(subcommand)]
         command: ProviderCommand,
     },
-    /// Read one startup-loaded global rule.
+    /// Read owner-registered project authority.
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommand,
+    },
+    /// Read or explicitly catch up one startup-loaded rule.
     Rule {
         #[command(subcommand)]
         command: RuleCommand,
@@ -392,18 +398,47 @@ enum ProviderCommand {
 #[derive(Subcommand)]
 enum RuleCommand {
     /// Show the loaded rule state and current/retiring cursor progress.
-    Show { id: String },
+    Show {
+        id: String,
+        #[arg(long, value_name = "PROJECT")]
+        project: Option<String>,
+    },
+    /// Process one finite committed-event range through the ordinary rule path.
+    CatchUp {
+        #[arg(value_name = "ID")]
+        rule: String,
+        #[arg(long, value_name = "SEQ", value_parser = clap::value_parser!(i64).range(0..))]
+        after: i64,
+        #[arg(long, value_name = "SEQ", value_parser = clap::value_parser!(i64).range(0..))]
+        through: Option<i64>,
+        #[arg(long, value_name = "PROJECT")]
+        project: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
 enum TimerCommand {
     /// Show the current timer schedule and durable UTC slot state.
-    Show { id: String },
+    Show {
+        id: String,
+        #[arg(long, value_name = "PROJECT")]
+        project: Option<String>,
+    },
     /// Run one timer action using a durable mutation ID.
     Run {
         #[arg(value_name = "ID")]
         rule: String,
+        #[arg(long, value_name = "PROJECT")]
+        project: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum ProjectCommand {
+    /// List owner-registered projects and their authority bounds.
+    List,
+    /// Show one owner-registered project readback.
+    Show { id: String },
 }
 
 #[derive(Subcommand)]
@@ -687,15 +722,88 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 Ok(0)
             }
         },
-        CliCommand::Rule {
-            command: RuleCommand::Show { id },
-        } => read_and_print!("rule.get", RuleGetRequest::new(id), RuleStateView),
-        CliCommand::Timer { command } => match command {
-            TimerCommand::Show { id } => {
-                read_and_print!("timer.get", TimerGetRequest::new(id), TimerStateView)
+        CliCommand::Project { command } => match command {
+            ProjectCommand::List => {
+                let response = eliot_daemon::client_call(&data_dir, "project.list", json!({}))
+                    .await
+                    .map_err(|error| Failure::from_core(error, false))?;
+                let Some(projects) = response.as_array() else {
+                    return Err(Failure::new(4, "project.list response is invalid"));
+                };
+                let projects: Vec<ProjectRegistrationView> =
+                    serde_json::from_value(Value::Array(projects.clone()))
+                        .map_err(|_| Failure::new(4, "project.list response is invalid"))?;
+                for project in &projects {
+                    project
+                        .validate()
+                        .map_err(|_| Failure::new(4, "project.list response is invalid"))?;
+                }
+                print_value(&response, json_output);
+                Ok(0)
             }
-            TimerCommand::Run { rule } => {
+            ProjectCommand::Show { id } => {
+                let response: ProjectRegistrationView =
+                    eliot_daemon::client_call_typed(&data_dir, "project.get", &json!({"id":id}))
+                        .await
+                        .map_err(|error| Failure::from_core(error, false))?;
+                if response.id != id || response.validate().is_err() {
+                    return Err(Failure::new(4, "project.get response is invalid"));
+                }
+                let value = serde_json::to_value(response)
+                    .map_err(|_| Failure::new(4, "project.get response is invalid"))?;
+                print_value(&value, json_output);
+                Ok(0)
+            }
+        },
+        CliCommand::Rule { command } => match command {
+            RuleCommand::Show { id, project } => {
+                let request = match project {
+                    Some(project) => RuleGetRequest::new(id).in_project(project),
+                    None => RuleGetRequest::new(id),
+                };
+                read_and_print!("rule.get", request, RuleStateView)
+            }
+            RuleCommand::CatchUp {
+                rule,
+                after,
+                through,
+                project,
+            } => {
+                let request = RuleCatchUpRequest::new(mutation_id(id)?, rule, after, through);
+                let request = match project {
+                    Some(project) => request.in_project(project),
+                    None => request,
+                };
+                request
+                    .validate()
+                    .map_err(|error| Failure::from_core(error, true))?;
+                let response: CoreCommand =
+                    eliot_daemon::client_call_typed(&data_dir, "rule.catch_up", &request)
+                        .await
+                        .map_err(|error| Failure::from_core(error, true))?;
+                request
+                    .validate_response(&response)
+                    .map_err(|error| Failure::from_core(error, true))?;
+                let exit_code = response_exit_code(response.state);
+                let value = command_value(response)?;
+                print_value(&value, json_output);
+                Ok(exit_code)
+            }
+        },
+        CliCommand::Timer { command } => match command {
+            TimerCommand::Show { id, project } => {
+                let request = match project {
+                    Some(project) => TimerGetRequest::new(id).in_project(project),
+                    None => TimerGetRequest::new(id),
+                };
+                read_and_print!("timer.get", request, TimerStateView)
+            }
+            TimerCommand::Run { rule, project } => {
                 let request = TimerRunRequest::new(mutation_id(id)?, rule);
+                let request = match project {
+                    Some(project) => request.in_project(project),
+                    None => request,
+                };
                 request
                     .validate()
                     .map_err(|error| Failure::from_core(error, true))?;

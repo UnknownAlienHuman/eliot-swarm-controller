@@ -76,9 +76,12 @@ async fn run_owned(
         events
     };
     router.note_events(&recovered);
+    let automation_config = crate::config::load_automation_config(data_dir.path())?;
     // Parse global definitions and seed only new rules before publishing ready.
     let (global_rules, initial_deferred_notice) =
         automation::initialize_global_rules(&router, data_dir.path(), &policy).await?;
+    let project_rule_namespaces =
+        automation::initialize_project_rules(&router, data_dir.path(), &policy).await?;
 
     let mut listener = IpcListener::bind(data_dir, daemon_lock).await?;
     let info =
@@ -106,10 +109,14 @@ async fn run_owned(
     automation_tasks.spawn(async move {
         automation::run_global_rules(
             rule_router,
-            global_rules,
-            rule_data_root,
-            rule_policy,
-            initial_deferred_notice,
+            automation::RuleWorkerStart {
+                global_rules,
+                project_rules: project_rule_namespaces,
+                max_event_backlog: automation_config.max_event_backlog,
+                data_root: rule_data_root,
+                policy: rule_policy,
+                initial_notices: initial_deferred_notice,
+            },
             automation_shutdown,
         )
         .await

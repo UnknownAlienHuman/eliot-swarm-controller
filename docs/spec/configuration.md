@@ -128,7 +128,6 @@ limits.max_selector_targets = 1000
 automation.max_actions_per_minute = 120
 automation.max_parallel_checks = 2
 automation.check_timeout = "10m"
-automation.max_event_backlog = 100000
 
 [mail]
 max_unread_bytes_per_agent = 10485760
@@ -146,6 +145,8 @@ fingerprint_max_bytes = 67108864
 
 [projects.app]
 path = "C:/src/app"
+profiles = ["codex-luna"]
+actions = ["stop"]
 
 [accounts.codex-main]
 max_live = 8
@@ -162,29 +163,46 @@ proxy = "opencodex"
 account = "codex-main"
 ```
 
+The implemented backlog setting is a root-level automation option:
+
+```toml
+[automation]
+max_event_backlog = 100000
+```
+
+`max_event_backlog` is a positive signed 64-bit integer. It defaults to `100000`; zero,
+negative, wrong-type and unknown automation values are invalid.
+
 Inspection dated 2026-10-29 of installed OpenCodex 2.92.0 source
 src/server/index/serve-options.ts shows an anonymous literal GET /readyz: readiness
 returns HTTP 200 with {"status":"ready"}; pending or failed states return HTTP 503.
 /healthz reports liveness only. Configure the readiness path explicitly; this is not a
 version gate or a default.
-The example's extends and project-overlay layers are later-target syntax, not part of
-the current L3.4 route/capacity increment.
+Profile `extends` is a separate profile configuration feature. Project registration and
+its rule allowlists are available to automation as described below.
 Unknown keys are errors with location; plugin-private keys are validated by that plugin.
 `extends` is one level. Missing fields use [core defaults](core.md#profile).
 Command/write retention must cover the supported retry window and allowed clock skew.
 
-## Authority and project overlays
+## Project registration and rule authority
 
-Load project config/rules only from the owner-registered checkout, never an Agent
-worktree. An overlay may narrow a global profile: lower capacity, choose liveness/wake
-settings, add non-authority labels, reference local notes/setup and relative scratch.
-It cannot replace harness/plugin/executable/args, model/effort, route/account/environment,
-permissions/control, workspace mode or Git identity. Labels used by owner rules as an
-authorization predicate are owner-defined and cannot be overridden by project config.
+Only owner-global `[projects.ID]` entries register projects. `path` names the canonical
+Git checkout; `profiles` and `actions` are explicit allowlists over existing global
+profiles and implemented actions. Missing or empty allowlists deny all. Project
+registration readback uses the canonical Core `ProjectRegistrationView`; project identity
+includes the canonical checkout and Git common directory, not an Agent's project label.
 
-Project automation has project authority, not owner authority. Invalid reload retains
-the last valid configuration. New profiles/routes are an owner config change; no approval
-packet or per-command profile ceremony.
+Load project rules only from the registered checkout's `.eliot/rules/*.toml`, never from
+an Agent worktree. Project rule files have principal `project:ID`. The owner registration
+approves the profile and action sets; project files cannot define or override profiles,
+executables, model/effort, route/account, environment, credentials, permissions, workspace
+mode, or Git identity. A project `.eliot/config.toml` overlay is unsupported. Admission
+and dispatch recheck the registration and the target's approved profile, repository
+identity, workspace readiness, and exact generation before an effect. Missing or changed
+authority fails closed; there is no Owner fallback for a project-scoped request.
+
+Project configuration changes remain owner edits to the private global config. Invalid
+project rule reload retains the last valid definition and reports a bounded diagnostic.
 
 ## Frozen profile and route binding
 

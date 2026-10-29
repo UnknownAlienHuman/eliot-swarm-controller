@@ -5,10 +5,27 @@
 
 use super::*;
 
+#[path = "rule_history.rs"]
+mod rule_history;
+
 const RULE_ACTION_WINDOW_MS: i64 = 60_000;
 const RULE_ACTION_LIMIT: i64 = 10;
 const GLOBAL_RULE_ACTION_LIMIT: i64 = 120;
 const RULE_COMMAND_ID_DOMAIN: &str = "eliot-rule-command-v1";
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct RuleCatchUpAction {
+    pub event_seq: i64,
+    pub request: SubmitCommand,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RuleCatchUpAdmission {
+    pub parent: Command,
+    pub children: Vec<Command>,
+    pub events: Vec<Event>,
+    pub is_new: bool,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuleDefinitionInput {
@@ -44,8 +61,19 @@ impl RuleDefinitionInput {
                 "rule definition digest does not match its canonical content",
             ));
         }
+        rule_limit_from_value(&value)?;
         Ok(value)
     }
+}
+
+fn rule_limit_from_value(value: &serde_json::Value) -> Result<Option<core::api::RuleLimit>> {
+    let Some(value) = value.get("limit") else {
+        return Ok(None);
+    };
+    let limit: core::api::RuleLimit = serde_json::from_value(value.clone())
+        .map_err(|_| Error::new("invalid", "rule limit is invalid"))?;
+    limit.validate()?;
+    Ok(Some(limit))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -118,17 +146,21 @@ impl<'a> RuleFiringKey<'a> {
         event_seq: i64,
         trigger_cause: Option<core::EventCause>,
     ) -> Result<Self> {
+        let mut args = json!({
+            "rule": state.id,
+            "revision": revision,
+            "event_seq": event_seq,
+        });
+        if let Some(project) = &state.project {
+            args["project"] = json!(project);
+        }
         Ok(Self {
             principal,
             state,
             trigger_cause,
             identity: RuleFiringIdentity::Event { event_seq },
             verb: "rule",
-            args: json!({
-                "rule": state.id,
-                "revision": revision,
-                "event_seq": event_seq,
-            }),
+            args,
             parent_digest: None,
             parent_id: derived_rule_id("parent", principal, &state.id, revision, event_seq)?,
             child_id: derived_rule_id("action-0", principal, &state.id, revision, event_seq)?,
@@ -145,6 +177,14 @@ impl<'a> RuleFiringKey<'a> {
             derived_timer_id("parent", principal, &state.id, schedule_revision, slot_ms)?;
         let child_id =
             derived_timer_id("action-0", principal, &state.id, schedule_revision, slot_ms)?;
+        let mut args = json!({
+            "rule": state.id,
+            "schedule_revision": schedule_revision,
+            "scheduled_at_ms": slot_ms,
+        });
+        if let Some(project) = &state.project {
+            args["project"] = json!(project);
+        }
         Ok(Self {
             principal,
             state,
@@ -154,11 +194,7 @@ impl<'a> RuleFiringKey<'a> {
                 slot_ms,
             },
             verb: "rule",
-            args: json!({
-                "rule": state.id,
-                "schedule_revision": schedule_revision,
-                "scheduled_at_ms": slot_ms,
-            }),
+            args,
             parent_digest: None,
             parent_id,
             child_id,
@@ -171,13 +207,17 @@ impl<'a> RuleFiringKey<'a> {
         parent_id: &'a str,
         parent_digest: Vec<u8>,
     ) -> Result<Self> {
+        let mut args = json!({"rule": state.id});
+        if let Some(project) = &state.project {
+            args["project"] = json!(project);
+        }
         Ok(Self {
             principal,
             state,
             trigger_cause: None,
             identity: RuleFiringIdentity::Manual,
             verb: "timer.run",
-            args: json!({"rule": state.id}),
+            args,
             parent_digest: Some(parent_digest),
             parent_id: parent_id.to_owned(),
             child_id: derived_manual_timer_id(principal, &state.id, parent_id)?,
@@ -291,11 +331,13 @@ impl Store {
         self.ensure_writer_healthy()?;
         let result = (|| {
             validate_principal_rule(principal, &input.id)?;
-            input.validated_value()?;
+            let value = input.validated_value()?;
             let tx = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
+            let project = validate_rule_principal_tx(&tx, principal)?;
+            validate_project_rule_definition(project.as_ref(), &value)?;
 
             let high_water = high_water_tx(&tx)?;
             let mut events = Vec::new();
@@ -312,7 +354,7 @@ impl Store {
         principal: &str,
         id: &str,
     ) -> Result<Option<core::api::RuleStateView>> {
-        require_nonempty(principal, "principal")?;
+        validate_rule_principal_read(&self.connection, principal)?;
         require_nonempty(id, "rule id")?;
         Ok(load_rule_state(&self.connection, principal, id)?.map(|state| state.view))
     }
@@ -330,10 +372,12 @@ impl Store {
         self.ensure_writer_healthy()?;
         let result = (|| {
             require_nonempty(principal, "principal")?;
+            rule_project_id(principal)?;
             let mut definition_ids = HashSet::new();
+            let mut values = Vec::with_capacity(definitions.len());
             for definition in definitions {
                 validate_principal_rule(principal, &definition.id)?;
-                definition.validated_value()?;
+                values.push(definition.validated_value()?);
                 if !definition_ids.insert(definition.id.as_str()) {
                     return Err(Error::new("invalid", "rule IDs must be unique"));
                 }
@@ -354,6 +398,10 @@ impl Store {
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
+            let project = validate_rule_principal_tx(&tx, principal)?;
+            for value in &values {
+                validate_project_rule_definition(project.as_ref(), value)?;
+            }
             let high_water = high_water_tx(&tx)?;
             let mut events = Vec::new();
             let existing_ids = rule_ids_tx(&tx, principal)?;
@@ -415,7 +463,7 @@ impl Store {
         after_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<RuleProcessingState>> {
-        require_nonempty(principal, "principal")?;
+        validate_rule_principal_read(&self.connection, principal)?;
         validate_limit(limit)?;
         if let Some(after_id) = after_id {
             require_nonempty(after_id, "rule cursor")?;
@@ -441,6 +489,7 @@ impl Store {
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
+            validate_rule_principal_tx(&tx, principal)?;
             let stored = load_rule_state(&tx, principal, &state.id)?
                 .ok_or_else(|| Error::new("not_found", "rule state was not found"))?;
 
@@ -574,6 +623,7 @@ impl Store {
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
+            validate_rule_principal_tx(&tx, principal)?;
             let stored = load_rule_state(&tx, principal, &state.id)?
                 .ok_or_else(|| Error::new("not_found", "rule state was not found"))?;
             if stored.view != *state {
@@ -760,6 +810,7 @@ impl Store {
                 "disabled rules cannot admit actions",
             ));
         }
+        validate_rule_principal_tx(&tx, principal)?;
 
         let depth = next_rule_cause_depth(trigger.cause.as_ref());
         if depth > 5 {
@@ -773,15 +824,29 @@ impl Store {
                 is_new: true,
             });
         }
-        let binding_error = stop_binding_error(&trigger, &request);
-        request.id = key.child_id.clone();
-
-        if let Some(code) = binding_error {
+        if let Some(code) = stop_binding_error(&trigger, &request) {
+            request.id = key.child_id.clone();
             return reject_rule_event(tx, &self.write_faulted, &key, &code, now);
         }
+        if let Err(error) = validate_project_rule_action_tx(&tx, principal, &request) {
+            if deterministic_rule_rejection(&error) {
+                request.id = key.child_id.clone();
+                return reject_rule_event(tx, &self.write_faulted, &key, &error.code, now);
+            }
+            return Err(error);
+        }
+        request.id = key.child_id.clone();
 
-        let (rule_count, global_count) = rule_action_counts(&tx, principal, &state.id, now)?;
-        if rule_count >= RULE_ACTION_LIMIT || global_count >= GLOBAL_RULE_ACTION_LIMIT {
+        let limit = rule_action_limit(&stored)?;
+        let (scoped_count, global_count) = rule_action_counts(
+            &tx,
+            principal,
+            &state.id,
+            request.target.as_deref(),
+            &limit,
+            now,
+        )?;
+        if rule_limit_reached(scoped_count, limit.max) || global_count >= GLOBAL_RULE_ACTION_LIMIT {
             return reject_rule_event(tx, &self.write_faulted, &key, "rate_limited", now);
         }
 
@@ -819,7 +884,7 @@ impl Store {
                         expected_turn_id, turn_id, request_id, verb, args, state, outcome,
                         created_at, updated_at, probe
                  FROM commands
-                 WHERE link_kind = 'rule_action' AND ordinal = 0
+                 WHERE link_kind = 'rule_action' AND ordinal IS NOT NULL
                    AND state IN ('accepted','queued')
                    AND (?1 IS NULL OR id > ?1)
                  ORDER BY id LIMIT ?2",
@@ -851,6 +916,7 @@ impl Store {
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
+            validate_rule_principal_tx(&tx, principal)?;
             let view = ensure_timer_state_tx(&tx, principal, input, now)?;
             commit_transaction(tx, &self.write_faulted)?;
             Ok(view)
@@ -865,6 +931,7 @@ impl Store {
         id: &str,
     ) -> Result<Option<core::api::TimerStateView>> {
         validate_principal_rule(principal, id)?;
+        validate_rule_principal_read(&self.connection, principal)?;
         Ok(load_timer_state(&self.connection, principal, id)?.map(|timer| timer.view))
     }
 
@@ -877,7 +944,7 @@ impl Store {
         due_by_ms: i64,
         limit: usize,
     ) -> Result<Vec<core::api::TimerStateView>> {
-        require_nonempty(principal, "principal")?;
+        validate_rule_principal_read(&self.connection, principal)?;
         validate_limit(limit)?;
         if let Some(after_id) = after_id {
             require_nonempty(after_id, "timer cursor")?;
@@ -885,7 +952,7 @@ impl Store {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT t.rule, t.schedule_revision, t.trigger, t.anchor,
+                "SELECT t.principal, t.rule, t.schedule_revision, t.trigger, t.anchor,
                         t.last_key, t.next_due_at, t.catch_up, r.enabled, r.paused_reason
                  FROM timers t
                  JOIN rule_state r ON r.principal = t.principal AND r.rule = t.rule
@@ -997,6 +1064,7 @@ impl Store {
                 blocked: false,
             });
         }
+        validate_rule_principal_tx(&tx, principal)?;
         if stored.view != *state || !stored.view.enabled || !rule.view.enabled {
             return Err(Error::new("bad_state", "timer state is stale or disabled"));
         }
@@ -1036,13 +1104,31 @@ impl Store {
         let mut parent = None;
         let mut child = None;
         if let Some(action) = slot.action {
-            let (per_rule, global) = rule_action_counts(&tx, principal, &state.id, now)?;
-            let rejected = if per_rule >= RULE_ACTION_LIMIT || global >= GLOBAL_RULE_ACTION_LIMIT {
-                Some("rate_limited".to_owned())
-            } else if !valid_timer_stop_request(&action) {
+            let rejected = if !valid_timer_stop_request(&action) {
                 Some("rule_action_binding_invalid".to_owned())
             } else {
-                None
+                match validate_project_rule_action_tx(&tx, principal, &action) {
+                    Err(error) if deterministic_rule_rejection(&error) => Some(error.code),
+                    Err(error) => return Err(error),
+                    Ok(_) => {
+                        let limit = rule_action_limit(&rule)?;
+                        let (scoped_count, global) = rule_action_counts(
+                            &tx,
+                            principal,
+                            &state.id,
+                            action.target.as_deref(),
+                            &limit,
+                            now,
+                        )?;
+                        if rule_limit_reached(scoped_count, limit.max)
+                            || global >= GLOBAL_RULE_ACTION_LIMIT
+                        {
+                            Some("rate_limited".to_owned())
+                        } else {
+                            None
+                        }
+                    }
+                }
             };
             if let Some(code) = rejected {
                 let (rejected_parent, event) = reject_timer_fire_tx(&tx, &key, &code, now)?;
@@ -1161,6 +1247,17 @@ impl Store {
                 blocked: false,
             });
         }
+        let project = validate_rule_principal_tx(&tx, principal)?;
+        if request.project.as_deref()
+            != project
+                .as_ref()
+                .map(|registration| registration.id.as_str())
+        {
+            return Err(Error::new(
+                "not_allowed",
+                "timer project does not match its rule principal",
+            ));
+        }
         let rule = load_rule_state(&tx, principal, &request.rule)?
             .ok_or_else(|| Error::new("not_found", "timer rule was not found"))?;
         if rule.view.revision != expected_rule_revision {
@@ -1180,6 +1277,7 @@ impl Store {
         if !valid_timer_stop_request(&action) {
             return Err(Error::new("invalid", "timer action is not a literal stop"));
         }
+        validate_project_rule_action_tx(&tx, principal, &action)?;
         if state.id != request.rule {
             return Err(Error::new(
                 "invalid",
@@ -1202,8 +1300,16 @@ impl Store {
                 blocked: true,
             });
         }
-        let (per_rule, global) = rule_action_counts(&tx, principal, &request.rule, now)?;
-        if per_rule >= RULE_ACTION_LIMIT || global >= GLOBAL_RULE_ACTION_LIMIT {
+        let limit = rule_action_limit(&rule)?;
+        let (scoped_count, global) = rule_action_counts(
+            &tx,
+            principal,
+            &request.rule,
+            action.target.as_deref(),
+            &limit,
+            now,
+        )?;
+        if rule_limit_reached(scoped_count, limit.max) || global >= GLOBAL_RULE_ACTION_LIMIT {
             return Err(Error::new(
                 "bad_state",
                 "timer action rate limit is reached",
@@ -1316,6 +1422,7 @@ fn ensure_timer_state_tx(
         }
         return Ok(core::api::TimerStateView {
             id: input.id.clone(),
+            project: rule_project_id(principal)?,
             schedule_revision: input.schedule_revision,
             schedule: input.schedule.clone(),
             anchor,
@@ -1353,6 +1460,7 @@ fn ensure_timer_state_tx(
     .map_err(sql_error)?;
     Ok(core::api::TimerStateView {
         id: input.id.clone(),
+        project: rule_project_id(principal)?,
         schedule_revision: input.schedule_revision,
         schedule: input.schedule.clone(),
         anchor,
@@ -1363,8 +1471,112 @@ fn ensure_timer_state_tx(
 }
 
 fn validate_principal_rule(principal: &str, rule: &str) -> Result<()> {
-    require_nonempty(principal, "principal")?;
+    rule_project_id(principal)?;
     require_nonempty(rule, "rule id")
+}
+
+fn rule_project_id(principal: &str) -> Result<Option<String>> {
+    if principal == "owner" {
+        return Ok(None);
+    }
+    let Some(project) = principal.strip_prefix("project:") else {
+        return Err(Error::new(
+            "not_allowed",
+            "rule principal is not authorized",
+        ));
+    };
+    if project.is_empty() || project.trim() != project || project.contains(':') {
+        return Err(Error::new("invalid", "rule project principal is invalid"));
+    }
+    Ok(Some(project.to_owned()))
+}
+
+fn validate_rule_principal_tx(
+    tx: &Transaction<'_>,
+    principal: &str,
+) -> Result<Option<core::api::ProjectRegistrationView>> {
+    let Some(project_id) = rule_project_id(principal)? else {
+        return Ok(None);
+    };
+    let registration = super::projects::project_registration_tx(tx, &project_id)?
+        .ok_or_else(|| Error::new("not_allowed", "project rule registration is absent"))?;
+    registration
+        .validate()
+        .map_err(|_| Error::new("source_integrity", "stored project registration is invalid"))?;
+    if registration.id != project_id {
+        return Err(Error::new(
+            "source_integrity",
+            "project registration does not match its principal",
+        ));
+    }
+    Ok(Some(registration))
+}
+
+fn validate_rule_principal_read(connection: &Connection, principal: &str) -> Result<()> {
+    let Some(project_id) = rule_project_id(principal)? else {
+        return Ok(());
+    };
+    let registration = super::projects::project_registration_tx(connection, &project_id)?
+        .ok_or_else(|| Error::new("not_allowed", "project rule registration is absent"))?;
+    registration
+        .validate()
+        .map_err(|_| Error::new("source_integrity", "stored project registration is invalid"))?;
+    if registration.id != project_id {
+        return Err(Error::new(
+            "source_integrity",
+            "project registration does not match its principal",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_project_rule_definition(
+    project: Option<&core::api::ProjectRegistrationView>,
+    value: &Value,
+) -> Result<()> {
+    let Some(project) = project else {
+        return Ok(());
+    };
+    let actions = value
+        .get("do")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::new("invalid", "project rule actions are invalid"))?;
+    if actions.iter().any(|action| {
+        action
+            .get("action")
+            .and_then(Value::as_str)
+            .is_none_or(|action| !project.actions.iter().any(|approved| approved == action))
+    }) {
+        return Err(Error::new(
+            "not_allowed",
+            "project rule uses an action not approved by its registration",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_project_rule_action_tx(
+    tx: &Transaction<'_>,
+    principal: &str,
+    request: &SubmitCommand,
+) -> Result<Option<core::api::ProjectRegistrationView>> {
+    if rule_project_id(principal)?.is_none() {
+        return Ok(None);
+    }
+    let target = request
+        .target
+        .as_deref()
+        .ok_or_else(|| Error::new("not_allowed", "project rule action has no target"))?;
+    let generation = request
+        .expected_generation
+        .ok_or_else(|| Error::new("not_allowed", "project rule action has no generation"))?;
+    super::projects::validate_project_rule_admission_tx(
+        tx,
+        principal,
+        target,
+        generation,
+        &request.verb,
+    )
 }
 
 struct StoredTimerState {
@@ -1374,6 +1586,7 @@ struct StoredTimerState {
 }
 
 struct TimerRecord {
+    principal: String,
     id: String,
     schedule_revision: i64,
     trigger: String,
@@ -1387,15 +1600,16 @@ struct TimerRecord {
 
 fn timer_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimerRecord> {
     Ok(TimerRecord {
-        id: row.get(0)?,
-        schedule_revision: row.get(1)?,
-        trigger: row.get(2)?,
-        anchor: row.get(3)?,
-        last_key: row.get(4)?,
-        next_due_at: row.get(5)?,
-        catch_up: row.get(6)?,
-        enabled: row.get(7)?,
-        paused_reason: row.get(8)?,
+        principal: row.get(0)?,
+        id: row.get(1)?,
+        schedule_revision: row.get(2)?,
+        trigger: row.get(3)?,
+        anchor: row.get(4)?,
+        last_key: row.get(5)?,
+        next_due_at: row.get(6)?,
+        catch_up: row.get(7)?,
+        enabled: row.get(8)?,
+        paused_reason: row.get(9)?,
     })
 }
 
@@ -1405,6 +1619,7 @@ fn timer_view_from_record(record: TimerRecord) -> Result<core::api::TimerStateVi
         .map_err(|_| Error::new("source_integrity", "stored timer schedule is invalid"))?;
     let view = core::api::TimerStateView {
         id: record.id,
+        project: rule_project_id(&record.principal)?,
         schedule_revision: record.schedule_revision,
         schedule,
         anchor: record.anchor,
@@ -1424,7 +1639,7 @@ fn load_timer_state(
 ) -> Result<Option<StoredTimerState>> {
     let record = connection
         .query_row(
-            "SELECT t.rule, t.schedule_revision, t.trigger, t.anchor,
+            "SELECT t.principal, t.rule, t.schedule_revision, t.trigger, t.anchor,
                     t.last_key, t.next_due_at, t.catch_up, r.enabled, r.paused_reason
              FROM timers t
              JOIN rule_state r ON r.principal = t.principal AND r.rule = t.rule
@@ -1570,6 +1785,7 @@ fn ensure_rule_state_tx(
     .map_err(sql_error)?;
     Ok(core::api::RuleStateView {
         id: input.id.clone(),
+        project: rule_project_id(principal)?,
         revision: 1,
         current_cursor: high_water,
         retiring_revision: None,
@@ -1732,13 +1948,17 @@ fn replay_timer_run_tx(
 }
 
 fn timer_run_digest(request: &core::api::TimerRunRequest) -> Result<Vec<u8>> {
-    canonical::digest(&json!({
+    let mut value = json!({
         "target": null,
         "verb": "timer.run",
         "args": {"rule": request.rule},
         "expected_generation": null,
         "expected_turn_id": null,
-    }))
+    });
+    if let Some(project) = &request.project {
+        value["args"]["project"] = json!(project);
+    }
+    canonical::digest(&value)
 }
 
 fn rule_catch_up(rule: &StoredRuleState) -> Result<core::api::CatchUp> {
@@ -1752,6 +1972,20 @@ fn rule_catch_up(rule: &StoredRuleState) -> Result<core::api::CatchUp> {
             "stored rule catch_up is invalid",
         )),
     }
+}
+
+fn rule_action_limit(rule: &StoredRuleState) -> Result<core::api::RuleLimit> {
+    let value: Value = serde_json::from_str(&rule.canonical_definition)
+        .map_err(|_| Error::new("source_integrity", "stored rule definition is invalid"))?;
+    rule_limit_from_value(&value)
+        .map_err(|_| Error::new("source_integrity", "stored rule limit is invalid"))
+        .map(|limit| {
+            limit.unwrap_or(core::api::RuleLimit {
+                max: RULE_ACTION_LIMIT as u64,
+                per: core::api::RuleLimitScope::Rule,
+                window_ms: RULE_ACTION_WINDOW_MS,
+            })
+        })
 }
 
 fn catch_up_name(catch_up: core::api::CatchUp) -> &'static str {
@@ -1858,7 +2092,7 @@ fn has_open_rule_actions_tx(tx: &Transaction<'_>, principal: &str, rule: &str) -
         "SELECT EXISTS(
              SELECT 1 FROM commands child
              JOIN commands parent ON parent.id = child.parent_command
-             WHERE child.link_kind = 'rule_action' AND child.ordinal = 0
+             WHERE child.link_kind = 'rule_action' AND child.ordinal IS NOT NULL
                AND child.state IN ('accepted','queued','dispatched','unknown')
                AND parent.principal = ?1
                AND json_extract(parent.args, '$.rule') = ?2
@@ -1973,6 +2207,7 @@ fn load_rule_state(
     })?;
     let view = core::api::RuleStateView {
         id: id.to_owned(),
+        project: rule_project_id(principal)?,
         revision,
         current_cursor,
         retiring_revision,
@@ -2243,32 +2478,64 @@ fn rule_action_counts(
     tx: &Transaction<'_>,
     principal: &str,
     rule: &str,
+    target_agent: Option<&str>,
+    limit: &core::api::RuleLimit,
     now: i64,
 ) -> Result<(i64, i64)> {
-    let since = now.saturating_sub(RULE_ACTION_WINDOW_MS);
-    let per_rule = tx
-        .query_row(
-            "SELECT COUNT(*)
-             FROM commands action
-             JOIN commands parent ON parent.id = action.parent_command
-             WHERE action.link_kind = 'rule_action' AND action.ordinal = 0
-               AND action.created_at >= ?1 AND action.created_at <= ?2
-               AND parent.principal = ?3
-               AND json_extract(parent.args, '$.rule') = ?4",
-            params![since, now, principal, rule],
-            |row| row.get(0),
-        )
-        .map_err(sql_error)?;
+    if limit.max == 0 || limit.window_ms <= 0 {
+        return Err(Error::new("invalid", "rule limit must be positive"));
+    }
+    let since = now.saturating_sub(limit.window_ms);
+    let scoped = match &limit.per {
+        core::api::RuleLimitScope::Rule => tx
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM commands action
+                 JOIN commands parent ON parent.id = action.parent_command
+                 WHERE action.link_kind = 'rule_action' AND action.ordinal IS NOT NULL
+                   AND action.created_at >= ?1 AND action.created_at <= ?2
+                   AND parent.principal = ?3
+                   AND json_extract(parent.args, '$.rule') = ?4",
+                params![since, now, principal, rule],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?,
+        core::api::RuleLimitScope::Agent => {
+            let target_agent = target_agent.ok_or_else(|| {
+                Error::new("invalid", "per-agent rule limit requires a frozen target")
+            })?;
+            let target_agent = parse_agent_id(target_agent)?;
+            tx.query_row(
+                "SELECT COUNT(*)
+                 FROM commands action
+                 JOIN commands parent ON parent.id = action.parent_command
+                 WHERE action.link_kind = 'rule_action' AND action.ordinal IS NOT NULL
+                   AND action.created_at >= ?1 AND action.created_at <= ?2
+                   AND parent.principal = ?3
+                   AND json_extract(parent.args, '$.rule') = ?4
+                   AND action.target = ?5",
+                params![since, now, principal, rule, target_agent],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?
+        }
+    };
+    // The global guard spans owner and project principals and stays fixed at
+    // 120 admitted action children per minute.
     let global = tx
         .query_row(
             "SELECT COUNT(*) FROM commands
-             WHERE link_kind = 'rule_action' AND ordinal = 0
+             WHERE link_kind = 'rule_action' AND ordinal IS NOT NULL
                AND created_at >= ?1 AND created_at <= ?2",
-            params![since, now],
+            params![now.saturating_sub(RULE_ACTION_WINDOW_MS), now],
             |row| row.get(0),
         )
         .map_err(sql_error)?;
-    Ok((per_rule, global))
+    Ok((scoped, global))
+}
+
+fn rule_limit_reached(count: i64, max: u64) -> bool {
+    u64::try_from(count).is_ok_and(|count| count >= max)
 }
 
 fn deterministic_rule_rejection(error: &Error) -> bool {
@@ -2529,6 +2796,115 @@ mod tests {
         let agent = tx.last_insert_rowid();
         tx.commit().unwrap();
         (agent, format_agent_id(agent))
+    }
+
+    fn insert_test_rule_action(
+        store: &mut Store,
+        principal: &str,
+        rule: &str,
+        target: &str,
+        generation: i64,
+        now: i64,
+    ) {
+        let parent_id = Ulid::new().to_string();
+        let child_id = Ulid::new().to_string();
+        let target_agent = parse_agent_id(target).unwrap();
+        ensure_test_project_action_scope(store, principal, target_agent, generation, now);
+        let payload_digest = [0_u8; 32];
+        let args = json!({"rule": rule});
+        let outcome = json!({"children": [child_id]});
+        let tx = store
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let parent = CommandInsert {
+            id: &parent_id,
+            principal,
+            method: COMMAND_METHOD,
+            payload_digest: &payload_digest,
+            target: None,
+            expected_generation: None,
+            generation: None,
+            expected_turn_id: None,
+            parent_command: None,
+            link_kind: None,
+            ordinal: None,
+            turn_id: None,
+            request_id: None,
+            probe: false,
+            verb: "rule",
+            args: &args,
+            state: CommandState::Applied,
+            outcome: Some(&outcome),
+            created_at: now,
+            updated_at: now,
+        };
+        admit_command(
+            &tx,
+            &parent,
+            json!({"command_id": parent_id, "children": [child_id]}),
+        )
+        .unwrap();
+
+        let child_args = json!({});
+        let child = CommandInsert {
+            id: &child_id,
+            principal,
+            method: COMMAND_METHOD,
+            payload_digest: &payload_digest,
+            target: Some(target_agent),
+            expected_generation: Some(generation),
+            generation: Some(generation),
+            expected_turn_id: None,
+            parent_command: Some(&parent_id),
+            link_kind: Some("rule_action"),
+            ordinal: Some(0),
+            turn_id: None,
+            request_id: None,
+            probe: false,
+            verb: "stop",
+            args: &child_args,
+            state: CommandState::Accepted,
+            outcome: None,
+            created_at: now,
+            updated_at: now,
+        };
+        insert_command(&tx, &child, &ordinary_command_cause(&child_id)).unwrap();
+        tx.commit().unwrap();
+    }
+
+    fn ensure_test_project_action_scope(
+        store: &mut Store,
+        principal: &str,
+        agent: i64,
+        generation: i64,
+        now: i64,
+    ) {
+        let Some(project) = principal.strip_prefix("project:") else {
+            return;
+        };
+        let checkout = format!("synthetic-checkout-{project}");
+        store
+            .upsert_project_registration(
+                "owner",
+                &ProjectRegistrationInput {
+                    id: project.to_owned(),
+                    checkout: checkout.clone(),
+                    repo_common_dir: format!("synthetic-common-{project}"),
+                    profiles: vec!["fake".to_owned()],
+                    actions: vec!["stop".to_owned()],
+                },
+                now,
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE agents SET project = ?1, profile = 'fake', workspace = ?2,
+                     generation = ?3 WHERE id = ?4",
+                params![project, checkout, generation, agent],
+            )
+            .unwrap();
     }
 
     fn insert_test_turn_completed(store: &mut Store, agent: i64, now: i64) -> i64 {
@@ -2929,6 +3305,711 @@ mod tests {
         assert_eq!(marker.value.current_cursor, marker_seq);
         assert!(marker.events.is_empty());
         assert_eq!(store.high_water().unwrap(), marker_seq);
+    }
+
+    #[test]
+    fn global_rule_guard_counts_all_principals_with_custom_windows() {
+        assert_eq!(GLOBAL_RULE_ACTION_LIMIT, 120);
+        assert_eq!(RULE_ACTION_WINDOW_MS, 60_000);
+
+        let mut store = store();
+        let now = 100_000;
+        let action_at = now - RULE_ACTION_WINDOW_MS / 2;
+        let custom_window_ms = RULE_ACTION_WINDOW_MS / 4;
+        let (agent, agent_id) = insert_test_agent(&mut store);
+        assert!(action_at >= now - RULE_ACTION_WINDOW_MS);
+        assert!(action_at < now - custom_window_ms);
+
+        for index in 0..GLOBAL_RULE_ACTION_LIMIT {
+            let (principal, rule) = match index % 4 {
+                0 => ("owner", "stop-rule"),
+                1 => ("project:alpha", "alpha-rule"),
+                2 => ("owner", "other-rule"),
+                _ => ("project:beta", "beta-rule"),
+            };
+            insert_test_rule_action(&mut store, principal, rule, &agent_id, 1, action_at);
+        }
+
+        let action_ids_before = {
+            let mut statement = store
+                .connection
+                .prepare(
+                    "SELECT id FROM commands
+                     WHERE link_kind = 'rule_action' AND ordinal IS NOT NULL
+                     ORDER BY id",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(action_ids_before.len(), GLOBAL_RULE_ACTION_LIMIT as usize);
+
+        let mut custom_definition = definition("stop-rule", true);
+        let mut canonical_definition: Value =
+            serde_json::from_str(&custom_definition.canonical_definition).unwrap();
+        canonical_definition["limit"] = json!({
+            "max": 121,
+            "per": "rule",
+            "window_ms": custom_window_ms,
+        });
+        custom_definition.canonical_definition =
+            serde_json::to_string(&canonical_definition).unwrap();
+        custom_definition.definition_digest =
+            core::canonical_json_sha256(&canonical_definition).unwrap();
+
+        let state = store
+            .ensure_rule_state("owner", &custom_definition, now - 1)
+            .unwrap();
+        let event_seq = insert_test_turn_completed(&mut store, agent, now);
+        let admission = store
+            .admit_rule_stop("owner", &state, event_seq, stop_request(&agent_id), now)
+            .unwrap();
+
+        assert!(admission.is_new);
+        assert!(admission.child.is_none());
+        let rejected_parent = admission.parent.as_ref().expect("rejected rule parent");
+        assert_eq!(rejected_parent.state, CommandState::Rejected);
+        assert_eq!(
+            rejected_parent.outcome.as_ref().unwrap()["children"],
+            json!([])
+        );
+        assert_eq!(
+            rejected_parent.outcome.as_ref().unwrap()["code"],
+            "rate_limited"
+        );
+        let rejected_parent_id = rejected_parent.id.clone();
+
+        let replay = store
+            .admit_rule_stop("owner", &state, event_seq, stop_request(&agent_id), now)
+            .unwrap();
+        assert!(!replay.is_new);
+        assert!(replay.child.is_none());
+        assert_eq!(
+            replay.parent.as_ref().expect("retained rule parent").id,
+            rejected_parent_id
+        );
+
+        let action_ids_after = {
+            let mut statement = store
+                .connection
+                .prepare(
+                    "SELECT id FROM commands
+                     WHERE link_kind = 'rule_action' AND ordinal IS NOT NULL
+                     ORDER BY id",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(action_ids_after, action_ids_before);
+    }
+
+    #[test]
+    fn finite_history_catch_up_replays_before_current_gates() {
+        let mut store = store();
+        let request_id = Ulid::new();
+        let now = i64::try_from(request_id.timestamp_ms()).unwrap() + 1;
+        let (agent, agent_id) = insert_test_agent(&mut store);
+        let event_seq = insert_test_turn_completed(&mut store, agent, now - 1);
+        let state = store
+            .ensure_rule_state("owner", &definition("history-rule", true), now)
+            .unwrap();
+        let captured_through = state.current_cursor;
+        assert!(state.retiring_revision.is_none());
+        assert!(event_seq <= captured_through);
+
+        let after_seq = event_seq - 1;
+        let request = core::api::RuleCatchUpRequest::new(
+            request_id.to_string(),
+            "history-rule",
+            after_seq,
+            Some(captured_through),
+        );
+        let actions = [RuleCatchUpAction {
+            event_seq,
+            request: stop_request(&agent_id),
+        }];
+        let first = store
+            .admit_rule_catch_up("owner", &request, &state, captured_through, &actions, now)
+            .unwrap();
+
+        assert!(first.is_new);
+        assert_eq!(first.parent.verb, "rule.catch_up");
+        assert_eq!(first.parent.args["revision"].as_i64(), Some(state.revision));
+        assert_eq!(first.children.len(), 1);
+        let child = &first.children[0];
+        assert_eq!(child.target.as_deref(), Some(agent_id.as_str()));
+        assert_eq!(child.expected_generation, Some(1));
+        assert_eq!(child.generation, Some(1));
+        let child_id = child.id.clone();
+        let parent_id = first.parent.id.clone();
+
+        let disabled_state = store
+            .ensure_rule_state("owner", &definition("history-rule", false), now + 1)
+            .unwrap();
+        assert!(!disabled_state.enabled);
+        assert!(disabled_state.revision > state.revision);
+        let high_water_after_edit = store.high_water().unwrap();
+
+        // Reuse the old view and exact request after the live definition changed.
+        let replay = store
+            .admit_rule_catch_up(
+                "owner",
+                &request,
+                &state,
+                captured_through,
+                &actions,
+                now + 2,
+            )
+            .unwrap();
+        assert!(!replay.is_new);
+        assert_eq!(replay.parent.id, parent_id);
+        assert_eq!(
+            replay.parent.args["revision"].as_i64(),
+            Some(state.revision)
+        );
+        assert_eq!(replay.children.len(), 1);
+        assert_eq!(replay.children[0].id, child_id);
+        assert!(replay.events.is_empty());
+        assert_eq!(store.high_water().unwrap(), high_water_after_edit);
+
+        let changed_request = core::api::RuleCatchUpRequest::new(
+            request.id.clone(),
+            "history-rule",
+            after_seq,
+            Some(captured_through + 1),
+        );
+        let conflict = store
+            .admit_rule_catch_up(
+                "owner",
+                &changed_request,
+                &disabled_state,
+                captured_through + 1,
+                &[],
+                now + 3,
+            )
+            .unwrap_err();
+        assert_eq!(conflict.code, "id_conflict");
+        assert_eq!(store.high_water().unwrap(), high_water_after_edit);
+    }
+
+    #[test]
+    fn finite_history_catch_up_unknown_child_blocks_new_work() {
+        let mut store = store();
+        let request_id = Ulid::new();
+        let now = i64::try_from(request_id.timestamp_ms()).unwrap() + 1;
+        let (agent, agent_id) = insert_test_agent(&mut store);
+        let event_seq = insert_test_turn_completed(&mut store, agent, now - 1);
+        let state = store
+            .ensure_rule_state("owner", &definition("history-rule", true), now)
+            .unwrap();
+        let captured_through = state.current_cursor;
+        assert!(event_seq <= captured_through);
+
+        insert_test_rule_action(&mut store, "owner", "history-rule", &agent_id, 1, now);
+        let unknown_child_id: String = store
+            .connection
+            .query_row(
+                "SELECT id FROM commands
+                 WHERE link_kind = 'rule_action' AND ordinal IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .connection
+                .execute(
+                    "UPDATE commands SET state = 'unknown' WHERE id = ?1",
+                    [&unknown_child_id],
+                )
+                .unwrap(),
+            1
+        );
+
+        let request = core::api::RuleCatchUpRequest::new(
+            request_id.to_string(),
+            "history-rule",
+            event_seq - 1,
+            Some(captured_through),
+        );
+        let actions = [RuleCatchUpAction {
+            event_seq,
+            request: stop_request(&agent_id),
+        }];
+        let commands_before: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+            .unwrap();
+        let events_before: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        let high_water_before = store.high_water().unwrap();
+
+        let error = store
+            .admit_rule_catch_up(
+                "owner",
+                &request,
+                &state,
+                captured_through,
+                &actions,
+                now + 1,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "bad_state");
+        let commands_after: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+            .unwrap();
+        let events_after: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        let unknown_state: String = store
+            .connection
+            .query_row(
+                "SELECT state FROM commands WHERE id = ?1",
+                [&unknown_child_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(commands_after, commands_before);
+        assert_eq!(events_after, events_before);
+        assert_eq!(store.high_water().unwrap(), high_water_before);
+        assert_eq!(unknown_state, "unknown");
+    }
+
+    #[test]
+    fn finite_history_catch_up_uses_authoritative_coverage_floor() {
+        let mut store = store();
+        let request_id = Ulid::new();
+        let now = i64::try_from(request_id.timestamp_ms()).unwrap() + 1;
+        let (agent, _) = insert_test_agent(&mut store);
+        let first_seq = insert_test_turn_completed(&mut store, agent, now - 1);
+        let missing_seq = insert_test_turn_completed(&mut store, agent, now - 1);
+        let last_seq = insert_test_turn_completed(&mut store, agent, now - 1);
+        let state = store
+            .ensure_rule_state("owner", &definition("history-rule", true), now)
+            .unwrap();
+        let captured_through = state.current_cursor;
+        assert!(last_seq <= captured_through);
+
+        assert_eq!(
+            store
+                .connection
+                .execute(
+                    "DELETE FROM events WHERE seq IN (?1, ?2)",
+                    params![first_seq, missing_seq],
+                )
+                .unwrap(),
+            2
+        );
+        let coverage_floor: i64 = store
+            .connection
+            .query_row(
+                "SELECT pruned_through FROM rule_history_coverage WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(coverage_floor, 0);
+
+        let sparse_request = core::api::RuleCatchUpRequest::new(
+            request_id.to_string(),
+            "history-rule",
+            0,
+            Some(captured_through),
+        );
+        let sparse = store
+            .admit_rule_catch_up("owner", &sparse_request, &state, captured_through, &[], now)
+            .unwrap();
+        assert!(sparse.is_new);
+        assert!(sparse.children.is_empty());
+
+        assert_eq!(
+            store
+                .connection
+                .execute(
+                    "UPDATE rule_history_coverage SET pruned_through = ?1 WHERE singleton = 1",
+                    [missing_seq],
+                )
+                .unwrap(),
+            1
+        );
+        let gap_id = Ulid::new();
+        let gap_now = i64::try_from(gap_id.timestamp_ms()).unwrap() + 1;
+        let gap_request = core::api::RuleCatchUpRequest::new(
+            gap_id.to_string(),
+            "history-rule",
+            0,
+            Some(captured_through),
+        );
+        let commands_before_gap: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+            .unwrap();
+        let events_before_gap: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        let high_water_before_gap = store.high_water().unwrap();
+
+        let error = store
+            .admit_rule_catch_up(
+                "owner",
+                &gap_request,
+                &state,
+                captured_through,
+                &[],
+                gap_now,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "history_gap");
+        let commands_after_gap: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+            .unwrap();
+        let events_after_gap: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(commands_after_gap, commands_before_gap);
+        assert_eq!(events_after_gap, events_before_gap);
+        assert_eq!(store.high_water().unwrap(), high_water_before_gap);
+    }
+
+    #[test]
+    fn finite_history_catch_up_oversized_result_rolls_back() {
+        let mut store = store();
+        let request_id = Ulid::new();
+        let now = i64::try_from(request_id.timestamp_ms()).unwrap() + 1;
+        let (agent, agent_id) = insert_test_agent(&mut store);
+        let action_count = RULE_ACTION_LIMIT as usize + 1;
+        let mut event_seqs = Vec::with_capacity(action_count);
+        for _ in 0..action_count {
+            event_seqs.push(insert_test_turn_completed(&mut store, agent, now - 1));
+        }
+
+        let rule_id = "r".repeat(48 * 1024);
+        let rule_definition = definition(&rule_id, true);
+        let state = store
+            .ensure_rule_state("owner", &rule_definition, now)
+            .unwrap();
+        let captured_through = state.current_cursor;
+        assert!(
+            event_seqs
+                .last()
+                .is_some_and(|seq| *seq <= captured_through)
+        );
+        assert!(rule_id.len() + 1024 < MAX_EVENT_BYTES);
+
+        let request = core::api::RuleCatchUpRequest::new(
+            request_id.to_string(),
+            rule_id.clone(),
+            0,
+            Some(captured_through),
+        );
+        let action_request = stop_request(&agent_id);
+        let actions = event_seqs
+            .iter()
+            .map(|event_seq| RuleCatchUpAction {
+                event_seq: *event_seq,
+                request: action_request.clone(),
+            })
+            .collect::<Vec<_>>();
+        let encoded_actions = serde_json::to_vec(&actions).unwrap();
+        assert!(encoded_actions.len() <= MAX_PAGE_BYTES);
+        // Each history marker repeats the rule in both data and cause.
+        assert!(actions.len() * 2 * rule_id.len() > MAX_PAGE_BYTES);
+
+        let commands_before: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+            .unwrap();
+        let events_before: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        let high_water_before = store.high_water().unwrap();
+
+        let first_error = match store.admit_rule_catch_up(
+            "owner",
+            &request,
+            &state,
+            captured_through,
+            &actions,
+            now,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("oversized catch-up result was admitted"),
+        };
+        assert_eq!(first_error.code, "frame_too_large");
+        assert!(first_error.message.contains("bounded response size"));
+        let commands_after_first: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+            .unwrap();
+        let events_after_first: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(commands_after_first, commands_before);
+        assert_eq!(events_after_first, events_before);
+        assert_eq!(store.high_water().unwrap(), high_water_before);
+
+        let retry_error = match store.admit_rule_catch_up(
+            "owner",
+            &request,
+            &state,
+            captured_through,
+            &actions,
+            now + 1,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("oversized catch-up retry was admitted"),
+        };
+        assert_eq!(retry_error.code, "frame_too_large");
+        assert!(retry_error.message.contains("bounded response size"));
+        let commands_after_retry: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+            .unwrap();
+        let events_after_retry: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(commands_after_retry, commands_before);
+        assert_eq!(events_after_retry, events_before);
+        assert_eq!(store.high_water().unwrap(), high_water_before);
+    }
+
+    #[test]
+    fn finite_history_catch_up_allows_cursor_only_progress() {
+        let mut store = store();
+        let request_id = Ulid::new();
+        let now = i64::try_from(request_id.timestamp_ms()).unwrap() + 1;
+        let (agent, agent_id) = insert_test_agent(&mut store);
+        let historical_event = insert_test_turn_completed(&mut store, agent, now - 1);
+        let seeded_state = store
+            .ensure_rule_state("owner", &definition("history-rule", true), now)
+            .unwrap();
+        let captured_through = seeded_state.current_cursor;
+        assert!(seeded_state.retiring_revision.is_none());
+        assert!(historical_event <= captured_through);
+
+        let later_unmatched_event = insert_test_event(&mut store, "fixture.unmatched", now + 1);
+        let advanced = store
+            .advance_rule_cursor(
+                "owner",
+                &seeded_state,
+                later_unmatched_event,
+                RuleCursorOutcome::NoMatch,
+                now + 2,
+            )
+            .unwrap();
+        assert!(advanced.events.is_empty());
+        assert_eq!(advanced.value.current_cursor, later_unmatched_event);
+        assert!(advanced.value.current_cursor > seeded_state.current_cursor);
+        assert_eq!(advanced.value.revision, seeded_state.revision);
+
+        let after_seq = historical_event - 1;
+        let request = core::api::RuleCatchUpRequest::new(
+            request_id.to_string(),
+            "history-rule",
+            after_seq,
+            Some(captured_through),
+        );
+        let actions = [RuleCatchUpAction {
+            event_seq: historical_event,
+            request: stop_request(&agent_id),
+        }];
+        let admission = store
+            .admit_rule_catch_up(
+                "owner",
+                &request,
+                &seeded_state,
+                captured_through,
+                &actions,
+                now + 3,
+            )
+            .unwrap();
+        assert!(admission.is_new);
+        assert_eq!(admission.parent.id, request.id);
+        assert_eq!(admission.children.len(), 1);
+        assert_eq!(
+            admission.children[0].target.as_deref(),
+            Some(agent_id.as_str())
+        );
+        assert_eq!(admission.children[0].expected_generation, Some(1));
+
+        let current_state = store
+            .get_rule_state("owner", "history-rule")
+            .unwrap()
+            .unwrap();
+        assert_eq!(current_state.current_cursor, advanced.value.current_cursor);
+        assert_eq!(current_state.revision, seeded_state.revision);
+
+        let wrong_id = Ulid::new();
+        let wrong_now = i64::try_from(wrong_id.timestamp_ms()).unwrap() + 1;
+        let wrong_request = core::api::RuleCatchUpRequest::new(
+            wrong_id.to_string(),
+            "history-rule",
+            after_seq,
+            Some(captured_through),
+        );
+        let mut wrong_revision_state = current_state.clone();
+        wrong_revision_state.revision += 1;
+        let commands_before_wrong_revision: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+            .unwrap();
+        let events_before_wrong_revision: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        let high_water_before_wrong_revision = store.high_water().unwrap();
+
+        let error = store
+            .admit_rule_catch_up(
+                "owner",
+                &wrong_request,
+                &wrong_revision_state,
+                captured_through,
+                &[],
+                wrong_now,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "bad_state");
+        let commands_after_wrong_revision: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+            .unwrap();
+        let events_after_wrong_revision: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            commands_after_wrong_revision,
+            commands_before_wrong_revision
+        );
+        assert_eq!(events_after_wrong_revision, events_before_wrong_revision);
+        assert_eq!(
+            store.high_water().unwrap(),
+            high_water_before_wrong_revision
+        );
+        assert_eq!(
+            store
+                .get_rule_state("owner", "history-rule")
+                .unwrap()
+                .unwrap(),
+            current_state
+        );
+    }
+
+    #[test]
+    fn per_agent_limit_is_scoped_by_principal_and_rule_across_generations() {
+        let mut store = store();
+        let now = 10_000;
+        let (alpha_agent_num, alpha_agent) = insert_test_agent(&mut store);
+        let (_, beta_agent) = insert_test_agent(&mut store);
+        let owner_rule = store
+            .ensure_rule_state("owner", &definition("same-rule", true), now - 3)
+            .unwrap();
+        let owner_event = insert_test_turn_completed(&mut store, alpha_agent_num, now - 2);
+        store
+            .admit_rule_stop(
+                "owner",
+                &owner_rule,
+                owner_event,
+                stop_request(&alpha_agent),
+                now - 1,
+            )
+            .unwrap();
+        insert_test_rule_action(
+            &mut store,
+            "project:alpha",
+            "same-rule",
+            &alpha_agent,
+            1,
+            now - 3,
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE agents SET generation = 2 WHERE id = ?1",
+                [alpha_agent_num],
+            )
+            .unwrap();
+        insert_test_rule_action(
+            &mut store,
+            "project:alpha",
+            "same-rule",
+            &alpha_agent,
+            2,
+            now - 2,
+        );
+        insert_test_rule_action(
+            &mut store,
+            "project:alpha",
+            "other-rule",
+            &alpha_agent,
+            2,
+            now - 1,
+        );
+        insert_test_rule_action(&mut store, "project:beta", "same-rule", &beta_agent, 1, now);
+
+        let limit = core::api::RuleLimit {
+            max: 2,
+            per: core::api::RuleLimitScope::Agent,
+            window_ms: RULE_ACTION_WINDOW_MS,
+        };
+        let tx = store
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .unwrap();
+        let (same_rule, global) = rule_action_counts(
+            &tx,
+            "project:alpha",
+            "same-rule",
+            Some(&alpha_agent),
+            &limit,
+            now,
+        )
+        .unwrap();
+        let (other_rule, _) = rule_action_counts(
+            &tx,
+            "project:alpha",
+            "other-rule",
+            Some(&alpha_agent),
+            &limit,
+            now,
+        )
+        .unwrap();
+        let (other_project, _) = rule_action_counts(
+            &tx,
+            "project:beta",
+            "same-rule",
+            Some(&beta_agent),
+            &limit,
+            now,
+        )
+        .unwrap();
+        tx.rollback().unwrap();
+
+        assert_eq!(same_rule, 2);
+        assert!(rule_limit_reached(same_rule, limit.max));
+        assert_eq!(other_rule, 1);
+        assert!(!rule_limit_reached(other_rule, limit.max));
+        assert_eq!(other_project, 1);
+        assert!(!rule_limit_reached(other_project, limit.max));
+        assert_eq!(global, 5);
     }
 
     #[test]

@@ -10,14 +10,15 @@ mod native_requests;
 mod provider;
 mod read_validation;
 mod reads;
+mod rules;
 mod timers;
 
 pub use agent_views::{
     AgentEditsRequest, AgentEditsResponse, AgentGetRequest, AgentGetResponse, AgentGitRequest,
     AgentGitResponse, AgentListRequest, AgentListResponse, AgentListRow, AgentProcessesRequest,
     AgentProcessesResponse, AgentStatsRequest, AgentStatsResponse, DaemonStatusRequest,
-    DaemonStatusResponse, PROCESS_CURSOR_MAX_BYTES, ProcessPageCursor, SourceOwner, SourceState,
-    StatusBlocker, UnsettledCommandSummary, WorkspaceCustodyView,
+    DaemonStatusResponse, PROCESS_CURSOR_MAX_BYTES, ProcessPageCursor, ProjectRegistrationView,
+    SourceOwner, SourceState, StatusBlocker, UnsettledCommandSummary, WorkspaceCustodyView,
 };
 pub use monitor_views::{
     FilesystemInvalidationState, FilesystemInvalidationView, GitObservation, GitView,
@@ -42,6 +43,7 @@ pub use reads::{
     AgentResultRequest, AgentResultResponse, CommandGetRequest, RuleGetRequest, RuleStateView,
     TurnGetRequest,
 };
+pub use rules::{RuleCatchUpRequest, RuleLimit, RuleLimitScope};
 pub use timers::{CatchUp, TimerGetRequest, TimerRunRequest, TimerSchedule, TimerStateView};
 
 use crate::{Error, Event, Result};

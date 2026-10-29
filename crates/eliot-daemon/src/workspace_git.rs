@@ -64,6 +64,16 @@ impl WorkspaceGit {
         })
     }
 
+    /// Read the exact canonical checkout and repository common-directory identity.
+    /// This is a bounded, read-only Git preflight and performs no Store work.
+    pub(crate) async fn repository_identity(&self, path: &str) -> Result<(String, String)> {
+        let repository = self.repository(path, Instant::now() + READ_TIME).await?;
+        Ok((
+            path_text(&repository.root)?,
+            path_text(&repository.common_dir)?,
+        ))
+    }
+
     pub(crate) async fn freeze(
         &self,
         repo_path: &str,

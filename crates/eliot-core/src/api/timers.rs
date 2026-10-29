@@ -2,6 +2,7 @@
 
 use crate::{Command, Error, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -54,6 +55,8 @@ pub enum CatchUp {
 #[serde(deny_unknown_fields)]
 pub struct TimerStateView {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
     pub schedule_revision: i64,
     pub schedule: TimerSchedule,
     /// Persisted interval anchor or cron/once registration boundary in signed
@@ -69,6 +72,9 @@ pub struct TimerStateView {
 impl TimerStateView {
     pub fn validate(&self) -> Result<()> {
         validate_nonempty(&self.id, "timer id")?;
+        if let Some(project) = &self.project {
+            validate_nonempty(project, "project id")?;
+        }
         if self.schedule_revision < 0 {
             return Err(Error::new(
                 "invalid",
@@ -99,19 +105,41 @@ impl TimerStateView {
 pub struct TimerGetRequest {
     #[serde(deserialize_with = "required_text")]
     pub id: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_project"
+    )]
+    pub project: Option<String>,
 }
 
 impl TimerGetRequest {
     pub fn new(id: impl Into<String>) -> Self {
-        Self { id: id.into() }
+        Self {
+            id: id.into(),
+            project: None,
+        }
+    }
+
+    pub fn in_project(mut self, project: impl Into<String>) -> Self {
+        self.project = Some(project.into());
+        self
     }
 
     pub fn validate(&self) -> Result<()> {
-        validate_nonempty(&self.id, "timer id")
+        validate_nonempty(&self.id, "timer id")?;
+        if let Some(project) = &self.project {
+            validate_nonempty(project, "project id")?;
+        }
+        Ok(())
     }
 
     pub fn validate_response(&self, response: &TimerStateView) -> Result<()> {
-        if self.validate().is_err() || response.id != self.id || response.validate().is_err() {
+        if self.validate().is_err()
+            || response.id != self.id
+            || response.project != self.project
+            || response.validate().is_err()
+        {
             return Err(Error::new(
                 "unknown",
                 "timer.get response does not match the requested timer",
@@ -128,6 +156,12 @@ pub struct TimerRunRequest {
     pub id: String,
     #[serde(deserialize_with = "required_text")]
     pub rule: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_project"
+    )]
+    pub project: Option<String>,
 }
 
 impl TimerRunRequest {
@@ -135,12 +169,22 @@ impl TimerRunRequest {
         Self {
             id: id.into(),
             rule: rule.into(),
+            project: None,
         }
+    }
+
+    pub fn in_project(mut self, project: impl Into<String>) -> Self {
+        self.project = Some(project.into());
+        self
     }
 
     pub fn validate(&self) -> Result<()> {
         validate_nonempty(&self.id, "mutation id")?;
-        validate_nonempty(&self.rule, "timer id")
+        validate_nonempty(&self.rule, "timer id")?;
+        if let Some(project) = &self.project {
+            validate_nonempty(project, "project id")?;
+        }
+        Ok(())
     }
 
     /// Manual timer runs return their existing durable parent command.
@@ -153,6 +197,7 @@ impl TimerRunRequest {
                 .get("rule")
                 .and_then(serde_json::Value::as_str)
                 != Some(self.rule.as_str())
+            || !project_matches_args(&response.args, self.project.as_deref())
         {
             return Err(Error::new(
                 "unknown",
@@ -160,6 +205,14 @@ impl TimerRunRequest {
             ));
         }
         Ok(())
+    }
+}
+
+fn project_matches_args(args: &Value, expected: Option<&str>) -> bool {
+    match (args.get("project"), expected) {
+        (None, None) | (Some(Value::Null), None) => true,
+        (Some(Value::String(actual)), Some(expected)) => actual == expected,
+        _ => false,
     }
 }
 
@@ -178,6 +231,16 @@ fn required_text<'de, D: serde::Deserializer<'de>>(
     Ok(value)
 }
 
+fn optional_project<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    let project = Option::<String>::deserialize(deserializer)?;
+    if let Some(project) = &project {
+        validate_nonempty(project, "project id").map_err(serde::de::Error::custom)?;
+    }
+    Ok(project)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,6 +249,7 @@ mod tests {
     fn timer_state() -> TimerStateView {
         TimerStateView {
             id: "daily-stop".to_owned(),
+            project: None,
             schedule_revision: 2,
             schedule: TimerSchedule::Interval {
                 period_ms: 30_000,
@@ -289,6 +353,11 @@ mod tests {
                 "enabled":true
             })
         );
+        assert_eq!(
+            serde_json::from_value::<TimerStateView>(serde_json::to_value(&state).unwrap())
+                .unwrap(),
+            state
+        );
         let mut slotted_state = state.clone();
         slotted_state.last_key = Some(-1);
         assert_eq!(
@@ -298,6 +367,12 @@ mod tests {
         let mut wrong_id = state.clone();
         wrong_id.id = "other".to_owned();
         assert!(get.validate_response(&wrong_id).is_err());
+        let scoped_get = TimerGetRequest::new("daily-stop").in_project("project-a");
+        let mut scoped_state = state.clone();
+        scoped_state.project = Some("project-a".to_owned());
+        scoped_get.validate_response(&scoped_state).unwrap();
+        scoped_state.project = Some("project-b".to_owned());
+        assert!(scoped_get.validate_response(&scoped_state).is_err());
         let mut wrong_anchor = state.clone();
         wrong_anchor.schedule = TimerSchedule::Interval {
             period_ms: 30_000,
@@ -316,6 +391,8 @@ mod tests {
             json!({}),
             json!({"id":null}),
             json!({"id":" "}),
+            json!({"id":"daily-stop","project":" "}),
+            json!({"id":"daily-stop","project":1}),
             json!({"id":"x","extra":true}),
         ] {
             assert!(serde_json::from_value::<TimerGetRequest>(invalid).is_err());
@@ -328,10 +405,18 @@ mod tests {
                 .is_err()
         );
         assert!(run.validate_response(&command(&run.id, "other")).is_err());
+        let scoped_run = TimerRunRequest::new("01ARZ3NDEKTSV4RRFFQ69G5FAV", "daily-stop")
+            .in_project("project-a");
+        let mut scoped_command = command(&scoped_run.id, &scoped_run.rule);
+        scoped_command.args["project"] = json!("project-a");
+        scoped_run.validate_response(&scoped_command).unwrap();
+        scoped_command.args["project"] = json!("project-b");
+        assert!(scoped_run.validate_response(&scoped_command).is_err());
         for invalid in [
             json!({}),
             json!({"id":"one"}),
             json!({"id":"one","rule":" "}),
+            json!({"id":"one","rule":"daily-stop","project":" "}),
             json!({"id":"one","rule":"daily-stop","extra":true}),
         ] {
             assert!(serde_json::from_value::<TimerRunRequest>(invalid).is_err());

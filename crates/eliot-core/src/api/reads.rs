@@ -10,21 +10,41 @@ use serde_json::{Map, Value};
 pub struct RuleGetRequest {
     #[serde(deserialize_with = "required_id")]
     pub id: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_project"
+    )]
+    pub project: Option<String>,
 }
 
 impl RuleGetRequest {
     pub fn new(id: impl Into<String>) -> Self {
-        Self { id: id.into() }
+        Self {
+            id: id.into(),
+            project: None,
+        }
+    }
+
+    pub fn in_project(mut self, project: impl Into<String>) -> Self {
+        self.project = Some(project.into());
+        self
     }
 
     pub fn validate(&self) -> Result<()> {
-        validate_id(&self.id)
+        validate_id(&self.id)?;
+        if let Some(project) = &self.project {
+            validate_id(project)?;
+        }
+        Ok(())
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuleStateView {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
     pub revision: i64,
     pub current_cursor: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -41,6 +61,9 @@ pub struct RuleStateView {
 impl RuleStateView {
     pub fn validate(&self) -> Result<()> {
         validate_id(&self.id)?;
+        if let Some(project) = &self.project {
+            validate_id(project)?;
+        }
         if self.revision < 0 || self.current_cursor < 0 {
             return Err(Error::new(
                 "invalid",
@@ -207,6 +230,16 @@ fn required_id<'de, D: serde::Deserializer<'de>>(
     Ok(id)
 }
 
+fn optional_project<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    let project = Option::<String>::deserialize(deserializer)?;
+    if let Some(project) = &project {
+        validate_id(project).map_err(serde::de::Error::custom)?;
+    }
+    Ok(project)
+}
+
 fn generation<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<i64, D::Error> {
@@ -282,6 +315,17 @@ mod tests {
         request.validate().unwrap();
         assert_eq!(serde_json::to_value(request).unwrap(), valid);
 
+        let project_request: RuleGetRequest =
+            serde_json::from_value(json!({"id":"rule-1","project":"project-a"})).unwrap();
+        assert_eq!(
+            project_request,
+            RuleGetRequest::new("rule-1").in_project("project-a")
+        );
+        assert_eq!(
+            serde_json::to_value(&project_request).unwrap(),
+            json!({"id":"rule-1","project":"project-a"})
+        );
+
         for invalid in [
             json!({}),
             json!({"id":null}),
@@ -289,6 +333,8 @@ mod tests {
             json!({"id":false}),
             json!({"id":""}),
             json!({"id":" \t "}),
+            json!({"id":"rule-1","project":" "}),
+            json!({"id":"rule-1","project":1}),
             json!({"id":"rule-1","extra":0}),
         ] {
             assert!(serde_json::from_value::<RuleGetRequest>(invalid).is_err());

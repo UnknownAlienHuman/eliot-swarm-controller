@@ -1,4 +1,4 @@
-use super::{BatchCommit, Store, contains_secret_marker};
+use super::{BatchCommit, ProjectRegistrationInput, Store, contains_secret_marker};
 use eliot_core::api::{ProviderClearHoldRequest, ProviderCorrectiveEvidence};
 use eliot_core::{
     AgentState, CommandState, EventCause, NativeEvent, NativeStoreBinding, ProviderHoldState,
@@ -140,6 +140,223 @@ fn ready_capacity_agent(store: &mut Store, project: &str, now: i64) -> (String, 
         .settle(&launch_id, CommandState::Applied, None, now)
         .expect("settle capacity launch");
     (agent, launch_id)
+}
+
+#[test]
+fn project_command_binding_is_captured_and_revalidated_before_dispatch() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let project = "project-binding";
+    let agent = ready_agent(&mut store, project, now);
+    let registration = ProjectRegistrationInput {
+        id: project.to_owned(),
+        checkout: "synthetic-workspace".to_owned(),
+        repo_common_dir: "synthetic-repository".to_owned(),
+        profiles: vec!["fake".to_owned()],
+        actions: vec!["stop".to_owned()],
+    };
+    let registered = store
+        .upsert_project_registration("owner", &registration, now + 1)
+        .expect("register project")
+        .value;
+    assert_eq!(registered.revision, 1);
+    assert_eq!(
+        store
+            .get_project_registration("owner", project)
+            .expect("read project registration"),
+        Some(registered.clone())
+    );
+    assert_eq!(
+        store
+            .list_project_registrations("owner", None, 10)
+            .expect("list project registrations"),
+        vec![registered.clone()]
+    );
+
+    let stop_id = Ulid::new().to_string();
+    store
+        .submit(
+            &format!("project:{project}"),
+            SubmitCommand {
+                id: stop_id.clone(),
+                target: Some(agent.clone()),
+                verb: "stop".to_owned(),
+                args: json!({}),
+                expected_generation: Some(1),
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now + 2,
+        )
+        .expect("admit project stop under the registered profile/action");
+    let binding: String = store
+        .connection
+        .query_row(
+            "SELECT project_binding FROM commands WHERE id = ?1",
+            [&stop_id],
+            |row| row.get(0),
+        )
+        .expect("persist frozen project binding");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&binding).expect("decode project binding")["registration_revision"],
+        json!(registered.revision)
+    );
+
+    assert!(
+        store
+            .reconcile_project_registrations("owner", &[], now + 3)
+            .expect("remove project registration")
+            .value
+            .is_empty()
+    );
+    let next = store
+        .upsert_project_registration("owner", &registration, now + 4)
+        .expect("re-register project")
+        .value;
+    assert!(next.revision > registered.revision);
+
+    let error = store
+        .dispatch(&stop_id, now + 5)
+        .expect_err("revoked project command must fail its dispatch fence");
+    assert_eq!(error.code, "not_allowed");
+    assert_eq!(
+        store
+            .get_command(&stop_id)
+            .expect("read admitted stop")
+            .expect("stop remains retained")
+            .state,
+        CommandState::Accepted,
+        "failed dispatch validation must not dispatch or consume the command"
+    );
+}
+
+#[test]
+fn project_workspace_stop_revalidates_registration_in_cancel_transaction() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let project = "project-workspace-binding";
+    let start_id = Ulid::new().to_string();
+    let checkout = "/synthetic-owner";
+    let repo_common_dir = "/synthetic-owner/.git";
+    let worktree_path = "/synthetic-worktree";
+    let branch = "codex/project-binding";
+    let base_oid = "b".repeat(40);
+    let launch = store
+        .submit(
+            "owner",
+            SubmitCommand {
+                id: start_id.clone(),
+                target: None,
+                verb: "launch".to_owned(),
+                args: json!({
+                    "project": project,
+                    "workspace": worktree_path,
+                    "harness": "fake",
+                    "profile": "fake",
+                    "profile_snapshot": {}
+                }),
+                expected_generation: Some(0),
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now,
+        )
+        .expect("admit project launch");
+    let agent = launch.command.target.expect("workspace Agent");
+    let frozen_setup = serde_json::to_string(&Vec::<eliot_core::WorkspaceSetup>::new())
+        .expect("encode empty frozen setup");
+    let outcome = serde_json::to_string(&json!({"stage":"creation", "reuse":false}))
+        .expect("encode verified creation state");
+    store
+        .connection
+        .execute(
+            "INSERT INTO workspaces(
+                 agent, target_generation, start_command_id, project, repo_path,
+                 repo_common_dir, requested_branch, base_ref, base_oid, worktree_path,
+                 frozen_setup, phase, setup_index, outcome, updated_at
+             ) VALUES (?1, 1, ?2, ?3, ?3, ?4, ?5, 'HEAD', ?6, ?7, ?8, 'ready', 0, ?9, ?10)",
+            rusqlite::params![
+                eliot_core::parse_agent_id(&agent).expect("valid Agent id"),
+                start_id,
+                checkout,
+                repo_common_dir,
+                branch,
+                base_oid,
+                worktree_path,
+                frozen_setup,
+                outcome,
+                now + 1,
+            ],
+        )
+        .expect("seed L3 workspace with canonical checkout project");
+    let registration = ProjectRegistrationInput {
+        id: project.to_owned(),
+        checkout: checkout.to_owned(),
+        repo_common_dir: repo_common_dir.to_owned(),
+        profiles: vec!["fake".to_owned()],
+        actions: vec!["stop".to_owned()],
+    };
+    store
+        .upsert_project_registration("owner", &registration, now + 2)
+        .expect("register project");
+    let stop_id = Ulid::new().to_string();
+    store
+        .submit(
+            &format!("project:{project}"),
+            SubmitCommand {
+                id: stop_id.clone(),
+                target: Some(agent),
+                verb: "stop".to_owned(),
+                args: json!({}),
+                expected_generation: Some(0),
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now + 3,
+        )
+        .expect("admit workspace stop");
+    store
+        .reconcile_project_registrations("owner", &[], now + 4)
+        .expect("revoke project registration");
+
+    let error = store
+        .dispatch(&stop_id, now + 5)
+        .expect_err("revoked workspace stop must not mark cancellation requested");
+    assert_eq!(error.code, "not_allowed");
+    assert_eq!(
+        store
+            .get_command(&stop_id)
+            .expect("read workspace stop")
+            .expect("stop retained")
+            .state,
+        CommandState::Accepted
+    );
+}
+
+#[test]
+fn project_registration_list_rejects_oversized_whole_value_without_truncation() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let profile_body = "p".repeat(470 * 1024);
+    for id in ["large-project-a", "large-project-b"] {
+        let registration = ProjectRegistrationInput {
+            id: id.to_owned(),
+            checkout: format!("/synthetic/{id}"),
+            repo_common_dir: format!("/synthetic/{id}/.git"),
+            profiles: vec![format!("{profile_body}-{id}")],
+            actions: vec!["stop".to_owned()],
+        };
+        store
+            .upsert_project_registration("owner", &registration, 0)
+            .expect("each registration fits by itself");
+    }
+
+    let error = store
+        .list_project_registrations("owner", None, 1_000)
+        .expect_err("the complete result exceeds the response bound");
+    assert_eq!(error.code, "frame_too_large");
 }
 
 #[test]

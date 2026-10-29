@@ -4,12 +4,15 @@
 
 mod canonical;
 mod capacity;
+mod projects;
 mod provider_holds;
 mod rules;
 
+pub use projects::ProjectRegistrationInput;
 pub use rules::{
-    RuleCursorOutcome, RuleDefinitionInput, RuleEventAdmission, RuleProcessingState,
-    TimerDefinitionInput, TimerSlotAdmission, TimerSlotCommit,
+    RuleCatchUpAction, RuleCatchUpAdmission, RuleCursorOutcome, RuleDefinitionInput,
+    RuleEventAdmission, RuleProcessingState, TimerDefinitionInput, TimerSlotAdmission,
+    TimerSlotCommit,
 };
 
 use eliot_core::{
@@ -136,7 +139,7 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(sql_error)?;
-        if current > 13 {
+        if current > 14 {
             return Err(Error::new(
                 "unsupported",
                 format!("Store schema version {current} is newer than this binary"),
@@ -524,6 +527,32 @@ impl Store {
                  ALTER TABLE rule_state ADD COLUMN retire_through INTEGER
                      CHECK(retire_through IS NULL OR retire_through >= 0);
                  INSERT INTO schema_migrations(version) VALUES (13);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 14 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE commands ADD COLUMN project_binding TEXT;
+                 CREATE TABLE project_registrations (
+                     revision INTEGER PRIMARY KEY AUTOINCREMENT,
+                     id TEXT NOT NULL UNIQUE,
+                     checkout TEXT NOT NULL,
+                     repo_common_dir TEXT NOT NULL,
+                     profiles TEXT NOT NULL,
+                     actions TEXT NOT NULL
+                 );
+                 CREATE TABLE rule_history_coverage (
+                     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                     pruned_through INTEGER NOT NULL CHECK(pruned_through >= 0)
+                 );
+                 INSERT INTO rule_history_coverage(singleton, pruned_through)
+                     VALUES (1, 0);
+                 INSERT INTO schema_migrations(version) VALUES (14);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
@@ -1500,6 +1529,7 @@ impl Store {
         let mut events = Vec::new();
         let agent = load_agent_by_num(&tx, agent_num)?
             .ok_or_else(|| Error::new("not_found", "command target Agent was not found"))?;
+        projects::validate_project_command_dispatch_tx(&tx, &command)?;
         let command_generation = command.command.generation.unwrap_or(agent.generation);
         if !matches!(command.command.verb.as_str(), "attach" | "detach") {
             observer::require_controlled(&agent)?;
@@ -5543,6 +5573,7 @@ fn request_workspace_cancel_tx(
     let (start, agent) = preparation_command(tx, workspace)?;
     let stop = load_command_record(tx, stop_id)?
         .ok_or_else(|| Error::new("not_found", "stop command was not found"))?;
+    projects::validate_project_command_dispatch_tx(tx, &stop)?;
     if stop.command.verb != "stop"
         || stop.target != start.target
         || stop.command.generation != Some(agent.generation)
@@ -6502,6 +6533,7 @@ fn insert_command(
             "ordinary command admission must start at cause depth zero",
         ));
     }
+    let project_binding = projects::capture_project_command_binding_tx(tx, command)?;
     let args = encode_json(command.args)?;
     let outcome = command.outcome.map(encode_json).transpose()?;
     let cause = encode_json(cause)?;
@@ -6509,9 +6541,10 @@ fn insert_command(
         "INSERT INTO commands(
              id, principal, method, payload_digest, target, expected_generation,
              generation, expected_turn_id, parent_command, link_kind, ordinal,
-             turn_id, request_id, verb, args, state, outcome, created_at, updated_at, probe, cause
+             turn_id, request_id, verb, args, state, outcome, created_at, updated_at, probe, cause,
+             project_binding
          ) VALUES (
-             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21
+             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22
          )",
         params![
             command.id,
@@ -6535,6 +6568,7 @@ fn insert_command(
             command.updated_at,
             command.probe,
             cause,
+            project_binding,
         ],
     ));
     Ok(())
