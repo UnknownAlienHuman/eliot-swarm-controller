@@ -2,6 +2,7 @@ use crate::protocol::{
     DecodeErrorKind, MAX_EVENT_BYTES, MAX_FRAME_BYTES, PrivateIncoming as Incoming, RpcError,
     RpcRequest, RpcResponse, decode_private_frame,
 };
+use crate::sync::LockExt;
 use eliot_core::{
     BatchAck, Error, MAX_STDERR_DIAGNOSTIC_BYTES, Result, SourceBatch, bound_stderr_diagnostics,
 };
@@ -198,10 +199,7 @@ impl PeerClient {
     ) -> Result<Value> {
         let (response_tx, response_rx) = oneshot::channel();
         {
-            let mut pending = self
-                .pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut pending = self.pending.lock_recover();
             pending.insert(prepared.id.clone(), response_tx);
         }
         let _pending_guard = PendingGuard {
@@ -239,11 +237,7 @@ impl PeerClient {
         let Some(id) = response.id.as_str() else {
             return;
         };
-        let sender = self
-            .pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(id);
+        let sender = self.pending.lock_recover().remove(id);
         let Some(sender) = sender else {
             return;
         };
@@ -260,10 +254,7 @@ impl PeerClient {
 
     fn fail_pending(&self, error: Error) {
         let pending = {
-            let mut pending = self
-                .pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut pending = self.pending.lock_recover();
             std::mem::take(&mut *pending)
         };
         for (_, sender) in pending {
@@ -448,9 +439,7 @@ async fn writer_loop(
         let _ = outbound.written.send(result);
         if let Some(error) = failure {
             let pending_calls = {
-                let mut pending = pending
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut pending = pending.lock_recover();
                 std::mem::take(&mut *pending)
             };
             for (_, sender) in pending_calls {
@@ -464,10 +453,7 @@ async fn writer_loop(
 
 impl Drop for PendingGuard {
     fn drop(&mut self) {
-        self.pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.id);
+        self.pending.lock_recover().remove(&self.id);
     }
 }
 

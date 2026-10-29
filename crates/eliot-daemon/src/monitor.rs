@@ -16,6 +16,7 @@ use eliot_core::{
         ProcessStatsView, SourceState, StatsCoverage, WorkspaceObservation, WorkspaceView,
     },
 };
+use eliot_plugin::sync::LockExt;
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
@@ -219,11 +220,7 @@ impl Monitoring {
     }
 
     pub(crate) fn mark_unavailable(&self, code: &str) {
-        *self
-            .inner
-            .unavailable
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(code.to_owned());
+        *self.inner.unavailable.lock_recover() = Some(code.to_owned());
         self.mark_git_unavailable(code);
     }
 
@@ -249,13 +246,11 @@ impl Monitoring {
         drop(store);
         self.inner
             .git_bindings
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_recover()
             .insert((agent.id.clone(), agent.generation), workspace.to_owned());
         self.inner
             .git_workspaces
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_recover()
             .entry(workspace.to_owned())
             .or_insert_with(|| Arc::new(GitWorkspace::default()));
         Ok(())
@@ -274,11 +269,7 @@ impl Monitoring {
             workspace: None,
         });
         {
-            let mut targets = self
-                .inner
-                .targets
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut targets = self.inner.targets.lock_recover();
             if targets.contains_key(&key) {
                 return Err(Error::new(
                     "bad_state",
@@ -341,11 +332,7 @@ impl Monitoring {
             workspace: Some(context),
         });
         {
-            let mut targets = self
-                .inner
-                .targets
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut targets = self.inner.targets.lock_recover();
             if targets.contains_key(&key) {
                 return Err(Error::new(
                     "bad_state",
@@ -365,11 +352,7 @@ impl Monitoring {
         handle: &WorkspaceProcessHandle,
     ) -> Result<()> {
         {
-            let mut targets = self
-                .inner
-                .targets
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut targets = self.inner.targets.lock_recover();
             match targets.get(&handle.target.key) {
                 Some(current) if !Arc::ptr_eq(current, &handle.target) => {
                     return Err(Error::new(
@@ -467,20 +450,9 @@ impl Monitoring {
     pub(crate) async fn view(&self, agent: &Agent) -> Result<ObservationView> {
         let cache = self
             .target(&agent.id, agent.generation)
-            .map(|target| {
-                target
-                    .cache
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone()
-            })
+            .map(|target| target.cache.lock_recover().clone())
             .unwrap_or_default();
-        let unavailable = self
-            .inner
-            .unavailable
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        let unavailable = self.inner.unavailable.lock_recover().clone();
         let (processes, last_model_progress, source_healthy) = {
             let store = self.inner.store.lock().await;
             let processes =
@@ -541,12 +513,7 @@ impl Monitoring {
             (preparation, processes, source)
         };
         let cache = self.workspace_cache(&agent.id, preparation.target_generation);
-        let unavailable = self
-            .inner
-            .unavailable
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        let unavailable = self.inner.unavailable.lock_recover().clone();
         Ok(Some(WorkspaceView::Data(Box::new(WorkspaceObservation {
             owner: workspace_owner(&agent.id, preparation.target_generation),
             target_generation: preparation.target_generation,
@@ -563,8 +530,7 @@ impl Monitoring {
         let targets: Vec<_> = self
             .inner
             .targets
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_recover()
             .values()
             .filter(|target| {
                 target.workspace.is_some()
@@ -584,10 +550,7 @@ impl Monitoring {
         let mut error = None;
         let mut identities = HashSet::new();
         for target in targets {
-            let cache = target
-                .cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let cache = target.cache.lock_recover();
             if let Some(at) = cache.sampled_at {
                 sampled_at = Some(sampled_at.map_or(at, |previous| previous.min(at)));
             }
@@ -622,36 +585,18 @@ impl Monitoring {
         let target = self
             .inner
             .git_workspaces
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_recover()
             .get(workspace)
             .cloned();
         let cache = target
             .as_ref()
-            .map(|target| {
-                target
-                    .cache
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone()
-            })
+            .map(|target| target.cache.lock_recover().clone())
             .unwrap_or_default();
         let invalidation = target
             .as_ref()
-            .map(|target| {
-                target
-                    .watch
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .view()
-            })
+            .map(|target| target.watch.lock_recover().view())
             .unwrap_or_else(FilesystemInvalidationView::inactive);
-        let unavailable = self
-            .inner
-            .git_unavailable
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        let unavailable = self.inner.git_unavailable.lock_recover().clone();
         let (baseline, edits, source) = {
             let store = self.inner.store.lock().await;
             (
@@ -710,14 +655,7 @@ impl Monitoring {
     }
 
     fn check_git_value(&self, mut value: Value) -> Result<()> {
-        let secrets: Vec<_> = self
-            .inner
-            .secrets
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .cloned()
-            .collect();
+        let secrets: Vec<_> = self.inner.secrets.lock_recover().iter().cloned().collect();
         if crate::redaction::redact_value(&mut value, &secrets) {
             return Err(Error::new(
                 "secret_in_payload",
@@ -776,11 +714,7 @@ impl Monitoring {
     }
 
     fn mark_git_unavailable(&self, code: &str) {
-        *self
-            .inner
-            .git_unavailable
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(code.to_owned());
+        *self.inner.git_unavailable.lock_recover() = Some(code.to_owned());
         self.release_inactive_watchers(&HashSet::new(), true);
     }
 
@@ -805,12 +739,7 @@ impl Monitoring {
     }
 
     async fn git_inputs(&self) -> Result<HashMap<String, GitGroup>> {
-        let bindings = self
-            .inner
-            .git_bindings
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        let bindings = self.inner.git_bindings.lock_recover().clone();
         let mut groups: HashMap<String, GitGroup> = HashMap::new();
         let mut retired = Vec::new();
         {
@@ -865,11 +794,7 @@ impl Monitoring {
                 });
             }
         }
-        let mut bindings = self
-            .inner
-            .git_bindings
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut bindings = self.inner.git_bindings.lock_recover();
         for key in retired {
             bindings.remove(&key);
         }
@@ -937,18 +862,14 @@ impl Monitoring {
         let targets: Vec<_> = self
             .inner
             .git_workspaces
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_recover()
             .iter()
             .filter(|(workspace, _)| !live.contains(*workspace))
             .map(|(_, target)| Arc::clone(target))
             .collect();
         for target in targets {
             let retired = {
-                let mut slot = target
-                    .watch
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut slot = target.watch.lock_recover();
                 slot.active = false;
                 let result = slot.pending.as_ref().map(|pending| pending.try_recv());
                 if matches!(
@@ -970,10 +891,7 @@ impl Monitoring {
 
     fn update_watcher(target: &GitWorkspace, workspace: &str, live: bool) -> bool {
         let (dirty, registration, retired) = {
-            let mut slot = target
-                .watch
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut slot = target.watch.lock_recover();
             slot.active = live;
             let mut retired = None;
             match slot.pending.as_ref().map(|pending| pending.try_recv()) {
@@ -1027,11 +945,7 @@ impl Monitoring {
                 })
                 .is_err()
             {
-                target
-                    .watch
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .pending = None;
+                target.watch.lock_recover().pending = None;
             }
         }
         dirty
@@ -1056,18 +970,14 @@ impl Monitoring {
             let target = self
                 .inner
                 .git_workspaces
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .lock_recover()
                 .entry(workspace.clone())
                 .or_insert_with(|| Arc::new(GitWorkspace::default()))
                 .clone();
             let dirty =
                 Self::update_watcher(&target, &workspace, live_workspaces.contains(&workspace));
             let (due, earliest) = {
-                let mut cache = target
-                    .cache
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut cache = target.cache.lock_recover();
                 if dirty {
                     let earliest = cache
                         .last_attempt
@@ -1091,11 +1001,7 @@ impl Monitoring {
                 sleep_until(earliest).await;
             }
             let started = Instant::now();
-            target
-                .cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .last_attempt = Some(started);
+            target.cache.lock_recover().last_attempt = Some(started);
             let result = async {
                 let (edited_paths, paths_complete) = self
                     .git_probe_paths(&workspace, &group, final_flush)
@@ -1153,10 +1059,7 @@ impl Monitoring {
                     {
                         failed = Some(error.code);
                     }
-                    let mut cache = target
-                        .cache
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let mut cache = target.cache.lock_recover();
                     cache.backoff = if slow || failed.is_some() {
                         cache.backoff.saturating_mul(2).min(GIT_MAX_BACKOFF)
                     } else {
@@ -1184,10 +1087,7 @@ impl Monitoring {
                             let _ = self.git_source_status(&input.key, "error", false).await;
                         }
                     }
-                    let mut cache = target
-                        .cache
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let mut cache = target.cache.lock_recover();
                     if error.code == "secret_in_payload" {
                         cache.snapshot = None;
                     }
@@ -1270,11 +1170,7 @@ impl Monitoring {
         self.git_source_status(&input.key, if slow { "slow" } else { "ok" }, final_binding)
             .await?;
         if final_binding {
-            self.inner
-                .git_bindings
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&input.key);
+            self.inner.git_bindings.lock_recover().remove(&input.key);
         }
         Ok(())
     }
@@ -1344,11 +1240,7 @@ impl Monitoring {
                 )?;
                 self.inner.bus.publish(&events);
                 drop(store);
-                self.inner
-                    .git_bindings
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&input.key);
+                self.inner.git_bindings.lock_recover().remove(&input.key);
                 return Ok(());
             }
             if input.page.through <= input.cursor {
@@ -1397,25 +1289,19 @@ impl Monitoring {
         let targets: Vec<_> = self
             .inner
             .git_workspaces
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_recover()
             .values()
             .cloned()
             .collect();
         for target in targets {
-            target
-                .cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .error = Some(code.to_owned());
+            target.cache.lock_recover().error = Some(code.to_owned());
         }
     }
 
     fn target(&self, agent: &str, generation: i64) -> Option<Arc<Target>> {
         self.inner
             .targets
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_recover()
             .get(&ProcessKey::Agent(agent.to_owned(), generation))
             .cloned()
     }
@@ -1424,8 +1310,7 @@ impl Monitoring {
         let targets: Vec<_> = self
             .inner
             .targets
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_recover()
             .values()
             .cloned()
             .collect();
@@ -1447,11 +1332,7 @@ impl Monitoring {
         let mut snapshot = match result {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                target
-                    .cache
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .error = Some(error.code.clone());
+                target.cache.lock_recover().error = Some(error.code.clone());
                 let _ = self.set_source_status(target, "error", false).await;
                 return Err(error);
             }
@@ -1499,11 +1380,7 @@ impl Monitoring {
             result
         };
         if let Err(error) = observed {
-            target
-                .cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .error = Some(error.code.clone());
+            target.cache.lock_recover().error = Some(error.code.clone());
             let _ = self.set_source_status(target, "error", false).await;
             return Err(error);
         }
@@ -1515,28 +1392,17 @@ impl Monitoring {
         // Workspace source lifetime includes subsequent setup steps/removal;
         // set_source_status keeps it open even after this owned scope exits.
         if let Err(error) = self.set_source_status(target, health, final_exit).await {
-            target
-                .cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .error = Some(error.code.clone());
+            target.cache.lock_recover().error = Some(error.code.clone());
             return Err(error);
         }
-        *target
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Cache {
+        *target.cache.lock_recover() = Cache {
             snapshot: Some(snapshot),
             sampled_at: Some(sampled_at),
             error: None,
         };
         if final_exit {
             let key = target.key.clone();
-            let mut targets = self
-                .inner
-                .targets
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut targets = self.inner.targets.lock_recover();
             if targets
                 .get(&key)
                 .is_some_and(|current| Arc::ptr_eq(current, target))

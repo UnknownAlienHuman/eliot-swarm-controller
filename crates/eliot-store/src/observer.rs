@@ -376,37 +376,20 @@ pub(super) fn admit(
         }
         agent
     };
-    insert_command(
+    let agent_num = parse_agent_id(&agent.id)?;
+    events.push(admit_command(
         tx,
         &CommandInsert {
-            id: &request.id,
-            principal,
-            method: COMMAND_METHOD,
-            payload_digest: digest,
-            target: Some(parse_agent_id(&agent.id)?),
             expected_generation: Some(agent.generation),
-            generation: Some(agent.generation),
             expected_turn_id: None,
-            parent_command: None,
-            link_kind: None,
-            ordinal: None,
-            turn_id: None,
-            request_id: None,
-            verb: &request.verb,
-            args: &request.args,
-            state: CommandState::Accepted,
-            outcome: None,
-            created_at: now,
-            updated_at: now,
+            ..CommandInsert::admitted(
+                principal,
+                request,
+                digest,
+                (agent_num, agent.generation),
+                now,
+            )
         },
-    )?;
-    events.push(insert_daemon_event(
-        tx,
-        now,
-        "command.accepted",
-        "command",
-        Some(parse_agent_id(&agent.id)?),
-        Some(agent.generation),
         json!({"command_id": request.id, "verb": request.verb, "mode": "observe"}),
     )?);
     Ok(())

@@ -470,6 +470,8 @@ impl Store {
         if !request.args.is_object() {
             return Err(Error::new("invalid", "command args must be a JSON object"));
         }
+        // Bound durable admission data here. Host checks the completed start
+        // frame, including runtime environment and source state, before writing.
         if request.verb != "attach" && encode_json(&request)?.len() > MAX_FRAME_BYTES {
             return Err(Error::new(
                 "frame_too_large",
@@ -663,18 +665,6 @@ impl Store {
                     require_nonempty(text, "args.text")?;
                     check_input(text)?;
                 }
-                check_rpc_frame(
-                    "agent.start",
-                    &json!({
-                        "agent_id": "a1",
-                        "generation": 1,
-                        "command_id": request.id,
-                        "profile": profile,
-                        "workspace": workspace,
-                        "source_plan": source_plan_for_harness(&harness)?
-                    }),
-                )?;
-
                 db!(tx.execute(
                     "INSERT INTO agents(generation, project, harness, profile,
                                             profile_snapshot, workspace, state,
@@ -701,95 +691,22 @@ impl Store {
                         json!({"agent_id": agent_id, "project": project, "harness": harness, "profile": profile}),
                     )?);
 
-                let state = CommandState::Accepted;
-                insert_command(
+                events.push(admit_command(
                     &tx,
-                    &CommandInsert {
-                        id: &request.id,
+                    &CommandInsert::admitted(
                         principal,
-                        method: COMMAND_METHOD,
-                        payload_digest: &payload_digest,
-                        target: Some(agent_num),
-                        expected_generation: request.expected_generation,
-                        generation: Some(0),
-                        expected_turn_id: None,
-                        parent_command: None,
-                        link_kind: None,
-                        ordinal: None,
-                        turn_id: None,
-                        request_id: None,
-                        verb: "launch",
-                        args: &request.args,
-                        state,
-                        outcome: None,
-                        created_at: now,
-                        updated_at: now,
-                    },
-                )?;
-                events.push(insert_daemon_event(
-                    &tx,
-                    now,
-                    "command.accepted",
-                    "command",
-                    Some(agent_num),
-                    Some(0),
+                        &request,
+                        &payload_digest,
+                        (agent_num, 0),
+                        now,
+                    ),
                     json!({"command_id": request.id, "verb": "launch"}),
                 )?);
 
                 if let Some(text) = text {
-                    let linked_id = format!("{}/send", request.id);
-                    let linked_args = json!({"text": text});
-                    check_rpc_frame(
-                        "agent.command",
-                        &json!({
-                            "agent_id": agent_id,
-                            "generation": 1,
-                            "command_id": linked_id,
-                            "verb": "send",
-                            "args": linked_args,
-                        }),
-                    )?;
-                    let linked_semantic = json!({
-                        "target": agent_id,
-                        "verb": "send",
-                        "args": linked_args,
-                        "expected_generation": 1,
-                        "expected_turn_id": Value::Null,
-                    });
-                    let linked_digest = canonical::digest(&linked_semantic)?;
-                    insert_command(
-                        &tx,
-                        &CommandInsert {
-                            id: &linked_id,
-                            principal,
-                            method: COMMAND_METHOD,
-                            payload_digest: &linked_digest,
-                            target: Some(agent_num),
-                            expected_generation: Some(1),
-                            generation: Some(1),
-                            expected_turn_id: None,
-                            parent_command: Some(&request.id),
-                            link_kind: Some("send"),
-                            ordinal: Some(0),
-                            turn_id: None,
-                            request_id: None,
-                            verb: "send",
-                            args: &linked_args,
-                            state: CommandState::Queued,
-                            outcome: None,
-                            created_at: now,
-                            updated_at: now,
-                        },
-                    )?;
-                    events.push(insert_daemon_event(
-                            &tx,
-                            now,
-                            "command.queued",
-                            "command",
-                            Some(agent_num),
-                            Some(1),
-                            json!({"command_id": linked_id, "parent_command": request.id, "verb": "send"}),
-                        )?);
+                    let (linked_id, event) =
+                        admit_linked_send(&tx, principal, &request.id, agent_num, 1, &text, now)?;
+                    events.push(event);
                     Some(linked_id)
                 } else {
                     None
@@ -857,41 +774,18 @@ impl Store {
                     } else {
                         CommandState::Queued
                     };
-                    insert_command(
+                    events.push(admit_command(
                         &tx,
                         &CommandInsert {
-                            id: &request.id,
-                            principal,
-                            method: COMMAND_METHOD,
-                            payload_digest: &payload_digest,
-                            target: Some(agent_num),
-                            expected_generation: request.expected_generation,
-                            generation: Some(agent.generation),
-                            expected_turn_id: request.expected_turn_id.as_deref(),
-                            parent_command: None,
-                            link_kind: None,
-                            ordinal: None,
-                            turn_id: None,
-                            request_id: None,
-                            verb: "send",
-                            args: &request.args,
                             state,
-                            outcome: None,
-                            created_at: now,
-                            updated_at: now,
+                            ..CommandInsert::admitted(
+                                principal,
+                                &request,
+                                &payload_digest,
+                                (agent_num, agent.generation),
+                                now,
+                            )
                         },
-                    )?;
-                    events.push(insert_daemon_event(
-                        &tx,
-                        now,
-                        if state == CommandState::Accepted {
-                            "command.accepted"
-                        } else {
-                            "command.queued"
-                        },
-                        "command",
-                        Some(agent_num),
-                        Some(agent.generation),
                         json!({"command_id": request.id, "verb": "send"}),
                     )?);
                     None
@@ -912,38 +806,18 @@ impl Store {
                             "force": request.args.get("force").and_then(Value::as_bool).unwrap_or(false),
                         }),
                     )?;
-                    let state = CommandState::Accepted;
-                    insert_command(
+                    events.push(admit_command(
                         &tx,
                         &CommandInsert {
-                            id: &request.id,
-                            principal,
-                            method: COMMAND_METHOD,
-                            payload_digest: &payload_digest,
-                            target: Some(agent_num),
-                            expected_generation: request.expected_generation,
-                            generation: Some(agent.generation),
-                            expected_turn_id: request.expected_turn_id.as_deref(),
-                            parent_command: None,
-                            link_kind: None,
-                            ordinal: None,
                             turn_id: request.expected_turn_id.as_deref(),
-                            request_id: None,
-                            verb: "stop",
-                            args: &request.args,
-                            state,
-                            outcome: None,
-                            created_at: now,
-                            updated_at: now,
+                            ..CommandInsert::admitted(
+                                principal,
+                                &request,
+                                &payload_digest,
+                                (agent_num, agent.generation),
+                                now,
+                            )
                         },
-                    )?;
-                    events.push(insert_daemon_event(
-                        &tx,
-                        now,
-                        "command.accepted",
-                        "command",
-                        Some(agent_num),
-                        Some(agent.generation),
                         json!({"command_id": request.id, "verb": "stop"}),
                     )?);
                     None
@@ -973,37 +847,18 @@ impl Store {
                     .ok_or_else(|| Error::new("not_found", "Agent has no managed worktree"))?;
                 require_workspace_removable(&tx, &agent, &workspace)?;
                 let args = json!({"target_generation": workspace.target_generation});
-                insert_command(
+                events.push(admit_command(
                     &tx,
                     &CommandInsert {
-                        id: &request.id,
-                        principal,
-                        method: COMMAND_METHOD,
-                        payload_digest: &payload_digest,
-                        target: Some(agent_num),
-                        expected_generation: request.expected_generation,
-                        generation: Some(agent.generation),
-                        expected_turn_id: None,
-                        parent_command: None,
-                        link_kind: None,
-                        ordinal: None,
-                        turn_id: None,
-                        request_id: None,
-                        verb: "worktree.remove",
                         args: &args,
-                        state: CommandState::Accepted,
-                        outcome: None,
-                        created_at: now,
-                        updated_at: now,
+                        ..CommandInsert::admitted(
+                            principal,
+                            &request,
+                            &payload_digest,
+                            (agent_num, agent.generation),
+                            now,
+                        )
                     },
-                )?;
-                events.push(insert_daemon_event(
-                    &tx,
-                    now,
-                    "command.accepted",
-                    "command",
-                    Some(agent_num),
-                    Some(agent.generation),
                     json!({"command_id": request.id, "verb": "worktree.remove"}),
                 )?);
                 None
@@ -1059,26 +914,15 @@ impl Store {
                         "resume requires a stopped, failed, or lost Agent with no active turn",
                     ));
                 }
-                let native_scope = agent
-                    .native_scope
-                    .as_deref()
-                    .filter(|value| !value.trim().is_empty())
-                    .ok_or_else(|| {
-                        Error::new(
-                            "unsupported",
-                            "resume requires a retained native_scope and native_ref",
-                        )
-                    })?;
-                let native_ref = agent
-                    .native_ref
-                    .as_deref()
-                    .filter(|value| !value.trim().is_empty())
-                    .ok_or_else(|| {
-                        Error::new(
-                            "unsupported",
-                            "resume requires a retained native_scope and native_ref",
-                        )
-                    })?;
+                if [&agent.native_scope, &agent.native_ref]
+                    .iter()
+                    .any(|value| value.as_deref().is_none_or(|value| value.trim().is_empty()))
+                {
+                    return Err(Error::new(
+                        "unsupported",
+                        "resume requires a retained native_scope and native_ref",
+                    ));
+                }
                 if request
                     .args
                     .as_object()
@@ -1097,114 +941,33 @@ impl Store {
                 let next_generation = agent.generation.checked_add(1).ok_or_else(|| {
                     Error::new("bad_state", "Agent generation cannot be incremented")
                 })?;
-                check_rpc_frame(
-                    "agent.start",
-                    &json!({
-                        "agent_id": agent.id,
-                        "generation": next_generation,
-                        "command_id": request.id,
-                        "profile": agent.profile,
-                        "workspace": agent.workspace,
-                        "resume_from": {
-                            "native_scope": native_scope,
-                            "native_ref": native_ref
-                        },
-                        "source_plan": source_plan_for_harness(&agent.harness)?
-                    }),
-                )?;
                 let resume_args = json!({});
-                insert_command(
+                events.push(admit_command(
                     &tx,
                     &CommandInsert {
-                        id: &request.id,
-                        principal,
-                        method: COMMAND_METHOD,
-                        payload_digest: &payload_digest,
-                        target: Some(agent_num),
-                        expected_generation: request.expected_generation,
-                        generation: Some(agent.generation),
-                        expected_turn_id: request.expected_turn_id.as_deref(),
-                        parent_command: None,
-                        link_kind: None,
-                        ordinal: None,
-                        turn_id: None,
-                        request_id: None,
-                        verb: "resume",
                         args: &resume_args,
-                        state: CommandState::Accepted,
-                        outcome: None,
-                        created_at: now,
-                        updated_at: now,
+                        ..CommandInsert::admitted(
+                            principal,
+                            &request,
+                            &payload_digest,
+                            (agent_num, agent.generation),
+                            now,
+                        )
                     },
-                )?;
-                events.push(insert_daemon_event(
-                    &tx,
-                    now,
-                    "command.accepted",
-                    "command",
-                    Some(agent_num),
-                    Some(agent.generation),
                     json!({"command_id": request.id, "verb": "resume"}),
                 )?);
 
                 if let Some(text) = text {
-                    let linked_id = format!("{}/send", request.id);
-                    let linked_args = json!({"text": text});
-                    check_rpc_frame(
-                        "agent.command",
-                        &json!({
-                            "agent_id": agent.id,
-                            "generation": next_generation,
-                            "command_id": linked_id,
-                            "verb": "send",
-                            "args": linked_args,
-                        }),
-                    )?;
-                    let linked_semantic = json!({
-                        "target": agent.id,
-                        "verb": "send",
-                        "args": linked_args,
-                        "expected_generation": next_generation,
-                        "expected_turn_id": Value::Null,
-                    });
-                    let linked_digest = canonical::digest(&linked_semantic)?;
-                    insert_command(
+                    let (linked_id, event) = admit_linked_send(
                         &tx,
-                        &CommandInsert {
-                            id: &linked_id,
-                            principal,
-                            method: COMMAND_METHOD,
-                            payload_digest: &linked_digest,
-                            target: Some(agent_num),
-                            expected_generation: Some(next_generation),
-                            generation: Some(next_generation),
-                            expected_turn_id: None,
-                            parent_command: Some(&request.id),
-                            link_kind: Some("send"),
-                            ordinal: Some(0),
-                            turn_id: None,
-                            request_id: None,
-                            verb: "send",
-                            args: &linked_args,
-                            state: CommandState::Queued,
-                            outcome: None,
-                            created_at: now,
-                            updated_at: now,
-                        },
-                    )?;
-                    events.push(insert_daemon_event(
-                        &tx,
+                        principal,
+                        &request.id,
+                        agent_num,
+                        next_generation,
+                        &text,
                         now,
-                        "command.queued",
-                        "command",
-                        Some(agent_num),
-                        Some(next_generation),
-                        json!({
-                            "command_id": linked_id,
-                            "parent_command": request.id,
-                            "verb": "send"
-                        }),
-                    )?);
+                    )?;
+                    events.push(event);
                     Some(linked_id)
                 } else {
                     None
@@ -1347,37 +1110,19 @@ impl Store {
                     params["request_id"] = Value::String(request_id.to_owned());
                 }
                 check_rpc_frame("agent.command", &params)?;
-                insert_command(
+                events.push(admit_command(
                     &tx,
                     &CommandInsert {
-                        id: &request.id,
-                        principal,
-                        method: COMMAND_METHOD,
-                        payload_digest: &payload_digest,
-                        target: Some(agent_num),
-                        expected_generation: request.expected_generation,
-                        generation: Some(agent.generation),
-                        expected_turn_id: request.expected_turn_id.as_deref(),
-                        parent_command: None,
-                        link_kind: None,
-                        ordinal: None,
                         turn_id: Some(&turn_id),
                         request_id: request_id.as_deref(),
-                        verb: &request.verb,
-                        args: &request.args,
-                        state: CommandState::Accepted,
-                        outcome: None,
-                        created_at: now,
-                        updated_at: now,
+                        ..CommandInsert::admitted(
+                            principal,
+                            &request,
+                            &payload_digest,
+                            (agent_num, agent.generation),
+                            now,
+                        )
                     },
-                )?;
-                events.push(insert_daemon_event(
-                    &tx,
-                    now,
-                    "command.accepted",
-                    "command",
-                    Some(agent_num),
-                    Some(agent.generation),
                     json!({
                         "command_id": request.id,
                         "verb": request.verb,
@@ -1554,17 +1299,6 @@ impl Store {
                         "launch no longer targets the initial created Agent generation",
                     ));
                 }
-                check_rpc_frame(
-                    "agent.start",
-                    &json!({
-                        "agent_id": agent.id,
-                        "generation": 1,
-                            "command_id": id,
-                        "profile": agent.profile,
-                        "workspace": agent.workspace,
-                        "source_plan": source_plan_for_harness(&agent.harness)?
-                    }),
-                )?;
                 gate_workspace_start(&tx, &agent, &command.command, 1)?;
                 let token = format!("{}{}", Ulid::new(), Ulid::new());
                 let changed = db!(tx.execute(
@@ -1642,22 +1376,6 @@ impl Store {
                     Error::new("bad_state", "Agent generation cannot be incremented")
                 })?;
                 gate_workspace_start(&tx, &agent, &command.command, next_generation)?;
-                check_rpc_frame(
-                    "agent.start",
-                    &json!({
-                        "agent_id": agent.id,
-                        "generation": next_generation,
-                        "command_id": id,
-                        "profile": agent.profile,
-                        "workspace": agent.workspace,
-                        "resume_from": {
-                            "native_scope": native_scope,
-                            "native_ref": native_ref
-                        },
-                        "source_plan": source_plan_for_harness(&agent.harness)?
-                    }),
-                )?;
-
                 for old_id in pending_command_ids(&tx, agent_num, agent.generation)? {
                     if old_id == id {
                         continue;
@@ -5797,6 +5515,38 @@ struct CommandInsert<'a> {
     updated_at: i64,
 }
 
+impl<'a> CommandInsert<'a> {
+    fn admitted(
+        principal: &'a str,
+        request: &'a SubmitCommand,
+        payload_digest: &'a [u8],
+        target: (i64, i64),
+        now: i64,
+    ) -> Self {
+        Self {
+            id: &request.id,
+            principal,
+            method: COMMAND_METHOD,
+            payload_digest,
+            target: Some(target.0),
+            expected_generation: request.expected_generation,
+            generation: Some(target.1),
+            expected_turn_id: request.expected_turn_id.as_deref(),
+            parent_command: None,
+            link_kind: None,
+            ordinal: None,
+            turn_id: None,
+            request_id: None,
+            verb: &request.verb,
+            args: &request.args,
+            state: CommandState::Accepted,
+            outcome: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+}
+
 struct EventRecord {
     seq: i64,
     ts: i64,
@@ -6082,6 +5832,68 @@ fn load_linked_command(connection: &Connection, parent: &str) -> Result<Option<C
         Some(id) => load_command(connection, &id),
         None => Ok(None),
     }
+}
+
+fn admit_command(
+    tx: &Transaction<'_>,
+    command: &CommandInsert<'_>,
+    event_data: Value,
+) -> Result<Event> {
+    insert_command(tx, command)?;
+    insert_daemon_event(
+        tx,
+        command.created_at,
+        &format!("command.{}", command_state_name(command.state)),
+        "command",
+        command.target,
+        command.generation,
+        event_data,
+    )
+}
+
+fn admit_linked_send(
+    tx: &Transaction<'_>,
+    principal: &str,
+    parent: &str,
+    agent: i64,
+    generation: i64,
+    text: &str,
+    now: i64,
+) -> Result<(String, Event)> {
+    let agent_id = format_agent_id(agent);
+    let mut request = SubmitCommand::new(format!("{parent}/send"), "send");
+    request.args = json!({"text": text});
+    request.expected_generation = Some(generation);
+    check_rpc_frame(
+        "agent.command",
+        &json!({
+            "agent_id": agent_id,
+            "generation": generation,
+            "command_id": request.id,
+            "verb": "send",
+            "args": request.args,
+        }),
+    )?;
+    let digest = canonical::digest(&json!({
+        "target": agent_id,
+        "verb": "send",
+        "args": request.args,
+        "expected_generation": generation,
+        "expected_turn_id": Value::Null,
+    }))?;
+    let command = CommandInsert {
+        parent_command: Some(parent),
+        link_kind: Some("send"),
+        ordinal: Some(0),
+        state: CommandState::Queued,
+        ..CommandInsert::admitted(principal, &request, &digest, (agent, generation), now)
+    };
+    let event = admit_command(
+        tx,
+        &command,
+        json!({"command_id": request.id, "parent_command": parent, "verb": "send"}),
+    )?;
+    Ok((request.id, event))
 }
 
 fn insert_command(tx: &Transaction<'_>, command: &CommandInsert<'_>) -> Result<()> {
@@ -6403,14 +6215,6 @@ fn source_families_for_harness(harness: &str) -> Result<&'static [&'static str]>
             format!("unsupported launch harness {other}"),
         )),
     }
-}
-
-fn source_plan_for_harness(harness: &str) -> Result<Value> {
-    let mut plan = serde_json::Map::new();
-    for family in source_families_for_harness(harness)? {
-        plan.insert((*family).to_owned(), json!("stream"));
-    }
-    Ok(Value::Object(plan))
 }
 
 fn family_for_kind(kind: &str) -> Result<&'static str> {
@@ -8145,23 +7949,12 @@ impl Store {
 
         let mut committed_events = Vec::with_capacity(batch.events.len());
         let mut command_events = Vec::new();
-        for (index, raw_event) in batch.events.iter().enumerate() {
-            let native_event = raw_event.clone();
-            let event_data = encode_json(&native_event.data)?;
-            if event_data.len() > MAX_EVENT_BYTES {
-                return Err(Error::new(
-                    "frame_too_large",
-                    format!(
-                        "event {} data exceeds 64 KiB after normalization",
-                        native_event.native_id
-                    ),
-                ));
-            }
+        for (index, native_event) in batch.events.iter().enumerate() {
             let (next, effects) = if expected_subject.is_some() {
-                observer_live::persist_turn_fact(&tx, &projection, &native_event)?;
+                observer_live::persist_turn_fact(&tx, &projection, native_event)?;
                 (projection.clone(), Vec::new())
             } else {
-                core::apply(&projection, &native_event, now)?
+                core::apply(&projection, native_event, now)?
             };
             let family = family_for_kind(&native_event.kind)?;
             let event_digest = canonical::digest(&native_event.semantic_value())?;
@@ -8174,7 +7967,7 @@ impl Store {
                 &tx,
                 NativeEventInsert {
                     ts: native_event.ts.unwrap_or(now),
-                    native_event: &native_event,
+                    native_event,
                     family,
                     agent: agent_num,
                     generation: batch.generation,
@@ -8189,7 +7982,7 @@ impl Store {
                 agent_num,
                 batch.generation,
                 now,
-                &native_event,
+                native_event,
                 &next,
             )?);
             if next.is_terminal() {

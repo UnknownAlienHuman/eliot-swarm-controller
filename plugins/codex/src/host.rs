@@ -1,7 +1,7 @@
 use crate::{
-    events::{self, EventConfig, EventHandle, TurnFacts},
+    events::{self, EventConfig, EventHandle, TurnFacts, rejected_control, unknown_control},
     native::{
-        NativeClient, NativeLaunch, NativeProcess,
+        NativeClient, NativeLaunch, NativeProcess, native_no_write,
         types::{
             NativeClientInfo, NativeCollaborationMode, NativeCollaborationModeKind,
             NativeCollaborationSettings, NativeInitializeCapabilities, NativeInitializeParams,
@@ -1950,6 +1950,7 @@ async fn read_final_text(
     turn_id: &str,
     secrets: &[String],
 ) -> Result<Option<String>> {
+    let policy = SecretPolicy::new(secrets.iter().cloned());
     let mut cursor: Option<String> = None;
     let mut seen_cursors = HashSet::new();
     let mut final_text = None;
@@ -1980,12 +1981,12 @@ async fn read_final_text(
                 match item.get("phase").and_then(Value::as_str) {
                     Some("final_answer") => {
                         if text.len() <= MAX_EVENT_BYTES {
-                            final_text = Some(redact(text, secrets));
+                            final_text = Some(policy.redact_text(text));
                         }
                         return Ok(final_text);
                     }
                     None if phase_unknown_text.is_none() && text.len() <= MAX_EVENT_BYTES => {
-                        phase_unknown_text = Some(redact(text, secrets));
+                        phase_unknown_text = Some(policy.redact_text(text));
                     }
                     _ => {}
                 }
@@ -2151,14 +2152,6 @@ fn settle_control(session: &mut AgentSession, command_id: &str, outcome: Control
     if let Some(command) = session.control_commands.get_mut(command_id) {
         command.outcome = outcome;
     }
-}
-
-fn rejected_control(reason: &str) -> Value {
-    json!({"state": "rejected", "reason": reason})
-}
-
-fn unknown_control(reason: &str) -> Value {
-    json!({"state": "unknown", "reason": reason})
 }
 
 fn validate_binding(session: &AgentSession, agent_id: &str, generation: i64) -> Result<()> {
@@ -2426,10 +2419,6 @@ fn terminal_turn_status(status: &str) -> bool {
     matches!(status, "completed" | "interrupted" | "failed")
 }
 
-fn native_no_write(code: &str) -> bool {
-    matches!(code, "native_not_dispatched" | "busy" | "frame_too_large")
-}
-
 pub(crate) fn contextual_error(
     error: Error,
     code: impl Into<String>,
@@ -2495,10 +2484,6 @@ fn is_secret_name(name: &str) -> bool {
         || upper.contains("PASSWORD")
         || upper.contains("API_KEY")
         || upper.contains("AUTH")
-}
-
-fn redact(text: &str, secrets: &[String]) -> String {
-    SecretPolicy::new(secrets.iter().cloned()).redact_text(text)
 }
 
 fn app_server_args() -> Vec<OsString> {

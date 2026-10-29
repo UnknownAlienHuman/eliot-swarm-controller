@@ -73,48 +73,41 @@ rule actions have bounded derived ids. No general receipt/floor framework.
 | `mail.send/inbox/read/ack`, `var.*`, `who`, `claim.*` | later coordination |
 | `rule.*`, `timer.*`, `goal.*` | later automation; effects remain commands |
 
-Filter shape is `{kinds?,agents?,tree?,sources?,ephemeral?}`. Errors include
+Canonical public wire types are re-exported by
+[`eliot_core::api`](../../crates/eliot-core/src/api.rs). These DTOs and their validators
+define field names, JSON shapes and grammar; this spec owns behavior and authority. Principal
+authentication precedes method parameter validation.
+
+| Surface | Canonical DTO definitions |
+| --- | --- |
+| Agent/daemon views and cursors | [agent_views.rs](../../crates/eliot-core/src/api/agent_views.rs) |
+| Nested observation/Git views | [monitor_views.rs](../../crates/eliot-core/src/api/monitor_views.rs) |
+| Command, turn and result queries | [reads.rs](../../crates/eliot-core/src/api/reads.rs) |
+| Command submission and shutdown | [mutations.rs](../../crates/eliot-core/src/api/mutations.rs) and [Core `SubmitCommand`](../../crates/eliot-core/src/lib.rs) |
+| Discovery/history queries and pages | [native_requests.rs](../../crates/eliot-core/src/api/native_requests.rs), [native_pages.rs](../../crates/eliot-core/src/api/native_pages.rs) |
+| Event queries, filters and pages | [api.rs](../../crates/eliot-core/src/api.rs) |
+
+Errors include
 `not_found`, `unsupported`, `not_allowed`, `bad_state`, `stale_generation`, `invalid`,
 `busy`, `unavailable`, `capacity_unavailable`, `history_gap`, `source_integrity`,
 `secret_in_payload`, `frame_too_large`, `mailbox_full`, `internal`.
 
+[`Error.code`](../../crates/eliot-core/src/lib.rs) is an open string, not a closed wire
+enum; plugin-specific codes may be preserved. Unfamiliar post-I/O error codes classify
+as `Unknown` under [Core policy](../../crates/eliot-core/src/command.rs), never proof
+of failure or permission to replay the effect.
+
 ## Agent and daemon read views
 
-The seven view calls use shared Core request/response DTOs and keep the existing JSON
-wire shape:
+The seven view calls use the Core view DTOs linked above. `daemon.status` is owner-only
+and accepts an empty object. Its bounded blocker/command lists retain truncation flags;
+unknown commands remain unknown. Agent list observations appear only when requested.
+Absent source cursors and sequence/acknowledgement values remain null.
 
-The request/response DTOs and `AgentListRow` are re-exported through `core::api`.
-
-```text
-daemon.status {} -> DaemonStatusResponse
-agent.get {id} -> AgentGetResponse
-agent.list {after?, limit?, observations?}
-  -> AgentListResponse {agents:[AgentListRow], next:string|null}
-agent.processes {id, generation?, scope?, after?, limit?}
-  -> AgentProcessesResponse {agent, generation, processes:[ProcessRecord], next, scope?}
-agent.stats {id, generation?} -> AgentStatsResponse
-agent.git {id, generation?} -> AgentGitResponse
-agent.edits {id, generation?, after?, limit?}
-  -> AgentEditsResponse {agent, generation, edits:[AgentEdit], next:string|null}
-```
-
-`daemon.status` is owner-only and accepts an empty object. Its response carries
-`state`, `admission`, `agents`, `store_write_faulted`, `owned_plugins`,
-`observer_readers`, `discovery_readers`, `workspace_custody`,
-`workspace_recovery_error`, the unknown/unsettled command counts and bounded lists with
-their truncation flags, and `blockers`. Unknown commands remain unknown in this view.
-
-`AgentGetResponse` flattens the existing `Agent` fields and adds `observation` and
-`source_states`. `AgentListRow` also flattens `Agent`, adding `observation` only when
-`observations` is true. `AgentStatsResponse` flattens `ObservationView` beside
-`agent`/`generation`; `AgentGitResponse` similarly flattens `GitView`. `SourceState`
-rows include `agent_id`, `generation`, `source`, `families`, `owners`, `state`, `health`,
-`cursor`, `last_store_seq`, last-batch id/sequence fields and gap id/from/to/sequence
-fields. Cursor and sequence/acknowledgement values that are not present remain null.
 `agent.get` includes the current generation's source rows and the managed workspace
 target generation's rows when it differs. If persisted state requires a live owner and
-the corresponding source is absent, `agent.get` returns `unknown` rather than asserting
-the persisted state is current.
+the corresponding source is absent, it returns `unknown` rather than asserting the
+persisted state is current.
 
 Request DTOs reject unknown fields. Required Agent IDs are nonempty after a trim check
 and are kept as supplied. Optional `generation`, `after` and process `scope` members may
@@ -135,10 +128,10 @@ reply before printing it or advancing a cursor.
 For `agent.processes`, omitted generation selects the current Agent generation for
 `scope:"agent"`, or the managed workspace target generation for `scope:"workspace"`.
 The Router resolves and authorizes that exact target before checking the cursor; owners
-may read retained historical Agent generations. `ProcessPageCursor` encodes
-`{agent,generation,scope,identity}`, with identity `{host_boot_id,pid,start_time}`, and
-is limited to 2 KiB. Pass it back unchanged. `next` is the last returned identity even
-on the last nonempty page; continue until `processes` is empty. A different Agent,
+may read retained historical Agent generations. `ProcessPageCursor` binds the exact
+Agent, generation, scope and process birth identity and is limited to 2 KiB. Pass it
+back unchanged. `next` is the last returned identity even on the last nonempty page;
+continue until `processes` is empty. A different Agent,
 generation or scope rejects before querying process rows. The workspace response includes
 `scope:"workspace"`; the Agent-scope response omits `scope`.
 
@@ -149,38 +142,17 @@ Its `after` is a path cursor: nonempty, at most 64 KiB, and without NUL. Pass it
 unchanged; the CLI does not resolve or normalize it. Edit pages default to 100 rows,
 with limits 1–1,000, and `next` is the last returned path even on a nonempty final page.
 
-`ObservationView::Data` contains `processes_truncated`, `processes`, `stats`, `liveness`,
-`workspace` and `git`; its unavailable variant is `{available:false,error_code}`.
-`ProcessStatsView` contains `available`, `sampled_at`, `age_ms`, `ttl_ms`,
-`clock_regressed`, `coverage`, `complete`, `cpu_time_ns`, `rss_bytes`, `samples` and
-`error`. `StatsCoverage` is `unknown`, `stale`, `complete` or `partial`. `LivenessView`
-contains `state`, `last_model_progress`, `age_ms`, `clock_regressed`, `basis` and
-`source_healthy`. Missing or stale metrics remain null/unknown, never zero.
+The canonical monitoring DTOs distinguish process records, ephemeral CPU/RSS samples,
+liveness, workspace custody and Git coverage. Their unavailable variants retain the
+reason and may retain cached data. Missing or stale metrics stay null/unknown, never
+zero; process activity is not model progress. Git and Windows canonical paths remain
+opaque to the CLI, without resolution or normalization. Filesystem `retry_after_ms`
+distinguishes an absent watch slot from an inactive one.
 
-`WorkspaceView::Data` contains `owner`, `target_generation`, `phase`, `setup_index`,
-`processes_truncated`, `processes`, `stats` and `source`; its unavailable variant retains
-`error`. `GitView::Data` contains `available`, `workspace`, `observed_at`, `age_ms`,
-`ttl_ms`, `clock_regressed`, `retry_after_ms`, `filesystem_invalidation`, `head`,
-`branch`, `dirty`, `commits`, `complete`, `history_complete`, `history_gap`, `base_oid`,
-`committed_paths`, `base_complete`, `baseline`, `edits_truncated`, `edits`, `source` and
-`error`. Its unavailable variant retains `error_code`; its nested error variant retains
-`error`. Git and Windows canonical paths remain opaque strings to the CLI; it does not
-resolve or normalize them. `FilesystemInvalidationState` is `healthy`, `degraded`,
-`unavailable` or `inactive`; `retry_after_ms` distinguishes an absent watch slot from
-an inactive one.
-
-The neutral types are `ObservationView`, `ObservationData`, `ProcessStatsView`,
-`StatsCoverage`, `LivenessView`, `WorkspaceView`, `WorkspaceObservation`, `GitView`,
-`GitObservation`, `MonitoringSourceState`, `FilesystemInvalidationView` and
-`FilesystemInvalidationState`. `WorkspaceObservation.source` uses `SourceState`, whose
-owner rows contain family/source/mechanism. `GitObservation.source` uses
-`MonitoringSourceState`, which has no owners. Its `last_batch_digest` and `gap_digest`
-are nullable JSON byte arrays, not strings. Source cursor and sequence/acknowledgement
-values remain nullable. Normal view variants may retain cached data while marked
-unavailable. Process records and ephemeral CPU/RSS samples stay distinct; process
-activity is not model progress. Stale, partial, gap and unknown values are not converted
-to clean, complete or zero. See
-[monitoring](monitoring.md#process-observation-and-terminal-ordering) for freshness and
+Workspace sources carry family ownership; Git monitoring sources do not. Source
+digests are nullable JSON byte arrays, not strings; cursor and acknowledgement values
+remain nullable. Stale, partial, gap and unknown values never become clean, complete
+or zero. See [monitoring](monitoring.md#process-observation-and-terminal-ordering) for freshness and
 [Git coverage](monitoring.md#git-and-filesystem-monitor) semantics.
 
 `agent.edits` attribution requires verified, generation-matched native file-change hints;
@@ -189,22 +161,14 @@ process statistics nor model progress.
 
 ## Command admission
 
-```text
-command.submit {
-  id:ULID, target?:string, verb:string, args?:object,
-  expected_generation?:i64, expected_turn_id?:string, request_id?:string
-}
--> CommandSubmitResponse {command_id:string, agent:string|null, generation:i64|null,
-    state:CommandState, outcome:Value|null, linked_command:string|null}
-```
-
-The shared request type is `core::api::CommandSubmitRequest`, an alias of Core
-`SubmitCommand`. `id` and `verb` are required; unknown fields and wrong types are
-`invalid`. Optional `target`, `expected_generation`, `expected_turn_id` and `request_id`
+`command.submit` uses `CommandSubmitRequest` (the Core `SubmitCommand` alias) and
+`CommandSubmitResponse` from the canonical mutation DTOs. `id` and `verb` are required;
+unknown fields and wrong types are `invalid`. Optional `target`, `expected_generation`,
+`expected_turn_id` and `request_id`
 may be omitted or `null` to mean absent. `args` defaults to `{}` only when omitted and
 must be a JSON object; explicit `null` or another type is `invalid`. Absent expectations
-remain absent. The response has these six members; `fanout` is not part of the current
-response.
+remain absent. All six response members remain present, including nullable binding,
+outcome and linked-command values; `fanout` is not part of the current response.
 
 Resolve the target and validate principal/capability/state before persisting the command
 binding and events. Each verb checks `expected_generation` at its defined admission or
@@ -273,22 +237,10 @@ execution semantics.
 
 ## Command, turn, and result reads
 
-These are read-only lookups of existing records. Their IDs are never sent through a
-mutation call and cannot submit or replay work. The current typed request/response
-shapes are:
-
-```text
-command.get {id:string} -> Command
-turn.get {agent:string, generation:i64, turn_id:string} -> Turn
-agent.result {id:string, generation?:i64, turn_id?:string, limit?:usize}
-  -> AgentResultResponse {agent:string, generation:i64, turns:[Turn], agent_metadata:Agent}
-```
-
-`Command` and `Agent` use their Core model fields. The current `Turn` object contains
-`agent`, `generation`, `turn_id`, `state`, `status`, `final_text`, `started_at` and
-`completed_at`; it has no `command_ids`, `usage` or `resolution_source` fields. Those
-remain future turn-result or resolution metadata. `agent.result` decodes `turns` as an
-array of objects and `agent_metadata` as an object.
+These are read-only lookups using the canonical read DTOs and Core `Command`, `Turn`
+and `Agent` models. IDs never pass through a mutation call and cannot submit or replay
+work. Richer command/usage/resolution metadata remains deferred. `agent.result` requires
+an array of turn objects and an object for Agent metadata, not positional records.
 
 Required IDs must be strings whose trimmed value is nonempty. Validation does not trim,
 normalize or impose a new length limit on them. `turn.get` requires a nonnegative integer
@@ -368,21 +320,8 @@ later ownership takeover gets the next generation. Validate before dispatch, com
 identity fence before native I/O, and install exact readback on success. Failure never
 restores revoked control; unknown blocks another takeover.
 
-The first discovery caller requires an explicit existing profile:
-
-```text
-agent.discover {profile:string, harness?:string, native_scope?:string,
-  cursor?:string, limit?:usize}
-  -> {harness, native_scope, subjects:[{native_ref,workspace,state,
-       created_at,updated_at,source,ephemeral}], next_cursor,
-       coverage:{kind,complete}}
-agent.history {id:string, generation?:i64, source:string,
-  view:string, turn_id?:string, cursor?:string, limit?:usize}
-  -> {agent_id, generation, native_scope, native_ref, source, view,
-      entries:[Value], next_cursor, coverage:object}
-```
-
-The shared Core request DTOs are `core::api::{AgentDiscoverRequest,AgentHistoryRequest}`.
+`agent.discover` uses `AgentDiscoverRequest`/`DiscoverPage`; `agent.history` uses
+`AgentHistoryRequest`/`ObservationPage` from the canonical native metadata DTOs.
 `profile` and `id` are required nonempty strings. Present strings are checked for
 nonemptiness after trimming but are preserved as supplied. For `agent.discover`, optional
 `harness`, `native_scope` and `cursor` may be omitted or `null` to mean absent. For
@@ -465,26 +404,7 @@ resends previous input.
 
 ## Event replay
 
-```text
-events.read {
-  after?: i64, limit?: usize, filter?: EventsFilter
-} -> EventsReadResponse {
-  events: Vec<Event>, next: i64, high_water: i64, truncated: bool
-}
-
-events.subscribe {
-  after?: i64, limit?: usize, wait_ms?: u64, filter?: EventsFilter
-} -> EventsSubscribeResponse {
-  events: Vec<Event>, next: i64, high_water: i64, truncated: bool, lagged: bool
-}
-
-EventsFilter {
-  agents?: Vec<String>, kinds?: Vec<String>, sources?: Vec<String>
-}
-```
-
-The shared Rust DTO surface for these two methods is
-`core::api::{EventsFilter,EventsReadRequest,EventsSubscribeRequest,EventsReadResponse,EventsSubscribeResponse}`.
+Event requests, responses and `EventsFilter` are defined in the canonical Core API.
 
 Before printing events or advancing a cursor, validate each response page against the
 effective request cursor: `0 <= after <= next <= high_water`. Event `seq` values must be
@@ -538,10 +458,7 @@ See [coordination](coordination.md#mailbox) for bounds and presentation policy.
 
 ## Drain and shutdown
 
-```text
-daemon.shutdown {id:ULID, mode:"drain"|"force"}
-  -> DaemonShutdownResponse {state, mode, blockers?:[StatusBlocker], store_write_faulted?:bool}
-```
+`daemon.shutdown` uses the canonical `DaemonShutdownRequest`/`DaemonShutdownResponse`.
 
 This owner-only request requires exactly an `id` and the `ShutdownMode` value `drain` or
 `force`; unknown fields, missing fields, wrong types and nulls are `invalid`. Its first

@@ -1,15 +1,13 @@
 //! Harness-neutral discovery and private-history pages shared with plugins.
-//! Transport/profile/environment DTOs and vendor records remain outside Core.
+//! Vendor records remain opaque; native transport types stay in their plugins.
 
+pub use crate::limits::{
+    MAX_DISCOVER_PAGE_BYTES, MAX_DISCOVER_PAGE_ENTRIES, MAX_OBSERVATION_CURSOR_BYTES,
+    MAX_OBSERVATION_PAGE_BYTES, MAX_OBSERVATION_PAGE_ENTRIES,
+};
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-
-pub const MAX_DISCOVER_PAGE_ENTRIES: usize = 1_000;
-pub const MAX_DISCOVER_PAGE_BYTES: usize = 900 * 1024;
-pub const MAX_OBSERVATION_PAGE_ENTRIES: usize = 1_000;
-pub const MAX_OBSERVATION_PAGE_BYTES: usize = 900 * 1024;
-pub const MAX_OBSERVATION_CURSOR_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DiscoverSubject {

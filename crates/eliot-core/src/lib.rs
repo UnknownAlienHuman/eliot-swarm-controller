@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
 pub mod api;
+pub mod limits;
 
+mod agent_start;
 mod canonical;
 mod command;
 mod diagnostics;
@@ -9,6 +11,7 @@ mod ids;
 mod secrets;
 mod source_handoff;
 
+pub use agent_start::AgentStartParams;
 pub use canonical::canonical_json_sha256;
 pub use command::{
     classify_dispatched_error, command_transition_allowed, workspace_preparation_transition_allowed,

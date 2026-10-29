@@ -8,7 +8,7 @@ use crate::{
     platform::{CustodyObserver, OwnedChild},
 };
 use eliot_core::{Agent, Error, Result, SecretPolicy, StderrSnapshot};
-use eliot_plugin::{PluginManifest, StderrCapture, spawn_stderr};
+use eliot_plugin::{PluginManifest, StderrCapture, spawn_stderr, sync::LockExt};
 use serde_json::{Value, json};
 #[cfg(unix)]
 use std::time::Duration;
@@ -108,11 +108,7 @@ impl PluginHost {
                 }
             })
         };
-        self.state
-            .secrets
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(credential.clone());
+        self.state.secrets.lock_recover().insert(credential.clone());
         Ok(ReaderTransport {
             child,
             client,

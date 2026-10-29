@@ -44,9 +44,10 @@ including JSON escaping. Error serialization reserves space for its primary code
 message within the 64 KiB encoded Error bound. Do not serialize free-form error messages,
 request arguments or environment values into the log record.
 
-Maximum encoded frame is 1 MiB. Inline input is at most 512 KiB; persisted event data/final
-text 64 KiB; pages at most 1,000 entries and below 900 KiB. Both semantic and encoded
-limits apply, including JSON escaping. Reject oversize input before native I/O.
+Maximum encoded frame is 1 MiB including the NDJSON newline. Inline input is at most
+512 KiB; persisted event data/final text 64 KiB; pages at most 1,000 entries and below
+900 KiB. Both semantic and encoded limits apply, including JSON escaping. Reject
+oversize input before native I/O.
 Continuously drain cancel-safe readers; never cancel a partially read line. Credentials
 are excluded from logs, recordings and plugin state.
 
@@ -91,6 +92,14 @@ normalized native family. Hooks never mirror lifecycle already supplied by the s
 `resume_from={native_scope,native_ref}` is an `agent.start` option, not replay of the
 old input. `initial={command_id,text}` is supplied only for a harness that requires
 input to create a session. Explicit new text remains a separate linked command.
+
+`eliot_core::AgentStartParams` is the shared start-parameter definition used by Store
+preflight, host dispatch and plugin decoding; Plugin reexports it. Missing optional
+fields decode as `None`, and serialization retains their nullable wire fields. Store's
+preflight cannot include runtime secrets/environment or later source readback. The host
+must check the complete encoded request, including its actual id and NDJSON newline,
+after filling those fields and before enqueueing the request. Admission preflight is
+not proof that the completed runtime frame fits.
 
 `features.discover` defaults to false. A discovery instance initializes independently
 of an Agent and has no authority to call `events.put`, `process.put` or other durable

@@ -8,9 +8,10 @@ use crate::common::{now_ms, secure_eq, valid_environment_name};
 use crate::monitor::Monitoring;
 use crate::platform::OwnedChild;
 use eliot_core::{
-    Agent, Command, Error, Result, SecretPolicy, SourceBatch, SourceGap, SourceGapAck, StderrSource,
+    Agent, AgentStartParams, Command, Error, Result, SecretPolicy, SourceBatch, SourceGap,
+    SourceGapAck, StderrSource,
 };
-use eliot_plugin::{PluginManifest, StderrCapture, StderrView, spawn_stderr};
+use eliot_plugin::{PluginManifest, StderrCapture, StderrView, spawn_stderr, sync::LockExt};
 use serde_json::{Map, Value, json};
 use std::{
     collections::{HashMap, HashSet},
@@ -283,11 +284,7 @@ impl PluginHost {
             generation: agent.generation,
         };
         {
-            let running = self
-                .state
-                .running
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let running = self.state.running.lock_recover();
             if running.contains_key(&key) {
                 return Err(Error::new(
                     "bad_state",
@@ -322,16 +319,11 @@ impl PluginHost {
             crate::redaction::redact_value(source_state, &source_credentials);
         }
         {
-            let mut credentials = self
-                .state
-                .agent_credentials
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut credentials = self.state.agent_credentials.lock_recover();
             credentials.insert((key.id.clone(), key.generation), agent_token.clone());
             self.state
                 .secrets
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .lock_recover()
                 .insert(agent_token.clone());
         }
         self.state.monitoring.prepare_generation(&agent).await?;
@@ -367,11 +359,7 @@ impl PluginHost {
             .await?;
             return Err(error);
         }
-        self.state
-            .secrets
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(credential.clone());
+        self.state.secrets.lock_recover().insert(credential.clone());
         let stdin = child.take_stdin();
         let stdout = child.take_stdout();
         let stderr = child.take_stderr();
@@ -420,11 +408,7 @@ impl PluginHost {
         let (started_tx, started_rx) = oneshot::channel();
         let actor_key = key.clone();
         {
-            let mut running = self
-                .state
-                .running
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut running = self.state.running.lock_recover();
             running.insert(
                 actor_key.clone(),
                 RuntimeEntry {
@@ -572,8 +556,7 @@ impl PluginHost {
         let entries: Vec<_> = self
             .state
             .running
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_recover()
             .iter()
             .map(|(key, entry)| (key.clone(), entry.sender.clone()))
             .collect();
@@ -596,29 +579,20 @@ impl PluginHost {
     }
 
     pub(crate) fn live_count(&self) -> usize {
-        self.state
-            .running
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
+        self.state.running.lock_recover().len()
     }
 
     pub(crate) fn controls_generation(&self, agent: &str, generation: i64) -> bool {
-        self.state
-            .running
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains_key(&AgentKey {
-                id: agent.to_owned(),
-                generation,
-            })
+        self.state.running.lock_recover().contains_key(&AgentKey {
+            id: agent.to_owned(),
+            generation,
+        })
     }
 
     pub(crate) fn take_late_batch_cause(&self, agent: &str, generation: i64) -> Option<String> {
         self.state
             .late_batch_causes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_recover()
             .remove(&AgentKey {
                 id: agent.to_owned(),
                 generation,
@@ -632,8 +606,7 @@ impl PluginHost {
     ) -> Result<(mpsc::Sender<RuntimeMessage>, StderrView, Arc<[String]>)> {
         self.state
             .running
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_recover()
             .get(key)
             .ok_or_else(|| {
                 Error::new(
@@ -668,10 +641,7 @@ impl PluginHost {
         let state = state
             .upgrade()
             .ok_or_else(|| Error::new("unknown", "plugin host stopped during initialization"))?;
-        let mut running = state
-            .running
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut running = state.running.lock_recover();
         let entry = running.get_mut(key).ok_or_else(|| {
             Error::new(
                 "unknown",
@@ -741,11 +711,7 @@ impl PluginHost {
     }
 
     fn remove_plugin_secret(&self, credential: &str) {
-        self.state
-            .secrets
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(credential);
+        self.state.secrets.lock_recover().remove(credential);
     }
 
     async fn mark_reader_unavailable(&self, key: &AgentKey) {
@@ -805,6 +771,69 @@ async fn run_agent(
     }
 }
 
+async fn initialize_agent(actor: &AgentActorConfig, client: &PluginClient) -> Result<Value> {
+    let init = client
+        .call(
+            "initialize",
+            json!({
+                "protocol": "eliot-plugin/1",
+                "credential": actor.plugin_credential,
+                "instance_dir": actor.instance_dir,
+                "config": {"harness": actor.agent.harness},
+            }),
+            deadline(),
+        )
+        .await
+        .map_err(|error| redact_native_error(error, &actor.source_credentials))?;
+    let manifest: PluginManifest = serde_json::from_value(init)
+        .map_err(|_| Error::new("unsupported", "Agent plugin returned a malformed manifest"))?;
+    let source_plan = manifest_source_plan(&manifest, &actor.agent.harness)?;
+    if !manifest
+        .verbs
+        .iter()
+        .any(|verb| verb == &actor.start_command.verb)
+    {
+        return Err(Error::new(
+            "unsupported",
+            format!(
+                "Agent plugin does not advertise {}",
+                actor.start_command.verb
+            ),
+        ));
+    }
+    PluginHost::install_runtime_verbs(
+        &actor.state,
+        &actor.key,
+        manifest.verbs.into_iter().collect(),
+    )?;
+    Ok(source_plan)
+}
+
+async fn cleanup_startup(
+    actor: &AgentActorConfig,
+    child: OwnedChild,
+    event_task: &mut tokio::task::JoinHandle<()>,
+    pending_failure: &mut Option<PendingFailure>,
+) {
+    let exited = terminate_child(child, &actor.monitoring, &actor.agent).await;
+    if let Err(error) = settle_owned_source_exit(
+        &actor.state,
+        &actor.key,
+        Some(event_task),
+        exited,
+        "plugin_startup_exit",
+    )
+    .await
+    {
+        pending_failure.get_or_insert(PendingFailure {
+            reply: None,
+            error,
+            command_id: actor.start_command.id.clone(),
+        });
+    }
+    cleanup_actor(&actor.state, &actor.key, &actor.plugin_credential, false).await;
+}
+
 async fn run_agent_inner(
     actor: AgentActorConfig,
     mut child: OwnedChild,
@@ -814,228 +843,67 @@ async fn run_agent_inner(
     started: oneshot::Sender<Result<Value>>,
     pending_failure: &mut Option<PendingFailure>,
 ) {
+    let source_plan = match initialize_agent(&actor, &client).await {
+        Ok(source_plan) => source_plan,
+        Err(error) => {
+            let _ = started.send(Err(error));
+            cleanup_startup(&actor, child, &mut event_task, pending_failure).await;
+            return;
+        }
+    };
+    let start_params = AgentStartParams {
+        agent_id: actor.agent.id.clone(),
+        generation: actor.agent.generation,
+        command_id: actor.start_command.id.clone(),
+        profile: Some(actor.agent.profile_snapshot.clone()),
+        workspace: actor.agent.workspace.clone(),
+        target_environment: Some(actor.target_environment.clone()),
+        note: None,
+        source_plan: Some(source_plan),
+        source_state: actor.source_state.clone(),
+        resume_from: actor.resume_from.clone(),
+        initial: None,
+    };
+    let start = match serde_json::to_value(start_params) {
+        // PluginClient validates the exact completed RPC frame, including its
+        // allocated request ID and newline, before any bytes reach the writer.
+        Ok(params) => client.call("agent.start", params, deadline()).await,
+        Err(_) => Err(Error::new(
+            "internal",
+            "agent.start params could not be encoded",
+        )),
+    };
+    match start {
+        Ok(value) if validate_start_result(&value, &actor.agent, &actor.start_command).is_ok() => {
+            let _ = started.send(Ok(value));
+        }
+        Ok(_) => {
+            let error = Error::new("unknown", "plugin start did not prove session readiness");
+            let _ = started.send(Err(error));
+        }
+        Err(error) => {
+            let error = redact_native_error(error, &actor.source_credentials);
+            let uncertain = error.code == "unknown";
+            let _ = started.send(Err(error));
+            if !uncertain {
+                cleanup_startup(&actor, child, &mut event_task, pending_failure).await;
+                return;
+            }
+        }
+    }
+
     let AgentActorConfig {
         state,
         monitoring,
         key,
         agent,
         start_command,
-        instance_dir,
         plugin_credential,
-        target_environment,
         source_credentials,
-        resume_from,
-        source_state,
         stderr,
+        ..
     } = actor;
     let mut last_command_id = start_command.id.clone();
-    let init = client
-        .call(
-            "initialize",
-            json!({
-                "protocol": "eliot-plugin/1",
-                "credential": plugin_credential,
-                "instance_dir": instance_dir,
-                "config": {"harness": agent.harness},
-            }),
-            deadline(),
-        )
-        .await;
-    let init = match init {
-        Ok(value) => value,
-        Err(error) => {
-            let _ = started.send(Err(redact_native_error(error, &source_credentials)));
-            let exited = terminate_child(child, &monitoring, &agent).await;
-            if let Err(error) = settle_owned_source_exit(
-                &state,
-                &key,
-                Some(&mut event_task),
-                exited,
-                "plugin_startup_exit",
-            )
-            .await
-            {
-                pending_failure.get_or_insert(PendingFailure {
-                    reply: None,
-                    error,
-                    command_id: last_command_id.clone(),
-                });
-            }
-            cleanup_actor(&state, &key, &plugin_credential, false).await;
-            return;
-        }
-    };
-    let manifest: PluginManifest = match serde_json::from_value(init) {
-        Ok(manifest) => manifest,
-        Err(_) => {
-            let _ = started.send(Err(Error::new(
-                "unsupported",
-                "Agent plugin returned a malformed manifest",
-            )));
-            let exited = terminate_child(child, &monitoring, &agent).await;
-            if let Err(error) = settle_owned_source_exit(
-                &state,
-                &key,
-                Some(&mut event_task),
-                exited,
-                "plugin_startup_exit",
-            )
-            .await
-            {
-                pending_failure.get_or_insert(PendingFailure {
-                    reply: None,
-                    error,
-                    command_id: last_command_id.clone(),
-                });
-            }
-            cleanup_actor(&state, &key, &plugin_credential, false).await;
-            return;
-        }
-    };
-    let source_plan = match manifest_source_plan(&manifest, &agent.harness) {
-        Ok(source_plan) => source_plan,
-        Err(error) => {
-            let _ = started.send(Err(error));
-            let exited = terminate_child(child, &monitoring, &agent).await;
-            if let Err(error) = settle_owned_source_exit(
-                &state,
-                &key,
-                Some(&mut event_task),
-                exited,
-                "plugin_startup_exit",
-            )
-            .await
-            {
-                pending_failure.get_or_insert(PendingFailure {
-                    reply: None,
-                    error,
-                    command_id: last_command_id.clone(),
-                });
-            }
-            cleanup_actor(&state, &key, &plugin_credential, false).await;
-            return;
-        }
-    };
-    if !manifest
-        .verbs
-        .iter()
-        .any(|verb| verb == &start_command.verb)
-    {
-        let _ = started.send(Err(Error::new(
-            "unsupported",
-            format!("Agent plugin does not advertise {}", start_command.verb),
-        )));
-        let exited = terminate_child(child, &monitoring, &agent).await;
-        if let Err(error) = settle_owned_source_exit(
-            &state,
-            &key,
-            Some(&mut event_task),
-            exited,
-            "plugin_startup_exit",
-        )
-        .await
-        {
-            pending_failure.get_or_insert(PendingFailure {
-                reply: None,
-                error,
-                command_id: last_command_id.clone(),
-            });
-        }
-        cleanup_actor(&state, &key, &plugin_credential, false).await;
-        return;
-    }
-    let verbs: HashSet<String> = manifest.verbs.iter().cloned().collect();
-    if let Err(error) = PluginHost::install_runtime_verbs(&state, &key, verbs) {
-        let _ = started.send(Err(error));
-        let exited = terminate_child(child, &monitoring, &agent).await;
-        if let Err(error) = settle_owned_source_exit(
-            &state,
-            &key,
-            Some(&mut event_task),
-            exited,
-            "plugin_startup_exit",
-        )
-        .await
-        {
-            pending_failure.get_or_insert(PendingFailure {
-                reply: None,
-                error,
-                command_id: last_command_id.clone(),
-            });
-        }
-        cleanup_actor(&state, &key, &plugin_credential, false).await;
-        return;
-    }
-
-    let start_params = json!({
-        "agent_id": agent.id,
-        "generation": agent.generation,
-        "command_id": start_command.id,
-        "profile": agent.profile_snapshot,
-        "workspace": agent.workspace,
-        "target_environment": target_environment,
-        "note": null,
-        "source_plan": source_plan,
-        "source_state": source_state,
-        "resume_from": resume_from,
-        "initial": null,
-    });
-    let start = client.call("agent.start", start_params, deadline()).await;
-    match start {
-        Ok(value) if validate_start_result(&value, &agent, &start_command).is_ok() => {
-            let _ = started.send(Ok(value));
-        }
-        Ok(_) => {
-            let error = Error::new("unknown", "plugin start did not prove session readiness");
-            let _ = started.send(Err(error.clone()));
-            if error.code != "unknown" {
-                let exited = terminate_child(child, &monitoring, &agent).await;
-                if let Err(error) = settle_owned_source_exit(
-                    &state,
-                    &key,
-                    Some(&mut event_task),
-                    exited,
-                    "plugin_startup_exit",
-                )
-                .await
-                {
-                    pending_failure.get_or_insert(PendingFailure {
-                        reply: None,
-                        error,
-                        command_id: last_command_id.clone(),
-                    });
-                }
-                cleanup_actor(&state, &key, &plugin_credential, false).await;
-                return;
-            }
-        }
-        Err(error) => {
-            let error = redact_native_error(error, &source_credentials);
-            let uncertain = error.code == "unknown";
-            let _ = started.send(Err(error));
-            if !uncertain {
-                let exited = terminate_child(child, &monitoring, &agent).await;
-                if let Err(error) = settle_owned_source_exit(
-                    &state,
-                    &key,
-                    Some(&mut event_task),
-                    exited,
-                    "plugin_startup_exit",
-                )
-                .await
-                {
-                    pending_failure.get_or_insert(PendingFailure {
-                        reply: None,
-                        error,
-                        command_id: last_command_id.clone(),
-                    });
-                }
-                cleanup_actor(&state, &key, &plugin_credential, false).await;
-                return;
-            }
-        }
-    }
-
     let mut planned_exit = false;
     loop {
         tokio::select! {
@@ -1436,13 +1304,9 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
             } else {
                 match method.as_str() {
                     "process.put" => {
-                        let current = state.upgrade().is_some_and(|state| {
-                            state
-                                .running
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .contains_key(&key)
-                        });
+                        let current = state
+                            .upgrade()
+                            .is_some_and(|state| state.running.lock_recover().contains_key(&key));
                         if !current
                             || params.get("agent_id").and_then(Value::as_str)
                                 != Some(agent_id.as_str())
@@ -1554,75 +1418,17 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
                             "events_put_malformed",
                         )),
                     },
-                    "source.gap" => match serde_json::from_value::<SourceGap>(params) {
-                        Ok(mut gap) if gap.agent_id == agent_id && gap.generation == generation => {
-                            match redact_source_gap(&mut gap, &source_credentials) {
-                                Err(error) => Err(error),
-                                Ok(())
-                                    if gap.agent_id == agent_id && gap.generation == generation =>
-                                {
-                                    match binding.expected_subject() {
-                                        Err(error) => Err(error),
-                                        Ok(subject) => {
-                                            match timeout_at(request_deadline, store.lock()).await {
-                                                Ok(mut store) => {
-                                                    let result = match subject {
-                                                        Some(subject) => store
-                                                            .record_observed_source_gap(
-                                                                gap,
-                                                                subject,
-                                                                now_ms(),
-                                                            ),
-                                                        None => {
-                                                            store.record_source_gap(gap, now_ms())
-                                                        }
-                                                    };
-                                                    match result {
-                                                        Ok(change) => {
-                                                            bus.publish(&change.events);
-                                                            drop(store);
-                                                            let ack: SourceGapAck = change.value;
-                                                            serde_json::to_value(ack).map_err(
-                                                        |_| {
-                                                            Error::new(
-                                                                "internal",
-                                                                "source.gap acknowledgement could not be encoded",
-                                                            )
-                                                        },
-                                                    )
-                                                        }
-                                                        Err(_) if store.is_write_faulted() => {
-                                                            Err(Error::new(
-                                                                "unknown",
-                                                                "source.gap outcome is unknown; settle with source.state",
-                                                            ))
-                                                        }
-                                                        Err(error) => Err(redact_native_error(
-                                                            error,
-                                                            &source_credentials,
-                                                        )),
-                                                    }
-                                                }
-                                                Err(_) => Err(Error::new(
-                                                    "busy",
-                                                    "Store lock deadline elapsed for source.gap",
-                                                )),
-                                            }
-                                        }
-                                    }
-                                }
-                                Ok(()) => Err(Error::new(
-                                    "not_allowed",
-                                    "source.gap binding does not match this Agent generation",
-                                )),
-                            }
-                        }
-                        Ok(_) => Err(Error::new(
-                            "not_allowed",
-                            "source.gap binding does not match this Agent generation",
-                        )),
-                        Err(_) => Err(Error::new("invalid", "source.gap params are malformed")),
-                    },
+                    "source.gap" => {
+                        record_source_gap(
+                            &store,
+                            &bus,
+                            params,
+                            binding,
+                            &source_credentials,
+                            request_deadline,
+                        )
+                        .await
+                    }
                     "source.handoff" => {
                         source_handoff::record_source_handoff(
                             &store,
@@ -1693,17 +1499,13 @@ fn late_batch_error(
     cause: &str,
 ) -> Error {
     if let Some(state) = state.upgrade() {
-        state
-            .late_batch_causes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                AgentKey {
-                    id: agent_id.to_owned(),
-                    generation,
-                },
-                cause.to_owned(),
-            );
+        state.late_batch_causes.lock_recover().insert(
+            AgentKey {
+                id: agent_id.to_owned(),
+                generation,
+            },
+            cause.to_owned(),
+        );
     }
     Error::new("unknown", format!("events.put outcome unknown: {cause}"))
 }
@@ -1776,6 +1578,56 @@ fn redact_source_batch(batch: &mut SourceBatch, credentials: &[String]) -> Resul
         }
     }
     Ok(())
+}
+
+async fn record_source_gap(
+    store: &StoreHandle,
+    bus: &Bus,
+    params: Value,
+    binding: source_handoff::SourceBinding<'_>,
+    credentials: &[String],
+    until: Instant,
+) -> Result<Value> {
+    let mut gap: SourceGap = serde_json::from_value(params)
+        .map_err(|_| Error::new("invalid", "source.gap params are malformed"))?;
+    if gap.agent_id != binding.agent_id || gap.generation != binding.generation {
+        return Err(Error::new(
+            "not_allowed",
+            "source.gap binding does not match this Agent generation",
+        ));
+    }
+    // Redaction changes only reason; immutable binding validation stays above.
+    redact_source_gap(&mut gap, credentials)?;
+    let subject = binding.expected_subject()?;
+    let (result, write_faulted) = {
+        let mut store = timeout_at(until, store.lock())
+            .await
+            .map_err(|_| Error::new("busy", "Store lock deadline elapsed for source.gap"))?;
+        let result = match subject {
+            Some(subject) => store.record_observed_source_gap(gap, subject, now_ms()),
+            None => store.record_source_gap(gap, now_ms()),
+        };
+        if let Ok(change) = &result {
+            bus.publish(&change.events);
+        }
+        (result, store.is_write_faulted())
+    };
+    match result {
+        Ok(change) => {
+            let ack: SourceGapAck = change.value;
+            serde_json::to_value(ack).map_err(|_| {
+                Error::new(
+                    "internal",
+                    "source.gap acknowledgement could not be encoded",
+                )
+            })
+        }
+        Err(_) if write_faulted => Err(Error::new(
+            "unknown",
+            "source.gap outcome is unknown; settle with source.state",
+        )),
+        Err(error) => Err(redact_native_error(error, credentials)),
+    }
 }
 
 fn redact_source_gap(gap: &mut SourceGap, credentials: &[String]) -> Result<()> {
@@ -2487,10 +2339,7 @@ async fn forget_if_revoked(state: &HostState, key: &AgentKey) {
 }
 
 fn note_unknown_commands(state: &HostState, events: &[eliot_core::Event]) {
-    let mut unknown = state
-        .unknown_commands
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut unknown = state.unknown_commands.lock_recover();
     for event in events
         .iter()
         .filter(|event| event.kind == "command.unknown")
@@ -2511,10 +2360,7 @@ async fn cleanup_actor(
         return;
     };
     fence_runtime_generation(&state, key);
-    let mut secrets = state
-        .secrets
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut secrets = state.secrets.lock_recover();
     if !plugin_credential.is_empty() {
         secrets.remove(plugin_credential);
     }
@@ -2522,26 +2368,17 @@ async fn cleanup_actor(
 
 // Stop new command routing without revoking authorization for buffered source facts.
 fn fence_command_routing(state: &HostState, key: &AgentKey) {
-    state
-        .running
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(key);
+    state.running.lock_recover().remove(key);
 }
 
 fn fence_runtime_generation(state: &HostState, key: &AgentKey) {
     fence_command_routing(state, key);
     let credential = state
         .agent_credentials
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .lock_recover()
         .remove(&(key.id.clone(), key.generation));
     if let Some(credential) = credential {
-        state
-            .secrets
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&credential);
+        state.secrets.lock_recover().remove(&credential);
     }
 }
 
@@ -2550,17 +2387,11 @@ pub(crate) fn forget_revoked_agent_token(
     secrets: &SecretSet,
     key: &(String, i64),
 ) {
-    let removed = credentials
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(key);
+    let removed = credentials.lock_recover().remove(key);
     let Some(token) = removed else {
         return;
     };
-    secrets
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(&token);
+    secrets.lock_recover().remove(&token);
 }
 
 #[cfg(test)]

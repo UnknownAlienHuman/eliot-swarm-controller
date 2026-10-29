@@ -15,6 +15,7 @@ use eliot_core::{
     WorkspaceCancelOutcome, WorkspaceCreationOutcome, WorkspacePhase, WorkspacePreparation,
     WorkspacePreparationInput, WorkspaceRemovalOutcome, WorkspaceSetupOutcome,
 };
+use eliot_plugin::sync::LockExt;
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
@@ -681,19 +682,10 @@ impl WorkspaceManager {
         for preparation in preparations {
             let slot = self.slot(&preparation);
             let _operation = slot.operation.lock().await;
-            if slot
-                .active
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_some()
-            {
+            if slot.active.lock_recover().is_some() {
                 continue;
             }
-            let quiescent = match *slot
-                .last
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-            {
+            let quiescent = match *slot.last.lock_recover() {
                 Some(result) => result.quiescent,
                 // recover runs after exclusive daemon acquisition; prior Windows
                 // kill-on-close Jobs cannot outlive their owning daemon.
@@ -789,16 +781,9 @@ impl WorkspaceManager {
     pub(crate) fn has_owned_processes(&self) -> bool {
         self.inner
             .slots
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_recover()
             .values()
-            .any(|slot| {
-                slot.active
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .is_some()
-                    || slot.operation.try_lock().is_err()
-            })
+            .any(|slot| slot.active.lock_recover().is_some() || slot.operation.try_lock().is_err())
     }
 
     pub(crate) async fn stop_all(&self, force: bool) {
@@ -832,12 +817,7 @@ impl WorkspaceManager {
                 };
                 self.publish(&change.events);
                 drop(store);
-                if let Some(active) = slot
-                    .active
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .as_ref()
-                {
+                if let Some(active) = slot.active.lock_recover().as_ref() {
                     active.cancel.send_replace(true);
                 }
                 continue;
@@ -877,20 +857,9 @@ impl WorkspaceManager {
             let _ = self.cancel(&id).await;
         }
         // Removal cancellation also waits for the owner, without replaying a signal.
-        let slots: Vec<_> = self
-            .inner
-            .slots
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values()
-            .cloned()
-            .collect();
+        let slots: Vec<_> = self.inner.slots.lock_recover().values().cloned().collect();
         for slot in slots {
-            let active = slot
-                .active
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
+            let active = slot.active.lock_recover().clone();
             if let Some(mut active) = active {
                 let deadline = Instant::now() + CANCEL_TIME;
                 while active.done.borrow().is_none() {
@@ -978,8 +947,7 @@ impl WorkspaceManager {
         // Cancellation reserves this same gate even before the first spawn slot exists.
         self.inner
             .slots
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_recover()
             .entry(Key {
                 agent: preparation.agent.clone(),
                 target_generation: preparation.target_generation,
@@ -996,14 +964,7 @@ impl WorkspaceManager {
     }
 
     fn check_nonsecret(&self, value: Value) -> Result<()> {
-        let secrets: Vec<_> = self
-            .inner
-            .secrets
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .cloned()
-            .collect();
+        let secrets: Vec<_> = self.inner.secrets.lock_recover().iter().cloned().collect();
         if SecretPolicy::new(secrets).contains_value(&value) {
             return Err(problem(
                 "secret_in_payload",
@@ -1072,11 +1033,7 @@ impl WorkspaceManager {
             current.phase
         };
         // The durable marker is committed before any cancellation signal is sent.
-        let active = slot
-            .active
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        let active = slot.active.lock_recover().clone();
         if let Some(active) = &active {
             active.cancel.send_replace(true);
         }
@@ -1096,11 +1053,7 @@ impl WorkspaceManager {
                     }
                 }
             }
-            None => match *slot
-                .last
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-            {
+            None => match *slot.last.lock_recover() {
                 Some(result) => result.quiescent,
                 // After exclusive daemon acquisition, prior Windows kill-on-close
                 // Jobs cannot survive. This proves physical custody only: the
@@ -1161,10 +1114,7 @@ impl WorkspaceManager {
                 quiescent: true,
                 code: "workspace_process_not_started",
             };
-            *slot
-                .last
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
+            *slot.last.lock_recover() = Some(result);
             drop(gate);
             return result;
         }
@@ -1186,10 +1136,7 @@ impl WorkspaceManager {
                     quiescent: false,
                     code: "workspace_spawn_unknown",
                 };
-                *slot
-                    .last
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
+                *slot.last.lock_recover() = Some(result);
                 drop(gate);
                 return result;
             }
@@ -1201,10 +1148,7 @@ impl WorkspaceManager {
         let stderr = child.take_stderr();
         let (cancel, mut cancellation) = watch::channel(false);
         let (done, done_rx) = watch::channel(None);
-        *slot
-            .active
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ActiveRun {
+        *slot.active.lock_recover() = Some(ActiveRun {
             cancel,
             done: done_rx,
         });
@@ -1287,14 +1231,8 @@ impl WorkspaceManager {
                 .await;
         }
         let _gate = slot.gate.clone().lock_owned().await;
-        *slot
-            .last
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
-        *slot
-            .active
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *slot.last.lock_recover() = Some(result);
+        *slot.active.lock_recover() = None;
         let _ = done.send_replace(Some(result));
         self.inner
             .progress

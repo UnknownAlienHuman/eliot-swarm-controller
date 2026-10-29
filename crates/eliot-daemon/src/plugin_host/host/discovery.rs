@@ -4,7 +4,7 @@ use super::{
     signal_progress,
 };
 use eliot_core::{Error, Result, SecretPolicy, StderrSource};
-use eliot_plugin::DiscoverPage;
+use eliot_plugin::{DiscoverPage, sync::LockExt};
 use serde_json::{Value, json};
 use std::{collections::HashSet, sync::atomic::Ordering, time::Duration};
 use tokio::{sync::watch, time::Instant};
@@ -24,31 +24,18 @@ impl PluginHost {
     pub(crate) fn close_discovery_admission(&self) {
         // Shares the registration lock, so shutdown cannot miss a reader that
         // passed the Router check immediately before its admission mode changed.
-        let _readers = self
-            .state
-            .readers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _readers = self.state.readers.lock_recover();
         self.state.discovery_closed.store(true, Ordering::SeqCst);
     }
 
     pub(crate) fn reader_count(&self) -> usize {
-        let discoveries = self
-            .state
-            .readers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len();
+        let discoveries = self.state.readers.lock_recover().len();
         discoveries + self.observer_count()
     }
 
     pub(crate) async fn cancel_discoveries(&self) {
         let readers: Vec<_> = {
-            let readers = self
-                .state
-                .readers
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let readers = self.state.readers.lock_recover();
             self.state.discovery_closed.store(true, Ordering::SeqCst);
             readers
                 .values()
@@ -100,11 +87,7 @@ impl PluginHost {
         let (stop_tx, stop_rx) = watch::channel(false);
         let (done_tx, done_rx) = watch::channel(false);
         {
-            let mut readers = self
-                .state
-                .readers
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut readers = self.state.readers.lock_recover();
             if self.state.discovery_closed.load(Ordering::SeqCst) {
                 return Err(Error::new("unavailable", "discovery admission is closed"));
             }
@@ -130,11 +113,7 @@ impl PluginHost {
             let result = host
                 .read_subject_page(profile, environment, native_scope, cursor, limit, stop_rx)
                 .await;
-            host.state
-                .readers
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&id);
+            host.state.readers.lock_recover().remove(&id);
             done_tx.send_replace(true);
             signal_progress(&host.state);
             let _ = reply.send(result);

@@ -5,7 +5,7 @@ use super::{
 };
 use crate::common::now_ms;
 use eliot_core::{Agent, Command, CommandState, Error, Result, StderrSource};
-use eliot_plugin::{ObservationPage, ObservationQuery};
+use eliot_plugin::{ObservationPage, ObservationQuery, sync::LockExt};
 use serde_json::{Value, json};
 use std::sync::{
     Arc,
@@ -41,8 +41,7 @@ impl PluginHost {
     pub(crate) fn observes_generation(&self, id: &str, generation: i64) -> bool {
         self.state
             .observers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_recover()
             .get(&AgentKey {
                 id: id.to_owned(),
                 generation,
@@ -51,11 +50,7 @@ impl PluginHost {
     }
 
     pub(crate) fn observer_count(&self) -> usize {
-        self.state
-            .observers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
+        self.state.observers.lock_recover().len()
     }
 
     pub(crate) async fn attach_observer(
@@ -89,19 +84,11 @@ impl PluginHost {
         {
             // Same admission lock as discovery shutdown; registration precedes
             // all process/native I/O and survives a disconnected RPC caller.
-            let _admission = self
-                .state
-                .readers
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _admission = self.state.readers.lock_recover();
             if self.state.discovery_closed.load(Ordering::SeqCst) {
                 return Err(Error::new("unavailable", "reader admission is closed"));
             }
-            let mut observers = self
-                .state
-                .observers
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut observers = self.state.observers.lock_recover();
             if observers.contains_key(&key) {
                 return Err(Error::new(
                     "busy",
@@ -124,11 +111,7 @@ impl PluginHost {
                 until,
             )
             .await;
-            host.state
-                .observers
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&key);
+            host.state.observers.lock_recover().remove(&key);
             signal_progress(&host.state);
         });
         timeout_at(until, result)
@@ -249,8 +232,7 @@ impl PluginHost {
         let entries: Vec<_> = self
             .state
             .observers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_recover()
             .values()
             .cloned()
             .collect();
@@ -267,8 +249,7 @@ impl PluginHost {
     fn observer_entry(&self, id: &str, generation: i64) -> Result<Arc<ObserverEntry>> {
         self.state
             .observers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock_recover()
             .get(&AgentKey {
                 id: id.to_owned(),
                 generation,

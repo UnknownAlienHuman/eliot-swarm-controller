@@ -1,4 +1,6 @@
 use eliot_core::{Error, ProcessIdentity, ProcessSample, ProcessSnapshot, ProcessState, Result};
+#[cfg(any(unix, windows))]
+use eliot_plugin::sync::LockExt;
 use std::sync::{Arc, Mutex};
 
 #[cfg(unix)]
@@ -38,11 +40,7 @@ impl CustodyObserver {
 
     pub(crate) fn record_root_exit(&self, code: Option<i32>) {
         #[cfg(any(unix, windows))]
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .platform
-            .record_root_exit(code);
+        self.inner.lock_recover().platform.record_root_exit(code);
         #[cfg(not(any(unix, windows)))]
         let _ = code;
     }
