@@ -312,6 +312,75 @@ fn manual_replay_precedes_current_gates_and_keeps_schedule_cursor() {
 }
 
 #[test]
+fn once_at_registration_allows_manual_run_without_consuming_schedule() {
+    let mut store = store();
+    let registration_ms = now_ms();
+    let agent = ready_agent(&mut store, "timer-once-now", registration_ms);
+    let rule_id = "once-now";
+    store
+        .ensure_rule_state("owner", &rule_input(rule_id), registration_ms)
+        .unwrap();
+    let initial = TimerDefinitionInput {
+        id: rule_id.to_owned(),
+        schedule_revision: 1,
+        schedule: TimerSchedule::Once {
+            at: registration_ms,
+        },
+        enabled: true,
+        initial_next_due_at: None,
+    };
+    let timer = store
+        .ensure_timer_state("owner", &initial, registration_ms)
+        .unwrap();
+    assert_eq!(timer.next_due_at, None);
+    assert_eq!(timer.last_key, None);
+
+    let request = TimerRunRequest::new(Ulid::new().to_string(), rule_id);
+    let action = stop_request(&agent);
+    let first = store
+        .admit_manual_timer_run("owner", &request, &timer, action.clone(), registration_ms)
+        .unwrap();
+    assert!(first.is_new);
+    assert_eq!(first.parent.as_ref().unwrap().id, request.id);
+    let child_id = first
+        .child
+        .as_ref()
+        .expect("one ordinary stop child")
+        .id
+        .clone();
+
+    let retained_parent = store.replay_timer_run("owner", &request).unwrap().unwrap();
+    assert_eq!(retained_parent.id, request.id);
+    let children_before: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM commands WHERE parent_command = ?1",
+            [&request.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let replay = store
+        .admit_manual_timer_run("owner", &request, &timer, action, registration_ms + 1)
+        .unwrap();
+    assert!(!replay.is_new);
+    assert_eq!(replay.parent.as_ref().unwrap().id, request.id);
+    assert_eq!(replay.child.as_ref().unwrap().id, child_id);
+    let children_after: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM commands WHERE parent_command = ?1",
+            [&request.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(children_after, children_before);
+
+    let after = store.get_timer_state("owner", rule_id).unwrap().unwrap();
+    assert_eq!(after.last_key, None);
+    assert_eq!(after.next_due_at, None);
+}
+
+#[test]
 fn rate_limit_counts_each_admitted_child_once_and_excludes_parents() {
     let mut store = store();
     let registration_ms = now_ms();

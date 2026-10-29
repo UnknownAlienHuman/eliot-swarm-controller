@@ -288,10 +288,6 @@ fn initial_next_due_at(schedule: &TimerSchedule, registration_now: i64) -> Resul
             // slot after registration, so an old phase never replays history.
             schedule::next_after(schedule, anchor, registration_now)
         }
-        TimerSchedule::Once { at } if *at == registration_now => Err(Error::new(
-            "invalid",
-            "once timer has no slot strictly after registration",
-        )),
         TimerSchedule::Once { .. } | TimerSchedule::Cron { .. } => {
             schedule::next_after(schedule, 0, registration_now)
         }
@@ -606,10 +602,7 @@ mod timer_tests {
         assert_eq!(initial_next_due_at(&future, 100).unwrap(), Some(101));
 
         let at_boundary = TimerSchedule::Once { at: 100 };
-        assert_eq!(
-            initial_next_due_at(&at_boundary, 100).unwrap_err().code,
-            "invalid"
-        );
+        assert_eq!(initial_next_due_at(&at_boundary, 100).unwrap(), None);
     }
 
     #[test]
