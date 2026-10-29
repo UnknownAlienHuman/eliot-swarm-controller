@@ -7,6 +7,7 @@ use crate::{common::now_ms, logging, router::Router};
 use eliot_core::{
     Error, Result, SecretPolicy, SubmitCommand,
     api::{CatchUp, RuleStateView, TimerSchedule, TimerStateView},
+    canonical_json_sha256,
 };
 use eliot_store::{
     RuleCursorOutcome, RuleDefinitionInput, RuleProcessingState, TimerDefinitionInput,
@@ -25,7 +26,18 @@ const RULE_EVENT_PAGE_SIZE: usize = 128;
 const TIMER_PAGE_SIZE: usize = 128;
 const MAX_RULE_EVENT_BACKLOG: i64 = 100_000;
 const RULE_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
-pub(crate) type ReloadNoticeKey = Vec<(String, [u8; 32], bool)>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ReloadNoticeKey {
+    Snapshot([u8; 32]),
+    Rejection([u8; 32]),
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ReloadNoticeContext {
+    deferred: Option<ReloadNoticeKey>,
+    rejected: Option<ReloadNoticeKey>,
+}
 
 enum TimerDecision {
     NotDue,
@@ -66,13 +78,14 @@ pub(crate) async fn initialize_global_rules(
     router: &Router,
     data_root: &Path,
     policy: &SecretPolicy,
-) -> Result<(Vec<ActiveRule>, Option<ReloadNoticeKey>)> {
+) -> Result<(Vec<ActiveRule>, ReloadNoticeContext)> {
+    let mut notices = ReloadNoticeContext::default();
     let prior = router.global_rule_processing().await?;
     let registration_now = now_ms();
     let (snapshot, from_file) = match reload::load(data_root) {
         Ok(snapshot) => (snapshot, true),
         Err(error) if !prior.is_empty() => {
-            logging::record(policy, "daemon.rule_reload_rejected", &[], Some(&error));
+            report_rejected_source(policy, &error, &mut notices)?;
             (reload::from_processing(&prior)?, false)
         }
         Err(error) => return Err(error),
@@ -87,7 +100,7 @@ pub(crate) async fn initialize_global_rules(
                         "frame_too_large" | "invalid" | "secret_in_payload" | "unsupported"
                     ) =>
             {
-                logging::record(policy, "daemon.rule_reload_rejected", &[], Some(&error));
+                report_rejected_reload(policy, &snapshot.inputs, &error, &mut notices)?;
                 let saved = reload::from_processing(&prior)?;
                 (
                     apply_global_rule_snapshot(router, &saved, None, registration_now).await?,
@@ -96,53 +109,94 @@ pub(crate) async fn initialize_global_rules(
             }
             Err(error) => return Err(error),
         };
-    let deferred_notice = if candidate_from_file
+    if candidate_from_file
         && rules.iter().any(|rule| rule.retiring.is_some())
         && !snapshot.matches(
             &rules
                 .iter()
                 .map(|rule| rule.definition.clone())
                 .collect::<Vec<_>>(),
-        )? {
-        let mut notice = None;
-        report_deferred_reload(policy, &snapshot.inputs, &mut notice);
-        notice
-    } else {
-        None
-    };
-    Ok((rules, deferred_notice))
-}
-
-fn reload_notice_key(inputs: &[RuleDefinitionInput]) -> ReloadNoticeKey {
-    let mut key = inputs
-        .iter()
-        .map(|input| (input.id.clone(), input.definition_digest, input.enabled))
-        .collect::<Vec<_>>();
-    key.sort_by(|left, right| left.0.cmp(&right.0));
-    key
-}
-
-fn claim_deferred_notice(
-    inputs: &[RuleDefinitionInput],
-    last_notice: &mut Option<ReloadNoticeKey>,
-) -> bool {
-    let key = reload_notice_key(inputs);
-    if last_notice.as_ref() == Some(&key) {
-        false
-    } else {
-        *last_notice = Some(key);
-        true
+        )?
+    {
+        report_deferred_reload(policy, &snapshot.inputs, &mut notices)?;
     }
+    Ok((rules, notices))
+}
+
+fn reload_notice_key(inputs: &[RuleDefinitionInput]) -> Result<ReloadNoticeKey> {
+    let mut ordered = inputs.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| left.id.cmp(&right.id));
+    let value = json!({
+        "rules": ordered
+            .iter()
+            .map(|input| json!({
+                "id": input.id,
+                "digest": input.definition_digest,
+                "enabled": input.enabled,
+            }))
+            .collect::<Vec<_>>(),
+    });
+    canonical_json_sha256(&value)
+        .map(ReloadNoticeKey::Snapshot)
+        .map_err(|_| Error::new("internal", "reload notice could not be canonicalized"))
+}
+
+fn claim_notice(key: ReloadNoticeKey, last_notice: &mut Option<ReloadNoticeKey>) -> bool {
+    if last_notice.as_ref() == Some(&key) {
+        return false;
+    }
+    *last_notice = Some(key);
+    true
 }
 
 fn report_deferred_reload(
     policy: &SecretPolicy,
     inputs: &[RuleDefinitionInput],
-    last_notice: &mut Option<ReloadNoticeKey>,
-) {
-    if claim_deferred_notice(inputs, last_notice) {
+    notices: &mut ReloadNoticeContext,
+) -> Result<()> {
+    if claim_deferred_reload(inputs, notices)? {
         logging::record(policy, "daemon.rule_reload_deferred", &[], None);
     }
+    Ok(())
+}
+
+fn claim_deferred_reload(
+    inputs: &[RuleDefinitionInput],
+    notices: &mut ReloadNoticeContext,
+) -> Result<bool> {
+    let key = reload_notice_key(inputs)?;
+    if notices.rejected.as_ref() == Some(&key) {
+        return Ok(false);
+    }
+    Ok(claim_notice(key, &mut notices.deferred))
+}
+
+fn report_rejected_reload(
+    policy: &SecretPolicy,
+    inputs: &[RuleDefinitionInput],
+    error: &Error,
+    notices: &mut ReloadNoticeContext,
+) -> Result<()> {
+    if claim_notice(reload_notice_key(inputs)?, &mut notices.rejected) {
+        logging::record(policy, "daemon.rule_reload_rejected", &[], Some(error));
+    }
+    Ok(())
+}
+
+fn report_rejected_source(
+    policy: &SecretPolicy,
+    error: &Error,
+    notices: &mut ReloadNoticeContext,
+) -> Result<()> {
+    let details = json!({"code": error.code, "message": error.message});
+    let key = ReloadNoticeKey::Rejection(
+        canonical_json_sha256(&details)
+            .map_err(|_| Error::new("internal", "reload notice could not be canonicalized"))?,
+    );
+    if claim_notice(key, &mut notices.rejected) {
+        logging::record(policy, "daemon.rule_reload_rejected", &[], Some(error));
+    }
+    Ok(())
 }
 
 async fn apply_global_rule_snapshot(
@@ -372,7 +426,7 @@ pub(crate) async fn run_global_rules(
     mut rules: Vec<ActiveRule>,
     data_root: PathBuf,
     policy: Arc<SecretPolicy>,
-    initial_deferred_notice: Option<ReloadNoticeKey>,
+    initial_notices: ReloadNoticeContext,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     // Bus messages are wake hints; durable Store pages remain authoritative.
@@ -388,9 +442,7 @@ pub(crate) async fn run_global_rules(
     };
     let mut reconcile = tokio::time::interval(RULE_RECONCILE_INTERVAL);
     reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut last_reload_error: Option<(String, String)> = None;
-    let mut deferred_notice = initial_deferred_notice;
-    let mut rejected_inputs: Option<Vec<RuleDefinitionInput>> = None;
+    let mut notices = initial_notices;
     let mut last_applied_inputs = None;
     if let Ok(snapshot) = reload::load(&data_root) {
         let current = rules
@@ -399,12 +451,30 @@ pub(crate) async fn run_global_rules(
             .collect::<Vec<_>>();
         if snapshot.matches(&current).unwrap_or(false) {
             last_applied_inputs = Some(snapshot.inputs);
-            deferred_notice = None;
+            notices.deferred = None;
+            notices.rejected = None;
         } else if rules
             .iter()
             .any(|rule| rule.state.retiring_revision.is_some())
         {
-            report_deferred_reload(&policy, &snapshot.inputs, &mut deferred_notice);
+            let key = reload_notice_key(&snapshot.inputs)?;
+            if notices.rejected.as_ref() != Some(&key) {
+                match router
+                    .validate_global_rule_definitions(&snapshot.inputs)
+                    .await
+                {
+                    Ok(()) => report_deferred_reload(&policy, &snapshot.inputs, &mut notices)?,
+                    Err(error)
+                        if matches!(
+                            error.code.as_str(),
+                            "frame_too_large" | "invalid" | "secret_in_payload" | "unsupported"
+                        ) =>
+                    {
+                        report_rejected_reload(&policy, &snapshot.inputs, &error, &mut notices)?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
         }
     }
     loop {
@@ -465,28 +535,19 @@ pub(crate) async fn run_global_rules(
         }
 
         let snapshot = match reload::load(&data_root) {
-            Ok(snapshot) => {
-                last_reload_error = None;
-                snapshot
-            }
+            Ok(snapshot) => snapshot,
             Err(error) => {
-                let signature = (error.code.clone(), error.message.clone());
-                if last_reload_error.as_ref() != Some(&signature) {
-                    logging::record(&policy, "daemon.rule_reload_rejected", &[], Some(&error));
-                }
-                last_reload_error = Some(signature);
+                report_rejected_source(&policy, &error, &mut notices)?;
                 continue;
             }
         };
-        if last_applied_inputs.as_ref() == Some(&snapshot.inputs) {
-            rejected_inputs = None;
+        let snapshot_key = reload_notice_key(&snapshot.inputs)?;
+        if notices.rejected.as_ref() == Some(&snapshot_key) {
             continue;
         }
-        if rejected_inputs.as_ref() == Some(&snapshot.inputs)
-            && !rules
-                .iter()
-                .any(|rule| rule.state.retiring_revision.is_some())
-        {
+        if last_applied_inputs.as_ref() == Some(&snapshot.inputs) {
+            notices.deferred = None;
+            notices.rejected = None;
             continue;
         }
         let current_definitions = rules
@@ -495,16 +556,14 @@ pub(crate) async fn run_global_rules(
             .collect::<Vec<_>>();
         if snapshot.matches(&current_definitions)? {
             last_applied_inputs = Some(snapshot.inputs.clone());
-            rejected_inputs = None;
-            deferred_notice = None;
+            notices.deferred = None;
+            notices.rejected = None;
             continue;
         }
         let retirement_pending = rules
             .iter()
             .any(|rule| rule.state.retiring_revision.is_some());
-        if retirement_pending
-            && deferred_notice.as_ref() == Some(&reload_notice_key(&snapshot.inputs))
-        {
+        if retirement_pending && notices.deferred.as_ref() == Some(&snapshot_key) {
             continue;
         }
         match apply_global_rule_snapshot(&router, &snapshot, Some(&rules), now_ms()).await {
@@ -518,11 +577,11 @@ pub(crate) async fn run_global_rules(
                     .any(|rule| rule.state.retiring_revision.is_some())
                     && !snapshot.matches(&updated_definitions)?;
                 if deferred {
-                    report_deferred_reload(&policy, &snapshot.inputs, &mut deferred_notice);
+                    report_deferred_reload(&policy, &snapshot.inputs, &mut notices)?;
                 } else {
                     last_applied_inputs = Some(snapshot.inputs.clone());
-                    rejected_inputs = None;
-                    deferred_notice = None;
+                    notices.deferred = None;
+                    notices.rejected = None;
                 }
                 rules = updated;
             }
@@ -532,12 +591,7 @@ pub(crate) async fn run_global_rules(
                     "frame_too_large" | "invalid" | "secret_in_payload" | "unsupported"
                 ) =>
             {
-                let signature = (error.code.clone(), error.message.clone());
-                if last_reload_error.as_ref() != Some(&signature) {
-                    logging::record(&policy, "daemon.rule_reload_rejected", &[], Some(&error));
-                }
-                last_reload_error = Some(signature);
-                rejected_inputs = Some(snapshot.inputs.clone());
+                report_rejected_reload(&policy, &snapshot.inputs, &error, &mut notices)?;
             }
             Err(error) => return Err(error),
         }
@@ -1014,7 +1068,7 @@ mod timer_tests {
     }
 
     #[test]
-    fn deferred_reload_notice_deduplicates_same_snapshot_and_reports_new_edit() {
+    fn startup_rejected_snapshot_is_not_deferred_and_new_pending_edit_reports_once() {
         let input = |digest| RuleDefinitionInput {
             id: "rule-a".to_owned(),
             canonical_definition: "{}".to_owned(),
@@ -1023,20 +1077,14 @@ mod timer_tests {
         };
         let first = input(1);
         let changed = input(2);
-        let mut last_notice = None;
-
-        assert!(claim_deferred_notice(
-            std::slice::from_ref(&first),
-            &mut last_notice
+        let mut notices = ReloadNoticeContext::default();
+        assert!(claim_notice(
+            reload_notice_key(std::slice::from_ref(&first)).unwrap(),
+            &mut notices.rejected,
         ));
-        assert!(!claim_deferred_notice(
-            std::slice::from_ref(&first),
-            &mut last_notice
-        ));
-        assert!(claim_deferred_notice(
-            std::slice::from_ref(&changed),
-            &mut last_notice
-        ));
+        assert!(!claim_deferred_reload(std::slice::from_ref(&first), &mut notices).unwrap());
+        assert!(claim_deferred_reload(std::slice::from_ref(&changed), &mut notices).unwrap());
+        assert!(!claim_deferred_reload(std::slice::from_ref(&changed), &mut notices).unwrap());
     }
 
     #[test]
