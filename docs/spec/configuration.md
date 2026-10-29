@@ -194,11 +194,22 @@ Windows and exactly elsewhere. [Environment construction](../../crates/eliot-dae
 uses these captured inputs instead of looking them up again. This selector capture
 leaves other `pass_env` resolution unchanged.
 
-Retained mutation IDs hydrate their stored snapshot before any new capture. Existing
-admitted snapshots are neither rewritten nor backfilled: an absent capture is a legacy
+Retained mutation IDs hydrate their stored snapshot before any new capture. Admitted
+selector inputs are neither rewritten nor backfilled: an absent capture is a legacy
 snapshot, not captured null/unset, and keeps the established execution-time lookup.
 Such legacy inputs are not frozen. Capture proves only the supplied inputs, not the
 effective native home, database root or scope; native configuration can affect selection.
+
+For a new Codex launch, resolve the effective store only after the actual workspace is
+prepared, including setup. The owned read-only
+[`profile.store`](../../crates/eliot-plugin/src/protocol.rs) reader uses that workspace
+and the admitted inputs; it performs no native control or model request. In the launch
+dispatch transaction, [Store](../../crates/eliot-store/src/lib.rs) appends the verified
+[`NativeStoreBinding`](../../crates/eliot-core/src/native_store.rs) once to
+`Agent.profile_snapshot.native_store_binding`. The admitted `Command.args` and its
+payload digest remain unchanged. A retained binding cannot be replaced by rediscovery.
+Codex resume reuses it and verifies the pinned store before native control; legacy
+Agents without a binding refuse before control rather than selecting a store anew.
 
 ```text
 ProfileSnapshot {

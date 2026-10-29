@@ -8,6 +8,7 @@ mod canonical;
 mod command;
 mod diagnostics;
 mod ids;
+mod native_store;
 mod secrets;
 mod source_handoff;
 
@@ -21,6 +22,7 @@ pub use diagnostics::{
     bound_stderr_diagnostics,
 };
 pub use ids::parse_agent_id;
+pub use native_store::NativeStoreBinding;
 pub use secrets::SecretPolicy;
 pub use source_handoff::{SourceHandoff, SourceHandoffAck, SourceHandoffGap};
 

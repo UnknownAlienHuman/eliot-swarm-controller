@@ -2,7 +2,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
-pub use eliot_core::AgentStartParams;
 pub use eliot_core::api::{
     DiscoverCoverage, DiscoverPage, DiscoverSubject, MAX_DISCOVER_PAGE_BYTES,
     MAX_DISCOVER_PAGE_ENTRIES, MAX_OBSERVATION_CURSOR_BYTES, MAX_OBSERVATION_PAGE_BYTES,
@@ -11,6 +10,7 @@ pub use eliot_core::api::{
 pub use eliot_core::limits::{
     MAX_COMMAND_ID_BYTES, MAX_CREDENTIAL_BYTES, MAX_EVENT_BYTES, MAX_FRAME_BYTES, MAX_TEXT_BYTES,
 };
+pub use eliot_core::{AgentStartParams, NativeStoreBinding};
 
 pub(crate) fn empty_object() -> Value {
     Value::Object(Map::new())
@@ -170,6 +170,14 @@ pub fn fake_manifest() -> PluginManifest {
         ]),
         proxy: "none".to_owned(),
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileStoreParams {
+    pub profile: Value,
+    pub target_environment: Value,
+    pub workspace: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

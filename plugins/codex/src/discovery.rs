@@ -1,5 +1,5 @@
-//! Probe selection, then read metadata through a reader pinned to that exact store.
-//! No controlled thread or lifecycle publication.
+//! Probe store selection and verify readers or controlled startup against its pin.
+//! This module never creates a controlled thread or publishes lifecycle facts.
 
 use crate::{
     host::{contextual_error, native_scope},
@@ -13,7 +13,7 @@ use crate::{
         },
     },
 };
-use eliot_core::{Error, Result, SecretPolicy, canonical_json_sha256};
+use eliot_core::{Error, NativeStoreBinding, Result, SecretPolicy, canonical_json_sha256};
 use eliot_plugin::{
     DiscoverCoverage, DiscoverPage, DiscoverParams, DiscoverSubject, MAX_DISCOVER_PAGE_BYTES,
     MAX_DISCOVER_PAGE_ENTRIES, MAX_EVENT_BYTES,
@@ -95,6 +95,91 @@ impl StoreContext {
     pub(crate) fn root(&self) -> &Path {
         &self.root
     }
+
+    fn native_binding(&self, metadata_secrets: &[String]) -> Result<NativeStoreBinding> {
+        let binding = NativeStoreBinding {
+            home: self.home.to_str().ok_or_else(unverified_store)?.to_owned(),
+            root: self.root.to_str().ok_or_else(unverified_store)?.to_owned(),
+            native_scope: self.scope.clone(),
+        };
+        reject_secrets(
+            &serde_json::to_value(&binding).map_err(|_| unverified_store())?,
+            metadata_secrets,
+        )?;
+        Ok(binding)
+    }
+}
+
+/// The host supplies the prepared workspace in launch.cwd. Capture broad diagnostic
+/// secrets independently from the credential-only metadata checks.
+pub(crate) async fn profile_store(
+    launch: &NativeLaunch,
+    environment: &Value,
+    metadata_secrets: &[String],
+    diagnostic_secrets: &[String],
+    deadline: Instant,
+) -> Result<NativeStoreBinding> {
+    probe_store_with_secrets(
+        launch,
+        environment,
+        metadata_secrets,
+        diagnostic_secrets,
+        deadline,
+    )
+    .await?
+    .native_binding(metadata_secrets)
+}
+
+pub(crate) fn pinned_launch_for_binding(
+    launch: &NativeLaunch,
+    binding: &NativeStoreBinding,
+) -> Result<NativeLaunch> {
+    let (_, root) = binding_paths(binding)?;
+    let mut pinned = pinned_launch(launch, root)?;
+    pinned.environment.retain(|(name, _)| {
+        let name = name.to_string_lossy();
+        if cfg!(windows) {
+            !name.eq_ignore_ascii_case("CODEX_HOME")
+        } else {
+            name != "CODEX_HOME"
+        }
+    });
+    pinned
+        .environment
+        .push((OsString::from("CODEX_HOME"), OsString::from(&binding.home)));
+    Ok(pinned)
+}
+
+/// Verify on the controlled process after its single initialize/initialized pair.
+/// The caller retains the normal event reader; no discard drainer is installed.
+pub(crate) async fn verify_initialized_store(
+    client: &NativeClient,
+    initialized: &NativeInitializeResponse,
+    binding: &NativeStoreBinding,
+    cwd: &Path,
+    metadata_secrets: &[String],
+    deadline: Instant,
+) -> Result<()> {
+    let (home, root) = binding_paths(binding)?;
+    reject_secrets(
+        &serde_json::to_value(binding).map_err(|_| unverified_store())?,
+        metadata_secrets,
+    )?;
+    let observed = read_store(client, &json!({}), &initialized.codex_home, cwd, deadline).await?;
+    validate_pin(home, root, &observed)
+}
+
+fn binding_paths(binding: &NativeStoreBinding) -> Result<(&Path, &Path)> {
+    for path in [&binding.home, &binding.root] {
+        check_text(path, MAX_TEXT_BYTES, true).map_err(|_| unverified_store())?;
+    }
+    check_text(&binding.native_scope, MAX_REFERENCE_BYTES, true).map_err(|_| unverified_store())?;
+    let home = Path::new(&binding.home);
+    let root = Path::new(&binding.root);
+    if !home.is_absolute() || !root.is_absolute() {
+        return Err(unverified_store());
+    }
+    Ok((home, root))
 }
 
 pub(crate) async fn discover(
@@ -148,6 +233,16 @@ pub(crate) async fn probe_store(
     secrets: &[String],
     deadline: Instant,
 ) -> Result<StoreContext> {
+    probe_store_with_secrets(launch, environment, secrets, secrets, deadline).await
+}
+
+async fn probe_store_with_secrets(
+    launch: &NativeLaunch,
+    environment: &Value,
+    metadata_secrets: &[String],
+    diagnostic_secrets: &[String],
+    deadline: Instant,
+) -> Result<StoreContext> {
     let (mut probe, drainer) = start_reader(
         NativeLaunch {
             program: launch.program.clone(),
@@ -155,13 +250,13 @@ pub(crate) async fn probe_store(
             cwd: launch.cwd.clone(),
             environment: launch.environment.clone(),
         },
-        secrets,
+        diagnostic_secrets,
         deadline,
     )
     .await?;
     let probe_result: Result<StoreContext> = async {
         let client = probe.client();
-        let initialized = initialize_reader(&client, secrets, deadline).await?;
+        let initialized = initialize_reader(&client, metadata_secrets, deadline).await?;
         read_store(
             &client,
             environment,
@@ -187,7 +282,7 @@ pub(crate) async fn open_pinned_reader(
 ) -> Result<(NativeProcess, JoinHandle<()>)> {
     // thread_store is fixed at process startup (pinned message_processor.rs:301-304).
     // A config/read reload must not relabel one store's page with another root.
-    let pinned = pinned_launch(launch, store)?;
+    let pinned = pinned_launch(launch, store.root())?;
     let (mut query, drainer) = start_reader(pinned, secrets, deadline).await?;
     let result = async {
         let client = query.client();
@@ -200,7 +295,7 @@ pub(crate) async fn open_pinned_reader(
             deadline,
         )
         .await?;
-        validate_pin(store, &pinned_store)
+        validate_pin(store.home(), store.root(), &pinned_store)
     }
     .await;
     match result {
@@ -365,8 +460,8 @@ async fn read_store(
     .map_err(|_| unverified_store())?
 }
 
-fn pinned_launch(launch: &NativeLaunch, store: &StoreContext) -> Result<NativeLaunch> {
-    let root = store.root().to_str().ok_or_else(unverified_store)?;
+fn pinned_launch(launch: &NativeLaunch, root: &Path) -> Result<NativeLaunch> {
+    let root = root.to_str().ok_or_else(unverified_store)?;
     // serde_json emits escapes valid in a TOML basic string; argv goes directly
     // to Codex, never through a shell. Pin before process-scoped store creation.
     let quoted = serde_json::to_string(root).map_err(|_| unverified_store())?;
@@ -383,11 +478,10 @@ fn pinned_launch(launch: &NativeLaunch, store: &StoreContext) -> Result<NativeLa
     })
 }
 
-fn validate_pin(selected: &StoreContext, pinned: &StoreContext) -> Result<()> {
+fn validate_pin(home: &Path, root: &Path, pinned: &StoreContext) -> Result<()> {
     // Requirements/managed config outrank CLI overrides. An absent sessionFlags
     // origin or another effective root is not proof that this process honored the pin.
-    if !pinned.pin_verified || selected.home() != pinned.home() || selected.root() != pinned.root()
-    {
+    if !pinned.pin_verified || home != pinned.home() || root != pinned.root() {
         return Err(unverified_store());
     }
     Ok(())
@@ -824,13 +918,136 @@ fn too_large() -> Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        CURSOR_PREFIX, Cursor, NativeLaunch, StoreContext, decode_cursor, fingerprint,
-        native_scope, pinned_launch, request_binding, select_store, sqlite_environment,
-        store_scope, validate_pin, validate_store,
+        CURSOR_PREFIX, Cursor, NativeLaunch, StoreContext, binding_paths, decode_cursor,
+        fingerprint, native_scope, pinned_launch, pinned_launch_for_binding, request_binding,
+        select_store, sqlite_environment, store_scope, validate_pin, validate_store,
     };
     use crate::native::types::NativeDiscoveryConfigReadResponse;
+    use eliot_core::{NativeStoreBinding, SecretPolicy};
     use serde_json::json;
     use std::{ffi::OsString, path::Path};
+
+    #[test]
+    fn controlled_store_binding_pins_relative_workspace_selection_and_round_trips() {
+        let base = Path::new(if cfg!(windows) {
+            r"C:\binding"
+        } else {
+            "/binding"
+        });
+        let home = base.join("home");
+        let workspace = base.join("prepared workspace");
+        let config: NativeDiscoveryConfigReadResponse =
+            serde_json::from_value(json!({"config":{"sqlite_home":null}, "origins":{}})).unwrap();
+        let selection = select_store(
+            &config,
+            &json!({"CODEX_SQLITE_HOME":" sqlite-data "}),
+            &home,
+            &workspace,
+        )
+        .unwrap();
+        assert_eq!(selection.root, workspace.join("sqlite-data"));
+        let mut observed = StoreContext {
+            scope: store_scope(home.to_str().unwrap(), &home, &selection.root).unwrap(),
+            binding: "private-discovery-only".to_owned(),
+            home,
+            root: selection.root,
+            pin_verified: true,
+        };
+        let binding = observed.native_binding(&[]).unwrap();
+        let encoded = serde_json::to_value(&binding).unwrap();
+        assert_eq!(encoded.as_object().unwrap().len(), 3);
+        let binding: NativeStoreBinding = serde_json::from_value(encoded).unwrap();
+        let launch = NativeLaunch {
+            program: "stable-codex".into(),
+            args: ["app-server", "--listen", "stdio://"]
+                .map(OsString::from)
+                .to_vec(),
+            cwd: workspace,
+            environment: vec![
+                (
+                    if cfg!(windows) {
+                        "codex_home"
+                    } else {
+                        "CODEX_HOME"
+                    }
+                    .into(),
+                    "late-home".into(),
+                ),
+                ("CODEX_SQLITE_HOME".into(), "late-store".into()),
+            ],
+        };
+        let pinned = pinned_launch_for_binding(&launch, &binding).unwrap();
+        assert_eq!(pinned.program, launch.program);
+        assert_eq!(pinned.cwd, launch.cwd);
+        assert_eq!(&pinned.args[2..], launch.args.as_slice());
+        let quoted = pinned.args[1]
+            .to_str()
+            .unwrap()
+            .strip_prefix("sqlite_home=")
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<String>(quoted).unwrap(),
+            binding.root
+        );
+        let homes: Vec<_> = pinned
+            .environment
+            .iter()
+            .filter(|(name, _)| {
+                let name = name.to_string_lossy();
+                if cfg!(windows) {
+                    name.eq_ignore_ascii_case("CODEX_HOME")
+                } else {
+                    name == "CODEX_HOME"
+                }
+            })
+            .collect();
+        assert_eq!(homes.len(), 1);
+        assert_eq!(homes[0].1, OsString::from(&binding.home));
+        assert_eq!(pinned.environment[0], launch.environment[1]);
+        let (home, root) = binding_paths(&binding).unwrap();
+        // Verification consumes canonical paths and pin origin, not private cursor digests/scope.
+        observed.scope = "synthetic-readback-scope".to_owned();
+        assert!(validate_pin(home, root, &observed).is_ok());
+        observed.home = base.join("wrong-home");
+        assert!(validate_pin(home, root, &observed).is_err());
+        observed.home = home.to_owned();
+        observed.root = base.join("wrong-store");
+        assert!(validate_pin(home, root, &observed).is_err());
+        observed.root = root.to_owned();
+        observed.pin_verified = false;
+        assert!(validate_pin(home, root, &observed).is_err());
+        let mut relative = binding.clone();
+        relative.root = "relative-store".to_owned();
+        assert!(pinned_launch_for_binding(&launch, &relative).is_err());
+    }
+
+    #[test]
+    fn controlled_store_binding_keeps_metadata_credentials_separate_from_diagnostic_paths() {
+        let home = Path::new(if cfg!(windows) {
+            r"C:\binding\home"
+        } else {
+            "/binding/home"
+        })
+        .to_owned();
+        let store = StoreContext {
+            scope: native_scope(home.to_str().unwrap()),
+            binding: "private-discovery-only".to_owned(),
+            home: home.clone(),
+            root: home,
+            pin_verified: false,
+        };
+        let path = store.home.to_str().unwrap().to_owned();
+        let metadata_secrets = vec!["fixture-credential".to_owned()];
+        let diagnostic_secrets = vec![path.clone(), "fixture-credential".to_owned()];
+        assert!(store.native_binding(&metadata_secrets).is_ok());
+        assert_eq!(
+            SecretPolicy::new(&diagnostic_secrets).redact_text(&path),
+            "[REDACTED]"
+        );
+        // A credential variable contributing the same literal must remain protected.
+        let error = store.native_binding(&[path]).unwrap_err();
+        assert_eq!(error.code, "secret_in_payload");
+    }
 
     #[test]
     fn discovery_fingerprint_retains_compact_json_lowercase_hex() {
@@ -1041,7 +1258,7 @@ mod tests {
                 OsString::from("environment-store"),
             )],
         };
-        let pinned = pinned_launch(&launch, &selected).expect("pinned launch");
+        let pinned = pinned_launch(&launch, selected.root()).expect("pinned launch");
         assert_eq!(pinned.program, launch.program);
         assert_eq!(pinned.cwd, cwd);
         assert_eq!(pinned.environment, launch.environment);
@@ -1072,13 +1289,13 @@ mod tests {
             root: selected.root.clone(),
             pin_verified: true,
         };
-        assert!(validate_pin(&selected, &query).is_ok());
+        assert!(validate_pin(selected.home(), selected.root(), &query).is_ok());
         assert_eq!(selected.scope, native_scope(home.to_str().expect("home")));
         assert_eq!(selected.binding, "original-selection");
         query.root = changed_selection.root;
-        assert!(validate_pin(&selected, &query).is_err());
+        assert!(validate_pin(selected.home(), selected.root(), &query).is_err());
         query.root = selected.root.clone();
         query.pin_verified = false;
-        assert!(validate_pin(&selected, &query).is_err());
+        assert!(validate_pin(selected.home(), selected.root(), &query).is_err());
     }
 }

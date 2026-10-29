@@ -50,7 +50,7 @@ per-task report packets or another status registry.
       help/version smoke commands on Windows/Ubuntu. No empty framework crates or
       test platform.
 
-**Next:** L3.3c live recovery. v1 remains available as a source donor.
+**Next:** L3.4 proxy/capacity. v1 remains available as a source donor.
 
 ## L1 — Core, Store, bus and one fake command path
 
