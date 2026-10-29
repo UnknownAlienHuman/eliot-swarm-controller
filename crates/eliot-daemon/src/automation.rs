@@ -223,6 +223,45 @@ async fn apply_global_rule_snapshot(
     Ok(active)
 }
 
+async fn attempt_reload_snapshot(
+    router: &Router,
+    snapshot: &reload::RuleSnapshot,
+    previous: &[ActiveRule],
+    now: i64,
+    policy: &SecretPolicy,
+    notices: &mut ReloadNoticeContext,
+) -> Result<Option<(Vec<ActiveRule>, bool)>> {
+    match apply_global_rule_snapshot(router, snapshot, Some(previous), now).await {
+        Ok(updated) => {
+            let definitions = updated
+                .iter()
+                .map(|rule| rule.definition.clone())
+                .collect::<Vec<_>>();
+            let deferred = updated
+                .iter()
+                .any(|rule| rule.state.retiring_revision.is_some())
+                && !snapshot.matches(&definitions)?;
+            if deferred {
+                report_deferred_reload(policy, &snapshot.inputs, notices)?;
+            } else {
+                notices.deferred = None;
+                notices.rejected = None;
+            }
+            Ok(Some((updated, deferred)))
+        }
+        Err(error)
+            if matches!(
+                error.code.as_str(),
+                "frame_too_large" | "invalid" | "secret_in_payload" | "unsupported"
+            ) =>
+        {
+            report_rejected_reload(policy, &snapshot.inputs, &error, notices)?;
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn defer_retiring_edits(
     snapshot: &reload::RuleSnapshot,
     prior: &[RuleProcessingState],
@@ -453,26 +492,28 @@ pub(crate) async fn run_global_rules(
             last_applied_inputs = Some(snapshot.inputs);
             notices.deferred = None;
             notices.rejected = None;
-        } else if rules
-            .iter()
-            .any(|rule| rule.state.retiring_revision.is_some())
-        {
+        } else {
             let key = reload_notice_key(&snapshot.inputs)?;
-            if notices.rejected.as_ref() != Some(&key) {
-                match router
-                    .validate_global_rule_definitions(&snapshot.inputs)
-                    .await
-                {
-                    Ok(()) => report_deferred_reload(&policy, &snapshot.inputs, &mut notices)?,
-                    Err(error)
-                        if matches!(
-                            error.code.as_str(),
-                            "frame_too_large" | "invalid" | "secret_in_payload" | "unsupported"
-                        ) =>
-                    {
-                        report_rejected_reload(&policy, &snapshot.inputs, &error, &mut notices)?;
-                    }
-                    Err(error) => return Err(error),
+            let already_rejected = notices.rejected.as_ref() == Some(&key);
+            let already_deferred = rules
+                .iter()
+                .any(|rule| rule.state.retiring_revision.is_some())
+                && notices.deferred.as_ref() == Some(&key);
+            if !already_rejected
+                && !already_deferred
+                && let Some((updated, deferred)) = attempt_reload_snapshot(
+                    &router,
+                    &snapshot,
+                    &rules,
+                    now_ms(),
+                    &policy,
+                    &mut notices,
+                )
+                .await?
+            {
+                rules = updated;
+                if !deferred {
+                    last_applied_inputs = Some(snapshot.inputs);
                 }
             }
         }
@@ -566,34 +607,14 @@ pub(crate) async fn run_global_rules(
         if retirement_pending && notices.deferred.as_ref() == Some(&snapshot_key) {
             continue;
         }
-        match apply_global_rule_snapshot(&router, &snapshot, Some(&rules), now_ms()).await {
-            Ok(updated) => {
-                let updated_definitions = updated
-                    .iter()
-                    .map(|rule| rule.definition.clone())
-                    .collect::<Vec<_>>();
-                let deferred = updated
-                    .iter()
-                    .any(|rule| rule.state.retiring_revision.is_some())
-                    && !snapshot.matches(&updated_definitions)?;
-                if deferred {
-                    report_deferred_reload(&policy, &snapshot.inputs, &mut notices)?;
-                } else {
-                    last_applied_inputs = Some(snapshot.inputs.clone());
-                    notices.deferred = None;
-                    notices.rejected = None;
-                }
-                rules = updated;
+        if let Some((updated, deferred)) =
+            attempt_reload_snapshot(&router, &snapshot, &rules, now_ms(), &policy, &mut notices)
+                .await?
+        {
+            rules = updated;
+            if !deferred {
+                last_applied_inputs = Some(snapshot.inputs);
             }
-            Err(error)
-                if matches!(
-                    error.code.as_str(),
-                    "frame_too_large" | "invalid" | "secret_in_payload" | "unsupported"
-                ) =>
-            {
-                report_rejected_reload(&policy, &snapshot.inputs, &error, &mut notices)?;
-            }
-            Err(error) => return Err(error),
         }
     }
 }
@@ -1085,6 +1106,139 @@ mod timer_tests {
         assert!(!claim_deferred_reload(std::slice::from_ref(&first), &mut notices).unwrap());
         assert!(claim_deferred_reload(std::slice::from_ref(&changed), &mut notices).unwrap());
         assert!(!claim_deferred_reload(std::slice::from_ref(&changed), &mut notices).unwrap());
+    }
+
+    #[tokio::test]
+    async fn store_invalid_snapshot_is_rejected_before_retirement_deferral() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-rule-reload-store-validation-{}",
+            ulid::Ulid::new()
+        ));
+        let rules_dir = root.join("rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        let rule_path = rules_dir.join("reload.toml");
+        let store = Arc::new(tokio::sync::Mutex::new(
+            eliot_store::Store::open(Path::new(":memory:")).unwrap(),
+        ));
+        let router = Router::new(
+            root.clone(),
+            "reload-fixture-owner".to_owned(),
+            Arc::clone(&store),
+            crate::bus::Bus::new(16),
+        );
+        let policy = SecretPolicy::default();
+        let render_rule = |match_value: Option<&str>| {
+            let matcher = match_value.map_or_else(String::new, |value| {
+                format!(", match = {{ \"subject.harness\" = '{value}' }}")
+            });
+            format!(
+                "[[rule]]\nid = \"reload-test\"\nenabled = true\non = {{ event = \"turn.completed\"{matcher} }}\ndo = [{{ action = \"stop\", target = \"a1\", expected_generation = 1 }}]\n"
+            )
+        };
+        let submit_launch = |project: &str| {
+            let mut request = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+            request.args = json!({
+                "project": project,
+                "workspace": format!("reload-{project}"),
+            });
+            request.expected_generation = Some(0);
+            request
+        };
+
+        {
+            let mut store = store.lock().await;
+            store
+                .submit("owner", submit_launch("before-seed"), now_ms())
+                .unwrap();
+        }
+        std::fs::write(&rule_path, render_rule(None)).unwrap();
+        let (initial, _) = initialize_global_rules(&router, &root, &policy)
+            .await
+            .unwrap();
+        assert_eq!(initial.len(), 1);
+
+        {
+            let mut store = store.lock().await;
+            store
+                .submit("owner", submit_launch("after-seed"), now_ms())
+                .unwrap();
+        }
+        std::fs::write(&rule_path, render_rule(Some("first-edit"))).unwrap();
+        let (retiring_rules, _) = initialize_global_rules(&router, &root, &policy)
+            .await
+            .unwrap();
+        assert!(retiring_rules[0].state.retiring_revision.is_some());
+        let before = router.global_rule_processing().await.unwrap();
+        let high_water_before = store.lock().await.high_water().unwrap();
+
+        let oversized_match = "\"".repeat(66 * 1024);
+        let oversized_source = render_rule(Some(&oversized_match));
+        assert!(oversized_source.len() < 128 * 1024);
+        std::fs::write(&rule_path, oversized_source).unwrap();
+        let invalid_snapshot = reload::load(&root).unwrap();
+        assert!(invalid_snapshot.inputs[0].canonical_definition.len() > 128 * 1024);
+
+        let mut notices = ReloadNoticeContext::default();
+        let invalid_attempt = attempt_reload_snapshot(
+            &router,
+            &invalid_snapshot,
+            &retiring_rules,
+            now_ms(),
+            &policy,
+            &mut notices,
+        )
+        .await
+        .unwrap();
+        assert!(invalid_attempt.is_none());
+        let invalid_key = reload_notice_key(&invalid_snapshot.inputs).unwrap();
+        assert_eq!(notices.rejected, Some(invalid_key));
+        assert!(notices.deferred.is_none());
+
+        let after_invalid = router.global_rule_processing().await.unwrap();
+        assert_eq!(after_invalid.len(), before.len());
+        assert_eq!(after_invalid[0].view, before[0].view);
+        assert_eq!(
+            after_invalid[0].current_definition,
+            before[0].current_definition
+        );
+        assert_eq!(
+            after_invalid[0].retiring_definition,
+            before[0].retiring_definition
+        );
+        assert_eq!(store.lock().await.high_water().unwrap(), high_water_before);
+
+        std::fs::write(&rule_path, render_rule(Some("second-pending-edit"))).unwrap();
+        let valid_snapshot = reload::load(&root).unwrap();
+        let (updated_rules, deferred) = attempt_reload_snapshot(
+            &router,
+            &valid_snapshot,
+            &retiring_rules,
+            now_ms(),
+            &policy,
+            &mut notices,
+        )
+        .await
+        .unwrap()
+        .expect("valid pending edit should apply through the shared attempt path");
+        assert!(deferred);
+        let valid_key = reload_notice_key(&valid_snapshot.inputs).unwrap();
+        assert_eq!(notices.deferred, Some(valid_key));
+
+        let (_, deferred_again) = attempt_reload_snapshot(
+            &router,
+            &valid_snapshot,
+            &updated_rules,
+            now_ms(),
+            &policy,
+            &mut notices,
+        )
+        .await
+        .unwrap()
+        .expect("repeat attempt remains a valid deferred edit");
+        assert!(deferred_again);
+        assert!(!claim_deferred_reload(&valid_snapshot.inputs, &mut notices).unwrap());
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

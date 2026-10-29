@@ -997,8 +997,7 @@ impl Router {
         // text is persisted by Store and must use the same known-secret policy
         // as command semantic data.
         for definition in definitions {
-            let value: Value = serde_json::from_str(&definition.canonical_definition)
-                .map_err(|_| Error::new("invalid", "canonical rule definition is invalid"))?;
+            let value = definition.validated_value()?;
             if contains_known_secret_including_keys(&value, &self.inner.secrets) {
                 return Err(Error::new(
                     "secret_in_payload",

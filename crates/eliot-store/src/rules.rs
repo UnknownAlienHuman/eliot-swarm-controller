@@ -18,6 +18,36 @@ pub struct RuleDefinitionInput {
     pub enabled: bool,
 }
 
+impl RuleDefinitionInput {
+    pub fn validated_value(&self) -> Result<serde_json::Value> {
+        if self.canonical_definition.len() > 128 * 1024 {
+            return Err(Error::new(
+                "frame_too_large",
+                "canonical rule definition exceeds 128 KiB",
+            ));
+        }
+        let value: serde_json::Value = serde_json::from_str(&self.canonical_definition)
+            .map_err(|_| Error::new("invalid", "canonical rule definition is invalid JSON"))?;
+        let canonical = serde_json::to_string(&value)
+            .map_err(|_| Error::new("invalid", "canonical rule definition cannot be encoded"))?;
+        if canonical != self.canonical_definition {
+            return Err(Error::new(
+                "invalid",
+                "rule definition must use canonical JSON encoding",
+            ));
+        }
+        let digest = core::canonical_json_sha256(&value)
+            .map_err(|_| Error::new("invalid", "rule definition cannot be canonicalized"))?;
+        if digest != self.definition_digest {
+            return Err(Error::new(
+                "source_integrity",
+                "rule definition digest does not match its canonical content",
+            ));
+        }
+        Ok(value)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuleCursorOutcome {
     /// A scanned event did not match. Cursor-only; this emits no event.
@@ -261,7 +291,7 @@ impl Store {
         self.ensure_writer_healthy()?;
         let result = (|| {
             validate_principal_rule(principal, &input.id)?;
-            validate_definition_input(input)?;
+            input.validated_value()?;
             let tx = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -303,7 +333,7 @@ impl Store {
             let mut definition_ids = HashSet::new();
             for definition in definitions {
                 validate_principal_rule(principal, &definition.id)?;
-                validate_definition_input(definition)?;
+                definition.validated_value()?;
                 if !definition_ids.insert(definition.id.as_str()) {
                     return Err(Error::new("invalid", "rule IDs must be unique"));
                 }
@@ -1335,34 +1365,6 @@ fn ensure_timer_state_tx(
 fn validate_principal_rule(principal: &str, rule: &str) -> Result<()> {
     require_nonempty(principal, "principal")?;
     require_nonempty(rule, "rule id")
-}
-
-fn validate_definition_input(input: &RuleDefinitionInput) -> Result<()> {
-    if input.canonical_definition.len() > 128 * 1024 {
-        return Err(Error::new(
-            "frame_too_large",
-            "canonical rule definition exceeds 128 KiB",
-        ));
-    }
-    let value: Value = serde_json::from_str(&input.canonical_definition)
-        .map_err(|_| Error::new("invalid", "canonical rule definition is invalid JSON"))?;
-    let canonical = serde_json::to_string(&value)
-        .map_err(|_| Error::new("invalid", "canonical rule definition cannot be encoded"))?;
-    if canonical != input.canonical_definition {
-        return Err(Error::new(
-            "invalid",
-            "rule definition must use canonical JSON encoding",
-        ));
-    }
-    let digest = core::canonical_json_sha256(&value)
-        .map_err(|_| Error::new("invalid", "rule definition cannot be canonicalized"))?;
-    if digest != input.definition_digest {
-        return Err(Error::new(
-            "source_integrity",
-            "rule definition digest does not match its canonical content",
-        ));
-    }
-    Ok(())
 }
 
 struct StoredTimerState {
