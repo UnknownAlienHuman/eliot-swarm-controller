@@ -149,9 +149,9 @@ path = "C:/src/app"
 max_live = 8
 
 [proxies.opencodex]
-attach = "http://127.0.0.1:10100"
-health = "/api/system/health"
-api_key_env = "OPENCODEX_API_KEY"
+attach = "http://127.0.0.1:10300"
+health = "/readyz"
+base_url_for = { codex = "http://127.0.0.1:10300/v1" }
 max_live = 8
 
 [profiles.codex-opencodex]
@@ -160,7 +160,13 @@ proxy = "opencodex"
 account = "codex-main"
 ```
 
-The OpenCodex health path is an installed-version fact to verify, not a version gate.
+Inspection dated 2026-10-29 of installed OpenCodex 2.92.0 source
+src/server/index/serve-options.ts shows an anonymous literal GET /readyz: readiness
+returns HTTP 200 with {"status":"ready"}; pending or failed states return HTTP 503.
+/healthz reports liveness only. Configure the readiness path explicitly; this is not a
+version gate or a default.
+The example's extends and project-overlay layers are later-target syntax, not part of
+the current L3.4 route/capacity increment.
 Unknown keys are errors with location; plugin-private keys are validated by that plugin.
 `extends` is one level. Missing fields use [core defaults](core.md#profile).
 Command/write retention must cover the supported retry window and allowed clock skew.
@@ -222,23 +228,26 @@ ProfileSnapshot {
   model?, effort?, permissions, control, args,
   literal_env, pass_env_values, secret_env_names, inherit_env,
   account?, proxy?, billing?, workspace_mode, git_identity,
-  labels, max_live?, stall_after, notify_parent, wake_on_mail,
+  route_binding?, capacity_scopes[], labels, stall_after, notify_parent, wake_on_mail,
   system_note?, setup[], scratch, source_files
 }
 PluginBinding { name, kind: builtin|external, cmd?, private_config,
                 private_config_digest, executable?, referenced_files[] }
-AccountBinding { name, capacity_scope, auth_store_names, requested_billing }
-ProxyBinding { name, mode: adopted|managed, endpoint?, launch_cmd?, health_path,
-               capacity_scope, api_key_env_name?, base_url_for?, config_digest,
-               executable?, referenced_files[] }
 FrozenFile { canonical_path, size, digest, private_copy? }
 ```
 
-Builtin route is the plugin linked in the installed binary. External routes resolve an
-absolute executable plus explicit argv/private config; capture local entry files used
-by that command. Dispatch uses this binding, not a new config lookup. Changed/missing
-captured files fail before execution. Manifest cache keys use binding digest; software
-version itself is diagnostic, not authority.
+The optional `route_binding` and `capacity_scopes` values use the shared Core
+[`RouteBinding` and `CapacityScope` DTOs](../../crates/eliot-core/src/routing.rs); that code
+is their canonical field catalog. Snapshots preserve selected account/proxy names and
+local cap-scope names. These names and caps do not establish vendor identity, entitlement
+or quota. A route binding is captured at admission and is never inferred again after
+reload.
+
+Builtin plugins are linked in the installed binary. External plugin bindings resolve an
+absolute executable plus explicit argv/private config; capture local entry files used by
+that command. Dispatch uses this plugin binding, not a new config lookup. Changed or
+missing captured files fail before execution. Manifest cache keys use the plugin binding
+digest; software version itself is diagnostic, not authority.
 
 Capture entry files and explicit inputs, not a universal hermetic build/runtime graph.
 A script importing mutable dependencies is not fully reproducible merely because its
@@ -265,6 +274,9 @@ Build the native environment from OS baseline, admitted nonsecret `pass_env` val
 literal nonsecret `env`, named secrets resolved in memory, then Eliot identity/Git/PATH.
 `secret_env` is a subset of `pass_env`; those values are never persisted. Missing named
 required values fail clearly. Windows keys compare case-insensitively.
+An adopted route stores only the optional client-key environment-variable name; the
+profile must explicitly allow that name in pass_env. Its value is resolved at runtime
+and is not sent with the unauthenticated readiness request.
 
 `inherit_env=true` is an owner/global opt-in with a visible warning: unrelated daemon
 secrets then reach the process. It is not default. Route/account selectors still remain
@@ -276,17 +288,24 @@ Private routing tokens are handled separately from semantic profile data. Native
 children receive their own identity only where isolated environment injection is possible;
 otherwise their CLI calls remain attributed to the parent, as the plugin reports.
 
-## Accounts, capacity and provider holds
+## Accounts and configured capacity
 
-All named profile/account/proxy caps apply. Reserve capacity before native launch/control
-takeover, release on proven no-session failure or terminal observation. Observe-only
-uses no control slot; detaching a still-live session does not pretend provider usage
-vanished. Uncertain starts retain their reservation.
+Configured profile, account and selected-proxy `max_live` caps are local admission
+limits. An omitted cap (`None`) is unlimited; `0` disables that scope. The snapshot
+freezes the scope names and configured values. A full scope rejects before native
+control with `capacity_unavailable`. That request is not admitted or persisted, so it
+creates no command, Agent, event or reservation; the same ID may be submitted again
+after capacity changes. An already admitted command retains its result under its ID, and
+replay never starts another native generation or reservation. A capacity reservation is
+released only after the owned generation is proven closed. Uncertain starts retain their
+reservation across daemon replacement. These limits describe Eliot's admitted workload,
+not vendor entitlements, account permissions or provider quotas. Fake profiles may use
+named profile/account caps; Fake does not acquire a proxy route.
 
-[Provider holds](monitoring.md#provider-holds) survive restart. Rate/quota may permit one
-explicit eligible probe; unknown probe remains reserved. Auth/model removal requires
-explicit corrective evidence. Reads, approvals, interrupt and stop remain available.
-No automatic provider/model/account fallback.
+Provider rate/quota holds and billing/usage discovery are the next connected increment.
+They are not implemented here; hold-management requests remain `unsupported`. Readiness
+and configured capacity do not prove authentication or inference success. No automatic
+provider/model/account fallback is permitted.
 
 ## Plugins
 
@@ -299,14 +318,15 @@ several chats hosted in one process.
 Probe/cache a manifest without creating a billed native session. Existing snapshots use
 the matching binding. Recheck availability at dispatch without replacing its route.
 
-## Proxies and services
+## Adopted proxy services
 
-`attach` adopts an already-running direct endpoint: health/read only, never stop/repair.
-`launch` supervises an explicitly selected service in separate custody. Key fields:
-`health`, `max_live`, managed-only `idle_stop`, `api_key_env`, optional `base_url_for`.
-Agent stop never kills a shared/adopted service. First implement attach, then managed
-launch only when needed. Effective routing may be partly unobservable; report unknown,
-not the requested URL as verified fact.
+This increment supports only a named, already-running endpoint. Configure its endpoint,
+readiness path and provider base URL explicitly; there is no default readiness path.
+Eliot performs a bounded unauthenticated readiness read and never starts, stops or repairs
+the adopted service. Agent stop owns only the Agent's controlled process tree. Managed
+service launch and service-management APIs remain `unsupported`. Readiness and effective
+configuration readback do not verify runtime authentication, inference or all traffic;
+report those facts as unverified. The owner remains responsible for service lifecycle.
 
 ## Paths and platform defaults
 

@@ -3,6 +3,7 @@
 //! Durable L1 state for Agents, commands, native events, turns, and source acks.
 
 mod canonical;
+mod capacity;
 
 use eliot_core::{
     self as core, Agent, AgentEdit, AgentState, BatchAck, Command, CommandState, Effect, Event,
@@ -128,7 +129,7 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(sql_error)?;
-        if current > 8 {
+        if current > 9 {
             return Err(Error::new(
                 "unsupported",
                 format!("Store schema version {current} is newer than this binary"),
@@ -407,6 +408,23 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
+        if current < 9 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE agents ADD COLUMN capacity_generation INTEGER
+                     CHECK(capacity_generation IS NULL OR capacity_generation > 0);
+                 CREATE INDEX agents_capacity_reserved ON agents(capacity_generation)
+                     WHERE capacity_generation IS NOT NULL;",
+            )
+            .map_err(sql_error)?;
+            capacity::migrate_reservations_tx(&tx)?;
+            tx.execute("INSERT INTO schema_migrations(version) VALUES (9)", [])
+                .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
         Ok(())
     }
 
@@ -624,12 +642,6 @@ impl Store {
                 } else {
                     required_string(&request.args, "profile")?
                 };
-                if harness == "fake" && profile != "fake" {
-                    return Err(Error::new(
-                        "unsupported",
-                        "the fake harness requires the fake profile",
-                    ));
-                }
                 let profile_snapshot = match request.args.get("profile_snapshot") {
                     Some(Value::Object(_)) => request.args["profile_snapshot"].clone(),
                     Some(_) => {
@@ -926,6 +938,24 @@ impl Store {
                         "resume requires a stopped, failed, or lost Agent with no active turn",
                     ));
                 }
+                let pending_resume: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(
+                             SELECT 1 FROM commands
+                             WHERE target = ?1 AND generation = ?2 AND verb = 'resume'
+                               AND id <> ?3
+                               AND state IN ('accepted', 'queued', 'dispatched', 'unknown')
+                         )",
+                        params![agent_num, agent.generation, request.id],
+                        |row| row.get(0),
+                    )
+                    .map_err(sql_error)?;
+                if pending_resume {
+                    return Err(Error::new(
+                        "bad_state",
+                        "a pending resume already targets this Agent generation",
+                    ));
+                }
                 if [&agent.native_scope, &agent.native_ref]
                     .iter()
                     .any(|value| value.as_deref().is_none_or(|value| value.trim().is_empty()))
@@ -1162,6 +1192,25 @@ impl Store {
             Some(linked_id) => load_command(&tx, linked_id)?,
             None => None,
         };
+        if matches!(request.verb.as_str(), "launch" | "resume") {
+            let agent_num = command
+                .target
+                .as_deref()
+                .map(parse_agent_id)
+                .transpose()?
+                .ok_or_else(|| Error::new("internal", "start admission has no Agent"))?;
+            let agent = load_agent_by_num(&tx, agent_num)?
+                .ok_or_else(|| Error::new("internal", "start admission Agent disappeared"))?;
+            let generation = if request.verb == "launch" {
+                1
+            } else {
+                agent
+                    .generation
+                    .checked_add(1)
+                    .ok_or_else(|| Error::new("bad_state", "generation overflow"))?
+            };
+            capacity::reserve_tx(&tx, &agent, generation)?;
+        }
         commit_transaction(tx, &self.write_faulted)?;
         Ok(Admission {
             command,
@@ -1338,6 +1387,7 @@ impl Store {
                     ));
                 }
                 gate_workspace_start(&tx, &agent, &command.command, 1)?;
+                capacity::require_reservation_tx(&tx, agent_num, 1)?;
                 let snapshot = native_store
                     .map(|(expected, binding)| {
                         launch_snapshot_with_native_store(&agent, expected, binding, id)
@@ -1420,6 +1470,7 @@ impl Store {
                     Error::new("bad_state", "Agent generation cannot be incremented")
                 })?;
                 gate_workspace_start(&tx, &agent, &command.command, next_generation)?;
+                capacity::require_reservation_tx(&tx, agent_num, next_generation)?;
                 for old_id in pending_command_ids(&tx, agent_num, agent.generation)? {
                     if old_id == id {
                         continue;
@@ -1950,6 +2001,16 @@ impl Store {
 
         let target = record.target;
         let generation = record.command.generation;
+        let initial_launch_never_dispatched = if record.command.verb == "launch"
+            && generation == Some(0)
+            && matches!(record.state, CommandState::Accepted | CommandState::Queued)
+            && let Some(agent_num) = target
+        {
+            load_agent_by_num(&tx, agent_num)?
+                .is_some_and(|agent| agent.generation == 0 && agent.state == AgentState::Created)
+        } else {
+            false
+        };
         update_command_state(&tx, id, state, outcome.as_ref(), None, now)?;
         let mut events = Vec::new();
         let state_name = command_state_name(state);
@@ -1967,7 +2028,38 @@ impl Store {
             observer::settle_failure(&tx, &record.command, now, &mut events)?;
         }
 
-        if matches!(record.command.verb.as_str(), "launch" | "resume")
+        if initial_launch_never_dispatched
+            && matches!(state, CommandState::Rejected | CommandState::Failed)
+        {
+            capacity::release_unstarted_tx(
+                &tx,
+                target.ok_or_else(|| Error::new("internal", "launch has no Agent"))?,
+                1,
+                id,
+            )?;
+        } else if state == CommandState::Rejected
+            && matches!(record.command.verb.as_str(), "launch" | "resume")
+        {
+            let agent =
+                target.ok_or_else(|| Error::new("internal", "rejected start has no Agent"))?;
+            let command_generation = generation
+                .ok_or_else(|| Error::new("internal", "rejected start has no generation"))?;
+            let capacity_generation = if record.command.verb == "launch" {
+                1
+            } else if matches!(record.state, CommandState::Accepted | CommandState::Queued) {
+                command_generation
+                    .checked_add(1)
+                    .ok_or_else(|| Error::new("bad_state", "capacity generation overflow"))?
+            } else {
+                command_generation
+            };
+            capacity::release_unstarted_tx(&tx, agent, capacity_generation, id)?;
+        }
+
+        if initial_launch_never_dispatched {
+            let agent_num = target.ok_or_else(|| Error::new("internal", "launch has no Agent"))?;
+            fail_unstarted_launch_tx(&tx, agent_num, id, now, &mut events)?;
+        } else if matches!(record.command.verb.as_str(), "launch" | "resume")
             && matches!(state, CommandState::Rejected | CommandState::Failed)
         {
             if let (Some(agent_num), Some(generation)) = (target, generation) {
@@ -2290,6 +2382,50 @@ impl Store {
         }
         commit_transaction(tx, &self.write_faulted)?;
         Ok(events)
+    }
+
+    /// Release one generation only at the Host boundary that has proved both
+    /// owned-process exit and reader drain. Closing sources or marking an Agent
+    /// lost is not sufficient by itself. Missing persisted OS/process/reader
+    /// facts leave the reservation in place without failing Host settlement.
+    pub fn record_owned_control_exit(
+        &mut self,
+        agent: &str,
+        generation: i64,
+        now: i64,
+    ) -> Result<Vec<Event>> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let agent_num = parse_agent_id(agent)?;
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let current = load_agent_by_num(&tx, agent_num)?
+                .ok_or_else(|| Error::new("not_found", "owned-exit Agent was not found"))?;
+            observer::require_controlled(&current)?;
+            if generation <= 0 || generation > current.generation {
+                return Err(Error::new(
+                    "stale_generation",
+                    "owned-exit generation does not exist",
+                ));
+            }
+            let mut events = Vec::new();
+            if capacity::release_owned_exit_tx(&tx, agent_num, generation)? {
+                events.push(insert_daemon_event(
+                    &tx,
+                    now,
+                    "capacity.released",
+                    "source",
+                    Some(agent_num),
+                    Some(generation),
+                    json!({"reason": "owned_control_exit"}),
+                )?);
+            }
+            commit_transaction(tx, &self.write_faulted).map(|()| events)
+        })();
+        self.fault_on_persistence_error(&result);
+        result
     }
 
     pub fn mark_lost(&mut self, agent: &str, generation: i64, now: i64) -> Result<Vec<Event>> {
@@ -4577,6 +4713,14 @@ fn settle_preparation_command(
     // preparation_command plus the typed workspace caller prove the pre-native
     // marker/verb/generation exception; ordinary settlement cannot use it.
     write_command_state(tx, &command.command.id, state, Some(&outcome), None, now)?;
+    if matches!(state, CommandState::Failed | CommandState::Cancelled) {
+        capacity::release_unstarted_tx(
+            tx,
+            parse_agent_id(&agent.id)?,
+            workspace.target_generation,
+            &command.command.id,
+        )?;
+    }
     if command.command.verb == "launch" {
         let next = match state {
             CommandState::Failed => AgentState::Failed,
@@ -7150,6 +7294,107 @@ fn fail_start_tx(
     Ok(())
 }
 
+fn fail_unstarted_launch_tx(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    command_id: &str,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    let command = load_command_record(tx, command_id)?
+        .ok_or_else(|| Error::new("not_found", "initial launch command was not found"))?;
+    if command.target != Some(agent_num)
+        || command.command.verb != "launch"
+        || command.command.generation != Some(0)
+        || !matches!(command.state, CommandState::Rejected | CommandState::Failed)
+    {
+        return Err(Error::new(
+            "stale_generation",
+            "initial launch no longer has its exact pre-dispatch binding",
+        ));
+    }
+    let agent = load_agent_by_num(tx, agent_num)?
+        .ok_or_else(|| Error::new("not_found", "initial launch Agent was not found"))?;
+    if agent.generation != 0 || agent.state != AgentState::Created {
+        return Err(Error::new(
+            "stale_generation",
+            "initial launch Agent changed before its pre-dispatch failure was committed",
+        ));
+    }
+
+    cancel_unstarted_launch_input(tx, command_id, agent_num, now, events)?;
+    let changed = tx
+        .execute(
+            "UPDATE agents SET state = 'failed', active_turn = NULL, pending = '[]',
+                               token = NULL, updated_at = ?1
+             WHERE id = ?2 AND generation = 0 AND state = 'created'",
+            params![now, agent_num],
+        )
+        .map_err(sql_error)?;
+    if changed != 1 {
+        return Err(Error::new(
+            "stale_generation",
+            "initial launch Agent changed before failure settlement",
+        ));
+    }
+    events.push(insert_daemon_event(
+        tx,
+        now,
+        "agent.failed",
+        "agent",
+        Some(agent_num),
+        Some(0),
+        json!({
+            "agent_id": agent.id,
+            "command_id": command_id,
+            "reason": "launch_not_dispatched"
+        }),
+    )?);
+    Ok(())
+}
+
+fn cancel_unstarted_launch_input(
+    tx: &Transaction<'_>,
+    command_id: &str,
+    agent_num: i64,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    let Some(linked) = load_linked_command(tx, command_id)? else {
+        return Ok(());
+    };
+    let linked = load_command_record(tx, &linked.id)?
+        .ok_or_else(|| Error::new("source_integrity", "linked launch input disappeared"))?;
+    if linked.target != Some(agent_num) {
+        return Err(Error::new(
+            "source_integrity",
+            "linked launch input no longer matches its exact parent",
+        ));
+    }
+    if !matches!(linked.state, CommandState::Accepted | CommandState::Queued) {
+        return Ok(());
+    }
+    let outcome = json!({"reason": "launch_not_dispatched", "native_dispatched": false});
+    update_command_state(
+        tx,
+        &linked.command.id,
+        CommandState::Cancelled,
+        Some(&outcome),
+        None,
+        now,
+    )?;
+    events.push(insert_daemon_event(
+        tx,
+        now,
+        "command.cancelled",
+        "command",
+        Some(agent_num),
+        linked.command.generation,
+        json!({"command_id": linked.command.id, "outcome": outcome}),
+    )?);
+    Ok(())
+}
+
 fn stop_agent_tx(
     tx: &Transaction<'_>,
     agent_num: i64,
@@ -8099,6 +8344,9 @@ impl Store {
             }
             if expected_subject.is_none() {
                 update_agent_projection(&tx, &next)?;
+                if native_event.kind == "session.ended" && next.is_terminal() {
+                    capacity::release_proven_generation_tx(&tx, agent_num, batch.generation)?;
+                }
             }
             projection = next;
             committed_events.push(stored);

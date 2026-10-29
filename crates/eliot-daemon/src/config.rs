@@ -97,14 +97,18 @@ fn capture_native_store_inputs_inner(
         .filter_map(&mut credential_lookup)
         .filter_map(|value| value.into_string().ok())
         .collect::<Vec<_>>();
+    // Keep resolved credentials only in this temporary policy; snapshot data
+    // is checked against them but never receives their values.
     let policy = core::SecretPolicy::new(credentials.iter().map(String::as_str));
-    if policy.contains_value(&captured) {
+    let mut snapshot = profile.clone();
+    snapshot["pass_env_values"] = captured;
+    if policy.contains_value(&snapshot) {
         return Err(core::Error::new(
             "secret_in_payload",
-            "native store selector input contains a known credential",
+            "frozen profile metadata contains a known credential",
         ));
     }
-    profile["pass_env_values"] = captured;
+    *profile = snapshot;
     // The augmented snapshot is bounded by the existing Store admission/frame
     // checks. This capture proves inputs, never an effective native root/scope.
     Ok(())
@@ -114,11 +118,43 @@ fn capture_native_store_inputs_inner(
 struct FileConfig {
     #[serde(default)]
     profiles: HashMap<String, toml::Spanned<ProfileEntry>>,
+    #[serde(default)]
+    accounts: HashMap<String, toml::Spanned<AccountEntry>>,
+    #[serde(default)]
+    proxies: HashMap<String, toml::Spanned<ProxyEntry>>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AccountEntry {
+    #[serde(default)]
+    max_live: Option<u64>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProxyBaseUrls {
+    codex: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProxyEntry {
+    attach: String,
+    health: String,
+    #[serde(default)]
+    api_key_env: Option<String>,
+    #[serde(default)]
+    max_live: Option<u64>,
+    base_url_for: ProxyBaseUrls,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProfileEntry {
     harness: String,
+    #[serde(default)]
+    proxy: Option<String>,
+    #[serde(default)]
+    account: Option<String>,
+    #[serde(default)]
+    max_live: Option<u64>,
     #[serde(default)]
     cmd: Option<String>,
     #[serde(default)]
@@ -167,6 +203,28 @@ pub(crate) fn resolve_profile(data_root: &Path, name: &str) -> core::Result<Valu
             ));
         }
     }
+    for (account_name, entry) in &config.accounts {
+        if validate_profile_name(account_name).is_err() {
+            return Err(config_error_at(
+                &source,
+                entry.span().start,
+                "accounts",
+                "invalid account name",
+                "profile_error",
+            ));
+        }
+    }
+    for (proxy_name, entry) in &config.proxies {
+        if validate_profile_name(proxy_name).is_err() {
+            return Err(config_error_at(
+                &source,
+                entry.span().start,
+                "proxies",
+                "invalid proxy name",
+                "profile_error",
+            ));
+        }
+    }
     if let Some(fake) = config.profiles.get(FAKE_PROFILE) {
         return Err(config_error_at(
             &source,
@@ -185,7 +243,15 @@ pub(crate) fn resolve_profile(data_root: &Path, name: &str) -> core::Result<Valu
             format!("config.toml: profiles.{name}: profile not found"),
         )
     })?;
-    snapshot_from_entry(name, entry.get_ref(), entry.span().start, &source)
+    let snapshot = snapshot_from_entry(name, entry.get_ref(), entry.span().start, &source)?;
+    bind_route_and_capacity(
+        name,
+        entry.get_ref(),
+        &config,
+        entry.span().start,
+        &source,
+        snapshot,
+    )
 }
 fn read_config(data_root: &Path) -> core::Result<Option<(FileConfig, String)>> {
     let file = match std::fs::File::open(data_root.join("config.toml")) {
@@ -219,6 +285,11 @@ fn read_config(data_root: &Path) -> core::Result<Option<(FileConfig, String)>> {
     Ok(Some((config, source)))
 }
 fn fake_snapshot() -> Value {
+    let mut snapshot = fake_profile_snapshot();
+    snapshot["capacity_scopes"] = json!([{"scope":"profile:fake", "max_live":null}]);
+    snapshot
+}
+fn fake_profile_snapshot() -> Value {
     json!({
         "harness": "fake",
         "permissions": PERMISSION_WORKSPACE_WRITE,
@@ -234,22 +305,37 @@ fn snapshot_from_entry(
     source: &str,
 ) -> core::Result<Value> {
     let harness = entry.harness.trim();
+    if harness == FAKE_PROFILE {
+        if entry.proxy.is_some()
+            || entry.cmd.is_some()
+            || entry.model.is_some()
+            || entry.effort.is_some()
+            || entry.collaboration_mode.is_some()
+            || entry.permissions.is_some()
+            || entry.approval_policy.is_some()
+            || entry.pass_env.is_some()
+            || !entry.setup.is_empty()
+            || entry.scratch != default_scratch()
+        {
+            return Err(profile_field_error(
+                source,
+                table_offset,
+                name,
+                "harness",
+                "named fake profiles accept only account and capacity settings",
+                "profile_error",
+            ));
+        }
+        return Ok(fake_profile_snapshot());
+    }
     if harness != "codex" {
         return Err(profile_field_error(
             source,
             table_offset,
             name,
             "harness",
-            if harness == FAKE_PROFILE {
-                "builtin fake harness cannot be overridden"
-            } else {
-                "unsupported harness"
-            },
-            if harness == FAKE_PROFILE {
-                "profile_error"
-            } else {
-                "unsupported"
-            },
+            "unsupported harness",
+            "unsupported",
         ));
     }
     let model = entry
@@ -390,6 +476,153 @@ fn snapshot_from_entry(
     }
     Ok(Value::Object(snapshot))
 }
+
+fn bind_route_and_capacity(
+    profile_name: &str,
+    entry: &ProfileEntry,
+    config: &FileConfig,
+    table_offset: usize,
+    source: &str,
+    mut snapshot: Value,
+) -> core::Result<Value> {
+    let fail = |field: &str, message: &str| {
+        profile_field_error(
+            source,
+            table_offset,
+            profile_name,
+            field,
+            message,
+            "profile_error",
+        )
+    };
+    let mut scopes = vec![core::CapacityScope {
+        scope: format!("profile:{profile_name}"),
+        max_live: entry.max_live,
+    }];
+
+    if let Some(account_name) = entry.account.as_deref() {
+        validate_profile_name(account_name)
+            .map_err(|_| fail("account", "invalid account reference"))?;
+        let account = config
+            .accounts
+            .get(account_name)
+            .ok_or_else(|| fail("account", "named account was not found"))?;
+        scopes.push(core::CapacityScope {
+            scope: format!("account:{account_name}"),
+            max_live: account.get_ref().max_live,
+        });
+        snapshot["account"] = json!(account_name);
+    }
+
+    if let Some(proxy_name) = entry.proxy.as_deref() {
+        if entry.harness.trim() != "codex" {
+            return Err(fail(
+                "proxy",
+                "adopted proxy routes require the Codex harness",
+            ));
+        }
+        validate_profile_name(proxy_name).map_err(|_| fail("proxy", "invalid proxy reference"))?;
+        if is_builtin_codex_provider(proxy_name) {
+            return Err(fail(
+                "proxy",
+                "proxy name collides with a builtin Codex provider",
+            ));
+        }
+        let proxy = config
+            .proxies
+            .get(proxy_name)
+            .ok_or_else(|| fail("proxy", "named adopted proxy was not found"))?
+            .get_ref();
+
+        if entry
+            .effort
+            .as_deref()
+            .is_none_or(|effort| effort.trim().is_empty())
+        {
+            return Err(fail(
+                "effort",
+                "a routed Codex profile requires an explicit effort",
+            ));
+        }
+
+        let client_key_env_name = proxy
+            .api_key_env
+            .as_deref()
+            .map(|raw_name| {
+                let names =
+                    validate_pass_env(profile_name, &[raw_name.to_owned()], source, table_offset)?;
+                let name = names
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| fail("proxy", "invalid client key environment name"))?;
+                if native_store_selector(&name).is_some() {
+                    return Err(fail(
+                        "proxy",
+                        "client key cannot use a native store selector",
+                    ));
+                }
+                let allowed = snapshot["pass_env"].as_array().is_some_and(|values| {
+                    values.iter().filter_map(Value::as_str).any(|allowed| {
+                        if cfg!(windows) {
+                            allowed.eq_ignore_ascii_case(&name)
+                        } else {
+                            allowed == name.as_str()
+                        }
+                    })
+                });
+                if !allowed {
+                    return Err(fail(
+                        "proxy",
+                        "api_key_env must be explicitly allowed by profile pass_env",
+                    ));
+                }
+                Ok(name)
+            })
+            .transpose()?;
+
+        let route = core::RouteBinding {
+            name: proxy_name.to_owned(),
+            endpoint: proxy.attach.clone(),
+            readiness_path: proxy.health.clone(),
+            provider_base_url: proxy.base_url_for.codex.clone(),
+            client_key_env_name,
+        };
+        route
+            .validate()
+            .map_err(|_| fail("proxy", "invalid adopted route binding"))?;
+
+        scopes.push(core::CapacityScope {
+            scope: format!("proxy:{proxy_name}"),
+            max_live: proxy.max_live,
+        });
+        snapshot["proxy"] = json!(proxy_name);
+        snapshot["route_binding"] = serde_json::to_value(route)
+            .map_err(|_| fail("proxy", "adopted route binding could not be encoded"))?;
+    }
+
+    for scope in &scopes {
+        scope
+            .validate()
+            .map_err(|_| fail("max_live", "invalid capacity scope"))?;
+    }
+    snapshot["capacity_scopes"] = serde_json::to_value(scopes)
+        .map_err(|_| fail("max_live", "capacity scopes could not be encoded"))?;
+    Ok(snapshot)
+}
+
+fn is_builtin_codex_provider(name: &str) -> bool {
+    [
+        "openai",
+        "amazon-bedrock",
+        "amazon-bedrock-runtime",
+        "ollama",
+        "lmstudio",
+        "ollama-chat",
+    ]
+    .iter()
+    .any(|provider| name.eq_ignore_ascii_case(provider))
+}
+
 fn default_scratch() -> Vec<String> {
     vec!["target/".to_owned(), "node_modules/".to_owned()]
 }
@@ -698,13 +931,9 @@ fn safe_config_key(key: &str) -> bool {
 }
 fn is_unsupported_field(field: &str) -> bool {
     const FIELDS: &[&str] = &[
-        "proxy",
-        "proxies",
         "route",
         "routes",
         "extends",
-        "account",
-        "accounts",
         "registry",
         "registries",
         "overlay",
@@ -841,6 +1070,58 @@ mod tests {
         assert_eq!(profile, original);
     }
 
+    #[test]
+    fn native_store_capture_rejects_credentials_in_all_frozen_metadata() {
+        let credential = "CLIENT_SECRET_VALUE";
+        for location in [
+            "endpoint",
+            "name",
+            "model",
+            "capacity_scope",
+            "client_key_env_name",
+            "field_key",
+        ] {
+            let mut profile = json!({
+                "harness":"codex",
+                "model":"gpt-6-luna",
+                "pass_env":["CODEX_HOME", "RUNTIME_KEY"],
+                "route_binding":{
+                    "name":"opencodex",
+                    "endpoint":"http://127.0.0.1:10100",
+                    "readiness_path":"/api/system/health",
+                    "provider_base_url":"http://127.0.0.1:10100/v1",
+                    "client_key_env_name":"RUNTIME_KEY"
+                },
+                "capacity_scopes":[{"scope":"profile:routed", "max_live":null}]
+            });
+            match location {
+                "endpoint" => {
+                    profile["route_binding"]["endpoint"] =
+                        json!("http://127.0.0.1:10100/CLIENT_SECRET_VALUE");
+                }
+                "name" => profile["route_binding"]["name"] = json!(credential),
+                "model" => profile["model"] = json!(credential),
+                "capacity_scope" => {
+                    profile["capacity_scopes"][0]["scope"] = json!(format!("profile:{credential}"));
+                }
+                "client_key_env_name" => {
+                    profile["route_binding"]["client_key_env_name"] = json!(credential);
+                }
+                "field_key" => profile[credential] = json!("otherwise-safe-value"),
+                _ => unreachable!(),
+            }
+            let original = profile.clone();
+            let error = capture_native_store_inputs_with_lookups(
+                &mut profile,
+                |name| (name == "CODEX_HOME").then(|| OsString::from("C:/CodexHome")),
+                |name| (name == "RUNTIME_KEY").then(|| OsString::from(credential)),
+            )
+            .unwrap_err();
+            assert_eq!(error.code, "secret_in_payload", "missed {location}");
+            assert_eq!(profile, original, "mutated snapshot for {location}");
+        }
+    }
+
     fn config_error(source: &str) -> core::Error {
         let error = match toml::from_str::<FileConfig>(source) {
             Ok(_) => panic!("test configuration unexpectedly deserialized"),
@@ -849,15 +1130,198 @@ mod tests {
         map_toml_error(source, error)
     }
 
+    fn resolve_text_profile(source: &str, name: &str) -> core::Result<Value> {
+        let config: FileConfig = toml::from_str(source).unwrap();
+        let entry = config
+            .profiles
+            .get(name)
+            .ok_or_else(|| core::Error::new("profile_error", "test profile is missing"))?;
+        let snapshot = snapshot_from_entry(name, entry.get_ref(), entry.span().start, source)?;
+        bind_route_and_capacity(
+            name,
+            entry.get_ref(),
+            &config,
+            entry.span().start,
+            source,
+            snapshot,
+        )
+    }
+
+    #[test]
+    fn l34_route_and_capacity_snapshot_keeps_only_explicit_frozen_fields() {
+        let source = r#"
+[profiles.routed]
+harness = "codex"
+model = "gpt-6-luna"
+effort = "medium"
+proxy = "opencodex"
+account = "main"
+max_live = 2
+pass_env = ["RUNTIME_KEY"]
+
+[accounts.main]
+max_live = 4
+
+[proxies.opencodex]
+attach = "http://127.0.0.1:10300"
+health = "/api/system/health"
+api_key_env = "RUNTIME_KEY"
+max_live = 8
+base_url_for.codex = "http://127.0.0.1:10300/v1"
+"#;
+        let mut snapshot = resolve_text_profile(source, "routed").unwrap();
+        assert_eq!(snapshot["pass_env"], json!(["RUNTIME_KEY"]));
+        assert_eq!(snapshot["account"], "main");
+        assert_eq!(snapshot["proxy"], "opencodex");
+        assert_eq!(
+            snapshot["capacity_scopes"],
+            json!([
+                {"scope":"profile:routed", "max_live":2},
+                {"scope":"account:main", "max_live":4},
+                {"scope":"proxy:opencodex", "max_live":8}
+            ])
+        );
+        let route: core::RouteBinding =
+            serde_json::from_value(snapshot["route_binding"].clone()).unwrap();
+        assert_eq!(route.name, "opencodex");
+        assert_eq!(route.endpoint, "http://127.0.0.1:10300");
+        assert_eq!(route.readiness_path, "/api/system/health");
+        assert_eq!(route.provider_base_url, "http://127.0.0.1:10300/v1");
+        assert_eq!(route.client_key_env_name.as_deref(), Some("RUNTIME_KEY"));
+        assert_eq!(snapshot["route_binding"].as_object().unwrap().len(), 5);
+        capture_native_store_inputs_with_lookups(
+            &mut snapshot,
+            |_| panic!("unselected store selectors must not be read"),
+            |name| (name == "RUNTIME_KEY").then(|| OsString::from("runtime-secret-value")),
+        )
+        .unwrap();
+        assert!(!snapshot.to_string().contains("runtime-secret-value"));
+    }
+
+    #[test]
+    fn l34_key_reference_requires_explicit_allowlist_and_rejects_reserved_names() {
+        let base = r#"
+[profiles.routed]
+harness = "codex"
+model = "gpt-6-luna"
+effort = "medium"
+proxy = "opencodex"
+pass_env = ["__KEY__"]
+
+[proxies.opencodex]
+attach = "http://127.0.0.1:10300"
+health = "/api/system/health"
+api_key_env = "__KEY__"
+base_url_for.codex = "http://127.0.0.1:10300/v1"
+"#;
+        let missing_allowlist = base.replace("pass_env = [\"__KEY__\"]\n", "");
+        let error = resolve_text_profile(&missing_allowlist, "routed").unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("explicitly allowed by profile pass_env")
+        );
+
+        let selector = if cfg!(windows) {
+            "codex_home"
+        } else {
+            "CODEX_HOME"
+        };
+        let reserved = base.replace("__KEY__", selector);
+        assert!(resolve_text_profile(&reserved, "routed").is_err());
+
+        let identity = base.replace("__KEY__", "eliot_agent_token");
+        assert!(resolve_text_profile(&identity, "routed").is_err());
+    }
+
+    #[test]
+    fn l34_requires_explicit_health_base_and_effort_without_fallbacks() {
+        for source in [
+            "[proxies.opencodex]\nattach='http://127.0.0.1:10300'\nbase_url_for.codex='http://127.0.0.1:10300/v1'\n",
+            "[proxies.opencodex]\nattach='http://127.0.0.1:10300'\nhealth='/readyz'\n",
+        ] {
+            assert!(toml::from_str::<FileConfig>(source).is_err());
+        }
+
+        let without_effort = r#"
+[profiles.routed]
+harness = "codex"
+model = "gpt-6-luna"
+proxy = "opencodex"
+[proxies.opencodex]
+attach = "http://127.0.0.1:10300"
+health = "/api/system/health"
+base_url_for.codex = "http://127.0.0.1:10300/v1"
+"#;
+        assert!(resolve_text_profile(without_effort, "routed").is_err());
+
+        let direct = "[profiles.direct]\nharness='codex'\nmodel='gpt-6-luna'\n";
+        let direct = resolve_text_profile(direct, "direct").unwrap();
+        assert!(direct.get("effort").is_none());
+        assert!(direct.get("route_binding").is_none());
+    }
+
+    #[test]
+    fn l34_fake_profiles_allow_only_caps_and_account_selection() {
+        let source = r#"
+[profiles.fake-small]
+harness = "fake"
+account = "shared"
+max_live = 0
+[accounts.shared]
+max_live = 3
+"#;
+        let snapshot = resolve_text_profile(source, "fake-small").unwrap();
+        assert_eq!(snapshot["harness"], "fake");
+        assert_eq!(snapshot["account"], "shared");
+        assert!(snapshot.get("model").is_none());
+        assert!(snapshot.get("route_binding").is_none());
+        assert_eq!(
+            snapshot["capacity_scopes"],
+            json!([
+                {"scope":"profile:fake-small", "max_live":0},
+                {"scope":"account:shared", "max_live":3}
+            ])
+        );
+
+        for source in [
+            "[profiles.fake-proxy]\nharness='fake'\nproxy='opencodex'\n",
+            "[profiles.fake-cmd]\nharness='fake'\ncmd='codex'\n",
+            "[profiles.fake-model]\nharness='fake'\nmodel='some-model'\n",
+        ] {
+            let config: FileConfig = toml::from_str(source).unwrap();
+            let (name, entry) = config.profiles.iter().next().unwrap();
+            assert!(
+                snapshot_from_entry(name, entry.get_ref(), entry.span().start, source).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn l34_rejects_builtin_provider_name_collision() {
+        let source = r#"
+[profiles.routed]
+harness = "codex"
+model = "gpt-6-luna"
+effort = "medium"
+proxy = "OpenAI"
+[proxies.OpenAI]
+attach = "http://127.0.0.1:10300"
+health = "/api/system/health"
+base_url_for.codex = "http://127.0.0.1:10300/v1"
+"#;
+        assert!(resolve_text_profile(source, "routed").is_err());
+    }
+
     #[test]
     fn deferred_fields_use_decoded_keys_at_the_error_span() {
         let sources = [
-            "[profiles.codex-luna]\nharness = 'codex'\n\"proxy\" = 'private-value'\n",
+            "[profiles.codex-luna]\nharness = 'codex'\n\"routes\" = 'private-value'\n",
             r#"[profiles.codex-luna]
 harness = 'codex'
-"\u0070roxy" = 'private-value'
+"\u0072outes" = 'private-value'
 "#,
-            "profiles.codex-luna.harness = 'codex'\nprofiles.codex-luna.proxy = 'private-value'\n",
+            "profiles.codex-luna.harness = 'codex'\nprofiles.codex-luna.routes = 'private-value'\n",
             "[profiles.codex-luna]\nharness = 'codex'\n[[profiles.codex-luna.setup]]\nprogram = 'C:/tools/pwsh.exe'\nargs = []\ntimeout_ms = 120000\nextends = 'private-value'\n",
         ];
 

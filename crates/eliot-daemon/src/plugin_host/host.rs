@@ -794,6 +794,7 @@ async fn initialize_agent(actor: &AgentActorConfig, client: &PluginClient) -> Re
         .map_err(|error| redact_native_error(error, &actor.source_credentials))?;
     let manifest: PluginManifest = serde_json::from_value(init)
         .map_err(|_| Error::new("unsupported", "Agent plugin returned a malformed manifest"))?;
+    require_proxy_capability(&actor.agent.profile_snapshot, &manifest)?;
     let source_plan = manifest_source_plan(&manifest, &actor.agent.harness)?;
     if !manifest
         .verbs
@@ -814,6 +815,16 @@ async fn initialize_agent(actor: &AgentActorConfig, client: &PluginClient) -> Re
         manifest.verbs.into_iter().collect(),
     )?;
     Ok(source_plan)
+}
+
+fn require_proxy_capability(profile: &Value, manifest: &PluginManifest) -> Result<()> {
+    if profile.get("route_binding").is_some() && manifest.proxy != "responses" {
+        return Err(Error::new(
+            "unsupported",
+            "plugin does not advertise Responses-compatible proxy routing",
+        ));
+    }
+    Ok(())
 }
 
 async fn cleanup_startup(
@@ -2304,7 +2315,18 @@ async fn settle_drained_source_exit(
 ) -> Result<()> {
     let settlement = async {
         if reader_closed && exited {
-            return record_root_exit_gap(state, key, reason).await;
+            record_root_exit_gap(state, key, reason).await?;
+            let state = state
+                .upgrade()
+                .ok_or_else(|| Error::new("unavailable", "plugin host is unavailable"))?;
+            let mut store = timeout_at(deadline(), state.store.lock())
+                .await
+                .map_err(|_| Error::new("unknown", "owned exit capacity release timed out"))?;
+            // This call is reachable only after both physical exit and reader
+            // drain were proven above. Closing a source alone never frees capacity.
+            let events = store.record_owned_control_exit(&key.id, key.generation, now_ms())?;
+            state.bus.publish(&events);
+            return Ok(());
         }
         let state = state
             .upgrade()
@@ -2473,6 +2495,24 @@ pub(crate) fn forget_revoked_agent_token(
 mod tests {
     use super::*;
     use eliot_core::{NativeEvent, SubmitCommand};
+
+    #[test]
+    fn route_binding_requires_the_existing_responses_manifest_capability() {
+        let direct = json!({"harness":"codex"});
+        let routed = json!({"harness":"codex", "route_binding":{"name":"opencodex"}});
+        let mut manifest = eliot_plugin::protocol::fake_manifest();
+
+        require_proxy_capability(&direct, &manifest).unwrap();
+        assert_eq!(
+            require_proxy_capability(&routed, &manifest)
+                .unwrap_err()
+                .code,
+            "unsupported"
+        );
+        manifest.proxy = "responses".to_owned();
+        require_proxy_capability(&direct, &manifest).unwrap();
+        require_proxy_capability(&routed, &manifest).unwrap();
+    }
 
     const SECRET: &str = "__payload_guard_secret__";
     const SECRET_ERROR: &str =
@@ -3613,14 +3653,38 @@ mod tests {
         )
         .await
         .unwrap();
+        {
+            let store = host.state.store.lock().await;
+            assert_eq!(
+                store.read_source_state(&key.id, 1, "stream").unwrap()["state"],
+                json!("closed")
+            );
+            assert_eq!(
+                store.get_agent(&key.id).unwrap().unwrap().state,
+                eliot_core::AgentState::Starting
+            );
+            assert!(
+                store
+                    .read_events(before, 1000, None)
+                    .unwrap()
+                    .iter()
+                    .all(|event| event.kind != "capacity.released")
+            );
+        }
+        // Proven control loss can advance the Agent while the cap remains
+        // reserved until Store has the independent OS-source-close evidence.
+        mark_lost_state(&Arc::downgrade(&host.state), &key).await;
         let store = host.state.store.lock().await;
         assert_eq!(
-            store.read_source_state(&key.id, 1, "stream").unwrap()["state"],
-            json!("closed")
-        );
-        assert_eq!(
             store.get_agent(&key.id).unwrap().unwrap().state,
-            eliot_core::AgentState::Starting
+            eliot_core::AgentState::Lost
+        );
+        assert!(
+            store
+                .read_events(before, 1000, None)
+                .unwrap()
+                .iter()
+                .all(|event| event.kind != "capacity.released")
         );
     }
 

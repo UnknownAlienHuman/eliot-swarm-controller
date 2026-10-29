@@ -50,7 +50,8 @@ per-task report packets or another status registry.
       help/version smoke commands on Windows/Ubuntu. No empty framework crates or
       test platform.
 
-**Next:** L3.4 proxy/capacity. v1 remains available as a source donor.
+**Next:** L3.4 provider holds. The adopted route and configured-capacity path is one
+connected slice; L3.4 remains unchecked until provider holds are implemented.
 
 ## L1 — Core, Store, bus and one fake command path
 

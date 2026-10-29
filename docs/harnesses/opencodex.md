@@ -1,47 +1,53 @@
 # OpenCodex provider proxy
 
-Optional route in L3, after direct Codex already works. OpenCodex is an inference service,
-not another Agent harness. Source: [lidge-jun/opencodex](https://github.com/lidge-jun/opencodex).
-Inherited source check: 2026-10-25, v2.92.0. Recheck the selected installed API; this is
-not a required version or current runtime qualification.
+OpenCodex is an inference service, not an Agent harness. This increment adopts an
+already-running owner service as an optional Codex route; it does not manage service
+installation or lifecycle. Source: [lidge-jun/opencodex](https://github.com/lidge-jun/opencodex).
 
-## Ownership
+Inspection dated 2026-10-29 of installed OpenCodex 2.92.0 source
+`src/server/index/serve-options.ts` shows an anonymous literal `GET /readyz`: readiness
+returns HTTP 200 with `{"status":"ready"}`; pending or failed states return HTTP 503.
+`/healthz` reports liveness only. Configure the readiness path explicitly. There is no
+default path or OpenCodex version gate. This source contract does not establish provider
+authentication or inference success.
 
-`attach` adopts an owner-run endpoint: bounded health/read only, never start/stop/repair.
-`launch` explicitly supervises a service in separate custody. Start with attach; managed
-service orchestration must not delay the first working route. Agent stop never signals
-a shared or adopted service.
+## Ownership and configuration
+
+Eliot makes only a bounded unauthenticated readiness read. It never starts, stops or
+repairs an adopted endpoint. Agent stop owns the controlled Agent process tree and never
+signals the shared service. Managed service launch and service-management APIs remain
+`unsupported`; the owner retains service and credential administration.
 
 ```toml
 [proxies.opencodex]
-attach = "http://127.0.0.1:10100"
-health = "/api/system/health" # verify installed route
-api_key_env = "OPENCODEX_API_KEY"
+attach = "http://127.0.0.1:10300"
+health = "/readyz"
+base_url_for = { codex = "http://127.0.0.1:10300/v1" }
 max_live = 8
+# Optional; store only the environment-variable name, never its value.
+# api_key_env = "OPENCODEX_API_KEY"
 ```
 
-Owner performs install/init/login. Client/admin credentials remain separate secret
-references. Frozen profile captures endpoint, mode, health path, route/account and, for
-managed service, exact launch/config inputs. Reload affects future admissions only;
-service reuse requires matching binding and endpoint/custody readback.
+If api_key_env is set, the selected profile must explicitly allow that variable name in
+pass_env. Its value remains runtime-only and is not used for readiness.
 
-## Harness wiring
+The profile explicitly selects this proxy and may name an account. The frozen snapshot
+captures the selected names, optional shared Core `RouteBinding`, and configured
+`CapacityScope` values. The canonical Core DTOs own their field catalog. `None` means
+unlimited; `max_live = 0` disables that configured scope. These local workload limits
+do not describe OpenCodex account entitlement or vendor quota. Named Fake profiles may
+exercise profile/account caps, but Fake has no proxy route.
 
-Codex uses an explicit named Responses-compatible provider at the configured endpoint.
-Claude later uses documented Anthropic base URL/auth/header variables. Inject configuration
-per Agent; do not run global integration installers or alter owner client configuration.
-Keep native sessions, generation and lifecycle in the harness plugin.
+## Codex wiring and limits
 
-## Monitoring, capacity and holds
+The route uses the explicitly selected native executable's process-scoped configuration
+override and verifies the effective named provider before session start. It does not
+silently select another executable, provider or account. The owner's global Codex
+configuration is not rewritten. Only the optional client-key environment-variable name
+is frozen; its value is runtime-only.
 
-Optional management reads check supported endpoints/fields/capabilities. Version is
-diagnostic, never an equality gate. A timeout marks only that source stale; it neither
-completes Agent work nor authorizes fallback. Shared account/service capacity and provider
-holds survive restart. Unknown probe remains reserved; no silent model/account switch.
-
-## Billing visibility and final checks
-
-Display intended profile/billing and native/proxy effective facts separately. Requested
-URL or one successful main request does not prove auxiliary/subagent traffic used the
-same route. Mark unobservable scope unknown. L7 exercises actual direct/proxy requests,
-secret separation, config reload, service ownership, effective routing and hold recovery.
+The readiness and effective-config checks establish those limited facts only. Runtime
+authentication, inference, billing, and auxiliary/subagent traffic remain unverified in
+this increment. No model/provider probe or automatic route/account fallback is part of
+the path. Provider holds and their management API are the next connected increment and
+remain `unsupported` here.

@@ -134,8 +134,16 @@ Profile {
 }
 ```
 
-Model/effort are native values. Display requested/effective values separately. Add
-profile/account/proxy capacity with their callers; do not silently change a spending route.
+Model/effort are native values. Display requested/effective values separately. The frozen
+profile snapshot carries an optional shared Core `RouteBinding` and a vector of
+[`CapacityScope` values](../../crates/eliot-core/src/routing.rs); their field catalog
+is canonical there. Admission checks every configured profile/account/proxy scope
+before controlled dispatch. An
+omitted `max_live` is unlimited and zero disables that scope. These are Eliot workload
+limits, not vendor entitlement or quota. Reservations survive restart when closure is
+uncertain and release only after the owned generation is proven closed. Provider holds
+remain a later increment and are unsupported here; route changes never silently fall
+back to another provider or account.
 
 ## Events and authoritative sources
 

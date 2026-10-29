@@ -8,7 +8,8 @@ use eliot_core::{
 };
 use serde_json::json;
 use std::{
-    path::Path,
+    fs,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 use ulid::Ulid;
@@ -54,6 +55,89 @@ fn ready_agent(store: &mut Store, project: &str, now: i64) -> String {
         .settle(&launch_id, CommandState::Applied, None, now)
         .expect("settle launch");
     agent
+}
+
+fn capacity_launch_request(
+    project: &str,
+    profile: &str,
+    scopes: serde_json::Value,
+) -> SubmitCommand {
+    let mut request = SubmitCommand::new(Ulid::new().to_string(), "launch");
+    request.args = json!({
+        "project": project,
+        "harness": "codex",
+        "profile": profile,
+        "workspace": format!("synthetic-capacity-{project}"),
+        "profile_snapshot": {"capacity_scopes": scopes},
+    });
+    request.expected_generation = Some(0);
+    request
+}
+
+fn capacity_generation(store: &Store, agent: &str) -> Option<i64> {
+    let agent = eliot_core::parse_agent_id(agent).expect("valid Agent id");
+    store
+        .connection
+        .query_row(
+            "SELECT capacity_generation FROM agents WHERE id = ?1",
+            [agent],
+            |row| row.get(0),
+        )
+        .expect("read capacity generation")
+}
+
+fn capacity_store_path() -> PathBuf {
+    std::env::temp_dir().join(format!("eliot-capacity-{}.sqlite", Ulid::new()))
+}
+
+fn remove_capacity_store_files(path: &Path) {
+    for suffix in ["", "-wal", "-shm"] {
+        let mut candidate = path.as_os_str().to_os_string();
+        candidate.push(suffix);
+        let _ = fs::remove_file(PathBuf::from(candidate));
+    }
+}
+
+fn ready_capacity_agent(store: &mut Store, project: &str, now: i64) -> (String, String) {
+    let launch = capacity_launch_request(
+        project,
+        "resume-profile",
+        json!([{"scope":"profile:resume-profile","max_live":1}]),
+    );
+    let launch_id = launch.id.clone();
+    let admission = store
+        .submit("owner", launch, now)
+        .expect("admit capacity launch");
+    let agent = admission.command.target.expect("launch target");
+    store
+        .dispatch(&launch_id, now)
+        .expect("dispatch capacity launch");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("{project}:ready"),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                cursor: None,
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ready".to_owned(),
+                    native_id: format!("{project}:ready"),
+                    data: json!({
+                        "command_id": launch_id,
+                        "native_scope": format!("capacity-scope:{project}"),
+                        "native_ref": format!("capacity-ref:{project}")
+                    }),
+                }],
+            },
+            now,
+        )
+        .expect("commit capacity session ready");
+    store
+        .settle(&launch_id, CommandState::Applied, None, now)
+        .expect("settle capacity launch");
+    (agent, launch_id)
 }
 
 #[test]
@@ -201,10 +285,13 @@ fn workspace_exceptions_stay_marker_bound_across_unknown_readback() {
     };
     let start = store.submit_with_workspace("owner", SubmitCommand {
         id: start_id.clone(), target: None, verb: "launch".to_owned(),
-        args: json!({"project":input.project,"workspace":input.repo_path,"worktree":input.requested_branch}),
+        args: json!({"project":input.project,"workspace":input.repo_path,"worktree":input.requested_branch,
+            "harness":"fake","profile":"fake",
+            "profile_snapshot":{"capacity_scopes":[{"scope":"profile:fake","max_live":1}]}}),
         expected_generation: Some(0), expected_turn_id: None, request_id: None,
     }, input.clone(), now).expect("admit prepared launch");
     let agent = start.command.target.expect("workspace owner");
+    assert_eq!(capacity_generation(&store, &agent), Some(1));
     for state in [CommandState::Failed, CommandState::Unknown] {
         assert_eq!(
             store
@@ -241,6 +328,7 @@ fn workspace_exceptions_stay_marker_bound_across_unknown_readback() {
             .state,
         CommandState::Unknown
     );
+    assert_eq!(capacity_generation(&store, &agent), Some(1));
     assert_eq!(
         store
             .get_agent(&agent)
@@ -345,6 +433,7 @@ fn workspace_exceptions_stay_marker_bound_across_unknown_readback() {
     let owner = store.get_agent(&agent).expect("Agent").expect("owner");
     assert_eq!(owner.generation, 0);
     assert_eq!(owner.state, AgentState::Stopped);
+    assert_eq!(capacity_generation(&store, &agent), None);
     assert_eq!(store.get_agent_token(&agent, 0).expect("no token"), None);
     assert!(
         store
@@ -352,6 +441,17 @@ fn workspace_exceptions_stay_marker_bound_across_unknown_readback() {
             .expect("no native source installed")
             .is_empty()
     );
+    store
+        .submit(
+            "owner",
+            capacity_launch_request(
+                "workspace-capacity-reuse",
+                "fake",
+                json!([{"scope":"profile:fake","max_live":1}]),
+            ),
+            now + 1,
+        )
+        .expect("proven pre-native cancellation releases the slot");
 }
 
 #[test]
@@ -1305,4 +1405,650 @@ fn native_store_binding_frame_and_persistence_failures_roll_back_entire_dispatch
             .unwrap();
         assert_eq!(sources, 0);
     }
+}
+
+#[test]
+fn configured_capacity_scopes_are_reserved_atomically_and_retries_are_idempotent() {
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let mut account_store = Store::open(Path::new(":memory:")).expect("open Store");
+    let first = capacity_launch_request(
+        "capacity-account-first",
+        "profile-a",
+        json!([
+            {"scope":"profile:profile-a","max_live":null},
+            {"scope":"account:shared-account","max_live":1},
+            {"scope":"proxy:route-a","max_live":null}
+        ]),
+    );
+    let first_admission = account_store
+        .submit("owner", first.clone(), now)
+        .expect("reserve all configured scopes at admission");
+    let first_agent = first_admission.command.target.as_deref().unwrap();
+    assert_eq!(capacity_generation(&account_store, first_agent), Some(1));
+    let high_water = account_store.high_water().unwrap();
+    assert!(
+        !account_store
+            .submit("owner", first, now + 1)
+            .expect("retained id lookup precedes capacity reservation")
+            .is_new
+    );
+    assert_eq!(account_store.high_water().unwrap(), high_water);
+    let account_blocked = capacity_launch_request(
+        "capacity-account-second",
+        "profile-b",
+        json!([
+            {"scope":"profile:profile-b","max_live":null},
+            {"scope":"account:shared-account","max_live":1},
+            {"scope":"proxy:route-b","max_live":null}
+        ]),
+    );
+    let account_blocked_id = account_blocked.id.clone();
+    assert_eq!(
+        account_store
+            .submit("owner", account_blocked, now + 2)
+            .unwrap_err()
+            .code,
+        "capacity_unavailable"
+    );
+    assert_eq!(account_store.agent_count().unwrap(), 1);
+    assert!(
+        account_store
+            .get_command(&account_blocked_id)
+            .unwrap()
+            .is_none()
+    );
+
+    let mut fake_store = Store::open(Path::new(":memory:")).expect("open Store");
+    let mut named_fake = capacity_launch_request(
+        "capacity-named-fake",
+        "fake-small",
+        json!([{"scope":"profile:fake-small","max_live":1}]),
+    );
+    named_fake.args["harness"] = json!("fake");
+    let named_fake_agent = fake_store
+        .submit("owner", named_fake, now)
+        .expect("Store admits a configured named fake profile")
+        .command
+        .target
+        .expect("named fake Agent");
+    let named_fake_agent = fake_store.get_agent(&named_fake_agent).unwrap().unwrap();
+    assert_eq!(named_fake_agent.harness, "fake");
+    assert_eq!(named_fake_agent.profile, "fake-small");
+
+    let mut proxy_store = Store::open(Path::new(":memory:")).expect("open Store");
+    proxy_store
+        .submit(
+            "owner",
+            capacity_launch_request(
+                "capacity-proxy-first",
+                "profile-c",
+                json!([
+                    {"scope":"profile:profile-c","max_live":null},
+                    {"scope":"account:account-c","max_live":null},
+                    {"scope":"proxy:shared-route","max_live":1}
+                ]),
+            ),
+            now,
+        )
+        .expect("admit first proxy-scoped Agent");
+    assert_eq!(
+        proxy_store
+            .submit(
+                "owner",
+                capacity_launch_request(
+                    "capacity-proxy-second",
+                    "profile-d",
+                    json!([
+                        {"scope":"profile:profile-d","max_live":null},
+                        {"scope":"account:account-d","max_live":null},
+                        {"scope":"proxy:shared-route","max_live":1}
+                    ]),
+                ),
+                now + 1,
+            )
+            .unwrap_err()
+            .code,
+        "capacity_unavailable"
+    );
+
+    let mut profile_store = Store::open(Path::new(":memory:")).expect("open Store");
+    profile_store
+        .submit(
+            "owner",
+            capacity_launch_request(
+                "capacity-profile-first",
+                "profile-limited",
+                json!([
+                    {"scope":"profile:profile-limited","max_live":1},
+                    {"scope":"account:account-e","max_live":null},
+                    {"scope":"proxy:route-e","max_live":null}
+                ]),
+            ),
+            now,
+        )
+        .expect("admit first profile-scoped Agent");
+    assert_eq!(
+        profile_store
+            .submit(
+                "owner",
+                capacity_launch_request(
+                    "capacity-profile-second",
+                    "profile-limited",
+                    json!([
+                        {"scope":"profile:profile-limited","max_live":1},
+                        {"scope":"account:account-f","max_live":null},
+                        {"scope":"proxy:route-f","max_live":null}
+                    ]),
+                ),
+                now + 1,
+            )
+            .unwrap_err()
+            .code,
+        "capacity_unavailable"
+    );
+
+    let mut disabled_store = Store::open(Path::new(":memory:")).expect("open Store");
+    assert_eq!(
+        disabled_store
+            .submit(
+                "owner",
+                capacity_launch_request(
+                    "capacity-disabled",
+                    "profile-disabled",
+                    json!([{"scope":"profile:profile-disabled","max_live":0}]),
+                ),
+                now,
+            )
+            .unwrap_err()
+            .code,
+        "capacity_unavailable"
+    );
+
+    let mut unlimited_store = Store::open(Path::new(":memory:")).expect("open Store");
+    for (project, profile) in [
+        ("capacity-unlimited-one", "profile-unlimited-one"),
+        ("capacity-unlimited-two", "profile-unlimited-two"),
+    ] {
+        unlimited_store
+            .submit(
+                "owner",
+                capacity_launch_request(
+                    project,
+                    profile,
+                    json!([
+                        {"scope":format!("profile:{profile}"),"max_live":null},
+                        {"scope":"account:unlimited","max_live":null},
+                        {"scope":"proxy:unlimited","max_live":null}
+                    ]),
+                ),
+                now,
+            )
+            .expect("None capacity is unlimited");
+    }
+}
+
+#[test]
+fn unknown_start_capacity_survives_recovery_and_store_reopen() {
+    let path = capacity_store_path();
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let first = capacity_launch_request(
+        "capacity-unknown-first",
+        "profile-unknown-first",
+        json!([
+            {"scope":"profile:profile-unknown-first","max_live":null},
+            {"scope":"account:unknown-shared","max_live":1}
+        ]),
+    );
+    let first_id = first.id.clone();
+    let first_agent;
+    {
+        let mut store = Store::open(&path).expect("open persistent Store");
+        first_agent = store
+            .submit("owner", first, now)
+            .expect("admit launch")
+            .command
+            .target
+            .expect("launch Agent");
+        store.dispatch(&first_id, now + 1).expect("dispatch launch");
+        store
+            .settle(
+                &first_id,
+                CommandState::Unknown,
+                Some(json!({"reason":"start_readback_unknown"})),
+                now + 2,
+            )
+            .expect("retain uncertain native start");
+        store
+            .recover_on_restart(now + 3)
+            .expect("restart keeps uncertain start");
+        assert_eq!(capacity_generation(&store, &first_agent), Some(1));
+    }
+    {
+        let mut reopened = Store::open(&path).expect("reopen persistent Store");
+        assert_eq!(capacity_generation(&reopened, &first_agent), Some(1));
+        assert_eq!(
+            reopened
+                .submit(
+                    "owner",
+                    capacity_launch_request(
+                        "capacity-unknown-second",
+                        "profile-unknown-second",
+                        json!([
+                            {"scope":"profile:profile-unknown-second","max_live":null},
+                            {"scope":"account:unknown-shared","max_live":1}
+                        ]),
+                    ),
+                    now + 4,
+                )
+                .unwrap_err()
+                .code,
+            "capacity_unavailable"
+        );
+    }
+    remove_capacity_store_files(&path);
+}
+
+#[test]
+fn pending_plain_workspace_resume_reserves_next_generation_and_stale_exit_cannot_release_it() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let (agent, _) = ready_capacity_agent(&mut store, "resume-capacity", now);
+    store
+        .ensure_process_source(&agent, 1, now + 1)
+        .expect("install persisted process source");
+    let numeric_agent = eliot_core::parse_agent_id(&agent).unwrap();
+    let process_owner = format!("agent:{agent}#1");
+    store
+        .connection
+        .execute(
+            "INSERT INTO processes(host_boot_id, pid, start_time, owner, role, state, exit_code, updated_at)
+             VALUES ('capacity-boot', 81001, 1, ?1, 'plugin', 'exited', 0, ?2)",
+            rusqlite::params![process_owner, now + 2],
+        )
+        .expect("persist old generation process exit");
+    store
+        .set_process_source_status(&agent, 1, "ok", true, now + 2)
+        .expect("commit old generation process source closure");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "resume-capacity:ended".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                cursor: None,
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ended".to_owned(),
+                    native_id: "resume-capacity:ended".to_owned(),
+                    data: json!({}),
+                }],
+            },
+            now + 3,
+        )
+        .expect("commit terminal session fact");
+    assert_eq!(capacity_generation(&store, &agent), None);
+
+    let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
+    resume.target = Some(agent.clone());
+    resume.expected_generation = Some(1);
+    let resume_id = resume.id.clone();
+    store
+        .submit("owner", resume.clone(), now + 4)
+        .expect("admit resume into the existing non-managed workspace");
+    assert_eq!(capacity_generation(&store, &agent), Some(2));
+
+    let mut duplicate = resume;
+    duplicate.id = Ulid::new().to_string();
+    let high_water = store.high_water().unwrap();
+    assert_eq!(
+        store
+            .submit("owner", duplicate.clone(), now + 5)
+            .unwrap_err()
+            .code,
+        "bad_state"
+    );
+    assert!(store.get_command(&duplicate.id).unwrap().is_none());
+    assert_eq!(store.high_water().unwrap(), high_water);
+
+    assert!(
+        store
+            .record_owned_control_exit(&agent, 1, now + 6)
+            .expect("late generation-1 exit is harmless")
+            .is_empty()
+    );
+    assert_eq!(capacity_generation(&store, &agent), Some(2));
+    store
+        .dispatch(&resume_id, now + 7)
+        .expect("dispatch exact reservation");
+    assert_eq!(capacity_generation(&store, &agent), Some(2));
+    assert_eq!(
+        store.get_agent(&agent).unwrap().unwrap().generation,
+        2,
+        "old generation cleanup cannot change the resumed generation"
+    );
+    assert!(numeric_agent > 0);
+}
+
+#[test]
+fn exact_undispatched_resume_rejection_releases_only_its_next_generation_slot() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let (agent, _) = ready_capacity_agent(&mut store, "resume-withdrawal", now);
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "resume-withdrawal:ended".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                cursor: None,
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ended".to_owned(),
+                    native_id: "resume-withdrawal:ended".to_owned(),
+                    data: json!({}),
+                }],
+            },
+            now + 1,
+        )
+        .expect("commit terminal session fact");
+    let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
+    resume.target = Some(agent.clone());
+    resume.expected_generation = Some(1);
+    let resume_id = resume.id.clone();
+    store.submit("owner", resume, now + 2).unwrap();
+    assert_eq!(capacity_generation(&store, &agent), Some(2));
+    store
+        .settle(
+            &resume_id,
+            CommandState::Rejected,
+            Some(json!({"reason":"native_not_dispatched"})),
+            now + 3,
+        )
+        .expect("exact no-session rejection withdraws this resume");
+    assert_eq!(capacity_generation(&store, &agent), None);
+
+    let mut next = SubmitCommand::new(Ulid::new().to_string(), "resume");
+    next.target = Some(agent.clone());
+    next.expected_generation = Some(1);
+    store
+        .submit("owner", next, now + 4)
+        .expect("a withdrawn resume no longer blocks a new exact resume");
+    assert_eq!(capacity_generation(&store, &agent), Some(2));
+}
+
+#[test]
+fn capacity_migration_uses_commands_and_physical_facts_without_rewriting_snapshots() {
+    let path = capacity_store_path();
+    let pending_snapshot =
+        r#"{"capacity_scopes":[{"scope":"profile:pending","max_live":1}],"keep":"pending"}"#;
+    let rejected_snapshot =
+        r#"{"capacity_scopes":[{"scope":"profile:rejected","max_live":1}],"keep":"rejected"}"#;
+    let unknown_snapshot =
+        r#"{"capacity_scopes":[{"scope":"profile:unknown","max_live":1}],"keep":"unknown"}"#;
+    let ended_snapshot =
+        r#"{"capacity_scopes":[{"scope":"profile:ended","max_live":1}],"keep":"ended"}"#;
+    let closed_only_snapshot = r#"{"capacity_scopes":[{"scope":"profile:closed-only","max_live":1}],"keep":"closed-only"}"#;
+    let owned_exit_snapshot =
+        r#"{"capacity_scopes":[{"scope":"profile:owned-exit","max_live":1}],"keep":"owned-exit"}"#;
+    let rejected_dispatched_snapshot = r#"{"capacity_scopes":[{"scope":"profile:rejected-dispatched","max_live":1}],"keep":"rejected-dispatched"}"#;
+    let rejected_resume_snapshot = r#"{"capacity_scopes":[{"scope":"profile:rejected-resume","max_live":1}],"keep":"rejected-resume"}"#;
+    let pending_resume_snapshot = r#"{"capacity_scopes":[{"scope":"profile:pending-resume","max_live":1}],"keep":"pending-resume"}"#;
+    {
+        let old = rusqlite::Connection::open(&path).expect("create v8 fixture");
+        old.execute_batch(
+            "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY);
+             INSERT INTO schema_migrations VALUES (1),(2),(3),(4),(5),(6),(7),(8);
+             CREATE TABLE agents(
+                 id INTEGER PRIMARY KEY, generation INTEGER NOT NULL,
+                 observe_only INTEGER NOT NULL, profile TEXT NOT NULL,
+                 profile_snapshot TEXT NOT NULL
+             );
+             CREATE TABLE commands(
+                 id TEXT PRIMARY KEY, target INTEGER, verb TEXT,
+                 generation INTEGER, state TEXT
+             );
+             CREATE TABLE events(
+                 agent INTEGER, generation INTEGER, family TEXT,
+                 kind TEXT, source TEXT, data TEXT
+             );
+             CREATE TABLE source_state(
+                 agent INTEGER, generation INTEGER, source TEXT, state TEXT
+             );
+             CREATE TABLE processes(owner TEXT, role TEXT, state TEXT);
+             CREATE TABLE workspaces(start_command_id TEXT, target_generation INTEGER);",
+        )
+        .expect("create v8 tables");
+        for (id, generation, profile, snapshot) in [
+            (1_i64, 0_i64, "pending", pending_snapshot),
+            (2, 0, "rejected", rejected_snapshot),
+            (3, 1, "unknown", unknown_snapshot),
+            (4, 1, "ended", ended_snapshot),
+            (5, 1, "closed-only", closed_only_snapshot),
+            (6, 1, "owned-exit", owned_exit_snapshot),
+            (7, 0, "unadmitted", "{}"),
+            (8, 1, "rejected-dispatched", rejected_dispatched_snapshot),
+            (9, 1, "rejected-resume", rejected_resume_snapshot),
+            (10, 1, "pending-resume", pending_resume_snapshot),
+        ] {
+            old.execute(
+                "INSERT INTO agents(id, generation, observe_only, profile, profile_snapshot)
+                 VALUES (?1, ?2, 0, ?3, ?4)",
+                rusqlite::params![id, generation, profile, snapshot],
+            )
+            .expect("insert v8 Agent");
+        }
+        old.execute(
+            "INSERT INTO commands(id, target, verb, generation, state)
+             VALUES ('pending-launch',1,'launch',0,'accepted'),
+                    ('rejected-launch',2,'launch',0,'rejected'),
+                    ('unknown-launch',3,'launch',1,'unknown'),
+                    ('rejected-dispatched-start',8,'launch',1,'rejected'),
+                    ('rejected-resume',9,'resume',1,'rejected'),
+                    ('pending-resume',10,'resume',1,'accepted')",
+            [],
+        )
+        .expect("insert retained start commands");
+        old.execute(
+            "INSERT INTO events(agent, generation, family, kind, source, data)
+             VALUES (4,1,'session','session.ended','stream','{}'),
+                    (10,1,'session','session.ended','stream','{}'),
+                    (8,1,'agent','agent.starting','daemon','{\"command_id\":\"rejected-dispatched-start\"}')",
+            [],
+        )
+        .expect("insert terminal native fact");
+        old.execute(
+            "INSERT INTO source_state(agent, generation, source, state)
+             VALUES (5,1,'stream','closed'),
+                    (6,1,'stream','closed'),
+                    (6,1,'os','closed')",
+            [],
+        )
+        .expect("insert source facts");
+        old.execute(
+            "INSERT INTO processes(owner, role, state)
+             VALUES ('agent:a6#1','plugin','exited')",
+            [],
+        )
+        .expect("insert owned process exit fact");
+    }
+
+    let store = Store::open(&path).expect("migrate v8 Store");
+    assert_eq!(capacity_generation(&store, "a1"), Some(1));
+    assert_eq!(capacity_generation(&store, "a2"), None);
+    assert_eq!(capacity_generation(&store, "a3"), Some(1));
+    assert_eq!(capacity_generation(&store, "a4"), None);
+    assert_eq!(
+        capacity_generation(&store, "a5"),
+        Some(1),
+        "closed reader source alone is not process-exit proof"
+    );
+    assert_eq!(capacity_generation(&store, "a6"), None);
+    assert_eq!(capacity_generation(&store, "a7"), None);
+    assert_eq!(capacity_generation(&store, "a8"), None);
+    assert_eq!(
+        capacity_generation(&store, "a9"),
+        Some(1),
+        "pre-dispatch resume rejection does not prove the prior generation ended"
+    );
+    assert_eq!(
+        capacity_generation(&store, "a10"),
+        Some(2),
+        "retained resume admission reserves its next generation after terminal proof"
+    );
+    let retained_snapshot: String = store
+        .connection
+        .query_row(
+            "SELECT profile_snapshot FROM agents WHERE id = 5",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read legacy snapshot");
+    assert_eq!(retained_snapshot, closed_only_snapshot);
+    drop(store);
+    remove_capacity_store_files(&path);
+}
+
+#[test]
+fn pre_dispatch_initial_launch_rejection_is_terminal_cancels_linked_input_and_frees_drain_slot() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let mut request = capacity_launch_request(
+        "readiness-failure",
+        "readiness-profile",
+        json!([{"scope":"profile:readiness-profile","max_live":1}]),
+    );
+    request.args["text"] = json!("launch input never reaches the native process");
+    let start_id = request.id.clone();
+    let admission = store
+        .submit("owner", request, now)
+        .expect("admit initial launch");
+    let agent = admission.command.target.clone().expect("launch target");
+    let linked_id = admission
+        .linked_command
+        .as_ref()
+        .expect("linked launch input")
+        .id
+        .clone();
+    assert_eq!(capacity_generation(&store, &agent), Some(1));
+
+    let settled = store
+        .settle(
+            &start_id,
+            CommandState::Rejected,
+            Some(json!({"reason":"readiness_failed"})),
+            now + 1,
+        )
+        .expect("record proven pre-dispatch readiness rejection");
+    let failed = store.get_agent(&agent).unwrap().unwrap();
+    assert_eq!(failed.generation, 0);
+    assert_eq!(failed.state, AgentState::Failed);
+    assert!(
+        failed.is_terminal(),
+        "the never-started Agent no longer blocks drain"
+    );
+    assert_eq!(store.get_agent_token(&agent, 0).unwrap(), None);
+    assert_eq!(capacity_generation(&store, &agent), None);
+    assert_eq!(
+        store.get_command(&linked_id).unwrap().unwrap().state,
+        CommandState::Cancelled
+    );
+    assert!(settled.events.iter().any(|event| {
+        event.kind == "agent.failed" && event.data["reason"] == "launch_not_dispatched"
+    }));
+    assert!(settled.events.iter().any(|event| {
+        event.kind == "command.cancelled" && event.data["command_id"] == linked_id
+    }));
+
+    store
+        .submit(
+            "owner",
+            capacity_launch_request(
+                "readiness-retry-new-id",
+                "readiness-profile",
+                json!([{"scope":"profile:readiness-profile","max_live":1}]),
+            ),
+            now + 2,
+        )
+        .expect("failed generation-0 launch no longer blocks drain or capacity");
+}
+
+#[test]
+fn stop_and_source_closure_alone_do_not_release_capacity_or_fail_host_settlement() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let (agent, _) = ready_capacity_agent(&mut store, "capacity-stop-proof", now);
+    store
+        .ensure_process_source(&agent, 1, now + 1)
+        .expect("install OS process source");
+
+    let stop_id = Ulid::new().to_string();
+    store
+        .submit(
+            "owner",
+            SubmitCommand {
+                id: stop_id.clone(),
+                target: Some(agent.clone()),
+                verb: "stop".to_owned(),
+                args: json!({}),
+                expected_generation: Some(1),
+                expected_turn_id: None,
+                request_id: None,
+            },
+            now + 2,
+        )
+        .expect("admit stop");
+    store.dispatch(&stop_id, now + 2).unwrap();
+    store
+        .settle(&stop_id, CommandState::Applied, None, now + 3)
+        .expect("stop acknowledgement does not prove process exit");
+    assert_eq!(capacity_generation(&store, &agent), Some(1));
+
+    store
+        .set_process_source_status(&agent, 1, "ok", true, now + 4)
+        .expect("persist source closure without an observed process exit");
+    assert!(
+        store
+            .record_owned_control_exit(&agent, 1, now + 5)
+            .expect("insufficient evidence must not block Lost/source settlement")
+            .is_empty()
+    );
+    assert_eq!(capacity_generation(&store, &agent), Some(1));
+    assert_eq!(
+        store
+            .submit(
+                "owner",
+                capacity_launch_request(
+                    "capacity-stop-blocked",
+                    "resume-profile",
+                    json!([{"scope":"profile:resume-profile","max_live":1}]),
+                ),
+                now + 6,
+            )
+            .unwrap_err()
+            .code,
+        "capacity_unavailable"
+    );
+
+    let numeric_agent = eliot_core::parse_agent_id(&agent).unwrap();
+    let process_owner = format!("agent:{agent}#1");
+    store
+        .connection
+        .execute(
+            "INSERT INTO processes(host_boot_id, pid, start_time, owner, role, state, exit_code, updated_at)
+             VALUES ('capacity-stop-boot', 81002, 1, ?1, 'plugin', 'exited', 0, ?2)",
+            rusqlite::params![process_owner, now + 7],
+        )
+        .expect("persist exact exited process record");
+    store
+        .close_native_sources(&agent, 1, now + 8)
+        .expect("persist native reader drain independently");
+    assert_eq!(capacity_generation(&store, &agent), Some(1));
+    let events = store
+        .record_owned_control_exit(&agent, 1, now + 9)
+        .expect("matching OS, process, and reader facts release capacity");
+    assert!(events.iter().any(|event| event.kind == "capacity.released"));
+    assert_eq!(capacity_generation(&store, &agent), None);
+    assert!(numeric_agent > 0);
 }

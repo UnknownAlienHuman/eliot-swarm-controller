@@ -71,6 +71,11 @@ An initial plugin may declare:
 }
 ```
 
+`proxy` remains a string capability. "none" remains valid for this L1/L2 example,
+Fake, and direct Codex. A controlled Codex profile with an adopted Responses route
+advertises "responses" to declare per-Agent route-configuration support. This does not
+claim provider authentication or inference success and does not add a flag or enum.
+
 Extend verbs/families/features only when their paths exist. Version is diagnostic;
 methods/fields/capabilities establish compatibility. The host selects one owner per
 normalized native family. Hooks never mirror lifecycle already supplied by the stream.
@@ -89,6 +94,13 @@ normalized native family. Hooks never mirror lifecycle already supplied by the s
 | `discover` | frozen profile, target environment without Agent identity, optional exact scope/cursor, bounded limit | read-only native-subject metadata page |
 | `profile.store` (L3) | shared [`ProfileStoreParams`](../../crates/eliot-plugin/src/protocol.rs) | Return the effective [`NativeStoreBinding`](../../crates/eliot-core/src/native_store.rs) using the caller's actual prepared workspace and a bounded, owned metadata reader; success requires confirmed reader cleanup. It creates no model or thread, performs no native control and publishes no Agent events. This is outside the L1/L2 first-harness subset. |
 | `shutdown` | none | close owned paths, drain, exit; never kill an adopted service |
+
+An optional shared Core `RouteBinding` travels inside the frozen profile snapshot; it
+does not add a service RPC or a new harness. The controlled Codex process applies the
+explicit named-provider override and reads back its effective configuration before
+starting a session. This does not mutate the owner's global Codex configuration or prove
+provider authentication, inference, or auxiliary traffic. An adopted endpoint remains
+outside Agent custody and is never stopped by Agent or daemon shutdown.
 
 Treat the returned binding as metadata: reject metadata-secret values in it. Redact
 reader errors and stderr with the broader diagnostic-secret set.
