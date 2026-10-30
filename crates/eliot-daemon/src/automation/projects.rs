@@ -70,6 +70,8 @@ fn validate_project_rule_actions(
     inputs: &[eliot_store::RuleDefinitionInput],
     registration: &RegistrationSnapshot,
 ) -> Result<()> {
+    // The shared reload parser validates rule and trigger semantics. This
+    // boundary checks only that every parsed action is owner-approved.
     for input in inputs {
         let definition: Value = serde_json::from_str(&input.canonical_definition)
             .map_err(|_| Error::new("source_integrity", "project rule definition is invalid"))?;
@@ -357,15 +359,19 @@ mod tests {
     }
 
     #[test]
-    fn project_action_config_allows_send_and_rejects_unimplemented_actions() {
+    fn project_action_config_allows_stop_send_interrupt_and_rejects_unknown() {
         let fixture = ProjectFixture::new();
         let checkout = fixture.root.join("registered");
         fs::create_dir(&checkout).expect("create config checkout placeholder");
-        fixture.write_registration(&checkout, Some(&["fake"]), Some(&["send"]));
+        fixture.write_registration(
+            &checkout,
+            Some(&["fake"]),
+            Some(&["interrupt", "send", "stop"]),
+        );
 
         let configured = config::load_project_registration_config(&fixture.data_root)
-            .expect("send is an implemented project action");
-        assert_eq!(configured[0].actions, ["send"]);
+            .expect("implemented project actions are approved");
+        assert_eq!(configured[0].actions, ["interrupt", "send", "stop"]);
 
         fixture.write_registration(&checkout, Some(&["fake"]), Some(&["sendfile"]));
         assert_eq!(
@@ -377,26 +383,69 @@ mod tests {
     }
 
     #[test]
-    fn project_rule_loader_allows_approved_send_and_denies_unapproved_actions() {
+    fn project_rule_loader_uses_owner_allowlist_for_event_send_and_interrupt() {
         let registration = RegistrationSnapshot {
             id: "app".to_owned(),
             checkout: "C:/registered".to_owned(),
             repo_common_dir: "C:/registered/.git".to_owned(),
             profiles: vec!["fake".to_owned()],
-            actions: vec!["send".to_owned()],
+            actions: vec!["interrupt".to_owned(), "send".to_owned(), "stop".to_owned()],
         };
-        let input = |action: &str| eliot_store::RuleDefinitionInput {
-            id: "send-rule".to_owned(),
-            canonical_definition: serde_json::to_string(&serde_json::json!({
-                "do": [{ "action": action }]
-            }))
-            .expect("encode canonical rule actions"),
-            definition_digest: [0; 32],
-            enabled: true,
+        let input = |action: &str| {
+            let (event, action_definition) = match action {
+                "send" => (
+                    "turn.completed",
+                    serde_json::json!({
+                        "action": "send",
+                        "target": "${event.agent}",
+                        "expected_generation": "${event.generation}",
+                        "text": "reply",
+                    }),
+                ),
+                "interrupt" => (
+                    "turn.started",
+                    serde_json::json!({
+                        "action": "interrupt",
+                        "target": "${event.agent}",
+                        "expected_generation": "${event.generation}",
+                        "expected_turn_id": "${event.data.turn_id}",
+                    }),
+                ),
+                _ => panic!("unexpected fixture action: {action}"),
+            };
+            let id = format!("{action}-rule");
+            let definition = serde_json::json!({
+                "id": id,
+                "enabled": true,
+                "on": {"event": event, "match": {}},
+                "do": [action_definition],
+            });
+            eliot_store::RuleDefinitionInput {
+                id: definition["id"].as_str().unwrap().to_owned(),
+                canonical_definition: serde_json::to_string(&definition)
+                    .expect("encode canonical rule actions"),
+                definition_digest: eliot_core::canonical_json_sha256(&definition)
+                    .expect("digest canonical rule actions"),
+                enabled: true,
+            }
         };
 
         validate_project_rule_actions(&[input("send")], &registration)
             .expect("owner-approved send action is permitted");
+        validate_project_rule_actions(&[input("interrupt")], &registration)
+            .expect("owner-approved event interrupt is permitted");
+
+        let unapproved_interrupt = RegistrationSnapshot {
+            actions: vec!["send".to_owned(), "stop".to_owned()],
+            ..registration.clone()
+        };
+        assert_eq!(
+            validate_project_rule_actions(&[input("interrupt")], &unapproved_interrupt)
+                .expect_err("interrupt without owner approval is denied")
+                .code,
+            "not_allowed"
+        );
+
         let unapproved_send = RegistrationSnapshot {
             actions: vec!["stop".to_owned()],
             ..registration.clone()
@@ -404,12 +453,6 @@ mod tests {
         assert_eq!(
             validate_project_rule_actions(&[input("send")], &unapproved_send)
                 .expect_err("send without owner approval is denied")
-                .code,
-            "not_allowed"
-        );
-        assert_eq!(
-            validate_project_rule_actions(&[input("sendfile")], &registration)
-                .expect_err("unimplemented sendfile action is denied")
                 .code,
             "not_allowed"
         );

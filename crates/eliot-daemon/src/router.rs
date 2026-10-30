@@ -550,26 +550,108 @@ impl Router {
         Ok(prepared)
     }
 
+    pub(crate) async fn verify_project_rule_submission_authority(
+        &self,
+        requests: &[SubmitCommand],
+        registration: &ProjectRegistrationView,
+    ) -> Result<()> {
+        registration.validate()?;
+        crate::automation::verify_project_registration(&self.inner.data_root, registration).await?;
+        let principal = Principal::ProjectRule {
+            registration: registration.clone(),
+        };
+        for request in requests {
+            let mut authorized = request.clone();
+            authorize_command(&principal, &mut authorized)?;
+        }
+        Ok(())
+    }
+
+    /// Prepare ordinary action payload after catch-up has already preflighted every
+    /// project authority and frozen workspace binding in the request.
+    pub(crate) async fn prepare_project_rule_submission_after_authority(
+        &self,
+        request: SubmitCommand,
+        registration: &ProjectRegistrationView,
+    ) -> Result<PreparedSubmission> {
+        let principal = Principal::ProjectRule {
+            registration: registration.clone(),
+        };
+        self.prepare_submission_after_authorization(request, &principal, true)
+            .await
+    }
+
     async fn verify_project_rule_target(
         &self,
         registration: &ProjectRegistrationView,
         target: &str,
         generation: i64,
     ) -> Result<()> {
-        let (agent, workspace) = {
-            let store = self.inner.store.lock().await;
-            let agent = store
-                .get_agent(target)?
-                .ok_or_else(|| Error::new("not_found", "project action Agent was not found"))?;
-            if agent.generation != generation {
-                return Err(Error::new(
-                    "stale_generation",
-                    "project action generation is stale",
-                ));
-            }
-            let workspace = store.get_workspace(target)?;
-            (agent, workspace)
+        let Some((agent, workspace)) = self
+            .project_rule_target_snapshot(target, generation)
+            .await?
+        else {
+            return Err(Error::new(
+                "stale_generation",
+                "project action generation is stale",
+            ));
         };
+        self.verify_project_rule_target_workspace(
+            registration,
+            &agent,
+            workspace.as_ref(),
+            generation,
+        )
+        .await
+    }
+
+    /// Return false only for a stale captured generation. Workspace/project
+    /// authority failures remain errors for the catch-up request.
+    pub(crate) async fn verify_project_rule_target_scope(
+        &self,
+        registration: &ProjectRegistrationView,
+        target: &str,
+        generation: i64,
+    ) -> Result<bool> {
+        let Some((agent, workspace)) = self
+            .project_rule_target_snapshot(target, generation)
+            .await?
+        else {
+            return Ok(false);
+        };
+        self.verify_project_rule_target_workspace(
+            registration,
+            &agent,
+            workspace.as_ref(),
+            generation,
+        )
+        .await?;
+        Ok(true)
+    }
+
+    async fn project_rule_target_snapshot(
+        &self,
+        target: &str,
+        expected_generation: i64,
+    ) -> Result<Option<(eliot_core::Agent, Option<eliot_core::WorkspacePreparation>)>> {
+        let store = self.inner.store.lock().await;
+        let agent = store
+            .get_agent(target)?
+            .ok_or_else(|| Error::new("not_found", "project action Agent was not found"))?;
+        if expected_generation != agent.generation {
+            return Ok(None);
+        }
+        let workspace = store.get_workspace(target)?;
+        Ok(Some((agent, workspace)))
+    }
+
+    async fn verify_project_rule_target_workspace(
+        &self,
+        registration: &ProjectRegistrationView,
+        agent: &eliot_core::Agent,
+        workspace: Option<&eliot_core::WorkspacePreparation>,
+        generation: i64,
+    ) -> Result<()> {
         let target_workspace = agent
             .workspace
             .as_deref()
@@ -577,7 +659,7 @@ impl Router {
         if let Some(workspace) = workspace {
             crate::automation::verify_managed_project_workspace(
                 registration,
-                &workspace,
+                workspace,
                 target_workspace,
                 generation,
             )
@@ -593,12 +675,52 @@ impl Router {
         }
     }
 
+    pub(crate) async fn verify_project_rule_submission_target_generation(
+        &self,
+        request: &SubmitCommand,
+    ) -> Result<()> {
+        let target = request
+            .target
+            .as_deref()
+            .ok_or_else(|| Error::new("invalid", "project action has no Agent target"))?;
+        let expected_generation = request
+            .expected_generation
+            .ok_or_else(|| Error::new("invalid", "project action has no expected generation"))?;
+        let store = self.inner.store.lock().await;
+        let agent = store
+            .get_agent(target)?
+            .ok_or_else(|| Error::new("not_found", "project action Agent was not found"))?;
+        if agent.generation != expected_generation {
+            return Err(Error::new(
+                "stale_generation",
+                "project action generation is stale",
+            ));
+        }
+        if agent.observe_only {
+            return Err(Error::new(
+                "not_allowed",
+                "native control is unavailable for an observe-only Agent",
+            ));
+        }
+        Ok(())
+    }
+
     async fn prepare_submission(
         &self,
         mut request: SubmitCommand,
         principal: &Principal,
     ) -> Result<PreparedSubmission> {
         authorize_command(principal, &mut request)?;
+        self.prepare_submission_after_authorization(request, principal, false)
+            .await
+    }
+
+    async fn prepare_submission_after_authorization(
+        &self,
+        mut request: SubmitCommand,
+        principal: &Principal,
+        project_authority_preverified: bool,
+    ) -> Result<PreparedSubmission> {
         if request.probe && request.verb != "send" {
             return Err(Error::new(
                 "unsupported",
@@ -611,23 +733,8 @@ impl Router {
         if request.verb == "worktree.remove" {
             require_owner(principal)?;
         }
-        if is_native_control_verb(&request.verb)
-            && let Some(target) = request.target.as_deref()
-        {
-            let store = self.inner.store.lock().await;
-            // Preserve idempotent command retries; Store checks new controls
-            // transactionally after resolving an existing command binding.
-            if store.get_command(&request.id)?.is_none() {
-                let agent = store.get_agent(target)?.ok_or_else(|| {
-                    Error::new("not_found", format!("Agent {target} was not found"))
-                })?;
-                if agent.observe_only {
-                    return Err(Error::new(
-                        "not_allowed",
-                        "native control is unavailable for an observe-only Agent",
-                    ));
-                }
-            }
+        if !project_authority_preverified {
+            self.verify_native_control_target(&request).await?;
         }
         let mode = self.inner.mode.load(Ordering::SeqCst);
         if mode == MODE_FORCE {
@@ -726,6 +833,28 @@ impl Router {
         }
 
         Ok(PreparedSubmission { request, workspace })
+    }
+
+    async fn verify_native_control_target(&self, request: &SubmitCommand) -> Result<()> {
+        if is_native_control_verb(&request.verb)
+            && let Some(target) = request.target.as_deref()
+        {
+            let store = self.inner.store.lock().await;
+            // Preserve idempotent command retries; Store checks new controls
+            // transactionally after resolving an existing command binding.
+            if store.get_command(&request.id)?.is_none() {
+                let agent = store.get_agent(target)?.ok_or_else(|| {
+                    Error::new("not_found", format!("Agent {target} was not found"))
+                })?;
+                if agent.observe_only {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "native control is unavailable for an observe-only Agent",
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn hydrate_retained_launch(&self, request: &mut SubmitCommand) -> Result<bool> {
@@ -1573,10 +1702,10 @@ impl Router {
         prepared: PreparedSubmission,
     ) -> Result<Option<eliot_store::RuleEventAdmission>> {
         let PreparedSubmission { request, workspace } = prepared;
-        if !matches!(request.verb.as_str(), "stop" | "send") || workspace.is_some() {
+        if !matches!(request.verb.as_str(), "stop" | "send" | "interrupt") || workspace.is_some() {
             return Err(Error::new(
                 "invalid",
-                "rule firing must contain one prepared stop or send command",
+                "rule firing must contain one prepared stop, send, or interrupt command",
             ));
         }
         let admission = {
@@ -2627,7 +2756,7 @@ impl Router {
                 self.reject_undispatched(&id, &error.code).await;
                 return;
             }
-            if matches!(command.verb.as_str(), "stop" | "send") {
+            if matches!(command.verb.as_str(), "stop" | "send" | "interrupt") {
                 let (Some(target), Some(generation)) =
                     (command.target.as_deref(), command.generation)
                 else {
@@ -4263,7 +4392,7 @@ fn is_native_control_verb(verb: &str) -> bool {
 
 fn authorize_command(principal: &Principal, request: &mut SubmitCommand) -> Result<()> {
     if let Principal::ProjectRule { registration } = principal {
-        if !matches!(request.verb.as_str(), "stop" | "send")
+        if !matches!(request.verb.as_str(), "stop" | "send" | "interrupt")
             || !registration
                 .actions
                 .iter()
@@ -4720,6 +4849,632 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         assert_eq!(state.revision, 2);
         assert!(state.retiring_revision.is_some());
         assert_eq!(state.current_cursor, 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rule_catch_up_marks_deterministic_interrupt_refusal_and_replays_once() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-rule-catch-up-interrupt-{}",
+            ulid::Ulid::new()
+        ));
+        let rules_dir = root.join("rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        let router = router_with_data_root(root.clone());
+
+        let event_seq = {
+            let mut store = router.inner.store.lock().await;
+            let (agent, send_id) = result_fixture(&mut store);
+            read_fixture_event(
+                &mut store,
+                &agent,
+                "turn.completed",
+                json!({
+                    "command_id":send_id,
+                    "turn_id":"turn-1",
+                    "status":"completed",
+                }),
+            );
+            if store
+                .get_command(&send_id)
+                .unwrap()
+                .is_some_and(|command| command.state == CommandState::Dispatched)
+            {
+                store
+                    .settle(
+                        &send_id,
+                        CommandState::Applied,
+                        Some(json!({"turn_id":"turn-1"})),
+                        now_ms(),
+                    )
+                    .unwrap();
+            }
+            store
+                .read_events(0, 1_000, None)
+                .unwrap()
+                .into_iter()
+                .find(|event| {
+                    event.kind == "turn.completed"
+                        && event.data.get("command_id").and_then(Value::as_str)
+                            == Some(send_id.as_str())
+                })
+                .expect("committed historical turn completion")
+                .seq
+        };
+
+        std::fs::write(
+            rules_dir.join("interrupt.toml"),
+            r#"
+[[rule]]
+id = 'catch-up-interrupt-refusal'
+on = { event = 'turn.completed' }
+do = [{ action = 'interrupt', target = '${event.agent}', expected_generation = '${event.generation}', expected_turn_id = 'wrong-turn' }]
+"#,
+        )
+        .unwrap();
+        crate::automation::initialize_global_rules(&router, &root, &SecretPolicy::default())
+            .await
+            .unwrap();
+        let state = router
+            .inner
+            .store
+            .lock()
+            .await
+            .get_rule_state("owner", "catch-up-interrupt-refusal")
+            .unwrap()
+            .unwrap();
+        assert!(state.current_cursor >= event_seq);
+
+        let request = json!({
+            "id":ulid::Ulid::new().to_string(),
+            "rule":"catch-up-interrupt-refusal",
+            "after_seq":event_seq - 1,
+            "through_seq":event_seq,
+        });
+        let first: Command = serde_json::from_value(
+            router
+                .rule_catch_up(&request, &Principal::Owner)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first.verb, "rule.catch_up");
+        assert_eq!(first.state, CommandState::Applied);
+        assert_eq!(first.outcome.as_ref().unwrap()["children"], json!([]));
+
+        let events_after_first = router
+            .inner
+            .store
+            .lock()
+            .await
+            .read_events(0, 1_000, None)
+            .unwrap();
+        let rejection_markers = events_after_first
+            .iter()
+            .filter(|event| {
+                event.kind == "rule.rejected"
+                    && event.data["parent_command"] == first.id
+                    && event.data["event_seq"] == event_seq
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rejection_markers.len(), 1);
+        assert_eq!(rejection_markers[0].data["code"], "invalid");
+        assert!(!events_after_first.iter().any(|event| {
+            event.kind == "rule.fired"
+                && event.data["parent_command"] == first.id
+                && event.data["event_seq"] == event_seq
+        }));
+
+        let replay: Command = serde_json::from_value(
+            router
+                .rule_catch_up(&request, &Principal::Owner)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(replay, first);
+        assert_eq!(
+            router
+                .inner
+                .store
+                .lock()
+                .await
+                .read_events(0, 1_000, None)
+                .unwrap(),
+            events_after_first
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn project_rule_catch_up_marks_only_stale_generation_and_replays_valid_child_once() {
+        const PROJECT_ID: &str = "stale-catch-up-project";
+        const RULE_ID: &str = "stale-catch-up-rule";
+        const NOT_READY_RULE_ID: &str = "stale-catch-up-not-ready-workspace";
+
+        let root = std::env::temp_dir().join(format!(
+            "eliot-project-rule-stale-catch-up-{}",
+            ulid::Ulid::new()
+        ));
+        let checkout_path = root.join("checkout");
+        let data_root = root.join("owner-data");
+        std::fs::create_dir_all(&checkout_path).unwrap();
+        std::fs::create_dir_all(&data_root).unwrap();
+        let git_init = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&checkout_path)
+            .status()
+            .unwrap();
+        assert!(git_init.success(), "initialize registered checkout");
+
+        let checkout_input = checkout_path.to_string_lossy().into_owned();
+        let (checkout, repo_common_dir) = crate::workspace_git::WorkspaceGit::new()
+            .unwrap()
+            .repository_identity(&checkout_input)
+            .await
+            .unwrap();
+        std::fs::write(
+            data_root.join("config.toml"),
+            format!(
+                concat!(
+                    "[profiles.codex]\n",
+                    "harness = \"codex\"\n",
+                    "model = \"gpt-6-luna\"\n\n",
+                    "[projects.{PROJECT_ID}]\n",
+                    "path = {checkout:?}\n",
+                    "profiles = [\"codex\"]\n",
+                    "actions = [\"stop\"]\n",
+                ),
+                PROJECT_ID = PROJECT_ID,
+                checkout = checkout
+            ),
+        )
+        .unwrap();
+
+        let project_rules_dir = checkout_path.join(".eliot").join("rules");
+        std::fs::create_dir_all(&project_rules_dir).unwrap();
+        std::fs::write(
+            project_rules_dir.join("catch-up.toml"),
+            format!(
+                concat!(
+                    "[[rule]]\n",
+                    "id = \"{RULE_ID}\"\n",
+                    "on = {{ event = \"session.ready\" }}\n",
+                    "do = [{{ action = \"stop\", target = \"${{event.agent}}\", expected_generation = \"${{event.generation}}\" }}]\n\n",
+                    "[[rule]]\n",
+                    "id = \"{NOT_READY_RULE_ID}\"\n",
+                    "on = {{ event = \"command.accepted\" }}\n",
+                    "do = [{{ action = \"stop\", target = \"${{event.agent}}\", expected_generation = \"${{event.generation}}\" }}]\n",
+                ),
+                RULE_ID = RULE_ID,
+                NOT_READY_RULE_ID = NOT_READY_RULE_ID,
+            ),
+        )
+        .unwrap();
+
+        let router = router_with_data_root(data_root.clone());
+
+        let (agent, stale_event_seq, valid_event_seq) = {
+            let mut store = router.inner.store.lock().await;
+            let launch_id = ulid::Ulid::new().to_string();
+            let launch = store
+                .submit(
+                    "owner",
+                    SubmitCommand {
+                        id: launch_id.clone(),
+                        target: None,
+                        verb: "launch".to_owned(),
+                        args: json!({
+                            "project":"stale-catch-up-fixture",
+                            "workspace":checkout,
+                            "harness":"codex",
+                            "profile":"codex",
+                            "profile_snapshot":{},
+                        }),
+                        expected_generation: Some(0),
+                        expected_turn_id: None,
+                        request_id: None,
+                        probe: false,
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            let agent = launch.command.target.unwrap();
+            store.dispatch(&launch_id, now_ms()).unwrap();
+            read_fixture_event(
+                &mut store,
+                &agent,
+                "session.ready",
+                json!({
+                    "command_id":launch_id,
+                    "native_scope":"stale-catch-up-generation-1",
+                    "native_ref":"stale-catch-up-thread-1",
+                }),
+            );
+            store
+                .settle(&launch_id, CommandState::Applied, None, now_ms())
+                .unwrap();
+            let stale_event_seq = store
+                .read_events(0, 1_000, None)
+                .unwrap()
+                .into_iter()
+                .find(|event| {
+                    event.kind == "session.ready"
+                        && event.agent.as_deref() == Some(agent.as_str())
+                        && event.generation == Some(1)
+                })
+                .expect("generation-1 readiness event")
+                .seq;
+
+            read_fixture_event(&mut store, &agent, "session.ended", json!({}));
+            let resume_id = ulid::Ulid::new().to_string();
+            let mut resume = SubmitCommand::new(resume_id.clone(), "resume");
+            resume.target = Some(agent.clone());
+            resume.expected_generation = Some(1);
+            store.submit("owner", resume, now_ms()).unwrap();
+            store.dispatch(&resume_id, now_ms()).unwrap();
+
+            let batch_id = ulid::Ulid::new().to_string();
+            store
+                .put_batch(
+                    eliot_core::SourceBatch {
+                        batch_id: batch_id.clone(),
+                        agent_id: agent.clone(),
+                        generation: 2,
+                        source: "stream".to_owned(),
+                        events: vec![eliot_core::NativeEvent {
+                            ts: None,
+                            kind: "session.ready".to_owned(),
+                            native_id: batch_id,
+                            data: json!({
+                                "command_id":resume_id.clone(),
+                                "native_scope":"stale-catch-up-generation-2",
+                                "native_ref":"stale-catch-up-thread-2",
+                            }),
+                        }],
+                        cursor: None,
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            store
+                .settle(&resume_id, CommandState::Applied, None, now_ms())
+                .unwrap();
+            let valid_event_seq = store
+                .read_events(0, 1_000, None)
+                .unwrap()
+                .into_iter()
+                .find(|event| {
+                    event.kind == "session.ready"
+                        && event.agent.as_deref() == Some(agent.as_str())
+                        && event.generation == Some(2)
+                })
+                .expect("generation-2 readiness event")
+                .seq;
+            (agent, stale_event_seq, valid_event_seq)
+        };
+
+        // Seed the later stale-generation event before rule initialization so the
+        // captured rule cursor covers both explicit catch-up boundaries. Keep the
+        // next managed workspace absent until after the first valid child is checked.
+        let (pending_agent, pending_event_seq, pending_workspace_input) = {
+            let mut store = router.inner.store.lock().await;
+            let launch_id = ulid::Ulid::new().to_string();
+            let initial_branch = format!(
+                "codex/stale-catch-up-initial-{}",
+                ulid::Ulid::new().to_string().to_ascii_lowercase()
+            );
+            let initial_workspace = eliot_core::WorkspacePreparationInput {
+                project: checkout.clone(),
+                repo_path: checkout.clone(),
+                repo_common_dir: repo_common_dir.clone(),
+                requested_branch: initial_branch.clone(),
+                base_ref: Some("HEAD".to_owned()),
+                base_oid: "d".repeat(40),
+                worktree_path: root
+                    .join("pending-ready-worktree")
+                    .to_string_lossy()
+                    .into_owned(),
+                frozen_setup: Vec::new(),
+            };
+            let launch = store
+                .submit_with_workspace(
+                    "owner",
+                    SubmitCommand {
+                        id: launch_id.clone(),
+                        target: None,
+                        verb: "launch".to_owned(),
+                        args: json!({
+                            "project":checkout,
+                            "workspace":checkout,
+                            "worktree":initial_branch,
+                            "harness":"codex",
+                            "profile":"codex",
+                            "profile_snapshot":{},
+                        }),
+                        expected_generation: Some(0),
+                        expected_turn_id: None,
+                        request_id: None,
+                        probe: false,
+                    },
+                    initial_workspace.clone(),
+                    now_ms(),
+                )
+                .unwrap();
+            let pending_agent = launch.command.target.unwrap();
+            let pending_event_seq = store
+                .read_events(0, 1_000, None)
+                .unwrap()
+                .into_iter()
+                .find(|event| {
+                    event.kind == "command.accepted"
+                        && event.agent.as_deref() == Some(pending_agent.as_str())
+                        && event.generation == Some(0)
+                        && event.data["command_id"] == launch_id
+                })
+                .expect("generation-0 launch acceptance event")
+                .seq;
+
+            store
+                .settle_workspace_creation(
+                    &launch_id,
+                    1,
+                    eliot_core::WorkspaceCreationOutcome::Verified {
+                        repo_path: initial_workspace.repo_path.clone(),
+                        repo_common_dir: initial_workspace.repo_common_dir.clone(),
+                        worktree_path: initial_workspace.worktree_path.clone(),
+                        branch: initial_workspace.requested_branch.clone(),
+                        head: initial_workspace.base_oid.clone(),
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            store.dispatch(&launch_id, now_ms()).unwrap();
+            read_fixture_event(
+                &mut store,
+                &pending_agent,
+                "session.ready",
+                json!({
+                    "command_id":launch_id,
+                    "native_scope":"stale-catch-up-pending-generation-1",
+                    "native_ref":"stale-catch-up-pending-thread-1",
+                }),
+            );
+            store
+                .settle(&launch_id, CommandState::Applied, None, now_ms())
+                .unwrap();
+            read_fixture_event(&mut store, &pending_agent, "session.ended", json!({}));
+            (pending_agent, pending_event_seq, initial_workspace)
+        };
+
+        let project_principal = format!("project:{PROJECT_ID}");
+        let policy = SecretPolicy::default();
+        crate::automation::initialize_global_rules(&router, &data_root, &policy)
+            .await
+            .unwrap();
+        let namespaces = crate::automation::initialize_project_rules(&router, &data_root, &policy)
+            .await
+            .unwrap();
+        assert_eq!(namespaces.len(), 1);
+        assert!(
+            router
+                .rule_definition(&project_principal, RULE_ID)
+                .is_some()
+        );
+        assert!(
+            router
+                .rule_definition(&project_principal, NOT_READY_RULE_ID)
+                .is_some()
+        );
+
+        let (registration, state, not_ready_state) = {
+            let store = router.inner.store.lock().await;
+            let registration = store
+                .get_project_registration("owner", PROJECT_ID)
+                .unwrap()
+                .expect("owner-configured project registration readback");
+            let state = store
+                .get_rule_state(&project_principal, RULE_ID)
+                .unwrap()
+                .expect("project rule state readback");
+            let not_ready_state = store
+                .get_rule_state(&project_principal, NOT_READY_RULE_ID)
+                .unwrap()
+                .expect("not-ready project rule state readback");
+            (registration, state, not_ready_state)
+        };
+        assert_eq!(registration.id, PROJECT_ID);
+        assert_eq!(registration.checkout, checkout);
+        assert_eq!(registration.repo_common_dir, repo_common_dir);
+        assert!(state.current_cursor >= valid_event_seq);
+        assert!(state.current_cursor >= pending_event_seq);
+        assert!(not_ready_state.current_cursor >= pending_event_seq);
+
+        let request = json!({
+            "id":ulid::Ulid::new().to_string(),
+            "rule":RULE_ID,
+            "project":PROJECT_ID,
+            "after_seq":stale_event_seq - 1,
+            "through_seq":valid_event_seq,
+        });
+        let first: Command = serde_json::from_value(
+            router
+                .rule_catch_up(&request, &Principal::Owner)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first.state, CommandState::Applied);
+        let child_ids = first.outcome.as_ref().unwrap()["children"]
+            .as_array()
+            .unwrap();
+        assert_eq!(child_ids.len(), 1);
+        let child_id = child_ids[0].as_str().unwrap().to_owned();
+        let child = router
+            .inner
+            .store
+            .lock()
+            .await
+            .get_command(&child_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(child.verb, "stop");
+        assert_eq!(child.target.as_deref(), Some(agent.as_str()));
+        assert_eq!(child.generation, Some(2));
+
+        let events_after_first = router
+            .inner
+            .store
+            .lock()
+            .await
+            .read_events(0, 1_000, None)
+            .unwrap();
+        let stale_markers = events_after_first
+            .iter()
+            .filter(|event| {
+                event.kind == "rule.rejected"
+                    && event.data["parent_command"] == first.id
+                    && event.data["event_seq"] == stale_event_seq
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(stale_markers.len(), 1);
+        assert_eq!(stale_markers[0].data["code"], "stale_generation");
+        let valid_firings = events_after_first
+            .iter()
+            .filter(|event| {
+                event.kind == "rule.fired"
+                    && event.data["parent_command"] == first.id
+                    && event.data["event_seq"] == valid_event_seq
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(valid_firings.len(), 1);
+
+        let replay: Command = serde_json::from_value(
+            router
+                .rule_catch_up(&request, &Principal::Owner)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(replay, first);
+        let events_after_replay = router
+            .inner
+            .store
+            .lock()
+            .await
+            .read_events(0, 1_000, None)
+            .unwrap();
+        assert_eq!(
+            events_after_replay
+                .iter()
+                .filter(|event| {
+                    event.kind == "rule.rejected"
+                        && event.data["parent_command"] == first.id
+                        && event.data["event_seq"] == stale_event_seq
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            events_after_replay
+                .iter()
+                .filter(|event| {
+                    event.kind == "rule.fired"
+                        && event.data["parent_command"] == first.id
+                        && event.data["event_seq"] == valid_event_seq
+                })
+                .count(),
+            1
+        );
+
+        {
+            let mut store = router.inner.store.lock().await;
+            // Leave the next managed generation in Creating. Catch-up for the old
+            // launch event must stop at the generation mismatch before reading it.
+            let resume_id = ulid::Ulid::new().to_string();
+            let mut resume = SubmitCommand::new(resume_id, "resume");
+            resume.target = Some(pending_agent.clone());
+            resume.expected_generation = Some(1);
+            store
+                .submit_with_workspace("owner", resume, pending_workspace_input.clone(), now_ms())
+                .unwrap();
+            let workspace = store
+                .get_workspace(&pending_agent)
+                .unwrap()
+                .expect("pending generation-2 workspace");
+            assert_eq!(workspace.target_generation, 2);
+            assert_eq!(workspace.phase, eliot_core::WorkspacePhase::Creating);
+            assert_eq!(
+                store.get_agent(&pending_agent).unwrap().unwrap().generation,
+                1
+            );
+        }
+
+        let not_ready_request = json!({
+            "id":ulid::Ulid::new().to_string(),
+            "rule":NOT_READY_RULE_ID,
+            "project":PROJECT_ID,
+            "after_seq":pending_event_seq - 1,
+            "through_seq":pending_event_seq,
+        });
+        let not_ready_parent: Command = serde_json::from_value(
+            router
+                .rule_catch_up(&not_ready_request, &Principal::Owner)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(not_ready_parent.state, CommandState::Applied);
+        assert_eq!(
+            not_ready_parent.outcome.as_ref().unwrap()["children"],
+            json!([])
+        );
+        assert_eq!(
+            router
+                .inner
+                .store
+                .lock()
+                .await
+                .read_events(0, 1_000, None)
+                .unwrap()
+                .iter()
+                .filter(|event| {
+                    event.kind == "rule.rejected"
+                        && event.data["parent_command"] == not_ready_parent.id
+                        && event.data["event_seq"] == pending_event_seq
+                        && event.data["code"] == "stale_generation"
+                })
+                .count(),
+            1
+        );
+
+        let mut progress = router.progress_receiver();
+        loop {
+            let command = router
+                .inner
+                .store
+                .lock()
+                .await
+                .get_command(&child_id)
+                .unwrap()
+                .expect("admitted child command remains retained");
+            if matches!(
+                command.state,
+                CommandState::Applied
+                    | CommandState::Rejected
+                    | CommandState::Failed
+                    | CommandState::Unknown
+                    | CommandState::Cancelled
+            ) {
+                break;
+            }
+            progress
+                .changed()
+                .await
+                .expect("router remains available until child settlement");
+        }
+        drop(router);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -5512,9 +6267,9 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 Some(state.current_cursor),
             );
             let actions = [
-                RuleCatchUpAction {
-                    event_seq: first_event,
-                    request: SubmitCommand {
+                RuleCatchUpAction::command(
+                    first_event,
+                    SubmitCommand {
                         id: ulid::Ulid::new().to_string(),
                         target: Some(first_agent.clone()),
                         verb: "stop".to_owned(),
@@ -5524,10 +6279,10 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                         request_id: None,
                         probe: false,
                     },
-                },
-                RuleCatchUpAction {
-                    event_seq: second_event,
-                    request: SubmitCommand {
+                ),
+                RuleCatchUpAction::command(
+                    second_event,
+                    SubmitCommand {
                         id: ulid::Ulid::new().to_string(),
                         target: Some(second_agent.clone()),
                         verb: "stop".to_owned(),
@@ -5537,7 +6292,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                         request_id: None,
                         probe: false,
                     },
-                },
+                ),
             ];
             let admission = store
                 .admit_rule_catch_up(
@@ -6223,18 +6978,20 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             .unwrap();
             let actions = event_seqs
                 .into_iter()
-                .map(|event_seq| RuleCatchUpAction {
-                    event_seq,
-                    request: SubmitCommand {
-                        id: ulid::Ulid::new().to_string(),
-                        target: Some(agent.clone()),
-                        verb: "stop".to_owned(),
-                        args: json!({}),
-                        expected_generation: Some(1),
-                        expected_turn_id: None,
-                        request_id: None,
-                        probe: false,
-                    },
+                .map(|event_seq| {
+                    RuleCatchUpAction::command(
+                        event_seq,
+                        SubmitCommand {
+                            id: ulid::Ulid::new().to_string(),
+                            target: Some(agent.clone()),
+                            verb: "stop".to_owned(),
+                            args: json!({}),
+                            expected_generation: Some(1),
+                            expected_turn_id: None,
+                            request_id: None,
+                            probe: false,
+                        },
+                    )
                 })
                 .collect::<Vec<_>>();
             let admission = store

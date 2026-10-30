@@ -303,7 +303,7 @@ pub(crate) fn load_project_registration_config(
             offset,
             id,
             "actions",
-            |action| matches!(action, "stop" | "send"),
+            |action| matches!(action, "stop" | "send" | "interrupt"),
         )?;
 
         projects.push(ProjectRegistrationConfig {
@@ -335,7 +335,7 @@ fn normalize_project_allowlist(
                 offset,
                 &format!("projects.{project_id}.{field}"),
                 if field == "actions" {
-                    "only implemented stop and send actions may be approved"
+                    "only implemented stop, send and interrupt actions may be approved"
                 } else {
                     "must name an existing global profile"
                 },

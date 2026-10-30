@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 struct PlannedAction {
     event_seq: i64,
     child_id: String,
-    request: SubmitCommand,
+    admission: Admission,
     cause: core::EventCause,
 }
 
@@ -208,7 +208,21 @@ impl Store {
                 suppressed.push(action.event_seq);
                 continue;
             }
-            if let Some(code) = rule_action_binding_error(&trigger, &action.request) {
+            let action_request = match &action.outcome {
+                RuleCatchUpActionOutcome::Command(request) => request,
+                RuleCatchUpActionOutcome::Rejected { code } => {
+                    validate_rule_rejection_code(code)?;
+                    if !core::is_deterministic_pre_admission_rejection(code) {
+                        return Err(Error::new(
+                            "invalid",
+                            "rule catch-up rejection code is not deterministic",
+                        ));
+                    }
+                    rejected.push((action.event_seq, code.clone()));
+                    continue;
+                }
+            };
+            if let Some(code) = rule_action_binding_error(&trigger, action_request) {
                 rejected.push((action.event_seq, code));
                 continue;
             }
@@ -217,20 +231,20 @@ impl Store {
                 principal,
                 &request.rule,
                 &stored.canonical_definition,
-                &action.request,
+                action_request,
                 trigger.cause.as_ref(),
             )? {
                 suppressed.push(action.event_seq);
                 continue;
             }
-            if let Err(error) = validate_project_rule_action_tx(&tx, principal, &action.request) {
-                if deterministic_rule_rejection(&error) {
+            if let Err(error) = validate_project_rule_action_tx(&tx, principal, action_request) {
+                if core::is_deterministic_pre_admission_rejection(&error.code) {
                     rejected.push((action.event_seq, error.code));
                     continue;
                 }
                 return Err(error);
             }
-            let target = action.request.target.as_deref().ok_or_else(|| {
+            let target = action_request.target.as_deref().ok_or_else(|| {
                 Error::new("invalid", "rule catch-up action has no frozen Agent target")
             })?;
             let (scoped_count, global_count) =
@@ -261,17 +275,40 @@ impl Store {
                     "a deterministic rule action for this event already exists",
                 ));
             }
-            let mut child_request = action.request.clone();
+            let mut child_request = action_request.clone();
             child_request.id = child_id.clone();
             let cause = core::EventCause {
                 command_id: child_id.clone(),
                 rule: Some(request.rule.clone()),
                 depth,
             };
+            tx.execute_batch("SAVEPOINT rule_catch_up_action")
+                .map_err(sql_error)?;
+            let mut admission = match submit_tx(&tx, principal, child_request, None, now, true) {
+                Ok(admission) if admission.is_new => admission,
+                Ok(_) => {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "new rule catch-up child already exists",
+                    ));
+                }
+                Err(error) if core::is_deterministic_pre_admission_rejection(&error.code) => {
+                    tx.execute_batch(
+                        "ROLLBACK TO rule_catch_up_action; RELEASE rule_catch_up_action",
+                    )
+                    .map_err(sql_error)?;
+                    rejected.push((action.event_seq, error.code));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            annotate_rule_command_event(&tx, &child_id, &mut admission.events, cause.clone())?;
+            tx.execute_batch("RELEASE rule_catch_up_action")
+                .map_err(sql_error)?;
             planned.push(PlannedAction {
                 event_seq: action.event_seq,
                 child_id,
-                request: child_request,
+                admission,
                 cause,
             });
             *scoped_added.entry(bucket).or_default() += 1;
@@ -306,20 +343,13 @@ impl Store {
         let mut events = Vec::new();
         let mut fired = Vec::with_capacity(planned.len());
         for action in planned {
-            let mut admission = submit_tx(&tx, principal, action.request, None, now, true)?;
-            if !admission.is_new {
-                return Err(Error::new(
-                    "source_integrity",
-                    "new rule catch-up child already exists",
-                ));
-            }
+            let PlannedAction {
+                event_seq,
+                admission,
+                cause,
+                ..
+            } = action;
             let child = admission.command;
-            annotate_rule_command_event(
-                &tx,
-                &child.id,
-                &mut admission.events,
-                action.cause.clone(),
-            )?;
             let linked = tx
                 .execute(
                     "UPDATE commands SET parent_command = ?1, link_kind = 'rule_action', ordinal = ?2
@@ -335,7 +365,7 @@ impl Store {
                 ));
             }
             events.extend(admission.events);
-            fired.push((action.event_seq, child.id.clone(), action.cause));
+            fired.push((event_seq, child.id.clone(), cause));
             children.push(child);
         }
         events.push(parent_event);

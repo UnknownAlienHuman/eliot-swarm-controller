@@ -10,9 +10,9 @@ mod rules;
 
 pub use projects::ProjectRegistrationInput;
 pub use rules::{
-    RuleCatchUpAction, RuleCatchUpAdmission, RuleCursorOutcome, RuleDefinitionInput,
-    RuleEventAdmission, RuleProcessingState, TimerDefinitionInput, TimerSlotAdmission,
-    TimerSlotCommit,
+    RuleCatchUpAction, RuleCatchUpActionOutcome, RuleCatchUpAdmission, RuleCursorOutcome,
+    RuleDefinitionInput, RuleEventAdmission, RuleProcessingState, TimerDefinitionInput,
+    TimerSlotAdmission, TimerSlotCommit,
 };
 
 use eliot_core::{
@@ -1194,7 +1194,7 @@ fn submit_tx(
             let agent_num = parse_agent_id(target)?;
             let agent = load_agent_by_num(tx, agent_num)?
                 .ok_or_else(|| Error::new("not_found", format!("Agent {target} was not found")))?;
-            if agent.harness != "codex" {
+            if !supports_control_verb(&agent.harness, &request.verb) {
                 return Err(Error::new(
                     "unsupported",
                     format!(
@@ -1904,7 +1904,7 @@ impl Store {
                         "control command targets a stale Agent generation",
                     ));
                 }
-                if agent.harness != "codex" {
+                if !supports_control_verb(&agent.harness, &command.command.verb) {
                     return Err(Error::new(
                         "unsupported",
                         "control command is not supported by this harness",
@@ -7786,6 +7786,10 @@ fn require_effect_command(
 
 fn is_turn_control(verb: &str) -> bool {
     matches!(verb, "steer" | "interrupt" | "approve" | "deny" | "answer")
+}
+
+fn supports_control_verb(harness: &str, verb: &str) -> bool {
+    harness == "codex" || (harness == "fake" && verb == "interrupt")
 }
 
 fn contains_secret_marker(value: &Value) -> bool {

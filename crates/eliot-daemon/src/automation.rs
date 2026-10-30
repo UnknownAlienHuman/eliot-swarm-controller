@@ -8,7 +8,7 @@ use crate::{common::now_ms, logging, router::Router};
 use eliot_core::{
     Error, Event, Result, SecretPolicy,
     api::{CatchUp, ProjectRegistrationView, RuleStateView, TimerSchedule, TimerStateView},
-    canonical_json_sha256,
+    canonical_json_sha256, is_deterministic_pre_admission_rejection,
 };
 use eliot_store::{
     RuleCursorOutcome, RuleDefinitionInput, RuleProcessingState, TimerDefinitionInput,
@@ -1318,7 +1318,7 @@ async fn process_rule_cursor(
             let prepared = match prepared_result {
                 Ok(prepared) => prepared,
                 Err(_) if !router.rule_firings_open() => return Ok(false),
-                Err(error) if deterministic_rejection(&error.code) => {
+                Err(error) if is_deterministic_pre_admission_rejection(&error.code) => {
                     advance_rule_cursor(
                         router,
                         rule,
@@ -1493,7 +1493,9 @@ async fn reconcile_due_timers(router: &Router, rules: &mut [ActiveRule], now: i6
                                 }
                                 None => router.prepare_owner_submission(action).await,
                             },
-                            Err(error) if deterministic_rejection(&error.code) => Err(error),
+                            Err(error) if is_deterministic_pre_admission_rejection(&error.code) => {
+                                Err(error)
+                            }
                             Err(error) => return Err(error),
                         };
                         match prepared {
@@ -1504,13 +1506,15 @@ async fn reconcile_due_timers(router: &Router, rules: &mut [ActiveRule], now: i6
                                 None,
                                 live_armed.then_some(scheduled_at_ms),
                             ),
-                            Err(error) if deterministic_rejection(&error.code) => (
-                                scheduled_at_ms,
-                                next_due_at_ms,
-                                None,
-                                Some(error.code),
-                                None,
-                            ),
+                            Err(error) if is_deterministic_pre_admission_rejection(&error.code) => {
+                                (
+                                    scheduled_at_ms,
+                                    next_due_at_ms,
+                                    None,
+                                    Some(error.code),
+                                    None,
+                                )
+                            }
                             Err(_error) if !router.rule_firings_open() => return Ok(false),
                             Err(error) => return Err(error),
                         }
@@ -1623,55 +1627,95 @@ pub(crate) async fn prepare_rule_catch_up_actions(
     events: &[Event],
     project: Option<&ProjectRegistrationView>,
 ) -> Result<Vec<eliot_store::RuleCatchUpAction>> {
+    let mut actions = Vec::new();
     let mut rendered = Vec::new();
     for event in events {
-        if let Some(action) = definition::evaluate(definition, event)? {
-            rendered.push((event.seq, action));
-        }
+        let request = match definition::evaluate(definition, event) {
+            Ok(Some(request)) => request,
+            Ok(None) => continue,
+            Err(error) if is_deterministic_pre_admission_rejection(&error.code) => {
+                actions.push(eliot_store::RuleCatchUpAction::rejected(
+                    event.seq, error.code,
+                ));
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        rendered.push((event.seq, request));
     }
+
     if let Some(project) = project {
         let requests = rendered
             .iter()
             .map(|(_, request)| request.clone())
-            .collect();
-        let prepared = router
-            .prepare_project_rule_submissions(requests, project)
+            .collect::<Vec<_>>();
+        router
+            .verify_project_rule_submission_authority(&requests, project)
             .await?;
-        return Ok(rendered
-            .into_iter()
-            .zip(prepared)
-            .map(
-                |((event_seq, _), prepared)| eliot_store::RuleCatchUpAction {
-                    event_seq,
-                    request: prepared.request,
-                },
-            )
-            .collect());
     }
 
-    let mut actions = Vec::with_capacity(rendered.len());
     for (event_seq, request) in rendered {
-        let prepared = router.prepare_owner_submission(request).await?;
-        actions.push(eliot_store::RuleCatchUpAction {
-            event_seq,
-            request: prepared.request,
-        });
+        if let Some(project) = project {
+            let target = request
+                .target
+                .as_deref()
+                .ok_or_else(|| Error::new("invalid", "project action has no Agent target"))?;
+            let generation = request.expected_generation.ok_or_else(|| {
+                Error::new("invalid", "project action has no expected generation")
+            })?;
+            if !router
+                .verify_project_rule_target_scope(project, target, generation)
+                .await?
+            {
+                actions.push(eliot_store::RuleCatchUpAction::rejected(
+                    event_seq,
+                    "stale_generation".to_owned(),
+                ));
+                continue;
+            }
+            match router
+                .verify_project_rule_submission_target_generation(&request)
+                .await
+            {
+                Ok(()) => {}
+                Err(error) if error.code == "stale_generation" => {
+                    actions.push(eliot_store::RuleCatchUpAction::rejected(
+                        event_seq, error.code,
+                    ));
+                    continue;
+                }
+                Err(error) if is_deterministic_pre_admission_rejection(&error.code) => {
+                    actions.push(eliot_store::RuleCatchUpAction::rejected(
+                        event_seq, error.code,
+                    ));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let prepared = match project {
+            Some(project) => {
+                router
+                    .prepare_project_rule_submission_after_authority(request, project)
+                    .await
+            }
+            None => router.prepare_owner_submission(request).await,
+        };
+        match prepared {
+            Ok(prepared) => actions.push(eliot_store::RuleCatchUpAction::command(
+                event_seq,
+                prepared.request,
+            )),
+            Err(error) if is_deterministic_pre_admission_rejection(&error.code) => {
+                actions.push(eliot_store::RuleCatchUpAction::rejected(
+                    event_seq, error.code,
+                ));
+            }
+            Err(error) => return Err(error),
+        }
     }
+    actions.sort_by_key(|action| action.event_seq);
     Ok(actions)
-}
-
-fn deterministic_rejection(code: &str) -> bool {
-    matches!(
-        code,
-        "bad_state"
-            | "frame_too_large"
-            | "invalid"
-            | "not_allowed"
-            | "not_found"
-            | "secret_in_payload"
-            | "stale_generation"
-            | "unsupported"
-    )
 }
 
 #[cfg(test)]

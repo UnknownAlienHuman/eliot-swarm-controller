@@ -417,7 +417,7 @@ fn normalize_registration(input: &ProjectRegistrationInput) -> Result<ProjectReg
 }
 
 fn is_supported_project_action(action: &str) -> bool {
-    matches!(action, "stop" | "send")
+    matches!(action, "stop" | "send" | "interrupt")
 }
 
 fn normalize_allowset(values: &mut [String], name: &str) -> Result<()> {

@@ -86,6 +86,12 @@ commands continue. Explicit catch-up fails `history_gap`
 when its requested history has already been pruned. A lagging rule cannot pin storage
 indefinitely.
 
+During explicit history catch-up, a deterministic per-event action refusal emits
+`rule.rejected`; the retained catch-up parent remains `applied` and lists only admitted
+children. Store or persistence failure rolls back the whole request, leaving no partial
+parent or child set. A retained same-ID request returns its parent before current gates,
+as documented for `rule.catch_up` in the API.
+
 ## Triggers
 
 | Trigger | `on` fields | Durable key |
@@ -109,7 +115,8 @@ only edits preserve the schedule. Reconcile timers from stored state on restart.
 
 Global and registered-project timers use their namespace's startup-loaded rule files and
 the existing command router. The connected subset supports interval, once, five-field
-cron and owner-triggered manual runs with one ordinary `stop` or `send` action. Other
+cron and owner-triggered manual runs with one ordinary `stop` or `send` action. The
+event-rule `interrupt` action is not supported for scheduled or manual timer runs. Other
 action verbs remain future work.
 
 ```toml
@@ -197,15 +204,18 @@ do = [{ action = "stop", target = "${event.agent}", expected_generation = "${eve
 ```
 
 Whole-value rendering preserves JSON type. Templates cannot choose the action, action
-name, executable, environment, credential or authority. For event-triggered `stop` and
-`send`, the rendered target and `expected_generation` must exactly match the captured
-`Event.agent` and `Event.generation`; an absent or different binding is rejected before
-action-child admission. SEND text is rendered and frozen from that event, with no later
-Agent-row lookup to fill or retarget the command. An unresolved placeholder fails
-admission.
-One firing atomically admits its Store-only parent and ordinary `stop` or `send` child;
-the parent's fixed child set is durable, and `applied` means admission rather than task
-completion.
+name, executable, environment, credential or authority. For event-triggered `stop`,
+`send` and `interrupt`, the rendered target and `expected_generation` must exactly match
+the captured `Event.agent` and `Event.generation`; an absent or different binding is
+rejected before action-child admission. An event-rule `interrupt` must also bind
+`expected_turn_id` to that event's `data.turn_id`. Store revalidates that exact turn at
+admission and dispatch; a historical event for a turn that is no longer active is
+rejected without retargeting current work. SEND text is rendered and frozen from that
+event, with no later Agent-row lookup to fill or retarget the command. An unresolved
+placeholder fails admission.
+One firing atomically admits its Store-only parent and ordinary `stop`, `send` or
+event-rule `interrupt` child; the parent's fixed child set is durable, and `applied`
+means admission rather than task completion.
 
 Each committed event retains its event-time subject snapshot (or absence) and any
 Store-verified cause. Depth 0 denotes a proven ordinary controller command; rule, timer
@@ -225,11 +235,12 @@ Disabled rules advance their skipped range without firing.
 
 Backlog, explicit history catch-up, and rate-limit semantics are defined in
 [Retention and bounded backlog](#retention-and-bounded-backlog). This connected event-rule
-subset supports ordinary `stop` and `send` commands. SEND uses the existing Router path,
-keeps its exact target generation and turn association, and `applied` does not assert task
-completion. `allow_self` defaults to false, suppressing a rule's own causal SEND result;
-set it true only to opt into feedback, still subject to cause-depth and rate limits. Other
-action verbs, scripts, Goals, and project configuration overlays remain unsupported.
+subset supports ordinary `stop`, `send` and event-only `interrupt` commands. SEND uses the
+existing Router path, keeps its exact target generation and turn association, and
+`applied` does not assert task completion. `allow_self` defaults to false, suppressing a
+rule's own causal SEND result; set it true only to opt into feedback, still subject to
+cause-depth and rate limits. Other action verbs, scripts, Goals, and project configuration
+overlays remain unsupported.
 Cause-depth suppression is silent and does not emit an endlessly retriggerable rejection
 event.
 

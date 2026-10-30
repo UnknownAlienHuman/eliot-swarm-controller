@@ -6250,6 +6250,402 @@ fn cli_fake_history_catchup_dispatches_siblings_in_order_and_replays() {
 }
 
 #[test]
+fn cli_fake_event_rule_interrupt_binds_exact_turn_and_rejects_stale_catchup() {
+    const HOLD_TURN: &str = "[fake:hold-turn]";
+    const RULE_ID: &str = "interrupt-first-held-turn";
+    const HISTORY_RULE_ID: &str = "interrupt-first-held-turn-history";
+
+    let mut fixture = Fixture::new("event rule interrupt");
+    fixture.start();
+    fixture.stop(false);
+
+    let first_send_id = ulid::Ulid::new().to_string();
+    let rules = fixture.data.join("rules");
+    fs::create_dir_all(&rules).expect("create global event-rule directory");
+    let rule_source = |rule: &str| {
+        format!(
+            concat!(
+                "[[rule]]\n",
+                "id = \"{rule}\"\n",
+                "on = {{ event = \"turn.started\", match = {{ ",
+                "\"subject.harness\" = \"fake\", ",
+                "\"event.data.command_id\" = \"{command}\" }} }}\n",
+                "do = [{{ action = \"interrupt\", target = \"${{event.agent}}\", ",
+                "expected_generation = \"${{event.generation}}\", ",
+                "expected_turn_id = \"${{data.turn_id}}\" }}]\n",
+            ),
+            rule = rule,
+            command = first_send_id,
+        )
+    };
+    fs::write(rules.join("interrupt.toml"), rule_source(RULE_ID))
+        .expect("write event-bound exact-turn interrupt rule");
+    fixture.start();
+
+    let rule_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let initial_rule: RuleStateView = loop {
+        let reply = cli(&fixture.data, &["rule", "show", RULE_ID]);
+        if reply.status.success() {
+            break serde_json::from_str(&reply.stdout).expect("typed event interrupt rule");
+        }
+        assert!(
+            std::time::Instant::now() < rule_deadline,
+            "event interrupt rule load deadline; bounded stderr={:?}",
+            reply.stderr.chars().take(4096).collect::<String>()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(initial_rule.id, RULE_ID);
+    assert!(initial_rule.enabled);
+
+    let launch = fixture.json(&[
+        "launch",
+        "--profile",
+        "fake",
+        "--workspace",
+        fixture.workspace.to_str().unwrap(),
+    ]);
+    let agent = launch["target"].as_str().expect("Fake Agent").to_owned();
+    let generation = launch["generation"].as_i64().expect("Fake generation");
+    let generation_arg = generation.to_string();
+
+    let first_reply = cli(
+        &fixture.data,
+        &[
+            "--id",
+            &first_send_id,
+            "send",
+            &agent,
+            "--generation",
+            &generation_arg,
+            "--wait",
+            "--timeout-seconds",
+            "10",
+            "--",
+            HOLD_TURN,
+        ],
+    );
+    assert!(
+        first_reply.status.success(),
+        "held Fake turn did not complete through event interrupt; bounded stdout={:?}; bounded stderr={:?}",
+        first_reply.stdout.chars().take(4096).collect::<String>(),
+        first_reply.stderr.chars().take(4096).collect::<String>()
+    );
+    let first_send: CoreTurn =
+        serde_json::from_str(&first_reply.stdout).expect("typed interrupted Fake turn");
+    assert_eq!(first_send.agent, agent);
+    assert_eq!(first_send.generation, generation);
+    assert_eq!(first_send.state, TurnState::Completed);
+    assert_eq!(first_send.status.as_deref(), Some("interrupted"));
+
+    let after_first = fixture.events();
+    let first_started = after_first
+        .iter()
+        .find(|event| {
+            event["kind"] == "turn.started" && event["data"]["command_id"] == first_send_id
+        })
+        .expect("first held-turn start event");
+    let first_event_seq = first_started["seq"].as_i64().expect("first start sequence");
+    let first_turn_id = first_started["data"]["turn_id"]
+        .as_str()
+        .expect("first exact turn ID")
+        .to_owned();
+    assert_eq!(first_send.turn_id, first_turn_id);
+    assert_eq!(fault_dispatches(&after_first, &first_send_id), 1);
+    assert_eq!(
+        after_first
+            .iter()
+            .filter(|event| {
+                event["kind"] == "turn.completed"
+                    && event["data"]["command_id"] == first_send_id
+                    && event["data"]["turn_id"] == first_turn_id
+            })
+            .count(),
+        1,
+        "interrupt normalized one terminal event for the exact held turn"
+    );
+    let first_fires: Vec<_> = after_first
+        .iter()
+        .filter(|event| {
+            event["kind"] == "rule.fired"
+                && event["data"]["rule"] == RULE_ID
+                && event["data"]["event_seq"] == first_event_seq
+        })
+        .collect();
+    assert_eq!(first_fires.len(), 1, "only the first held turn matched");
+    let interrupt_id = first_fires[0]["data"]["child_command"]
+        .as_str()
+        .expect("interrupt child ID")
+        .to_owned();
+    let interrupt: CoreCommand =
+        serde_json::from_value(fixture.wait_command(&interrupt_id, "applied"))
+            .expect("applied ordinary Router interrupt child");
+    assert_eq!(interrupt.verb, "interrupt");
+    assert_eq!(interrupt.target.as_deref(), Some(agent.as_str()));
+    assert_eq!(interrupt.expected_generation, Some(generation));
+    assert_eq!(
+        interrupt
+            .outcome
+            .as_ref()
+            .expect("retained interrupt outcome")["turn_id"],
+        first_turn_id,
+        "interrupt outcome retains the event-bound turn"
+    );
+    assert_eq!(interrupt.args, json!({}));
+    assert!(fixture.json(&["show", &agent])["active_turn"].is_null());
+
+    // Register this rule only after its matching event and live interrupt have
+    // completed, so its explicit catch-up has no pre-existing deterministic child.
+    fs::write(
+        rules.join("interrupt-history.toml"),
+        rule_source(HISTORY_RULE_ID),
+    )
+    .expect("write catch-up-only interrupt rule");
+    let history_rule_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let history_rule: RuleStateView = loop {
+        let reply = cli(&fixture.data, &["rule", "show", HISTORY_RULE_ID]);
+        if reply.status.success() {
+            break serde_json::from_str(&reply.stdout).expect("typed catch-up-only rule");
+        }
+        assert!(
+            std::time::Instant::now() < history_rule_deadline,
+            "catch-up-only rule load deadline; bounded stderr={:?}",
+            reply.stderr.chars().take(4096).collect::<String>()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(history_rule.id, HISTORY_RULE_ID);
+    assert!(history_rule.enabled);
+    assert!(history_rule.current_cursor >= first_event_seq);
+    assert!(!fixture.events().iter().any(|event| {
+        event["kind"] == "rule.fired"
+            && event["data"]["rule"] == HISTORY_RULE_ID
+            && event["data"]["event_seq"] == first_event_seq
+    }));
+
+    let second_send_id = ulid::Ulid::new().to_string();
+    let second_reply = cli(
+        &fixture.data,
+        &[
+            "--id",
+            &second_send_id,
+            "send",
+            &agent,
+            "--generation",
+            &generation_arg,
+            "--",
+            HOLD_TURN,
+        ],
+    );
+    assert!(
+        matches!(second_reply.status.code(), Some(0 | 6)),
+        "second held-turn submission failed; bounded stdout={:?}; bounded stderr={:?}",
+        second_reply.stdout.chars().take(4096).collect::<String>(),
+        second_reply.stderr.chars().take(4096).collect::<String>()
+    );
+    let second_submit: CommandSubmitResponse = serde_json::from_str(&second_reply.stdout)
+        .expect("typed second otherwise-valid held-turn submission");
+    assert_eq!(second_submit.command_id, second_send_id);
+    assert_eq!(second_submit.agent.as_deref(), Some(agent.as_str()));
+    assert_eq!(second_submit.generation, Some(generation));
+    assert_eq!(
+        second_reply.status.code(),
+        Some(match second_submit.state {
+            CommandState::Accepted | CommandState::Queued | CommandState::Applied => 0,
+            CommandState::Dispatched => 6,
+            state => panic!("second held-turn submission returned {state:?}"),
+        }),
+        "second held-turn CLI exit matches its retained command state"
+    );
+
+    let second_started_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let second_started = loop {
+        let events = fixture.events();
+        if let Some(event) = events.iter().find(|event| {
+            event["kind"] == "turn.started" && event["data"]["command_id"] == second_send_id
+        }) {
+            break event.clone();
+        }
+        assert!(
+            std::time::Instant::now() < second_started_deadline,
+            "second held-turn start deadline"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    let second_event_seq = second_started["seq"]
+        .as_i64()
+        .expect("second start sequence");
+    let second_turn_id = second_started["data"]["turn_id"]
+        .as_str()
+        .expect("second exact turn ID")
+        .to_owned();
+    assert!(second_event_seq > first_event_seq);
+    assert_ne!(second_turn_id, first_turn_id);
+    let second_command: CoreCommand =
+        serde_json::from_value(fixture.wait_command(&second_send_id, "applied"))
+            .expect("second held SEND remains an associated turn");
+    assert_eq!(
+        second_command.turn_id.as_deref(),
+        Some(second_turn_id.as_str())
+    );
+    assert_eq!(
+        fixture.json(&["show", &agent])["active_turn"],
+        second_turn_id
+    );
+
+    let cursor_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let live_state: RuleStateView =
+            serde_json::from_value(fixture.json(&["rule", "show", RULE_ID]))
+                .expect("event interrupt rule cursor");
+        let history_state: RuleStateView =
+            serde_json::from_value(fixture.json(&["rule", "show", HISTORY_RULE_ID]))
+                .expect("catch-up-only rule cursor");
+        if live_state.current_cursor >= second_event_seq
+            && history_state.current_cursor >= second_event_seq
+        {
+            assert_eq!(history_state.revision, history_rule.revision);
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < cursor_deadline,
+            "event interrupt rule did not scan the second nonmatching turn"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let after_arg = (first_event_seq - 1).to_string();
+    let through_arg = first_event_seq.to_string();
+    let catchup_id = ulid::Ulid::new().to_string();
+    let catchup_args = [
+        "--id",
+        catchup_id.as_str(),
+        "rule",
+        "catch-up",
+        HISTORY_RULE_ID,
+        "--after",
+        after_arg.as_str(),
+        "--through",
+        through_arg.as_str(),
+    ];
+    let catchup_reply = cli(&fixture.data, &catchup_args);
+    assert_eq!(
+        catchup_reply.status.code(),
+        Some(0),
+        "catch-up-only stale-turn rejection returns a typed parent; bounded stdout={:?}; bounded stderr={:?}",
+        catchup_reply.stdout.chars().take(4096).collect::<String>(),
+        catchup_reply.stderr.chars().take(4096).collect::<String>()
+    );
+    let catchup: CoreCommand = serde_json::from_str(&catchup_reply.stdout)
+        .expect("typed stale-turn finite history catch-up parent");
+    assert_eq!(catchup.id, catchup_id);
+    assert_eq!(catchup.verb, "rule.catch_up");
+    assert_eq!(catchup.state, CommandState::Applied);
+    assert_eq!(catchup.args["rule"], HISTORY_RULE_ID);
+    assert_eq!(catchup.args["after_seq"], first_event_seq - 1);
+    assert_eq!(catchup.args["through_seq"], first_event_seq);
+    assert_eq!(catchup.args["revision"], history_rule.revision);
+    let catchup_outcome = catchup.outcome.as_ref().expect("rejected catch-up outcome");
+    assert_eq!(catchup_outcome["children"], json!([]));
+    assert!(catchup_outcome.get("code").is_none());
+
+    let after_catchup = fixture.events();
+    assert!(after_catchup.iter().any(|event| {
+        event["kind"] == "rule.rejected"
+            && event["data"]["rule"] == HISTORY_RULE_ID
+            && event["data"]["parent_command"] == catchup_id
+            && event["data"]["event_seq"] == first_event_seq
+            && event["data"]["code"] == "stale_generation"
+    }));
+    assert_eq!(
+        fixture.json(&["show", &agent])["active_turn"],
+        second_turn_id
+    );
+    assert_eq!(
+        after_catchup
+            .iter()
+            .filter(|event| {
+                event["kind"] == "rule.fired"
+                    && event["data"]["rule"] == HISTORY_RULE_ID
+                    && event["data"]["event_seq"] == second_event_seq
+            })
+            .count(),
+        0,
+        "the second held turn did not match the first command's event filter"
+    );
+
+    let replay_reply = cli(&fixture.data, &catchup_args);
+    assert_eq!(
+        replay_reply.status.code(),
+        Some(0),
+        "same-ID stale catch-up replay returns the retained parent; bounded stdout={:?}; bounded stderr={:?}",
+        replay_reply.stdout.chars().take(4096).collect::<String>(),
+        replay_reply.stderr.chars().take(4096).collect::<String>()
+    );
+    let replay: CoreCommand =
+        serde_json::from_str(&replay_reply.stdout).expect("same-ID stale-turn catch-up replay");
+    assert_eq!(replay, catchup);
+    let after_replay = fixture.events();
+    assert_eq!(
+        after_replay
+            .iter()
+            .filter(|event| {
+                event["kind"] == "rule.fired"
+                    && event["data"]["rule"] == RULE_ID
+                    && event["data"]["event_seq"] == first_event_seq
+            })
+            .count(),
+        1,
+        "same-ID catch-up replay did not repeat the original live interrupt"
+    );
+    assert_eq!(
+        after_replay
+            .iter()
+            .filter(|event| {
+                event["kind"] == "rule.fired"
+                    && event["data"]["rule"] == HISTORY_RULE_ID
+                    && event["data"]["event_seq"] == first_event_seq
+            })
+            .count(),
+        0,
+        "catch-up-only rule did not fire live on its pre-registration event"
+    );
+    assert_eq!(
+        after_replay
+            .iter()
+            .filter(|event| {
+                event["kind"] == "rule.rejected"
+                    && event["data"]["rule"] == HISTORY_RULE_ID
+                    && event["data"]["parent_command"] == catchup_id
+                    && event["data"]["event_seq"] == first_event_seq
+            })
+            .count(),
+        1,
+        "same-ID stale catch-up replay did not repeat rejection"
+    );
+    assert_eq!(fault_dispatches(&after_replay, &interrupt_id), 1);
+    assert_eq!(fault_dispatches(&after_replay, &catchup_id), 0);
+    assert_eq!(fault_dispatches(&after_replay, &second_send_id), 1);
+    assert_eq!(
+        fixture.json(&["show", &agent])["active_turn"],
+        second_turn_id
+    );
+
+    let stop_id = ulid::Ulid::new().to_string();
+    let stop: CommandSubmitResponse = serde_json::from_value(fixture.json(&[
+        "--id",
+        &stop_id,
+        "stop",
+        &agent,
+        "--generation",
+        &generation_arg,
+    ]))
+    .expect("owner stop for second held turn");
+    fixture.wait_command(&stop.command_id, "applied");
+    fixture.stop(false);
+}
+
+#[test]
 fn cli_fake_timer_send_scheduled_and_manual_replay_keep_exact_turns() {
     const SEND_TEXT: &str = "timer-send-echo";
 

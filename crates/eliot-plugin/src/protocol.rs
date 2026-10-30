@@ -149,7 +149,12 @@ pub fn fake_manifest() -> PluginManifest {
         harness_version: "fake-1".to_owned(),
         available: true,
         mode: "per_agent".to_owned(),
-        verbs: vec!["launch".to_owned(), "send".to_owned(), "stop".to_owned()],
+        verbs: vec![
+            "launch".to_owned(),
+            "send".to_owned(),
+            "stop".to_owned(),
+            "interrupt".to_owned(),
+        ],
         child_verbs: Vec::new(),
         features: ManifestFeatures {
             start_requires_input: false,
