@@ -122,7 +122,8 @@ Global and registered-project timers use their namespace's startup-loaded rule f
 the existing command router. The connected timer slice admits ordinary `stop`, `send` and `run` children for global and
 registered-project interval, cron and once firings, including manual `timer.run`. See
 [Timer Run invocation context](#timer-run-invocation-context).
-The event-rule `interrupt` action remains unsupported for scheduled or manual timer runs.
+The event-rule `interrupt` and `steer` actions remain unsupported for scheduled or manual
+timer runs.
 Other action verbs remain future work.
 
 ```toml
@@ -211,17 +212,25 @@ do = [{ action = "stop", target = "${event.agent}", expected_generation = "${eve
 
 Whole-value rendering preserves JSON type. Templates cannot choose the action, action
 name, executable, environment, credential or authority. For event-triggered `stop`,
-`send` and `interrupt`, the rendered target and `expected_generation` must exactly match
-the captured `Event.agent` and `Event.generation`; an absent or different binding is
-rejected before action-child admission. An event-rule `interrupt` must also bind
-`expected_turn_id` to that event's `data.turn_id`. Store revalidates that exact turn at
-admission and dispatch; a historical event for a turn that is no longer active is
-rejected without retargeting current work. SEND text is rendered and frozen from that
-event, with no later Agent-row lookup to fill or retarget the command. An unresolved
-placeholder fails admission.
-One firing atomically admits its Store-only parent and ordinary `stop`, `send` or
-event-rule `interrupt` child; the parent's fixed child set is durable, and `applied`
-means admission rather than task completion.
+`send`, `interrupt` and `steer`, the rendered target and `expected_generation` must exactly
+match the captured `Event.agent` and `Event.generation`; an absent or different binding is
+rejected before action-child admission. Event-rule `interrupt` and `steer` must also bind
+`expected_turn_id` to that event's nonempty string `data.turn_id`. Store revalidates that
+exact turn at admission and at the dispatch effect boundary; a historical or queued
+action whose turn is no longer active is refused without retargeting current work.
+SEND and STEER text is rendered once and frozen from that captured event, with no later
+Agent-row lookup to fill or retarget the command. An unresolved placeholder fails admission.
+The action definition is owned by [the rule definition module](../../crates/eliot-daemon/src/automation/definition.rs).
+One firing atomically admits its Store-only parent and ordinary action child; the
+parent's fixed child set is durable, and `applied` means admission rather than task completion.
+
+Global event-rule STEER uses Owner authority. Project event-rule STEER requires an
+explicit `steer` entry in the registered project's action allowlist; a `send` or `interrupt`
+grant does not authorize it. Revalidate current project authority and the captured
+Agent/generation binding before effects. STEER uses the existing Router control path,
+including its harness capability, text validation, provider-hold and exact active-turn
+checks; it supplies input to that captured turn, without starting a new turn. An applied
+STEER does not assert task completion. See [Store command admission and dispatch](../../crates/eliot-store/src/lib.rs).
 
 Each committed event retains its event-time subject snapshot (or absence) and any
 Store-verified cause. Depth 0 denotes a proven ordinary controller command; rule, timer
@@ -242,9 +251,9 @@ Disabled rules advance their skipped range without firing.
 Backlog, explicit history catch-up, and rate-limit semantics are defined in
 [Retention and bounded backlog](#retention-and-bounded-backlog).
 This connected event-rule subset supports ordinary `stop`, `send` and event-only
-`interrupt`, plus project event-rule `run` during live evaluation and explicit history
-catch-up. The global event-rule `run` contract below uses owner-global approval and the shared frozen
-execution path. Other full L4.2 action requirements remain cumulative. SEND uses the
+`interrupt` and `steer`, plus project event-rule `run` during live evaluation and explicit
+history catch-up. The global event-rule `run` contract below uses owner-global approval
+and the shared frozen execution path. Other full L4.2 action requirements remain cumulative. SEND uses the
 existing Router path, keeps its exact target generation and turn association, and
 `applied` does not assert task completion. `allow_self` defaults to false; see [Guardrails](#guardrails)
 for the same-principal self-cause behavior for SEND and Run. Goal actions and project
@@ -464,7 +473,8 @@ line is one JSON object, LF or CRLF terminated; a final complete object may end 
 Empty lines, malformed JSON, invalid UTF-8, truncated capture or excess output invalidate
 the entire stream. Each line must deserialize as the strict Core `ScriptActionRecord`
 DTO; that type owns the closed flat record field catalog and converts to an ordinary
-`SubmitCommand`. The effective send-text limit is Core `MAX_EVENT_BYTES` (64 KiB) from
+`SubmitCommand`. Event-rule STEER does not extend the script stdout action set.
+The effective send-text limit is Core `MAX_EVENT_BYTES` (64 KiB) from
 [Core limits](../../crates/eliot-core/src/limits.rs). Unknown, missing, `null`, nested,
 extra or wrong-type fields fail validation. Targets and generation/turn bindings are
 literal and must pass ordinary command validation. Records cannot supply command `id`, `principal`, `parent_command`, `ordinal`,
