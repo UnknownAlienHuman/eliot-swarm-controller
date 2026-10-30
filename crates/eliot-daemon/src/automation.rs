@@ -1655,6 +1655,44 @@ pub(crate) async fn prepare_rule_catch_up_actions(
     }
 
     for (event_seq, request) in rendered {
+        if let Some(project) = project {
+            let target = request
+                .target
+                .as_deref()
+                .ok_or_else(|| Error::new("invalid", "project action has no Agent target"))?;
+            let generation = request.expected_generation.ok_or_else(|| {
+                Error::new("invalid", "project action has no expected generation")
+            })?;
+            if !router
+                .verify_project_rule_target_scope(project, target, generation)
+                .await?
+            {
+                actions.push(eliot_store::RuleCatchUpAction::rejected(
+                    event_seq,
+                    "stale_generation".to_owned(),
+                ));
+                continue;
+            }
+            match router
+                .verify_project_rule_submission_target_generation(&request)
+                .await
+            {
+                Ok(()) => {}
+                Err(error) if error.code == "stale_generation" => {
+                    actions.push(eliot_store::RuleCatchUpAction::rejected(
+                        event_seq, error.code,
+                    ));
+                    continue;
+                }
+                Err(error) if is_deterministic_pre_admission_rejection(&error.code) => {
+                    actions.push(eliot_store::RuleCatchUpAction::rejected(
+                        event_seq, error.code,
+                    ));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
         let prepared = match project {
             Some(project) => {
                 router
