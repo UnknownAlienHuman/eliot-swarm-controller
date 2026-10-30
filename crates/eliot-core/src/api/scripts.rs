@@ -5,11 +5,12 @@
 
 use super::{mutations::CommandSubmitRequest, reads::CommandGetRequest};
 use crate::{
-    Error, Event, EventSubject, FrozenSetupFile, Result, SubmitCommand, limits::MAX_EVENT_BYTES,
+    Error, Event, EventSubject, FrozenSetupFile, Result, StderrDiagnostic, StderrSnapshot,
+    StderrSource, SubmitCommand, bound_stderr_diagnostics, limits::MAX_EVENT_BYTES,
     parse_agent_id,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::Path};
 
 /// Owner-configured interpreter executable and fixed argv prefix.
@@ -320,6 +321,184 @@ impl ScriptInputContext {
     }
 }
 
+/// Custody guarantee observed for one script process family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScriptCustody {
+    Exact,
+    Degraded,
+    Unknown,
+}
+
+/// Direct-exit observation. Exited with no code represents a known signal exit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ScriptDirectExit {
+    Unknown,
+    Exited {
+        success: bool,
+        exit_code: Option<i32>,
+    },
+}
+
+impl ScriptDirectExit {
+    fn is_successful_zero(&self) -> bool {
+        matches!(
+            self,
+            Self::Exited {
+                success: true,
+                exit_code: Some(0)
+            }
+        )
+    }
+}
+
+/// Reusable process metadata for applied runs and failed-capture diagnostics.
+/// Stderr is an optional bounded diagnostic and does not determine the primary result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScriptProcessResult {
+    pub custody: ScriptCustody,
+    pub quiescent: bool,
+    pub direct_exit: ScriptDirectExit,
+    pub stderr: Option<StderrSnapshot>,
+}
+
+impl ScriptProcessResult {
+    pub fn validate(&self) -> Result<()> {
+        if let ScriptDirectExit::Exited {
+            success: true,
+            exit_code,
+        } = &self.direct_exit
+            && *exit_code != Some(0)
+        {
+            return Err(invalid(
+                "successful script exit must carry a known zero exit code",
+            ));
+        }
+        if let ScriptDirectExit::Exited {
+            success: false,
+            exit_code: Some(0),
+        } = &self.direct_exit
+        {
+            return Err(invalid(
+                "unsuccessful script exit cannot carry a zero exit code",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Applied run outcome carries admitted child IDs rather than recursive Command objects.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScriptRunApplied {
+    pub children: Vec<String>,
+    pub process: ScriptProcessResult,
+}
+
+impl ScriptRunApplied {
+    pub fn validate(&self) -> Result<()> {
+        self.process.validate()?;
+        if !self.process.direct_exit.is_successful_zero()
+            || !self.process.quiescent
+            || self.process.custody == ScriptCustody::Unknown
+        {
+            return Err(invalid(
+                "applied script run requires known zero exit and quiescent custody",
+            ));
+        }
+        for child_id in &self.children {
+            CommandGetRequest::new(child_id.clone()).validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Bound only optional process stderr in a Run outcome using the supplied
+/// budget for the complete encoded outcome value. The existing process DTO owns
+/// its shape; callers own Run outcome identity and shape.
+pub fn bound_script_outcome_stderr(outcome: &mut Value, max_encoded_bytes: usize) {
+    let Some(process_value) = outcome.get("process") else {
+        return;
+    };
+    let Ok(process_result) =
+        serde_json::from_value::<ScriptProcessResult>(process_value.clone())
+    else {
+        return;
+    };
+    let Some(snapshot) = process_result.stderr else {
+        return;
+    };
+
+    let mut without_stderr = outcome.clone();
+    let Some(process) = without_stderr
+        .get_mut("process")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    process.insert("stderr".to_owned(), Value::Null);
+    let Ok(base_bytes) = serde_json::to_vec(&without_stderr) else {
+        return;
+    };
+    if base_bytes.len() > max_encoded_bytes {
+        // Leave an oversized primary outcome for its existing semantic guard.
+        *outcome = without_stderr;
+        return;
+    }
+
+    let diagnostic = StderrDiagnostic {
+        // This diagnostic is only a temporary carrier for the shared encoded
+        // tail bounder; only its snapshot is written back to the Run outcome.
+        source: StderrSource::Harness,
+        snapshot,
+    };
+    let snapshot_bytes = serde_json::to_vec(&diagnostic.snapshot).map_or(0, |bytes| bytes.len());
+    let diagnostic_bytes = serde_json::to_vec(std::slice::from_ref(&diagnostic))
+        .map_or(snapshot_bytes, |bytes| bytes.len());
+    let wrapper_bytes = diagnostic_bytes.saturating_sub(snapshot_bytes);
+    let null_bytes = serde_json::to_vec(&Value::Null).map_or(0, |bytes| bytes.len());
+    let snapshot_budget = max_encoded_bytes
+        .saturating_sub(base_bytes.len())
+        .saturating_add(null_bytes);
+    let mut diagnostics = vec![diagnostic];
+    bound_stderr_diagnostics(&mut diagnostics, snapshot_budget.saturating_add(wrapper_bytes));
+
+    let Some(diagnostic) = diagnostics.pop() else {
+        *outcome = without_stderr;
+        return;
+    };
+    let Ok(stderr) = serde_json::to_value(diagnostic.snapshot) else {
+        *outcome = without_stderr;
+        return;
+    };
+    let Some(process) = without_stderr
+        .get_mut("process")
+        .and_then(Value::as_object_mut)
+    else {
+        *outcome = without_stderr;
+        return;
+    };
+    process.insert("stderr".to_owned(), stderr);
+    if serde_json::to_vec(&without_stderr)
+        .is_ok_and(|bytes| bytes.len() <= max_encoded_bytes)
+    {
+        *outcome = without_stderr;
+    } else {
+        *outcome = {
+            let mut primary = outcome.clone();
+            if let Some(process) = primary
+                .get_mut("process")
+                .and_then(Value::as_object_mut)
+            {
+                process.insert("stderr".to_owned(), Value::Null);
+            }
+            primary
+        };
+    }
+}
+
 fn invalid(message: &'static str) -> Error {
     Error::new("invalid", message)
 }
@@ -396,9 +575,8 @@ mod tests {
             json!({"action":"interrupt","target":"a7","expected_generation":4}),
             json!({"action":"run","target":"a7","expected_generation":4}),
         ] {
-            match serde_json::from_value::<ScriptActionRecord>(record.clone()) {
-                Ok(parsed) => assert!(parsed.validate().is_err()),
-                Err(_) => {}
+            if let Ok(parsed) = serde_json::from_value::<ScriptActionRecord>(record.clone()) {
+                assert!(parsed.validate().is_err());
             }
         }
     }
@@ -538,5 +716,141 @@ mod tests {
             json!({"id":"check-completed-turn","revision":2})
         );
         assert!(wire["command"].get("args").is_none());
+    }
+
+    #[test]
+    fn process_result_keeps_signal_exit_distinct_from_unknown() {
+        let signaled = ScriptProcessResult {
+            custody: ScriptCustody::Degraded,
+            quiescent: true,
+            direct_exit: ScriptDirectExit::Exited {
+                success: false,
+                exit_code: None,
+            },
+            stderr: None,
+        };
+        signaled.validate().unwrap();
+
+        let unknown = ScriptProcessResult {
+            custody: ScriptCustody::Unknown,
+            quiescent: false,
+            direct_exit: ScriptDirectExit::Unknown,
+            stderr: None,
+        };
+        unknown.validate().unwrap();
+        assert_ne!(
+            serde_json::to_value(signaled).unwrap(),
+            serde_json::to_value(unknown).unwrap()
+        );
+    }
+
+    #[test]
+    fn applied_run_carries_child_ids_and_accepts_degraded_quiescence_with_stderr_diagnostic() {
+        let applied = ScriptRunApplied {
+            children: vec!["child-command-id".to_owned()],
+            process: ScriptProcessResult {
+                custody: ScriptCustody::Degraded,
+                quiescent: true,
+                direct_exit: ScriptDirectExit::Exited {
+                    success: true,
+                    exit_code: Some(0),
+                },
+                stderr: Some(StderrSnapshot {
+                    text: "diagnostic tail".to_owned(),
+                    truncated: true,
+                    eof: false,
+                    read_error: true,
+                }),
+            },
+        };
+        applied.validate().unwrap();
+        let wire = serde_json::to_value(&applied).unwrap();
+        assert_eq!(wire["children"], json!(["child-command-id"]));
+        assert!(wire["children"][0].is_string());
+        assert_eq!(wire["process"]["custody"], "degraded");
+        assert_eq!(wire["process"]["stderr"]["read_error"], true);
+
+        let mut unproven = applied;
+        unproven.process.custody = ScriptCustody::Unknown;
+        assert!(unproven.validate().is_err());
+    }
+
+    #[test]
+    fn run_outcome_stderr_trims_escaped_nuls_to_the_whole_value_budget() {
+        let mut outcome = json!({
+            "children": ["child-one", "child-two"],
+            "process": {
+                "custody": "degraded",
+                "quiescent": true,
+                "direct_exit": {
+                    "state": "exited",
+                    "success": true,
+                    "exit_code": 0
+                },
+                "stderr": {
+                    "text": "\0".repeat(crate::MAX_STDERR_BYTES),
+                    "truncated": false,
+                    "eof": true,
+                    "read_error": true
+                }
+            }
+        });
+        let mut primary = outcome.clone();
+        primary["process"]["stderr"] = Value::Null;
+        let max_encoded_bytes = 8 * 1024;
+
+        bound_script_outcome_stderr(&mut outcome, max_encoded_bytes);
+
+        assert!(
+            serde_json::to_vec(&outcome).unwrap().len() <= max_encoded_bytes,
+            "the complete Run outcome must fit the supplied encoded budget"
+        );
+        let mut retained_primary = outcome.clone();
+        retained_primary["process"]["stderr"] = Value::Null;
+        assert_eq!(retained_primary, primary);
+        let stderr: StderrSnapshot =
+            serde_json::from_value(outcome["process"]["stderr"].clone()).unwrap();
+        assert!(!stderr.text.is_empty());
+        assert!(stderr.text.len() < crate::MAX_STDERR_BYTES);
+        assert!(stderr.text.chars().all(|character| character == '\0'));
+        assert!(stderr.truncated);
+        assert!(stderr.eof);
+        assert!(stderr.read_error);
+    }
+
+    #[test]
+    fn run_outcome_stderr_is_omitted_when_no_envelope_room_remains() {
+        let original = json!({
+            "code": "failed",
+            "cause": "script_output_invalid",
+            "process": {
+                "custody": "degraded",
+                "quiescent": true,
+                "direct_exit": {
+                    "state": "exited",
+                    "success": false,
+                    "exit_code": 7
+                },
+                "stderr": {
+                    "text": "diagnostic tail",
+                    "truncated": false,
+                    "eof": true,
+                    "read_error": false
+                }
+            }
+        });
+        let mut primary = original.clone();
+        primary["process"]["stderr"] = Value::Null;
+        let primary_bytes = serde_json::to_vec(&primary).unwrap().len();
+
+        let mut exact_room = original.clone();
+        bound_script_outcome_stderr(&mut exact_room, primary_bytes);
+        assert_eq!(exact_room, primary);
+
+        let max_encoded_bytes = primary_bytes - 1;
+        let mut undersized = original;
+        bound_script_outcome_stderr(&mut undersized, max_encoded_bytes);
+        assert_eq!(undersized, primary);
+        assert!(serde_json::to_vec(&undersized).unwrap().len() > max_encoded_bytes);
     }
 }

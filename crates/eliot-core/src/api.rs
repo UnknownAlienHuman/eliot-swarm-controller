@@ -47,8 +47,9 @@ pub use reads::{
 pub use rules::{RuleCatchUpRequest, RuleLimit, RuleLimitScope};
 pub use scripts::{
     FrozenScriptContext, FrozenScriptInterpreter, FrozenScriptRun, RunDefinitionArgs,
-    ScriptActionRecord, ScriptCommandContext, ScriptInputContext, ScriptInterpreter,
-    ScriptRuleContext,
+    ScriptActionRecord, ScriptCommandContext, ScriptCustody, ScriptDirectExit, ScriptInputContext,
+    ScriptInterpreter, ScriptProcessResult, ScriptRuleContext, ScriptRunApplied,
+    bound_script_outcome_stderr,
 };
 pub use timers::{CatchUp, TimerGetRequest, TimerRunRequest, TimerSchedule, TimerStateView};
 
