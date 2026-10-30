@@ -7062,7 +7062,7 @@ fn cli_event_rule_steers_exact_held_turn_in_global_and_project_scopes() {
         assert_eq!(steer.target.as_deref(), Some(agent.as_str()));
         assert_eq!(steer.expected_generation, Some(generation));
         assert_eq!(steer.generation, Some(generation));
-        assert_eq!(steer.expected_turn_id.as_deref(), Some(turn_id.as_str()));
+        assert_eq!(steer.turn_id.as_deref(), Some(turn_id.as_str()));
         assert_eq!(steer.args, json!({"text": steer_text}));
         assert_eq!(
             steer.outcome.as_ref().expect("retained control outcome")["turn_id"],
@@ -7133,10 +7133,7 @@ fn cli_event_rule_steers_exact_held_turn_in_global_and_project_scopes() {
         let interrupt: CoreCommand =
             serde_json::from_value(fixture.wait_command(&interrupt_id, "applied"))
                 .expect("applied exact-turn interrupt cleanup");
-        assert_eq!(
-            interrupt.expected_turn_id.as_deref(),
-            Some(turn_id.as_str())
-        );
+        assert_eq!(interrupt.turn_id.as_deref(), Some(turn_id.as_str()));
         let after_interrupt = fixture.events();
         let terminal = after_interrupt
             .iter()
@@ -7196,9 +7193,9 @@ fn cli_event_rule_steers_exact_held_turn_in_global_and_project_scopes() {
                 .iter()
                 .filter(|event| {
                     event["kind"] == "rule.fired"
-                        && event["data"]["rule"] == rule_id
-                        && event["data"]["event_seq"] == event_seq
-                        && event["data"]["parent_command"] == parent_id
+                        && event["data"]["rule"].as_str() == Some(rule_id.as_str())
+                        && event["data"]["event_seq"].as_i64() == Some(*event_seq)
+                        && event["data"]["parent_command"].as_str() == Some(parent_id.as_str())
                 })
                 .count(),
             1,

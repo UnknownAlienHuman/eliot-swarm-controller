@@ -8576,7 +8576,6 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         action.expected_turn_id = Some(turn_id.clone());
 
         let prepared = router.prepare_owner_submission(action).await.unwrap();
-        let mut committed = router.subscribe_rule_events();
         let admission = router
             .admit_rule_action("owner", None, &state, event.seq, prepared)
             .await

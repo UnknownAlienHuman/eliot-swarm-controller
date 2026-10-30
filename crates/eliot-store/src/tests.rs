@@ -1180,10 +1180,10 @@ fn project_fake_steer_requires_explicit_approval_and_keeps_exact_turn_binding() 
     let principal = format!("project:{project}");
     let agent = ready_agent(&mut store, project, now);
     let turn_id = start_fake_turn(&mut store, &agent, now + 1);
-    let checkout = format!("/synthetic/{project}");
+    let checkout = "synthetic-workspace";
     let mut registration = ProjectRegistrationInput {
         id: project.to_owned(),
-        checkout: checkout.clone(),
+        checkout: checkout.to_owned(),
         repo_common_dir: format!("{checkout}/.git"),
         profiles: vec!["fake".to_owned()],
         actions: vec!["send".to_owned()],
