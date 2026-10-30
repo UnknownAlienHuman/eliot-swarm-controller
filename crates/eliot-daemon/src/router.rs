@@ -25,7 +25,7 @@ use eliot_core::{
         RuleStateView, ShutdownMode, SourceState, StatusBlocker, TimerGetRequest, TimerRunRequest,
         TimerStateView, TurnGetRequest, UnsettledCommandSummary, WorkspaceCustodyView,
     },
-    classify_dispatched_error,
+    classify_dispatched_error, is_deterministic_pre_admission_rejection,
 };
 use eliot_plugin::{MAX_EVENT_BYTES, sync::LockExt};
 use eliot_store::{
@@ -3221,8 +3221,14 @@ impl Router {
                 }
                 Ok(change) => break change.value,
                 Err(error) => {
-                    self.settle_dispatch_error(&id, &error, change.1, launch_binding.is_some())
-                        .await;
+                    self.settle_dispatch_error(
+                        &id,
+                        &error,
+                        change.1,
+                        launch_binding.is_some(),
+                        command.verb == "run" && command.principal.starts_with("project:"),
+                    )
+                    .await;
                     return;
                 }
             }
@@ -3520,9 +3526,13 @@ impl Router {
         error: &Error,
         write_faulted: bool,
         native_binding: bool,
+        project_run: bool,
     ) {
         // This is only the local Store dispatch result, before any control RPC.
         // A plugin error with the same code still follows post-I/O C1 handling.
+        let revoked_run_authority = project_run
+            && error.code == "not_allowed"
+            && is_deterministic_pre_admission_rejection(&error.code);
         if write_faulted {
             self.note_unknown_if_uncertain(id, "store_dispatch_outcome_unknown")
                 .await;
@@ -3534,6 +3544,7 @@ impl Router {
                 error.code.as_str(),
                 "source_integrity" | "frame_too_large" | "invalid"
             )
+            || revoked_run_authority
         {
             self.reject_undispatched(id, &error.code).await;
         }
@@ -6309,7 +6320,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         };
         assert!(!faulted);
         router
-            .settle_dispatch_error(&invalid.id, &error, faulted, true)
+            .settle_dispatch_error(&invalid.id, &error, faulted, true, false)
             .await;
         let store = router.inner.store.lock().await;
         let rejected = store.get_command(&invalid.id).unwrap().unwrap();
@@ -7325,6 +7336,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 &Error::new("provider_held", "provider scope is held"),
                 false,
                 false,
+                false,
             )
             .await;
 
@@ -7339,6 +7351,283 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 .iter()
                 .any(|event| event.kind == "command.dispatched")
         );
+    }
+
+    #[tokio::test]
+    async fn project_run_registration_revocation_rejects_before_dispatch_and_recovery_is_quiet() {
+        const PROJECT_ID: &str = "run-revocation";
+
+        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let root = base.join(format!("eliot-router-run-revocation-{}", ulid::Ulid::new()));
+        let checkout_path = root.join("checkout");
+        let data_root = root.join("owner-data");
+        std::fs::create_dir_all(&checkout_path).unwrap();
+        std::fs::create_dir_all(&data_root).unwrap();
+        let git_init = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&checkout_path)
+            .status()
+            .unwrap();
+        assert!(git_init.success(), "initialize registered checkout");
+
+        let checkout_input = checkout_path.to_string_lossy().into_owned();
+        let (checkout, repo_common_dir) = crate::workspace_git::WorkspaceGit::new()
+            .unwrap()
+            .repository_identity(&checkout_input)
+            .await
+            .unwrap();
+        let interpreter_program = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let write_registration = |actions: &[&str]| {
+            let actions = actions
+                .iter()
+                .map(|action| serde_json::to_string(action).unwrap())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let source = format!(
+                concat!(
+                    "[projects.{project_id}]\n",
+                    "path = {checkout}\n",
+                    "actions = [{actions}]\n\n",
+                    "[projects.{project_id}.interpreters.fixture]\n",
+                    "program = {interpreter}\n",
+                    "argv_prefix = []\n",
+                ),
+                project_id = PROJECT_ID,
+                checkout = serde_json::to_string(&checkout).unwrap(),
+                actions = actions,
+                interpreter = serde_json::to_string(&interpreter_program).unwrap(),
+            );
+            std::fs::write(data_root.join("config.toml"), source).unwrap();
+        };
+        write_registration(&["run"]);
+
+        let scripts_dir = std::path::Path::new(&checkout)
+            .join(".eliot")
+            .join("scripts");
+        std::fs::create_dir_all(&scripts_dir).unwrap();
+        std::fs::write(scripts_dir.join("not-executed.sh"), "exit 0\n").unwrap();
+
+        let router = router_with_data_root(data_root.clone());
+        let registration_input = ProjectRegistrationInput {
+            id: PROJECT_ID.to_owned(),
+            checkout: checkout.clone(),
+            repo_common_dir,
+            profiles: Vec::new(),
+            actions: vec!["run".to_owned()],
+            interpreters: std::collections::BTreeMap::from([(
+                "fixture".to_owned(),
+                eliot_core::api::ScriptInterpreter {
+                    program: interpreter_program.clone(),
+                    argv_prefix: Vec::new(),
+                },
+            )]),
+            run_env: Vec::new(),
+        };
+        let registration = router
+            .reconcile_project_registrations(std::slice::from_ref(&registration_input))
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let project_principal = format!("project:{PROJECT_ID}");
+        let rule_id = "revocation-rule";
+        let rule_value = json!({
+            "id":rule_id,
+            "enabled":true,
+            "on":{"event":"turn.completed"},
+            "do":[{"action":"run", "cmd":["fixture", ".eliot/scripts/not-executed.sh"], "timeout":"5s"}],
+        });
+        let rule_input = eliot_store::RuleDefinitionInput {
+            id: rule_id.to_owned(),
+            canonical_definition: serde_json::to_string(&rule_value).unwrap(),
+            definition_digest: eliot_core::canonical_json_sha256(&rule_value).unwrap(),
+            enabled: true,
+        };
+        let (agent, trigger_id) = {
+            let mut store = router.inner.store.lock().await;
+            result_fixture(&mut store)
+        };
+        let rule_state = router
+            .initialize_rules(
+                &project_principal,
+                std::slice::from_ref(&rule_input),
+                &[],
+                now_ms(),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .view;
+
+        let event = {
+            let mut store = router.inner.store.lock().await;
+            read_fixture_event(
+                &mut store,
+                &agent,
+                "turn.completed",
+                json!({
+                    "command_id":trigger_id,
+                    "turn_id":"turn-1",
+                    "status":"completed",
+                }),
+            );
+            if store
+                .get_command(&trigger_id)
+                .unwrap()
+                .is_some_and(|command| command.state == CommandState::Dispatched)
+            {
+                store
+                    .settle(
+                        &trigger_id,
+                        CommandState::Applied,
+                        Some(json!({"turn_id":"turn-1"})),
+                        now_ms(),
+                    )
+                    .unwrap();
+            }
+            store
+                .read_events(0, 1_000, None)
+                .unwrap()
+                .into_iter()
+                .find(|event| {
+                    event.kind == "turn.completed"
+                        && event.data.get("command_id").and_then(Value::as_str)
+                            == Some(trigger_id.as_str())
+                })
+                .unwrap()
+        };
+
+        let frozen = crate::scripts::freeze_project_run(
+            eliot_core::RunDefinitionArgs {
+                cmd: vec![
+                    "fixture".to_owned(),
+                    ".eliot/scripts/not-executed.sh".to_owned(),
+                ],
+                cwd: None,
+                timeout: Some("5s".to_owned()),
+                env: std::collections::BTreeMap::new(),
+            },
+            &registration,
+            eliot_core::FrozenScriptContext {
+                event: event.clone(),
+                subject: event.subject.clone(),
+                rule: eliot_core::ScriptRuleContext {
+                    id: rule_id.to_owned(),
+                    revision: rule_state.revision,
+                },
+            },
+            &SecretPolicy::default(),
+        )
+        .unwrap();
+        let mut request = SubmitCommand::new(String::new(), "run");
+        request.args = serde_json::to_value(frozen).unwrap();
+        let prepared = router
+            .prepare_project_rule_submission(request, &registration)
+            .await
+            .unwrap();
+
+        // Use Store's real rule-firing transaction without scheduling the
+        // child, so this test can commit authority revocation before Router
+        // attempts the Run dispatch.
+        let run_id = {
+            let mut store = router.inner.store.lock().await;
+            let firing = store
+                .admit_rule_action(
+                    &project_principal,
+                    &rule_state,
+                    event.seq,
+                    prepared.request,
+                    now_ms(),
+                )
+                .unwrap();
+            assert!(firing.is_new);
+            let parent = firing
+                .parent
+                .as_ref()
+                .expect("committed rule firing parent");
+            let run = firing
+                .child
+                .as_ref()
+                .expect("committed targetless Run child");
+            assert_eq!(parent.verb, "rule");
+            assert_eq!(parent.state, CommandState::Applied);
+            assert_eq!(run.verb, "run");
+            assert_eq!(run.state, CommandState::Accepted);
+            assert_eq!(run.principal, project_principal);
+            assert!(firing.events.iter().any(|fired_event| {
+                fired_event.kind == "rule.fired"
+                    && fired_event.data["event_seq"] == event.seq
+                    && fired_event.data["child_command"] == run.id
+            }));
+            router.publish_locked(&firing.events);
+            run.id.clone()
+        };
+
+        let mut revoked_registration = registration_input;
+        revoked_registration.actions.clear();
+        write_registration(&[]);
+        let updated = router
+            .reconcile_project_registrations(&[revoked_registration])
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(updated.revision > registration.revision);
+
+        router
+            .clone()
+            .process_command_inner(run_id.clone(), None)
+            .await;
+        let (rejected, events_after_rejection) = {
+            let store = router.inner.store.lock().await;
+            let command = store.get_command(&run_id).unwrap().unwrap();
+            let events = store.read_events(0, 1_000, None).unwrap();
+            (command, events)
+        };
+        assert_eq!(rejected.state, CommandState::Rejected);
+        assert_eq!(rejected.outcome, Some(json!({"reason":"not_allowed"})));
+        assert_eq!(
+            events_after_rejection
+                .iter()
+                .filter(|event| {
+                    event.kind == "command.rejected"
+                        && event.data.get("command_id").and_then(Value::as_str)
+                            == Some(run_id.as_str())
+                })
+                .count(),
+            1
+        );
+        assert!(!events_after_rejection.iter().any(|event| {
+            event.kind == "command.dispatched"
+                && event.data.get("command_id").and_then(Value::as_str) == Some(run_id.as_str())
+        }));
+        assert!(router.inner.run_workers.lock_recover().is_empty());
+
+        router
+            .clone()
+            .process_command_inner(run_id.clone(), None)
+            .await;
+        let store = router.inner.store.lock().await;
+        assert_eq!(
+            store.get_command(&run_id).unwrap().unwrap().state,
+            CommandState::Rejected
+        );
+        assert_eq!(
+            store.read_events(0, 1_000, None).unwrap(),
+            events_after_rejection,
+            "recovery does not retry or rewrite a terminally rejected Run"
+        );
+        drop(store);
+        assert!(router.inner.run_workers.lock_recover().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -7526,7 +7815,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 .await;
             let dispatch_error = Error::new("internal", "injected Store dispatch failure");
             router
-                .settle_dispatch_error(id, &dispatch_error, true, false)
+                .settle_dispatch_error(id, &dispatch_error, true, false, false)
                 .await;
             let command: Command = serde_json::from_value(
                 router
@@ -7558,7 +7847,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             .await;
         let dispatch_error = Error::new("internal", "injected Store dispatch failure");
         router
-            .settle_dispatch_error(&dispatched_id, &dispatch_error, true, false)
+            .settle_dispatch_error(&dispatched_id, &dispatch_error, true, false, false)
             .await;
         let persisted = router
             .inner

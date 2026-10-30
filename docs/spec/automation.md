@@ -248,9 +248,9 @@ ordinary command admission. Run actions on timer rules and global event rules re
 in this first slice. The full L4.2 action contract is cumulative: global `run` and the other
 actions listed below remain required, and this project contour does not complete or remove that
 requirement. SEND uses the existing Router path, keeps its exact target generation and turn
-association, and `applied` does not assert task completion. `allow_self` defaults to false,
-suppressing a rule's own causal SEND result; set it true only to opt into feedback, still subject
-to cause-depth and rate limits. Goal actions and project configuration overlays remain outside
+association, and `applied` does not assert task completion. `allow_self` defaults to
+false; see [Guardrails](#guardrails) for the same-principal self-cause behavior for SEND
+and Run. Goal actions and project configuration overlays remain outside
 this connected event-rule contour.
 Cause-depth suppression is silent and does not emit an endlessly retriggerable rejection event.
 
@@ -361,8 +361,12 @@ no path escape, symlink/reparse point, device or alternate stream. Before spawn,
 the project `run` action and resolve element 0 to its approved interpreter. The executable
 path and fixed argv prefix come only from owner configuration. Event data cannot change
 argv or become a shell command string. Eliot invokes the executable directly with the
-configured prefix, the frozen canonical entry path and the remaining literal arguments;
-event-derived values are available on stdin only. See [Project registration and rule authority](configuration.md#project-registration-and-rule-authority).
+configured prefix, the script-entry argument from the frozen canonical receipt via the
+[setup::file_argument helper](../../crates/eliot-daemon/src/setup.rs), and the remaining
+literal arguments. On Windows only, the helper may normalize argv spelling after
+link/reparse checks and a canonical round-trip prove it resolves to the same file; the
+frozen canonical entry receipt and digest remain unchanged. Event-derived values are
+available on stdin only. See [Project registration and rule authority](configuration.md#project-registration-and-rule-authority).
 
 `cwd` defaults to the registered canonical project checkout. A supplied literal relative
 path must resolve inside that checkout after canonicalization and link/reparse checks.
@@ -528,9 +532,10 @@ reconstructs old provenance from a current Agent row. Cause depth above 5 silent
 advances the cursor without a parent/action command or a new event, so suppression is
 quiescent. Default per-rule limit is 10/minute, global
 120 actions/minute; configured windows must fit retained accounting history. SEND
-self-triggering defaults off. Store suppresses only when the originating command/parent
-rows prove the same principal and rule; `EventCause.rule` alone is not authority.
-`allow_self=true` opts a rule into its own SEND feedback, still subject to cause-depth
-and rate limits.
+Self-triggering SEND and Run default off. Store suppresses a SEND or Run only when
+Store-verified cause and origin command/parent rows prove the same principal and rule;
+it checks Run before invoking the script. `EventCause.rule` alone is not authority.
+`allow_self=true` permits intentional SEND or Run feedback, still subject to the existing
+cause-depth and rate limits.
 Draining or paused automation admits no new firings. Every action uses normal router
 checks. These are execution limits, not a task approval process.

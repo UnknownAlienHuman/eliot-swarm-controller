@@ -359,6 +359,20 @@ mod tests {
         }
     }
 
+    fn rule_input_with_allow_self(
+        id: &str,
+        limit: Option<Value>,
+        allow_self: bool,
+    ) -> RuleDefinitionInput {
+        let mut input = rule_input(id, limit);
+        let mut value: Value =
+            serde_json::from_str(&input.canonical_definition).expect("decode rule");
+        value["allow_self"] = json!(allow_self);
+        input.canonical_definition = serde_json::to_string(&value).expect("encode rule");
+        input.definition_digest = core::canonical_json_sha256(&value).expect("digest rule");
+        input
+    }
+
     fn stop_rule_input(id: &str) -> RuleDefinitionInput {
         let value = json!({
             "id": id,
@@ -392,6 +406,53 @@ mod tests {
         let id = tx.last_insert_rowid();
         tx.commit().expect("commit Agent");
         (id, format_agent_id(id))
+    }
+
+    fn native_ready_agent(store: &mut Store, project: &str, now: i64) -> (i64, String) {
+        let launch_id = ulid::Ulid::new().to_string();
+        let launch = store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: launch_id.clone(),
+                    target: None,
+                    verb: "launch".to_owned(),
+                    args: json!({"project":project, "workspace":"synthetic-workspace"}),
+                    expected_generation: Some(0),
+                    expected_turn_id: None,
+                    request_id: None,
+                    probe: false,
+                },
+                now,
+            )
+            .expect("admit launch");
+        let agent_id = launch.command.target.expect("launch target");
+        store
+            .dispatch(&launch_id, now + 1)
+            .expect("dispatch launch");
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: format!("{project}:ready"),
+                    agent_id: agent_id.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        kind: "session.ready".to_owned(),
+                        native_id: format!("{project}:ready"),
+                        data: json!({"command_id":launch_id}),
+                        ts: None,
+                    }],
+                    cursor: None,
+                },
+                now + 2,
+            )
+            .expect("commit Agent readiness");
+        store
+            .settle(&launch_id, CommandState::Applied, None, now + 3)
+            .expect("settle launch");
+        let agent_num = core::parse_agent_id(&agent_id).expect("parse Agent id");
+        (agent_num, agent_id)
     }
 
     fn insert_event(
@@ -547,6 +608,128 @@ mod tests {
                 .any(|event| event.kind == "command.dispatched" && event.agent.is_none())
         );
         dispatched.value
+    }
+
+    struct ScriptSendCompletion {
+        state: core::api::RuleStateView,
+        event: Event,
+    }
+
+    fn script_send_completion(
+        store: &mut Store,
+        rule: &str,
+        allow_self: bool,
+        now: i64,
+    ) -> ScriptSendCompletion {
+        let (agent_num, agent_id) = native_ready_agent(store, rule, now);
+        let state = store
+            .ensure_rule_state(
+                "owner",
+                &rule_input_with_allow_self(
+                    rule,
+                    Some(json!({"max":3,"per":"rule","window_ms":60_000})),
+                    allow_self,
+                ),
+                now + 4,
+            )
+            .expect("ensure Run rule");
+        let trigger = insert_event(store, now + 5, Some((agent_num, 1)), None);
+        let first = store
+            .admit_rule_action(
+                "owner",
+                &state,
+                trigger.seq,
+                run_request(&trigger, rule, state.revision),
+                now + 6,
+            )
+            .expect("admit initial rule Run");
+        let state = first.state;
+        let run = dispatch_run(store, &first.child.expect("initial Run child"), now + 7);
+        let output = store
+            .admit_script_output(
+                &run.id,
+                vec![send_action(&agent_id, "script output")],
+                process_result(core::ScriptCustody::Exact),
+                now + 8,
+            )
+            .expect("admit script SEND output");
+        let send = output.children.first().expect("script SEND child").clone();
+        store
+            .dispatch(&send.id, now + 9)
+            .expect("dispatch script SEND");
+
+        let turn_id = format!("{rule}-script-send-turn");
+        let committed = store
+            .put_batch(
+                SourceBatch {
+                    batch_id: format!("{rule}:script-send-result"),
+                    agent_id: agent_id.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![
+                        NativeEvent {
+                            kind: "turn.started".to_owned(),
+                            native_id: format!("{rule}:turn-started"),
+                            data: json!({"command_id":send.id, "turn_id":turn_id}),
+                            ts: None,
+                        },
+                        NativeEvent {
+                            kind: "message.completed".to_owned(),
+                            native_id: format!("{rule}:message-completed"),
+                            data: json!({
+                                "command_id":send.id,
+                                "turn_id":turn_id,
+                                "text":"script output"
+                            }),
+                            ts: None,
+                        },
+                        NativeEvent {
+                            kind: "turn.completed".to_owned(),
+                            native_id: format!("{rule}:turn-completed"),
+                            data: json!({
+                                "command_id":send.id,
+                                "turn_id":turn_id,
+                                "status":"completed"
+                            }),
+                            ts: None,
+                        },
+                    ],
+                    cursor: None,
+                },
+                now + 10,
+            )
+            .expect("commit native script Send completion");
+        let event = committed
+            .events
+            .iter()
+            .find(|event| event.kind == "turn.completed")
+            .expect("native turn completion event")
+            .clone();
+        let stored_cause = command_cause_tx(&store.connection, &send.id)
+            .expect("read script Send cause")
+            .expect("script Send has a stored cause");
+        assert_eq!(event.cause, Some(stored_cause));
+
+        ScriptSendCompletion { state, event }
+    }
+
+    fn stored_command_count(store: &Store) -> i64 {
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+            .expect("count stored commands")
+    }
+
+    fn stored_rule_action_count(store: &Store) -> i64 {
+        store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM commands
+                 WHERE link_kind = 'rule_action' AND ordinal IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count stored rule actions")
     }
 
     fn project_registration(id: &str, actions: Vec<String>) -> ProjectRegistrationInput {
@@ -787,7 +970,7 @@ mod tests {
     }
 
     #[test]
-    fn run_cause_depth_and_self_send_provenance_follow_the_stored_root_rule() {
+    fn run_cause_depth_and_self_result_suppression_follow_the_stored_root_rule() {
         let mut store = store();
         let (agent_num, agent_id) = insert_agent(&mut store, "script-cause", 10);
         let state = store
@@ -860,7 +1043,10 @@ mod tests {
             .get_rule_state("owner", "cause-script")
             .expect("read advanced rule")
             .expect("rule remains stored");
-        let second_run = store
+        let high_water_before = store.high_water().expect("read event boundary");
+        let commands_before = stored_command_count(&store);
+        let actions_before = stored_rule_action_count(&store);
+        let suppressed_run = store
             .admit_rule_action(
                 "owner",
                 &current,
@@ -868,21 +1054,163 @@ mod tests {
                 run_request(&event3, "cause-script", current.revision),
                 19,
             )
-            .expect("admit Run at the next cause depth");
-        let second_run = dispatch_run(&mut store, &second_run.child.expect("second Run child"), 20);
-        let output = store
-            .admit_script_output(
-                &second_run.id,
-                vec![stop_action(&agent_id)],
-                process_result(core::ScriptCustody::Exact),
-                21,
+            .expect("suppress Run at the next self-cause depth");
+        assert!(suppressed_run.parent.is_none());
+        assert!(suppressed_run.child.is_none());
+        assert!(suppressed_run.events.is_empty());
+        assert_eq!(suppressed_run.state.current_cursor, event3.seq);
+        assert_eq!(stored_command_count(&store), commands_before);
+        assert_eq!(stored_rule_action_count(&store), actions_before);
+        assert_eq!(
+            store.high_water().expect("read event boundary"),
+            high_water_before
+        );
+    }
+
+    fn assert_live_script_send_run_case(allow_self: bool) {
+        let request_id = ulid::Ulid::new();
+        let now = i64::try_from(request_id.timestamp_ms()).expect("timestamp fits") + 100;
+        let rule = if allow_self {
+            "live-run-self-allowed"
+        } else {
+            "live-run-self-suppressed"
+        };
+        let mut store = store();
+        let fixture = script_send_completion(&mut store, rule, allow_self, now);
+        let high_water_before = store.high_water().expect("read event boundary");
+        let commands_before = stored_command_count(&store);
+        let actions_before = stored_rule_action_count(&store);
+
+        let admission = store
+            .admit_rule_action(
+                "owner",
+                &fixture.state,
+                fixture.event.seq,
+                run_request(&fixture.event, rule, fixture.state.revision),
+                now + 20,
             )
-            .expect("admit depth-preserving script output");
-        let stop_cause = command_cause_tx(&store.connection, &output.children[0].id)
-            .expect("read second output cause")
-            .expect("second output has a cause");
-        assert_eq!(stop_cause.rule.as_deref(), Some("cause-script"));
-        assert_eq!(stop_cause.depth, 2);
+            .expect("admit or suppress self-caused live Run");
+
+        if allow_self {
+            let parent = admission.parent.expect("allow_self Run parent");
+            let run = admission.child.expect("allow_self Run child");
+            assert_eq!(parent.verb, "rule");
+            assert_eq!(run.verb, "run");
+            let cause = command_cause_tx(&store.connection, &run.id)
+                .expect("read admitted Run cause")
+                .expect("admitted Run cause");
+            assert_eq!(cause.rule.as_deref(), Some(rule));
+            assert_eq!(cause.depth, 2);
+            assert_eq!(stored_command_count(&store), commands_before + 2);
+            assert_eq!(stored_rule_action_count(&store), actions_before + 1);
+            assert!(stored_rule_action_count(&store) <= 3);
+            assert!(store.high_water().expect("read event boundary") > high_water_before);
+        } else {
+            assert!(admission.parent.is_none());
+            assert!(admission.child.is_none());
+            assert!(admission.events.is_empty());
+            assert_eq!(admission.state.current_cursor, fixture.event.seq);
+            assert_eq!(stored_command_count(&store), commands_before);
+            assert_eq!(stored_rule_action_count(&store), actions_before);
+            assert_eq!(
+                store.high_water().expect("read event boundary"),
+                high_water_before
+            );
+        }
+    }
+
+    #[test]
+    fn live_run_from_own_script_send_result_is_suppressed_without_consumption() {
+        assert_live_script_send_run_case(false);
+    }
+
+    #[test]
+    fn allow_self_permits_live_run_from_own_script_send_result_within_limits() {
+        assert_live_script_send_run_case(true);
+    }
+
+    fn assert_history_script_send_run_case(allow_self: bool) {
+        let request_id = ulid::Ulid::new();
+        let now = i64::try_from(request_id.timestamp_ms()).expect("timestamp fits") + 100;
+        let rule = if allow_self {
+            "history-run-self-allowed"
+        } else {
+            "history-run-self-suppressed"
+        };
+        let mut store = store();
+        let fixture = script_send_completion(&mut store, rule, allow_self, now);
+        let through_seq = store.high_water().expect("read catch-up boundary");
+        store
+            .advance_rule_cursor(
+                "owner",
+                &fixture.state,
+                through_seq,
+                RuleCursorOutcome::NoMatch,
+                now + 20,
+            )
+            .expect("advance live cursor through the native result");
+        let current = store
+            .get_rule_state("owner", rule)
+            .expect("read advanced rule")
+            .expect("rule remains stored");
+        let request = core::api::RuleCatchUpRequest::new(
+            request_id.to_string(),
+            rule,
+            fixture.state.current_cursor,
+            Some(through_seq),
+        );
+        let actions = [RuleCatchUpAction::command(
+            fixture.event.seq,
+            run_request(&fixture.event, rule, current.revision),
+        )];
+        let commands_before = stored_command_count(&store);
+        let actions_before = stored_rule_action_count(&store);
+
+        let admission = store
+            .admit_rule_catch_up("owner", &request, &current, through_seq, &actions, now + 21)
+            .expect("admit or suppress self-caused history Run");
+
+        if allow_self {
+            assert_eq!(admission.children.len(), 1);
+            let run = &admission.children[0];
+            assert_eq!(run.verb, "run");
+            let cause = command_cause_tx(&store.connection, &run.id)
+                .expect("read admitted history Run cause")
+                .expect("admitted history Run cause");
+            assert_eq!(cause.rule.as_deref(), Some(rule));
+            assert_eq!(cause.depth, 2);
+            assert_eq!(stored_command_count(&store), commands_before + 2);
+            assert_eq!(stored_rule_action_count(&store), actions_before + 1);
+            assert!(stored_rule_action_count(&store) <= 3);
+            assert!(admission.events.iter().any(|event| {
+                event.kind == "rule.fired" && event.data["event_seq"] == fixture.event.seq
+            }));
+        } else {
+            assert!(admission.children.is_empty());
+            assert_eq!(
+                admission.parent.outcome.as_ref().unwrap()["children"],
+                json!([])
+            );
+            assert_eq!(
+                admission.parent.outcome.as_ref().unwrap()["suppressed_event_seqs"],
+                json!([fixture.event.seq])
+            );
+            assert!(!admission.events.iter().any(|event| {
+                event.kind == "rule.fired" && event.data["event_seq"] == fixture.event.seq
+            }));
+            assert_eq!(stored_command_count(&store), commands_before + 1);
+            assert_eq!(stored_rule_action_count(&store), actions_before);
+        }
+    }
+
+    #[test]
+    fn catch_up_run_from_own_script_send_result_is_suppressed_without_action_consumption() {
+        assert_history_script_send_run_case(false);
+    }
+
+    #[test]
+    fn allow_self_permits_history_run_from_own_script_send_result_within_limits() {
+        assert_history_script_send_run_case(true);
     }
 
     #[test]

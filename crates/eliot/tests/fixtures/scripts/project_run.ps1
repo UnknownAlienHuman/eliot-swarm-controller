@@ -25,9 +25,25 @@ $contextBytes = $memory.ToArray()
 
 # This is deliberately the Run principal's first RPC. Keep its JSON in a variable
 # so only action NDJSON is written to this script's stdout.
-$ownOutput = @(& $Cli --data-dir $DataDir --json cmd show $env:ELIOT_RUN_COMMAND_ID 2>$null)
+$ownOutput = @(& $Cli --data-dir $DataDir --json cmd show $env:ELIOT_RUN_COMMAND_ID 2>&1)
 $ownExit = $LASTEXITCODE
-if ($ownExit -ne 0) { exit 42 }
+if ($ownExit -ne 0) {
+    [Console]::Error.WriteLine("ELIOT_RUN_OWN_COMMAND_EXIT=$ownExit")
+    $ownOutputText = $ownOutput -join "`n"
+    $ownOutputBytes = [Text.Encoding]::UTF8.GetBytes($ownOutputText)
+    $diagnosticLength = [Math]::Min(4096, $ownOutputBytes.Length)
+    $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+    while ($diagnosticLength -gt 0) {
+        try {
+            $ownDiagnostic = $strictUtf8.GetString($ownOutputBytes, 0, $diagnosticLength)
+            break
+        } catch [Text.DecoderFallbackException] {
+            $diagnosticLength--
+        }
+    }
+    if ($diagnosticLength -gt 0) { [Console]::Error.WriteLine($ownDiagnostic) }
+    exit 42
+}
 $ownText = $ownOutput -join "`n"
 try {
     $ownCommand = ConvertFrom-Json -InputObject $ownText -AsHashtable -ErrorAction Stop

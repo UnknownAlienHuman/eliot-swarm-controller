@@ -335,11 +335,13 @@ select another account/provider.
 
 Project script `run.env` is separate from profile `env` and `pass_env`: the child receives
 the minimal platform baseline, literal values for owner-approved `run_env` names and its
-Run identity. It does not inherit arbitrary owner/Agent environment, profile secrets or
-route/account credentials and selectors. `run_env` cannot name Eliot/Agent/Run identity,
-credential, route/account, native-store selector, Git identity, `PATH` or other reserved
-environment names; names compare case-insensitively on Windows. Project values cannot
-override the role-specific Run variables.
+Run identity. On Windows the baseline reads `SystemRoot` and `PATHEXT` from the
+daemon OS environment and fails before spawn if either is absent; it does not add
+`PATH`. It does not inherit arbitrary owner/Agent environment, profile secrets or route/account
+credentials and selectors. `run_env` cannot name Eliot/Agent/Run identity, credential,
+route/account, native-store selector, Git identity, `PATH` or other reserved environment names;
+names compare case-insensitively on Windows. Project values cannot override the
+role-specific Run variables.
 
 Mask known secret values in native output and reject them in caller durable text.
 Private routing tokens are handled separately from semantic profile data. Native

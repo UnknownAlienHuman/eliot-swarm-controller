@@ -103,10 +103,12 @@ pub(crate) fn verify_project_run(
     let cwd = resolve_project_cwd(&checkout, frozen.definition.cwd.as_deref())?;
     project_run_timeout(frozen)?;
 
+    let entry_argument = crate::setup::file_argument(&frozen.entry)
+        .map_err(|_| source_changed("registered script entry argument path changed"))?;
     let mut command = Command::new(&frozen.interpreter.executable.canonical_path);
     command
         .args(&frozen.interpreter.argv_prefix)
-        .arg(&frozen.entry.canonical_path)
+        .arg(entry_argument)
         .args(frozen.definition.cmd.iter().skip(2))
         .current_dir(cwd)
         .env_clear();
@@ -280,6 +282,9 @@ fn add_minimal_platform_environment(command: &mut Command) -> Result<()> {
         let system_root = std::env::var_os("SystemRoot")
             .ok_or_else(|| Error::new("unavailable", "Windows SystemRoot is unavailable"))?;
         command.env("SystemRoot", system_root);
+        let pathext = std::env::var_os("PATHEXT")
+            .ok_or_else(|| Error::new("unavailable", "Windows PATHEXT is unavailable"))?;
+        command.env("PATHEXT", pathext);
     }
     #[cfg(not(windows))]
     {
@@ -438,6 +443,10 @@ mod tests {
             process.get_program().to_string_lossy(),
             frozen.interpreter.executable.canonical_path
         );
+        let expected_entry_argument = crate::setup::file_argument(&frozen.entry)
+            .expect("validated frozen entry argument")
+            .to_string_lossy()
+            .into_owned();
         let args: Vec<String> = process
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())
@@ -448,7 +457,7 @@ mod tests {
                 "-NoProfile",
                 "-NonInteractive",
                 "-File",
-                frozen.entry.canonical_path.as_str(),
+                expected_entry_argument.as_str(),
                 "-Changed"
             ]
         );
@@ -469,6 +478,83 @@ mod tests {
                 .iter()
                 .any(|name| name.eq_ignore_ascii_case("ELIOT_RUN_TOKEN"))
         );
+        #[cfg(windows)]
+        {
+            let system_root = std::env::var_os("SystemRoot").expect("Windows SystemRoot");
+            let pathext = std::env::var_os("PATHEXT").expect("Windows PATHEXT");
+            let baseline = process
+                .get_envs()
+                .map(|(name, value)| {
+                    (
+                        name.to_string_lossy().into_owned(),
+                        value.map(|value| value.to_os_string()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut names = baseline
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>();
+            names.sort();
+            assert_eq!(
+                names,
+                vec![
+                    "CI".to_owned(),
+                    "PATHEXT".to_owned(),
+                    "SystemRoot".to_owned(),
+                ]
+            );
+            let actual_pathext = baseline
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("PATHEXT"))
+                .and_then(|(_, value)| value.as_deref());
+            assert_eq!(actual_pathext, Some(pathext.as_os_str()));
+            let actual_system_root = baseline
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("SystemRoot"))
+                .and_then(|(_, value)| value.as_deref());
+            assert_eq!(actual_system_root, Some(system_root.as_os_str()));
+            let literal_ci = baseline
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("CI"))
+                .and_then(|(_, value)| value.as_deref());
+            assert_eq!(literal_ci, Some(std::ffi::OsStr::new("true")));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn project_run_normalizes_windows_entry_argv_without_changing_receipt() {
+        let fixture = ProjectFixture::new();
+        let frozen = freeze_project_run(
+            fixture.definition(),
+            &fixture.registration,
+            fixture.context(),
+            &policy(),
+        )
+        .expect("freeze project run");
+        let frozen_entry = frozen.entry.clone();
+        assert!(
+            frozen_entry.canonical_path.starts_with(r"\\?\"),
+            "Windows canonical entry should use its verbatim receipt spelling"
+        );
+
+        let command = verify_project_run(&frozen, &fixture.registration, &policy())
+            .expect("verify project run");
+        let entry_argument = command
+            .as_std()
+            .get_args()
+            .nth(3)
+            .expect("entry after PowerShell argv prefix");
+        assert!(
+            !entry_argument.to_string_lossy().starts_with(r"\\?\"),
+            "PowerShell argv uses a normalized disk or UNC spelling"
+        );
+        assert_eq!(
+            fs::canonicalize(Path::new(entry_argument)).expect("normal entry path"),
+            PathBuf::from(frozen_entry.canonical_path.as_str())
+        );
+        assert_eq!(frozen.entry, frozen_entry);
     }
 
     #[test]

@@ -353,7 +353,7 @@ fn verify_file(expected: &FrozenSetupFile, remaining: &mut u64) -> Result<()> {
     Ok(())
 }
 
-fn file_argument(file: &FrozenSetupFile) -> Result<OsString> {
+pub(crate) fn file_argument(file: &FrozenSetupFile) -> Result<OsString> {
     #[cfg(windows)]
     {
         use std::path::Prefix;

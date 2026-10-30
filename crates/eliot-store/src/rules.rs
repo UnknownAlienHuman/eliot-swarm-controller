@@ -868,7 +868,7 @@ impl Store {
         } else {
             &stored.canonical_definition
         };
-        if should_suppress_own_event_send_tx(
+        if should_suppress_own_event_send_or_run_tx(
             &tx,
             principal,
             &state.id,
@@ -3040,7 +3040,7 @@ fn rule_action_binding_error(event: &StoredRuleTrigger, request: &SubmitCommand)
     None
 }
 
-fn should_suppress_own_event_send_tx(
+fn should_suppress_own_event_send_or_run_tx(
     tx: &Transaction<'_>,
     principal: &str,
     rule: &str,
@@ -3048,7 +3048,7 @@ fn should_suppress_own_event_send_tx(
     request: &SubmitCommand,
     trigger_cause: Option<&core::EventCause>,
 ) -> Result<bool> {
-    if request.verb != "send" {
+    if !matches!(request.verb.as_str(), "send" | "run") {
         return Ok(false);
     }
     let definition: Value = serde_json::from_str(canonical_definition)

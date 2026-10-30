@@ -25,9 +25,13 @@ printf '%s' "$context" > "$context_path"
 # This is deliberately the Run principal's first RPC. Capture stdout so it never
 # mixes with the NDJSON action stream emitted below.
 run_command_id=${ELIOT_RUN_COMMAND_ID-}
-if own_output=$("$cli" --data-dir "$data_dir" --json cmd show "$run_command_id" 2>/dev/null); then
+if own_output=$("$cli" --data-dir "$data_dir" --json cmd show "$run_command_id" 2>&1); then
     :
 else
+    own_status=$?
+    printf 'ELIOT_RUN_OWN_COMMAND_EXIT=%s\n' "$own_status" >&2
+    printf '%s' "$own_output" | /usr/bin/head -c 4096 >&2
+    printf '\n' >&2
     exit 42
 fi
 printf '%s' "$own_output" > "$own_command_path"

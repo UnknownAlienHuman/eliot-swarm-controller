@@ -238,7 +238,7 @@ impl Store {
                 rejected.push((action.event_seq, code));
                 continue;
             }
-            if should_suppress_own_event_send_tx(
+            if should_suppress_own_event_send_or_run_tx(
                 &tx,
                 principal,
                 &request.rule,
