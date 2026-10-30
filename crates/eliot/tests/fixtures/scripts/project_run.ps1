@@ -6,10 +6,31 @@ param(
     [string]$Generation,
     [string]$OtherCommandId,
     [string]$ContextPath,
-    [string]$OwnCommandPath
+    [string]$OwnCommandPath,
+    [string]$ExpectedCwd = ""
 )
 
 $PSNativeCommandUseErrorActionPreference = $false
+
+if ($ExpectedCwd) {
+    $normalizePath = {
+        param([string]$Value)
+        $path = [IO.Path]::GetFullPath($Value)
+        if ($path.StartsWith("\\?\UNC\", [System.StringComparison]::OrdinalIgnoreCase)) {
+            $path = "\\" + $path.Substring(8)
+        } elseif ($path.StartsWith("\\?\", [System.StringComparison]::OrdinalIgnoreCase)) {
+            $path = $path.Substring(4)
+        }
+        $path.TrimEnd([char[]]@('\'))
+    }
+    $expectedCwd = & $normalizePath $ExpectedCwd
+    $actualCwd = & $normalizePath ([Environment]::CurrentDirectory)
+    if (-not [string]::Equals(
+        $expectedCwd,
+        $actualCwd,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) { exit 47 }
+}
 
 if ($env:CI -ne "script-approved") { exit 40 }
 

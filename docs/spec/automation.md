@@ -121,8 +121,9 @@ only edits preserve the schedule. Reconcile timers from stored state on restart.
 Global and registered-project timers use their namespace's startup-loaded rule files and
 the existing command router. The connected subset supports interval, once, five-field
 cron and owner-triggered manual runs with one ordinary `stop` or `send` action. The
-event-rule `interrupt` action is not supported for scheduled or manual timer runs. Other
-action verbs remain future work.
+event-rule `interrupt` action is not supported for scheduled or manual timer runs.
+Timer-rule `run` remains unsupported in this increment but remains required by L4.2.
+Other action verbs remain future work.
 
 ```toml
 [[rule]]
@@ -241,17 +242,14 @@ Disabled rules advance their skipped range without firing.
 Backlog, explicit history catch-up, and rate-limit semantics are defined in
 [Retention and bounded backlog](#retention-and-bounded-backlog).
 This connected event-rule subset supports ordinary `stop`, `send` and event-only
-`interrupt`, plus project event-rule `run` during both live evaluation and explicit history
-catch-up; both paths use the frozen inputs in [Frozen script inputs](#frozen-script-inputs).
-Each catch-up Run freezes the exact captured event and validated current rule revision before
-ordinary command admission. Run actions on timer rules and global event rules remain unsupported
-in this first slice. The full L4.2 action contract is cumulative: global `run` and the other
-actions listed below remain required, and this project contour does not complete or remove that
-requirement. SEND uses the existing Router path, keeps its exact target generation and turn
-association, and `applied` does not assert task completion. `allow_self` defaults to
-false; see [Guardrails](#guardrails) for the same-principal self-cause behavior for SEND
-and Run. Goal actions and project configuration overlays remain outside
-this connected event-rule contour.
+`interrupt`, plus project event-rule `run` during live evaluation and explicit history
+catch-up. The global event-rule `run` contract below specifies owner-global approval and the shared
+frozen execution path. Timer-rule `run` remains unsupported in this increment but remains required
+by L4.2; other full L4.2 action requirements remain cumulative. SEND uses the existing
+Router path, keeps its exact target generation and turn association, and `applied` does not
+assert task completion. `allow_self` defaults to false; see [Guardrails](#guardrails) for the
+same-principal self-cause behavior for SEND and Run. Goal actions and project
+configuration overlays remain outside this connected event-rule contour.
 Cause-depth suppression is silent and does not emit an endlessly retriggerable rejection event.
 
 ## Matching and rendering
@@ -368,17 +366,32 @@ link/reparse checks and a canonical round-trip prove it resolves to the same fil
 frozen canonical entry receipt and digest remain unchanged. Event-derived values are
 available on stdin only. See [Project registration and rule authority](configuration.md#project-registration-and-rule-authority).
 
-`cwd` defaults to the registered canonical project checkout. A supplied literal relative
-path must resolve inside that checkout after canonicalization and link/reparse checks.
+For global event rules, `cmd[0]` is an exact key in owner-private
+`[automation.run].interpreters` ([owner approval](configuration.md#global-event-run-approval)). `cmd[1]` is a
+literal relative entry below the fixed private `<data_dir>/scripts/` root; later elements are
+literal script arguments. The entry must resolve to a canonical regular file below that
+root with no path escape, symlink/reparse point, device or alternate stream. Any eligible
+canonical regular entry under the root may be selected with an approved global Run and
+interpreter; rules have no per-entry or per-rule file allowlist. Event data cannot alter
+argv or become a shell command string.
+
+`cwd` for project Run defaults to the registered canonical project checkout. A supplied
+project cwd must be a literal relative path resolving inside that checkout after
+canonicalization and link/reparse checks. Global event Run defaults to the canonical
+private `<data_dir>/scripts/` root. A safe relative global cwd resolves against that root
+and must remain inside it after canonicalization and link/reparse checks. An explicit
+absolute literal cwd is allowed only for global owner rules and must resolve to an existing
+safe canonical directory with link/reparse checks; project cwd remains checkout-confined.
+
 `timeout` uses the humantime duration grammar and positive-millisecond validation already
 used for timer intervals. It must represent a positive whole number of milliseconds and
 allow a checked runtime deadline; when omitted it defaults to `10m`. This contract adds
-no fixed run-specific maximum. `env`, when present, is a bounded map of literal strings
-whose names are in the owner's `run_env` allowlist. No template substitution is allowed
-in `cmd`, `cwd`, `timeout` or `env`; an absent or empty `run_env` permits no
-action-supplied environment keys. Names also follow the credential, route, identity and
-reserved-variable exclusions in
-[Environment and secrets](configuration.md#environment-and-secrets).
+no fixed run-specific maximum. `env`, when present, is a bounded map of literal nonsecret strings. Project Run names
+must be in the registered project's `run_env`; global Run names must be in owner
+`[automation.run].run_env`. A missing or empty scope-specific allowlist permits no
+action-supplied environment keys. No template substitution is allowed in `cmd`, `cwd`,
+`timeout` or `env`. Names also follow the credential, route, identity and reserved-variable
+exclusions in [Environment and secrets](configuration.md#environment-and-secrets).
 
 `cmd` and `env` reuse existing process/config validation and bounds; do not add a
 script-specific numeric limit registry. Implementers should use the shared Core constants
@@ -392,9 +405,12 @@ and constants `MAX_CMD_LEN`, `MAX_ENV_NAME_LEN` and `MAX_PASS_ENV_ENTRIES` from
 The ordinary command args store Core `FrozenScriptRun`, which carries the resolved
 interpreter snapshot, entry receipt and frozen event/rule context. Entry and executable
 receipts reuse Core `FrozenSetupFile`; see [the Core model](../../crates/eliot-core/src/lib.rs).
-Before spawn, dispatch revalidates the owner project grant and both file receipts. A
-changed registration, executable or entry fails closed instead of replacing queued
-inputs. This freezes explicit references, not an interpreter's imported dependency graph.
+Before spawn, dispatch revalidates the selected owner grant and both file receipts. Project
+Run rechecks its current registration. Global Run rechecks the current owner
+`[automation.run]` grant for the selected interpreter reference, program, argv prefix and every
+action-supplied environment name. Any changed selected grant, executable or entry fails
+closed rather than replacing frozen inputs. This freezes explicit references, not an
+interpreter's imported dependency graph.
 
 The controller serializes bounded JSON before spawn and rejects input larger than 1 MiB.
 The child stdin uses the Core `ScriptInputContext` DTO from [the Core script DTO module](../../crates/eliot-core/src/api/scripts.rs).
@@ -402,7 +418,13 @@ Its event, event-time subject and rule id/revision are the captured snapshots. T
 `ScriptCommandContext` member is the minimal run command id/verb projection assembled
 after Store assigns the id; it never serializes the full Core `Command` or its args.
 The input excludes recursive stdin/context payload, environment, principal/scope and
-bearer values, including the Run token. Its stdout is UTF-8 NDJSON, at most 1 MiB including line endings: each nonempty
+bearer values, including the Run token.
+
+The ephemeral Run token permits only `command.get` for its own Run ID; the RPC returns the
+standard Core `Command` DTO with normal secret-free semantic args. The token is absent from
+persisted command args and stdin and is revoked on process exit/cleanup or restart.
+
+Its stdout is UTF-8 NDJSON, at most 1 MiB including line endings: each nonempty
 line is one JSON object, LF or CRLF terminated; a final complete object may end at EOF.
 Empty lines, malformed JSON, invalid UTF-8, truncated capture or excess output invalidate
 the entire stream. Each line must deserialize as the strict Core `ScriptActionRecord`
@@ -413,10 +435,12 @@ extra or wrong-type fields fail validation. Targets and generation/turn bindings
 literal and must pass ordinary command validation. Records cannot supply command `id`, `principal`, `parent_command`, `ordinal`,
 `executable`, `cmd`, `cwd`, `timeout`, `env` or token fields.
 
-After successful exit, validate each actually emitted record separately against the
-project action allowlist, Router authorization and generation/turn checks. All records
-must pass before atomic admission; the rule loader does not statically analyze possible
-script output.
+After successful exit, validate each actually emitted record separately against its saved
+scope: project Run uses the project action allowlist and Router generation/turn fences;
+global Run uses ordinary Owner Router checks. All records must pass before atomic admission;
+the rule loader does not statically analyze possible script output. Admitted children use the
+saved rule principal—Owner for global Run, project principal for project Run—even after the
+Run token is revoked.
 
 The Core [`ScriptRunApplied` outcome](../../crates/eliot-core/src/api/scripts.rs) carries
 the current child ID list and a per-run [`ScriptProcessResult`](../../crates/eliot-core/src/api/scripts.rs).

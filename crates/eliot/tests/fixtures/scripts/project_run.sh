@@ -9,6 +9,15 @@ generation=$5
 other_command_id=$6
 context_path=$7
 own_command_path=$8
+expected_cwd=
+if [ "$#" -ge 9 ]; then
+    expected_cwd=$9
+fi
+
+if [ -n "$expected_cwd" ]; then
+    actual_cwd=$(pwd -P)
+    [ "$actual_cwd" = "$expected_cwd" ] || exit 47
+fi
 
 [ "${CI-}" = "script-approved" ] || exit 40
 

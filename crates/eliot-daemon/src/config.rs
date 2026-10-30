@@ -139,29 +139,55 @@ struct FileConfig {
     automation: AutomationConfig,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+/// Owner-approved interpreter and action-environment grant shared by project
+/// registrations and owner-global automation Run.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RunGrantConfig {
+    #[serde(default)]
+    pub(crate) interpreters: BTreeMap<String, core::api::ScriptInterpreter>,
+    #[serde(default)]
+    pub(crate) run_env: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AutomationConfig {
     #[serde(default = "default_max_event_backlog")]
     pub(crate) max_event_backlog: i64,
+    #[serde(default)]
+    pub(crate) run: RunGrantConfig,
 }
 
 impl Default for AutomationConfig {
     fn default() -> Self {
         Self {
             max_event_backlog: default_max_event_backlog(),
+            run: RunGrantConfig::default(),
         }
     }
 }
 
 impl AutomationConfig {
-    fn validate(self) -> core::Result<Self> {
+    fn validate(
+        mut self,
+        source: &str,
+        route_credential_env_names: &[String],
+    ) -> core::Result<Self> {
         if self.max_event_backlog <= 0 {
             return Err(core::Error::new(
                 "profile_error",
                 "config.toml: automation.max_event_backlog must be a positive integer",
             ));
         }
+        self.run = normalize_run_grant(
+            &self.run.interpreters,
+            &self.run.run_env,
+            route_credential_env_names,
+            source,
+            0,
+            "automation.run",
+        )?;
         Ok(self)
     }
 }
@@ -266,14 +292,7 @@ pub(crate) fn load_project_registration_config(
         .map(String::as_str)
         .chain(std::iter::once(FAKE_PROFILE))
         .collect();
-    let route_credential_env_names: Vec<String> = config
-        .proxies
-        .values()
-        .filter_map(|proxy| proxy.get_ref().api_key_env.as_deref())
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_owned)
-        .collect();
+    let route_credential_env_names = configured_route_credential_env_names(&config.proxies);
     let mut projects = Vec::with_capacity(config.projects.len());
     for (id, spanned) in &config.projects {
         let entry = spanned.get_ref();
@@ -319,14 +338,13 @@ pub(crate) fn load_project_registration_config(
             "actions",
             |action| matches!(action, "stop" | "send" | "interrupt" | "run"),
         )?;
-        let interpreters =
-            normalize_project_interpreters(&entry.interpreters, &source, offset, id)?;
-        let run_env = normalize_project_run_env(
+        let run_grant = normalize_run_grant(
+            &entry.interpreters,
             &entry.run_env,
             &route_credential_env_names,
             &source,
             offset,
-            id,
+            &format!("projects.{id}"),
         )?;
 
         projects.push(ProjectRegistrationConfig {
@@ -334,23 +352,25 @@ pub(crate) fn load_project_registration_config(
             path: path.to_owned(),
             profiles,
             actions,
-            interpreters,
-            run_env,
+            interpreters: run_grant.interpreters,
+            run_env: run_grant.run_env,
         });
     }
     projects.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(projects)
 }
 
-fn normalize_project_interpreters(
+fn normalize_run_grant(
     interpreters: &BTreeMap<String, core::api::ScriptInterpreter>,
+    run_env: &[String],
+    route_credential_env_names: &[String],
     source: &str,
     offset: usize,
-    project_id: &str,
-) -> core::Result<BTreeMap<String, core::api::ScriptInterpreter>> {
+    grant_path: &str,
+) -> core::Result<RunGrantConfig> {
     let mut normalized = BTreeMap::new();
     for (reference, interpreter) in interpreters {
-        let field = format!("projects.{project_id}.interpreters.{reference}");
+        let field = format!("{grant_path}.interpreters.{reference}");
         if validate_profile_name(reference).is_err() {
             return Err(config_error_at(
                 source,
@@ -371,22 +391,31 @@ fn normalize_project_interpreters(
         })?;
         normalized.insert(reference.clone(), interpreter.clone());
     }
-    Ok(normalized)
+    let run_env = normalize_run_env(
+        run_env,
+        route_credential_env_names,
+        source,
+        offset,
+        &format!("{grant_path}.run_env"),
+    )?;
+    Ok(RunGrantConfig {
+        interpreters: normalized,
+        run_env,
+    })
 }
 
-fn normalize_project_run_env(
+fn normalize_run_env(
     names: &[String],
     route_credential_env_names: &[String],
     source: &str,
     offset: usize,
-    project_id: &str,
+    field: &str,
 ) -> core::Result<Vec<String>> {
-    let field = format!("projects.{project_id}.run_env");
     if names.len() > MAX_PASS_ENV_ENTRIES {
         return Err(config_error_at(
             source,
             offset,
-            &field,
+            field,
             "exceeds 64 entries",
             "profile_error",
         ));
@@ -400,16 +429,16 @@ fn normalize_project_run_env(
             return Err(config_error_at(
                 source,
                 offset,
-                &field,
+                field,
                 "names must use 1-256 letters, digits and underscores, starting with a letter or underscore",
                 "profile_error",
             ));
         }
-        if forbidden_project_run_env_name(name, route_credential_env_names) {
+        if forbidden_run_env_name(name, route_credential_env_names) {
             return Err(config_error_at(
                 source,
                 offset,
-                &field,
+                field,
                 "cannot include identity, credential, route, native-store, Git or reserved environment names",
                 "profile_error",
             ));
@@ -423,7 +452,7 @@ fn normalize_project_run_env(
             return Err(config_error_at(
                 source,
                 offset,
-                &field,
+                field,
                 "contains a duplicate environment name",
                 "profile_error",
             ));
@@ -434,7 +463,7 @@ fn normalize_project_run_env(
     Ok(normalized)
 }
 
-fn forbidden_project_run_env_name(name: &str, route_credential_env_names: &[String]) -> bool {
+fn forbidden_run_env_name(name: &str, route_credential_env_names: &[String]) -> bool {
     let uppercase = name.to_ascii_uppercase();
     uppercase.starts_with("ELIOT_")
         || uppercase.starts_with("GIT_")
@@ -460,6 +489,18 @@ fn forbidden_project_run_env_name(name: &str, route_credential_env_names: &[Stri
         ]
         .iter()
         .any(|suffix| uppercase.ends_with(suffix))
+}
+
+fn configured_route_credential_env_names(
+    proxies: &HashMap<String, toml::Spanned<ProxyEntry>>,
+) -> Vec<String> {
+    proxies
+        .values()
+        .filter_map(|proxy| proxy.get_ref().api_key_env.as_deref())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 fn env_names_equal(left: &str, right: &str) -> bool {
@@ -632,10 +673,13 @@ fn read_config(data_root: &Path) -> core::Result<Option<(FileConfig, String)>> {
 }
 
 pub(crate) fn load_automation_config(data_root: &Path) -> core::Result<AutomationConfig> {
-    let Some((config, _source)) = read_config(data_root)? else {
+    let Some((config, source)) = read_config(data_root)? else {
         return Ok(AutomationConfig::default());
     };
-    config.automation.validate()
+    let route_credential_env_names = configured_route_credential_env_names(&config.proxies);
+    config
+        .automation
+        .validate(&source, &route_credential_env_names)
 }
 
 fn fake_snapshot() -> Value {
@@ -1367,7 +1411,8 @@ mod tests {
         assert_eq!(
             load_automation_config(&fixture.root).unwrap(),
             AutomationConfig {
-                max_event_backlog: 4096
+                max_event_backlog: 4096,
+                run: RunGrantConfig::default(),
             }
         );
         assert_eq!(
@@ -1381,6 +1426,67 @@ mod tests {
                 run_env: Vec::new(),
             }]
         );
+    }
+
+    #[test]
+    fn global_run_configuration_defaults_to_denial_and_keeps_literal_grants() {
+        let fixture = AutomationConfigFixture::new();
+        let denied = load_automation_config(&fixture.root).unwrap();
+        assert!(denied.run.interpreters.is_empty());
+        assert!(denied.run.run_env.is_empty());
+
+        fixture.write("[automation.run]\nrun_env = [\"CI\"]\n");
+        let no_interpreter = load_automation_config(&fixture.root).unwrap();
+        assert!(no_interpreter.run.interpreters.is_empty());
+        assert_eq!(no_interpreter.run.run_env, vec!["CI"]);
+
+        let program = std::env::current_exe()
+            .expect("current executable path")
+            .to_string_lossy()
+            .into_owned();
+        fixture.write(
+            "[automation.run]\n\
+             [automation.run.interpreters.fixture]\n\
+             program = \"relative-program\"\nargv_prefix = [\"--literal\"]\n",
+        );
+        assert!(load_automation_config(&fixture.root).is_err());
+
+        fixture.write(&format!(
+            "[automation.run]\nrun_env = [\"PATH\"]\n\
+             [automation.run.interpreters.fixture]\nprogram = {program:?}\n\
+             argv_prefix = [\"--literal\", \"fixed-value\"]\n"
+        ));
+        assert!(load_automation_config(&fixture.root).is_err());
+
+        fixture.write(&format!(
+            "[automation.run]\nrun_env = [\"CI\"]\n\
+             [automation.run.interpreters.fixture]\nprogram = {program:?}\n\
+             argv_prefix = [\"--literal\", \"fixed-value\"]\n"
+        ));
+        let configured = load_automation_config(&fixture.root).unwrap();
+        assert_eq!(
+            configured.run,
+            RunGrantConfig {
+                interpreters: BTreeMap::from([(
+                    "fixture".to_owned(),
+                    core::api::ScriptInterpreter {
+                        program: program.clone(),
+                        argv_prefix: vec!["--literal".to_owned(), "fixed-value".to_owned()],
+                    },
+                )]),
+                run_env: vec!["CI".to_owned()],
+            }
+        );
+
+        fixture.write(&format!(
+            "[automation.run.interpreters.fixture]\nprogram = {program:?}\n\
+             argv_prefix = [\"--literal\"]\n"
+        ));
+        let no_action_env = load_automation_config(&fixture.root).unwrap();
+        assert!(no_action_env.run.run_env.is_empty());
+
+        fixture.write("[automation.run]\nrun_env = [\"GITHUB_TOKEN\"]\n");
+        assert!(load_automation_config(&fixture.root).is_err());
     }
 
     #[test]
@@ -1411,27 +1517,27 @@ mod tests {
         );
         assert_eq!(configured[0].run_env, vec!["BUILD_ID", "CI"]);
 
-        assert!(forbidden_project_run_env_name("ELIOT_RUN_TOKEN", &[]));
-        assert!(forbidden_project_run_env_name("USER_ROLE", &[]));
-        assert!(forbidden_project_run_env_name("GITHUB_TOKEN", &[]));
-        assert!(forbidden_project_run_env_name("SERVICE_CREDENTIAL", &[]));
-        assert!(forbidden_project_run_env_name("SERVICE_SECRET", &[]));
-        assert!(forbidden_project_run_env_name("OPENAI_API_KEY", &[]));
-        assert!(forbidden_project_run_env_name("PROVIDER_BASE_URL", &[]));
-        assert!(forbidden_project_run_env_name("CUSTOM_ENDPOINT", &[]));
-        assert!(forbidden_project_run_env_name("CUSTOM_ROUTE", &[]));
-        assert!(forbidden_project_run_env_name("CUSTOM_ACCOUNT", &[]));
-        assert!(forbidden_project_run_env_name("CODEX_HOME", &[]));
-        assert!(forbidden_project_run_env_name("CODEX_SQLITE_HOME", &[]));
-        assert!(forbidden_project_run_env_name("GIT_AUTHOR_NAME", &[]));
-        assert!(forbidden_project_run_env_name("PATH", &[]));
+        assert!(forbidden_run_env_name("ELIOT_RUN_TOKEN", &[]));
+        assert!(forbidden_run_env_name("USER_ROLE", &[]));
+        assert!(forbidden_run_env_name("GITHUB_TOKEN", &[]));
+        assert!(forbidden_run_env_name("SERVICE_CREDENTIAL", &[]));
+        assert!(forbidden_run_env_name("SERVICE_SECRET", &[]));
+        assert!(forbidden_run_env_name("OPENAI_API_KEY", &[]));
+        assert!(forbidden_run_env_name("PROVIDER_BASE_URL", &[]));
+        assert!(forbidden_run_env_name("CUSTOM_ENDPOINT", &[]));
+        assert!(forbidden_run_env_name("CUSTOM_ROUTE", &[]));
+        assert!(forbidden_run_env_name("CUSTOM_ACCOUNT", &[]));
+        assert!(forbidden_run_env_name("CODEX_HOME", &[]));
+        assert!(forbidden_run_env_name("CODEX_SQLITE_HOME", &[]));
+        assert!(forbidden_run_env_name("GIT_AUTHOR_NAME", &[]));
+        assert!(forbidden_run_env_name("PATH", &[]));
         if cfg!(windows) {
-            assert!(forbidden_project_run_env_name(
+            assert!(forbidden_run_env_name(
                 "runtime_key",
                 &["RUNTIME_KEY".to_owned()]
             ));
         } else {
-            assert!(!forbidden_project_run_env_name(
+            assert!(!forbidden_run_env_name(
                 "runtime_key",
                 &["RUNTIME_KEY".to_owned()]
             ));

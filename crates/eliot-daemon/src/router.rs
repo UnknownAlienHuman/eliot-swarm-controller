@@ -8,9 +8,9 @@ use crate::{
     workspaces::WorkspaceManager,
 };
 use eliot_core::{
-    Agent, AgentState, Command, CommandState, Error, Event, NativeStoreBinding, Result,
-    ScriptProcessResult, SecretPolicy, SubmitCommand, Turn, TurnState, WorkspacePhase,
-    WorkspacePreparationInput,
+    Agent, AgentState, Command, CommandState, Error, Event, FrozenScriptContext, FrozenScriptRun,
+    NativeStoreBinding, Result, RunDefinitionArgs, ScriptProcessResult, SecretPolicy,
+    SubmitCommand, Turn, TurnState, WorkspacePhase, WorkspacePreparationInput,
     api::{
         AgentDiscoverRequest, AgentEditsRequest, AgentEditsResponse, AgentGetRequest,
         AgentGetResponse, AgentGitRequest, AgentGitResponse, AgentHistoryRequest, AgentListRequest,
@@ -531,14 +531,13 @@ impl Router {
                     .and_then(Value::as_str)
                     .filter(|id| !id.trim().is_empty() && !id.contains('\0'))
                     .ok_or_else(|| Error::new("not_allowed", "Run command id is invalid"))?;
-                let saved_principal = self
+                let _saved_principal = self
                     .inner
                     .run_credentials
                     .authenticate(run_command_id, credential)
                     .ok_or_else(|| {
                         Error::new("not_allowed", "Run credential is invalid or revoked")
                     })?;
-                let SavedRunPrincipal::ProjectRule { .. } = saved_principal;
                 Ok((
                     Principal::Run {
                         run_command_id: run_command_id.to_owned(),
@@ -647,10 +646,7 @@ impl Router {
             registration.validate()?;
             SavedRunPrincipal::ProjectRule { registration }
         } else if command.principal == "owner" {
-            return Err(Error::new(
-                "unsupported",
-                "global script runs are not supported in this increment",
-            ));
+            SavedRunPrincipal::Owner
         } else {
             return Err(Error::new(
                 "not_allowed",
@@ -668,6 +664,43 @@ impl Router {
         request: SubmitCommand,
     ) -> Result<PreparedSubmission> {
         self.prepare_submission(request, &Principal::Owner).await
+    }
+
+    /// Prepare a targetless global event-rule Run under the current Owner Run grant.
+    /// Ordinary Owner command submission still rejects Run in `authorize_command`.
+    pub(crate) async fn prepare_owner_rule_run_submission(
+        &self,
+        mut request: SubmitCommand,
+        context: FrozenScriptContext,
+    ) -> Result<PreparedSubmission> {
+        if request.verb != "run"
+            || !request.id.is_empty()
+            || request.target.is_some()
+            || request.expected_generation.is_some()
+            || request.expected_turn_id.is_some()
+            || request.request_id.is_some()
+            || request.probe
+        {
+            return Err(Error::new(
+                "invalid",
+                "Owner event Run must be targetless and unbound",
+            ));
+        }
+        let definition: RunDefinitionArgs = serde_json::from_value(request.args.clone())
+            .map_err(|_| Error::new("invalid", "Owner Run args are malformed"))?;
+        let automation = crate::config::load_automation_config(&self.inner.data_root)?;
+        let policy = self.secret_policy_snapshot();
+        let frozen = crate::scripts::freeze::freeze_global_run(
+            definition,
+            &automation.run,
+            &self.inner.data_root,
+            context,
+            policy.as_ref(),
+        )?;
+        request.args = serde_json::to_value(frozen)
+            .map_err(|_| Error::new("internal", "frozen Owner Run could not be encoded"))?;
+        self.prepare_submission_after_authorization(request, &Principal::Owner, false)
+            .await
     }
 
     pub(crate) async fn prepare_project_rule_submission(
@@ -1866,25 +1899,6 @@ impl Router {
             ));
         }
         if request.verb == "run" {
-            let Some(registration) = project else {
-                return Err(Error::new(
-                    "unsupported",
-                    "global script runs are not supported in this increment",
-                ));
-            };
-            let expected_principal = format!("project:{}", registration.id);
-            if principal != expected_principal {
-                return Err(Error::new(
-                    "not_allowed",
-                    "project Run principal does not match its registration",
-                ));
-            }
-            if !registration.actions.iter().any(|action| action == "run") {
-                return Err(Error::new(
-                    "not_allowed",
-                    "project registration does not approve Run",
-                ));
-            }
             if !request.id.is_empty()
                 || request.target.is_some()
                 || request.expected_generation.is_some()
@@ -1894,12 +1908,38 @@ impl Router {
             {
                 return Err(Error::new(
                     "invalid",
-                    "project Run must be targetless and unbound",
+                    "event Run must be targetless and unbound",
                 ));
             }
             let frozen: eliot_core::FrozenScriptRun = serde_json::from_value(request.args.clone())
                 .map_err(|_| Error::new("invalid", "project Run args are not frozen"))?;
             frozen.validate()?;
+            match project {
+                Some(registration) => {
+                    let expected_principal = format!("project:{}", registration.id);
+                    if principal != expected_principal {
+                        return Err(Error::new(
+                            "not_allowed",
+                            "project Run principal does not match its registration",
+                        ));
+                    }
+                    if !registration.actions.iter().any(|action| action == "run") {
+                        return Err(Error::new(
+                            "not_allowed",
+                            "project registration does not approve Run",
+                        ));
+                    }
+                }
+                None if principal == "owner" => {
+                    let _ = self.verify_global_run(&frozen).await?;
+                }
+                None => {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "global Run firing requires the Owner rule principal",
+                    ));
+                }
+            }
         } else if !matches!(request.verb.as_str(), "stop" | "send" | "interrupt") {
             return Err(Error::new(
                 "invalid",
@@ -1946,6 +1986,40 @@ impl Router {
         through: i64,
         actions: &[RuleCatchUpAction],
     ) -> Result<Option<RuleCatchUpAdmission>> {
+        let retained = {
+            let store = self.inner.store.lock().await;
+            store.get_command(&request.id)?.is_some()
+        };
+        let owner_actions = if !retained && principal == "owner" && project.is_none() {
+            let mut checked = Vec::with_capacity(actions.len());
+            for action in actions {
+                if let eliot_store::RuleCatchUpActionOutcome::Command(command) = &action.outcome
+                    && command.verb == "run"
+                {
+                    let frozen: FrozenScriptRun = match serde_json::from_value(command.args.clone())
+                    {
+                        Ok(frozen) => frozen,
+                        Err(_) => {
+                            checked.push(RuleCatchUpAction::rejected(action.event_seq, "invalid"));
+                            continue;
+                        }
+                    };
+                    match self.verify_global_run(&frozen).await {
+                        Ok(_) => checked.push(action.clone()),
+                        Err(error) if is_deterministic_pre_admission_rejection(&error.code) => {
+                            checked.push(RuleCatchUpAction::rejected(action.event_seq, error.code));
+                        }
+                        Err(error) => return Err(error),
+                    }
+                } else {
+                    checked.push(action.clone());
+                }
+            }
+            Some(checked)
+        } else {
+            None
+        };
+        let actions = owner_actions.as_deref().unwrap_or(actions);
         let admission = {
             let mut store = self.inner.store.lock().await;
             let retained = store.get_command(&request.id)?.is_some();
@@ -3039,9 +3113,25 @@ impl Router {
                 _ => return,
             }
         };
-        if command.verb == "run" && !command.principal.starts_with("project:") {
+        if command.verb == "run"
+            && command.principal != "owner"
+            && !command.principal.starts_with("project:")
+        {
             self.reject_undispatched(&id, "unsupported").await;
             return;
+        }
+        if command.verb == "run" && command.principal == "owner" {
+            let frozen: FrozenScriptRun = match serde_json::from_value(command.args.clone()) {
+                Ok(frozen) => frozen,
+                Err(_) => {
+                    self.reject_undispatched(&id, "invalid").await;
+                    return;
+                }
+            };
+            if let Err(error) = self.verify_global_run(&frozen).await {
+                self.reject_undispatched(&id, &error.code).await;
+                return;
+            }
         }
         if let Some(project_id) = command.principal.strip_prefix("project:") {
             let registration = {
@@ -3226,7 +3316,9 @@ impl Router {
                         &error,
                         change.1,
                         launch_binding.is_some(),
-                        command.verb == "run" && command.principal.starts_with("project:"),
+                        command.verb == "run"
+                            && (command.principal == "owner"
+                                || command.principal.starts_with("project:")),
                     )
                     .await;
                     return;
@@ -3526,11 +3618,11 @@ impl Router {
         error: &Error,
         write_faulted: bool,
         native_binding: bool,
-        project_run: bool,
+        script_run: bool,
     ) {
         // This is only the local Store dispatch result, before any control RPC.
         // A plugin error with the same code still follows post-I/O C1 handling.
-        let revoked_run_authority = project_run
+        let revoked_run_authority = script_run
             && error.code == "not_allowed"
             && is_deterministic_pre_admission_rejection(&error.code);
         if write_faulted {
@@ -3766,6 +3858,20 @@ impl Router {
         crate::automation::verify_project_registration(&self.inner.data_root, registration).await
     }
 
+    pub(crate) async fn verify_global_run(
+        &self,
+        frozen: &FrozenScriptRun,
+    ) -> Result<tokio::process::Command> {
+        let grant = crate::config::load_automation_config(&self.inner.data_root)?.run;
+        let policy = self.secret_policy_snapshot();
+        crate::scripts::freeze::verify_global_run(
+            frozen,
+            &grant,
+            &self.inner.data_root,
+            policy.as_ref(),
+        )
+    }
+
     pub(crate) async fn admit_script_output(
         &self,
         run_id: &str,
@@ -3812,8 +3918,16 @@ impl Router {
         &self,
         actions: Vec<SubmitCommand>,
         saved_principal: &SavedRunPrincipal,
+        frozen: &FrozenScriptRun,
     ) -> Result<Vec<SubmitCommand>> {
-        let SavedRunPrincipal::ProjectRule { registration } = saved_principal;
+        let SavedRunPrincipal::ProjectRule { registration } = saved_principal else {
+            let _ = self.verify_global_run(frozen).await?;
+            let mut prepared = Vec::with_capacity(actions.len());
+            for action in actions {
+                prepared.push(self.prepare_owner_submission(action).await?.request);
+            }
+            return Ok(prepared);
+        };
         let current = self
             .inner
             .store
@@ -4892,7 +5006,7 @@ fn authorize_command(principal: &Principal, request: &mut SubmitCommand) -> Resu
     if matches!(principal, Principal::Owner) && request.verb == "run" {
         return Err(Error::new(
             "unsupported",
-            "global script runs are not supported in this increment",
+            "standalone Owner Run submission is unsupported",
         ));
     }
     if matches!(principal, Principal::Run { .. }) {
@@ -7628,6 +7742,215 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             store.read_events(0, 1_000, None).unwrap(),
             events_after_rejection,
             "recovery does not retry or rewrite a terminally rejected Run"
+        );
+        drop(store);
+        assert!(router.inner.run_workers.lock_recover().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn owner_global_run_grant_revocation_rejects_before_dispatch_and_recovery_is_quiet() {
+        const RULE_ID: &str = "owner-run-revocation";
+
+        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let root = base.join(format!(
+            "eliot-router-owner-run-revocation-{}",
+            ulid::Ulid::new()
+        ));
+        let data_root = root.join("owner-data");
+        let scripts_dir = data_root.join("scripts");
+        let tools_dir = root.join("tools");
+        std::fs::create_dir_all(&scripts_dir).unwrap();
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        std::fs::write(scripts_dir.join("not-executed.sh"), "exit 0\n").unwrap();
+        let interpreter_path = tools_dir.join(if cfg!(windows) { "pwsh.exe" } else { "pwsh" });
+        std::fs::write(&interpreter_path, b"tiny fixture interpreter").unwrap();
+        let interpreter_program = std::fs::canonicalize(interpreter_path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let write_global_grant = |interpreter_approved: bool| {
+            let source = if interpreter_approved {
+                format!(
+                    concat!(
+                        "[automation.run]\n",
+                        "run_env = [\"CI\"]\n\n",
+                        "[automation.run.interpreters.fixture]\n",
+                        "program = {}\n",
+                        "argv_prefix = []\n",
+                    ),
+                    serde_json::to_string(&interpreter_program).unwrap(),
+                )
+            } else {
+                "[automation.run]\nrun_env = [\"CI\"]\n".to_owned()
+            };
+            std::fs::write(data_root.join("config.toml"), source).unwrap();
+        };
+        write_global_grant(true);
+
+        let router = router_with_data_root(data_root.clone());
+        let (agent, trigger_id) = {
+            let mut store = router.inner.store.lock().await;
+            result_fixture(&mut store)
+        };
+        let run_definition = eliot_core::RunDefinitionArgs {
+            cmd: vec!["fixture".to_owned(), "not-executed.sh".to_owned()],
+            cwd: Some(data_root.to_string_lossy().into_owned()),
+            timeout: Some("5s".to_owned()),
+            env: std::collections::BTreeMap::from([(
+                "CI".to_owned(),
+                "script-approved".to_owned(),
+            )]),
+        };
+        let run_value = serde_json::to_value(&run_definition).unwrap();
+        let rule_value = json!({
+            "id":RULE_ID,
+            "enabled":true,
+            "on":{"event":"turn.completed"},
+            "do":[{
+                "action":"run",
+                "cmd":run_value["cmd"].clone(),
+                "cwd":run_value["cwd"].clone(),
+                "timeout":run_value["timeout"].clone(),
+                "env":run_value["env"].clone(),
+            }],
+        });
+        let rule_input = eliot_store::RuleDefinitionInput {
+            id: RULE_ID.to_owned(),
+            canonical_definition: serde_json::to_string(&rule_value).unwrap(),
+            definition_digest: eliot_core::canonical_json_sha256(&rule_value).unwrap(),
+            enabled: true,
+        };
+        let rule_state = router
+            .initialize_rules("owner", std::slice::from_ref(&rule_input), &[], now_ms())
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .view;
+
+        let event = {
+            let mut store = router.inner.store.lock().await;
+            read_fixture_event(
+                &mut store,
+                &agent,
+                "turn.completed",
+                json!({
+                    "command_id":trigger_id,
+                    "turn_id":"turn-1",
+                    "status":"completed",
+                }),
+            );
+            if store
+                .get_command(&trigger_id)
+                .unwrap()
+                .is_some_and(|command| command.state == CommandState::Dispatched)
+            {
+                store
+                    .settle(
+                        &trigger_id,
+                        CommandState::Applied,
+                        Some(json!({"turn_id":"turn-1"})),
+                        now_ms(),
+                    )
+                    .unwrap();
+            }
+            store
+                .read_events(0, 1_000, None)
+                .unwrap()
+                .into_iter()
+                .find(|event| {
+                    event.kind == "turn.completed"
+                        && event.data.get("command_id").and_then(Value::as_str)
+                            == Some(trigger_id.as_str())
+                })
+                .unwrap()
+        };
+        let mut request = SubmitCommand::new(String::new(), "run");
+        request.args = run_value;
+        let prepared = router
+            .prepare_owner_rule_run_submission(
+                request,
+                FrozenScriptContext {
+                    event: event.clone(),
+                    subject: event.subject.clone(),
+                    rule: eliot_core::ScriptRuleContext {
+                        id: RULE_ID.to_owned(),
+                        revision: rule_state.revision,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let run_id = {
+            let mut store = router.inner.store.lock().await;
+            let firing = store
+                .admit_rule_action("owner", &rule_state, event.seq, prepared.request, now_ms())
+                .unwrap();
+            assert!(firing.is_new);
+            let parent = firing.parent.as_ref().expect("committed Owner rule firing");
+            let run = firing.child.as_ref().expect("committed Owner Run child");
+            assert_eq!(parent.verb, "rule");
+            assert_eq!(parent.state, CommandState::Applied);
+            assert_eq!(run.verb, "run");
+            assert_eq!(run.state, CommandState::Accepted);
+            assert_eq!(run.principal, "owner");
+            assert!(firing.events.iter().any(|fired_event| {
+                fired_event.kind == "rule.fired"
+                    && fired_event.data["event_seq"] == event.seq
+                    && fired_event.data["child_command"] == run.id
+            }));
+            router.publish_locked(&firing.events);
+            run.id.clone()
+        };
+
+        write_global_grant(false);
+        router
+            .clone()
+            .process_command_inner(run_id.clone(), None)
+            .await;
+        let (rejected, events_after_rejection) = {
+            let store = router.inner.store.lock().await;
+            let command = store.get_command(&run_id).unwrap().unwrap();
+            let events = store.read_events(0, 1_000, None).unwrap();
+            (command, events)
+        };
+        assert_eq!(rejected.state, CommandState::Rejected);
+        assert_eq!(rejected.outcome, Some(json!({"reason":"not_allowed"})));
+        assert_eq!(
+            events_after_rejection
+                .iter()
+                .filter(|event| {
+                    event.kind == "command.rejected"
+                        && event.data.get("command_id").and_then(Value::as_str)
+                            == Some(run_id.as_str())
+                })
+                .count(),
+            1
+        );
+        assert!(!events_after_rejection.iter().any(|event| {
+            event.kind == "command.dispatched"
+                && event.data.get("command_id").and_then(Value::as_str) == Some(run_id.as_str())
+        }));
+        assert!(!events_after_rejection.iter().any(|event| {
+            event.data.get("parent_command").and_then(Value::as_str) == Some(run_id.as_str())
+        }));
+        assert!(router.inner.run_workers.lock_recover().is_empty());
+
+        router
+            .clone()
+            .process_command_inner(run_id.clone(), None)
+            .await;
+        let store = router.inner.store.lock().await;
+        assert_eq!(
+            store.get_command(&run_id).unwrap().unwrap().state,
+            CommandState::Rejected
+        );
+        assert_eq!(
+            store.read_events(0, 1_000, None).unwrap(),
+            events_after_rejection,
+            "recovery does not rewrite or retry a terminally rejected Owner Run"
         );
         drop(store);
         assert!(router.inner.run_workers.lock_recover().is_empty());

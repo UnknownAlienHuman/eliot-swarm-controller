@@ -34,23 +34,29 @@ pub(crate) async fn execute_dispatched(router: Router, command: Command) {
             return;
         }
     };
-    let auth::SavedRunPrincipal::ProjectRule { registration } = &saved_principal;
-
-    if router.verify_run_registration(registration).await.is_err() {
-        credential.revoke();
-        settle_failed_before_process(&router, &run_id, "project_registration_changed").await;
-        return;
-    }
-    let verification_policy = router.secret_policy_snapshot();
-    let mut child =
-        match freeze::verify_project_run(&frozen, registration, verification_policy.as_ref()) {
-            Ok(child) => child,
-            Err(error) => {
-                credential.revoke();
-                settle_failed_before_process(&router, &run_id, &error.code).await;
-                return;
+    let verified_child = match &saved_principal {
+        auth::SavedRunPrincipal::Owner => router
+            .verify_global_run(&frozen)
+            .await
+            .map_err(|error| error.code),
+        auth::SavedRunPrincipal::ProjectRule { registration } => {
+            if router.verify_run_registration(registration).await.is_err() {
+                Err("project_registration_changed".to_owned())
+            } else {
+                let verification_policy = router.secret_policy_snapshot();
+                freeze::verify_project_run(&frozen, registration, verification_policy.as_ref())
+                    .map_err(|error| error.code)
             }
-        };
+        }
+    };
+    let mut child = match verified_child {
+        Ok(child) => child,
+        Err(cause) => {
+            credential.revoke();
+            settle_failed_before_process(&router, &run_id, &cause).await;
+            return;
+        }
+    };
 
     scrub_role_environment(&mut child);
     child
@@ -138,7 +144,7 @@ pub(crate) async fn execute_dispatched(router: Router, command: Command) {
                 return;
             }
             let prepared = match router
-                .prepare_script_output(actions, &saved_principal)
+                .prepare_script_output(actions, &saved_principal, &frozen)
                 .await
             {
                 Ok(prepared) => prepared,
