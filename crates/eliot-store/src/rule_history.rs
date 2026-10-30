@@ -208,7 +208,21 @@ impl Store {
                 suppressed.push(action.event_seq);
                 continue;
             }
-            if let Some(code) = rule_action_binding_error(&trigger, &action.request) {
+            let action_request = match &action.outcome {
+                RuleCatchUpActionOutcome::Command(request) => request,
+                RuleCatchUpActionOutcome::Rejected { code } => {
+                    validate_rule_rejection_code(code)?;
+                    if !core::is_deterministic_pre_admission_rejection(code) {
+                        return Err(Error::new(
+                            "invalid",
+                            "rule catch-up rejection code is not deterministic",
+                        ));
+                    }
+                    rejected.push((action.event_seq, code.clone()));
+                    continue;
+                }
+            };
+            if let Some(code) = rule_action_binding_error(&trigger, action_request) {
                 rejected.push((action.event_seq, code));
                 continue;
             }
@@ -217,20 +231,20 @@ impl Store {
                 principal,
                 &request.rule,
                 &stored.canonical_definition,
-                &action.request,
+                action_request,
                 trigger.cause.as_ref(),
             )? {
                 suppressed.push(action.event_seq);
                 continue;
             }
-            if let Err(error) = validate_project_rule_action_tx(&tx, principal, &action.request) {
-                if deterministic_rule_rejection(&error) {
+            if let Err(error) = validate_project_rule_action_tx(&tx, principal, action_request) {
+                if core::is_deterministic_pre_admission_rejection(&error.code) {
                     rejected.push((action.event_seq, error.code));
                     continue;
                 }
                 return Err(error);
             }
-            let target = action.request.target.as_deref().ok_or_else(|| {
+            let target = action_request.target.as_deref().ok_or_else(|| {
                 Error::new("invalid", "rule catch-up action has no frozen Agent target")
             })?;
             let (scoped_count, global_count) =
@@ -261,7 +275,7 @@ impl Store {
                     "a deterministic rule action for this event already exists",
                 ));
             }
-            let mut child_request = action.request.clone();
+            let mut child_request = action_request.clone();
             child_request.id = child_id.clone();
             let cause = core::EventCause {
                 command_id: child_id.clone(),
@@ -278,7 +292,7 @@ impl Store {
                         "new rule catch-up child already exists",
                     ));
                 }
-                Err(error) if deterministic_rule_rejection(&error) => {
+                Err(error) if core::is_deterministic_pre_admission_rejection(&error.code) => {
                     tx.execute_batch(
                         "ROLLBACK TO rule_catch_up_action; RELEASE rule_catch_up_action",
                     )

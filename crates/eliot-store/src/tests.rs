@@ -1083,10 +1083,10 @@ fn history_project_rule_send_rejects_rebinding_old_event_to_current_generation()
             &catch_up_request,
             &cursor.value,
             event_seq,
-            &[RuleCatchUpAction {
+            &[RuleCatchUpAction::command(
                 event_seq,
-                request: valid_current_generation_send,
-            }],
+                valid_current_generation_send,
+            )],
             now + 18,
         )
         .expect("old-event rebinding is a deterministic history rejection");

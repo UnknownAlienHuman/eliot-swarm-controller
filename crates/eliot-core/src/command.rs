@@ -3,6 +3,23 @@
 
 use crate::CommandState;
 
+/// Whether a code is a deterministic refusal before an external effect is
+/// dispatched. After dispatch, callers must use `classify_dispatched_error`;
+/// these codes alone do not prove that native I/O did not occur.
+pub fn is_deterministic_pre_admission_rejection(code: &str) -> bool {
+    matches!(
+        code,
+        "bad_state"
+            | "frame_too_large"
+            | "invalid"
+            | "not_allowed"
+            | "not_found"
+            | "secret_in_payload"
+            | "stale_generation"
+            | "unsupported"
+    )
+}
+
 /// Classify an error after command dispatch without inventing a native receipt.
 /// Only `native_not_dispatched` explicitly proves that native I/O did not start.
 /// Generic validation, framing and transport codes can also arrive after I/O.
@@ -53,7 +70,7 @@ pub fn workspace_preparation_transition_allowed(from: CommandState, to: CommandS
 mod tests {
     use super::{
         classify_dispatched_error, command_transition_allowed,
-        workspace_preparation_transition_allowed,
+        is_deterministic_pre_admission_rejection, workspace_preparation_transition_allowed,
     };
     use crate::CommandState::{
         Accepted, Applied, Cancelled, Dispatched, Failed, Queued, Rejected, Unknown,
@@ -84,6 +101,28 @@ mod tests {
             "",
         ] {
             assert_eq!(classify_dispatched_error(code), Unknown, "code={code}");
+        }
+    }
+
+    #[test]
+    fn rejection_codes_are_stage_scoped_and_do_not_widen_dispatch_classification() {
+        for code in [
+            "bad_state",
+            "frame_too_large",
+            "invalid",
+            "not_allowed",
+            "not_found",
+            "secret_in_payload",
+            "stale_generation",
+            "unsupported",
+        ] {
+            assert!(is_deterministic_pre_admission_rejection(code), "{code}");
+        }
+        for code in ["invalid", "secret_in_payload"] {
+            assert_eq!(classify_dispatched_error(code), Unknown, "{code}");
+        }
+        for code in ["storage", "internal", "unavailable", "future_error_code"] {
+            assert!(!is_deterministic_pre_admission_rejection(code), "{code}");
         }
     }
 

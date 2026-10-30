@@ -550,6 +550,47 @@ impl Router {
         Ok(prepared)
     }
 
+    pub(crate) async fn verify_project_rule_submission_authority(
+        &self,
+        requests: &[SubmitCommand],
+        registration: &ProjectRegistrationView,
+    ) -> Result<()> {
+        registration.validate()?;
+        crate::automation::verify_project_registration(&self.inner.data_root, registration).await?;
+        let principal = Principal::ProjectRule {
+            registration: registration.clone(),
+        };
+        for request in requests {
+            let mut authorized = request.clone();
+            authorize_command(&principal, &mut authorized)?;
+            self.verify_native_control_target(&authorized).await?;
+            let target = authorized
+                .target
+                .as_deref()
+                .ok_or_else(|| Error::new("invalid", "project action has no Agent target"))?;
+            let generation = authorized.expected_generation.ok_or_else(|| {
+                Error::new("invalid", "project action has no expected generation")
+            })?;
+            self.verify_project_rule_target(registration, target, generation)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Prepare ordinary action payload after catch-up has already preflighted every
+    /// project authority and frozen workspace binding in the request.
+    pub(crate) async fn prepare_project_rule_submission_after_authority(
+        &self,
+        request: SubmitCommand,
+        registration: &ProjectRegistrationView,
+    ) -> Result<PreparedSubmission> {
+        let principal = Principal::ProjectRule {
+            registration: registration.clone(),
+        };
+        self.prepare_submission_after_authorization(request, &principal, true)
+            .await
+    }
+
     async fn verify_project_rule_target(
         &self,
         registration: &ProjectRegistrationView,
@@ -599,6 +640,16 @@ impl Router {
         principal: &Principal,
     ) -> Result<PreparedSubmission> {
         authorize_command(principal, &mut request)?;
+        self.prepare_submission_after_authorization(request, principal, false)
+            .await
+    }
+
+    async fn prepare_submission_after_authorization(
+        &self,
+        mut request: SubmitCommand,
+        principal: &Principal,
+        project_authority_preverified: bool,
+    ) -> Result<PreparedSubmission> {
         if request.probe && request.verb != "send" {
             return Err(Error::new(
                 "unsupported",
@@ -611,23 +662,8 @@ impl Router {
         if request.verb == "worktree.remove" {
             require_owner(principal)?;
         }
-        if is_native_control_verb(&request.verb)
-            && let Some(target) = request.target.as_deref()
-        {
-            let store = self.inner.store.lock().await;
-            // Preserve idempotent command retries; Store checks new controls
-            // transactionally after resolving an existing command binding.
-            if store.get_command(&request.id)?.is_none() {
-                let agent = store.get_agent(target)?.ok_or_else(|| {
-                    Error::new("not_found", format!("Agent {target} was not found"))
-                })?;
-                if agent.observe_only {
-                    return Err(Error::new(
-                        "not_allowed",
-                        "native control is unavailable for an observe-only Agent",
-                    ));
-                }
-            }
+        if !project_authority_preverified {
+            self.verify_native_control_target(&request).await?;
         }
         let mode = self.inner.mode.load(Ordering::SeqCst);
         if mode == MODE_FORCE {
@@ -726,6 +762,28 @@ impl Router {
         }
 
         Ok(PreparedSubmission { request, workspace })
+    }
+
+    async fn verify_native_control_target(&self, request: &SubmitCommand) -> Result<()> {
+        if is_native_control_verb(&request.verb)
+            && let Some(target) = request.target.as_deref()
+        {
+            let store = self.inner.store.lock().await;
+            // Preserve idempotent command retries; Store checks new controls
+            // transactionally after resolving an existing command binding.
+            if store.get_command(&request.id)?.is_none() {
+                let agent = store.get_agent(target)?.ok_or_else(|| {
+                    Error::new("not_found", format!("Agent {target} was not found"))
+                })?;
+                if agent.observe_only {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "native control is unavailable for an observe-only Agent",
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn hydrate_retained_launch(&self, request: &mut SubmitCommand) -> Result<bool> {
@@ -4724,6 +4782,141 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
     }
 
     #[tokio::test]
+    async fn rule_catch_up_marks_deterministic_interrupt_refusal_and_replays_once() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-rule-catch-up-interrupt-{}",
+            ulid::Ulid::new()
+        ));
+        let rules_dir = root.join("rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        let router = router_with_data_root(root.clone());
+
+        let event_seq = {
+            let mut store = router.inner.store.lock().await;
+            let (agent, send_id) = result_fixture(&mut store);
+            read_fixture_event(
+                &mut store,
+                &agent,
+                "turn.completed",
+                json!({
+                    "command_id":send_id,
+                    "turn_id":"turn-1",
+                    "status":"completed",
+                }),
+            );
+            if store
+                .get_command(&send_id)
+                .unwrap()
+                .is_some_and(|command| command.state == CommandState::Dispatched)
+            {
+                store
+                    .settle(
+                        &send_id,
+                        CommandState::Applied,
+                        Some(json!({"turn_id":"turn-1"})),
+                        now_ms(),
+                    )
+                    .unwrap();
+            }
+            store
+                .read_events(0, 1_000, None)
+                .unwrap()
+                .into_iter()
+                .find(|event| {
+                    event.kind == "turn.completed"
+                        && event.data.get("command_id").and_then(Value::as_str)
+                            == Some(send_id.as_str())
+                })
+                .expect("committed historical turn completion")
+                .seq
+        };
+
+        std::fs::write(
+            rules_dir.join("interrupt.toml"),
+            r#"
+[[rule]]
+id = 'catch-up-interrupt-refusal'
+on = { event = 'turn.completed' }
+do = [{ action = 'interrupt', target = '${event.agent}', expected_generation = '${event.generation}', expected_turn_id = 'wrong-turn' }]
+"#,
+        )
+        .unwrap();
+        crate::automation::initialize_global_rules(&router, &root, &SecretPolicy::default())
+            .await
+            .unwrap();
+        let state = router
+            .inner
+            .store
+            .lock()
+            .await
+            .get_rule_state("owner", "catch-up-interrupt-refusal")
+            .unwrap()
+            .unwrap();
+        assert!(state.current_cursor >= event_seq);
+
+        let request = json!({
+            "id":ulid::Ulid::new().to_string(),
+            "rule":"catch-up-interrupt-refusal",
+            "after_seq":event_seq - 1,
+            "through_seq":event_seq,
+        });
+        let first: Command = serde_json::from_value(
+            router
+                .rule_catch_up(&request, &Principal::Owner)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first.verb, "rule.catch_up");
+        assert_eq!(first.state, CommandState::Applied);
+        assert_eq!(first.outcome.as_ref().unwrap()["children"], json!([]));
+
+        let events_after_first = router
+            .inner
+            .store
+            .lock()
+            .await
+            .read_events(0, 1_000, None)
+            .unwrap();
+        let rejection_markers = events_after_first
+            .iter()
+            .filter(|event| {
+                event.kind == "rule.rejected"
+                    && event.data["parent_command"] == first.id
+                    && event.data["event_seq"] == event_seq
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rejection_markers.len(), 1);
+        assert_eq!(rejection_markers[0].data["code"], "invalid");
+        assert!(!events_after_first.iter().any(|event| {
+            event.kind == "rule.fired"
+                && event.data["parent_command"] == first.id
+                && event.data["event_seq"] == event_seq
+        }));
+
+        let replay: Command = serde_json::from_value(
+            router
+                .rule_catch_up(&request, &Principal::Owner)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(replay, first);
+        assert_eq!(
+            router
+                .inner
+                .store
+                .lock()
+                .await
+                .read_events(0, 1_000, None)
+                .unwrap(),
+            events_after_first
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn invalid_initial_timer_slot_leaves_rules_unseeded_and_same_id_registers_after_fix() {
         let root =
             std::env::temp_dir().join(format!("eliot-timer-preflight-{}", ulid::Ulid::new()));
@@ -5512,9 +5705,9 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 Some(state.current_cursor),
             );
             let actions = [
-                RuleCatchUpAction {
-                    event_seq: first_event,
-                    request: SubmitCommand {
+                RuleCatchUpAction::command(
+                    first_event,
+                    SubmitCommand {
                         id: ulid::Ulid::new().to_string(),
                         target: Some(first_agent.clone()),
                         verb: "stop".to_owned(),
@@ -5524,10 +5717,10 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                         request_id: None,
                         probe: false,
                     },
-                },
-                RuleCatchUpAction {
-                    event_seq: second_event,
-                    request: SubmitCommand {
+                ),
+                RuleCatchUpAction::command(
+                    second_event,
+                    SubmitCommand {
                         id: ulid::Ulid::new().to_string(),
                         target: Some(second_agent.clone()),
                         verb: "stop".to_owned(),
@@ -5537,7 +5730,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                         request_id: None,
                         probe: false,
                     },
-                },
+                ),
             ];
             let admission = store
                 .admit_rule_catch_up(
@@ -6223,18 +6416,20 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             .unwrap();
             let actions = event_seqs
                 .into_iter()
-                .map(|event_seq| RuleCatchUpAction {
-                    event_seq,
-                    request: SubmitCommand {
-                        id: ulid::Ulid::new().to_string(),
-                        target: Some(agent.clone()),
-                        verb: "stop".to_owned(),
-                        args: json!({}),
-                        expected_generation: Some(1),
-                        expected_turn_id: None,
-                        request_id: None,
-                        probe: false,
-                    },
+                .map(|event_seq| {
+                    RuleCatchUpAction::command(
+                        event_seq,
+                        SubmitCommand {
+                            id: ulid::Ulid::new().to_string(),
+                            target: Some(agent.clone()),
+                            verb: "stop".to_owned(),
+                            args: json!({}),
+                            expected_generation: Some(1),
+                            expected_turn_id: None,
+                            request_id: None,
+                            probe: false,
+                        },
+                    )
                 })
                 .collect::<Vec<_>>();
             let admission = store

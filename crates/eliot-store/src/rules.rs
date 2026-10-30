@@ -16,7 +16,29 @@ const RULE_COMMAND_ID_DOMAIN: &str = "eliot-rule-command-v1";
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct RuleCatchUpAction {
     pub event_seq: i64,
-    pub request: SubmitCommand,
+    pub outcome: RuleCatchUpActionOutcome,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub enum RuleCatchUpActionOutcome {
+    Command(SubmitCommand),
+    Rejected { code: String },
+}
+
+impl RuleCatchUpAction {
+    pub fn command(event_seq: i64, request: SubmitCommand) -> Self {
+        Self {
+            event_seq,
+            outcome: RuleCatchUpActionOutcome::Command(request),
+        }
+    }
+
+    pub fn rejected(event_seq: i64, code: impl Into<String>) -> Self {
+        Self {
+            event_seq,
+            outcome: RuleCatchUpActionOutcome::Rejected { code: code.into() },
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -569,9 +591,7 @@ impl Store {
                     }
                 }
                 RuleCursorOutcome::Rejected { code } => {
-                    if code.trim().is_empty() || code.len() > 128 {
-                        return Err(Error::new("invalid", "rule rejection code is invalid"));
-                    }
+                    validate_rule_rejection_code(&code)?;
                     let trigger = load_rule_trigger(&tx, through)?;
                     // A malformed rule-triggered bookkeeping event is consumed
                     // silently so a rule cannot generate an endless rejection chain.
@@ -862,7 +882,7 @@ impl Store {
             });
         }
         if let Err(error) = validate_project_rule_action_tx(&tx, principal, &request) {
-            if deterministic_rule_rejection(&error) {
+            if core::is_deterministic_pre_admission_rejection(&error.code) {
                 request.id = key.child_id.clone();
                 return reject_rule_event(tx, &self.write_faulted, &key, &error.code, now);
             }
@@ -888,7 +908,7 @@ impl Store {
         // the surrounding transaction rolls every write back on persistence failure.
         let (parent, child, events) = match admit_rule_action_tx(&tx, &key, request, now) {
             Ok(admission) => admission,
-            Err(error) if deterministic_rule_rejection(&error) => {
+            Err(error) if core::is_deterministic_pre_admission_rejection(&error.code) => {
                 return reject_rule_event(tx, &self.write_faulted, &key, &error.code, now);
             }
             Err(error) => return Err(error),
@@ -1151,7 +1171,9 @@ impl Store {
                 Some("rule_action_binding_invalid".to_owned())
             } else {
                 match validate_project_rule_action_tx(&tx, principal, &action) {
-                    Err(error) if deterministic_rule_rejection(&error) => Some(error.code),
+                    Err(error) if core::is_deterministic_pre_admission_rejection(&error.code) => {
+                        Some(error.code)
+                    }
                     Err(error) => return Err(error),
                     Ok(_) => {
                         let limit = rule_action_limit(&rule)?;
@@ -1184,7 +1206,7 @@ impl Store {
                         child = Some(admitted_child);
                         events.extend(admitted_events);
                     }
-                    Err(error) if deterministic_rule_rejection(&error) => {
+                    Err(error) if core::is_deterministic_pre_admission_rejection(&error.code) => {
                         let (rejected_parent, rejected_events) =
                             reject_timer_fire_tx(&tx, &key, &error.code, now)?;
                         parent = Some(rejected_parent);
@@ -1375,7 +1397,7 @@ impl Store {
                     blocked: false,
                 })
             }
-            Err(error) if deterministic_rule_rejection(&error) => {
+            Err(error) if core::is_deterministic_pre_admission_rejection(&error.code) => {
                 let (parent, events) = reject_timer_fire_tx(&tx, &key, &error.code, now)?;
                 commit_transaction(tx, &self.write_faulted)?;
                 Ok(TimerSlotAdmission {
@@ -2857,17 +2879,11 @@ fn rule_limit_reached(count: i64, max: u64) -> bool {
     u64::try_from(count).is_ok_and(|count| count >= max)
 }
 
-fn deterministic_rule_rejection(error: &Error) -> bool {
-    matches!(
-        error.code.as_str(),
-        "invalid"
-            | "not_allowed"
-            | "not_found"
-            | "unsupported"
-            | "bad_state"
-            | "stale_generation"
-            | "frame_too_large"
-    )
+fn validate_rule_rejection_code(code: &str) -> Result<()> {
+    if code.trim().is_empty() || code.len() > 128 {
+        return Err(Error::new("invalid", "rule rejection code is invalid"));
+    }
+    Ok(())
 }
 
 fn insert_rule_parent(
@@ -3448,10 +3464,10 @@ mod tests {
             state.current_cursor,
             Some(event_seq),
         );
-        let actions = [RuleCatchUpAction {
+        let actions = [RuleCatchUpAction::command(
             event_seq,
-            request: interrupt_request(&agent_id, 1, Some("turn-historical")),
-        }];
+            interrupt_request(&agent_id, 1, Some("turn-historical")),
+        )];
         let high_water = store.high_water().unwrap();
 
         let first = store
@@ -3525,7 +3541,7 @@ mod tests {
     }
 
     #[test]
-    fn catch_up_failed_first_submit_does_not_consume_rate_limit() {
+    fn catch_up_rejections_do_not_consume_rate_before_a_valid_child() {
         let mut store = store();
         let request_id = Ulid::new();
         let now = i64::try_from(request_id.timestamp_ms()).unwrap() + 10;
@@ -3544,34 +3560,37 @@ mod tests {
 
         let state = store.ensure_rule_state("owner", &rule, now - 3).unwrap();
         let stale_event =
-            insert_test_interrupt_event(&mut store, agent, 1, Some("turn-historical"), now - 2);
+            insert_test_interrupt_event(&mut store, agent, 1, Some("turn-historical"), now - 3);
         let current_event =
+            insert_test_interrupt_event(&mut store, agent, 1, Some("turn-current"), now - 2);
+        let prepared_rejection_event =
             insert_test_interrupt_event(&mut store, agent, 1, Some("turn-current"), now - 1);
-        assert!(stale_event < current_event);
+        assert!(stale_event < current_event && current_event < prepared_rejection_event);
         let advanced = store
             .advance_rule_cursor(
                 "owner",
                 &state,
-                current_event,
+                prepared_rejection_event,
                 RuleCursorOutcome::NoMatch,
-                now,
+                now + 1,
             )
             .unwrap();
         let request = core::api::RuleCatchUpRequest::new(
             request_id.to_string(),
             rule.id.as_str(),
             state.current_cursor,
-            Some(current_event),
+            Some(prepared_rejection_event),
         );
         let actions = [
-            RuleCatchUpAction {
-                event_seq: stale_event,
-                request: interrupt_request(&agent_id, 1, Some("turn-historical")),
-            },
-            RuleCatchUpAction {
-                event_seq: current_event,
-                request: interrupt_request(&agent_id, 1, Some("turn-current")),
-            },
+            RuleCatchUpAction::command(
+                stale_event,
+                interrupt_request(&agent_id, 1, Some("turn-historical")),
+            ),
+            RuleCatchUpAction::command(
+                current_event,
+                interrupt_request(&agent_id, 1, Some("turn-current")),
+            ),
+            RuleCatchUpAction::rejected(prepared_rejection_event, "invalid"),
         ];
 
         let admission = store
@@ -3579,9 +3598,9 @@ mod tests {
                 "owner",
                 &request,
                 &advanced.value,
-                current_event,
+                prepared_rejection_event,
                 &actions,
-                now + 1,
+                now + 2,
             )
             .unwrap();
         assert!(admission.is_new);
@@ -3594,11 +3613,24 @@ mod tests {
             admission.parent.outcome.as_ref().unwrap()["children"],
             json!([admitted_child.id.clone()])
         );
-        let stale_child_id =
+        let rejected_child_id = derived_rule_id(
+            "action-0",
+            "owner",
+            &rule.id,
+            state.revision,
+            prepared_rejection_event,
+        )
+        .unwrap();
+        assert!(store.get_command(&rejected_child_id).unwrap().is_none());
+        let failed_submit_child_id =
             derived_rule_id("action-0", "owner", &rule.id, state.revision, stale_event).unwrap();
-        assert!(store.get_command(&stale_child_id).unwrap().is_none());
-
-        let rejected = admission
+        assert!(
+            store
+                .get_command(&failed_submit_child_id)
+                .unwrap()
+                .is_none()
+        );
+        let failed_submit_rejected = admission
             .events
             .iter()
             .find(|event| {
@@ -3606,8 +3638,18 @@ mod tests {
                     && event.data["event_seq"] == stale_event
                     && event.data["parent_command"] == request.id
             })
-            .expect("failed first action has a rejection marker");
-        assert_eq!(rejected.data["code"], "stale_generation");
+            .expect("failed ordinary submit has a rejection marker");
+        assert_eq!(failed_submit_rejected.data["code"], "stale_generation");
+        let rejected = admission
+            .events
+            .iter()
+            .find(|event| {
+                event.kind == "rule.rejected"
+                    && event.data["event_seq"] == prepared_rejection_event
+                    && event.data["parent_command"] == request.id
+            })
+            .expect("prepared rejection has a marker");
+        assert_eq!(rejected.data["code"], "invalid");
         let fired = admission
             .events
             .iter()
@@ -3629,6 +3671,23 @@ mod tests {
             )
             .unwrap();
         assert_eq!(linked_children, 1);
+
+        let high_water = store.high_water().unwrap();
+        let replay = store
+            .admit_rule_catch_up(
+                "owner",
+                &request,
+                &advanced.value,
+                prepared_rejection_event,
+                &actions,
+                now + 3,
+            )
+            .unwrap();
+        assert!(!replay.is_new);
+        assert_eq!(replay.parent.id, admission.parent.id);
+        assert_eq!(replay.children[0].id, admitted_child.id);
+        assert!(replay.events.is_empty());
+        assert_eq!(store.high_water().unwrap(), high_water);
     }
 
     #[test]
@@ -4109,10 +4168,10 @@ mod tests {
             after_seq,
             Some(captured_through),
         );
-        let actions = [RuleCatchUpAction {
+        let actions = [RuleCatchUpAction::command(
             event_seq,
-            request: stop_request(&agent_id),
-        }];
+            stop_request(&agent_id),
+        )];
         let first = store
             .admit_rule_catch_up("owner", &request, &state, captured_through, &actions, now)
             .unwrap();
@@ -4217,10 +4276,10 @@ mod tests {
             event_seq - 1,
             Some(captured_through),
         );
-        let actions = [RuleCatchUpAction {
+        let actions = [RuleCatchUpAction::command(
             event_seq,
-            request: stop_request(&agent_id),
-        }];
+            stop_request(&agent_id),
+        )];
         let commands_before: i64 = store
             .connection
             .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
@@ -4397,10 +4456,7 @@ mod tests {
         let action_request = stop_request(&agent_id);
         let actions = event_seqs
             .iter()
-            .map(|event_seq| RuleCatchUpAction {
-                event_seq: *event_seq,
-                request: action_request.clone(),
-            })
+            .map(|event_seq| RuleCatchUpAction::command(*event_seq, action_request.clone()))
             .collect::<Vec<_>>();
         let encoded_actions = serde_json::to_vec(&actions).unwrap();
         assert!(encoded_actions.len() <= MAX_PAGE_BYTES);
@@ -4504,10 +4560,10 @@ mod tests {
             after_seq,
             Some(captured_through),
         );
-        let actions = [RuleCatchUpAction {
-            event_seq: historical_event,
-            request: stop_request(&agent_id),
-        }];
+        let actions = [RuleCatchUpAction::command(
+            historical_event,
+            stop_request(&agent_id),
+        )];
         let admission = store
             .admit_rule_catch_up(
                 "owner",
@@ -4626,14 +4682,8 @@ mod tests {
             Some(captured_through),
         );
         let actions = [
-            RuleCatchUpAction {
-                event_seq: first_event,
-                request: stop_request(&first_target),
-            },
-            RuleCatchUpAction {
-                event_seq: second_event,
-                request: stop_request(&second_target),
-            },
+            RuleCatchUpAction::command(first_event, stop_request(&first_target)),
+            RuleCatchUpAction::command(second_event, stop_request(&second_target)),
         ];
         let admission = store
             .admit_rule_catch_up("owner", &request, &state, captured_through, &actions, now)
@@ -4834,14 +4884,8 @@ mod tests {
                 Some(captured_through),
             );
             let actions = [
-                RuleCatchUpAction {
-                    event_seq: first_event,
-                    request: stop_request(&first_target),
-                },
-                RuleCatchUpAction {
-                    event_seq: second_event,
-                    request: stop_request(&second_target),
-                },
+                RuleCatchUpAction::command(first_event, stop_request(&first_target)),
+                RuleCatchUpAction::command(second_event, stop_request(&second_target)),
             ];
             let admission = store
                 .admit_rule_catch_up("owner", &request, &state, captured_through, &actions, now)
@@ -5292,10 +5336,7 @@ mod tests {
         history_send.target = Some(history_agent_id);
         history_send.expected_generation = Some(1);
         history_send.args = json!({"text": "history uncertain send"});
-        let history_actions = [RuleCatchUpAction {
-            event_seq: history_event,
-            request: history_send,
-        }];
+        let history_actions = [RuleCatchUpAction::command(history_event, history_send)];
         let history_admission = store
             .admit_rule_catch_up(
                 "owner",

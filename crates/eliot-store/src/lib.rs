@@ -10,9 +10,9 @@ mod rules;
 
 pub use projects::ProjectRegistrationInput;
 pub use rules::{
-    RuleCatchUpAction, RuleCatchUpAdmission, RuleCursorOutcome, RuleDefinitionInput,
-    RuleEventAdmission, RuleProcessingState, TimerDefinitionInput, TimerSlotAdmission,
-    TimerSlotCommit,
+    RuleCatchUpAction, RuleCatchUpActionOutcome, RuleCatchUpAdmission, RuleCursorOutcome,
+    RuleDefinitionInput, RuleEventAdmission, RuleProcessingState, TimerDefinitionInput,
+    TimerSlotAdmission, TimerSlotCommit,
 };
 
 use eliot_core::{

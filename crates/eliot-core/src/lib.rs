@@ -16,7 +16,8 @@ mod source_handoff;
 pub use agent_start::AgentStartParams;
 pub use canonical::canonical_json_sha256;
 pub use command::{
-    classify_dispatched_error, command_transition_allowed, workspace_preparation_transition_allowed,
+    classify_dispatched_error, command_transition_allowed,
+    is_deterministic_pre_admission_rejection, workspace_preparation_transition_allowed,
 };
 pub use diagnostics::{
     MAX_STDERR_BYTES, MAX_STDERR_DIAGNOSTIC_BYTES, StderrDiagnostic, StderrSnapshot, StderrSource,
