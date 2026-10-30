@@ -6,7 +6,8 @@ pub(crate) use definition::RuleDefinition;
 
 use crate::{common::now_ms, logging, router::Router};
 use eliot_core::{
-    Error, Event, Result, SecretPolicy,
+    Error, Event, FrozenScriptContext, Result, ScriptRuleContext, ScriptTimerContext,
+    ScriptTimerInvocation, SecretPolicy,
     api::{CatchUp, ProjectRegistrationView, RuleStateView, TimerSchedule, TimerStateView},
     canonical_json_sha256, is_deterministic_pre_admission_rejection,
 };
@@ -1405,11 +1406,31 @@ fn frozen_script_context(
     event: &Event,
     revision: i64,
 ) -> eliot_core::FrozenScriptContext {
-    eliot_core::FrozenScriptContext {
-        event: event.clone(),
+    FrozenScriptContext::Event {
+        event: Box::new(event.clone()),
         subject: event.subject.clone(),
-        rule: eliot_core::ScriptRuleContext {
+        rule: ScriptRuleContext {
             id: definition.id.clone(),
+            revision,
+        },
+    }
+}
+
+pub(crate) fn timer_script_context(
+    rule_id: &str,
+    revision: i64,
+    state: &TimerStateView,
+    invocation: ScriptTimerInvocation,
+) -> FrozenScriptContext {
+    FrozenScriptContext::Timer {
+        timer: ScriptTimerContext {
+            schedule_revision: state.schedule_revision,
+            schedule: state.schedule.clone(),
+            anchor: state.anchor,
+            invocation,
+        },
+        rule: ScriptRuleContext {
+            id: rule_id.to_owned(),
             revision,
         },
     }
@@ -1565,7 +1586,32 @@ async fn reconcile_due_timers(router: &Router, rules: &mut [ActiveRule], now: i6
                         next_due_at_ms,
                         live_armed,
                     } => {
+                        if let Some(admission) = router
+                            .replay_rule_timer_slot(&rule.principal, &timer.state, scheduled_at_ms)
+                            .await?
+                        {
+                            timer.state = admission.state;
+                            timer.blocked = admission.blocked;
+                            timer.armed_due_at_ms =
+                                timer.state.next_due_at.filter(|due| *due > now);
+                            continue;
+                        }
+
                         let prepared = match rule.definition.evaluate_timer() {
+                            Ok(action) if action.verb == "run" => {
+                                router
+                                    .prepare_timer_rule_run_submission(
+                                        action,
+                                        rule.project.as_ref(),
+                                        timer_script_context(
+                                            &rule.definition.id,
+                                            rule.state.revision,
+                                            &timer.state,
+                                            ScriptTimerInvocation::Scheduled { scheduled_at_ms },
+                                        ),
+                                    )
+                                    .await
+                            }
                             Ok(action) => match rule.project.as_ref() {
                                 Some(project) => {
                                     router
@@ -2219,7 +2265,9 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
     }
     #[tokio::test]
     async fn event_run_catch_up_prepares_project_and_granted_global_commands() {
-        use eliot_core::{AgentState, EventSubject, FrozenScriptRun};
+        use eliot_core::{
+            AgentState, EventSubject, FrozenScriptRun, RunDefinitionArgs, ScriptInputContext,
+        };
         use std::{fs, io::Cursor, path::Path};
 
         let root =
@@ -2352,10 +2400,10 @@ do = [{ action = "run", cmd = ["pwsh", ".eliot/scripts/check.ps1", "-Changed"], 
         assert_eq!(request.expected_generation, None);
         let frozen: FrozenScriptRun = serde_json::from_value(request.args.clone()).unwrap();
         frozen.validate().unwrap();
-        assert_eq!(frozen.context.event, event);
-        assert_eq!(frozen.context.subject, event.subject);
-        assert_eq!(frozen.context.rule.id, definition.id);
-        assert_eq!(frozen.context.rule.revision, rule_revision);
+        assert_eq!(frozen.context.event(), Some(&event));
+        assert_eq!(frozen.context.subject(), event.subject.as_ref());
+        assert_eq!(frozen.context.rule().id, definition.id);
+        assert_eq!(frozen.context.rule().revision, rule_revision);
         assert_eq!(frozen.definition.cmd[0], "pwsh");
         assert_eq!(frozen.definition.cmd[1], ".eliot/scripts/check.ps1");
 
@@ -2431,10 +2479,10 @@ do = [{ action = "run", cmd = ["pwsh", ".eliot/scripts/check.ps1", "-Changed"], 
         let global_frozen: FrozenScriptRun =
             serde_json::from_value(global_request.args.clone()).unwrap();
         global_frozen.validate().unwrap();
-        assert_eq!(global_frozen.context.event, event);
-        assert_eq!(global_frozen.context.subject, event.subject);
-        assert_eq!(global_frozen.context.rule.id, global_definition.id);
-        assert_eq!(global_frozen.context.rule.revision, rule_revision);
+        assert_eq!(global_frozen.context.event(), Some(&event));
+        assert_eq!(global_frozen.context.subject(), event.subject.as_ref());
+        assert_eq!(global_frozen.context.rule().id, global_definition.id);
+        assert_eq!(global_frozen.context.rule().revision, rule_revision);
         assert_eq!(global_frozen.definition.cmd[1], "check.ps1");
         assert_eq!(
             global_frozen.definition.cwd.as_deref(),
@@ -2451,6 +2499,88 @@ do = [{ action = "run", cmd = ["pwsh", ".eliot/scripts/check.ps1", "-Changed"], 
                 events_before_granted_global_prepare.1,
                 "granted Owner Run preparation does not write Store effects"
             );
+        }
+
+        let project_timer_state = TimerStateView {
+            id: "project-timer-run".to_owned(),
+            project: Some(registration.id.clone()),
+            schedule_revision: 4,
+            schedule: TimerSchedule::Interval {
+                period_ms: 1_000,
+                anchor: Some(100),
+            },
+            anchor: 100,
+            last_key: None,
+            next_due_at: Some(1_100),
+            enabled: true,
+        };
+        let owner_timer_state = TimerStateView {
+            id: "owner-timer-run".to_owned(),
+            project: None,
+            ..project_timer_state.clone()
+        };
+        let project_run = RunDefinitionArgs {
+            cmd: vec![
+                "pwsh".to_owned(),
+                ".eliot/scripts/check.ps1".to_owned(),
+                "-Changed".to_owned(),
+            ],
+            cwd: Some(".".to_owned()),
+            timeout: Some("10m".to_owned()),
+            env: std::collections::BTreeMap::from([("CI".to_owned(), "true".to_owned())]),
+        };
+        let owner_run = RunDefinitionArgs {
+            cmd: vec![
+                "pwsh".to_owned(),
+                "check.ps1".to_owned(),
+                "-Changed".to_owned(),
+            ],
+            cwd: Some(data_root.to_string_lossy().into_owned()),
+            timeout: Some("10m".to_owned()),
+            env: std::collections::BTreeMap::from([("CI".to_owned(), "true".to_owned())]),
+        };
+        let cases = [
+            (&project_timer_state, Some(&registration), project_run),
+            (&owner_timer_state, None, owner_run),
+        ];
+        for (timer_state, project, run_definition) in cases {
+            for manual in [false, true] {
+                let invocation = if manual {
+                    ScriptTimerInvocation::Manual {
+                        parent_command_id: ulid::Ulid::new().to_string(),
+                    }
+                } else {
+                    ScriptTimerInvocation::Scheduled {
+                        scheduled_at_ms: 1_100,
+                    }
+                };
+                let context =
+                    timer_script_context(&timer_state.id, rule_revision, timer_state, invocation);
+                let expected_timer = context.timer().unwrap().clone();
+                let mut action = SubmitCommand::new(String::new(), "run");
+                action.args = serde_json::to_value(&run_definition).unwrap();
+                let prepared = router
+                    .prepare_timer_rule_run_submission(action, project, context.clone())
+                    .await
+                    .unwrap();
+                let frozen: FrozenScriptRun =
+                    serde_json::from_value(prepared.request.args).unwrap();
+                frozen.validate().unwrap();
+                assert_eq!(frozen.context, context);
+
+                let input = ScriptInputContext::for_run_command(
+                    &frozen.context,
+                    ulid::Ulid::new().to_string(),
+                )
+                .unwrap();
+                assert_eq!(input.timer(), Some(&expected_timer));
+                assert!(input.event().is_none());
+                assert!(input.subject().is_none());
+                let input_value = serde_json::to_value(input).unwrap();
+                assert!(input_value.get("timer").is_some());
+                assert!(input_value.get("event").is_none());
+                assert!(input_value.get("subject").is_none());
+            }
         }
 
         write_config(&["send"], true);

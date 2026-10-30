@@ -518,7 +518,10 @@ fn source_changed(message: &'static str) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eliot_core::{AgentState, Event, EventSubject, ScriptRuleContext};
+    use eliot_core::{
+        AgentState, Event, EventSubject, ScriptRuleContext,
+        api::{ScriptTimerContext, ScriptTimerInvocation, TimerSchedule},
+    };
     use serde_json::json;
     use std::{fs, path::PathBuf};
 
@@ -616,8 +619,8 @@ mod tests {
                 state: AgentState::Busy,
                 workspace: Some(self.root.to_string_lossy().into_owned()),
             };
-            FrozenScriptContext {
-                event: Event {
+            FrozenScriptContext::Event {
+                event: Box::new(Event {
                     seq: 1,
                     ts: 2,
                     kind: "turn.completed".to_owned(),
@@ -628,11 +631,31 @@ mod tests {
                     native_id: Some("fake:turn.completed".to_owned()),
                     data: json!({"status":"complete"}),
                     cause: None,
-                },
+                }),
                 subject: Some(subject),
                 rule: ScriptRuleContext {
                     id: "check-completed".to_owned(),
                     revision: 1,
+                },
+            }
+        }
+
+        fn timer_context(&self) -> FrozenScriptContext {
+            FrozenScriptContext::Timer {
+                timer: ScriptTimerContext {
+                    schedule_revision: 2,
+                    schedule: TimerSchedule::Interval {
+                        period_ms: 60_000,
+                        anchor: Some(30_000),
+                    },
+                    anchor: 30_000,
+                    invocation: ScriptTimerInvocation::Scheduled {
+                        scheduled_at_ms: 90_000,
+                    },
+                },
+                rule: ScriptRuleContext {
+                    id: "periodic-check".to_owned(),
+                    revision: 2,
                 },
             }
         }
@@ -658,6 +681,18 @@ mod tests {
             &policy(),
         )
         .expect("freeze project run");
+        assert_eq!(
+            frozen.context.event().map(|event| event.kind.as_str()),
+            Some("turn.completed")
+        );
+        assert!(frozen.context.subject().is_some());
+        assert!(frozen.context.timer().is_none());
+        let context_json = serde_json::to_value(&frozen.context).expect("event context JSON");
+        assert_eq!(context_json.as_object().map(|object| object.len()), Some(3));
+        assert!(context_json.get("event").is_some());
+        assert!(context_json.get("subject").is_some());
+        assert!(context_json.get("rule").is_some());
+        assert!(context_json.get("timer").is_none());
         let command = verify_project_run(&frozen, &fixture.registration, &policy())
             .expect("verify project run");
         let process = command.as_std();
@@ -985,5 +1020,50 @@ mod tests {
         let mut removed_environment = grant;
         removed_environment.run_env.clear();
         assert!(verify_global_run(&frozen, &removed_environment, &data_root, &policy()).is_err());
+    }
+
+    #[test]
+    fn project_and_global_freezers_accept_the_real_timer_context() {
+        let fixture = ProjectFixture::new();
+        let timer_context = fixture.timer_context();
+
+        let project = freeze_project_run(
+            fixture.definition(),
+            &fixture.registration,
+            timer_context.clone(),
+            &policy(),
+        )
+        .expect("freeze timer Run under project grants");
+        assert!(project.context.event().is_none());
+        assert!(project.context.subject().is_none());
+        assert_eq!(
+            project.context.timer().map(|timer| timer.schedule_revision),
+            Some(2)
+        );
+        assert_eq!(project.context.rule().id, "periodic-check");
+        verify_project_run(&project, &fixture.registration, &policy())
+            .expect("verify timer Run under project grants");
+
+        let data_root = fixture.global_data_root();
+        let grant = fixture.global_grant();
+        let global = freeze_global_run(
+            fixture.global_definition(),
+            &grant,
+            &data_root,
+            timer_context,
+            &policy(),
+        )
+        .expect("freeze timer Run under owner grants");
+        assert!(global.context.event().is_none());
+        assert!(global.context.subject().is_none());
+        assert_eq!(
+            global.context.timer().map(|timer| timer.invocation.clone()),
+            Some(ScriptTimerInvocation::Scheduled {
+                scheduled_at_ms: 90_000
+            })
+        );
+        assert_eq!(global.context.rule().revision, 2);
+        verify_global_run(&global, &grant, &data_root, &policy())
+            .expect("verify timer Run under owner grants");
     }
 }

@@ -119,10 +119,10 @@ only edits preserve the schedule. Reconcile timers from stored state on restart.
 ## First connected timer slice
 
 Global and registered-project timers use their namespace's startup-loaded rule files and
-the existing command router. The connected subset supports interval, once, five-field
-cron and owner-triggered manual runs with one ordinary `stop` or `send` action. The
-event-rule `interrupt` action is not supported for scheduled or manual timer runs.
-Timer-rule `run` remains unsupported in this increment but remains required by L4.2.
+the existing command router. The connected timer slice admits ordinary `stop`, `send` and `run` children for global and
+registered-project interval, cron and once firings, including manual `timer.run`. See
+[Timer Run invocation context](#timer-run-invocation-context).
+The event-rule `interrupt` action remains unsupported for scheduled or manual timer runs.
 Other action verbs remain future work.
 
 ```toml
@@ -243,12 +243,11 @@ Backlog, explicit history catch-up, and rate-limit semantics are defined in
 [Retention and bounded backlog](#retention-and-bounded-backlog).
 This connected event-rule subset supports ordinary `stop`, `send` and event-only
 `interrupt`, plus project event-rule `run` during live evaluation and explicit history
-catch-up. The global event-rule `run` contract below specifies owner-global approval and the shared
-frozen execution path. Timer-rule `run` remains unsupported in this increment but remains required
-by L4.2; other full L4.2 action requirements remain cumulative. SEND uses the existing
-Router path, keeps its exact target generation and turn association, and `applied` does not
-assert task completion. `allow_self` defaults to false; see [Guardrails](#guardrails) for the
-same-principal self-cause behavior for SEND and Run. Goal actions and project
+catch-up. The global event-rule `run` contract below uses owner-global approval and the shared frozen
+execution path. Other full L4.2 action requirements remain cumulative. SEND uses the
+existing Router path, keeps its exact target generation and turn association, and
+`applied` does not assert task completion. `allow_self` defaults to false; see [Guardrails](#guardrails)
+for the same-principal self-cause behavior for SEND and Run. Goal actions and project
 configuration overlays remain outside this connected event-rule contour.
 Cause-depth suppression is silent and does not emit an endlessly retriggerable rejection event.
 
@@ -367,7 +366,7 @@ frozen canonical entry receipt and digest remain unchanged. Event-derived values
 available on stdin only. See [Project registration and rule authority](configuration.md#project-registration-and-rule-authority).
 
 For global event rules, `cmd[0]` is an exact key in owner-private
-`[automation.run].interpreters` ([owner approval](configuration.md#global-event-run-approval)). `cmd[1]` is a
+`[automation.run].interpreters` ([owner approval](configuration.md#global-script-run-approval)). `cmd[1]` is a
 literal relative entry below the fixed private `<data_dir>/scripts/` root; later elements are
 literal script arguments. The entry must resolve to a canonical regular file below that
 root with no path escape, symlink/reparse point, device or alternate stream. Any eligible
@@ -393,7 +392,42 @@ action-supplied environment keys. No template substitution is allowed in `cmd`, 
 `timeout` or `env`. Names also follow the credential, route, identity and reserved-variable
 exclusions in [Environment and secrets](configuration.md#environment-and-secrets).
 
-`cmd` and `env` reuse existing process/config validation and bounds; do not add a
+### Timer Run invocation context
+
+Timer Run applies to global and registered-project interval, cron and once rules, and to
+manual `timer.run` invocations of any existing timer. Manual invocation is not a
+`TimerSchedule` variant; the existing schedule model remains authoritative, including
+`Once` with its required `at: i64`. Timer Run uses the same scope-specific interpreter,
+entry, cwd, environment, process-custody, output-validation and no-replay rules above.
+
+Core represents Run context as either the existing Event context or a typed Timer context.
+Keep the current Event-mode JSON shape and frozen Run-args digests unchanged. Timer context
+has no synthetic Event, subject or clock timestamp. It carries the persisted
+`schedule_revision`, existing `TimerSchedule`, persisted anchor and an invocation:
+`Scheduled { scheduled_at_ms }` uses the actual selected slot; `Manual { parent_command_id }` uses the
+real external ID of its `timer.run` parent. The enclosing rule ID and definition revision are
+distinct from `schedule_revision`. Core script and timer DTOs own these shapes; see
+[Core script DTOs](../../crates/eliot-core/src/api/scripts.rs) and
+[Core timer DTOs](../../crates/eliot-core/src/api/timers.rs).
+
+For scheduled firings, the existing `rule` parent args bind the rule, schedule revision and
+selected slot. For manual firings, the parent is the existing `timer.run` command, whose ID is
+the supplied external ULID; its request args and payload digest stay unchanged. Store
+validates each Timer context against the authoritative timer row, rule/revision and actual
+slot or manual parent, then stores the authoritative snapshot beside the children in the
+existing timer-parent outcome. At dispatch and output admission, verify the frozen Timer
+context against that stored parent snapshot. Derive principal and scope from the stored
+parent/project binding, never from Timer context. Store keeps pure context, authority and
+cursor validation inside its existing transactions/effect boundaries; script execution
+and filesystem/vendor I/O remain outside Store locks.
+
+Timer stdin uses the typed Timer/rule context and minimal command ID/verb projection; it
+contains no Event or subject. The Run command itself keeps its own assigned ID; a manual
+Timer context refers to the separate external `timer.run` parent ID. Timer Run uses the
+saved Owner scope for global timers and project scope for project timers after its
+command-scoped token is revoked. Existing `timer.run` replay returns the retained parent before
+current gates; an Unknown Run is never respawned.
+ `cmd` and `env` reuse existing process/config validation and bounds; do not add a
 script-specific numeric limit registry. Implementers should use the shared Core constants
 `MAX_FRAME_BYTES`, `MAX_TEXT_BYTES`, `MAX_EVENT_BYTES` and `MAX_COMMAND_ID_BYTES` from
 [Core limits](../../crates/eliot-core/src/limits.rs), and the existing config validators
@@ -413,10 +447,11 @@ closed rather than replacing frozen inputs. This freezes explicit references, no
 interpreter's imported dependency graph.
 
 The controller serializes bounded JSON before spawn and rejects input larger than 1 MiB.
-The child stdin uses the Core `ScriptInputContext` DTO from [the Core script DTO module](../../crates/eliot-core/src/api/scripts.rs).
-Its event, event-time subject and rule id/revision are the captured snapshots. The
-`ScriptCommandContext` member is the minimal run command id/verb projection assembled
-after Store assigns the id; it never serializes the full Core `Command` or its args.
+Core `ScriptInputContext` carries the existing Event, event-time subject and rule snapshot for
+Event Run. That Event-mode JSON shape and the frozen Run-args digest stay unchanged. Timer
+Run uses the typed Timer/rule context described above and has no Event or subject. In
+either mode, `ScriptCommandContext` is the minimal Run command ID/verb projection assembled
+after Store assigns the ID; it never serializes the full Core `Command` or its args.
 The input excludes recursive stdin/context payload, environment, principal/scope and
 bearer values, including the Run token.
 

@@ -20,7 +20,7 @@ symlink/reparse roots or unsafe ownership.
   worktrees/               L3 opt-in workspaces
   services/                managed services, when needed
   rules/                   L4
-  scripts/                 global event Run entries
+  scripts/                 global script Run entries
   frozen/                  bounded admitted entry-file copies, when needed
 ```
 
@@ -190,18 +190,18 @@ Unknown keys are errors with location; plugin-private keys are validated by that
 `extends` is one level. Missing fields use [core defaults](core.md#profile).
 Command/write retention must cover the supported retry window and allowed clock skew.
 
-## Global event Run approval
+## Global script Run approval
 
-Global event-script approval is owner-only in private `<data_dir>/config.toml` under
+Global event and timer script Run approvals are owner-only in private `<data_dir>/config.toml` under
 `[automation.run]`. The config loader exposes this grant as `config::RunGrantConfig` with
 `interpreters` and `run_env`, via `config::load_automation_config(data_root)?.run`. Interpreter
-map keys are exact literal references used by global rules; values use the Core
+map keys are exact literal references used by global event and timer rules; values use the Core
 [`ScriptInterpreter` DTO](../../crates/eliot-core/src/api/scripts.rs). A missing or empty
 `[automation.run]` table or `interpreters` map denies global Run. `run_env` is an exact
 allowlist of literal nonsecret environment names; if absent or empty, no action-supplied
 environment keys are allowed. Names follow [Environment and secrets](#environment-and-secrets).
 
-The fixed private global script-entry root is `<data_dir>/scripts/`. Any selected entry must
+The fixed private global script-entry root for event and timer Run is `<data_dir>/scripts/`. Any selected entry must
 resolve to a canonical regular file below that root. The owner-approved interpreter and
 Run action are the authorization boundary; there is no per-entry or per-rule file
 allowlist. Project Run remains confined to its separate registered-checkout
