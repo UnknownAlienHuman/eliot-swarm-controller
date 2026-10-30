@@ -38,11 +38,26 @@ pub(crate) enum ProcessUncertainty {
     PipeSetup,
     Stdin,
     Stdout,
-    Stderr,
     Exit,
     Quiescence,
     InterruptedSuccess,
     Supervisor,
+}
+
+impl ProcessUncertainty {
+    pub(crate) const fn stable_code(self) -> &'static str {
+        match self {
+            Self::Spawn => "script_spawn_unknown",
+            Self::Custody => "script_custody_unknown",
+            Self::PipeSetup => "script_pipe_setup_unknown",
+            Self::Stdin => "script_stdin_unknown",
+            Self::Stdout => "script_stdout_unknown",
+            Self::Exit => "script_exit_unknown",
+            Self::Quiescence => "script_quiescence_unknown",
+            Self::InterruptedSuccess => "script_interrupted_success",
+            Self::Supervisor => "script_supervisor_unknown",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -105,6 +120,25 @@ pub(crate) async fn run_owned_process(
     }
 }
 
+enum RootExitWait {
+    #[cfg(not(target_os = "linux"))]
+    Reaped(ExitStatus),
+    #[cfg(target_os = "linux")]
+    Unreaped,
+}
+
+async fn wait_root_exit(child: &mut OwnedChild) -> eliot_core::Result<RootExitWait> {
+    #[cfg(target_os = "linux")]
+    {
+        child.wait_exit_unreaped().await?;
+        Ok(RootExitWait::Unreaped)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        child.wait().await.map(RootExitWait::Reaped)
+    }
+}
+
 async fn run_owned_process_inner(
     mut command: Command,
     stdin: Vec<u8>,
@@ -156,7 +190,11 @@ async fn run_owned_process_inner(
 
     let mut stdin_result = None;
     let mut stdout_result = None;
+    #[cfg(target_os = "linux")]
+    let status = None;
+    #[cfg(not(target_os = "linux"))]
     let mut status = None;
+    let mut root_exit_observed = false;
     let custody_unavailable = {
         #[cfg(windows)]
         {
@@ -174,7 +212,7 @@ async fn run_owned_process_inner(
     let mut stop = custody_unavailable.then_some(StopReason::Unknown(ProcessUncertainty::Custody));
 
     while stop.is_none() {
-        if stdin_result.is_some() && stdout_result.is_some() && status.is_some() {
+        if stdin_result.is_some() && stdout_result.is_some() && root_exit_observed {
             break;
         }
 
@@ -203,9 +241,15 @@ async fn run_owned_process_inner(
                     stop = Some(StopReason::Unknown(ProcessUncertainty::Stdout));
                 }
             }
-            result = child.wait(), if status.is_none() => {
+            result = wait_root_exit(&mut child), if !root_exit_observed => {
                 match result {
-                    Ok(exit) => status = Some(exit),
+                    #[cfg(not(target_os = "linux"))]
+                    Ok(RootExitWait::Reaped(exit)) => {
+                        status = Some(exit);
+                        root_exit_observed = true;
+                    }
+                    #[cfg(target_os = "linux")]
+                    Ok(RootExitWait::Unreaped) => root_exit_observed = true,
                     Err(_) => stop = Some(StopReason::Unknown(ProcessUncertainty::Exit)),
                 }
             }
@@ -219,6 +263,7 @@ async fn run_owned_process_inner(
             custody,
             stop,
             status,
+            root_exit_observed,
             &mut stdin_task,
             stdin_result,
             &mut stdout_task,
@@ -228,12 +273,12 @@ async fn run_owned_process_inner(
         .await;
     }
 
-    let Some(status) = status else {
+    if !root_exit_observed {
         return ProcessOutcome::Unknown {
             reason: ProcessUncertainty::Exit,
             quiescent: false,
         };
-    };
+    }
     let stdout = match stdout_result {
         Some(Ok(Ok(stdout))) => stdout,
         _ => unreachable!("stdout errors exit through the cleanup path"),
@@ -244,7 +289,8 @@ async fn run_owned_process_inner(
             observer.as_ref(),
             custody,
             StopReason::Unknown(ProcessUncertainty::Stdin),
-            Some(status),
+            status,
+            root_exit_observed,
             &mut stdin_task,
             stdin_result,
             &mut stdout_task,
@@ -266,15 +312,16 @@ async fn run_owned_process_inner(
             result.map_err(|_| StopReason::Unknown(ProcessUncertainty::Quiescence))
         }
     };
-    let quiescent = match quiescence {
-        Ok(true) => true,
+    match quiescence {
+        Ok(true) => {}
         Ok(false) => {
             return settle_interrupted(
                 &mut child,
                 observer.as_ref(),
                 custody,
                 StopReason::Failure(ProcessFailure::Timeout),
-                Some(status),
+                status,
+                root_exit_observed,
                 &mut stdin_task,
                 stdin_result,
                 &mut stdout_task,
@@ -289,7 +336,8 @@ async fn run_owned_process_inner(
                 observer.as_ref(),
                 custody,
                 stop,
-                Some(status),
+                status,
+                root_exit_observed,
                 &mut stdin_task,
                 stdin_result,
                 &mut stdout_task,
@@ -298,31 +346,46 @@ async fn run_owned_process_inner(
             )
             .await;
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    let status = match timeout_at(Instant::now() + CLEANUP_GRACE, child.wait()).await {
+        Ok(Ok(status)) => status,
+        _ => {
+            return ProcessOutcome::Unknown {
+                reason: ProcessUncertainty::Exit,
+                quiescent: false,
+            };
+        }
+    };
+    #[cfg(target_os = "linux")]
+    if !matches!(
+        observer
+            .as_ref()
+            .and_then(|observer| observer.known_process_group_empty().ok()),
+        Some(true)
+    ) {
+        return ProcessOutcome::Unknown {
+            reason: ProcessUncertainty::Quiescence,
+            quiescent: false,
+        };
+    }
+    #[cfg(not(target_os = "linux"))]
+    let Some(status) = status else {
+        return ProcessOutcome::Unknown {
+            reason: ProcessUncertainty::Exit,
+            quiescent: false,
+        };
     };
 
     let stderr = stderr_task.finish(Instant::now() + CLEANUP_GRACE).await;
-    if !stderr.eof || stderr.read_error {
-        return ProcessOutcome::Unknown {
-            reason: ProcessUncertainty::Stderr,
-            quiescent,
-        };
-    }
-
-    let capture = ProcessCapture {
+    classify_quiescent_capture(ProcessCapture {
         stdout: stdout.bytes,
         stdout_complete: true,
         stderr,
         status,
         custody,
-    };
-    if capture.status.success() {
-        ProcessOutcome::Completed(capture)
-    } else {
-        ProcessOutcome::Failed {
-            reason: ProcessFailure::Exit,
-            capture: Some(capture),
-        }
-    }
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -335,6 +398,24 @@ struct StdoutCapture {
     bytes: Vec<u8>,
     complete: bool,
     exceeded: bool,
+}
+
+/// Classify after stdin/stdout completion and custody quiescence are known.
+/// Stderr is diagnostic-only and never changes the primary process outcome.
+fn classify_quiescent_capture(capture: ProcessCapture) -> ProcessOutcome {
+    if !capture.stdout_complete {
+        return ProcessOutcome::Unknown {
+            reason: ProcessUncertainty::Stdout,
+            quiescent: true,
+        };
+    }
+    if !capture.status.success() {
+        return ProcessOutcome::Failed {
+            reason: ProcessFailure::Exit,
+            capture: Some(capture),
+        };
+    }
+    ProcessOutcome::Completed(capture)
 }
 
 async fn write_stdin(mut stdin: ChildStdin, bytes: Vec<u8>) -> io::Result<()> {
@@ -381,51 +462,62 @@ async fn settle_interrupted(
     custody: CustodyGuarantee,
     stop: StopReason,
     mut status: Option<ExitStatus>,
+    root_exit_observed: bool,
     stdin_task: &mut JoinHandle<io::Result<()>>,
     stdin_result: Option<Result<io::Result<()>, tokio::task::JoinError>>,
     stdout_task: &mut JoinHandle<io::Result<StdoutCapture>>,
     mut stdout_result: Option<Result<io::Result<StdoutCapture>, tokio::task::JoinError>>,
     stderr_task: StderrCapture,
 ) -> ProcessOutcome {
+    #[cfg(target_os = "linux")]
+    let root_exit_observed = root_exit_observed || child.try_wait_exit_unreaped().unwrap_or(false);
+    let exit_was_known_before_cleanup = root_exit_observed;
     // Signal before wait() reaps a Unix group leader and drops its signal identity.
     let _ = child.terminate();
-    let cleanup_deadline = Instant::now() + CLEANUP_GRACE;
-    if status.is_none() {
-        status = match timeout_at(cleanup_deadline, child.wait()).await {
-            Ok(Ok(exit)) => Some(exit),
-            _ => None,
-        };
-    }
-
-    let quiescent = if status.is_some() {
-        matches!(
-            wait_for_quiescence(child, observer, cleanup_deadline).await,
-            Ok(true)
-        )
-    } else {
-        false
+    #[cfg(target_os = "linux")]
+    let quiescent = {
+        let mut root_exit_observed = root_exit_observed;
+        settle_linux_custody(child, observer, &mut root_exit_observed, &mut status).await
     };
-    #[cfg(windows)]
-    let quiescent = if quiescent {
-        true
-    } else {
-        // The Job remains a safe family handle after the direct process exits.
-        let _ = child.terminate();
-        matches!(
-            wait_for_quiescence(child, observer, Instant::now() + CLEANUP_GRACE).await,
-            Ok(true)
-        )
+    #[cfg(not(target_os = "linux"))]
+    let quiescent = {
+        let cleanup_deadline = Instant::now() + CLEANUP_GRACE;
+        if status.is_none() {
+            status = match timeout_at(cleanup_deadline, child.wait()).await {
+                Ok(Ok(exit)) => Some(exit),
+                _ => None,
+            };
+        }
+
+        let quiescent = if status.is_some() {
+            matches!(
+                wait_for_quiescence(child, observer, cleanup_deadline).await,
+                Ok(true)
+            )
+        } else {
+            false
+        };
+        #[cfg(windows)]
+        let quiescent = if quiescent {
+            true
+        } else {
+            // The Job remains a safe family handle after the direct process exits.
+            let _ = child.terminate();
+            matches!(
+                wait_for_quiescence(child, observer, Instant::now() + CLEANUP_GRACE).await,
+                Ok(true)
+            )
+        };
+        quiescent
     };
 
     let capture_deadline = Instant::now() + CLEANUP_GRACE;
-    let stdin_finished = match stdin_result {
-        Some(Ok(_)) => true,
-        Some(Err(_)) => false,
-        None => matches!(
-            join_bounded(stdin_task, capture_deadline).await,
-            Some(Ok(_))
-        ),
+    let stdin_result = match stdin_result {
+        Some(result) => Some(result),
+        None => join_bounded(stdin_task, capture_deadline).await,
     };
+    let stdin_finished = matches!(stdin_result.as_ref(), Some(Ok(_)));
+    let stdin_complete = matches!(stdin_result.as_ref(), Some(Ok(Ok(()))));
     if stdout_result.is_none() {
         stdout_result = join_bounded(stdout_task, capture_deadline).await;
     }
@@ -435,7 +527,6 @@ async fn settle_interrupted(
         Some(Ok(Ok(capture))) => Some(capture),
         _ => None,
     };
-    let stderr_complete = stderr.eof && !stderr.read_error;
     let Some(status) = status else {
         return ProcessOutcome::Unknown {
             reason: stop.unknown_reason().unwrap_or(ProcessUncertainty::Exit),
@@ -460,9 +551,9 @@ async fn settle_interrupted(
             quiescent: true,
         };
     }
-    if !stderr_complete {
+    if exit_was_known_before_cleanup && !stdin_complete {
         return ProcessOutcome::Unknown {
-            reason: ProcessUncertainty::Stderr,
+            reason: ProcessUncertainty::Stdin,
             quiescent: true,
         };
     }
@@ -489,6 +580,23 @@ async fn settle_interrupted(
             quiescent: true,
         };
     }
+    if !output_limit && !status.success() {
+        let failure = if exit_was_known_before_cleanup {
+            ProcessFailure::Exit
+        } else {
+            reason
+        };
+        return ProcessOutcome::Failed {
+            reason: failure,
+            capture: Some(ProcessCapture {
+                stdout: stdout.bytes,
+                stdout_complete: true,
+                stderr,
+                status,
+                custody,
+            }),
+        };
+    }
     if !output_limit && status.success() {
         return ProcessOutcome::Unknown {
             reason: ProcessUncertainty::InterruptedSuccess,
@@ -509,6 +617,68 @@ async fn settle_interrupted(
     }
 }
 
+#[cfg(target_os = "linux")]
+async fn settle_linux_custody(
+    child: &mut OwnedChild,
+    observer: Option<&CustodyObserver>,
+    root_exit_observed: &mut bool,
+    status: &mut Option<ExitStatus>,
+) -> bool {
+    let first_deadline = Instant::now() + CLEANUP_GRACE;
+    if !*root_exit_observed {
+        *root_exit_observed = matches!(
+            timeout_at(first_deadline, child.wait_exit_unreaped()).await,
+            Ok(Ok(()))
+        );
+    }
+    let mut group_empty = *root_exit_observed
+        && matches!(
+            child
+                .wait_group_empty_except_leader(
+                    first_deadline.saturating_duration_since(Instant::now(),)
+                )
+                .await,
+            Ok(true)
+        );
+
+    if !group_empty {
+        // Revalidate and signal while the exact exited leader is still waitable.
+        let _ = child.terminate();
+        let retry_deadline = Instant::now() + CLEANUP_GRACE;
+        if !*root_exit_observed {
+            *root_exit_observed = matches!(
+                timeout_at(retry_deadline, child.wait_exit_unreaped()).await,
+                Ok(Ok(()))
+            );
+        }
+        if *root_exit_observed {
+            group_empty = matches!(
+                child
+                    .wait_group_empty_except_leader(
+                        retry_deadline.saturating_duration_since(Instant::now(),)
+                    )
+                    .await,
+                Ok(true)
+            );
+        }
+    }
+
+    // Reap the direct child only after the final birth-checked group signal and
+    // pre-reap group observation have completed.
+    if status.is_none() {
+        *status = match timeout_at(Instant::now() + CLEANUP_GRACE, child.wait()).await {
+            Ok(Ok(exit)) => Some(exit),
+            _ => None,
+        };
+    }
+    let group_empty_after_reap = status.is_some()
+        && matches!(
+            observer.and_then(|observer| observer.known_process_group_empty().ok()),
+            Some(true)
+        );
+    group_empty && group_empty_after_reap
+}
+
 impl StopReason {
     fn unknown_reason(self) -> Option<ProcessUncertainty> {
         match self {
@@ -520,13 +690,22 @@ impl StopReason {
 
 async fn terminate_and_wait(child: &mut OwnedChild, observer: Option<&CustodyObserver>) -> bool {
     let _ = child.terminate();
-    let deadline = Instant::now() + CLEANUP_GRACE;
-    let status = matches!(timeout_at(deadline, child.wait()).await, Ok(Ok(_)));
-    status
-        && matches!(
-            wait_for_quiescence(child, observer, deadline).await,
-            Ok(true)
-        )
+    #[cfg(target_os = "linux")]
+    {
+        let mut root_exit_observed = false;
+        let mut status = None;
+        return settle_linux_custody(child, observer, &mut root_exit_observed, &mut status).await;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let deadline = Instant::now() + CLEANUP_GRACE;
+        let status = matches!(timeout_at(deadline, child.wait()).await, Ok(Ok(_)));
+        status
+            && matches!(
+                wait_for_quiescence(child, observer, deadline).await,
+                Ok(true)
+            )
+    }
 }
 
 async fn wait_for_quiescence(
@@ -534,13 +713,22 @@ async fn wait_for_quiescence(
     observer: Option<&CustodyObserver>,
     deadline: Instant,
 ) -> Result<bool, ()> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = observer;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        child
+            .wait_group_empty_except_leader(remaining)
+            .await
+            .map_err(|_| ())
+    }
     #[cfg(windows)]
     {
         let _ = observer;
         let remaining = deadline.saturating_duration_since(Instant::now());
         child.wait_family_empty(remaining).await.map_err(|_| ())
     }
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
         let _ = child;
         let Some(observer) = observer else {
@@ -595,6 +783,8 @@ async fn join_bounded<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use std::process::Child as StdChild;
     use std::{
         io::Write,
         process::{Command as StdCommand, Stdio as StdStdio},
@@ -614,6 +804,97 @@ mod tests {
 
     fn cancellation() -> (watch::Sender<bool>, watch::Receiver<bool>) {
         watch::channel(false)
+    }
+
+    #[cfg(unix)]
+    fn unsuccessful_exit_status() -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        ExitStatus::from_raw(7 << 8)
+    }
+
+    #[cfg(windows)]
+    fn unsuccessful_exit_status() -> ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+        ExitStatus::from_raw(7)
+    }
+
+    #[cfg(unix)]
+    fn successful_exit_status() -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        ExitStatus::from_raw(0)
+    }
+
+    #[cfg(windows)]
+    fn successful_exit_status() -> ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+        ExitStatus::from_raw(0)
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn known_nonzero_exit_stays_failed_when_stderr_drain_is_incomplete() {
+        #[cfg(unix)]
+        let custody = CustodyGuarantee::Degraded;
+        #[cfg(windows)]
+        let custody = CustodyGuarantee::Exact;
+
+        let outcome = classify_quiescent_capture(ProcessCapture {
+            stdout: br#"{"action":"send"}"#.to_vec(),
+            stdout_complete: true,
+            stderr: StderrSnapshot {
+                text: "[REDACTED]".to_owned(),
+                truncated: true,
+                eof: false,
+                read_error: true,
+            },
+            status: unsuccessful_exit_status(),
+            custody,
+        });
+
+        let ProcessOutcome::Failed {
+            reason: ProcessFailure::Exit,
+            capture: Some(capture),
+        } = outcome
+        else {
+            panic!("known nonzero exit must remain a failure");
+        };
+        assert!(capture.stdout_complete);
+        assert_eq!(capture.stderr.text, "[REDACTED]");
+        assert!(capture.stderr.truncated);
+        assert!(!capture.stderr.eof);
+        assert!(capture.stderr.read_error);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn known_success_stays_completed_when_stderr_drain_is_incomplete() {
+        #[cfg(unix)]
+        let custody = CustodyGuarantee::Degraded;
+        #[cfg(windows)]
+        let custody = CustodyGuarantee::Exact;
+
+        let outcome = classify_quiescent_capture(ProcessCapture {
+            stdout: br#"{"action":"send"}"#.to_vec(),
+            stdout_complete: true,
+            stderr: StderrSnapshot {
+                text: "[REDACTED]".to_owned(),
+                truncated: true,
+                eof: false,
+                read_error: true,
+            },
+            status: successful_exit_status(),
+            custody,
+        });
+
+        let ProcessOutcome::Completed(capture) = outcome else {
+            panic!("known success must remain completed");
+        };
+        assert!(capture.stdout_complete);
+        assert_eq!(capture.stdout, br#"{"action":"send"}"#);
+        assert_eq!(capture.stderr.text, "[REDACTED]");
+        assert!(capture.stderr.truncated);
+        assert!(!capture.stderr.eof);
+        assert!(capture.stderr.read_error);
     }
 
     #[tokio::test]
@@ -719,6 +1000,72 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn timeout_after_root_exit_kills_owned_group_and_preserves_unrelated_group() {
+        use std::os::unix::process::CommandExt;
+
+        struct ChildGuard(StdChild);
+
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+        }
+
+        let mut unrelated = StdCommand::new(std::env::current_exe().expect("test executable"));
+        unrelated
+            .args(["--exact", FIXTURE_TEST, "--nocapture"])
+            .env(FIXTURE_ENV, "hold")
+            .stdin(StdStdio::null())
+            .stdout(StdStdio::null())
+            .stderr(StdStdio::null())
+            .process_group(0);
+        let mut unrelated = ChildGuard(unrelated.spawn().expect("spawn unrelated group"));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            unrelated
+                .0
+                .try_wait()
+                .expect("observe unrelated group")
+                .is_none(),
+            "unrelated process must be live before the script run"
+        );
+
+        let (_sender, receiver) = cancellation();
+        let started = Instant::now();
+        let outcome = run_owned_process(
+            fixture_command("descendant-hold"),
+            Vec::new(),
+            Duration::from_millis(100),
+            Arc::new(SecretPolicy::default()),
+            receiver,
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            ProcessOutcome::Unknown {
+                reason: ProcessUncertainty::InterruptedSuccess,
+                quiescent: true,
+            }
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "owned-group cleanup must not wait for the fixture descendant's natural exit"
+        );
+        assert!(
+            unrelated
+                .0
+                .try_wait()
+                .expect("recheck unrelated group")
+                .is_none(),
+            "timeout cleanup must preserve a different process group"
+        );
+    }
+
     #[tokio::test]
     async fn process_fixture() {
         let Ok(mode) = std::env::var(FIXTURE_ENV) else {
@@ -761,8 +1108,25 @@ mod tests {
                     .expect("spawn bounded descendant fixture");
                 std::process::exit(0);
             }
+            "descendant-hold" => {
+                let mut descendant =
+                    StdCommand::new(std::env::current_exe().expect("test executable"));
+                descendant
+                    .args(["--exact", FIXTURE_TEST, "--nocapture"])
+                    .env(FIXTURE_ENV, "hold")
+                    .stdin(StdStdio::inherit())
+                    .stdout(StdStdio::inherit())
+                    .stderr(StdStdio::inherit())
+                    .spawn()
+                    .expect("spawn retained descendant fixture");
+                std::process::exit(0);
+            }
             "brief" => {
                 thread::sleep(Duration::from_millis(300));
+                std::process::exit(0);
+            }
+            "hold" => {
+                thread::sleep(Duration::from_secs(6));
                 std::process::exit(0);
             }
             _ => std::process::exit(2),

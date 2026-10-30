@@ -273,6 +273,9 @@ pub(crate) struct ProcessGroupIdentity {
 }
 
 #[cfg(target_os = "linux")]
+const MAX_PROC_SCAN_ENTRIES: usize = 65_536;
+
+#[cfg(target_os = "linux")]
 pub(crate) fn capture_process_group_identity(pid: u32) -> Result<ProcessGroupIdentity> {
     let (pgid, start_ticks) = read_linux_process_identity(pid)
         .map_err(|error| unknown_process_identity("cannot read spawned process identity", error))?;
@@ -306,15 +309,7 @@ pub(crate) fn capture_process_group_identity(_pid: u32) -> Result<ProcessGroupId
 pub(crate) fn terminate_process_group(identity: &ProcessGroupIdentity) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        let (pgid, start_ticks) = read_linux_process_identity(identity.pid).map_err(|error| {
-            unknown_process_identity("cannot revalidate process-group leader", error)
-        })?;
-        if pgid != identity.pgid || start_ticks != identity.start_ticks {
-            return Err(Error::new(
-                "process_custody_unknown",
-                "process-group leader PID birth or PGID changed; no signal was sent",
-            ));
-        }
+        validate_process_group_leader(identity)?;
 
         // The owner retains the Tokio child until wait succeeds. A reaped leader
         // loses this identity in OwnedChild, so its numeric PGID cannot be reused
@@ -342,6 +337,110 @@ pub(crate) fn terminate_process_group(identity: &ProcessGroupIdentity) -> Result
             "no exact Unix process-group identity is available; no signal was sent",
         ))
     }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_process_group_leader(identity: &ProcessGroupIdentity) -> Result<()> {
+    let (pgid, start_ticks) = read_linux_process_identity(identity.pid).map_err(|error| {
+        unknown_process_identity("cannot revalidate process-group leader", error)
+    })?;
+    if pgid != identity.pgid || start_ticks != identity.start_ticks {
+        return Err(Error::new(
+            "process_custody_unknown",
+            "process-group leader PID birth or PGID changed; no signal was sent",
+        ));
+    }
+    Ok(())
+}
+
+/// Observe the retained direct child without consuming its wait status. The
+/// caller must keep the Tokio Child and birth-checked group identity alive.
+#[cfg(target_os = "linux")]
+pub(crate) fn process_group_leader_exited_unreaped(
+    identity: &ProcessGroupIdentity,
+) -> Result<bool> {
+    validate_process_group_leader(identity)?;
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: this is our retained direct child, and WNOWAIT leaves its exit
+    // status waitable so the validated leader continues to anchor its PGID.
+    if unsafe {
+        libc::waitid(
+            libc::P_PID,
+            identity.pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    } != 0
+    {
+        return Err(io_error(
+            "observe unreaped process-group leader exit",
+            std::io::Error::last_os_error(),
+        ));
+    }
+
+    // WNOHANG may return no waitable child. The siginfo value was zeroed first
+    // so kernels that leave it untouched also produce the no-exit result.
+    let pid = unsafe { info.si_pid() };
+    if pid == 0 {
+        return Ok(false);
+    }
+    if u32::try_from(pid).ok() != Some(identity.pid)
+        || !matches!(
+            info.si_code,
+            libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+        )
+    {
+        return Err(Error::new(
+            "process_custody_unknown",
+            "waitid returned an unexpected child identity or state",
+        ));
+    }
+    validate_process_group_leader(identity)?;
+    Ok(true)
+}
+
+/// Check the recorded group while its exact exited leader is still unreaped.
+/// Only that revalidated leader is excluded; every other PGID member retains it.
+#[cfg(target_os = "linux")]
+pub(crate) fn process_group_empty_except_leader(identity: &ProcessGroupIdentity) -> Result<bool> {
+    if !process_group_leader_exited_unreaped(identity)? {
+        return Ok(false);
+    }
+    let entries = fs::read_dir("/proc")
+        .map_err(|error| io_error("enumerate retained process group", error))?;
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_PROC_SCAN_ENTRIES {
+            return Err(Error::new(
+                "process_custody_unknown",
+                "process-group scan exceeded its existing observation bound",
+            ));
+        }
+        let entry = entry.map_err(|error| io_error("read process directory entry", error))?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == identity.pid {
+            validate_process_group_leader(identity)?;
+            continue;
+        }
+        match read_linux_process_identity(pid) {
+            Ok((pgid, _)) if pgid == identity.pgid => return Ok(false),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(unknown_process_identity(
+                    "cannot observe a retained process-group member",
+                    error,
+                ));
+            }
+        }
+    }
+    validate_process_group_leader(identity)?;
+    process_group_leader_exited_unreaped(identity)
 }
 
 #[cfg(target_os = "linux")]
@@ -536,7 +635,7 @@ impl ProcessObserver {
         // /proc is host-wide: both scanned directory entries and returned group
         // members are bounded. This never limits spawning or signals a process.
         for (index, entry) in entries.enumerate() {
-            if index >= 65_536 {
+            if index >= MAX_PROC_SCAN_ENTRIES {
                 snapshot.complete = false;
                 break;
             }

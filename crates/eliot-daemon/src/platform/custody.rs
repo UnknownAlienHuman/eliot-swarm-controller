@@ -1,7 +1,7 @@
 use eliot_core::{Error, Result};
 use eliot_plugin::sync::LockExt;
 use std::process::ExitStatus;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use std::time::Duration;
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
@@ -93,6 +93,53 @@ impl OwnedChild {
                 return Ok(false);
             }
             tokio::time::sleep((deadline - now).min(Duration::from_millis(10))).await;
+        }
+    }
+
+    /// Observe the Linux direct child exit without reaping its birth-checked
+    /// group leader. Call `wait()` only after the retained group is settled.
+    #[cfg(target_os = "linux")]
+    pub async fn wait_exit_unreaped(&mut self) -> Result<()> {
+        loop {
+            if self.try_wait_exit_unreaped()? {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Nonblocking, non-reaping Linux exit observation for timeout arbitration.
+    #[cfg(target_os = "linux")]
+    pub fn try_wait_exit_unreaped(&self) -> Result<bool> {
+        let identity = self.identity.ok_or_else(|| {
+            Error::new(
+                "process_custody_unknown",
+                "owned process-group identity is unavailable",
+            )
+        })?;
+        super::unix::process_group_leader_exited_unreaped(&identity)
+    }
+
+    /// Wait until the retained exited leader is the only process in its group.
+    /// Reaping it is deliberately left to the existing `wait()` method.
+    #[cfg(target_os = "linux")]
+    pub async fn wait_group_empty_except_leader(&self, timeout: Duration) -> Result<bool> {
+        let identity = self.identity.ok_or_else(|| {
+            Error::new(
+                "process_custody_unknown",
+                "owned process-group identity is unavailable",
+            )
+        })?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if super::unix::process_group_empty_except_leader(&identity)? {
+                return Ok(true);
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Ok(false);
+            }
+            tokio::time::sleep((deadline - now).min(Duration::from_millis(50))).await;
         }
     }
 
