@@ -44,7 +44,7 @@ impl RuleCatchUpAction {
 #[derive(Clone, Debug, PartialEq)]
 pub struct RuleCatchUpAdmission {
     pub parent: Command,
-    pub children: Vec<Command>,
+    pub children: Vec<Admission>,
     pub events: Vec<Event>,
     pub is_new: bool,
 }
@@ -114,7 +114,7 @@ pub struct RuleEventAdmission {
     /// Absent only for a cause-depth-suppressed event, which advances the
     /// cursor without creating a parent or action command.
     pub parent: Option<Command>,
-    pub child: Option<Command>,
+    pub child: Option<Admission>,
     pub events: Vec<Event>,
     pub is_new: bool,
 }
@@ -342,7 +342,7 @@ pub struct TimerSlotCommit {
 pub struct TimerSlotAdmission {
     pub state: core::api::TimerStateView,
     pub parent: Option<Command>,
-    pub child: Option<Command>,
+    pub child: Option<Admission>,
     pub events: Vec<Event>,
     pub is_new: bool,
     pub blocked: bool,
@@ -757,6 +757,34 @@ impl Store {
         result
     }
 
+    /// Resolve an already committed event firing before the caller prepares or
+    /// freezes the action. The captured definition revision is part of its key.
+    pub fn replay_rule_event_action(
+        &self,
+        principal: &str,
+        state: &core::api::RuleStateView,
+        revision: i64,
+        event_seq: i64,
+    ) -> Result<Option<RuleEventAdmission>> {
+        require_nonempty(principal, "principal")?;
+        require_nonempty(&state.id, "rule id")?;
+        if revision <= 0 || event_seq <= 0 {
+            return Err(Error::new(
+                "invalid",
+                "rule replay revision and event sequence must be positive",
+            ));
+        }
+        let stored = load_rule_state(&self.connection, principal, &state.id)?
+            .ok_or_else(|| Error::new("not_found", "rule state was not found"))?;
+        load_retained_rule_event_action(
+            &self.connection,
+            principal,
+            &stored,
+            revision,
+            event_seq,
+        )
+    }
+
     fn admit_rule_action_inner(
         &mut self,
         principal: &str,
@@ -777,7 +805,6 @@ impl Store {
             .map_err(sql_error)?;
         let stored = load_rule_state(&tx, principal, &state.id)?
             .ok_or_else(|| Error::new("not_found", "rule state was not found"))?;
-        let trigger = load_rule_trigger(&tx, event_seq)?;
         let retiring = rule_cursor_is_retiring(&stored.view, event_seq);
         let cursor = if retiring {
             stored
@@ -795,6 +822,13 @@ impl Store {
         } else {
             stored.view.revision
         };
+        if let Some(replay) =
+            load_retained_rule_event_action(&tx, principal, &stored, revision, event_seq)?
+        {
+            commit_transaction(tx, &self.write_faulted)?;
+            return Ok(replay);
+        }
+        let trigger = load_rule_trigger(&tx, event_seq)?;
         let key = RuleFiringKey::event(
             principal,
             &stored.view,
@@ -803,29 +837,6 @@ impl Store {
             trigger.cause.clone(),
         )?;
 
-        if let Some(parent) = load_command(&tx, &key.parent_id)? {
-            if !key.matches_parent(&parent, principal) {
-                return Err(Error::new(
-                    "source_integrity",
-                    "derived rule parent id is bound to another action",
-                ));
-            }
-            if cursor < event_seq {
-                return Err(Error::new(
-                    "source_integrity",
-                    "rule parent exists before its event cursor commit",
-                ));
-            }
-            let child = load_rule_child(&tx, &key.parent_id, &key.child_id)?;
-            commit_transaction(tx, &self.write_faulted)?;
-            return Ok(RuleEventAdmission {
-                state: stored.view,
-                parent: Some(parent),
-                child,
-                events: Vec::new(),
-                is_new: false,
-            });
-        }
         if cursor >= event_seq {
             return Err(Error::new(
                 "bad_state",
@@ -854,6 +865,12 @@ impl Store {
                 events: Vec::new(),
                 is_new: true,
             });
+        }
+        if has_open_rule_actions_tx(&tx, principal, &state.id)? {
+            return Err(Error::new(
+                "bad_state",
+                "an open or unknown rule child blocks a new firing",
+            ));
         }
         let binding_error = if request.verb == "run" {
             rule_run_action_binding_error(&tx, principal, &state.id, revision, event_seq, &request)?
@@ -915,7 +932,7 @@ impl Store {
         // submit_tx validates and admits the ordinary rule action. Its verb path
         // performs the normal deterministic checks before inserting the child;
         // the surrounding transaction rolls every write back on persistence failure.
-        let (parent, child, events) = match admit_rule_action_tx(&tx, &key, request, now) {
+        let (parent, child_admission, events) = match admit_rule_action_tx(&tx, &key, request, now) {
             Ok(admission) => admission,
             Err(error) if core::is_deterministic_pre_admission_rejection(&error.code) => {
                 return reject_rule_event(tx, &self.write_faulted, &key, &error.code, now);
@@ -928,13 +945,13 @@ impl Store {
         Ok(RuleEventAdmission {
             state: view,
             parent: Some(parent),
-            child: Some(child),
+            child: Some(child_admission),
             events,
             is_new: true,
         })
     }
 
-    pub fn recover_rule_children(&self, after: Option<&str>, limit: usize) -> Result<Vec<Command>> {
+    pub fn recover_rule_children(&self, after: Option<&str>, limit: usize) -> Result<Vec<Admission>> {
         validate_limit(limit)?;
         if let Some(after) = after {
             validate_ulid(after)?;
@@ -950,13 +967,31 @@ impl Store {
                         created_at, updated_at, probe
                  FROM commands
                  WHERE link_kind = 'rule_action' AND ordinal IS NOT NULL
-                   AND state IN ('accepted','queued')
+                   AND (
+                       state IN ('accepted','queued')
+                       OR (verb = 'launch' AND state = 'applied'
+                           AND EXISTS (
+                               SELECT 1 FROM commands input
+                               WHERE input.parent_command = commands.id
+                                 AND input.link_kind = 'send' AND input.ordinal = 0
+                                 AND input.state IN ('accepted','queued')
+                           ))
+                   )
                    AND NOT EXISTS (
                        SELECT 1 FROM commands earlier
                        WHERE earlier.parent_command = commands.parent_command
                          AND earlier.link_kind = 'rule_action'
                          AND earlier.ordinal < commands.ordinal
-                         AND earlier.state IN ('accepted','queued','dispatched','unknown')
+                         AND (
+                             earlier.state IN ('accepted','queued','dispatched','unknown')
+                             OR (earlier.verb = 'launch' AND earlier.state = 'applied'
+                                 AND EXISTS (
+                                     SELECT 1 FROM commands input
+                                     WHERE input.parent_command = earlier.id
+                                       AND input.link_kind = 'send' AND input.ordinal = 0
+                                       AND input.state IN ('accepted','queued','dispatched','unknown')
+                                 ))
+                         )
                    )
                    AND (?1 IS NULL OR id > ?1)
                  ORDER BY id LIMIT ?2",
@@ -965,12 +1000,13 @@ impl Store {
         let rows = statement
             .query_map(params![after, limit as i64], command_record_from_row)
             .map_err(sql_error)?;
-        let mut commands = Vec::new();
+        let mut admissions = Vec::new();
         for row in rows {
-            commands.push(command_from_raw(row.map_err(sql_error)?)?.command);
+            let command = command_from_raw(row.map_err(sql_error)?)?.command;
+            admissions.push(retained_action_admission(&self.connection, command)?);
         }
-        enforce_page_bytes(&mut commands)?;
-        Ok(commands)
+        ensure_admission_page(&admissions)?;
+        Ok(admissions)
     }
 
     /// Persist a timer's immutable schedule beside its owning rule state. The
@@ -1287,7 +1323,7 @@ impl Store {
                     }
                     Err(error) => return Err(error),
                 }
-            } else if !valid_rule_action_request(&action, false) {
+            } else if !valid_timer_action_request(&action) {
                 Some("rule_action_binding_invalid".to_owned())
             } else {
                 None
@@ -1471,7 +1507,7 @@ impl Store {
                     "timer Run must be targetless and have no Agent bindings",
                 ));
             }
-        } else if !valid_rule_action_request(&action, false) {
+        } else if !valid_timer_action_request(&action) {
             return Err(Error::new(
                 "invalid",
                 "timer action is not a valid rule action",
@@ -1774,6 +1810,13 @@ fn validate_project_rule_action_tx(
     principal: &str,
     request: &SubmitCommand,
 ) -> Result<Option<core::api::ProjectRegistrationView>> {
+    if request.verb == "launch" {
+        return super::projects::validate_project_rule_launch_action_tx(
+            tx,
+            principal,
+            &request.args,
+        );
+    }
     if request.verb == "run" {
         if rule_project_id(principal)?.is_none() {
             return Ok(None);
@@ -2146,7 +2189,7 @@ fn replay_timer_run_tx(
     connection: &Connection,
     principal: &str,
     request: &core::api::TimerRunRequest,
-) -> Result<Option<(Command, Option<Command>)>> {
+) -> Result<Option<(Command, Option<Admission>)>> {
     let digest = timer_run_digest(request)?;
     let Some((old_principal, old_method, old_digest)) = command_binding(connection, &request.id)?
     else {
@@ -2166,7 +2209,8 @@ fn replay_timer_run_tx(
             "timer command binding does not match its retained parent",
         ));
     }
-    let child = load_linked_command(connection, &request.id)?;
+    let child_id = derived_manual_timer_id(principal, &request.rule, &request.id)?;
+    let child = load_rule_child(connection, &request.id, &child_id)?;
     Ok(Some((parent, child)))
 }
 
@@ -2790,6 +2834,9 @@ pub(super) fn valid_rule_action_request(request: &SubmitCommand, allow_interrupt
 }
 
 fn valid_event_rule_action_request(request: &SubmitCommand) -> bool {
+    if request.verb == "launch" {
+        return valid_targetless_rule_launch_request(request);
+    }
     let reply = matches!(request.verb.as_str(), "approve" | "deny" | "answer");
     if request.verb != "steer" && !reply {
         return valid_rule_action_request(request, true);
@@ -2832,6 +2879,25 @@ fn valid_targetless_rule_run_request(request: &SubmitCommand) -> bool {
         && request.request_id.is_none()
         && !request.probe
         && request.args.is_object()
+}
+
+fn valid_targetless_rule_launch_request(request: &SubmitCommand) -> bool {
+    request.validate().is_ok()
+        && request.verb == "launch"
+        && request.target.is_none()
+        && request.expected_generation == Some(0)
+        && request.expected_turn_id.is_none()
+        && request.request_id.is_none()
+        && !request.probe
+        && request.args.is_object()
+}
+
+fn valid_timer_action_request(request: &SubmitCommand) -> bool {
+    if request.verb == "launch" {
+        valid_targetless_rule_launch_request(request)
+    } else {
+        valid_rule_action_request(request, false)
+    }
 }
 
 fn expected_timer_script_context(
@@ -3041,46 +3107,83 @@ pub(super) fn gate_rule_action_dispatch_tx(
 
     let mut failed_predecessor = None;
     for (index, row) in sibling_rows.iter().take(current_index).enumerate() {
-        match parse_enum::<CommandState>(&row.3, "command state")? {
-            CommandState::Applied => {}
-            CommandState::Rejected | CommandState::Failed | CommandState::Cancelled => {
-                failed_predecessor = Some(index);
-                break;
-            }
+        let predecessor_state = parse_enum::<CommandState>(&row.3, "command state")?;
+        let mut predecessor_pending = matches!(
+            predecessor_state,
             CommandState::Accepted
-            | CommandState::Queued
-            | CommandState::Dispatched
-            | CommandState::Unknown => {
-                let current = load_command_record(tx, command_id)?.ok_or_else(|| {
-                    Error::new("source_integrity", "rule-action child disappeared")
-                })?;
-                if current.state == CommandState::Accepted {
-                    let target = current.target.ok_or_else(|| {
-                        Error::new("source_integrity", "rule-action child has no target")
-                    })?;
-                    let generation = current
-                        .command
-                        .generation
-                        .or(current.command.expected_generation)
-                        .ok_or_else(|| {
-                            Error::new("source_integrity", "rule-action child has no generation")
-                        })?;
-                    update_command_state(tx, command_id, CommandState::Queued, None, None, now)?;
-                    events.push(insert_daemon_command_event(
-                        tx,
-                        now,
-                        "command.queued",
-                        Some(target),
-                        Some(generation),
-                        command_id,
-                        json!({
-                            "command_id": command_id,
-                            "reason": "rule_action_predecessor_pending",
-                        }),
-                    )?);
+                | CommandState::Queued
+                | CommandState::Dispatched
+                | CommandState::Unknown
+        );
+        let mut predecessor_failed = matches!(
+            predecessor_state,
+            CommandState::Rejected | CommandState::Failed | CommandState::Cancelled
+        );
+        if predecessor_state == CommandState::Applied {
+            let predecessor = load_command_record(tx, &row.0)?.ok_or_else(|| {
+                Error::new("source_integrity", "rule-action predecessor disappeared")
+            })?;
+            if predecessor.command.verb == "launch" {
+                let expects_linked_send = predecessor
+                    .command
+                    .args
+                    .get("text")
+                    .is_some_and(|text| !text.is_null());
+                let linked_send = load_linked_command(tx, &row.0)?;
+                if expects_linked_send != linked_send.is_some() {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "applied launch predecessor has an inconsistent linked-send child",
+                    ));
                 }
-                return Ok(RuleActionDispatchGate::Held);
+                if let Some(linked_send) = linked_send {
+                    match linked_send.state {
+                        CommandState::Applied => {}
+                        CommandState::Rejected
+                        | CommandState::Failed
+                        | CommandState::Cancelled => predecessor_failed = true,
+                        CommandState::Accepted
+                        | CommandState::Queued
+                        | CommandState::Dispatched
+                        | CommandState::Unknown => predecessor_pending = true,
+                    }
+                }
             }
+        }
+        if predecessor_failed {
+            failed_predecessor = Some(index);
+            break;
+        }
+        if predecessor_pending {
+            let current = load_command_record(tx, command_id)?.ok_or_else(|| {
+                Error::new("source_integrity", "rule-action child disappeared")
+            })?;
+            if current.state == CommandState::Accepted {
+                let target = current.target.ok_or_else(|| {
+                    Error::new("source_integrity", "rule-action child has no target")
+                })?;
+                let generation = current
+                    .command
+                    .generation
+                    .or(current.command.expected_generation)
+                    .ok_or_else(|| {
+                        Error::new("source_integrity", "rule-action child has no generation")
+                    })?;
+                update_command_state(tx, command_id, CommandState::Queued, None, None, now)?;
+                events.push(insert_daemon_command_event(
+                    tx,
+                    now,
+                    "command.queued",
+                    Some(target),
+                    Some(generation),
+                    command_id,
+                    json!({
+                        "command_id": command_id,
+                        "reason": "rule_action_predecessor_pending",
+                    }),
+                )?);
+            }
+            return Ok(RuleActionDispatchGate::Held);
         }
     }
     let Some(failed_index) = failed_predecessor else {
@@ -3122,7 +3225,15 @@ fn has_open_rule_actions_tx(tx: &Transaction<'_>, principal: &str, rule: &str) -
              SELECT 1 FROM commands child
              JOIN commands parent ON parent.id = child.parent_command
              WHERE child.link_kind = 'rule_action' AND child.ordinal IS NOT NULL
-               AND child.state IN ('accepted','queued','dispatched','unknown')
+               AND (
+                   child.state IN ('accepted','queued','dispatched','unknown')
+                   OR (child.verb = 'launch' AND EXISTS (
+                       SELECT 1 FROM commands input
+                       WHERE input.parent_command = child.id
+                         AND input.link_kind = 'send' AND input.ordinal = 0
+                         AND input.state IN ('accepted','queued','dispatched','unknown')
+                   ))
+               )
                 AND (
                     (parent.principal = ?1
                      AND json_extract(parent.args, '$.rule') = ?2)
@@ -3509,6 +3620,9 @@ fn rule_action_binding_error(event: &StoredRuleTrigger, request: &SubmitCommand)
     if !valid_event_rule_action_request(request) {
         return Some("rule_action_binding_invalid".to_owned());
     }
+    if request.verb == "launch" {
+        return None;
+    }
     if request.target != event.agent.map(format_agent_id)
         || request.expected_generation != event.generation
         || (matches!(
@@ -3776,7 +3890,7 @@ fn admit_rule_action_tx(
     key: &RuleFiringKey<'_>,
     mut request: SubmitCommand,
     now: i64,
-) -> Result<(Command, Command, Vec<Event>)> {
+) -> Result<(Command, Admission, Vec<Event>)> {
     let parent_cause = key.command_cause(&key.parent_id)?;
     let child_cause = key.command_cause(&key.child_id)?;
     request.id = key.child_id.clone();
@@ -3788,8 +3902,25 @@ fn admit_rule_action_tx(
         ));
     }
 
-    let child = child_admission.command;
-    annotate_rule_command_event(tx, &child.id, &mut child_admission.events, child_cause)?;
+    let child_id = child_admission.command.id.clone();
+    annotate_rule_command_event(
+        tx,
+        &child_id,
+        &mut child_admission.events,
+        child_cause.clone(),
+    )?;
+    if let Some(linked_command) = &child_admission.linked_command {
+        annotate_rule_command_event(
+            tx,
+            &linked_command.id,
+            &mut child_admission.events,
+            core::EventCause {
+                command_id: linked_command.id.clone(),
+                rule: child_cause.rule.clone(),
+                depth: child_cause.depth,
+            },
+        )?;
+    }
     let (parent, mut parent_event) = insert_rule_parent(tx, key, RuleParentOutcome::Admitted, now)?;
     annotate_new_command_cause_tx(tx, &parent.id, &mut parent_event, parent_cause.clone())?;
     let linked = tx
@@ -3798,7 +3929,7 @@ fn admit_rule_action_tx(
              SET parent_command = ?1, link_kind = 'rule_action', ordinal = 0
              WHERE id = ?2 AND parent_command IS NULL
                AND link_kind IS NULL AND ordinal IS NULL",
-            params![key.parent_id, child.id],
+            params![key.parent_id, child_id],
         )
         .map_err(sql_error)?;
     if linked != 1 {
@@ -3808,16 +3939,16 @@ fn admit_rule_action_tx(
         ));
     }
 
-    let mut events = child_admission.events;
+    let mut events = child_admission.events.iter().cloned().collect::<Vec<_>>();
     events.push(parent_event);
     events.push(insert_rule_event_with_cause(
         tx,
         now,
         "rule.fired",
-        key.fired_data(&child.id),
+        key.fired_data(&child_id),
         Some(parent_cause),
     )?);
-    Ok((parent, child, events))
+    Ok((parent, child_admission, events))
 }
 
 pub(super) fn annotate_rule_command_event(
@@ -3878,7 +4009,7 @@ fn load_rule_child(
     connection: &Connection,
     parent_id: &str,
     expected_child_id: &str,
-) -> Result<Option<Command>> {
+) -> Result<Option<Admission>> {
     let child_id: Option<String> = connection
         .query_row(
             "SELECT id FROM commands
@@ -3897,7 +4028,156 @@ fn load_rule_child(
             "rule parent child id does not match its deterministic action id",
         ));
     }
-    load_command(connection, &child_id)
+    let command = load_command(connection, &child_id)?.ok_or_else(|| {
+        Error::new("source_integrity", "rule parent child command is missing")
+    })?;
+    Ok(Some(retained_action_admission(connection, command)?))
+}
+
+fn retained_action_admission(connection: &Connection, command: Command) -> Result<Admission> {
+    let linked_command = if command.verb == "launch" {
+        load_linked_command(connection, &command.id)?
+    } else {
+        None
+    };
+    let expects_linked_send = command
+        .args
+        .get("text")
+        .is_some_and(|text| !text.is_null());
+    match (expects_linked_send, linked_command.as_ref()) {
+        (true, Some(linked))
+            if linked.id == format!("{}/send", command.id)
+                && linked.principal == command.principal
+                && linked.verb == "send"
+                && linked.target == command.target
+                && linked.expected_generation == Some(1)
+                && linked.generation == Some(1)
+                && linked.args.get("text") == command.args.get("text") => {}
+        (false, None) => {}
+        _ => {
+            return Err(Error::new(
+                "source_integrity",
+                "rule launch linked-send row differs from its retained command",
+            ));
+        }
+    }
+    Ok(Admission {
+        command,
+        linked_command,
+        events: Vec::new(),
+        is_new: false,
+    })
+}
+
+fn ensure_admission_page(admissions: &[Admission]) -> Result<()> {
+    if admissions.len() > MAX_PAGE_ENTRIES {
+        return Err(Error::new(
+            "frame_too_large",
+            "admission page exceeds the bounded entry count",
+        ));
+    }
+    let commands = admissions
+        .iter()
+        .map(|admission| &admission.command)
+        .collect::<Vec<_>>();
+    let linked = admissions
+        .iter()
+        .filter_map(|admission| admission.linked_command.as_ref())
+        .collect::<Vec<_>>();
+    let command_bytes = serde_json::to_vec(&commands)
+        .map_err(|_| Error::new("internal", "recovered commands cannot be encoded"))?;
+    let linked_bytes = serde_json::to_vec(&linked)
+        .map_err(|_| Error::new("internal", "recovered linked commands cannot be encoded"))?;
+    if command_bytes.len().saturating_add(linked_bytes.len()) > MAX_PAGE_BYTES {
+        return Err(Error::new(
+            "frame_too_large",
+            "recovered rule admissions exceed the page byte bound",
+        ));
+    }
+    Ok(())
+}
+
+fn load_retained_rule_event_action(
+    connection: &Connection,
+    principal: &str,
+    stored: &StoredRuleState,
+    revision: i64,
+    event_seq: i64,
+) -> Result<Option<RuleEventAdmission>> {
+    let key = RuleFiringKey::event(principal, &stored.view, revision, event_seq, None)?;
+    let Some(parent) = load_command(connection, &key.parent_id)? else {
+        return Ok(None);
+    };
+    if !key.matches_parent(&parent, principal) {
+        return Err(Error::new(
+            "source_integrity",
+            "derived rule parent id is bound to another action",
+        ));
+    }
+    if stored.view.current_cursor < event_seq
+        && stored
+            .view
+            .retiring_cursor
+            .is_none_or(|cursor| cursor < event_seq)
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "rule parent exists before its event cursor commit",
+        ));
+    }
+    let expected_children = match &parent.state {
+        CommandState::Applied => vec![key.child_id.clone()],
+        CommandState::Rejected => Vec::new(),
+        _ => {
+            return Err(Error::new(
+                "source_integrity",
+                "retained rule parent has a nonterminal admission state",
+            ));
+        }
+    };
+    let recorded_children = parent
+        .outcome
+        .as_ref()
+        .and_then(|outcome| outcome.get("children"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "retained rule parent has no fixed child set",
+            )
+        })?
+        .iter()
+        .map(|child| {
+            child
+                .as_str()
+                .ok_or_else(|| Error::new("source_integrity", "retained rule child ID is invalid"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if recorded_children
+        .iter()
+        .map(|child| (*child).to_owned())
+        .collect::<Vec<_>>()
+        != expected_children
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "retained rule parent child set differs from its deterministic action",
+        ));
+    }
+    let child = load_rule_child(connection, &key.parent_id, &key.child_id)?;
+    if child.is_some() != (parent.state == CommandState::Applied) {
+        return Err(Error::new(
+            "source_integrity",
+            "retained rule child rows differ from the parent outcome",
+        ));
+    }
+    Ok(Some(RuleEventAdmission {
+        state: stored.view.clone(),
+        parent: Some(parent),
+        child,
+        events: Vec::new(),
+        is_new: false,
+    }))
 }
 
 #[cfg(test)]
@@ -4186,7 +4466,7 @@ mod tests {
             .unwrap();
         assert!(first.is_new);
         let parent_id = first.parent.as_ref().expect("admitted parent").id.clone();
-        let child = first.child.as_ref().expect("admitted interrupt child");
+        let child = &first.child.as_ref().expect("admitted interrupt child").command;
         assert_eq!(child.verb, "interrupt");
         assert_eq!(child.target.as_deref(), Some(agent_id.as_str()));
         assert_eq!(child.expected_generation, Some(1));
@@ -4208,7 +4488,7 @@ mod tests {
             .unwrap();
         assert!(!replay.is_new);
         assert_eq!(replay.parent.as_ref().unwrap().id, parent_id);
-        assert_eq!(replay.child.as_ref().unwrap().id, child_id);
+        assert_eq!(replay.child.as_ref().unwrap().command.id, child_id);
         assert!(replay.events.is_empty());
         assert!(store.get_command(&child_id).unwrap().is_some());
     }
@@ -4547,7 +4827,7 @@ mod tests {
         assert!(admission.is_new);
         assert_eq!(admission.parent.state, CommandState::Applied);
         assert_eq!(admission.children.len(), 1);
-        let admitted_child = &admission.children[0];
+        let admitted_child = &admission.children[0].command;
         assert_eq!(admitted_child.verb, "interrupt");
         assert_eq!(admitted_child.turn_id.as_deref(), Some("turn-current"));
         assert_eq!(
@@ -4626,7 +4906,7 @@ mod tests {
             .unwrap();
         assert!(!replay.is_new);
         assert_eq!(replay.parent.id, admission.parent.id);
-        assert_eq!(replay.children[0].id, admitted_child.id);
+        assert_eq!(replay.children[0].command.id, admitted_child.id);
         assert!(replay.events.is_empty());
         assert_eq!(store.high_water().unwrap(), high_water);
     }
@@ -5121,7 +5401,7 @@ mod tests {
         assert_eq!(first.parent.verb, "rule.catch_up");
         assert_eq!(first.parent.args["revision"].as_i64(), Some(state.revision));
         assert_eq!(first.children.len(), 1);
-        let child = &first.children[0];
+        let child = &first.children[0].command;
         assert_eq!(child.target.as_deref(), Some(agent_id.as_str()));
         assert_eq!(child.expected_generation, Some(1));
         assert_eq!(child.generation, Some(1));
@@ -5153,7 +5433,7 @@ mod tests {
             Some(state.revision)
         );
         assert_eq!(replay.children.len(), 1);
-        assert_eq!(replay.children[0].id, child_id);
+        assert_eq!(replay.children[0].command.id, child_id);
         assert!(replay.events.is_empty());
         assert_eq!(store.high_water().unwrap(), high_water_after_edit);
 
@@ -5519,10 +5799,10 @@ mod tests {
         assert_eq!(admission.parent.id, request.id);
         assert_eq!(admission.children.len(), 1);
         assert_eq!(
-            admission.children[0].target.as_deref(),
+            admission.children[0].command.target.as_deref(),
             Some(agent_id.as_str())
         );
-        assert_eq!(admission.children[0].expected_generation, Some(1));
+        assert_eq!(admission.children[0].command.expected_generation, Some(1));
 
         let current_state = store
             .get_rule_state("owner", "history-rule")
@@ -5631,10 +5911,13 @@ mod tests {
             .unwrap();
         assert!(admission.is_new);
         assert_eq!(admission.children.len(), 2);
-        assert_ne!(admission.children[0].target, admission.children[1].target);
+        assert_ne!(
+            admission.children[0].command.target,
+            admission.children[1].command.target
+        );
 
-        let first_child_id = admission.children[0].id.clone();
-        let second_child_id = admission.children[1].id.clone();
+        let first_child_id = admission.children[0].command.id.clone();
+        let second_child_id = admission.children[1].command.id.clone();
         let first_link: (String, i64) = store
             .connection
             .query_row(
