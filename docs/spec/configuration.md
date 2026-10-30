@@ -146,7 +146,12 @@ fingerprint_max_bytes = 67108864
 [projects.app]
 path = "C:/src/app"
 profiles = ["codex-luna"]
-actions = ["interrupt", "send", "stop"]
+actions = ["run", "interrupt", "send", "stop"]
+run_env = ["CI"]
+
+[projects.app.interpreters.pwsh]
+program = "C:/Program Files/PowerShell/7/pwsh.exe"
+argv_prefix = ["-NoProfile", "-NonInteractive", "-File"]
 
 [accounts.codex-main]
 max_live = 8
@@ -192,14 +197,33 @@ profiles and implemented actions. Missing or empty allowlists deny all. Project
 registration readback uses the canonical Core `ProjectRegistrationView`; project identity
 includes the canonical checkout and Git common directory, not an Agent's project label.
 
+Project run uses two additional owner-global approvals. Each
+`[projects.ID.interpreters.NAME]` table requires an absolute `program` executable path
+and a literal `argv_prefix` array; its name is the interpreter reference used by `cmd[0]`.
+A missing or empty `interpreters` map denies project runs. `run_env` is an exact allowlist
+of nonsecret environment names; missing or empty `run_env` permits no action-supplied
+environment keys.
+
+`cmd[1]` must be a literal relative path resolving to a canonical regular file below
+the registered checkout's `.eliot/scripts/`. Reject escapes, symlinks/reparse points,
+devices and alternate streams. Freeze the selected path, size and digest with the
+command and verify them before spawn. Before spawn, authorize the `run` action in
+`actions` and resolve `cmd[0]` to an approved interpreter. After successful exit, check
+each emitted action separately against `actions` and the ordinary Router/Store fences
+before atomic child admission. The interpreter and `run_env` approvals are part of the
+canonical project registration snapshot/revision and are revalidated at admission and
+dispatch.
+
 Load project rules only from the registered checkout's `.eliot/rules/*.toml`, never from
 an Agent worktree. Project rule files have principal `project:ID`. The owner registration
-approves the profile and action sets; project files cannot define or override profiles,
-executables, model/effort, route/account, environment, credentials, permissions, workspace
-mode, or Git identity. A project `.eliot/config.toml` overlay is unsupported. Admission
-and dispatch recheck the registration and the target's approved profile, repository
-identity, workspace readiness, and exact generation before an effect. Missing or changed
-authority fails closed; there is no Owner fallback for a project-scoped request.
+approves the profile, action, interpreter and `run_env` sets; project files cannot define
+or override profiles, interpreter executables or fixed argv prefixes,
+model/effort, route/account, credentials, permissions, workspace mode or Git identity.
+A project rule may supply only literal `run.env` values for owner-approved names. A
+project `.eliot/config.toml` overlay is unsupported. Admission and dispatch recheck the
+registration and the target's approved profile, repository identity, workspace readiness,
+and exact generation before an effect. Missing or changed authority fails closed; there
+is no Owner fallback for a project-scoped request.
 
 Project configuration changes remain owner edits to the private global config. Invalid
 project rule reload retains the last valid definition and reports a bounded diagnostic.
@@ -308,6 +332,14 @@ and is not sent with the unauthenticated readiness request.
 secrets then reach the process. It is not default. Route/account selectors still remain
 explicit. Credential rotation may change authentication success but must not silently
 select another account/provider.
+
+Project script `run.env` is separate from profile `env` and `pass_env`: the child receives
+the minimal platform baseline, literal values for owner-approved `run_env` names and its
+Run identity. It does not inherit arbitrary owner/Agent environment, profile secrets or
+route/account credentials and selectors. `run_env` cannot name Eliot/Agent/Run identity,
+credential, route/account, native-store selector, Git identity, `PATH` or other reserved
+environment names; names compare case-insensitively on Windows. Project values cannot
+override the role-specific Run variables.
 
 Mask known secret values in native output and reject them in caller durable text.
 Private routing tokens are handled separately from semantic profile data. Native
