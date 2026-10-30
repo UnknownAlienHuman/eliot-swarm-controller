@@ -121,7 +121,8 @@ only edits preserve the schedule. Reconcile timers from stored state on restart.
 ## First connected timer slice
 
 Global and registered-project timers use their namespace's startup-loaded rule files and
-the existing command router. The connected timer slice admits ordinary `stop`, `send` and `run` children for global and
+the existing command router. The connected timer slice admits ordinary `stop`, `send`,
+targetless `launch` and `run` children for global and
 registered-project interval, cron and once firings, including manual `timer.run`. See
 [Timer Run invocation context](#timer-run-invocation-context).
 The event-rule `interrupt`, `steer` and request-reply actions remain unsupported for
@@ -139,7 +140,8 @@ do = [{ action = "send", target = "a1", expected_generation = 1, text = "schedul
 `eliot timer run periodic-send` manually invokes the same SEND action with a generated
 external ULID; `eliot --id ULID timer run periodic-send` supplies one explicitly.
 Scheduled and manual timer actions have no event or subject context, so target, generation
-and SEND text are literal values.
+and SEND text are literal values. A timer `launch` also requires literal profile and
+workspace values; its optional text is literal and cannot use event or subject templates.
 
 An interval `every` value uses the humantime duration grammar and must be positive with
 whole-millisecond precision; it is normalized to signed `period_ms`. An explicit interval
@@ -171,9 +173,10 @@ the most recent due instant. A normally delayed wake for a timer that remained a
 the live daemon still fires its due slot under either policy. Do not burst missed slots or
 stack another firing while the previous action children are open or unknown.
 
-The timer action freezes its literal `target` and `expected_generation`; it does not look
-up an Agent row to fill either value. Timer invocations have no event or subject, so a
-template that requires `${event...}` or `${subject...}` fails admission. `timer.get` is
+Timer `stop` and `send` actions freeze their literal `target` and `expected_generation`; they
+do not look up an Agent row to fill either value. A timer `launch` is targetless and fixes
+`expected_generation` at 0. Timer invocations have no event or subject, so a template that
+requires `${event...}` or `${subject...}` fails admission. `timer.get` is
 an owner-only read of the canonical Core timer view. `timer.run ID` is an owner-only
 manual firing keyed by an external ULID. Reusing that ULID returns the retained parent
 before checking current enabled/paused/drain/rate gates and never dispatches a second
@@ -279,7 +282,7 @@ Disabled rules advance their skipped range without firing.
 
 Backlog, explicit history catch-up, and rate-limit semantics are defined in
 [Retention and bounded backlog](#retention-and-bounded-backlog).
-This connected event-rule subset supports event actions `stop`, `send`, `interrupt`,
+This connected event-rule subset supports event actions `stop`, `send`, `launch`, `interrupt`,
 `steer`, `approve`, `deny` and `answer`, plus project event-rule `run` during live
 evaluation and explicit history catch-up. The global event-rule `run` contract below uses
 owner-global approval and the shared frozen execution path. Other full L4.2 action
@@ -289,6 +292,43 @@ existing Router path, keeps its exact target generation and turn association, an
 for the same-principal self-cause behavior for SEND and Run. Goal actions and project
 configuration overlays remain outside this connected event-rule contour.
 Cause-depth suppression is silent and does not emit an endlessly retriggerable rejection event.
+
+### Targetless launch
+
+The `launch` action submits the existing ordinary launch command with flat fields:
+
+```toml
+[[rule]]
+id = "launch-on-result"
+on = { event = "turn.completed", match = { "subject.harness" = "fake" } }
+do = [{ action = "launch", profile = "fake", workspace = "/work/eliot", text = "Review ${data.status}" }]
+```
+
+`profile` is a nonempty literal profile name and `workspace` is a nonempty literal path
+to an existing workspace. Neither accepts templates. `text` is optional; for event rules,
+its value is rendered once from the captured event context and frozen into the launch
+command. Timer launch uses the same action shape, but its optional text must be literal.
+Launch text follows the ordinary launch/linked-send 64 KiB persisted-text bound. A
+nonblank text value uses the normal linked `send` admission and dispatch path.
+
+The emitted command has `target = null`, `expected_generation = 0`, and no turn or request
+binding. Event Agent/generation fields do not select or retarget the new Agent. The rule
+worker and Store retain the authoritative triggering event identity and verified cause
+with the action admission; they are not copied into launch args. No `project` field grants
+authority: `Agent.project` remains descriptive.
+
+Owner rules use Owner authority. Project rules require the explicit `launch` action grant,
+an approved named profile, and revalidation of the current canonical project registration
+and checkout. A supplied initial text also requires an explicit `send` grant; nonblank text
+creates the ordinary linked send. The selected profile supplies model, effort, permissions,
+executable and other profile settings; a rule cannot override them. A profile that requires
+setup is refused. Workspace paths are checked by normal launch admission. Managed
+worktree/base fields and per-action overrides are unsupported and rejected; unrecognized
+fields remain errors rather than being discarded.
+
+Launch readiness, linked input association and the eventual turn result are distinct
+outcomes. An uncertain launch is not replayed and cannot silently choose another profile
+or workspace.
 
 ## Matching and rendering
 
@@ -330,6 +370,7 @@ hidden wait/acceptance state to the router.
 | Action | Existing implementation path |
 | --- | --- |
 | Agent verb | router with generation/turn/request binding |
+| `launch` | targetless ordinary launch command at generation 0; optional nonblank text creates the normal linked `send` |
 | `msg.send`, `var.set` | scoped coordination command; available after L5 |
 | `run` | targetless `SubmitCommand` via Router; bounded child under saved authority; emitted commands become ordered children |
 | `notify`, `emit` | bounded log/desktop or approved named webhook; persisted `x.user.*` event |

@@ -113,6 +113,12 @@ enum AgentActionDefinition {
         request_id: Value,
         answers: BTreeMap<String, Value>,
     },
+    Launch {
+        profile: String,
+        workspace: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<Value>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -209,7 +215,7 @@ impl CompiledMatch {
 }
 
 impl AgentActionDefinition {
-    fn target(&self) -> &Value {
+    fn target(&self) -> Option<&Value> {
         match self {
             Self::Stop { target, .. }
             | Self::Send { target, .. }
@@ -217,11 +223,12 @@ impl AgentActionDefinition {
             | Self::Steer { target, .. }
             | Self::Approve { target, .. }
             | Self::Deny { target, .. }
-            | Self::Answer { target, .. } => target,
+            | Self::Answer { target, .. } => Some(target),
+            Self::Launch { .. } => None,
         }
     }
 
-    fn expected_generation(&self) -> &Value {
+    fn expected_generation(&self) -> Option<&Value> {
         match self {
             Self::Stop {
                 expected_generation,
@@ -250,7 +257,8 @@ impl AgentActionDefinition {
             | Self::Answer {
                 expected_generation,
                 ..
-            } => expected_generation,
+            } => Some(expected_generation),
+            Self::Launch { .. } => None,
         }
     }
 
@@ -258,6 +266,9 @@ impl AgentActionDefinition {
         match self {
             Self::Send { text, .. } => Some((text, MAX_EVENT_BYTES, "64 KiB persisted-text bound")),
             Self::Steer { text, .. } => Some((text, MAX_TEXT_BYTES, "512 KiB text bound")),
+            Self::Launch {
+                text: Some(text), ..
+            } => Some((text, MAX_EVENT_BYTES, "64 KiB persisted-text bound")),
             _ => None,
         }
     }
@@ -308,6 +319,7 @@ impl AgentActionDefinition {
             Self::Approve { .. } => "approve",
             Self::Deny { .. } => "deny",
             Self::Answer { .. } => "answer",
+            Self::Launch { .. } => "launch",
         }
     }
 }
@@ -508,11 +520,27 @@ pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<SubmitCom
         subject,
         data: &event.data,
     };
-    let target_source = action.target();
+    if let AgentActionDefinition::Launch {
+        profile, workspace, ..
+    } = action
+    {
+        let text = action
+            .text()
+            .map(|(text, max_bytes, limit_label)| {
+                render_text(text, &roots, max_bytes, action.verb(), limit_label)
+            })
+            .transpose()?;
+        return submit_launch_command(profile, workspace, text).map(Some);
+    }
+    let target_source = action
+        .target()
+        .ok_or_else(|| Error::new("invalid", "Agent action target is missing"))?;
     let target = render_agent_target(target_source, &roots)?;
     parse_agent_id(&target)
         .map_err(|_| Error::new("invalid", "action target is not a canonical Agent id"))?;
-    let generation_source = action.expected_generation();
+    let generation_source = action
+        .expected_generation()
+        .ok_or_else(|| Error::new("invalid", "Agent action generation is missing"))?;
     let generation = render_generation(generation_source, &roots)?;
     let generation = generation
         .as_i64()
@@ -604,6 +632,21 @@ fn submit_run_command(definition: &RunDefinitionArgs) -> Result<SubmitCommand, E
     Ok(command)
 }
 
+fn submit_launch_command(
+    profile: &str,
+    workspace: &str,
+    text: Option<String>,
+) -> Result<SubmitCommand, Error> {
+    let mut command = CommandSubmitRequest::new(String::new(), "launch");
+    command.expected_generation = Some(0);
+    command.args = json!({"profile": profile, "workspace": workspace});
+    if let Some(text) = text {
+        command.args["text"] = Value::String(text);
+    }
+    command.validate()?;
+    Ok(command)
+}
+
 /// Inspect only known later-slice knobs before typed deserialization so they get an
 /// explicit `unsupported` result. Required fields and their types are decoded once.
 fn reject_unimplemented_options(raw: &toml::Value) -> Result<(), Error> {
@@ -634,6 +677,28 @@ fn reject_unimplemented_options(raw: &toml::Value) -> Result<(), Error> {
                         .is_some_and(|action| action.contains_key("selector"))
                 })
             });
+    let has_unsupported_launch_option =
+        rule.get("do")
+            .and_then(toml::Value::as_array)
+            .is_some_and(|actions| {
+                actions.iter().any(|action| {
+                    let Some(action_fields) = action.as_table() else {
+                        return false;
+                    };
+                    action_fields.get("action").and_then(toml::Value::as_str) == Some("launch")
+                        && [
+                            "worktree",
+                            "base",
+                            "setup",
+                            "model",
+                            "effort",
+                            "permissions",
+                            "executable",
+                        ]
+                        .iter()
+                        .any(|field| action_fields.contains_key(*field))
+                })
+            });
     let has_unsupported_action =
         rule.get("do")
             .and_then(toml::Value::as_array)
@@ -653,11 +718,18 @@ fn reject_unimplemented_options(raw: &toml::Value) -> Result<(), Error> {
                                     | "approve"
                                     | "deny"
                                     | "answer"
+                                    | "launch"
                                     | "run"
                             )
                         })
                 })
             });
+    if has_unsupported_launch_option {
+        return Err(Error::new(
+            "unsupported",
+            "launch accepts only profile, workspace, and optional text; worktree and per-action overrides are unsupported",
+        ));
+    }
     if has_unsupported_trigger || has_unsupported_selector || has_unsupported_action {
         return Err(Error::new(
             "unsupported",
@@ -810,12 +882,23 @@ fn validate_event_action(action: &ActionDefinition) -> Result<(), Error> {
         ActionDefinition::Run { definition } => return definition.validate(),
         ActionDefinition::Agent(action) => action,
     };
+    if let AgentActionDefinition::Launch {
+        profile,
+        workspace,
+        text,
+    } = action
+    {
+        return validate_launch_action(profile, workspace, text.as_ref(), true);
+    }
     let target = action
         .target()
-        .as_str()
+        .and_then(Value::as_str)
         .ok_or_else(|| Error::new("invalid", "Agent action requires a string target"))?;
     validate_template(target, true)?;
-    match action.expected_generation() {
+    let expected_generation = action
+        .expected_generation()
+        .ok_or_else(|| Error::new("invalid", "Agent action generation is missing"))?;
+    match expected_generation {
         Value::String(value) => {
             let parts = parse_template(value)?;
             if !is_whole_template(&parts) {
@@ -841,6 +924,42 @@ fn validate_event_action(action: &ActionDefinition) -> Result<(), Error> {
     }
     if let Some((request_id, verb)) = action.request_binding() {
         validate_event_binding_template(request_id, verb, "request_id")?;
+    }
+    Ok(())
+}
+
+fn validate_launch_action(
+    profile: &str,
+    workspace: &str,
+    text: Option<&Value>,
+    allow_text_templates: bool,
+) -> Result<(), Error> {
+    validate_launch_literal(profile, "profile")?;
+    validate_launch_literal(workspace, "workspace")?;
+    if let Some(text) = text {
+        validate_text_template(
+            text,
+            allow_text_templates,
+            MAX_EVENT_BYTES,
+            "launch",
+            "64 KiB persisted-text bound",
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_launch_literal(value: &str, field: &str) -> Result<(), Error> {
+    if value.trim().is_empty() {
+        return Err(Error::new(
+            "invalid",
+            format!("launch {field} must be a nonempty literal string"),
+        ));
+    }
+    if has_templates(&parse_template(value)?) {
+        return Err(Error::new(
+            "invalid",
+            format!("launch {field} cannot use templates"),
+        ));
     }
     Ok(())
 }
@@ -909,6 +1028,17 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
                 "unsupported",
                 "request reply actions require an event trigger",
             ));
+        }
+        AgentActionDefinition::Launch {
+            profile,
+            workspace,
+            text,
+        } => {
+            validate_launch_action(profile, workspace, text.as_ref(), false)?;
+            let text = text
+                .as_ref()
+                .map(|text| text.as_str().expect("validated launch text").to_owned());
+            return submit_launch_command(profile, workspace, text);
         }
     };
     let target = target_value
@@ -1387,6 +1517,13 @@ on = { event = 'command.applied', match = { 'event.kind' = 'glob:command.*', 'ev
 do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${event.generation}' }]
 "#;
 
+    const EVENT_LAUNCH_RULE: &str = r#"
+[[rule]]
+id = 'launch-on-result'
+on = { event = 'turn.completed' }
+do = [{ action = 'launch', profile = 'fake', workspace = '/work/eliot', text = 'Review ${data.status}' }]
+"#;
+
     fn event() -> Event {
         Event {
             seq: 7,
@@ -1570,6 +1707,133 @@ do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${eve
         let unknown =
             PROJECT_RUN_RULE.replace("timeout = '10m'", "timeout = '10m', principal = 'owner'");
         assert_eq!(load(Cursor::new(unknown)).unwrap_err().code, "invalid");
+    }
+
+    #[test]
+    fn event_launch_is_flat_targetless_and_renders_only_its_text() {
+        let rule = load(Cursor::new(EVENT_LAUNCH_RULE)).unwrap().remove(0);
+        let command = evaluate(&rule, &event()).unwrap().unwrap();
+
+        assert_eq!(command.id, "");
+        assert_eq!(command.verb, "launch");
+        assert_eq!(command.target, None);
+        assert_eq!(command.expected_generation, Some(0));
+        assert_eq!(command.expected_turn_id, None);
+        assert_eq!(command.request_id, None);
+        assert!(!command.probe);
+        assert_eq!(
+            command.args,
+            json!({
+                "profile": "fake",
+                "workspace": "/work/eliot",
+                "text": "Review completed"
+            })
+        );
+        command.validate().unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&rule).unwrap()["do"][0],
+            json!({
+                "action": "launch",
+                "profile": "fake",
+                "workspace": "/work/eliot",
+                "text": "Review ${data.status}"
+            })
+        );
+        let saved = serde_json::to_string(&rule).unwrap();
+        let restored = RuleDefinition::deserialize_saved(&saved).unwrap();
+        assert_eq!(
+            restored.semantic_digest().unwrap(),
+            rule.semantic_digest().unwrap()
+        );
+
+        let without_text = EVENT_LAUNCH_RULE.replace(", text = 'Review ${data.status}'", "");
+        let without_text = load(Cursor::new(without_text)).unwrap().remove(0);
+        assert_eq!(
+            evaluate(&without_text, &event()).unwrap().unwrap().args,
+            json!({"profile":"fake", "workspace":"/work/eliot"})
+        );
+    }
+
+    #[test]
+    fn timer_launch_keeps_literal_text_and_rejects_event_templates() {
+        let timer = INTERVAL_TIMER.replace(
+            "action = 'stop', target = 'a7', expected_generation = 3",
+            "action = 'launch', profile = 'fake', workspace = '/work/eliot', text = 'timer input'",
+        );
+        let rule = load(Cursor::new(timer)).unwrap().remove(0);
+        let command = rule.evaluate_timer().unwrap();
+        assert_eq!(command.verb, "launch");
+        assert_eq!(command.target, None);
+        assert_eq!(command.expected_generation, Some(0));
+        assert_eq!(command.expected_turn_id, None);
+        assert_eq!(command.request_id, None);
+        assert_eq!(
+            command.args,
+            json!({
+                "profile": "fake",
+                "workspace": "/work/eliot",
+                "text": "timer input"
+            })
+        );
+
+        let templated = INTERVAL_TIMER.replace(
+            "action = 'stop', target = 'a7', expected_generation = 3",
+            "action = 'launch', profile = 'fake', workspace = '/work/eliot', text = '${data.status}'",
+        );
+        assert_eq!(load(Cursor::new(templated)).unwrap_err().code, "invalid");
+    }
+
+    #[test]
+    fn launch_rejects_templates_managed_worktrees_and_profile_overrides() {
+        for (old, replacement) in [
+            ("profile = 'fake'", "profile = '${data.profile}'"),
+            (
+                "workspace = '/work/eliot'",
+                "workspace = '${data.workspace}'",
+            ),
+        ] {
+            let source = EVENT_LAUNCH_RULE.replace(old, replacement);
+            assert_eq!(load(Cursor::new(source)).unwrap_err().code, "invalid");
+        }
+
+        for option in [
+            "worktree = 'branch'",
+            "base = 'HEAD'",
+            "setup = true",
+            "model = 'other'",
+            "effort = 'high'",
+            "permissions = true",
+            "executable = 'other'",
+        ] {
+            let source = EVENT_LAUNCH_RULE.replace(
+                "workspace = '/work/eliot'",
+                &format!("workspace = '/work/eliot', {option}"),
+            );
+            assert_eq!(load(Cursor::new(source)).unwrap_err().code, "unsupported");
+        }
+    }
+
+    #[test]
+    fn launch_text_uses_the_normal_persisted_launch_bound() {
+        let accepted_text = "x".repeat(MAX_EVENT_BYTES);
+        let accepted = EVENT_LAUNCH_RULE.replace(
+            "text = 'Review ${data.status}'",
+            &format!("text = '{accepted_text}'"),
+        );
+        let rule = load(Cursor::new(accepted)).unwrap().remove(0);
+        let command = evaluate(&rule, &event()).unwrap().unwrap();
+        assert_eq!(
+            command.args["text"].as_str().unwrap().len(),
+            MAX_EVENT_BYTES
+        );
+
+        let oversized_text = "x".repeat(MAX_EVENT_BYTES + 1);
+        let oversized = EVENT_LAUNCH_RULE.replace(
+            "text = 'Review ${data.status}'",
+            &format!("text = '{oversized_text}'"),
+        );
+        assert_eq!(load(Cursor::new(oversized)).unwrap_err().code, "invalid");
     }
 
     #[test]
