@@ -544,7 +544,6 @@ mod tests {
         fn new() -> Self {
             let base = fs::canonicalize(std::env::temp_dir()).expect("canonical temp directory");
             let path = base.join(format!("eliot-daemon-read-acl-{}", ulid::Ulid::new()));
-            fs::create_dir(&path).expect("create private metadata test root");
             Self { base, path }
         }
     }
