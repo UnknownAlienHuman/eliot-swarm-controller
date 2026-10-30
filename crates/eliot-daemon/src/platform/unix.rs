@@ -469,6 +469,13 @@ fn read_linux_process_stat(pid: u32) -> std::io::Result<LinuxProcessStat> {
         ));
     }
     let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    parse_linux_process_stat(pid, &stat)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_process_stat(pid: u32, stat: &str) -> std::io::Result<LinuxProcessStat> {
+    use std::io::{Error as IoError, ErrorKind};
+
     let open = stat
         .find('(')
         .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "malformed process stat"))?;
@@ -492,7 +499,10 @@ fn read_linux_process_stat(pid: u32) -> std::io::Result<LinuxProcessStat> {
     let pgid = fields
         .get(2)
         .and_then(|value| value.parse::<i32>().ok())
-        .filter(|value| *value > 0)
+        // Generic procfs census includes tasks without a process group, which
+        // Linux represents as PGID 0. Owned group capture applies its own
+        // positive, birth-checked leader validation.
+        .filter(|value| *value >= 0)
         .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "invalid process PGID"))?;
     let start_ticks = fields
         .get(19)
@@ -864,4 +874,41 @@ fn check_path_components(path: &Path) -> Result<()> {
 
 fn io_error(action: &str, error: std::io::Error) -> Error {
     Error::new("platform_io", format!("{action}: {error}"))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_process_stat_tests {
+    use super::*;
+
+    fn stat_line(pid: u32, pgid: &str) -> String {
+        let mut fields = ["0"; 22];
+        fields[0] = "S";
+        fields[1] = "1";
+        fields[2] = pgid;
+        fields[11] = "2";
+        fields[12] = "3";
+        fields[19] = "1234";
+        fields[21] = "4";
+        format!("{pid} (fixture) {}", fields.join(" "))
+    }
+
+    #[test]
+    fn parses_zero_pgid_nonmember_and_positive_owned_group() {
+        let nonmember = parse_linux_process_stat(42, &stat_line(42, "0"))
+            .expect("zero PGID is a valid procfs value");
+        assert_eq!(nonmember.pgid, 0);
+
+        let owned = parse_linux_process_stat(73, &stat_line(73, "73"))
+            .expect("positive owned PGID remains valid");
+        assert_eq!(owned.pgid, 73);
+    }
+
+    #[test]
+    fn rejects_negative_pgid_as_invalid_data() {
+        let error = match parse_linux_process_stat(42, &stat_line(42, "-1")) {
+            Err(error) => error,
+            Ok(_) => panic!("negative PGID is not a valid namespace process-group ID"),
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
 }
