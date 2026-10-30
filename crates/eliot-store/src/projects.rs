@@ -476,7 +476,10 @@ fn normalize_registration(input: &ProjectRegistrationInput) -> Result<ProjectReg
 }
 
 fn is_supported_project_action(action: &str) -> bool {
-    matches!(action, "stop" | "send" | "interrupt" | "steer")
+    matches!(
+        action,
+        "stop" | "send" | "interrupt" | "steer" | "approve" | "deny" | "answer"
+    )
 }
 
 fn is_supported_project_registration_action(action: &str) -> bool {

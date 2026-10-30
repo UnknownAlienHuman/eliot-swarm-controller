@@ -2790,10 +2790,11 @@ pub(super) fn valid_rule_action_request(request: &SubmitCommand, allow_interrupt
 }
 
 fn valid_event_rule_action_request(request: &SubmitCommand) -> bool {
-    if request.verb != "steer" {
+    let reply = matches!(request.verb.as_str(), "approve" | "deny" | "answer");
+    if request.verb != "steer" && !reply {
         return valid_rule_action_request(request, true);
     }
-    request.validate().is_ok()
+    let common = request.validate().is_ok()
         && request
             .target
             .as_deref()
@@ -2805,8 +2806,17 @@ fn valid_event_rule_action_request(request: &SubmitCommand) -> bool {
             .expected_turn_id
             .as_deref()
             .is_some_and(|turn_id| !turn_id.is_empty())
-        && request.request_id.is_none()
-        && !request.probe
+        && !request.probe;
+    if !common {
+        return false;
+    }
+    if reply {
+        return request
+            .request_id
+            .as_deref()
+            .is_some_and(|request_id| !request_id.is_empty());
+    }
+    request.request_id.is_none()
         && request
             .args
             .as_object()
@@ -3459,7 +3469,9 @@ fn load_rule_trigger(tx: &Transaction<'_>, event_seq: i64) -> Result<StoredRuleT
     tx.query_row(
         "SELECT kind, agent, generation, cause,
                 CASE WHEN json_type(data, '$.turn_id') = 'text'
-                     THEN json_extract(data, '$.turn_id') END
+                     THEN json_extract(data, '$.turn_id') END,
+                CASE WHEN json_type(data, '$.request_id') = 'text'
+                     THEN json_extract(data, '$.request_id') END
          FROM events WHERE seq = ?1",
         [event_seq],
         |row| {
@@ -3469,6 +3481,7 @@ fn load_rule_trigger(tx: &Transaction<'_>, event_seq: i64) -> Result<StoredRuleT
                 generation: row.get(2)?,
                 encoded_cause: row.get(3)?,
                 turn_id: row.get(4)?,
+                request_id: row.get(5)?,
                 cause: None,
             })
         },
@@ -3488,6 +3501,7 @@ struct StoredRuleTrigger {
     generation: Option<i64>,
     encoded_cause: Option<String>,
     turn_id: Option<String>,
+    request_id: Option<String>,
     cause: Option<core::EventCause>,
 }
 
@@ -3497,8 +3511,13 @@ fn rule_action_binding_error(event: &StoredRuleTrigger, request: &SubmitCommand)
     }
     if request.target != event.agent.map(format_agent_id)
         || request.expected_generation != event.generation
-        || (matches!(request.verb.as_str(), "interrupt" | "steer")
-            && request.expected_turn_id.as_deref() != event.turn_id.as_deref())
+        || (matches!(
+            request.verb.as_str(),
+            "interrupt" | "steer" | "approve" | "deny" | "answer"
+        ) && request.expected_turn_id.as_deref() != event.turn_id.as_deref())
+        || (matches!(request.verb.as_str(), "approve" | "deny" | "answer")
+            && (event.kind != "request.opened"
+                || request.request_id.as_deref() != event.request_id.as_deref()))
     {
         return Some("rule_action_binding_invalid".to_owned());
     }

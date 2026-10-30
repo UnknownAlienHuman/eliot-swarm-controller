@@ -2055,11 +2055,11 @@ impl Router {
             }
         } else if !matches!(
             request.verb.as_str(),
-            "stop" | "send" | "steer" | "interrupt"
+            "stop" | "send" | "steer" | "interrupt" | "approve" | "deny" | "answer"
         ) {
             return Err(Error::new(
                 "invalid",
-                "rule firing must contain one prepared stop, send, steer, interrupt, or project Run",
+                "rule firing must contain a prepared stop, send, steer, interrupt, reply, or Run action",
             ));
         }
         let admission = {
@@ -2067,7 +2067,11 @@ impl Router {
             if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
                 return Ok(None);
             }
-            if let Some(expected) = project {
+            let request_reply =
+                matches!(request.verb.as_str(), "approve" | "deny" | "answer");
+            // Let Store resolve a retained reply parent before checking current
+            // registration and pending-request authority for a new admission.
+            if !request_reply && let Some(expected) = project {
                 let current = store
                     .get_project_registration("owner", &expected.id)?
                     .ok_or_else(|| Error::new("not_allowed", "project registration was removed"))?;
@@ -3274,7 +3278,7 @@ impl Router {
             }
             if matches!(
                 command.verb.as_str(),
-                "stop" | "send" | "steer" | "interrupt"
+                "stop" | "send" | "steer" | "interrupt" | "approve" | "deny" | "answer"
             ) {
                 let (Some(target), Some(generation)) =
                     (command.target.as_deref(), command.generation)
@@ -5105,7 +5109,7 @@ fn authorize_command(principal: &Principal, request: &mut SubmitCommand) -> Resu
         }
         if !matches!(
             request.verb.as_str(),
-            "stop" | "send" | "steer" | "interrupt"
+            "stop" | "send" | "steer" | "interrupt" | "approve" | "deny" | "answer"
         ) || !registration
             .actions
             .iter()
@@ -5120,6 +5124,18 @@ fn authorize_command(principal: &Principal, request: &mut SubmitCommand) -> Resu
             return Err(Error::new(
                 "invalid",
                 "project action requires its frozen Agent and generation",
+            ));
+        }
+        if matches!(request.verb.as_str(), "approve" | "deny" | "answer")
+            && (request
+                .expected_turn_id
+                .as_deref()
+                .is_none_or(str::is_empty)
+                || request.request_id.as_deref().is_none_or(str::is_empty))
+        {
+            return Err(Error::new(
+                "invalid",
+                "project request reply requires its captured turn and request",
             ));
         }
         return Ok(());
@@ -8607,6 +8623,269 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         assert_eq!(turn_id, "turn-1");
     }
 
+    #[tokio::test]
+    async fn owner_request_opened_rule_admits_the_captured_request_reply() {
+        let router = router();
+        let rule_id = "owner-approve-request";
+        let definition = json!({
+            "id":rule_id,
+            "enabled":true,
+            "on":{"event":"request.opened"},
+            "do":[{"action":"approve", "target":"a1",
+                "expected_generation":1,
+                "expected_turn_id":"turn-1",
+                "request_id":"request-approve-1"}],
+        });
+        let input = eliot_store::RuleDefinitionInput {
+            id: rule_id.to_owned(),
+            canonical_definition: serde_json::to_string(&definition).unwrap(),
+            definition_digest: eliot_core::canonical_json_sha256(&definition).unwrap(),
+            enabled: true,
+        };
+        let (state, agent, send_id) = {
+            let mut store = router.inner.store.lock().await;
+            let state = store.ensure_rule_state("owner", &input, now_ms()).unwrap();
+            let (agent, send_id) = result_fixture(&mut store);
+            (state, agent, send_id)
+        };
+        let request_id = "request-approve-1";
+        {
+            let mut store = router.inner.store.lock().await;
+            store
+                .settle(
+                    &send_id,
+                    CommandState::Applied,
+                    Some(json!({"turn_id":"turn-1"})),
+                    now_ms(),
+                )
+                .unwrap();
+            read_fixture_event(
+                &mut store,
+                &agent,
+                "request.opened",
+                json!({
+                    "command_id":send_id,
+                    "request_id":request_id,
+                    "turn_id":"turn-1",
+                    "kind":"command_execution_approval",
+                    "details":{"item_id":"item-1"},
+                }),
+            );
+        }
+        let event = router
+            .inner
+            .store
+            .lock()
+            .await
+            .read_events(0, 1_000, None)
+            .unwrap()
+            .into_iter()
+            .find(|event| {
+                event.kind == "request.opened"
+                    && event.data.get("request_id").and_then(Value::as_str) == Some(request_id)
+            })
+            .expect("the exact request.opened event");
+        let mut action = SubmitCommand::new(String::new(), "approve");
+        action.target = event.agent.clone();
+        action.expected_generation = event.generation;
+        action.expected_turn_id = Some("turn-1".to_owned());
+        action.request_id = Some(request_id.to_owned());
+
+        let prepared = router.prepare_owner_submission(action).await.unwrap();
+        let admission = router
+            .admit_rule_action("owner", None, &state, event.seq, prepared)
+            .await
+            .unwrap()
+            .expect("Owner request reply is admitted");
+        let child = admission.child.expect("the firing has one reply command");
+        assert_eq!(child.verb, "approve");
+        assert_eq!(child.target.as_deref(), Some(agent.as_str()));
+        assert_eq!(child.generation, Some(1));
+        assert_eq!(child.turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(child.request_id.as_deref(), Some(request_id));
+        assert_eq!(child.args, json!({}));
+    }
+
+    #[tokio::test]
+    async fn owner_secret_answer_rejects_once_and_replays_after_request_closes() {
+        let router = router();
+        let rule_id = "owner-secret-answer";
+        let definition = json!({
+            "id":rule_id,
+            "enabled":true,
+            "on":{"event":"request.opened"},
+            "do":[{"action":"answer", "target":"a1",
+                "expected_generation":1,
+                "expected_turn_id":"turn-1",
+                "request_id":"request-secret-1"}],
+        });
+        let input = eliot_store::RuleDefinitionInput {
+            id: rule_id.to_owned(),
+            canonical_definition: serde_json::to_string(&definition).unwrap(),
+            definition_digest: eliot_core::canonical_json_sha256(&definition).unwrap(),
+            enabled: true,
+        };
+        let (state, agent, send_id) = {
+            let mut store = router.inner.store.lock().await;
+            let state = store.ensure_rule_state("owner", &input, now_ms()).unwrap();
+            let (agent, send_id) = result_fixture(&mut store);
+            (state, agent, send_id)
+        };
+        let request_id = "request-secret-1";
+        {
+            let mut store = router.inner.store.lock().await;
+            store
+                .settle(
+                    &send_id,
+                    CommandState::Applied,
+                    Some(json!({"turn_id":"turn-1"})),
+                    now_ms(),
+                )
+                .unwrap();
+            read_fixture_event(
+                &mut store,
+                &agent,
+                "request.opened",
+                json!({
+                    "command_id":send_id,
+                    "request_id":request_id,
+                    "turn_id":"turn-1",
+                    "kind":"user_input",
+                    "details":{"questions":[{"id":"q1","is_secret":true}]},
+                }),
+            );
+        }
+        let event = router
+            .inner
+            .store
+            .lock()
+            .await
+            .read_events(0, 1_000, None)
+            .unwrap()
+            .into_iter()
+            .find(|event| {
+                event.kind == "request.opened"
+                    && event.data.get("request_id").and_then(Value::as_str) == Some(request_id)
+            })
+            .expect("the exact secret request.opened event");
+        let mut action = SubmitCommand::new(String::new(), "answer");
+        action.target = event.agent.clone();
+        action.args = json!({"answers":{"q1":{"answers":["secret-answer-marker"]}}});
+        action.expected_generation = event.generation;
+        action.expected_turn_id = Some("turn-1".to_owned());
+        action.request_id = Some(request_id.to_owned());
+        let prepared = router
+            .prepare_owner_submission(action.clone())
+            .await
+            .unwrap();
+
+        let rejected = router
+            .admit_rule_action("owner", None, &state, event.seq, prepared)
+            .await
+            .unwrap()
+            .expect("the secret answer refusal advances this firing");
+        assert!(rejected.is_new);
+        assert!(rejected.child.is_none());
+        let parent = rejected.parent.expect("metadata-only rejected parent");
+        assert_eq!(parent.state, CommandState::Rejected);
+        assert_eq!(parent.outcome.as_ref().unwrap()["code"], "secret_in_payload");
+        assert!(!serde_json::to_string(&parent)
+            .unwrap()
+            .contains("secret-answer-marker"));
+        assert_eq!(rejected.state.current_cursor, event.seq);
+        assert_eq!(
+            rejected
+                .events
+                .iter()
+                .filter(|event| event.kind == "rule.rejected")
+                .count(),
+            1
+        );
+
+        {
+            let mut store = router.inner.store.lock().await;
+            read_fixture_event(
+                &mut store,
+                &agent,
+                "request.closed",
+                json!({"request_id":request_id,"turn_id":"turn-1"}),
+            );
+        }
+        let before_replay = router.inner.store.lock().await.high_water().unwrap();
+        let replay = router
+            .admit_rule_action(
+                "owner",
+                None,
+                &state,
+                event.seq,
+                PreparedSubmission {
+                    request: action,
+                    workspace: None,
+                },
+            )
+            .await
+            .unwrap()
+            .expect("Store returns the retained firing before current pending checks");
+        assert!(!replay.is_new);
+        assert!(replay.child.is_none());
+        assert!(replay.events.is_empty());
+        assert_eq!(replay.parent.as_ref().unwrap().id, parent.id);
+        assert_eq!(
+            router.inner.store.lock().await.high_water().unwrap(),
+            before_replay
+        );
+    }
+
+    #[test]
+    fn project_request_replies_require_per_verb_grants_and_keep_exact_bindings() {
+        let checkout = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let base = eliot_core::api::ProjectRegistrationView {
+            id: "reply-project".to_owned(),
+            checkout: checkout.clone(),
+            repo_common_dir: checkout,
+            profiles: vec!["fake".to_owned()],
+            actions: Vec::new(),
+            interpreters: std::collections::BTreeMap::new(),
+            run_env: Vec::new(),
+            revision: 1,
+        };
+        let verbs = ["approve", "deny", "answer"];
+        for granted in verbs {
+            let mut registration = base.clone();
+            registration.actions = vec![granted.to_owned()];
+            for verb in verbs {
+                let mut request = SubmitCommand::new(String::new(), verb);
+                request.target = Some("a7".to_owned());
+                request.args = if verb == "answer" {
+                    json!({"answers":{"q1":{"answers":["Continue"]}}})
+                } else {
+                    json!({})
+                };
+                request.expected_generation = Some(7);
+                request.expected_turn_id = Some("turn-captured".to_owned());
+                request.request_id = Some("request-captured".to_owned());
+                let result = authorize_command(
+                    &Principal::ProjectRule {
+                        registration: registration.clone(),
+                    },
+                    &mut request,
+                );
+                if granted == verb {
+                    result.expect("each reply verb has its own explicit grant");
+                    assert_eq!(request.target.as_deref(), Some("a7"));
+                    assert_eq!(request.expected_generation, Some(7));
+                    assert_eq!(request.expected_turn_id.as_deref(), Some("turn-captured"));
+                    assert_eq!(request.request_id.as_deref(), Some("request-captured"));
+                } else {
+                    assert_eq!(result.unwrap_err().code, "not_allowed");
+                }
+            }
+        }
+    }
+
     #[test]
     fn project_rule_steer_requires_an_explicit_grant_and_keeps_its_fences() {
         let checkout = std::fs::canonicalize(std::env::temp_dir())
@@ -8723,6 +9002,139 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         assert_eq!(
             router.inner.store.lock().await.high_water().unwrap(),
             before
+        );
+    }
+
+    #[tokio::test]
+    async fn project_rule_reply_replays_after_the_grant_is_revoked() {
+        let router = router();
+        let project_id = "typed-results";
+        let principal = format!("project:{project_id}");
+        let rule_id = "project-reply-replay";
+        let definition = json!({
+            "id":rule_id,
+            "enabled":true,
+            "on":{"event":"request.opened"},
+            "do":[{"action":"approve", "target":"a1",
+                "expected_generation":1,
+                "expected_turn_id":"turn-1",
+                "request_id":"request-project-replay"}],
+        });
+        let input = eliot_store::RuleDefinitionInput {
+            id: rule_id.to_owned(),
+            canonical_definition: serde_json::to_string(&definition).unwrap(),
+            definition_digest: eliot_core::canonical_json_sha256(&definition).unwrap(),
+            enabled: true,
+        };
+        let registration_input = eliot_store::ProjectRegistrationInput {
+            id: project_id.to_owned(),
+            checkout: "synthetic-workspace".to_owned(),
+            repo_common_dir: "synthetic-workspace/.git".to_owned(),
+            profiles: vec!["synthetic".to_owned()],
+            actions: vec!["approve".to_owned()],
+            interpreters: std::collections::BTreeMap::new(),
+            run_env: Vec::new(),
+        };
+        let (state, registration, agent, send_id) = {
+            let mut store = router.inner.store.lock().await;
+            let registration = store
+                .upsert_project_registration("owner", &registration_input, now_ms())
+                .unwrap()
+                .value;
+            let state = store.ensure_rule_state(&principal, &input, now_ms()).unwrap();
+            let (agent, send_id) = result_fixture(&mut store);
+            (state, registration, agent, send_id)
+        };
+        let request_id = "request-project-replay";
+        {
+            let mut store = router.inner.store.lock().await;
+            store
+                .settle(
+                    &send_id,
+                    CommandState::Applied,
+                    Some(json!({"turn_id":"turn-1"})),
+                    now_ms(),
+                )
+                .unwrap();
+            read_fixture_event(
+                &mut store,
+                &agent,
+                "request.opened",
+                json!({
+                    "command_id":send_id,
+                    "request_id":request_id,
+                    "turn_id":"turn-1",
+                    "kind":"command_execution_approval",
+                    "details":{"item_id":"item-1"},
+                }),
+            );
+        }
+        let event = router
+            .inner
+            .store
+            .lock()
+            .await
+            .read_events(0, 1_000, None)
+            .unwrap()
+            .into_iter()
+            .find(|event| {
+                event.kind == "request.opened"
+                    && event.data.get("request_id").and_then(Value::as_str) == Some(request_id)
+            })
+            .expect("the exact project request.opened event");
+        let mut action = SubmitCommand::new(String::new(), "approve");
+        action.target = event.agent.clone();
+        action.expected_generation = event.generation;
+        action.expected_turn_id = Some("turn-1".to_owned());
+        action.request_id = Some(request_id.to_owned());
+        authorize_command(
+            &Principal::ProjectRule {
+                registration: registration.clone(),
+            },
+            &mut action,
+        )
+        .expect("the captured project snapshot grants APPROVE");
+        let first = router
+            .inner
+            .store
+            .lock()
+            .await
+            .admit_rule_action(&principal, &state, event.seq, action.clone(), now_ms())
+            .unwrap();
+        let first_parent = first.parent.expect("the project firing parent");
+        let first_child = first.child.expect("the admitted project reply");
+        assert_eq!(first_child.verb, "approve");
+
+        let mut revoked = registration_input;
+        revoked.actions = vec!["send".to_owned()];
+        {
+            let mut store = router.inner.store.lock().await;
+            store
+                .upsert_project_registration("owner", &revoked, now_ms())
+                .unwrap();
+        }
+        let before_replay = router.inner.store.lock().await.high_water().unwrap();
+        let replay = router
+            .admit_rule_action(
+                &principal,
+                Some(&registration),
+                &state,
+                event.seq,
+                PreparedSubmission {
+                    request: action,
+                    workspace: None,
+                },
+            )
+            .await
+            .unwrap()
+            .expect("Store returns the retained firing before the current grant gate");
+        assert!(!replay.is_new);
+        assert!(replay.events.is_empty());
+        assert_eq!(replay.parent.as_ref().unwrap().id, first_parent.id);
+        assert_eq!(replay.child.as_ref().unwrap().id, first_child.id);
+        assert_eq!(
+            router.inner.store.lock().await.high_water().unwrap(),
+            before_replay
         );
     }
 

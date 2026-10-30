@@ -65,6 +65,20 @@ fn ready_agent(store: &mut Store, project: &str, now: i64) -> String {
     agent
 }
 
+fn ready_fake_agent_with_request_stream(store: &mut Store, project: &str, now: i64) -> String {
+    let agent = ready_agent(store, project, now);
+    let agent_num = eliot_core::parse_agent_id(&agent).expect("Fake Agent ID");
+    store
+        .connection
+        .execute(
+            "INSERT INTO source_owners(agent, generation, family, source, mechanism)
+             VALUES (?1, 1, 'request', 'stream', 'stream')",
+            [agent_num],
+        )
+        .expect("initialize Fake's manifest-owned request family on its stream");
+    agent
+}
+
 fn ready_managed_codex_agent(
     store: &mut Store,
     checkout: &str,
@@ -1124,7 +1138,29 @@ fn project_fake_interrupt_requires_explicit_action_approval() {
     let project = "fake-interrupt-approval";
     let principal = format!("project:{project}");
     let agent = ready_agent(&mut store, project, now);
-    let turn_id = start_fake_turn(&mut store, &agent, now + 1);
+    let send = send_request(&agent, 1, "open project approval");
+    let send_id = send.id.clone();
+    store.submit("owner", send, now + 1).unwrap();
+    store.dispatch(&send_id, now + 2).unwrap();
+    let turn_id = format!("project-reply-turn-{send_id}");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: Ulid::new().to_string(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "turn.started".to_owned(),
+                    native_id: Ulid::new().to_string(),
+                    data: json!({"command_id":send_id, "turn_id":turn_id}),
+                }],
+                cursor: None,
+            },
+            now + 3,
+        )
+        .unwrap();
     let mut registration = ProjectRegistrationInput {
         id: project.to_owned(),
         checkout: "synthetic-workspace".to_owned(),
@@ -1309,10 +1345,10 @@ fn fake_steer_admits_and_dispatches_exact_turn_text_without_retargeting() {
 }
 
 #[test]
-fn fake_interrupt_rejects_stale_bindings_and_keeps_other_controls_unsupported() {
+fn fake_interrupt_rejects_stale_bindings_and_dispatches_exact_request_replies() {
     let mut store = Store::open(Path::new(":memory:")).expect("open Store");
     let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
-    let agent = ready_agent(&mut store, "fake-interrupt-stale-turn", now);
+    let agent = ready_fake_agent_with_request_stream(&mut store, "fake-interrupt-stale-turn", now);
     let turn_id = start_fake_turn(&mut store, &agent, now + 1);
 
     let mut stale_turn = SubmitCommand::new(Ulid::new().to_string(), "interrupt");
@@ -1346,21 +1382,88 @@ fn fake_interrupt_rejects_stale_bindings_and_keeps_other_controls_unsupported() 
     assert!(store.get_command(&stale_generation_id).unwrap().is_none());
     assert_eq!(store.high_water().unwrap(), before_stale_generation);
 
-    for verb in ["approve", "deny", "answer"] {
+    let send_id = turn_id
+        .strip_prefix("fake-turn-")
+        .expect("Fake turn id retains its source send id");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("fake-replies-{send_id}"),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![
+                    NativeEvent {
+                        ts: None,
+                        kind: "request.opened".to_owned(),
+                        native_id: "fake-reply-approve".to_owned(),
+                        data: json!({
+                            "command_id": send_id,
+                            "request_id": "fake-approve-request",
+                            "turn_id": turn_id,
+                            "kind": "approval",
+                            "details": {}
+                        }),
+                    },
+                    NativeEvent {
+                        ts: None,
+                        kind: "request.opened".to_owned(),
+                        native_id: "fake-reply-deny".to_owned(),
+                        data: json!({
+                            "command_id": send_id,
+                            "request_id": "fake-deny-request",
+                            "turn_id": turn_id,
+                            "kind": "approval",
+                            "details": {}
+                        }),
+                    },
+                    NativeEvent {
+                        ts: None,
+                        kind: "request.opened".to_owned(),
+                        native_id: "fake-reply-answer".to_owned(),
+                        data: json!({
+                            "command_id": send_id,
+                            "request_id": "fake-answer-request",
+                            "turn_id": turn_id,
+                            "kind": "question",
+                            "details": {
+                                "questions": [{"id":"q1", "is_secret":false}]
+                            }
+                        }),
+                    },
+                ],
+                cursor: None,
+            },
+            now + 6,
+        )
+        .expect("commit exact Fake reply requests");
+
+    for (verb, request_id, args) in [
+        ("approve", "fake-approve-request", json!({})),
+        ("deny", "fake-deny-request", json!({})),
+        (
+            "answer",
+            "fake-answer-request",
+            json!({"answers":{"q1":{"answers":["Continue"]}}}),
+        ),
+    ] {
         let mut request = SubmitCommand::new(Ulid::new().to_string(), verb);
         request.target = Some(agent.clone());
-        request.args = json!({});
+        request.args = args;
         request.expected_generation = Some(1);
         request.expected_turn_id = Some(turn_id.clone());
+        request.request_id = Some(request_id.to_owned());
         let command_id = request.id.clone();
-        let before_unsupported = store.high_water().unwrap();
+        let admitted = store
+            .submit("owner", request, now + 7)
+            .unwrap_or_else(|error| panic!("Fake {verb} should admit its exact request: {error}"));
+        assert_eq!(admitted.command.request_id.as_deref(), Some(request_id));
+        assert_eq!(admitted.command.turn_id.as_deref(), Some(turn_id.as_str()));
         assert_eq!(
-            store.submit("owner", request, now + 6).unwrap_err().code,
-            "unsupported",
-            "Fake {verb} remains unsupported",
+            store.dispatch(&command_id, now + 8).unwrap().value.state,
+            CommandState::Dispatched,
+            "Fake {verb} should pass the dispatch fence"
         );
-        assert!(store.get_command(&command_id).unwrap().is_none());
-        assert_eq!(store.high_water().unwrap(), before_unsupported);
     }
 }
 
@@ -1743,7 +1846,7 @@ fn session_end_keeps_dispatched_stop_pending_until_exact_reply() {
             &stop_id,
             CommandState::Applied,
             Some(json!({"state":"applied"})),
-            now + 3,
+            now + 4,
         )
         .expect("the exact stop RPC reply settles its command");
     assert_eq!(settled.value.state, CommandState::Applied);
@@ -2263,7 +2366,18 @@ fn secret_question_answer_is_rejected_before_command_persistence() {
             now,
         )
         .expect("commit synthetic turn start");
-    store
+    let rule_id = "secret-answer-event-rule";
+    let rule_value = json!({"id":rule_id,"enabled":true});
+    let rule_definition = RuleDefinitionInput {
+        id: rule_id.to_owned(),
+        canonical_definition: serde_json::to_string(&rule_value).unwrap(),
+        definition_digest: eliot_core::canonical_json_sha256(&rule_value).unwrap(),
+        enabled: true,
+    };
+    let rule_state = store
+        .ensure_rule_state("owner", &rule_definition, now + 1)
+        .expect("install event rule before request event");
+    let request_batch = store
         .put_batch(
             SourceBatch {
                 batch_id: Ulid::new().to_string(),
@@ -2286,9 +2400,17 @@ fn secret_question_answer_is_rejected_before_command_persistence() {
                 }],
                 cursor: None,
             },
-            now,
+            now + 2,
         )
         .expect("commit synthetic secret question");
+    let request_event_seq = request_batch
+        .events
+        .iter()
+        .find(|event| {
+            event.kind == "request.opened" && event.data["request_id"] == "public-request-1"
+        })
+        .expect("retained exact request.opened event")
+        .seq;
 
     let marker = "synthetic-answer-secret-marker";
     let error = store
@@ -2296,9 +2418,9 @@ fn secret_question_answer_is_rejected_before_command_persistence() {
             "owner",
             SubmitCommand {
                 id: answer_id.clone(),
-                target: Some(agent_id),
+                target: Some(agent_id.clone()),
                 verb: "answer".to_owned(),
-                args: json!({"text": marker}),
+                args: json!({"answers":{"q1":{"answers":[marker]}}}),
                 expected_generation: None,
                 expected_turn_id: None,
                 request_id: None,
@@ -2314,6 +2436,548 @@ fn secret_question_answer_is_rejected_before_command_persistence() {
             .expect("read rejected answer command")
             .is_none(),
         "rejected answer args must not be persisted"
+    );
+
+    let mut rule_answer = SubmitCommand::new(String::new(), "answer");
+    rule_answer.target = Some(agent_id.clone());
+    rule_answer.args = json!({"answers":{"q1":{"answers":[marker]}}});
+    rule_answer.expected_generation = Some(1);
+    rule_answer.expected_turn_id = Some("turn-1".to_owned());
+    rule_answer.request_id = Some("public-request-1".to_owned());
+    let rejected = store
+        .admit_rule_action(
+            "owner",
+            &rule_state,
+            request_event_seq,
+            rule_answer,
+            now + 3,
+        )
+        .expect("secret rule answer is a durable deterministic rejection");
+    assert!(rejected.child.is_none());
+    let parent = rejected
+        .parent
+        .expect("retained secret answer refusal parent");
+    assert_eq!(parent.state, CommandState::Rejected);
+    assert_eq!(parent.outcome.as_ref().unwrap()["children"], json!([]));
+    assert_eq!(
+        parent.outcome.as_ref().unwrap()["code"],
+        "secret_in_payload"
+    );
+    assert_eq!(parent.args["rule"], json!(rule_id));
+    assert_eq!(parent.args["event_seq"], json!(request_event_seq));
+    assert!(parent.args.get("answers").is_none());
+    assert!(!serde_json::to_string(&parent).unwrap().contains(marker));
+    assert!(
+        !serde_json::to_string(&rejected.events)
+            .unwrap()
+            .contains(marker)
+    );
+    assert_eq!(rejected.state.current_cursor, request_event_seq);
+    let parent_id = parent.id.clone();
+    let persisted_answers: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM commands WHERE verb = 'answer'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(persisted_answers, 0);
+
+    let closed = store
+        .put_batch(
+            SourceBatch {
+                batch_id: Ulid::new().to_string(),
+                agent_id: agent_id.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "request.closed".to_owned(),
+                    native_id: "request-closed-after-secret-refusal".to_owned(),
+                    data: json!({"request_id":"public-request-1", "turn_id":"turn-1"}),
+                }],
+                cursor: None,
+            },
+            now + 4,
+        )
+        .expect("close the request after its refusal was committed");
+    let closed_seq = closed.events[0].seq;
+    let advanced = store
+        .advance_rule_cursor(
+            "owner",
+            &rejected.state,
+            closed_seq,
+            RuleCursorOutcome::NoMatch,
+            now + 5,
+        )
+        .expect("scan the request closure without firing the rule");
+    assert_eq!(advanced.value.current_cursor, closed_seq);
+
+    let mut replay_answer = SubmitCommand::new(String::new(), "answer");
+    replay_answer.target = Some(agent_id.clone());
+    replay_answer.args = json!({"answers":{"q1":{"answers":[marker]}}});
+    replay_answer.expected_generation = Some(1);
+    replay_answer.expected_turn_id = Some("turn-1".to_owned());
+    replay_answer.request_id = Some("public-request-1".to_owned());
+    let high_water_before_replay = store.high_water().unwrap();
+    let replay = store
+        .admit_rule_action(
+            "owner",
+            &advanced.value,
+            request_event_seq,
+            replay_answer,
+            now + 6,
+        )
+        .expect("replay the retained refusal after pending state changed");
+    assert!(!replay.is_new);
+    assert_eq!(replay.parent.as_ref().unwrap().id, parent_id);
+    assert_eq!(
+        replay.parent.as_ref().unwrap().outcome.as_ref().unwrap()["code"],
+        "secret_in_payload"
+    );
+    assert!(replay.child.is_none());
+    assert!(replay.events.is_empty());
+    assert_eq!(replay.state.current_cursor, closed_seq);
+    assert_eq!(store.high_water().unwrap(), high_water_before_replay);
+
+    let next_request = store
+        .put_batch(
+            SourceBatch {
+                batch_id: Ulid::new().to_string(),
+                agent_id: agent_id.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "request.opened".to_owned(),
+                    native_id: "request-opened-read-failure".to_owned(),
+                    data: json!({
+                        "command_id": send_id,
+                        "request_id": "public-request-read-failure",
+                        "turn_id": "turn-1",
+                        "kind": "question",
+                        "details": {"questions":[{"id":"q1", "is_secret":false}]}
+                    }),
+                }],
+                cursor: None,
+            },
+            now + 7,
+        )
+        .expect("commit the next public request");
+    let next_event_seq = next_request.events[0].seq;
+    let high_water_before_read_failure = store.high_water().unwrap();
+    store
+        .connection
+        .execute("DROP TABLE pending_requests", [])
+        .expect("inject an unreadable pending-request table");
+    let mut unreadable_answer = SubmitCommand::new(String::new(), "answer");
+    unreadable_answer.target = Some(agent_id);
+    unreadable_answer.args = json!({"answers":{"q1":{"answers":["Continue"]}}});
+    unreadable_answer.expected_generation = Some(1);
+    unreadable_answer.expected_turn_id = Some("turn-1".to_owned());
+    unreadable_answer.request_id = Some("public-request-read-failure".to_owned());
+    let read_failure = store
+        .admit_rule_action(
+            "owner",
+            &replay.state,
+            next_event_seq,
+            unreadable_answer,
+            now + 8,
+        )
+        .expect_err("pending-request read failure must propagate");
+    assert_eq!(read_failure.code, "internal");
+    assert_eq!(
+        store
+            .get_rule_state("owner", rule_id)
+            .unwrap()
+            .unwrap()
+            .current_cursor,
+        closed_seq
+    );
+    assert_eq!(store.high_water().unwrap(), high_water_before_read_failure);
+    let persisted_answers: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM commands WHERE verb = 'answer'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(persisted_answers, 0);
+}
+
+#[test]
+fn event_rule_replies_bind_open_request_turn_and_replay_without_competing_reply() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64") + 100;
+    let (agent_id, _) =
+        ready_managed_codex_agent(&mut store, "/synthetic/event-replies", "codex-fixture", now);
+    let send = send_request(&agent_id, 1, "open request replies");
+    let send_id = send.id.clone();
+    store.submit("owner", send, now + 5).unwrap();
+    store.dispatch(&send_id, now + 6).unwrap();
+    let turn_id = format!("request-turn-{send_id}");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: Ulid::new().to_string(),
+                agent_id: agent_id.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "turn.started".to_owned(),
+                    native_id: Ulid::new().to_string(),
+                    data: json!({"command_id":send_id, "turn_id":turn_id}),
+                }],
+                cursor: None,
+            },
+            now + 7,
+        )
+        .expect("commit exact request turn");
+
+    let rule_id = "event-request-replies";
+    let rule_value = json!({"id":rule_id,"enabled":true});
+    let rule_state = store
+        .ensure_rule_state(
+            "owner",
+            &RuleDefinitionInput {
+                id: rule_id.to_owned(),
+                canonical_definition: serde_json::to_string(&rule_value).unwrap(),
+                definition_digest: eliot_core::canonical_json_sha256(&rule_value).unwrap(),
+                enabled: true,
+            },
+            now + 8,
+        )
+        .unwrap();
+    let open_request = |native_id: &str, request_id: &str, kind: &str, details| NativeEvent {
+        ts: None,
+        kind: "request.opened".to_owned(),
+        native_id: native_id.to_owned(),
+        data: json!({
+            "command_id":send_id,
+            "request_id":request_id,
+            "turn_id":turn_id,
+            "kind":kind,
+            "details":details,
+        }),
+    };
+    let opened = store
+        .put_batch(
+            SourceBatch {
+                batch_id: Ulid::new().to_string(),
+                agent_id: agent_id.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![
+                    open_request("reply-forged", "request-forged", "approval", json!({})),
+                    open_request("reply-approve", "request-approve", "approval", json!({})),
+                    open_request("reply-deny", "request-deny", "approval", json!({})),
+                    open_request(
+                        "reply-answer",
+                        "request-answer",
+                        "question",
+                        json!({"questions":[{"id":"q1","is_secret":false}]}),
+                    ),
+                    open_request("reply-closed", "request-closed", "approval", json!({})),
+                ],
+                cursor: None,
+            },
+            now + 9,
+        )
+        .expect("commit pending request events");
+    let event_seq = |request_id: &str| {
+        opened
+            .events
+            .iter()
+            .find(|event| event.kind == "request.opened" && event.data["request_id"] == request_id)
+            .expect("request.opened event is retained")
+            .seq
+    };
+    let reply = |verb: &str, request_id: &str, text: Option<&str>| {
+        let mut request = SubmitCommand::new(String::new(), verb);
+        request.target = Some(agent_id.clone());
+        request.args = text.map_or_else(|| json!({}), |text| json!({"text":text}));
+        request.expected_generation = Some(1);
+        request.expected_turn_id = Some(turn_id.clone());
+        request.request_id = Some(request_id.to_owned());
+        request
+    };
+
+    let forged = store
+        .admit_rule_action(
+            "owner",
+            &rule_state,
+            event_seq("request-forged"),
+            reply("approve", "request-approve", None),
+            now + 10,
+        )
+        .unwrap();
+    assert!(forged.child.is_none());
+    assert_eq!(
+        forged.parent.unwrap().outcome.unwrap()["code"],
+        "rule_action_binding_invalid"
+    );
+
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: Ulid::new().to_string(),
+                agent_id: agent_id.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "request.closed".to_owned(),
+                    native_id: "reply-closed-native".to_owned(),
+                    data: json!({"request_id":"request-closed","turn_id":turn_id}),
+                }],
+                cursor: None,
+            },
+            now + 11,
+        )
+        .expect("close the captured request");
+    let closed = store
+        .admit_rule_action(
+            "owner",
+            &forged.state,
+            event_seq("request-closed"),
+            reply("approve", "request-closed", None),
+            now + 12,
+        )
+        .unwrap_err();
+    assert_eq!(closed.code, "source_integrity");
+
+    let approved = store
+        .admit_rule_action(
+            "owner",
+            &forged.state,
+            event_seq("request-approve"),
+            reply("approve", "request-approve", None),
+            now + 13,
+        )
+        .unwrap();
+    let approved_parent_id = approved.parent.as_ref().unwrap().id.clone();
+    let approved_child = approved.child.as_ref().unwrap().clone();
+    assert_eq!(approved_child.verb, "approve");
+    assert_eq!(
+        approved_child.request_id.as_deref(),
+        Some("request-approve")
+    );
+    assert_eq!(approved_child.turn_id.as_deref(), Some(turn_id.as_str()));
+    assert_eq!(approved_child.target.as_deref(), Some(agent_id.as_str()));
+    assert_eq!(approved_child.generation, Some(1));
+
+    store.dispatch(&approved_child.id, now + 14).unwrap();
+    store
+        .settle(
+            &approved_child.id,
+            CommandState::Unknown,
+            Some(json!({"reason":"reply result unknown"})),
+            now + 15,
+        )
+        .unwrap();
+    let high_water_before_replay = store.high_water().unwrap();
+    let replay = store
+        .admit_rule_action(
+            "owner",
+            &approved.state,
+            event_seq("request-approve"),
+            reply("approve", "request-approve", None),
+            now + 16,
+        )
+        .unwrap();
+    assert!(!replay.is_new);
+    assert!(replay.events.is_empty());
+    assert_eq!(replay.parent.as_ref().unwrap().id, approved_parent_id);
+    assert_eq!(replay.child.as_ref().unwrap().id, approved_child.id);
+    assert_eq!(store.high_water().unwrap(), high_water_before_replay);
+
+    let mut competing = reply("approve", "request-approve", None);
+    competing.id = Ulid::new().to_string();
+    let competing_id = competing.id.clone();
+    assert_eq!(
+        store.submit("owner", competing, now + 17).unwrap_err().code,
+        "bad_state"
+    );
+    assert!(store.get_command(&competing_id).unwrap().is_none());
+
+    let denied = store
+        .admit_rule_action(
+            "owner",
+            &replay.state,
+            event_seq("request-deny"),
+            reply("deny", "request-deny", None),
+            now + 18,
+        )
+        .unwrap();
+    assert_eq!(denied.child.as_ref().unwrap().verb, "deny");
+    assert_eq!(
+        denied.child.as_ref().unwrap().request_id.as_deref(),
+        Some("request-deny")
+    );
+
+    let answered = store
+        .admit_rule_action(
+            "owner",
+            &denied.state,
+            event_seq("request-answer"),
+            reply("answer", "request-answer", Some("ordinary answer")),
+            now + 19,
+        )
+        .unwrap();
+    assert_eq!(answered.child.as_ref().unwrap().verb, "answer");
+    assert_eq!(
+        answered.child.as_ref().unwrap().request_id.as_deref(),
+        Some("request-answer")
+    );
+    assert_eq!(
+        answered.child.as_ref().unwrap().args,
+        json!({"text":"ordinary answer"})
+    );
+}
+
+#[test]
+fn project_event_reply_requires_the_explicit_per_verb_grant() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64") + 100;
+    let project = "project-event-reply-grant";
+    let principal = format!("project:{project}");
+    let agent = ready_fake_agent_with_request_stream(&mut store, project, now);
+    let turn_id = start_fake_turn(&mut store, &agent, now + 1);
+    let send_id = turn_id
+        .strip_prefix("fake-turn-")
+        .expect("Fake turn id retains its source send id");
+    let checkout = "synthetic-workspace";
+    let mut registration = ProjectRegistrationInput {
+        id: project.to_owned(),
+        checkout: checkout.to_owned(),
+        repo_common_dir: format!("{checkout}/.git"),
+        profiles: vec!["fake".to_owned()],
+        actions: vec!["approve".to_owned()],
+        interpreters: BTreeMap::new(),
+        run_env: Vec::new(),
+    };
+    store
+        .upsert_project_registration("owner", &registration, now + 2)
+        .unwrap();
+    let rule_id = "project-reply-rule";
+    let rule_value = json!({
+        "id": rule_id,
+        "enabled": true,
+        "on": {"event":"request.opened"},
+        "do": [{"action":"approve"}]
+    });
+    store
+        .ensure_rule_state(
+            &principal,
+            &RuleDefinitionInput {
+                id: rule_id.to_owned(),
+                canonical_definition: serde_json::to_string(&rule_value).unwrap(),
+                definition_digest: eliot_core::canonical_json_sha256(&rule_value).unwrap(),
+                enabled: true,
+            },
+            now + 3,
+        )
+        .unwrap();
+    let open_request = |native_id: &str, request_id: &str| NativeEvent {
+        ts: None,
+        kind: "request.opened".to_owned(),
+        native_id: native_id.to_owned(),
+        data: json!({
+            "command_id": send_id,
+            "request_id": request_id,
+            "turn_id": turn_id,
+            "kind": "approval",
+            "details": {}
+        }),
+    };
+    let first_open = store
+        .put_batch(
+            SourceBatch {
+                batch_id: Ulid::new().to_string(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![open_request("project-approval-1", "project-request-1")],
+                cursor: None,
+            },
+            now + 5,
+        )
+        .unwrap()
+        .events
+        .into_iter()
+        .find(|event| event.kind == "request.opened")
+        .unwrap();
+    registration.actions = vec!["stop".to_owned()];
+    store
+        .upsert_project_registration("owner", &registration, now + 6)
+        .unwrap();
+
+    let make_approval = |request_id: &str| {
+        let mut request = SubmitCommand::new(String::new(), "approve");
+        request.target = Some(agent.clone());
+        request.args = json!({});
+        request.expected_generation = Some(1);
+        request.expected_turn_id = Some(turn_id.clone());
+        request.request_id = Some(request_id.to_owned());
+        request
+    };
+    let denied = store
+        .admit_rule_action(
+            &principal,
+            &store.get_rule_state(&principal, rule_id).unwrap().unwrap(),
+            first_open.seq,
+            make_approval("project-request-1"),
+            now + 7,
+        )
+        .unwrap();
+    assert!(denied.child.is_none());
+    assert_eq!(
+        denied.parent.unwrap().outcome.unwrap()["code"],
+        "not_allowed"
+    );
+
+    registration.actions = vec!["stop".to_owned(), "approve".to_owned()];
+    store
+        .upsert_project_registration("owner", &registration, now + 8)
+        .unwrap();
+    let second_open = store
+        .put_batch(
+            SourceBatch {
+                batch_id: Ulid::new().to_string(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![open_request("project-approval-2", "project-request-2")],
+                cursor: None,
+            },
+            now + 9,
+        )
+        .unwrap()
+        .events
+        .into_iter()
+        .find(|event| event.kind == "request.opened")
+        .unwrap();
+    let current = store.get_rule_state(&principal, rule_id).unwrap().unwrap();
+    let approved = store
+        .admit_rule_action(
+            &principal,
+            &current,
+            second_open.seq,
+            make_approval("project-request-2"),
+            now + 10,
+        )
+        .unwrap();
+    let child = approved.child.expect("approved project reply child");
+    assert_eq!(child.verb, "approve");
+    assert_eq!(child.principal, principal);
+    assert_eq!(child.turn_id.as_deref(), Some(turn_id.as_str()));
+    assert_eq!(child.request_id.as_deref(), Some("project-request-2"));
+    assert_eq!(
+        store.dispatch(&child.id, now + 11).unwrap().value.state,
+        CommandState::Dispatched
     );
 }
 
