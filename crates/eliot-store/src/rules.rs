@@ -162,6 +162,7 @@ struct RuleFiringKey<'a> {
     identity: RuleFiringIdentity,
     verb: &'static str,
     args: Value,
+    script_context: Option<core::api::FrozenScriptContext>,
     parent_digest: Option<Vec<u8>>,
     parent_id: String,
     child_id: String,
@@ -190,6 +191,7 @@ impl<'a> RuleFiringKey<'a> {
             identity: RuleFiringIdentity::Event { event_seq },
             verb: "rule",
             args,
+            script_context: None,
             parent_digest: None,
             parent_id: derived_rule_id("parent", principal, &state.id, revision, event_seq)?,
             child_id: derived_rule_id("action-0", principal, &state.id, revision, event_seq)?,
@@ -224,6 +226,7 @@ impl<'a> RuleFiringKey<'a> {
             },
             verb: "rule",
             args,
+            script_context: None,
             parent_digest: None,
             parent_id,
             child_id,
@@ -247,6 +250,7 @@ impl<'a> RuleFiringKey<'a> {
             identity: RuleFiringIdentity::Manual,
             verb: "timer.run",
             args,
+            script_context: None,
             parent_digest: Some(parent_digest),
             parent_id: parent_id.to_owned(),
             child_id: derived_manual_timer_id(principal, &state.id, parent_id)?,
@@ -1044,6 +1048,96 @@ impl Store {
         Ok(timers)
     }
 
+    /// Read a committed timer slot before its caller prepares or freezes an action.
+    ///
+    /// `state` and `scheduled_at_ms` identify the retained slot only. Current timer
+    /// enablement, rate limits and project registration are deliberately not checked
+    /// on replay. The returned state is reread from Store so a stale caller snapshot
+    /// cannot repeat the timer cursor.
+    pub fn replay_timer_slot(
+        &self,
+        principal: &str,
+        state: &core::api::TimerStateView,
+        scheduled_at_ms: i64,
+    ) -> Result<Option<TimerSlotAdmission>> {
+        require_nonempty(principal, "principal")?;
+        state.validate()?;
+        let parent_id = derived_timer_id(
+            "parent",
+            principal,
+            &state.id,
+            state.schedule_revision,
+            scheduled_at_ms,
+        )?;
+        let Some(parent) = load_command(&self.connection, &parent_id)? else {
+            return Ok(None);
+        };
+        if parent.principal != principal
+            || parent.verb != "rule"
+            || parent.args.get("rule").and_then(Value::as_str) != Some(state.id.as_str())
+            || parent.args.get("schedule_revision").and_then(Value::as_i64)
+                != Some(state.schedule_revision)
+            || parent.args.get("scheduled_at_ms").and_then(Value::as_i64) != Some(scheduled_at_ms)
+            || parent.args.get("project").and_then(Value::as_str) != state.project.as_deref()
+        {
+            return Err(Error::new(
+                "source_integrity",
+                "scheduled timer parent does not match its slot identity",
+            ));
+        }
+        let expected_children = parent
+            .outcome
+            .as_ref()
+            .and_then(|outcome| outcome.get("children"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                Error::new(
+                    "source_integrity",
+                    "scheduled timer parent has no child set",
+                )
+            })?;
+        let child_id = derived_timer_id(
+            "action-0",
+            principal,
+            &state.id,
+            state.schedule_revision,
+            scheduled_at_ms,
+        )?;
+        if expected_children.len() > 1
+            || expected_children
+                .first()
+                .is_some_and(|child| child.as_str() != Some(child_id.as_str()))
+        {
+            return Err(Error::new(
+                "source_integrity",
+                "scheduled timer parent has an invalid fixed child set",
+            ));
+        }
+        let child = load_rule_child(&self.connection, &parent.id, &child_id)?;
+        if expected_children.is_empty() == child.is_some() {
+            return Err(Error::new(
+                "source_integrity",
+                "scheduled timer child rows differ from the retained parent",
+            ));
+        }
+        let state = load_timer_state(&self.connection, principal, &state.id)?
+            .ok_or_else(|| {
+                Error::new(
+                    "source_integrity",
+                    "scheduled timer parent has no retained timer state",
+                )
+            })?
+            .view;
+        Ok(Some(TimerSlotAdmission {
+            state,
+            parent: Some(parent),
+            child,
+            events: Vec::new(),
+            is_new: false,
+            blocked: false,
+        }))
+    }
+
     /// Commit one scheduled slot with its ordinary rule-action child, fixed parent,
     /// action accounting, and numeric cursor in one writer transaction.
     pub fn commit_timer_slot(
@@ -1077,7 +1171,7 @@ impl Store {
             .ok_or_else(|| Error::new("not_found", "timer rule was not found"))?;
         let stored = load_timer_state(&tx, principal, &state.id)?
             .ok_or_else(|| Error::new("not_found", "timer state was not found"))?;
-        let key = RuleFiringKey::timer(
+        let mut key = RuleFiringKey::timer(
             principal,
             &rule.view,
             state.schedule_revision,
@@ -1172,8 +1266,34 @@ impl Store {
         let mut parent = None;
         let mut child = None;
         if let Some(action) = slot.action {
-            let rejected = if !valid_rule_action_request(&action, false) {
+            let action_rejection = if action.verb == "run" {
+                let expected_context = expected_timer_script_context(
+                    &rule.view,
+                    &stored.view,
+                    core::api::ScriptTimerInvocation::Scheduled {
+                        scheduled_at_ms: slot.scheduled_at_ms,
+                    },
+                )?;
+                match validate_timer_script_run_request(&action, &expected_context) {
+                    Ok(()) => {
+                        key.script_context = Some(expected_context);
+                        None
+                    }
+                    Err(error)
+                        if error.code == "rule_action_binding_invalid"
+                            || core::is_deterministic_pre_admission_rejection(&error.code) =>
+                    {
+                        Some(error.code)
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else if !valid_rule_action_request(&action, false) {
                 Some("rule_action_binding_invalid".to_owned())
+            } else {
+                None
+            };
+            let rejected = if let Some(code) = action_rejection {
+                Some(code)
             } else {
                 match validate_project_rule_action_tx(&tx, principal, &action) {
                     Err(error) if core::is_deterministic_pre_admission_rejection(&error.code) => {
@@ -1344,7 +1464,14 @@ impl Store {
             ));
         }
         validate_id_age(&request.id, now)?;
-        if !valid_rule_action_request(&action, false) {
+        if action.verb == "run" {
+            if !valid_targetless_rule_run_request(&action) {
+                return Err(Error::new(
+                    "invalid",
+                    "timer Run must be targetless and have no Agent bindings",
+                ));
+            }
+        } else if !valid_rule_action_request(&action, false) {
             return Err(Error::new(
                 "invalid",
                 "timer action is not a valid rule action",
@@ -1362,6 +1489,19 @@ impl Store {
         if timer.view != *state || !timer.view.enabled || !rule.view.enabled {
             return Err(Error::new("bad_state", "timer is disabled or paused"));
         }
+        let timer_context = if action.verb == "run" {
+            let expected = expected_timer_script_context(
+                &rule.view,
+                &timer.view,
+                core::api::ScriptTimerInvocation::Manual {
+                    parent_command_id: request.id.clone(),
+                },
+            )?;
+            validate_timer_script_run_request(&action, &expected)?;
+            Some(expected)
+        } else {
+            None
+        };
         if has_open_rule_actions_tx(&tx, principal, &request.rule)? {
             commit_transaction(tx, &self.write_faulted)?;
             return Ok(TimerSlotAdmission {
@@ -1389,7 +1529,8 @@ impl Store {
             ));
         }
 
-        let key = RuleFiringKey::manual(principal, &rule.view, &request.id, digest)?;
+        let mut key = RuleFiringKey::manual(principal, &rule.view, &request.id, digest)?;
+        key.script_context = timer_context;
         match admit_rule_action_tx(&tx, &key, action, now) {
             Ok((parent, child, events)) => {
                 commit_transaction(tx, &self.write_faulted)?;
@@ -2086,6 +2227,32 @@ pub(super) fn resolve_script_run_origin_tx(
     run: &Command,
     frozen: &core::api::FrozenScriptRun,
 ) -> Result<ScriptRunOrigin> {
+    match &frozen.context {
+        core::api::FrozenScriptContext::Event { .. } => {
+            resolve_event_script_run_origin_tx(tx, run, frozen)
+        }
+        core::api::FrozenScriptContext::Timer { .. } => {
+            resolve_timer_script_run_origin_tx(tx, run, frozen)
+        }
+    }
+}
+
+fn resolve_event_script_run_origin_tx(
+    tx: &Transaction<'_>,
+    run: &Command,
+    frozen: &core::api::FrozenScriptRun,
+) -> Result<ScriptRunOrigin> {
+    let core::api::FrozenScriptContext::Event {
+        event: frozen_event,
+        subject: frozen_subject,
+        rule: frozen_rule,
+    } = &frozen.context
+    else {
+        return Err(Error::new(
+            "source_integrity",
+            "event rule Run has no frozen event context",
+        ));
+    };
     let link: Option<(Option<String>, Option<String>, Option<i64>)> = tx
         .query_row(
             "SELECT parent_command, link_kind, ordinal FROM commands WHERE id = ?1",
@@ -2175,7 +2342,7 @@ pub(super) fn resolve_script_run_origin_tx(
                 .ok_or_else(|| {
                     Error::new("source_integrity", "catch-up parent has no upper bound")
                 })?;
-            let event_seq = frozen.context.event.seq;
+            let event_seq = frozen_event.seq;
             if event_seq <= after_seq || event_seq > through_seq {
                 return Err(Error::new(
                     "source_integrity",
@@ -2186,17 +2353,14 @@ pub(super) fn resolve_script_run_origin_tx(
         }
         _ => unreachable!("parent verb was checked above"),
     };
-    if frozen.context.rule.id != rule
-        || frozen.context.rule.revision != revision
-        || frozen.context.event.seq != event_seq
-    {
+    if frozen_rule.id != rule || frozen_rule.revision != revision || frozen_event.seq != event_seq {
         return Err(Error::new(
             "source_integrity",
             "stored script context differs from its rule parent",
         ));
     }
     let event = scripts::load_event_tx(tx, event_seq)?;
-    if frozen.context.event != event || frozen.context.subject != event.subject {
+    if frozen_event.as_ref() != &event || frozen_subject != &event.subject {
         return Err(Error::new(
             "source_integrity",
             "stored script context differs from its committed event",
@@ -2246,6 +2410,229 @@ pub(super) fn resolve_script_run_origin_tx(
         return Err(Error::new(
             "source_integrity",
             "script rule revision is no longer retained",
+        ));
+    };
+    let limit = rule_action_limit_for_definition(definition)?;
+    Ok(ScriptRunOrigin {
+        principal: run.principal.clone(),
+        rule,
+        cause,
+        limit,
+    })
+}
+
+fn resolve_timer_script_run_origin_tx(
+    tx: &Transaction<'_>,
+    run: &Command,
+    frozen: &core::api::FrozenScriptRun,
+) -> Result<ScriptRunOrigin> {
+    let core::api::FrozenScriptContext::Timer {
+        timer: timer_context,
+        rule: script_rule,
+    } = &frozen.context
+    else {
+        return Err(Error::new(
+            "source_integrity",
+            "timer Run has no frozen timer context",
+        ));
+    };
+    let link: Option<(Option<String>, Option<String>, Option<i64>)> = tx
+        .query_row(
+            "SELECT parent_command, link_kind, ordinal FROM commands WHERE id = ?1",
+            [&run.id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let (Some(parent_id), Some(link_kind), Some(ordinal)) =
+        link.ok_or_else(|| Error::new("source_integrity", "timer Run has no stored parent link"))?
+    else {
+        return Err(Error::new(
+            "source_integrity",
+            "timer Run has incomplete parent ordering metadata",
+        ));
+    };
+    if link_kind != "rule_action" || ordinal < 0 {
+        return Err(Error::new(
+            "source_integrity",
+            "timer Run is not an ordered rule action",
+        ));
+    }
+    let parent = load_command_record(tx, &parent_id)?
+        .ok_or_else(|| Error::new("source_integrity", "timer Run parent is missing"))?;
+    if parent.command.principal != run.principal
+        || parent.command.state != CommandState::Applied
+        || !matches!(parent.command.verb.as_str(), "rule" | "timer.run")
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "timer Run has an unsupported or differently-authorized parent",
+        ));
+    }
+    let firing_children = parent
+        .command
+        .outcome
+        .as_ref()
+        .and_then(|outcome| outcome.get("children"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::new("source_integrity", "timer parent has no fixed child set"))?;
+    if !firing_children
+        .iter()
+        .any(|child| child.as_str() == Some(run.id.as_str()))
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "timer Run is absent from its parent fixed child set",
+        ));
+    }
+    let rule = parent
+        .command
+        .args
+        .get("rule")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::new("source_integrity", "timer parent has no rule id"))?
+        .to_owned();
+    if script_rule.id != rule {
+        return Err(Error::new(
+            "source_integrity",
+            "frozen timer context rule differs from its parent",
+        ));
+    }
+    let stored_context = parent
+        .command
+        .outcome
+        .as_ref()
+        .and_then(|outcome| outcome.get("script_context"))
+        .cloned()
+        .ok_or_else(|| Error::new("source_integrity", "timer Run parent has no script context"))
+        .and_then(|value| {
+            serde_json::from_value::<core::api::FrozenScriptContext>(value).map_err(|_| {
+                Error::new("source_integrity", "stored timer script context is invalid")
+            })
+        })?;
+    if stored_context != frozen.context {
+        return Err(Error::new(
+            "source_integrity",
+            "frozen timer context differs from its stored parent snapshot",
+        ));
+    }
+    timer_context
+        .validate()
+        .map_err(|_| Error::new("source_integrity", "frozen timer context is invalid"))?;
+
+    let project = rule_project_id(&run.principal)?;
+    if parent.command.args.get("project").and_then(Value::as_str) != project.as_deref() {
+        return Err(Error::new(
+            "source_integrity",
+            "timer parent project differs from its stored principal",
+        ));
+    }
+    match parent.command.verb.as_str() {
+        "rule" => {
+            let schedule_revision = parent
+                .command
+                .args
+                .get("schedule_revision")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| {
+                    Error::new(
+                        "source_integrity",
+                        "scheduled timer parent has no schedule revision",
+                    )
+                })?;
+            let scheduled_at_ms = parent
+                .command
+                .args
+                .get("scheduled_at_ms")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| {
+                    Error::new("source_integrity", "scheduled timer parent has no slot key")
+                })?;
+            if parent.command.args.get("event_seq").is_some()
+                || timer_context.schedule_revision != schedule_revision
+                || timer_context.invocation
+                    != (core::api::ScriptTimerInvocation::Scheduled { scheduled_at_ms })
+                || derived_timer_id(
+                    "parent",
+                    &run.principal,
+                    &rule,
+                    schedule_revision,
+                    scheduled_at_ms,
+                )?
+                .as_str()
+                    != parent.command.id.as_str()
+            {
+                return Err(Error::new(
+                    "source_integrity",
+                    "scheduled timer context differs from its stored slot identity",
+                ));
+            }
+        }
+        "timer.run" => {
+            if timer_context.invocation
+                != (core::api::ScriptTimerInvocation::Manual {
+                    parent_command_id: parent.command.id.clone(),
+                })
+            {
+                return Err(Error::new(
+                    "source_integrity",
+                    "manual timer context differs from its stored parent identity",
+                ));
+            }
+            let mut request =
+                core::api::TimerRunRequest::new(parent.command.id.clone(), rule.clone());
+            if let Some(project) = project {
+                request = request.in_project(project);
+            }
+            request
+                .validate_response(&parent.command)
+                .map_err(|_| Error::new("source_integrity", "manual timer parent is invalid"))?;
+            let digest = timer_run_digest(&request)?;
+            let binding = command_binding(tx, &parent.command.id)?.ok_or_else(|| {
+                Error::new("source_integrity", "manual timer parent binding is absent")
+            })?;
+            if binding.0 != run.principal || binding.1 != COMMAND_METHOD || binding.2 != digest {
+                return Err(Error::new(
+                    "source_integrity",
+                    "manual timer parent differs from its request binding",
+                ));
+            }
+        }
+        _ => unreachable!("timer parent verb was checked above"),
+    }
+
+    let cause = command_cause_tx(tx, &run.id)?
+        .ok_or_else(|| Error::new("source_integrity", "timer Run has no stored cause"))?;
+    let parent_cause = command_cause_tx(tx, &parent_id)?
+        .ok_or_else(|| Error::new("source_integrity", "timer parent has no stored cause"))?;
+    if parent_cause.command_id != parent_id
+        || parent_cause.rule.as_deref() != Some(rule.as_str())
+        || parent_cause.depth != 1
+        || cause.command_id != run.id
+        || cause.rule.as_deref() != Some(rule.as_str())
+        || cause.depth != parent_cause.depth
+        || cause.depth > 5
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "timer Run cause differs from its verified parent",
+        ));
+    }
+
+    let stored = load_rule_state(tx, &run.principal, &rule)?
+        .ok_or_else(|| Error::new("source_integrity", "timer rule state was removed"))?;
+    let revision = script_rule.revision;
+    let definition = if stored.view.revision == revision {
+        stored.canonical_definition.as_str()
+    } else if stored.view.retiring_revision == Some(revision) {
+        stored
+            .retiring_definition
+            .as_deref()
+            .ok_or_else(|| Error::new("source_integrity", "retiring timer rule is absent"))?
+    } else {
+        return Err(Error::new(
+            "source_integrity",
+            "timer rule revision is no longer retained",
         ));
     };
     let limit = rule_action_limit_for_definition(definition)?;
@@ -2411,6 +2798,60 @@ fn valid_targetless_rule_run_request(request: &SubmitCommand) -> bool {
         && request.request_id.is_none()
         && !request.probe
         && request.args.is_object()
+}
+
+fn expected_timer_script_context(
+    rule: &core::api::RuleStateView,
+    timer: &core::api::TimerStateView,
+    invocation: core::api::ScriptTimerInvocation,
+) -> Result<core::api::FrozenScriptContext> {
+    if rule.id != timer.id {
+        return Err(Error::new(
+            "source_integrity",
+            "timer and rule state identities differ",
+        ));
+    }
+    let context = core::api::FrozenScriptContext::Timer {
+        timer: core::api::ScriptTimerContext {
+            schedule_revision: timer.schedule_revision,
+            schedule: timer.schedule.clone(),
+            anchor: timer.anchor,
+            invocation,
+        },
+        rule: core::api::ScriptRuleContext {
+            id: rule.id.clone(),
+            revision: rule.revision,
+        },
+    };
+    context
+        .validate()
+        .map_err(|_| Error::new("source_integrity", "stored timer script context is invalid"))?;
+    Ok(context)
+}
+
+fn validate_timer_script_run_request(
+    request: &SubmitCommand,
+    expected: &core::api::FrozenScriptContext,
+) -> Result<()> {
+    if !valid_targetless_rule_run_request(request) {
+        return Err(Error::new(
+            "rule_action_binding_invalid",
+            "timer Run must be targetless and have no Agent bindings",
+        ));
+    }
+    let frozen = scripts::decode_frozen_run(&request.args).map_err(|_| {
+        Error::new(
+            "rule_action_binding_invalid",
+            "timer Run arguments are not a valid frozen script snapshot",
+        )
+    })?;
+    if &frozen.context != expected {
+        return Err(Error::new(
+            "rule_action_binding_invalid",
+            "frozen timer context differs from its stored firing identity",
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn rule_run_action_binding_error(
@@ -2659,7 +3100,7 @@ fn has_open_rule_actions_tx(tx: &Transaction<'_>, principal: &str, rule: &str) -
                           AND parent.ordinal IS NOT NULL
                           AND root.id = parent.parent_command
                           AND root.principal = ?1
-                          AND root.verb IN ('rule','rule.catch_up')
+                          AND root.verb IN ('rule','timer.run','rule.catch_up')
                           AND json_extract(root.args, '$.rule') = ?2
                     )
                 )
@@ -3099,7 +3540,7 @@ fn should_suppress_own_event_send_or_run_tx(
                           AND run.link_kind = 'rule_action'
                           AND run.ordinal IS NOT NULL
                           AND root.principal = ?2
-                          AND root.verb IN ('rule','rule.catch_up')
+                          AND root.verb IN ('rule','timer.run','rule.catch_up')
                           AND json_extract(root.args, '$.rule') = ?3
                     )
                )
@@ -3223,10 +3664,16 @@ fn insert_rule_parent(
         RuleParentOutcome::Rejected { code } => (Vec::new(), CommandState::Rejected, Some(code)),
     };
     let args = &key.args;
-    let outcome = match rejection_code {
+    let mut outcome = match rejection_code {
         Some(code) => json!({"children": child_ids, "code": code}),
         None => json!({"children": child_ids}),
     };
+    if rejection_code.is_none()
+        && let Some(script_context) = &key.script_context
+    {
+        outcome["script_context"] = serde_json::to_value(script_context)
+            .map_err(|_| Error::new("internal", "timer script context cannot be encoded"))?;
+    }
     let digest = match &key.parent_digest {
         Some(digest) => digest.clone(),
         None => canonical::digest(&json!({
@@ -3385,11 +3832,11 @@ fn reject_rule_event(
 }
 
 fn load_rule_child(
-    tx: &Transaction<'_>,
+    connection: &Connection,
     parent_id: &str,
     expected_child_id: &str,
 ) -> Result<Option<Command>> {
-    let child_id: Option<String> = tx
+    let child_id: Option<String> = connection
         .query_row(
             "SELECT id FROM commands
              WHERE parent_command = ?1 AND link_kind = 'rule_action' AND ordinal = 0",
@@ -3407,7 +3854,7 @@ fn load_rule_child(
             "rule parent child id does not match its deterministic action id",
         ));
     }
-    load_command(tx, &child_id)
+    load_command(connection, &child_id)
 }
 
 #[cfg(test)]

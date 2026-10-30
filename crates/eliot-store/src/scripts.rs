@@ -220,17 +220,25 @@ pub(super) fn validate_rule_run_context_tx(
     args: &Value,
 ) -> Result<()> {
     let frozen = decode_frozen_run(args)?;
-    if frozen.context.rule.id != rule
-        || frozen.context.rule.revision != revision
-        || frozen.context.event.seq != event_seq
-    {
+    let core::api::FrozenScriptContext::Event {
+        event: frozen_event,
+        subject: frozen_subject,
+        rule: frozen_rule,
+    } = &frozen.context
+    else {
+        return Err(Error::new(
+            "invalid",
+            "event rule firing requires an event Run context",
+        ));
+    };
+    if frozen_rule.id != rule || frozen_rule.revision != revision || frozen_event.seq != event_seq {
         return Err(Error::new(
             "invalid",
             "frozen Run context does not match its rule firing",
         ));
     }
     let event = load_event_tx(tx, event_seq)?;
-    if frozen.context.event != event || frozen.context.subject != event.subject {
+    if frozen_event.as_ref() != &event || frozen_subject != &event.subject {
         return Err(Error::new(
             "invalid",
             "frozen Run context does not match the committed event and subject",
@@ -506,8 +514,8 @@ mod tests {
                 size: 1,
                 sha256: "cd".repeat(32),
             },
-            context: core::api::FrozenScriptContext {
-                event: event.clone(),
+            context: core::api::FrozenScriptContext::Event {
+                event: Box::new(event.clone()),
                 subject: event.subject.clone(),
                 rule: core::api::ScriptRuleContext {
                     id: rule.to_owned(),

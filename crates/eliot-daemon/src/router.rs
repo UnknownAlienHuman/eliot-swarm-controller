@@ -9,8 +9,8 @@ use crate::{
 };
 use eliot_core::{
     Agent, AgentState, Command, CommandState, Error, Event, FrozenScriptContext, FrozenScriptRun,
-    NativeStoreBinding, Result, RunDefinitionArgs, ScriptProcessResult, SecretPolicy,
-    SubmitCommand, Turn, TurnState, WorkspacePhase, WorkspacePreparationInput,
+    NativeStoreBinding, Result, RunDefinitionArgs, ScriptProcessResult, ScriptTimerInvocation,
+    SecretPolicy, SubmitCommand, Turn, TurnState, WorkspacePhase, WorkspacePreparationInput,
     api::{
         AgentDiscoverRequest, AgentEditsRequest, AgentEditsResponse, AgentGetRequest,
         AgentGetResponse, AgentGitRequest, AgentGitResponse, AgentHistoryRequest, AgentListRequest,
@@ -666,7 +666,7 @@ impl Router {
         self.prepare_submission(request, &Principal::Owner).await
     }
 
-    /// Prepare a targetless global event-rule Run under the current Owner Run grant.
+    /// Prepare a targetless global rule Run under the current Owner Run grant.
     /// Ordinary Owner command submission still rejects Run in `authorize_command`.
     pub(crate) async fn prepare_owner_rule_run_submission(
         &self,
@@ -701,6 +701,52 @@ impl Router {
             .map_err(|_| Error::new("internal", "frozen Owner Run could not be encoded"))?;
         self.prepare_submission_after_authorization(request, &Principal::Owner, false)
             .await
+    }
+
+    /// Freeze a timer Run under its live Owner or project grant before admission.
+    pub(crate) async fn prepare_timer_rule_run_submission(
+        &self,
+        mut request: SubmitCommand,
+        project: Option<&eliot_core::api::ProjectRegistrationView>,
+        context: FrozenScriptContext,
+    ) -> Result<PreparedSubmission> {
+        if request.verb != "run"
+            || !request.id.is_empty()
+            || request.target.is_some()
+            || request.expected_generation.is_some()
+            || request.expected_turn_id.is_some()
+            || request.request_id.is_some()
+            || request.probe
+            || context.timer().is_none()
+        {
+            return Err(Error::new(
+                "invalid",
+                "timer Run must be targetless, unbound, and carry timer context",
+            ));
+        }
+        context.validate()?;
+        match project {
+            Some(registration) => {
+                let definition: RunDefinitionArgs = serde_json::from_value(request.args.clone())
+                    .map_err(|_| Error::new("invalid", "project Run args are malformed"))?;
+                let policy = self.secret_policy_snapshot();
+                let frozen = crate::scripts::freeze_project_run(
+                    definition,
+                    registration,
+                    context,
+                    policy.as_ref(),
+                )?;
+                request.args = serde_json::to_value(frozen).map_err(|_| {
+                    Error::new("internal", "frozen project Run could not be encoded")
+                })?;
+                self.prepare_project_rule_submission(request, registration)
+                    .await
+            }
+            None => {
+                self.prepare_owner_rule_run_submission(request, context)
+                    .await
+            }
+        }
     }
 
     pub(crate) async fn prepare_project_rule_submission(
@@ -1503,9 +1549,25 @@ impl Router {
         }
 
         let command = definition.evaluate_timer()?;
-        let prepared_result = match project_view.as_ref() {
-            Some(project) => self.prepare_project_rule_submission(command, project).await,
-            None => self.prepare_owner_submission(command).await,
+        let prepared_result = if command.verb == "run" {
+            self.prepare_timer_rule_run_submission(
+                command,
+                project_view.as_ref(),
+                crate::automation::timer_script_context(
+                    &definition.id,
+                    expected_rule_revision,
+                    &timer,
+                    ScriptTimerInvocation::Manual {
+                        parent_command_id: request.id.clone(),
+                    },
+                ),
+            )
+            .await
+        } else {
+            match project_view.as_ref() {
+                Some(project) => self.prepare_project_rule_submission(command, project).await,
+                None => self.prepare_owner_submission(command).await,
+            }
         };
         let prepared = match prepared_result {
             Ok(prepared) => prepared,
@@ -1576,11 +1638,42 @@ impl Router {
             request: action,
             workspace,
         } = prepared;
-        if !matches!(action.verb.as_str(), "stop" | "send") || workspace.is_some() {
+        if !matches!(action.verb.as_str(), "stop" | "send" | "run") || workspace.is_some() {
             return Err(Error::new(
                 "invalid",
-                "timer firing must contain one prepared stop or send command",
+                "timer firing must contain one prepared stop, send, or Run command",
             ));
+        }
+        if action.verb == "run" {
+            if !action.id.is_empty()
+                || action.target.is_some()
+                || action.expected_generation.is_some()
+                || action.expected_turn_id.is_some()
+                || action.request_id.is_some()
+                || action.probe
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "timer Run must be targetless and unbound",
+                ));
+            }
+            let frozen: FrozenScriptRun = serde_json::from_value(action.args.clone())
+                .map_err(|_| Error::new("invalid", "manual timer Run args are not frozen"))?;
+            frozen.validate()?;
+            let expected_context = crate::automation::timer_script_context(
+                &request.rule,
+                expected_rule_revision,
+                state,
+                ScriptTimerInvocation::Manual {
+                    parent_command_id: request.id.clone(),
+                },
+            );
+            if frozen.context != expected_context {
+                return Err(Error::new(
+                    "invalid",
+                    "manual timer Run context does not match its admission",
+                ));
+            }
         }
         let admission = {
             let mut store = self.inner.store.lock().await;
@@ -1792,6 +1885,19 @@ impl Router {
             .list_due_timer_states(principal, after_id, due_by_ms, limit)
     }
 
+    pub(crate) async fn replay_rule_timer_slot(
+        &self,
+        principal: &str,
+        state: &TimerStateView,
+        scheduled_at_ms: i64,
+    ) -> Result<Option<TimerSlotAdmission>> {
+        self.inner
+            .store
+            .lock()
+            .await
+            .replay_timer_slot(principal, state, scheduled_at_ms)
+    }
+
     pub(crate) async fn commit_rule_timer_slot(
         &self,
         principal: &str,
@@ -1800,25 +1906,32 @@ impl Router {
         slot: TimerSlotCommit,
         now: i64,
     ) -> Result<Option<TimerSlotAdmission>> {
+        let scheduled_at_ms = slot.scheduled_at_ms;
         let admission = {
             let mut store = self.inner.store.lock().await;
-            if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
-                return Ok(None);
-            }
-            if let Some(expected) = project {
-                let current = store
-                    .get_project_registration("owner", &expected.id)?
-                    .ok_or_else(|| Error::new("not_allowed", "project registration was removed"))?;
-                if &current != expected {
-                    return Err(Error::new(
-                        "not_allowed",
-                        "project registration changed before timer admission",
-                    ));
+            if let Some(admission) = store.replay_timer_slot(principal, state, scheduled_at_ms)? {
+                admission
+            } else {
+                if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
+                    return Ok(None);
                 }
+                if let Some(expected) = project {
+                    let current = store
+                        .get_project_registration("owner", &expected.id)?
+                        .ok_or_else(|| {
+                            Error::new("not_allowed", "project registration was removed")
+                        })?;
+                    if &current != expected {
+                        return Err(Error::new(
+                            "not_allowed",
+                            "project registration changed before timer admission",
+                        ));
+                    }
+                }
+                let admission = store.commit_timer_slot(principal, state, slot, now)?;
+                self.publish_locked(&admission.events);
+                admission
             }
-            let admission = store.commit_timer_slot(principal, state, slot, now)?;
-            self.publish_locked(&admission.events);
-            admission
         };
         if admission.is_new
             && let Some(child) = &admission.child
@@ -7633,8 +7746,8 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 env: std::collections::BTreeMap::new(),
             },
             &registration,
-            eliot_core::FrozenScriptContext {
-                event: event.clone(),
+            eliot_core::FrozenScriptContext::Event {
+                event: Box::new(event.clone()),
                 subject: event.subject.clone(),
                 rule: eliot_core::ScriptRuleContext {
                     id: rule_id.to_owned(),
@@ -7872,8 +7985,8 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         let prepared = router
             .prepare_owner_rule_run_submission(
                 request,
-                FrozenScriptContext {
-                    event: event.clone(),
+                FrozenScriptContext::Event {
+                    event: Box::new(event.clone()),
                     subject: event.subject.clone(),
                     rule: eliot_core::ScriptRuleContext {
                         id: RULE_ID.to_owned(),

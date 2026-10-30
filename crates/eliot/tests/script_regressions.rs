@@ -4,6 +4,7 @@ mod support;
 
 use eliot_core::api::{
     AgentResultRequest, AgentResultResponse, ProjectRegistrationView, RuleStateView,
+    ScriptInputContext, ScriptTimerInvocation, TimerSchedule, TimerStateView,
 };
 use eliot_core::{
     Command as CoreCommand, CommandState, ScriptCustody, ScriptDirectExit, ScriptRunApplied,
@@ -14,13 +15,17 @@ use std::{
     fs,
     path::{Path, PathBuf},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use support::{CLI, Fixture, cli};
 
 const PROJECT_ID: &str = "script-fixture";
 const RULE_ID: &str = "project-script-on-completed";
 const GLOBAL_RULE_ID: &str = "global-script-on-completed";
+const GLOBAL_SCHEDULED_TIMER_ID: &str = "global-scheduled-run";
+const PROJECT_SCHEDULED_TIMER_ID: &str = "project-scheduled-run";
+const GLOBAL_MANUAL_TIMER_ID: &str = "global-manual-run";
+const PROJECT_MANUAL_TIMER_ID: &str = "project-manual-run";
 const SEND_TEXT: &str = "script-event-send";
 const INVALID_SEND_TEXT: &str = "must-not-dispatch";
 
@@ -213,6 +218,38 @@ fn setup_global_run_fixture(fixture: &mut Fixture, interpreter: &ApprovedInterpr
     fs::canonicalize(scripts).expect("canonical private global script root")
 }
 
+fn setup_global_project_timer_fixture(fixture: &mut Fixture) -> (ApprovedInterpreter, PathBuf) {
+    let interpreter = setup_registered_project(fixture);
+    fixture.stop(false);
+
+    let scripts = fixture.data.join("scripts");
+    fs::create_dir_all(&scripts).expect("create private global script directory");
+    fs::create_dir_all(fixture.data.join("rules")).expect("create private global rule directory");
+    let entry = interpreter
+        .entry
+        .rsplit('/')
+        .next()
+        .expect("script entry filename");
+    fs::write(scripts.join(entry), SCRIPT_FIXTURE).expect("install global script fixture");
+
+    let config_path = fixture.data.join("config.toml");
+    let mut config = fs::read_to_string(&config_path).expect("read owner project config");
+    config.push_str(&format!(
+        "\n[automation.run]\nrun_env = [\"CI\"]\n\
+         [automation.run.interpreters.{}]\nprogram = {}\nargv_prefix = {}\n",
+        interpreter.reference,
+        toml_string(&interpreter.program),
+        toml_array(&interpreter.argv_prefix),
+    ));
+    fs::write(config_path, config).expect("add owner-global timer Run grant");
+    fixture.start();
+
+    (
+        interpreter,
+        fs::canonicalize(scripts).expect("canonical private global script root"),
+    )
+}
+
 fn write_global_run_config(
     fixture: &Fixture,
     interpreter: &ApprovedInterpreter,
@@ -230,6 +267,16 @@ fn write_global_run_config(
     };
     let config = format!("[automation.run]\nrun_env = [\"CI\"]\n{interpreter_table}");
     fs::write(fixture.data.join("config.toml"), config).expect("write owner global Run grant");
+}
+
+fn epoch_ms_now() -> i64 {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock is after the Unix epoch")
+            .as_millis(),
+    )
+    .expect("current epoch milliseconds fit signed range")
 }
 
 struct RunRuleCase<'a> {
@@ -356,6 +403,222 @@ fn write_global_run_rule(
     )
     .expect("write owner global event rule");
     wait_for_global_rule(fixture);
+}
+
+struct TimerRunRuleCase<'a> {
+    project: Option<&'a str>,
+    id: &'a str,
+    on: &'a str,
+    mode: &'a str,
+    max_actions: u64,
+    agent: &'a str,
+    generation: i64,
+    other_command_id: &'a str,
+    context_path: &'a Path,
+    own_command_path: &'a Path,
+    expected_cwd: &'a Path,
+}
+
+struct TimerRunReplay<'a> {
+    project: Option<&'a str>,
+    timer_id: &'a str,
+    mutation_id: String,
+    parent: CoreCommand,
+    run_id: String,
+    send_id: String,
+    rule_path: PathBuf,
+}
+
+fn write_timer_run_rule(
+    fixture: &Fixture,
+    interpreter: &ApprovedInterpreter,
+    case: TimerRunRuleCase<'_>,
+) -> PathBuf {
+    let entry = match case.project {
+        Some(_) => interpreter.entry.to_owned(),
+        None => interpreter
+            .entry
+            .rsplit('/')
+            .next()
+            .expect("script entry filename")
+            .to_owned(),
+    };
+    let arguments = vec![
+        interpreter.reference.clone(),
+        entry,
+        case.mode.to_owned(),
+        CLI.to_owned(),
+        fixture.data.display().to_string(),
+        case.agent.to_owned(),
+        case.generation.to_string(),
+        case.other_command_id.to_owned(),
+        case.context_path.display().to_string(),
+        case.own_command_path.display().to_string(),
+        case.expected_cwd.display().to_string(),
+    ];
+    let source = format!(
+        concat!(
+            "[[rule]]\n",
+            "id = {rule_id}\n",
+            "enabled = true\n",
+            "on = {on}\n",
+            "limit = {{ max = {max_actions}, per = \"rule\", window = \"1h\" }}\n",
+            "do = [{{ action = \"run\", cmd = {cmd}, env = {{ CI = \"script-approved\" }} }}]\n",
+        ),
+        rule_id = toml_string(case.id),
+        on = case.on,
+        max_actions = case.max_actions,
+        cmd = toml_array(&arguments),
+    );
+    let rules_root = match case.project {
+        Some(_) => fixture.workspace.join(".eliot").join("rules"),
+        None => fixture.data.join("rules"),
+    };
+    let path = rules_root.join(format!("timer-{}.toml", case.id));
+    fs::write(&path, source).expect("write timer Run rule");
+    path
+}
+
+fn wait_for_timer_scope(
+    fixture: &Fixture,
+    timer_id: &str,
+    project: Option<&str>,
+) -> (RuleStateView, TimerStateView) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let (rule_reply, timer_reply) = match project {
+            Some(project) => (
+                cli(
+                    &fixture.data,
+                    &["rule", "show", timer_id, "--project", project],
+                ),
+                cli(
+                    &fixture.data,
+                    &["timer", "show", timer_id, "--project", project],
+                ),
+            ),
+            None => (
+                cli(&fixture.data, &["rule", "show", timer_id]),
+                cli(&fixture.data, &["timer", "show", timer_id]),
+            ),
+        };
+        if rule_reply.status.success() && timer_reply.status.success() {
+            let rule: RuleStateView =
+                serde_json::from_str(&rule_reply.stdout).expect("typed timer rule state");
+            let timer: TimerStateView =
+                serde_json::from_str(&timer_reply.stdout).expect("typed timer state");
+            assert_eq!(rule.id, timer_id);
+            assert_eq!(rule.project.as_deref(), project);
+            assert_eq!(timer.id, timer_id);
+            assert_eq!(timer.project.as_deref(), project);
+            return (rule, timer);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timer rule load deadline; rule_stderr={:?}; timer_stderr={:?}",
+            rule_reply.stderr.chars().take(1024).collect::<String>(),
+            timer_reply.stderr.chars().take(1024).collect::<String>()
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_for_timer_firing(
+    fixture: &Fixture,
+    timer_id: &str,
+    project: Option<&str>,
+    schedule_revision: i64,
+) -> Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let events = fixture.events();
+        if let Some(firing) = events.iter().find(|event| {
+            let event_project = event["data"].get("project");
+            let scope_matches = match project {
+                Some(project) => event_project.and_then(Value::as_str) == Some(project),
+                None => event_project.is_none_or(Value::is_null),
+            };
+            event["kind"] == "rule.fired"
+                && event["data"]["rule"] == timer_id
+                && event["data"]["schedule_revision"] == schedule_revision
+                && scope_matches
+        }) {
+            return firing.clone();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "scheduled timer Run firing deadline for {timer_id}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn timer_run_cli(
+    fixture: &Fixture,
+    id: &str,
+    timer_id: &str,
+    project: Option<&str>,
+) -> CoreCommand {
+    let reply = match project {
+        Some(project) => cli(
+            &fixture.data,
+            &["--id", id, "timer", "run", timer_id, "--project", project],
+        ),
+        None => cli(&fixture.data, &["--id", id, "timer", "run", timer_id]),
+    };
+    assert!(
+        reply.status.success(),
+        "timer Run CLI failed; bounded stdout={:?}; bounded stderr={:?}",
+        reply.stdout.chars().take(2048).collect::<String>(),
+        reply.stderr.chars().take(2048).collect::<String>()
+    );
+    serde_json::from_str(&reply.stdout).expect("typed timer.run parent")
+}
+
+fn assert_timer_script_input(
+    path: &Path,
+    run: &CoreCommand,
+    rule: &RuleStateView,
+    timer: &TimerStateView,
+    invocation: ScriptTimerInvocation,
+) {
+    let bytes = fs::read(path).expect("script's bounded timer stdin artifact");
+    assert!(
+        bytes.len() <= 1_048_576,
+        "timer stdin exceeded the 1 MiB bound"
+    );
+    let input: ScriptInputContext =
+        serde_json::from_slice(&bytes).expect("typed timer script input");
+    assert!(input.event().is_none(), "timer input has no Event");
+    assert!(input.subject().is_none(), "timer input has no subject");
+    let wire = serde_json::to_value(&input).expect("encode typed timer script input");
+    assert_eq!(wire.as_object().expect("timer input object").len(), 3);
+    assert!(wire.get("event").is_none());
+    assert!(wire.get("subject").is_none());
+
+    let ScriptInputContext::Timer {
+        timer: timer_context,
+        rule: rule_context,
+        command,
+    } = &input
+    else {
+        panic!("Run stdin must contain the typed Timer context");
+    };
+    assert_eq!(rule_context.id, rule.id);
+    assert_eq!(rule_context.revision, rule.revision);
+    assert_eq!(timer_context.schedule_revision, timer.schedule_revision);
+    assert_eq!(timer_context.schedule, timer.schedule);
+    assert_eq!(timer_context.anchor, timer.anchor);
+    assert_eq!(timer_context.invocation, invocation);
+    assert_eq!(command.id, run.id);
+    assert_eq!(command.verb, "run");
+
+    let frozen = run.args.get("context").expect("frozen Run context");
+    assert_eq!(frozen.as_object().expect("frozen timer context").len(), 2);
+    assert!(frozen.get("event").is_none());
+    assert!(frozen.get("subject").is_none());
+    assert_eq!(frozen["timer"], wire["timer"]);
+    assert_eq!(frozen["rule"], wire["rule"]);
 }
 
 fn owner_send(fixture: &Fixture, id: &str, agent: &str, generation: i64, text: &str) -> CoreTurn {
@@ -1537,4 +1800,319 @@ fn project_event_run_rejects_late_invalid_record_before_any_send_dispatch() {
         command_events(&events, "command.dispatched", &run_id).len(),
         1
     );
+}
+
+#[test]
+fn scheduled_timer_runs_capture_context_for_global_and_project_scopes() {
+    let mut fixture = Fixture::new("t-run-sched");
+    let (interpreter, global_scripts_root) = setup_global_project_timer_fixture(&mut fixture);
+    let project_cwd = fs::canonicalize(&fixture.workspace).expect("canonical project cwd");
+    let launch = fixture.json(&[
+        "launch",
+        "--profile",
+        "fake",
+        "--workspace",
+        fixture.workspace.to_str().expect("workspace path"),
+    ]);
+    let agent = launch["target"].as_str().expect("Fake Agent").to_owned();
+    let generation = launch["generation"].as_i64().expect("Fake generation");
+    let owner_probe_id = ulid::Ulid::new().to_string();
+    owner_send(
+        &fixture,
+        &owner_probe_id,
+        &agent,
+        generation,
+        "timer-run-owner-probe",
+    );
+
+    let anchor = epoch_ms_now() - 500;
+    let on = format!("{{ every = \"5s\", anchor = {anchor} }}");
+    let scopes = [
+        (
+            None,
+            GLOBAL_SCHEDULED_TIMER_ID,
+            global_scripts_root.as_path(),
+        ),
+        (
+            Some(PROJECT_ID),
+            PROJECT_SCHEDULED_TIMER_ID,
+            project_cwd.as_path(),
+        ),
+    ];
+    for (project, timer_id, cwd) in scopes {
+        let context_path = fixture.root.join(format!("{timer_id}-context.json"));
+        let own_command_path = fixture.root.join(format!("{timer_id}-own-command.json"));
+        write_timer_run_rule(
+            &fixture,
+            &interpreter,
+            TimerRunRuleCase {
+                project,
+                id: timer_id,
+                on: &on,
+                mode: "empty",
+                max_actions: 1,
+                agent: &agent,
+                generation,
+                other_command_id: &owner_probe_id,
+                context_path: &context_path,
+                own_command_path: &own_command_path,
+                expected_cwd: cwd,
+            },
+        );
+    }
+
+    for (project, timer_id, _) in scopes {
+        let (rule, timer_before) = wait_for_timer_scope(&fixture, timer_id, project);
+        assert!(rule.enabled);
+        assert!(timer_before.enabled);
+        assert_eq!(
+            timer_before.schedule,
+            TimerSchedule::Interval {
+                period_ms: 5_000,
+                anchor: Some(anchor),
+            }
+        );
+        let firing =
+            wait_for_timer_firing(&fixture, timer_id, project, timer_before.schedule_revision);
+        let scheduled_at = firing["data"]["scheduled_at_ms"]
+            .as_i64()
+            .expect("scheduled timer slot");
+        assert_eq!(
+            firing["data"]["schedule_revision"],
+            timer_before.schedule_revision
+        );
+        let run_id = firing["data"]["child_command"]
+            .as_str()
+            .expect("scheduled timer Run command")
+            .to_owned();
+        let run = wait_for_run_outcome(&fixture, &run_id);
+        let principal = project.map_or_else(
+            || "owner".to_owned(),
+            |project| format!("project:{project}"),
+        );
+        assert_eq!(run.id, run_id);
+        assert_eq!(run.verb, "run");
+        assert_eq!(run.principal, principal);
+        assert_eq!(run.target, None);
+        assert_run_state(&run, CommandState::Applied);
+        let applied: ScriptRunApplied =
+            serde_json::from_value(run.outcome.as_ref().expect("applied timer Run").clone())
+                .expect("typed scheduled Run outcome");
+        applied.validate().expect("valid scheduled Run result");
+        assert!(
+            applied.children.is_empty(),
+            "empty mode emits no action records"
+        );
+
+        let context_path = fixture.root.join(format!("{timer_id}-context.json"));
+        let (rule, _) = wait_for_timer_scope(&fixture, timer_id, project);
+        assert_timer_script_input(
+            &context_path,
+            &run,
+            &rule,
+            &timer_before,
+            ScriptTimerInvocation::Scheduled {
+                scheduled_at_ms: scheduled_at,
+            },
+        );
+        let (_, timer_after) = wait_for_timer_scope(&fixture, timer_id, project);
+        assert_eq!(timer_after.schedule, timer_before.schedule);
+        assert_eq!(timer_after.anchor, timer_before.anchor);
+        assert_eq!(
+            timer_after.schedule_revision,
+            timer_before.schedule_revision
+        );
+        assert!(
+            timer_after
+                .last_key
+                .is_some_and(|last_key| last_key >= scheduled_at),
+            "rate-skipped slots may advance last_key beyond the Run's scheduled slot"
+        );
+        assert_eq!(
+            command_events(&fixture.events(), "command.dispatched", &run_id).len(),
+            1
+        );
+    }
+}
+
+#[test]
+fn manual_timer_runs_send_and_replay_after_grant_revocation_in_both_scopes() {
+    let mut fixture = Fixture::new("t-run-manual");
+    let (interpreter, global_scripts_root) = setup_global_project_timer_fixture(&mut fixture);
+    let project_cwd = fs::canonicalize(&fixture.workspace).expect("canonical project cwd");
+    let launch = fixture.json(&[
+        "launch",
+        "--profile",
+        "fake",
+        "--workspace",
+        fixture.workspace.to_str().expect("workspace path"),
+    ]);
+    let agent = launch["target"].as_str().expect("Fake Agent").to_owned();
+    let generation = launch["generation"].as_i64().expect("Fake generation");
+    let owner_probe_id = ulid::Ulid::new().to_string();
+    owner_send(
+        &fixture,
+        &owner_probe_id,
+        &agent,
+        generation,
+        "timer-run-owner-probe",
+    );
+
+    let manual_anchor = epoch_ms_now();
+    let manual_on = format!("{{ every = \"1h\", anchor = {manual_anchor} }}");
+    let scopes = [
+        (None, GLOBAL_MANUAL_TIMER_ID, global_scripts_root.as_path()),
+        (
+            Some(PROJECT_ID),
+            PROJECT_MANUAL_TIMER_ID,
+            project_cwd.as_path(),
+        ),
+    ];
+    let mut replay_cases = Vec::new();
+    for (project, timer_id, cwd) in scopes {
+        let mutation_id = ulid::Ulid::new().to_string();
+        let context_path = fixture.root.join(format!("{timer_id}-context.json"));
+        let own_command_path = fixture.root.join(format!("{timer_id}-own-command.json"));
+        let rule_path = write_timer_run_rule(
+            &fixture,
+            &interpreter,
+            TimerRunRuleCase {
+                project,
+                id: timer_id,
+                on: &manual_on,
+                mode: "success",
+                max_actions: 2,
+                agent: &agent,
+                generation,
+                other_command_id: &mutation_id,
+                context_path: &context_path,
+                own_command_path: &own_command_path,
+                expected_cwd: cwd,
+            },
+        );
+        let (rule, timer_before) = wait_for_timer_scope(&fixture, timer_id, project);
+        assert!(rule.enabled);
+        assert!(timer_before.enabled);
+        assert_eq!(
+            timer_before.schedule,
+            TimerSchedule::Interval {
+                period_ms: 3_600_000,
+                anchor: Some(manual_anchor),
+            }
+        );
+
+        let parent = timer_run_cli(&fixture, &mutation_id, timer_id, project);
+        let principal = project.map_or_else(
+            || "owner".to_owned(),
+            |project| format!("project:{project}"),
+        );
+        assert_eq!(parent.id, mutation_id);
+        assert_eq!(parent.verb, "timer.run");
+        assert_eq!(parent.principal, principal);
+        assert_eq!(parent.args["rule"], timer_id);
+        match project {
+            Some(project) => assert_eq!(parent.args["project"], project),
+            None => assert!(parent.args.get("project").is_none_or(Value::is_null)),
+        }
+        let run_ids: Vec<String> = serde_json::from_value(
+            parent.outcome.as_ref().expect("manual parent outcome")["children"].clone(),
+        )
+        .expect("manual parent fixed Run child set");
+        assert_eq!(run_ids.len(), 1);
+        let run_id = run_ids[0].clone();
+        let run = wait_for_run_outcome(&fixture, &run_id);
+        assert_eq!(run.id, run_id);
+        assert_eq!(run.verb, "run");
+        assert_run_state(&run, CommandState::Applied);
+        assert_eq!(run.principal, principal);
+        assert_eq!(run.target, None);
+        let applied: ScriptRunApplied =
+            serde_json::from_value(run.outcome.as_ref().expect("applied manual Run").clone())
+                .expect("typed manual Run outcome");
+        applied.validate().expect("valid manual Run result");
+        assert_eq!(applied.children.len(), 1);
+        let (rule, _) = wait_for_timer_scope(&fixture, timer_id, project);
+        assert_timer_script_input(
+            &context_path,
+            &run,
+            &rule,
+            &timer_before,
+            ScriptTimerInvocation::Manual {
+                parent_command_id: mutation_id.clone(),
+            },
+        );
+
+        let send_id = applied.children[0].clone();
+        let send: CoreCommand = serde_json::from_value(fixture.wait_command(&send_id, "applied"))
+            .expect("typed manual timer SEND child");
+        assert_eq!(send.verb, "send");
+        assert_eq!(send.principal, principal);
+        assert_eq!(send.target.as_deref(), Some(agent.as_str()));
+        assert_eq!(send.expected_generation, Some(generation));
+        assert_eq!(send.generation, Some(generation));
+        assert_eq!(send.args, json!({"text": SEND_TEXT}));
+        let send_turn = exact_result(&fixture, &agent, generation, &send, SEND_TEXT);
+        wait_for_turn_terminal(&fixture, &agent, generation, &send_id, &send_turn.turn_id);
+
+        let (_, timer_after) = wait_for_timer_scope(&fixture, timer_id, project);
+        assert_eq!(timer_after.last_key, timer_before.last_key);
+        assert_eq!(timer_after.next_due_at, timer_before.next_due_at);
+        replay_cases.push(TimerRunReplay {
+            project,
+            timer_id,
+            mutation_id,
+            parent,
+            run_id,
+            send_id,
+            rule_path,
+        });
+    }
+
+    fixture.stop(false);
+    for replay in &replay_cases {
+        let source = fs::read_to_string(&replay.rule_path).expect("read timer rule before disable");
+        let disabled = source.replacen("enabled = true", "enabled = false", 1);
+        assert_ne!(disabled, source, "timer rule was enabled before replay");
+        fs::write(&replay.rule_path, disabled).expect("disable timer rule before replay");
+    }
+    let revoked_config = format!(
+        concat!(
+            "[projects.{project_id}]\n",
+            "path = {path}\n",
+            "profiles = [\"fake\"]\n",
+            "actions = [\"run\", \"send\", \"stop\"]\n",
+            "run_env = []\n\n",
+            "[automation.run]\n",
+            "run_env = []\n",
+        ),
+        project_id = PROJECT_ID,
+        path = toml_string(&fixture.workspace.display().to_string()),
+    );
+    fs::write(fixture.data.join("config.toml"), revoked_config)
+        .expect("remove global and project Run interpreter grants");
+    fixture.start();
+
+    for replay in &replay_cases {
+        let (rule, timer) = wait_for_timer_scope(&fixture, replay.timer_id, replay.project);
+        assert!(!rule.enabled);
+        assert!(!timer.enabled);
+        let parent = timer_run_cli(
+            &fixture,
+            &replay.mutation_id,
+            replay.timer_id,
+            replay.project,
+        );
+        assert_eq!(parent, replay.parent);
+        let events = fixture.events();
+        assert_eq!(
+            command_events(&events, "command.dispatched", &replay.run_id).len(),
+            1,
+            "same-ID timer replay did not dispatch another Run"
+        );
+        assert_eq!(
+            command_events(&events, "command.dispatched", &replay.send_id).len(),
+            1,
+            "same-ID timer replay did not dispatch another SEND"
+        );
+    }
 }

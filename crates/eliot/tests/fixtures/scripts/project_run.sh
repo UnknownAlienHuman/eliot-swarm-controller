@@ -58,6 +58,9 @@ case "$other_output" in
 esac
 
 case "$mode" in
+    empty)
+        exit 0
+        ;;
     success)
         printf '{"action":"send","target":"%s","expected_generation":%s,"text":"script-event-send"}\n' "$agent" "$generation"
         ;;

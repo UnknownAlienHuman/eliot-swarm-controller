@@ -119,11 +119,9 @@ only edits preserve the schedule. Reconcile timers from stored state on restart.
 ## First connected timer slice
 
 Global and registered-project timers use their namespace's startup-loaded rule files and
-the existing command router. The connected subset supports interval, cron, once and manual
-timer runs with ordinary
-`stop`, `send` and `run` actions for global and registered-project timers.
-Scheduled Run uses the selected due slot; manual `timer.run` invokes an existing timer under its
-selected scope. See [Timer Run invocation context](#timer-run-invocation-context).
+the existing command router. The connected timer slice admits ordinary `stop`, `send` and `run` children for global and
+registered-project interval, cron and once firings, including manual `timer.run`. See
+[Timer Run invocation context](#timer-run-invocation-context).
 The event-rule `interrupt` action remains unsupported for scheduled or manual timer runs.
 Other action verbs remain future work.
 

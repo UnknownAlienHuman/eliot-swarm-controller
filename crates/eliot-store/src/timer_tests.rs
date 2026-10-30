@@ -1,7 +1,14 @@
-use super::{RuleDefinitionInput, Store, TimerDefinitionInput, TimerSlotCommit};
+use super::{
+    ProjectRegistrationInput, RuleDefinitionInput, Store, TimerDefinitionInput, TimerSlotCommit,
+};
 use eliot_core::{
-    CommandState, NativeEvent, SourceBatch, SubmitCommand,
-    api::{TimerRunRequest, TimerSchedule},
+    CommandState, FrozenSetupFile, NativeEvent, ScriptCustody, ScriptDirectExit,
+    ScriptProcessResult, SourceBatch, SubmitCommand,
+    api::{
+        FrozenScriptContext, FrozenScriptInterpreter, FrozenScriptRun, RunDefinitionArgs,
+        ScriptInterpreter, ScriptRuleContext, ScriptTimerContext, ScriptTimerInvocation,
+        TimerRunRequest, TimerSchedule,
+    },
     canonical_json_sha256,
 };
 use serde_json::json;
@@ -46,6 +53,129 @@ fn rule_input_with_action(id: &str, target: &str) -> RuleDefinitionInput {
     }
 }
 
+fn rule_input_with_limit(id: &str, max: u64) -> RuleDefinitionInput {
+    let value = json!({
+        "id": id,
+        "enabled": true,
+        "limit": {"max":max,"per":"rule","window_ms":60_000}
+    });
+    RuleDefinitionInput {
+        id: id.to_owned(),
+        canonical_definition: serde_json::to_string(&value).unwrap(),
+        definition_digest: canonical_json_sha256(&value).unwrap(),
+        enabled: true,
+    }
+}
+
+fn project_run_rule_input(id: &str) -> RuleDefinitionInput {
+    let value = json!({
+        "id": id,
+        "enabled": true,
+        "do": [{"action":"run","cmd":["pwsh", ".eliot/scripts/timer.ps1"]}]
+    });
+    RuleDefinitionInput {
+        id: id.to_owned(),
+        canonical_definition: serde_json::to_string(&value).unwrap(),
+        definition_digest: canonical_json_sha256(&value).unwrap(),
+        enabled: true,
+    }
+}
+
+fn timer_run_action(
+    timer: &eliot_core::api::TimerStateView,
+    rule_revision: i64,
+    invocation: ScriptTimerInvocation,
+) -> SubmitCommand {
+    let executable = std::env::current_exe()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let entry = std::env::temp_dir()
+        .join("eliot-timer-script-test.ps1")
+        .display()
+        .to_string();
+    let run = FrozenScriptRun {
+        definition: RunDefinitionArgs {
+            cmd: vec!["pwsh".to_owned(), ".eliot/scripts/timer.ps1".to_owned()],
+            cwd: None,
+            timeout: None,
+            env: Default::default(),
+        },
+        interpreter: FrozenScriptInterpreter {
+            reference: "pwsh".to_owned(),
+            executable: FrozenSetupFile {
+                canonical_path: executable,
+                size: 1,
+                sha256: "ab".repeat(32),
+            },
+            argv_prefix: vec!["-File".to_owned()],
+        },
+        entry: FrozenSetupFile {
+            canonical_path: entry,
+            size: 1,
+            sha256: "cd".repeat(32),
+        },
+        context: FrozenScriptContext::Timer {
+            timer: ScriptTimerContext {
+                schedule_revision: timer.schedule_revision,
+                schedule: timer.schedule.clone(),
+                anchor: timer.anchor,
+                invocation,
+            },
+            rule: ScriptRuleContext {
+                id: timer.id.clone(),
+                revision: rule_revision,
+            },
+        },
+    };
+    let mut request = SubmitCommand::new(String::new(), "run");
+    request.args = serde_json::to_value(run).unwrap();
+    request
+}
+
+fn exact_script_result() -> ScriptProcessResult {
+    ScriptProcessResult {
+        custody: ScriptCustody::Exact,
+        quiescent: true,
+        direct_exit: ScriptDirectExit::Exited {
+            success: true,
+            exit_code: Some(0),
+        },
+        stderr: None,
+    }
+}
+
+fn send_request(agent: &str) -> SubmitCommand {
+    let mut request = SubmitCommand::new(String::new(), "send");
+    request.target = Some(agent.to_owned());
+    request.expected_generation = Some(1);
+    request.args = json!({"text":"timer script output"});
+    request
+}
+
+fn project_registration(id: &str, actions: Vec<String>) -> ProjectRegistrationInput {
+    let executable = std::env::current_exe()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let checkout = std::env::temp_dir().join(format!("eliot-store-timer-{id}"));
+    ProjectRegistrationInput {
+        id: id.to_owned(),
+        checkout: checkout.display().to_string(),
+        repo_common_dir: checkout.join(".git").display().to_string(),
+        profiles: Vec::new(),
+        actions,
+        interpreters: std::collections::BTreeMap::from([(
+            "pwsh".to_owned(),
+            ScriptInterpreter {
+                program: executable,
+                argv_prefix: vec!["-File".to_owned()],
+            },
+        )]),
+        run_env: Vec::new(),
+    }
+}
+
 fn ensure_interval(
     store: &mut Store,
     id: &str,
@@ -71,6 +201,56 @@ fn ensure_interval(
             registration_ms,
         )
         .unwrap()
+}
+
+fn commit_scheduled_timer_run(
+    store: &mut Store,
+    id: &str,
+    schedule: TimerSchedule,
+    registration_ms: i64,
+    initial_next_due_at: Option<i64>,
+    next_due_at_ms: Option<i64>,
+) -> (
+    eliot_core::api::TimerStateView,
+    i64,
+    super::TimerSlotAdmission,
+) {
+    let rule = store
+        .ensure_rule_state("owner", &rule_input(id), registration_ms)
+        .unwrap();
+    let state = store
+        .ensure_timer_state(
+            "owner",
+            &TimerDefinitionInput {
+                id: id.to_owned(),
+                schedule_revision: 1,
+                schedule,
+                enabled: true,
+                initial_next_due_at,
+            },
+            registration_ms,
+        )
+        .unwrap();
+    let scheduled_at_ms = state.next_due_at.expect("scheduled timer has a slot");
+    let action = timer_run_action(
+        &state,
+        rule.revision,
+        ScriptTimerInvocation::Scheduled { scheduled_at_ms },
+    );
+    let admission = store
+        .commit_timer_slot(
+            "owner",
+            &state,
+            TimerSlotCommit {
+                scheduled_at_ms,
+                next_due_at_ms,
+                action: Some(action),
+                skip_code: None,
+            },
+            scheduled_at_ms,
+        )
+        .unwrap();
+    (state, scheduled_at_ms, admission)
 }
 
 fn rule_revision(store: &Store, id: &str) -> i64 {
@@ -590,4 +770,548 @@ fn rate_limit_counts_each_admitted_child_once_and_excludes_parents() {
         )
         .unwrap();
     assert_eq!(children, 10);
+}
+
+fn assert_scheduled_timer_run_context(
+    id: &str,
+    schedule: TimerSchedule,
+    registration_ms: i64,
+    first_due: i64,
+    next_due: Option<i64>,
+) {
+    let mut store = store();
+    let (timer, scheduled_at_ms, admitted) = commit_scheduled_timer_run(
+        &mut store,
+        id,
+        schedule,
+        registration_ms,
+        Some(first_due),
+        next_due,
+    );
+    let parent = admitted.parent.expect("scheduled timer parent");
+    let run = admitted.child.expect("scheduled timer Run child");
+    let rule_revision = store
+        .get_rule_state("owner", id)
+        .unwrap()
+        .expect("timer rule remains stored")
+        .revision;
+    let expected_context = FrozenScriptContext::Timer {
+        timer: ScriptTimerContext {
+            schedule_revision: timer.schedule_revision,
+            schedule: timer.schedule.clone(),
+            anchor: timer.anchor,
+            invocation: ScriptTimerInvocation::Scheduled { scheduled_at_ms },
+        },
+        rule: ScriptRuleContext {
+            id: id.to_owned(),
+            revision: rule_revision,
+        },
+    };
+    let saved_context: FrozenScriptContext =
+        serde_json::from_value(parent.outcome.as_ref().unwrap()["script_context"].clone()).unwrap();
+    assert_eq!(saved_context, expected_context);
+    assert_eq!(parent.args["rule"], id);
+    assert_eq!(parent.args["schedule_revision"], timer.schedule_revision);
+    assert_eq!(parent.args["scheduled_at_ms"], scheduled_at_ms);
+    assert!(parent.args.get("revision").is_none());
+    let frozen: FrozenScriptRun = serde_json::from_value(run.args.clone()).unwrap();
+    assert_eq!(frozen.context, saved_context);
+    assert!(frozen.context.event().is_none());
+    assert!(frozen.context.subject().is_none());
+
+    let dispatched = store.dispatch(&run.id, scheduled_at_ms + 1).unwrap();
+    assert_eq!(dispatched.value.state, CommandState::Dispatched);
+    store
+        .admit_script_output(
+            &run.id,
+            Vec::new(),
+            exact_script_result(),
+            scheduled_at_ms + 2,
+        )
+        .unwrap();
+
+    let updated_rule = store
+        .ensure_rule_state("owner", &rule_input_with_limit(id, 9), scheduled_at_ms + 3)
+        .unwrap();
+    assert_ne!(updated_rule.revision, rule_revision);
+    assert_eq!(
+        store
+            .get_timer_state("owner", id)
+            .unwrap()
+            .unwrap()
+            .schedule_revision,
+        timer.schedule_revision
+    );
+
+    let high_water_before_replay = store.high_water().unwrap();
+    let replay = store
+        .replay_timer_slot("owner", &timer, scheduled_at_ms)
+        .unwrap()
+        .expect("retained slot replays before current rule gates");
+    assert!(!replay.is_new);
+    assert!(replay.events.is_empty());
+    assert_eq!(replay.parent.as_ref().unwrap().id, parent.id);
+    assert_eq!(replay.child.as_ref().unwrap().id, run.id);
+    assert_eq!(replay.state.last_key, Some(scheduled_at_ms));
+    let replay_context: FrozenScriptContext = serde_json::from_value(
+        replay.parent.as_ref().unwrap().outcome.as_ref().unwrap()["script_context"].clone(),
+    )
+    .unwrap();
+    assert_eq!(replay_context, saved_context);
+    assert_eq!(store.high_water().unwrap(), high_water_before_replay);
+}
+
+#[test]
+fn scheduled_timer_run_freezes_interval_cron_and_once_slots_and_replays_original_context() {
+    let registration_ms = now_ms();
+    let interval_ms = 60_000;
+    assert_scheduled_timer_run_context(
+        "timer-run-interval",
+        TimerSchedule::Interval {
+            period_ms: interval_ms,
+            anchor: Some(registration_ms),
+        },
+        registration_ms,
+        registration_ms + interval_ms,
+        Some(registration_ms + interval_ms * 2),
+    );
+    assert_scheduled_timer_run_context(
+        "timer-run-cron",
+        TimerSchedule::Cron {
+            expression: "* * * * *".to_owned(),
+            tz: "UTC".to_owned(),
+        },
+        registration_ms,
+        registration_ms + interval_ms,
+        Some(registration_ms + interval_ms * 2),
+    );
+    assert_scheduled_timer_run_context(
+        "timer-run-once",
+        TimerSchedule::Once {
+            at: registration_ms + interval_ms,
+        },
+        registration_ms,
+        registration_ms + interval_ms,
+        None,
+    );
+}
+
+fn assert_forged_scheduled_timer_run_rejected(
+    id: &str,
+    mutate_context: fn(&mut serde_json::Value),
+) {
+    let mut store = store();
+    let registration_ms = now_ms();
+    let period_ms = 60_000;
+    let timer = ensure_interval(&mut store, id, registration_ms, period_ms);
+    let rule = store.get_rule_state("owner", id).unwrap().unwrap();
+    let scheduled_at_ms = timer.next_due_at.unwrap();
+    let mut action = timer_run_action(
+        &timer,
+        rule.revision,
+        ScriptTimerInvocation::Scheduled { scheduled_at_ms },
+    );
+    mutate_context(&mut action.args["context"]);
+    let admission = store
+        .commit_timer_slot(
+            "owner",
+            &timer,
+            TimerSlotCommit {
+                scheduled_at_ms,
+                next_due_at_ms: Some(scheduled_at_ms + period_ms),
+                action: Some(action),
+                skip_code: None,
+            },
+            scheduled_at_ms,
+        )
+        .unwrap();
+    let parent = admission.parent.expect("durable binding rejection parent");
+    assert_eq!(parent.state, CommandState::Rejected);
+    assert_eq!(
+        parent.outcome.as_ref().unwrap()["code"],
+        "rule_action_binding_invalid"
+    );
+    assert_eq!(parent.outcome.as_ref().unwrap()["children"], json!([]));
+    assert!(
+        parent
+            .outcome
+            .as_ref()
+            .unwrap()
+            .get("script_context")
+            .is_none()
+    );
+    assert!(admission.child.is_none());
+    assert_eq!(
+        store
+            .get_timer_state("owner", id)
+            .unwrap()
+            .unwrap()
+            .last_key,
+        Some(scheduled_at_ms)
+    );
+}
+
+#[test]
+fn scheduled_timer_run_rejects_forged_slot_schedule_and_rule_revisions() {
+    assert_forged_scheduled_timer_run_rejected("timer-forged-slot", |context| {
+        context["timer"]["invocation"]["scheduled_at_ms"] = json!(i64::MAX);
+    });
+    assert_forged_scheduled_timer_run_rejected("timer-forged-schedule-revision", |context| {
+        context["timer"]["schedule_revision"] = json!(2);
+    });
+    assert_forged_scheduled_timer_run_rejected("timer-forged-rule-revision", |context| {
+        context["rule"]["revision"] = json!(999);
+    });
+}
+
+#[test]
+fn manual_timer_run_rejects_forged_parent_context_without_writes() {
+    let mut store = store();
+    let registration_ms = now_ms();
+    let rule_id = "manual-timer-run-forged-context";
+    let timer = ensure_interval(&mut store, rule_id, registration_ms, 60_000);
+    let revision = rule_revision(&store, rule_id);
+    let request = TimerRunRequest::new(Ulid::new().to_string(), rule_id);
+    let action = timer_run_action(
+        &timer,
+        revision,
+        ScriptTimerInvocation::Manual {
+            parent_command_id: Ulid::new().to_string(),
+        },
+    );
+    let commands_before: i64 = store
+        .connection
+        .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+        .unwrap();
+    let high_water_before = store.high_water().unwrap();
+    let error = store
+        .admit_manual_timer_run(
+            "owner",
+            &request,
+            &timer,
+            revision,
+            action,
+            registration_ms + 1,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, "rule_action_binding_invalid");
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        commands_before
+    );
+    assert_eq!(store.high_water().unwrap(), high_water_before);
+    assert_eq!(
+        store.get_timer_state("owner", rule_id).unwrap().unwrap(),
+        timer
+    );
+}
+
+#[test]
+fn manual_timer_run_uses_external_parent_id_and_replays_its_saved_context() {
+    let mut store = store();
+    let registration_ms = now_ms();
+    let rule_id = "manual-timer-run";
+    let period_ms = 60_000;
+    let timer = ensure_interval(&mut store, rule_id, registration_ms, period_ms);
+    let rule_revision = rule_revision(&store, rule_id);
+    let request = TimerRunRequest::new(Ulid::new().to_string(), rule_id);
+    let action = timer_run_action(
+        &timer,
+        rule_revision,
+        ScriptTimerInvocation::Manual {
+            parent_command_id: request.id.clone(),
+        },
+    );
+    let first = store
+        .admit_manual_timer_run(
+            "owner",
+            &request,
+            &timer,
+            rule_revision,
+            action.clone(),
+            registration_ms + 1,
+        )
+        .unwrap();
+    assert!(first.is_new);
+    let parent = first.parent.unwrap();
+    let run = first.child.unwrap();
+    assert_eq!(parent.verb, "timer.run");
+    assert_eq!(parent.id, request.id);
+    assert_eq!(parent.args, json!({"rule": rule_id}));
+    assert!(parent.args.get("revision").is_none());
+    assert!(parent.args.get("schedule_revision").is_none());
+    let saved_context = parent.outcome.as_ref().unwrap()["script_context"].clone();
+    let parsed_context: FrozenScriptContext =
+        serde_json::from_value(saved_context.clone()).unwrap();
+    assert_eq!(
+        parsed_context,
+        FrozenScriptContext::Timer {
+            timer: ScriptTimerContext {
+                schedule_revision: timer.schedule_revision,
+                schedule: timer.schedule.clone(),
+                anchor: timer.anchor,
+                invocation: ScriptTimerInvocation::Manual {
+                    parent_command_id: request.id.clone(),
+                },
+            },
+            rule: ScriptRuleContext {
+                id: rule_id.to_owned(),
+                revision: rule_revision,
+            },
+        }
+    );
+
+    store.dispatch(&run.id, registration_ms + 2).unwrap();
+    store
+        .admit_script_output(
+            &run.id,
+            Vec::new(),
+            exact_script_result(),
+            registration_ms + 3,
+        )
+        .unwrap();
+    let updated = store
+        .ensure_rule_state(
+            "owner",
+            &rule_input_with_limit(rule_id, 7),
+            registration_ms + 4,
+        )
+        .unwrap();
+    assert_ne!(updated.revision, rule_revision);
+    let before_replay = store.high_water().unwrap();
+    let replay = store
+        .admit_manual_timer_run(
+            "owner",
+            &request,
+            &timer,
+            updated.revision,
+            timer_run_action(
+                &timer,
+                updated.revision,
+                ScriptTimerInvocation::Manual {
+                    parent_command_id: request.id.clone(),
+                },
+            ),
+            registration_ms + 5,
+        )
+        .unwrap();
+    assert!(!replay.is_new);
+    assert!(replay.events.is_empty());
+    assert_eq!(
+        replay.parent.unwrap().outcome.unwrap()["script_context"],
+        saved_context
+    );
+    assert_eq!(replay.child.unwrap().id, run.id);
+    assert_eq!(store.high_water().unwrap(), before_replay);
+    assert_eq!(
+        store
+            .get_timer_state("owner", rule_id)
+            .unwrap()
+            .unwrap()
+            .last_key,
+        None
+    );
+}
+
+#[test]
+fn manual_timer_run_unknown_send_descendant_holds_scheduled_and_manual_firings() {
+    let mut store = store();
+    let registration_ms = now_ms();
+    let agent = ready_agent(&mut store, "timer-run-nested-unknown", registration_ms);
+    let rule_id = "timer-run-nested-unknown";
+    let period_ms = 60_000;
+    let timer = ensure_interval(&mut store, rule_id, registration_ms, period_ms);
+    let expected_rule_revision = rule_revision(&store, rule_id);
+    let request = TimerRunRequest::new(Ulid::new().to_string(), rule_id);
+    let initial_run = timer_run_action(
+        &timer,
+        expected_rule_revision,
+        ScriptTimerInvocation::Manual {
+            parent_command_id: request.id.clone(),
+        },
+    );
+    let admitted = store
+        .admit_manual_timer_run(
+            "owner",
+            &request,
+            &timer,
+            expected_rule_revision,
+            initial_run.clone(),
+            registration_ms + 1,
+        )
+        .unwrap();
+    let parent_id = admitted.parent.as_ref().unwrap().id.clone();
+    let run = admitted.child.unwrap();
+    store.dispatch(&run.id, registration_ms + 2).unwrap();
+    let output = store
+        .admit_script_output(
+            &run.id,
+            vec![send_request(&agent)],
+            exact_script_result(),
+            registration_ms + 3,
+        )
+        .unwrap();
+    let send = output.children[0].clone();
+    store.dispatch(&send.id, registration_ms + 4).unwrap();
+    store
+        .settle(&send.id, CommandState::Unknown, None, registration_ms + 5)
+        .unwrap();
+
+    let high_water_before_replay = store.high_water().unwrap();
+    let replay = store
+        .admit_manual_timer_run(
+            "owner",
+            &request,
+            &timer,
+            expected_rule_revision,
+            initial_run,
+            registration_ms + 6,
+        )
+        .unwrap();
+    assert!(!replay.is_new);
+    assert!(replay.events.is_empty());
+    assert_eq!(replay.parent.as_ref().unwrap().id, parent_id);
+    assert_eq!(replay.child.as_ref().unwrap().id, run.id);
+    assert_eq!(store.high_water().unwrap(), high_water_before_replay);
+
+    let output_replay = store
+        .admit_script_output(
+            &run.id,
+            Vec::new(),
+            exact_script_result(),
+            registration_ms + 7,
+        )
+        .unwrap();
+    assert!(!output_replay.is_new);
+    assert!(output_replay.events.is_empty());
+    assert_eq!(output_replay.children[0].id, send.id);
+    assert_eq!(
+        store.get_command(&send.id).unwrap().unwrap().state,
+        CommandState::Unknown
+    );
+
+    let scheduled_at_ms = timer.next_due_at.unwrap();
+    let scheduled = store
+        .commit_timer_slot(
+            "owner",
+            &timer,
+            scheduled_stop(scheduled_at_ms, Some(scheduled_at_ms + period_ms), &agent),
+            scheduled_at_ms,
+        )
+        .unwrap();
+    assert!(scheduled.blocked);
+    assert!(scheduled.parent.is_none());
+    assert!(scheduled.child.is_none());
+    assert_eq!(scheduled.state.last_key, timer.last_key);
+    assert_eq!(scheduled.state.next_due_at, timer.next_due_at);
+
+    let second_request = TimerRunRequest::new(Ulid::new().to_string(), rule_id);
+    let manual = store
+        .admit_manual_timer_run(
+            "owner",
+            &second_request,
+            &timer,
+            expected_rule_revision,
+            stop_request(&agent),
+            scheduled_at_ms + 1,
+        )
+        .unwrap();
+    assert!(manual.blocked);
+    assert!(manual.parent.is_none());
+    assert!(manual.child.is_none());
+}
+
+#[test]
+fn project_timer_run_reuses_registration_authority_at_dispatch() {
+    let mut store = store();
+    let registration_ms = now_ms();
+    let project = "timer-run-project-authority";
+    let rule_id = "project-timer-run";
+    store
+        .upsert_project_registration(
+            "owner",
+            &project_registration(project, vec!["run".to_owned()]),
+            registration_ms,
+        )
+        .unwrap();
+    let principal = format!("project:{project}");
+    let rule = store
+        .ensure_rule_state(
+            &principal,
+            &project_run_rule_input(rule_id),
+            registration_ms,
+        )
+        .unwrap();
+    let period_ms = 60_000;
+    let timer = store
+        .ensure_timer_state(
+            &principal,
+            &TimerDefinitionInput {
+                id: rule_id.to_owned(),
+                schedule_revision: 1,
+                schedule: TimerSchedule::Interval {
+                    period_ms,
+                    anchor: Some(registration_ms),
+                },
+                enabled: true,
+                initial_next_due_at: Some(registration_ms + period_ms),
+            },
+            registration_ms,
+        )
+        .unwrap();
+    let scheduled_at_ms = timer.next_due_at.unwrap();
+    let action = timer_run_action(
+        &timer,
+        rule.revision,
+        ScriptTimerInvocation::Scheduled { scheduled_at_ms },
+    );
+    let admitted = store
+        .commit_timer_slot(
+            &principal,
+            &timer,
+            TimerSlotCommit {
+                scheduled_at_ms,
+                next_due_at_ms: Some(scheduled_at_ms + period_ms),
+                action: Some(action),
+                skip_code: None,
+            },
+            scheduled_at_ms,
+        )
+        .unwrap();
+    let run = admitted.child.unwrap();
+    assert_eq!(run.principal, principal);
+    assert!(run.target.is_none());
+
+    store
+        .upsert_project_registration(
+            "owner",
+            &project_registration(project, Vec::new()),
+            scheduled_at_ms + 1,
+        )
+        .unwrap();
+    let replay = store
+        .replay_timer_slot(&principal, &timer, scheduled_at_ms)
+        .unwrap()
+        .expect("retained slot replays without the current project grant");
+    assert!(!replay.is_new);
+    assert_eq!(
+        replay.parent.as_ref().unwrap().id,
+        admitted.parent.unwrap().id
+    );
+    assert_eq!(replay.child.as_ref().unwrap().id, run.id);
+    assert_eq!(
+        store
+            .dispatch(&run.id, scheduled_at_ms + 2)
+            .unwrap_err()
+            .code,
+        "not_allowed"
+    );
+    assert_eq!(
+        store.get_command(&run.id).unwrap().unwrap().state,
+        CommandState::Accepted
+    );
 }

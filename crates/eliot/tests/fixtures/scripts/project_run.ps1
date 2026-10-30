@@ -80,6 +80,8 @@ $otherExit = $LASTEXITCODE
 $otherText = $otherOutput -join "`n"
 if ($otherExit -ne 1 -or $otherText -notmatch "not_allowed") { exit 44 }
 
+if ($Mode -eq "empty") { exit 0 }
+
 $sendText = "script-event-send"
 if ($Mode -eq "invalid") { $sendText = "must-not-dispatch" }
 if ($Mode -ne "success" -and $Mode -ne "invalid") { exit 45 }

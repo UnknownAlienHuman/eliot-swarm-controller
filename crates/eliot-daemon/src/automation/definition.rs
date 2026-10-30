@@ -826,12 +826,7 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
         .first()
         .ok_or_else(|| Error::new("invalid", "rule has no action"))?;
     let (target_value, generation_value, args) = match action {
-        ActionDefinition::Run { .. } => {
-            return Err(Error::new(
-                "unsupported",
-                "run actions are unsupported for timers in this increment",
-            ));
-        }
+        ActionDefinition::Run { definition } => return submit_run_command(definition),
         ActionDefinition::Stop {
             target,
             expected_generation,
@@ -1404,7 +1399,7 @@ do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${eve
     }
 
     #[test]
-    fn event_run_emits_raw_targetless_command_and_timer_run_stays_unsupported() {
+    fn event_and_timer_runs_emit_raw_targetless_commands() {
         let rule = load(Cursor::new(PROJECT_RUN_RULE)).unwrap().remove(0);
         let command = evaluate(&rule, &event()).unwrap().unwrap();
         assert_eq!(command.id, "");
@@ -1436,7 +1431,20 @@ do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${eve
             "action = 'stop', target = 'a7', expected_generation = 3",
             "action = 'run', cmd = ['pwsh', '.eliot/scripts/check.ps1'], timeout = '10m'",
         );
-        assert_eq!(load(Cursor::new(timer)).unwrap_err().code, "unsupported");
+        let timer_rule = load(Cursor::new(timer)).unwrap().remove(0);
+        let timer_command = timer_rule.evaluate_timer().expect("timer Run command");
+        assert_eq!(timer_command.verb, "run");
+        assert_eq!(timer_command.target, None);
+        assert_eq!(timer_command.expected_generation, None);
+        assert_eq!(
+            timer_command.args,
+            json!({
+                "cmd": ["pwsh", ".eliot/scripts/check.ps1"],
+                "timeout": "10m",
+                "env": {}
+            })
+        );
+        timer_command.validate().unwrap();
 
         let unknown =
             PROJECT_RUN_RULE.replace("timeout = '10m'", "timeout = '10m', principal = 'owner'");
@@ -1862,6 +1870,30 @@ do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${eve
 
         let once = load(Cursor::new(ONCE_TIMER)).unwrap().remove(0);
         assert_eq!(once.schedule(), Some(&TimerSchedule::Once { at: 1_000 }));
+    }
+
+    #[test]
+    fn timer_run_renders_raw_targetless_command_without_event_templates() {
+        let source = INTERVAL_TIMER.replace(
+            "action = 'stop', target = 'a7', expected_generation = 3",
+            "action = 'run', cmd = ['pwsh', 'check.ps1', '${event.data.status}'], cwd = 'work', timeout = '10m', env = { CI = 'true' }",
+        );
+        let rule = load(Cursor::new(source)).unwrap().remove(0);
+        let command = rule.evaluate_timer().expect("timer Run command");
+
+        assert_eq!(command.verb, "run");
+        assert_eq!(command.target, None);
+        assert_eq!(command.expected_generation, None);
+        assert_eq!(command.expected_turn_id, None);
+        assert_eq!(
+            command.args,
+            json!({
+                "cmd": ["pwsh", "check.ps1", "${event.data.status}"],
+                "cwd": "work",
+                "timeout": "10m",
+                "env": {"CI": "true"}
+            })
+        );
     }
 
     #[test]
