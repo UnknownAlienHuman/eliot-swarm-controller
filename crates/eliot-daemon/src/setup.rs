@@ -238,7 +238,7 @@ fn valid_agent_id(value: &str) -> bool {
         .is_some_and(|id| id > 0 && format!("a{id}") == value)
 }
 
-fn canonical_directory(path: &Path) -> Result<PathBuf> {
+pub(crate) fn canonical_directory(path: &Path) -> Result<PathBuf> {
     if !path.is_absolute() {
         return Err(invalid("setup root must be an absolute admitted directory"));
     }
@@ -252,7 +252,11 @@ fn canonical_directory(path: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-fn capture_file(path: &Path, root: Option<&Path>, remaining: &mut u64) -> Result<FrozenSetupFile> {
+pub(crate) fn capture_file(
+    path: &Path,
+    root: Option<&Path>,
+    remaining: &mut u64,
+) -> Result<FrozenSetupFile> {
     check_path(path)?;
     reject_links(path)?;
     let canonical = fs::canonicalize(path).map_err(|_| invalid("setup file is unavailable"))?;
@@ -413,7 +417,7 @@ fn open_reference(path: &Path) -> Result<File> {
         .map_err(|_| invalid("setup file cannot be opened without following links"))
 }
 
-fn check_program(path: &Path) -> Result<()> {
+pub(crate) fn check_program(path: &Path) -> Result<()> {
     if !path.is_absolute() {
         return Err(invalid("setup program must be an absolute executable path"));
     }
@@ -520,7 +524,7 @@ fn reject_links(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn inside(root: &Path, candidate: &Path) -> bool {
+pub(crate) fn inside(root: &Path, candidate: &Path) -> bool {
     let base: Vec<_> = root.components().collect();
     let path: Vec<_> = candidate.components().collect();
     path.len() > base.len()

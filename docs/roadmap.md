@@ -138,7 +138,8 @@ No second executor, workflow graph or acceptance engine.
 - [x] **L4.1 Rules/timers.** Global and owner-registered project rules use event-time
       subjects, durable cursors, bounded matching/reload/backlog and finite history
       catch-up. Interval/cron/once/manual timers and action limits use ordinary command
-      admission; the connected action subset is one generation-bound `stop`.
+      admission; connected timer and event-rule action support is defined in the
+      [automation spec](spec/automation.md).
 - [ ] **L4.2 Actions/scripts.** Agent commands first, then bounded explicit scripts.
       Frozen inputs, scoped principal, exit/output handling and unknown outcomes use
       normal commands. Add Git fetch/push wrappers only with their concrete recipe;

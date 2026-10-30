@@ -73,6 +73,23 @@ pub(crate) enum ProcessOutcome {
     },
 }
 
+struct ProcessIo {
+    stdin_task: JoinHandle<io::Result<()>>,
+    stdin_result: Option<Result<io::Result<()>, tokio::task::JoinError>>,
+    stdout_task: JoinHandle<io::Result<StdoutCapture>>,
+    stdout_result: Option<Result<io::Result<StdoutCapture>, tokio::task::JoinError>>,
+    stderr_task: StderrCapture,
+}
+
+struct InterruptedProcess<'a> {
+    child: &'a mut OwnedChild,
+    observer: Option<&'a CustodyObserver>,
+    custody: CustodyGuarantee,
+    stop: StopReason,
+    status: Option<ExitStatus>,
+    root_exit_observed: bool,
+}
+
 /// Run one already-resolved command. Output is exposed only after the direct
 /// exit, all required pipe drainage and owned-custody quiescence are known.
 pub(crate) async fn run_owned_process(
@@ -184,12 +201,13 @@ async fn run_owned_process_inner(
         };
     };
 
-    let mut stdin_task = tokio::spawn(write_stdin(stdin_pipe, stdin));
-    let mut stdout_task = tokio::spawn(capture_stdout(stdout_pipe));
-    let stderr_task = spawn_stderr(stderr_pipe, policy);
-
-    let mut stdin_result = None;
-    let mut stdout_result = None;
+    let mut io = ProcessIo {
+        stdin_task: tokio::spawn(write_stdin(stdin_pipe, stdin)),
+        stdin_result: None,
+        stdout_task: tokio::spawn(capture_stdout(stdout_pipe)),
+        stdout_result: None,
+        stderr_task: spawn_stderr(stderr_pipe, policy),
+    };
     #[cfg(target_os = "linux")]
     let status = None;
     #[cfg(not(target_os = "linux"))]
@@ -212,7 +230,7 @@ async fn run_owned_process_inner(
     let mut stop = custody_unavailable.then_some(StopReason::Unknown(ProcessUncertainty::Custody));
 
     while stop.is_none() {
-        if stdin_result.is_some() && stdout_result.is_some() && root_exit_observed {
+        if io.stdin_result.is_some() && io.stdout_result.is_some() && root_exit_observed {
             break;
         }
 
@@ -224,17 +242,17 @@ async fn run_owned_process_inner(
             _ = sleep_until(deadline) => {
                 stop = Some(StopReason::Failure(ProcessFailure::Timeout));
             }
-            result = &mut stdin_task, if stdin_result.is_none() => {
+            result = &mut io.stdin_task, if io.stdin_result.is_none() => {
                 let complete = matches!(&result, Ok(Ok(())));
-                stdin_result = Some(result);
+                io.stdin_result = Some(result);
                 if !complete {
                     stop = Some(StopReason::Unknown(ProcessUncertainty::Stdin));
                 }
             }
-            result = &mut stdout_task, if stdout_result.is_none() => {
+            result = &mut io.stdout_task, if io.stdout_result.is_none() => {
                 let output_limit = matches!(&result, Ok(Ok(capture)) if capture.exceeded);
                 let complete = matches!(&result, Ok(Ok(_)));
-                stdout_result = Some(result);
+                io.stdout_result = Some(result);
                 if output_limit {
                     stop = Some(StopReason::Failure(ProcessFailure::OutputLimit));
                 } else if !complete {
@@ -258,17 +276,15 @@ async fn run_owned_process_inner(
 
     if let Some(stop) = stop {
         return settle_interrupted(
-            &mut child,
-            observer.as_ref(),
-            custody,
-            stop,
-            status,
-            root_exit_observed,
-            &mut stdin_task,
-            stdin_result,
-            &mut stdout_task,
-            stdout_result,
-            stderr_task,
+            InterruptedProcess {
+                child: &mut child,
+                observer: observer.as_ref(),
+                custody,
+                stop,
+                status,
+                root_exit_observed,
+            },
+            io,
         )
         .await;
     }
@@ -279,23 +295,22 @@ async fn run_owned_process_inner(
             quiescent: false,
         };
     }
-    let stdout = match stdout_result {
+    let stdout = match io.stdout_result.take() {
         Some(Ok(Ok(stdout))) => stdout,
         _ => unreachable!("stdout errors exit through the cleanup path"),
     };
-    if !matches!(stdin_result.as_ref(), Some(Ok(Ok(())))) || !stdout.complete {
+    if !matches!(io.stdin_result.as_ref(), Some(Ok(Ok(())))) || !stdout.complete {
+        io.stdout_result = Some(Ok(Ok(stdout)));
         return settle_interrupted(
-            &mut child,
-            observer.as_ref(),
-            custody,
-            StopReason::Unknown(ProcessUncertainty::Stdin),
-            status,
-            root_exit_observed,
-            &mut stdin_task,
-            stdin_result,
-            &mut stdout_task,
-            Some(Ok(Ok(stdout))),
-            stderr_task,
+            InterruptedProcess {
+                child: &mut child,
+                observer: observer.as_ref(),
+                custody,
+                stop: StopReason::Unknown(ProcessUncertainty::Stdin),
+                status,
+                root_exit_observed,
+            },
+            io,
         )
         .await;
     }
@@ -315,34 +330,89 @@ async fn run_owned_process_inner(
     match quiescence {
         Ok(true) => {}
         Ok(false) => {
+            io.stdout_result = Some(Ok(Ok(stdout)));
             return settle_interrupted(
-                &mut child,
-                observer.as_ref(),
-                custody,
-                StopReason::Failure(ProcessFailure::Timeout),
-                status,
-                root_exit_observed,
-                &mut stdin_task,
-                stdin_result,
-                &mut stdout_task,
-                Some(Ok(Ok(stdout))),
-                stderr_task,
+                InterruptedProcess {
+                    child: &mut child,
+                    observer: observer.as_ref(),
+                    custody,
+                    stop: StopReason::Failure(ProcessFailure::Timeout),
+                    status,
+                    root_exit_observed,
+                },
+                io,
             )
             .await;
         }
         Err(stop) => {
+            io.stdout_result = Some(Ok(Ok(stdout)));
             return settle_interrupted(
-                &mut child,
-                observer.as_ref(),
-                custody,
-                stop,
-                status,
-                root_exit_observed,
-                &mut stdin_task,
-                stdin_result,
-                &mut stdout_task,
-                Some(Ok(Ok(stdout))),
-                stderr_task,
+                InterruptedProcess {
+                    child: &mut child,
+                    observer: observer.as_ref(),
+                    custody,
+                    stop,
+                    status,
+                    root_exit_observed,
+                },
+                io,
+            )
+            .await;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(stop) = pending_interruption(deadline, &cancellation) {
+            io.stdout_result = Some(Ok(Ok(stdout)));
+            return settle_interrupted(
+                InterruptedProcess {
+                    child: &mut child,
+                    observer: observer.as_ref(),
+                    custody,
+                    stop,
+                    status,
+                    root_exit_observed,
+                },
+                io,
+            )
+            .await;
+        }
+
+        // The pre-reap observation is read-only. Reuse the validated owner
+        // signal, then rescan while the exact leader still anchors the PGID.
+        let _ = child.terminate();
+        let final_quiescent = matches!(
+            child.wait_group_empty_except_leader(CLEANUP_GRACE).await,
+            Ok(true)
+        );
+        if !final_quiescent {
+            io.stdout_result = Some(Ok(Ok(stdout)));
+            return settle_interrupted(
+                InterruptedProcess {
+                    child: &mut child,
+                    observer: observer.as_ref(),
+                    custody,
+                    stop: StopReason::Unknown(ProcessUncertainty::Quiescence),
+                    status,
+                    root_exit_observed,
+                },
+                io,
+            )
+            .await;
+        }
+        if let Some(stop) = pending_interruption(deadline, &cancellation) {
+            io.stdout_result = Some(Ok(Ok(stdout)));
+            return settle_interrupted(
+                InterruptedProcess {
+                    child: &mut child,
+                    observer: observer.as_ref(),
+                    custody,
+                    stop,
+                    status,
+                    root_exit_observed,
+                },
+                io,
             )
             .await;
         }
@@ -378,7 +448,20 @@ async fn run_owned_process_inner(
         };
     };
 
-    let stderr = stderr_task.finish(Instant::now() + CLEANUP_GRACE).await;
+    let stderr = io.stderr_task.finish(Instant::now() + CLEANUP_GRACE).await;
+    #[cfg(target_os = "linux")]
+    if let Some(stop) = pending_interruption(deadline, &cancellation) {
+        return classify_settled_process(SettledProcess {
+            status,
+            exit_was_known_before_cleanup: true,
+            stop,
+            quiescent: true,
+            stdin_finished: true,
+            stdout: Some(stdout),
+            stderr,
+            custody,
+        });
+    }
     classify_quiescent_capture(ProcessCapture {
         stdout: stdout.bytes,
         stdout_complete: true,
@@ -394,10 +477,35 @@ enum StopReason {
     Unknown(ProcessUncertainty),
 }
 
+#[cfg(target_os = "linux")]
+fn pending_interruption(
+    deadline: Instant,
+    cancellation: &watch::Receiver<bool>,
+) -> Option<StopReason> {
+    if cancellation_requested(cancellation) {
+        Some(StopReason::Failure(ProcessFailure::Cancelled))
+    } else if Instant::now() >= deadline {
+        Some(StopReason::Failure(ProcessFailure::Timeout))
+    } else {
+        None
+    }
+}
+
 struct StdoutCapture {
     bytes: Vec<u8>,
     complete: bool,
     exceeded: bool,
+}
+
+struct SettledProcess {
+    status: ExitStatus,
+    exit_was_known_before_cleanup: bool,
+    stop: StopReason,
+    quiescent: bool,
+    stdin_finished: bool,
+    stdout: Option<StdoutCapture>,
+    stderr: StderrSnapshot,
+    custody: CustodyGuarantee,
 }
 
 /// Classify after stdin/stdout completion and custody quiescence are known.
@@ -456,19 +564,22 @@ where
     }
 }
 
-async fn settle_interrupted(
-    child: &mut OwnedChild,
-    observer: Option<&CustodyObserver>,
-    custody: CustodyGuarantee,
-    stop: StopReason,
-    mut status: Option<ExitStatus>,
-    root_exit_observed: bool,
-    stdin_task: &mut JoinHandle<io::Result<()>>,
-    stdin_result: Option<Result<io::Result<()>, tokio::task::JoinError>>,
-    stdout_task: &mut JoinHandle<io::Result<StdoutCapture>>,
-    mut stdout_result: Option<Result<io::Result<StdoutCapture>, tokio::task::JoinError>>,
-    stderr_task: StderrCapture,
-) -> ProcessOutcome {
+async fn settle_interrupted(interrupted: InterruptedProcess<'_>, io: ProcessIo) -> ProcessOutcome {
+    let InterruptedProcess {
+        child,
+        observer,
+        custody,
+        stop,
+        mut status,
+        root_exit_observed,
+    } = interrupted;
+    let ProcessIo {
+        mut stdin_task,
+        stdin_result,
+        mut stdout_task,
+        mut stdout_result,
+        stderr_task,
+    } = io;
     #[cfg(target_os = "linux")]
     let root_exit_observed = root_exit_observed || child.try_wait_exit_unreaped().unwrap_or(false);
     let exit_was_known_before_cleanup = root_exit_observed;
@@ -514,12 +625,11 @@ async fn settle_interrupted(
     let capture_deadline = Instant::now() + CLEANUP_GRACE;
     let stdin_result = match stdin_result {
         Some(result) => Some(result),
-        None => join_bounded(stdin_task, capture_deadline).await,
+        None => join_bounded(&mut stdin_task, capture_deadline).await,
     };
     let stdin_finished = matches!(stdin_result.as_ref(), Some(Ok(_)));
-    let stdin_complete = matches!(stdin_result.as_ref(), Some(Ok(Ok(()))));
     if stdout_result.is_none() {
-        stdout_result = join_bounded(stdout_task, capture_deadline).await;
+        stdout_result = join_bounded(&mut stdout_task, capture_deadline).await;
     }
     let stderr = stderr_task.finish(capture_deadline).await;
 
@@ -533,10 +643,46 @@ async fn settle_interrupted(
             quiescent,
         };
     };
+    classify_settled_process(SettledProcess {
+        status,
+        exit_was_known_before_cleanup,
+        stop,
+        quiescent,
+        stdin_finished,
+        stdout: clean_stdout,
+        stderr,
+        custody,
+    })
+}
+
+fn classify_settled_process(settled: SettledProcess) -> ProcessOutcome {
+    let SettledProcess {
+        status,
+        exit_was_known_before_cleanup,
+        stop,
+        quiescent,
+        stdin_finished,
+        stdout,
+        stderr,
+        custody,
+    } = settled;
     if !quiescent {
         return ProcessOutcome::Unknown {
             reason: ProcessUncertainty::Quiescence,
             quiescent: false,
+        };
+    }
+    if exit_was_known_before_cleanup && !status.success() {
+        let capture = stdout.map(|stdout| ProcessCapture {
+            stdout: stdout.bytes,
+            stdout_complete: stdout.complete,
+            stderr,
+            status,
+            custody,
+        });
+        return ProcessOutcome::Failed {
+            reason: ProcessFailure::Exit,
+            capture,
         };
     }
     if let Some(reason) = stop.unknown_reason() {
@@ -551,18 +697,12 @@ async fn settle_interrupted(
             quiescent: true,
         };
     }
-    if exit_was_known_before_cleanup && !stdin_complete {
-        return ProcessOutcome::Unknown {
-            reason: ProcessUncertainty::Stdin,
-            quiescent: true,
-        };
-    }
 
     let StopReason::Failure(reason) = stop else {
         unreachable!("unknown stop reasons returned above");
     };
     let output_limit = reason == ProcessFailure::OutputLimit;
-    let Some(stdout) = clean_stdout else {
+    let Some(stdout) = stdout else {
         return ProcessOutcome::Unknown {
             reason: ProcessUncertainty::Stdout,
             quiescent: true,
@@ -581,13 +721,8 @@ async fn settle_interrupted(
         };
     }
     if !output_limit && !status.success() {
-        let failure = if exit_was_known_before_cleanup {
-            ProcessFailure::Exit
-        } else {
-            reason
-        };
         return ProcessOutcome::Failed {
-            reason: failure,
+            reason,
             capture: Some(ProcessCapture {
                 stdout: stdout.bytes,
                 stdout_complete: true,
@@ -604,16 +739,15 @@ async fn settle_interrupted(
         };
     }
 
-    let capture = ProcessCapture {
-        stdout: stdout.bytes,
-        stdout_complete: stdout.complete,
-        stderr,
-        status,
-        custody,
-    };
     ProcessOutcome::Failed {
         reason,
-        capture: Some(capture),
+        capture: Some(ProcessCapture {
+            stdout: stdout.bytes,
+            stdout_complete: stdout.complete,
+            stderr,
+            status,
+            custody,
+        }),
     }
 }
 
@@ -661,6 +795,23 @@ async fn settle_linux_custody(
                 Ok(true)
             );
         }
+    }
+
+    if group_empty {
+        // An empty observation grants no signal authority by itself. Reuse the
+        // retained leader's birth check, then observe the group again pre-reap.
+        let _ = child.terminate();
+        group_empty = matches!(
+            child.wait_group_empty_except_leader(Duration::ZERO).await,
+            Ok(true)
+        );
+    }
+    if !group_empty {
+        let _ = child.terminate();
+        group_empty = matches!(
+            child.wait_group_empty_except_leader(CLEANUP_GRACE).await,
+            Ok(true)
+        );
     }
 
     // Reap the direct child only after the final birth-checked group signal and
@@ -895,6 +1046,131 @@ mod tests {
         assert!(capture.stderr.truncated);
         assert!(!capture.stderr.eof);
         assert!(capture.stderr.read_error);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn cleanup_failure_precedence_requires_exit_observed_before_cleanup() {
+        #[cfg(unix)]
+        let custody = CustodyGuarantee::Degraded;
+        #[cfg(windows)]
+        let custody = CustodyGuarantee::Exact;
+        let stderr = StderrSnapshot {
+            text: "[REDACTED]".to_owned(),
+            truncated: true,
+            eof: false,
+            read_error: true,
+        };
+
+        let natural_exit = classify_settled_process(SettledProcess {
+            status: unsuccessful_exit_status(),
+            exit_was_known_before_cleanup: true,
+            stop: StopReason::Unknown(ProcessUncertainty::Stdout),
+            quiescent: true,
+            stdin_finished: false,
+            stdout: Some(StdoutCapture {
+                bytes: b"partial stdout".to_vec(),
+                complete: false,
+                exceeded: false,
+            }),
+            stderr: stderr.clone(),
+            custody,
+        });
+        let ProcessOutcome::Failed {
+            reason: ProcessFailure::Exit,
+            capture: Some(capture),
+        } = natural_exit
+        else {
+            panic!("observed nonzero exit must outrank later stream loss");
+        };
+        assert!(!capture.stdout_complete);
+        assert_eq!(capture.stdout, b"partial stdout");
+        assert!(capture.stderr.read_error);
+        assert!(!capture.stderr.eof);
+
+        let controller_termination = classify_settled_process(SettledProcess {
+            status: unsuccessful_exit_status(),
+            exit_was_known_before_cleanup: false,
+            stop: StopReason::Unknown(ProcessUncertainty::Stdout),
+            quiescent: true,
+            stdin_finished: false,
+            stdout: None,
+            stderr,
+            custody,
+        });
+        assert!(matches!(
+            controller_termination,
+            ProcessOutcome::Unknown {
+                reason: ProcessUncertainty::Stdout,
+                quiescent: true,
+            }
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn late_deadline_or_cancel_after_quiescence_never_completes_success() {
+        #[cfg(unix)]
+        let custody = CustodyGuarantee::Degraded;
+        #[cfg(windows)]
+        let custody = CustodyGuarantee::Exact;
+        let (sender, receiver) = cancellation();
+        let expired = pending_interruption(Instant::now() - Duration::from_secs(1), &receiver)
+            .unwrap_or(StopReason::Unknown(ProcessUncertainty::Exit));
+        assert!(matches!(
+            expired,
+            StopReason::Failure(ProcessFailure::Timeout)
+        ));
+        let timeout_outcome = classify_settled_process(SettledProcess {
+            status: successful_exit_status(),
+            exit_was_known_before_cleanup: true,
+            stop: expired,
+            quiescent: true,
+            stdin_finished: true,
+            stdout: Some(StdoutCapture {
+                bytes: b"complete stdout".to_vec(),
+                complete: true,
+                exceeded: false,
+            }),
+            stderr: StderrSnapshot::default(),
+            custody,
+        });
+        assert!(matches!(
+            timeout_outcome,
+            ProcessOutcome::Unknown {
+                reason: ProcessUncertainty::InterruptedSuccess,
+                quiescent: true,
+            }
+        ));
+
+        let _ = sender.send(true);
+        let cancelled = pending_interruption(Instant::now() + Duration::from_secs(1), &receiver)
+            .unwrap_or(StopReason::Unknown(ProcessUncertainty::Exit));
+        assert!(matches!(
+            cancelled,
+            StopReason::Failure(ProcessFailure::Cancelled)
+        ));
+        let cancel_outcome = classify_settled_process(SettledProcess {
+            status: successful_exit_status(),
+            exit_was_known_before_cleanup: true,
+            stop: cancelled,
+            quiescent: true,
+            stdin_finished: true,
+            stdout: Some(StdoutCapture {
+                bytes: b"complete stdout".to_vec(),
+                complete: true,
+                exceeded: false,
+            }),
+            stderr: StderrSnapshot::default(),
+            custody,
+        });
+        assert!(matches!(
+            cancel_outcome,
+            ProcessOutcome::Unknown {
+                reason: ProcessUncertainty::InterruptedSuccess,
+                quiescent: true,
+            }
+        ));
     }
 
     #[tokio::test]

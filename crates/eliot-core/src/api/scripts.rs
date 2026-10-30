@@ -6,8 +6,7 @@
 use super::{mutations::CommandSubmitRequest, reads::CommandGetRequest};
 use crate::{
     Error, Event, EventSubject, FrozenSetupFile, Result, StderrDiagnostic, StderrSnapshot,
-    StderrSource, SubmitCommand, bound_stderr_diagnostics, limits::MAX_EVENT_BYTES,
-    parse_agent_id,
+    StderrSource, SubmitCommand, bound_stderr_diagnostics, limits::MAX_EVENT_BYTES, parse_agent_id,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -422,8 +421,7 @@ pub fn bound_script_outcome_stderr(outcome: &mut Value, max_encoded_bytes: usize
     let Some(process_value) = outcome.get("process") else {
         return;
     };
-    let Ok(process_result) =
-        serde_json::from_value::<ScriptProcessResult>(process_value.clone())
+    let Ok(process_result) = serde_json::from_value::<ScriptProcessResult>(process_value.clone())
     else {
         return;
     };
@@ -463,7 +461,10 @@ pub fn bound_script_outcome_stderr(outcome: &mut Value, max_encoded_bytes: usize
         .saturating_sub(base_bytes.len())
         .saturating_add(null_bytes);
     let mut diagnostics = vec![diagnostic];
-    bound_stderr_diagnostics(&mut diagnostics, snapshot_budget.saturating_add(wrapper_bytes));
+    bound_stderr_diagnostics(
+        &mut diagnostics,
+        snapshot_budget.saturating_add(wrapper_bytes),
+    );
 
     let Some(diagnostic) = diagnostics.pop() else {
         *outcome = without_stderr;
@@ -481,17 +482,12 @@ pub fn bound_script_outcome_stderr(outcome: &mut Value, max_encoded_bytes: usize
         return;
     };
     process.insert("stderr".to_owned(), stderr);
-    if serde_json::to_vec(&without_stderr)
-        .is_ok_and(|bytes| bytes.len() <= max_encoded_bytes)
-    {
+    if serde_json::to_vec(&without_stderr).is_ok_and(|bytes| bytes.len() <= max_encoded_bytes) {
         *outcome = without_stderr;
     } else {
         *outcome = {
             let mut primary = outcome.clone();
-            if let Some(process) = primary
-                .get_mut("process")
-                .and_then(Value::as_object_mut)
-            {
+            if let Some(process) = primary.get_mut("process").and_then(Value::as_object_mut) {
                 process.insert("stderr".to_owned(), Value::Null);
             }
             primary

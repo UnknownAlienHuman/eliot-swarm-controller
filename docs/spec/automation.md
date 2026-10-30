@@ -89,11 +89,13 @@ commands continue. Explicit catch-up fails `history_gap`
 when its requested history has already been pruned. A lagging rule cannot pin storage
 indefinitely.
 
-During explicit history catch-up, a deterministic per-event action refusal emits
-`rule.rejected`; the retained catch-up parent remains `applied` and lists only admitted
-children. Store or persistence failure rolls back the whole request, leaving no partial
-parent or child set. A retained same-ID request returns its parent before current gates,
-as documented for `rule.catch_up` in the API.
+During explicit history catch-up, project Run actions use the same freeze path as live firing,
+capturing each matching event and the validated current rule revision. Project authorization
+preflights the complete rendered request set; deterministic per-event preparation refusals emit
+`rule.rejected`. The retained catch-up parent remains `applied` and lists only admitted
+children. Store or persistence failure rolls back the whole request, leaving no partial parent or
+child set. A retained same-ID request returns its parent before current gates, as documented for
+`rule.catch_up` in the API.
 
 ## Triggers
 
@@ -239,17 +241,18 @@ Disabled rules advance their skipped range without firing.
 Backlog, explicit history catch-up, and rate-limit semantics are defined in
 [Retention and bounded backlog](#retention-and-bounded-backlog).
 This connected event-rule subset supports ordinary `stop`, `send` and event-only
-`interrupt`, plus the project event-rule `run` contour in
-[Frozen script inputs](#frozen-script-inputs). `run` uses the same command admission path
-described there. The full L4.2 action contract is cumulative: global `run` and the other
-actions listed below remain required; this project contour does not remove or replace
-them. SEND uses the existing Router path, keeps its exact target generation and turn
-association, and `applied` does not assert task completion. `allow_self` defaults to
-false, suppressing a rule's own causal SEND result; set it true only to opt into feedback,
-still subject to cause-depth and rate limits. Goal actions and project configuration
-overlays remain outside this connected event-rule contour.
-Cause-depth suppression is silent and does not emit an endlessly retriggerable rejection
-event.
+`interrupt`, plus project event-rule `run` during both live evaluation and explicit history
+catch-up; both paths use the frozen inputs in [Frozen script inputs](#frozen-script-inputs).
+Each catch-up Run freezes the exact captured event and validated current rule revision before
+ordinary command admission. Run actions on timer rules and global event rules remain unsupported
+in this first slice. The full L4.2 action contract is cumulative: global `run` and the other
+actions listed below remain required, and this project contour does not complete or remove that
+requirement. SEND uses the existing Router path, keeps its exact target generation and turn
+association, and `applied` does not assert task completion. `allow_self` defaults to false,
+suppressing a rule's own causal SEND result; set it true only to opt into feedback, still subject
+to cause-depth and rate limits. Goal actions and project configuration overlays remain outside
+this connected event-rule contour.
+Cause-depth suppression is silent and does not emit an endlessly retriggerable rejection event.
 
 ## Matching and rendering
 
@@ -346,21 +349,20 @@ Hold later writes to the same repository behind an unknown write; unrelated work
 A `run` action (global or project) is an ordinary targetless `SubmitCommand` in existing
 `commands`, with `verb="run"` and no Agent target or generation/turn/request binding. It
 uses the existing Router for admission and dispatch; it adds no executor, run table or
-workflow. Its `args` retain the `cmd`, `cwd`, `timeout` and `env` contract.
+workflow. Its raw input and frozen command args use Core `RunDefinitionArgs` and
+`FrozenScriptRun`, respectively, defined in [the Core script DTO module](../../crates/eliot-core/src/api/scripts.rs).
+Those DTOs own their field catalogs; this spec defines their run semantics.
 
-For project event rules, `cmd` is a literal argv array: `cmd[0]` is an exact key in the
-project's owner-configured `interpreters`; `cmd[1]` is a literal relative path below the
-registered checkout's `.eliot/scripts/`; remaining elements are literal script arguments.
-The entry must resolve to a canonical regular file under that directory, with no path
-escape, symlink/reparse point, device or alternate stream. Before spawn, authorize the
-project `run` action and resolve `cmd[0]` to its approved interpreter; this entry
-validation completes the project path check. The executable path and fixed `argv_prefix` come
-only from owner configuration. A project rule may select a configured interpreter
-reference and eligible literal entry, but cannot supply or override the executable path
-or prefix. Event data cannot change argv or become a shell command string. Eliot invokes
-the executable directly with argv
-`[program, ...argv_prefix, frozen_entry_path, ...cmd[2..]]`; event-derived values are
-available on stdin only. See [Project registration and rule authority](configuration.md#project-registration-and-rule-authority).
+For project event rules, `RunDefinitionArgs.cmd` is a literal argv vector: element 0 is
+the exact owner-approved key in `interpreters`; element 1 is a literal relative entry
+path below the registered checkout's `.eliot/scripts/`; later elements are literal script
+arguments. The entry must resolve to a canonical regular file under that directory, with
+no path escape, symlink/reparse point, device or alternate stream. Before spawn, authorize
+the project `run` action and resolve element 0 to its approved interpreter. The executable
+path and fixed argv prefix come only from owner configuration. Event data cannot change
+argv or become a shell command string. Eliot invokes the executable directly with the
+configured prefix, the frozen canonical entry path and the remaining literal arguments;
+event-derived values are available on stdin only. See [Project registration and rule authority](configuration.md#project-registration-and-rule-authority).
 
 `cwd` defaults to the registered canonical project checkout. A supplied literal relative
 path must resolve inside that checkout after canonicalization and link/reparse checks.
@@ -383,61 +385,65 @@ and constants `MAX_CMD_LEN`, `MAX_ENV_NAME_LEN` and `MAX_PASS_ENV_ENTRIES` from
 `MAX_TIMEOUT_MS` does not set a Run timeout maximum. Timer duration parsing is in
 [the existing schedule module](../../crates/eliot-daemon/src/automation/schedule.rs).
 
-Admission freezes the resolved interpreter id, executable path and fixed prefix, plus
-the entry's canonical allowed path, size and digest. Before spawn, dispatch revalidates
-the owner project registration and the frozen entry path/size/digest. A changed
-registration or entry fails closed instead of replacing queued inputs. This freezes
-explicit references, not an interpreter's imported dependency graph.
+The ordinary command args store Core `FrozenScriptRun`, which carries the resolved
+interpreter snapshot, entry receipt and frozen event/rule context. Entry and executable
+receipts reuse Core `FrozenSetupFile`; see [the Core model](../../crates/eliot-core/src/lib.rs).
+Before spawn, dispatch revalidates the owner project grant and both file receipts. A
+changed registration, executable or entry fails closed instead of replacing queued
+inputs. This freezes explicit references, not an interpreter's imported dependency graph.
 
 The controller serializes bounded JSON before spawn and rejects input larger than 1 MiB.
-The child receives one `{event,subject,rule,command}` object on stdin. The committed event,
-event-time subject and rule identity/revision are frozen inputs. `command` is a minimal
-projection of the canonical [Core `Command` model](../../crates/eliot-core/src/lib.rs):
-its own run command id, verb and only the bounded nonsecret context metadata needed by
-the script. It is not a recursive serialization of the full command or its `args`. The
-projection excludes recursive stdin/context payload, environment, bearer values and
-principal/scope. The eventual run-input DTO owns the exact projection field catalog;
-link that DTO here when implemented instead of repeating the full Core `Command` fields.
-Neither stdin nor this view contains a Run token. Its stdout is UTF-8 NDJSON, at most 1 MiB including line endings: each nonempty
+The child stdin uses the Core `ScriptInputContext` DTO from [the Core script DTO module](../../crates/eliot-core/src/api/scripts.rs).
+Its event, event-time subject and rule id/revision are the captured snapshots. The
+`ScriptCommandContext` member is the minimal run command id/verb projection assembled
+after Store assigns the id; it never serializes the full Core `Command` or its args.
+The input excludes recursive stdin/context payload, environment, principal/scope and
+bearer values, including the Run token. Its stdout is UTF-8 NDJSON, at most 1 MiB including line endings: each nonempty
 line is one JSON object, LF or CRLF terminated; a final complete object may end at EOF.
 Empty lines, malformed JSON, invalid UTF-8, truncated capture or excess output invalidate
-the entire stream. Each record is exactly one of:
+the entire stream. Each line must deserialize as the strict Core `ScriptActionRecord`
+DTO; that type owns the closed flat record field catalog and converts to an ordinary
+`SubmitCommand`. The effective send-text limit is Core `MAX_EVENT_BYTES` (64 KiB) from
+[Core limits](../../crates/eliot-core/src/limits.rs). Unknown, missing, `null`, nested,
+extra or wrong-type fields fail validation. Targets and generation/turn bindings are
+literal and must pass ordinary command validation. Records cannot supply command `id`, `principal`, `parent_command`, `ordinal`,
+`executable`, `cmd`, `cwd`, `timeout`, `env` or token fields.
 
-- stop: `{"action":"stop","target":string,"expected_generation":nonnegative_integer}`
-- send: `{"action":"send","target":string,"expected_generation":nonnegative_integer,"text":string}`
-- interrupt: `{"action":"interrupt","target":string,"expected_generation":nonnegative_integer,"expected_turn_id":string}`
+After successful exit, validate each actually emitted record separately against the
+project action allowlist, Router authorization and generation/turn checks. All records
+must pass before atomic admission; the rule loader does not statically analyze possible
+script output.
 
-Unknown, missing, `null`, nested or extra fields fail validation. After successful exit,
-validate every emitted record separately against the project action allowlist, Router
-authorization and generation/turn checks; all records must pass before atomic admission.
-Records cannot supply a command `id`,
-principal, parent, ordinal, executable, `cmd`, `cwd`, timeout, environment or token field.
+The Core [`ScriptRunApplied` outcome](../../crates/eliot-core/src/api/scripts.rs) carries
+the current child ID list and a per-run [`ScriptProcessResult`](../../crates/eliot-core/src/api/scripts.rs).
+Its direct-exit state distinguishes an unobserved exit from an observed signal exit with
+no numeric code. Its custody value is platform-specific: Windows reports `exact` only
+after the owned Job is empty; Linux may report `degraded` when the direct exit is known
+zero and the owned process group is observed empty. Degraded Linux quiescence does not
+prove every descendant exited: a descendant may escape the process group with `setsid`.
+Do not claim those descendants were killed or classify that limit alone as `unknown`.
+See [existing process custody](../../crates/eliot-daemon/src/platform/custody.rs).
 
-Before admission, the controller must prove direct exit code zero, complete valid NDJSON
-and confirmed stopped/quiescent owned-descendant custody. It then atomically admits all
-records as ordered command children of the run command. The controller generates ids,
-parent links and ordinals using the existing `rule_action` child representation; normal
-Router dispatch preserves output order. No output action is admitted or dispatched
-before all three conditions hold. Empty stdout admits an empty child set. If descendant
-quiescence cannot be proven, no child set is admitted.
+Before child admission, require direct exit code zero, complete valid stdout NDJSON and
+quiescence proven by the platform's custody guarantee. Exact and degraded quiescence
+both permit an applied result when the direct exit and stdout are proven; unknown custody
+does not. Then admit all validated records atomically as ordered command children; the
+applied outcome retains their IDs, not recursive Command objects. Empty stdout admits an
+empty child set.
 
-Run uses existing [scoped child custody](../../crates/eliot-daemon/src/platform/custody.rs).
-Timeout or cancellation requests termination of owned custody. A known unsuccessful
-direct exit, including a timeout/cancellation whose exit and stopped custody are confirmed,
-or a conclusive output-limit violation or fully observed invalid stream with confirmed
-stopped custody is `failed` and may follow partial script effects. A truncated or lost
-stream that does not establish a limit violation is not a known invalid stream.
+The same `ScriptProcessResult` is used for process-backed failed-capture diagnostics;
+the existing failure code/cause remains authoritative, with no separate stderr DTO.
+Its optional bounded Core [`StderrSnapshot`](../../crates/eliot-core/src/diagnostics.rs)
+is diagnostic only. A stderr read/truncation condition does not invalidate an otherwise
+known direct exit, complete stdout result and custody result.
 
-Classify the result as `unknown` only when direct exit, required output completeness/validity,
-owned-custody quiescence or the final atomic child-set commit cannot be proven. Thus a
-successful exit and valid output still yield `unknown` without confirmed descendant
-quiescence. A timeout/cancellation with confirmed stopped custody and known unsuccessful
-exit is `failed`, not `unknown`. A known rejection or rollback of the atomic child-set
-admission is also `failed`; an indeterminate commit is `unknown`. Neither failed nor
-unknown runs are automatically
-replayed; retrying the same command id never starts the script again. After exit and
-quiescence, the controller admits validated output under the saved rule principal/scope,
-so those commands remain controller-authorized after the Run credential is revoked.
+A known unsuccessful direct exit, including timeout/cancellation with a confirmed
+unsuccessful exit and quiescence, or a conclusive output-limit violation or fully observed
+invalid stream with confirmed quiescence is `failed` and may follow partial script
+effects. A truncated/lost required stdout stream, unobserved exit, unproven platform
+quiescence or indeterminate final child-set commit is `unknown`. A known child-set
+rejection/rollback is `failed`. Failed and unknown runs are never replayed; retrying the
+same command id never starts the script again.
 
 The contract is interpreter-agnostic; this Windows example uses the owner's PowerShell
 interpreter approval, a registered script entry and one stdout record:

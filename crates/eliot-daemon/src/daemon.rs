@@ -265,6 +265,14 @@ pub async fn client_call(path: &Path, method: &str, params: Value) -> Result<Val
             "generation": generation,
             "credential": token,
         }),
+        ClientIdentity::Run {
+            run_command_id,
+            token,
+        } => json!({
+            "kind": "run",
+            "run_command_id": run_command_id,
+            "credential": token,
+        }),
     };
     let policy = SecretPolicy::new([
         data_dir.owner_token(),
@@ -550,34 +558,65 @@ enum ClientIdentity {
         generation: i64,
         token: String,
     },
+    Run {
+        run_command_id: String,
+        token: String,
+    },
 }
 
+const AGENT_IDENTITY_ENV: [&str; 3] = [
+    "ELIOT_AGENT_ID",
+    "ELIOT_AGENT_GENERATION",
+    "ELIOT_AGENT_TOKEN",
+];
+const RUN_IDENTITY_ENV: [&str; 2] = ["ELIOT_RUN_COMMAND_ID", "ELIOT_RUN_TOKEN"];
+const OWNER_IDENTITY_ENV: [&str; 3] = [
+    "ELIOT_OWNER_ID",
+    "ELIOT_OWNER_TOKEN",
+    "ELIOT_OWNER_CREDENTIAL",
+];
+
 fn caller_identity() -> Result<ClientIdentity> {
-    let names = [
-        "ELIOT_AGENT_ID",
-        "ELIOT_AGENT_GENERATION",
-        "ELIOT_AGENT_TOKEN",
-    ];
-    let values: Vec<_> = names.iter().map(std::env::var_os).collect();
-    let any = values.iter().any(Option::is_some);
-    if any {
-        if values.iter().any(Option::is_none) {
+    caller_identity_from(
+        AGENT_IDENTITY_ENV.map(std::env::var_os),
+        RUN_IDENTITY_ENV.map(std::env::var_os),
+        OWNER_IDENTITY_ENV.map(std::env::var_os),
+    )
+}
+
+fn caller_identity_from(
+    agent_values: [Option<std::ffi::OsString>; 3],
+    run_values: [Option<std::ffi::OsString>; 2],
+    owner_values: [Option<std::ffi::OsString>; 3],
+) -> Result<ClientIdentity> {
+    let has_agent = agent_values.iter().any(Option::is_some);
+    let has_run = run_values.iter().any(Option::is_some);
+    let has_owner = owner_values.iter().any(Option::is_some);
+    if has_owner || (has_agent && has_run) {
+        return Err(Error::new(
+            "not_allowed",
+            "managed role credentials conflict",
+        ));
+    }
+
+    if has_agent {
+        if agent_values.iter().any(Option::is_none) {
             return Err(Error::new(
                 "not_allowed",
                 "managed Agent credentials are incomplete",
             ));
         }
-        let id = values[0]
+        let id = agent_values[0]
             .as_ref()
             .and_then(|value| value.to_str())
             .ok_or_else(|| Error::new("not_allowed", "managed Agent id is invalid"))?;
-        let generation = values[1]
+        let generation = agent_values[1]
             .as_ref()
             .and_then(|value| value.to_str())
             .and_then(|value| value.parse::<i64>().ok())
             .filter(|value| *value > 0)
             .ok_or_else(|| Error::new("not_allowed", "managed Agent generation is invalid"))?;
-        let token = values[2]
+        let token = agent_values[2]
             .as_ref()
             .and_then(|value| value.to_str())
             .filter(|value| !value.is_empty())
@@ -591,9 +630,34 @@ fn caller_identity() -> Result<ClientIdentity> {
             token: token.to_owned(),
         });
     }
+
+    if has_run {
+        if run_values.iter().any(Option::is_none) {
+            return Err(Error::new("not_allowed", "Run credentials are incomplete"));
+        }
+        let run_command_id = run_values[0]
+            .as_ref()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.trim().is_empty() && !value.contains('\0'))
+            .ok_or_else(|| Error::new("not_allowed", "Run command id is invalid"))?;
+        let token = run_values[1]
+            .as_ref()
+            .and_then(|value| value.to_str())
+            .filter(|value| {
+                value.len() == 64
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            .ok_or_else(|| Error::new("not_allowed", "Run credential is invalid"))?;
+        return Ok(ClientIdentity::Run {
+            run_command_id: run_command_id.to_owned(),
+            token: token.to_owned(),
+        });
+    }
+
     Ok(ClientIdentity::Owner)
 }
-
 fn valid_agent_id(id: &str) -> bool {
     eliot_core::parse_agent_id(id).is_ok()
 }
@@ -788,6 +852,92 @@ mod tests {
         for diagnostic in &restored.diagnostics {
             assert!(diagnostic.snapshot.truncated);
             assert!(!diagnostic.snapshot.text.contains('!'));
+        }
+    }
+    fn envs<const N: usize>(values: [Option<&str>; N]) -> [Option<std::ffi::OsString>; N] {
+        values.map(|value| value.map(std::ffi::OsString::from))
+    }
+
+    #[test]
+    fn run_identity_requires_exact_pair_and_never_falls_back_to_owner() {
+        let owner_values = envs([None, None, None]);
+        let run_token = "a".repeat(64);
+        let run_values = envs([Some("run-1"), Some(run_token.as_str())]);
+        assert!(matches!(
+            caller_identity_from(
+                envs([None, None, None]),
+                run_values.clone(),
+                owner_values.clone()
+            ),
+            Ok(ClientIdentity::Run { .. })
+        ));
+        assert!(
+            caller_identity_from(
+                envs([None, None, None]),
+                envs([Some("run-1"), None]),
+                owner_values.clone()
+            )
+            .is_err()
+        );
+        assert!(
+            caller_identity_from(
+                envs([None, None, None]),
+                envs([None, Some(run_token.as_str())]),
+                owner_values.clone()
+            )
+            .is_err()
+        );
+        assert!(matches!(
+            caller_identity_from(envs([None, None, None]), envs([None, None]), owner_values),
+            Ok(ClientIdentity::Owner)
+        ));
+    }
+
+    #[test]
+    fn role_environment_conflicts_fail_closed_and_agent_identity_stays_supported() {
+        let run_token = "a".repeat(64);
+        assert!(
+            caller_identity_from(
+                envs([Some("a1"), Some("1"), Some("agent-token")]),
+                envs([Some("run-1"), Some(run_token.as_str())]),
+                envs([None, None, None])
+            )
+            .is_err()
+        );
+        assert!(
+            caller_identity_from(
+                envs([Some("a1"), None, None]),
+                envs([None, None]),
+                envs([None, None, None])
+            )
+            .is_err()
+        );
+        assert!(
+            caller_identity_from(
+                envs([None, None, None]),
+                envs([None, None]),
+                envs([None, Some("owner-token"), None])
+            )
+            .is_err()
+        );
+
+        match caller_identity_from(
+            envs([Some("a1"), Some("7"), Some("agent-token")]),
+            envs([None, None]),
+            envs([None, None, None]),
+        )
+        .expect("preserve complete Agent identity")
+        {
+            ClientIdentity::Agent {
+                id,
+                generation,
+                token,
+            } => {
+                assert_eq!(id, "a1");
+                assert_eq!(generation, 7);
+                assert_eq!(token, "agent-token");
+            }
+            _ => panic!("expected Agent identity"),
         }
     }
 }

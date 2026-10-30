@@ -14,6 +14,7 @@ mod plugin_host;
 mod proxy;
 mod redaction;
 mod router;
+pub(crate) mod scripts;
 mod setup;
 mod workspace_git;
 mod workspaces;

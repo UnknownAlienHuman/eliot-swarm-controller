@@ -4,11 +4,13 @@ use crate::{
     common::{now_ms, secure_eq, valid_environment_name},
     monitor::Monitoring,
     plugin_host::{AgentCredentials, PluginHost, PluginHostOptions, SecretSet, UnknownCommands},
+    scripts::auth::{RunCredentialGuard, RunCredentialRegistry, SavedRunPrincipal},
     workspaces::WorkspaceManager,
 };
 use eliot_core::{
     Agent, AgentState, Command, CommandState, Error, Event, NativeStoreBinding, Result,
-    SecretPolicy, SubmitCommand, Turn, TurnState, WorkspacePhase, WorkspacePreparationInput,
+    ScriptProcessResult, SecretPolicy, SubmitCommand, Turn, TurnState, WorkspacePhase,
+    WorkspacePreparationInput,
     api::{
         AgentDiscoverRequest, AgentEditsRequest, AgentEditsResponse, AgentGetRequest,
         AgentGetResponse, AgentGitRequest, AgentGitResponse, AgentHistoryRequest, AgentListRequest,
@@ -36,13 +38,13 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::Duration,
 };
 use tokio::{
-    sync::{Mutex as AsyncMutex, broadcast, watch},
+    sync::{Mutex as AsyncMutex, broadcast, oneshot, watch},
     time::{Instant, timeout_at},
 };
 
@@ -55,6 +57,7 @@ const EVENT_RESPONSE_ENTRIES_MAX_BYTES: usize =
 const LIVE_WAIT_MAX_MS: u64 = 30_000;
 const STATUS_BLOCKER_MAX: usize = 64;
 const CONTROLLED_PLUGIN_SOURCE: &str = "stream";
+const RUN_WORKER_FORCE_GRACE: Duration = Duration::from_secs(15);
 
 type StoreHandle = Arc<AsyncMutex<eliot_store::Store>>;
 
@@ -74,6 +77,7 @@ struct RouterInner {
     owner_token: String,
     secrets: SecretSet,
     agent_credentials: AgentCredentials,
+    run_credentials: RunCredentialRegistry,
     unknown_commands: UnknownCommands,
     unknown_causes: Mutex<HashMap<String, String>>,
     rule_definitions: Mutex<HashMap<(String, String), (i64, RuleDefinition)>>,
@@ -84,8 +88,49 @@ struct RouterInner {
     mode: AtomicU8,
     shutdown_ready: AtomicBool,
     progress: watch::Sender<u64>,
+    run_cancellation: watch::Sender<bool>,
+    run_workers: Mutex<HashMap<String, RunWorkerHandle>>,
 }
 
+struct RunWorkerHandle {
+    task: tokio::task::JoinHandle<()>,
+    completed: watch::Receiver<bool>,
+}
+
+struct RunWorkerCompletion {
+    router: Weak<RouterInner>,
+    run_id: String,
+    completed: watch::Sender<bool>,
+    finished: bool,
+}
+
+impl RunWorkerCompletion {
+    fn finish(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.completed.send_replace(true);
+        if let Some(router) = self.router.upgrade() {
+            router.run_workers.lock_recover().remove(&self.run_id);
+        }
+        self.finished = true;
+    }
+}
+
+impl Drop for RunWorkerCompletion {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.completed.send_replace(true);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunWorkerStart {
+    Started,
+    AlreadyActive,
+    ForceRequested,
+}
 #[derive(Clone)]
 enum Principal {
     Owner,
@@ -96,8 +141,10 @@ enum Principal {
     ProjectRule {
         registration: ProjectRegistrationView,
     },
+    Run {
+        run_command_id: String,
+    },
 }
-
 struct EventFilter {
     agents: HashSet<String>,
     kinds: HashSet<String>,
@@ -146,8 +193,10 @@ impl Router {
     ) -> Self {
         let secrets: SecretSet = Arc::new(Mutex::new(HashSet::from([owner_token.clone()])));
         let agent_credentials: AgentCredentials = Arc::new(Mutex::new(Default::default()));
+        let run_credentials = RunCredentialRegistry::default();
         let unknown_commands: UnknownCommands = Arc::new(Mutex::new(Default::default()));
         let (progress, _) = watch::channel(0_u64);
+        let (run_cancellation, _) = watch::channel(false);
         let monitoring = Monitoring::new(Arc::clone(&store), bus.clone(), Arc::clone(&secrets));
         let workspaces = WorkspaceManager::new(
             data_root.clone(),
@@ -175,6 +224,7 @@ impl Router {
                 owner_token,
                 secrets,
                 agent_credentials,
+                run_credentials,
                 unknown_commands,
                 unknown_causes: Mutex::new(HashMap::new()),
                 rule_definitions: Mutex::new(HashMap::new()),
@@ -185,12 +235,15 @@ impl Router {
                 mode: AtomicU8::new(MODE_OPEN),
                 shutdown_ready: AtomicBool::new(false),
                 progress,
+                run_cancellation,
+                run_workers: Mutex::new(HashMap::new()),
             }),
         }
     }
 
     pub(crate) async fn handle(&self, method: &str, wire_params: Value) -> Result<Value> {
         let (principal, params) = self.authenticate(wire_params).await?;
+        authorize_rpc_method(&principal, method)?;
         match method {
             "daemon.status" => {
                 require_owner(&principal)?;
@@ -250,7 +303,9 @@ impl Router {
     pub(crate) async fn request_force(&self) {
         self.inner.plugin_host.close_discovery_admission();
         let _store = self.inner.store.lock().await;
+        let _run_workers = self.inner.run_workers.lock_recover();
         self.inner.mode.store(MODE_FORCE, Ordering::SeqCst);
+        self.inner.run_cancellation.send_replace(true);
         self.inner.shutdown_ready.store(true, Ordering::SeqCst);
         drop(_store);
         self.signal_progress();
@@ -272,10 +327,37 @@ impl Router {
     }
 
     pub(crate) async fn force_owned_processes(&self) {
+        let workers = {
+            let _store = self.inner.store.lock().await;
+            let mut workers = self.inner.run_workers.lock_recover();
+            self.inner.mode.fetch_max(MODE_FORCE, Ordering::SeqCst);
+            self.inner.run_cancellation.send_replace(true);
+            workers.drain().collect::<Vec<_>>()
+        };
+        let deadline = Instant::now() + RUN_WORKER_FORCE_GRACE;
+        for (run_id, mut worker) in workers {
+            match timeout_at(deadline, &mut worker.task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    self.settle_run_worker_unknown(&run_id, "script_worker_failed")
+                        .await;
+                }
+                Err(_) => {
+                    self.settle_run_worker_unknown(&run_id, "script_force_shutdown_unsettled")
+                        .await;
+                    let mut active = self.inner.run_workers.lock_recover();
+                    if worker.task.is_finished() {
+                        drop(active);
+                        let _ = worker.task.await;
+                    } else {
+                        active.insert(run_id, worker);
+                    }
+                }
+            }
+        }
         self.inner.workspaces.stop_all(true).await;
         self.inner.plugin_host.force_all().await;
     }
-
     pub(crate) async fn recover_workspaces(&self) -> Result<()> {
         for id in self.inner.workspaces.recover().await? {
             let linked = {
@@ -356,6 +438,12 @@ impl Router {
             .as_object()
             .ok_or_else(|| Error::new("not_allowed", "daemon credentials are malformed"))?;
         let kind = auth.get("kind").and_then(Value::as_str).unwrap_or_default();
+        if !auth_fields_are_exact(auth, kind) {
+            return Err(Error::new(
+                "not_allowed",
+                "daemon credential fields are incomplete or conflicting",
+            ));
+        }
         let credential = auth
             .get("credential")
             .and_then(Value::as_str)
@@ -437,10 +525,30 @@ impl Router {
                     payload,
                 ))
             }
+            "run" => {
+                let run_command_id = auth
+                    .get("run_command_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty() && !id.contains('\0'))
+                    .ok_or_else(|| Error::new("not_allowed", "Run command id is invalid"))?;
+                let saved_principal = self
+                    .inner
+                    .run_credentials
+                    .authenticate(run_command_id, credential)
+                    .ok_or_else(|| {
+                        Error::new("not_allowed", "Run credential is invalid or revoked")
+                    })?;
+                let SavedRunPrincipal::ProjectRule { .. } = saved_principal;
+                Ok((
+                    Principal::Run {
+                        run_command_id: run_command_id.to_owned(),
+                    },
+                    payload,
+                ))
+            }
             _ => Err(Error::new("not_allowed", "daemon principal is unsupported")),
         }
     }
-
     async fn submit(&self, params: &Value, principal: &Principal) -> Result<Value> {
         let request: CommandSubmitRequest = serde_json::from_value(params.clone())
             .map_err(|_| Error::new("invalid", "command.submit params are malformed"))?;
@@ -507,6 +615,54 @@ impl Router {
         .map_err(|_| Error::new("internal", "command admission result could not be encoded"))
     }
 
+    pub(crate) async fn issue_run_credential(
+        &self,
+        command: &Command,
+    ) -> Result<(RunCredentialGuard, SavedRunPrincipal)> {
+        if command.verb != "run"
+            || command.state != CommandState::Dispatched
+            || command.target.is_some()
+            || command.generation.is_some()
+            || command.request_id.is_some()
+        {
+            return Err(Error::new(
+                "bad_state",
+                "Run credentials require a dispatched targetless run command",
+            ));
+        }
+        let saved_principal = if let Some(project_id) = command.principal.strip_prefix("project:") {
+            if project_id.trim().is_empty() {
+                return Err(Error::new("not_allowed", "stored Run principal is invalid"));
+            }
+            let registration = self
+                .inner
+                .store
+                .lock()
+                .await
+                .get_project_registration("owner", project_id)?
+                .ok_or_else(|| Error::new("not_allowed", "Run project registration is absent"))?;
+            if registration.id != project_id {
+                return Err(Error::new("source_integrity", "Run project scope changed"));
+            }
+            registration.validate()?;
+            SavedRunPrincipal::ProjectRule { registration }
+        } else if command.principal == "owner" {
+            return Err(Error::new(
+                "unsupported",
+                "global script runs are not supported in this increment",
+            ));
+        } else {
+            return Err(Error::new(
+                "not_allowed",
+                "stored Run principal is unsupported",
+            ));
+        };
+        let guard = self
+            .inner
+            .run_credentials
+            .issue(command.id.clone(), saved_principal.clone())?;
+        Ok((guard, saved_principal))
+    }
     pub(crate) async fn prepare_owner_submission(
         &self,
         request: SubmitCommand,
@@ -1136,6 +1292,7 @@ impl Router {
         let actions = crate::automation::prepare_rule_catch_up_actions(
             self,
             &definition,
+            state.revision,
             &events,
             project.as_ref(),
         )
@@ -1702,10 +1859,51 @@ impl Router {
         prepared: PreparedSubmission,
     ) -> Result<Option<eliot_store::RuleEventAdmission>> {
         let PreparedSubmission { request, workspace } = prepared;
-        if !matches!(request.verb.as_str(), "stop" | "send" | "interrupt") || workspace.is_some() {
+        if workspace.is_some() {
             return Err(Error::new(
                 "invalid",
-                "rule firing must contain one prepared stop, send, or interrupt command",
+                "rule firing cannot contain workspace preparation",
+            ));
+        }
+        if request.verb == "run" {
+            let Some(registration) = project else {
+                return Err(Error::new(
+                    "unsupported",
+                    "global script runs are not supported in this increment",
+                ));
+            };
+            let expected_principal = format!("project:{}", registration.id);
+            if principal != expected_principal {
+                return Err(Error::new(
+                    "not_allowed",
+                    "project Run principal does not match its registration",
+                ));
+            }
+            if !registration.actions.iter().any(|action| action == "run") {
+                return Err(Error::new(
+                    "not_allowed",
+                    "project registration does not approve Run",
+                ));
+            }
+            if !request.id.is_empty()
+                || request.target.is_some()
+                || request.expected_generation.is_some()
+                || request.expected_turn_id.is_some()
+                || request.request_id.is_some()
+                || request.probe
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "project Run must be targetless and unbound",
+                ));
+            }
+            let frozen: eliot_core::FrozenScriptRun = serde_json::from_value(request.args.clone())
+                .map_err(|_| Error::new("invalid", "project Run args are not frozen"))?;
+            frozen.validate()?;
+        } else if !matches!(request.verb.as_str(), "stop" | "send" | "interrupt") {
+            return Err(Error::new(
+                "invalid",
+                "rule firing must contain one prepared stop, send, interrupt, or project Run",
             ));
         }
         let admission = {
@@ -1809,6 +2007,14 @@ impl Router {
         let request: CommandGetRequest = serde_json::from_value(params.clone())
             .map_err(|_| Error::new("invalid", "command.get params are invalid"))?;
         request.validate()?;
+        if let Principal::Run { run_command_id, .. } = principal
+            && request.id.as_str() != run_command_id.as_str()
+        {
+            return Err(Error::new(
+                "not_allowed",
+                "Run credentials are scoped to their own command",
+            ));
+        }
         let id = request.id.as_str();
         let mut command = {
             let store = self.inner.store.lock().await;
@@ -2241,6 +2447,12 @@ impl Router {
                 Principal::Agent { id, .. } => {
                     store.get_agent(id)?.into_iter().collect::<Vec<Agent>>()
                 }
+                Principal::Run { .. } => {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "Run credentials cannot list Agents",
+                    ));
+                }
                 Principal::ProjectRule { .. } => {
                     return Err(Error::new(
                         "not_allowed",
@@ -2276,6 +2488,7 @@ impl Router {
             let next = match principal {
                 Principal::Owner => rows.last().map(|row| row.agent.id.clone()),
                 Principal::Agent { .. } => None,
+                Principal::Run { .. } => None,
                 Principal::ProjectRule { .. } => None,
             };
             return serde_json::to_value(AgentListResponse { agents: rows, next })
@@ -2284,6 +2497,7 @@ impl Router {
         let next = match principal {
             Principal::Owner => agents.last().map(|agent| agent.id.clone()),
             Principal::Agent { .. } => None,
+            Principal::Run { .. } => None,
             Principal::ProjectRule { .. } => None,
         };
         serde_json::to_value(AgentListResponse {
@@ -2687,6 +2901,7 @@ impl Router {
             };
             // Rule admissions serialize their final mode check under this same
             // writer guard, so no firing crosses the drain/force boundary.
+            let _run_workers = self.inner.run_workers.lock_recover();
             self.inner.mode.fetch_max(
                 if mode == ShutdownMode::Force {
                     MODE_FORCE
@@ -2696,6 +2911,9 @@ impl Router {
                 Ordering::SeqCst,
             );
             self.inner.shutdown_ready.store(false, Ordering::SeqCst);
+            if mode == ShutdownMode::Force {
+                self.inner.run_cancellation.send_replace(true);
+            }
             write
         };
         // Decode the retained receipt, never replace it with the newly computed
@@ -2716,6 +2934,94 @@ impl Router {
             .map_err(|_| Error::new("internal", "shutdown result could not be encoded"))
     }
 
+    fn start_run_worker(&self, command: Command) -> RunWorkerStart {
+        let run_id = command.id.clone();
+        let mut workers = self.inner.run_workers.lock_recover();
+        if workers.contains_key(&run_id) {
+            return RunWorkerStart::AlreadyActive;
+        }
+        if self.inner.mode.load(Ordering::SeqCst) == MODE_FORCE {
+            return RunWorkerStart::ForceRequested;
+        }
+
+        let (start_tx, start_rx) = oneshot::channel();
+        let (completed_tx, completed_rx) = watch::channel(false);
+        let worker_id = run_id.clone();
+        let worker_router = self.clone();
+        let registry = Arc::downgrade(&self.inner);
+        let task = tokio::spawn(async move {
+            let mut completion = RunWorkerCompletion {
+                router: registry,
+                run_id: worker_id,
+                completed: completed_tx,
+                finished: false,
+            };
+            if start_rx.await.is_ok() {
+                crate::scripts::execute_dispatched(worker_router, command).await;
+            }
+            completion.finish();
+        });
+        workers.insert(
+            run_id,
+            RunWorkerHandle {
+                task,
+                completed: completed_rx,
+            },
+        );
+        drop(workers);
+        let _ = start_tx.send(());
+        RunWorkerStart::Started
+    }
+
+    async fn wait_run_worker(&self, run_id: &str) {
+        let completed = self
+            .inner
+            .run_workers
+            .lock_recover()
+            .get(run_id)
+            .map(|worker| worker.completed.clone());
+        if let Some(mut completed) = completed {
+            loop {
+                if *completed.borrow_and_update() {
+                    break;
+                }
+                if completed.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+        let worker = self.inner.run_workers.lock_recover().remove(run_id);
+        if let Some(worker) = worker
+            && worker.task.await.is_err()
+        {
+            self.settle_run_worker_unknown(run_id, "script_worker_failed")
+                .await;
+        }
+    }
+
+    async fn settle_run_cancelled_before_start(&self, run_id: &str) {
+        let process = crate::scripts::unobserved_process_result(true);
+        let outcome = json!({
+            "code": "failed",
+            "cause": "script_cancelled_before_start",
+            "process": process,
+        });
+        let _ = self
+            .settle(run_id, CommandState::Failed, Some(outcome))
+            .await;
+    }
+
+    async fn settle_run_worker_unknown(&self, run_id: &str, cause: &str) {
+        let process = crate::scripts::unobserved_process_result(false);
+        let outcome = json!({"code":"unknown", "cause":cause, "process":process});
+        if self
+            .settle(run_id, CommandState::Unknown, Some(outcome))
+            .await
+            .is_none()
+        {
+            self.note_unknown_if_uncertain(run_id, cause).await;
+        }
+    }
     pub(crate) fn schedule_command(&self, id: String, linked_id: Option<String>) {
         tokio::spawn(self.clone().process_command(id, linked_id));
     }
@@ -2733,6 +3039,10 @@ impl Router {
                 _ => return,
             }
         };
+        if command.verb == "run" && !command.principal.starts_with("project:") {
+            self.reject_undispatched(&id, "unsupported").await;
+            return;
+        }
         if let Some(project_id) = command.principal.strip_prefix("project:") {
             let registration = {
                 let store = self.inner.store.lock().await;
@@ -2851,6 +3161,14 @@ impl Router {
                         expected_agent,
                         binding,
                     ),
+                    None if command.verb == "run"
+                        && self.inner.mode.load(Ordering::SeqCst) == MODE_FORCE =>
+                    {
+                        Err(Error::new(
+                            "bad_state",
+                            "force shutdown prevents script dispatch",
+                        ))
+                    }
                     None => store.dispatch(&id, now_ms()),
                 };
                 let result = match dispatched {
@@ -2870,6 +3188,13 @@ impl Router {
                         match receiver.recv().await {
                             Ok(event)
                                 if event.kind.starts_with("provider.")
+                                    || matches!(
+                                        event.kind.as_str(),
+                                        "command.applied"
+                                            | "command.failed"
+                                            | "command.rejected"
+                                            | "command.cancelled"
+                                    )
                                     || (event.agent == target
                                         && event.generation == generation
                                         && (event.kind.starts_with("turn.")
@@ -2910,6 +3235,19 @@ impl Router {
             return;
         }
 
+        if dispatched.verb == "run" {
+            let run_id = dispatched.id.clone();
+            match self.start_run_worker(dispatched) {
+                RunWorkerStart::Started | RunWorkerStart::AlreadyActive => {
+                    self.wait_run_worker(&run_id).await;
+                }
+                RunWorkerStart::ForceRequested => {
+                    self.settle_run_cancelled_before_start(&run_id).await;
+                }
+            }
+            self.signal_progress();
+            return;
+        }
         let target = match dispatched.target.as_deref() {
             Some(target) => target.to_owned(),
             None => return,
@@ -3396,6 +3734,96 @@ impl Router {
         }
     }
 
+    pub(crate) fn run_cancellation_receiver(&self) -> watch::Receiver<bool> {
+        self.inner.run_cancellation.subscribe()
+    }
+
+    pub(crate) fn secret_policy_snapshot(&self) -> Arc<SecretPolicy> {
+        let secrets = self.inner.secrets.lock_recover();
+        Arc::new(SecretPolicy::new(secrets.iter()))
+    }
+    pub(crate) fn script_secret_policy(&self, token: &str) -> Arc<SecretPolicy> {
+        let mut secrets = self.inner.secrets.lock_recover().clone();
+        secrets.insert(token.to_owned());
+        Arc::new(SecretPolicy::new(secrets.iter()))
+    }
+
+    pub(crate) async fn verify_run_registration(
+        &self,
+        registration: &ProjectRegistrationView,
+    ) -> Result<()> {
+        crate::automation::verify_project_registration(&self.inner.data_root, registration).await
+    }
+
+    pub(crate) async fn admit_script_output(
+        &self,
+        run_id: &str,
+        actions: Vec<SubmitCommand>,
+        process: ScriptProcessResult,
+    ) -> Result<eliot_store::ScriptRunAdmission> {
+        let (result, write_faulted) = {
+            let mut store = self.inner.store.lock().await;
+            let result = if self.inner.mode.load(Ordering::SeqCst) == MODE_FORCE {
+                Err(Error::new(
+                    "not_allowed",
+                    "force shutdown prevents script output admission",
+                ))
+            } else {
+                store.admit_script_output(run_id, actions, process, now_ms())
+            };
+            (result, store.is_write_faulted())
+        };
+        match result {
+            Ok(admission) => {
+                self.publish_locked(&admission.events);
+                if admission.is_new {
+                    for child in &admission.children {
+                        if matches!(child.state, CommandState::Accepted | CommandState::Queued) {
+                            self.schedule_command(child.id.clone(), None);
+                        }
+                    }
+                }
+                self.signal_progress();
+                Ok(admission)
+            }
+            Err(error) if write_faulted || error.code == "unknown" => {
+                self.note_unknown_if_uncertain(run_id, "script_output_commit_unknown")
+                    .await;
+                Err(Error::new(
+                    "unknown",
+                    "script output admission outcome is unknown",
+                ))
+            }
+            Err(error) => Err(error),
+        }
+    }
+    pub(crate) async fn prepare_script_output(
+        &self,
+        actions: Vec<SubmitCommand>,
+        saved_principal: &SavedRunPrincipal,
+    ) -> Result<Vec<SubmitCommand>> {
+        let SavedRunPrincipal::ProjectRule { registration } = saved_principal;
+        let current = self
+            .inner
+            .store
+            .lock()
+            .await
+            .get_project_registration("owner", &registration.id)?
+            .ok_or_else(|| Error::new("not_allowed", "Run project registration is absent"))?;
+        if &current != registration {
+            return Err(Error::new(
+                "not_allowed",
+                "project registration changed during script execution",
+            ));
+        }
+        let prepared = self
+            .prepare_project_rule_submissions(actions, registration)
+            .await?;
+        Ok(prepared
+            .into_iter()
+            .map(|submission| submission.request)
+            .collect())
+    }
     fn redact_native_value(&self, value: &mut Value) {
         let secrets = self
             .inner
@@ -3473,7 +3901,7 @@ impl Router {
         let _ = self.settle(id, state, Some(outcome)).await;
     }
 
-    async fn settle(
+    pub(crate) async fn settle(
         &self,
         id: &str,
         state: CommandState,
@@ -3483,10 +3911,9 @@ impl Router {
             let envelope = json!({"command_id": id, "state": state, "outcome": null});
             let overhead = serde_json::to_vec(&envelope)
                 .map_or(usize::MAX, |bytes| bytes.len().saturating_sub(4));
-            crate::redaction::bound_outcome_diagnostics(
-                outcome,
-                MAX_EVENT_BYTES.saturating_sub(overhead),
-            );
+            let outcome_budget = MAX_EVENT_BYTES.saturating_sub(overhead);
+            crate::redaction::bound_outcome_diagnostics(outcome, outcome_budget);
+            eliot_core::bound_script_outcome_stderr(outcome, outcome_budget);
         }
         let persistence_cause = outcome
             .as_ref()
@@ -3593,7 +4020,7 @@ impl Router {
         causes.insert(id.to_owned(), cause.to_owned());
     }
 
-    async fn note_unknown_if_uncertain(&self, id: &str, cause: &str) {
+    pub(crate) async fn note_unknown_if_uncertain(&self, id: &str, cause: &str) {
         let store = self.inner.store.lock().await;
         match store.get_command(id) {
             Ok(Some(command))
@@ -4390,8 +4817,48 @@ fn is_native_control_verb(verb: &str) -> bool {
     )
 }
 
+fn authorize_rpc_method(principal: &Principal, method: &str) -> Result<()> {
+    if matches!(principal, Principal::Run { .. }) && method != "command.get" {
+        return Err(Error::new(
+            "not_allowed",
+            "Run credentials may call only command.get",
+        ));
+    }
+    Ok(())
+}
+
+fn auth_fields_are_exact(auth: &serde_json::Map<String, Value>, kind: &str) -> bool {
+    let fields: &[&str] = match kind {
+        "owner" => &["kind", "credential"],
+        "agent" => &["kind", "agent_id", "generation", "credential"],
+        "run" => &["kind", "run_command_id", "credential"],
+        _ => return false,
+    };
+    auth.len() == fields.len() && fields.iter().all(|field| auth.contains_key(*field))
+}
+
 fn authorize_command(principal: &Principal, request: &mut SubmitCommand) -> Result<()> {
     if let Principal::ProjectRule { registration } = principal {
+        if request.verb == "run" {
+            if !registration.actions.iter().any(|action| action == "run") {
+                return Err(Error::new(
+                    "not_allowed",
+                    "project rule is not approved for run",
+                ));
+            }
+            if request.target.is_some()
+                || request.expected_generation.is_some()
+                || request.expected_turn_id.is_some()
+                || request.request_id.is_some()
+                || request.probe
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "Run command must be targetless and unbound",
+                ));
+            }
+            return Ok(());
+        }
         if !matches!(request.verb.as_str(), "stop" | "send" | "interrupt")
             || !registration
                 .actions
@@ -4410,6 +4877,18 @@ fn authorize_command(principal: &Principal, request: &mut SubmitCommand) -> Resu
             ));
         }
         return Ok(());
+    }
+    if matches!(principal, Principal::Owner) && request.verb == "run" {
+        return Err(Error::new(
+            "unsupported",
+            "global script runs are not supported in this increment",
+        ));
+    }
+    if matches!(principal, Principal::Run { .. }) {
+        return Err(Error::new(
+            "not_allowed",
+            "Run credentials cannot submit commands",
+        ));
     }
     let Principal::Agent { id, generation } = principal else {
         return Ok(());
@@ -4450,6 +4929,14 @@ fn authorize_command_read(principal: &Principal, command: &Command) -> Result<()
             "project rule authority cannot read commands",
         ));
     }
+    if let Principal::Run { run_command_id, .. } = principal
+        && command.id.as_str() != run_command_id.as_str()
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "Run credentials are scoped to their own command",
+        ));
+    }
     if let Principal::Agent { id, generation } = principal
         && (command.target.as_deref() != Some(id.as_str())
             || command
@@ -4463,8 +4950,13 @@ fn authorize_command_read(principal: &Principal, command: &Command) -> Result<()
     }
     Ok(())
 }
-
 fn authorize_agent_read(principal: &Principal, id: &str, generation: Option<i64>) -> Result<()> {
+    if matches!(principal, Principal::Run { .. }) {
+        return Err(Error::new(
+            "not_allowed",
+            "Run credentials cannot read Agents",
+        ));
+    }
     if matches!(principal, Principal::ProjectRule { .. }) {
         return Err(Error::new(
             "not_allowed",
@@ -4501,6 +4993,7 @@ fn principal_name(principal: &Principal) -> String {
         Principal::Owner => "owner".to_owned(),
         Principal::Agent { id, generation } => format!("agent:{id}:{generation}"),
         Principal::ProjectRule { registration } => format!("project:{}", registration.id),
+        Principal::Run { run_command_id, .. } => format!("run:{run_command_id}"),
     }
 }
 
@@ -8427,5 +8920,192 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         assert_eq!(response["high_water"], response["next"]);
         assert_eq!(response["lagged"], json!(false));
         assert_eq!(response["truncated"], json!(false));
+    }
+}
+
+#[cfg(test)]
+mod run_authorization_tests {
+    use super::*;
+
+    fn command(id: &str) -> Command {
+        Command {
+            id: id.to_owned(),
+            principal: "project:sample".to_owned(),
+            method: "command.submit".to_owned(),
+            verb: "run".to_owned(),
+            target: None,
+            expected_generation: None,
+            generation: None,
+            args: json!({}),
+            state: CommandState::Dispatched,
+            turn_id: None,
+            request_id: None,
+            outcome: None,
+            created_at: 0,
+            updated_at: 0,
+            probe: false,
+        }
+    }
+
+    fn run_principal() -> Principal {
+        Principal::Run {
+            run_command_id: "run-1".to_owned(),
+        }
+    }
+
+    #[test]
+    fn run_auth_envelope_requires_exact_run_fields() {
+        let exact = json!({
+            "kind": "run",
+            "run_command_id": "run-1",
+            "credential": "opaque",
+        })
+        .as_object()
+        .expect("object")
+        .clone();
+        assert!(auth_fields_are_exact(&exact, "run"));
+        let mut conflicting = exact;
+        conflicting.insert("agent_id".to_owned(), json!("a1"));
+        assert!(!auth_fields_are_exact(&conflicting, "run"));
+        assert!(!auth_fields_are_exact(&conflicting, "owner"));
+    }
+
+    #[test]
+    fn targetless_run_is_project_only_and_requires_the_run_grant() {
+        let registration = ProjectRegistrationView {
+            id: "sample".to_owned(),
+            checkout: "C:\\work\\sample".to_owned(),
+            repo_common_dir: "C:\\work".to_owned(),
+            profiles: Vec::new(),
+            actions: vec!["run".to_owned()],
+            interpreters: Default::default(),
+            run_env: Vec::new(),
+            revision: 1,
+        };
+        let project = Principal::ProjectRule { registration };
+        let mut request = SubmitCommand::new("", "run");
+        assert!(authorize_command(&project, &mut request).is_ok());
+        request.target = Some("a1".to_owned());
+        assert_eq!(
+            authorize_command(&project, &mut request).unwrap_err().code,
+            "invalid"
+        );
+
+        let mut owner_request = SubmitCommand::new("", "run");
+        assert_eq!(
+            authorize_command(&Principal::Owner, &mut owner_request)
+                .unwrap_err()
+                .code,
+            "unsupported"
+        );
+        let mut run_request = SubmitCommand::new("", "send");
+        assert!(authorize_command(&run_principal(), &mut run_request).is_err());
+    }
+    #[tokio::test]
+    async fn force_joins_active_run_worker_and_rejects_post_force_output() {
+        let store = Arc::new(AsyncMutex::new(
+            eliot_store::Store::open(std::path::Path::new(":memory:")).expect("open test Store"),
+        ));
+        let router = Router::new(
+            PathBuf::from("."),
+            "owner-token".to_owned(),
+            store,
+            Bus::new(8),
+        );
+        let run_id = ulid::Ulid::new().to_string();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (completed_tx, completed_rx) = watch::channel(false);
+        let cleanup_completed = Arc::new(AtomicBool::new(false));
+        let worker_cleanup_completed = Arc::clone(&cleanup_completed);
+        let worker_router = Arc::downgrade(&router.inner);
+        let worker_id = run_id.clone();
+        let task = tokio::spawn(async move {
+            let mut completion = RunWorkerCompletion {
+                router: worker_router,
+                run_id: worker_id,
+                completed: completed_tx,
+                finished: false,
+            };
+            let _ = release_rx.await;
+            worker_cleanup_completed.store(true, Ordering::SeqCst);
+            completion.finish();
+        });
+        router.inner.run_workers.lock_recover().insert(
+            run_id.clone(),
+            RunWorkerHandle {
+                task,
+                completed: completed_rx,
+            },
+        );
+
+        let mut cancellation = router.run_cancellation_receiver();
+        let force_router = router.clone();
+        let mut force = tokio::spawn(async move {
+            force_router.force_owned_processes().await;
+        });
+        timeout_at(
+            Instant::now() + Duration::from_secs(2),
+            cancellation.changed(),
+        )
+        .await
+        .expect("Force requested")
+        .expect("run cancellation channel remains open");
+        assert!(*cancellation.borrow_and_update());
+        assert_eq!(
+            router.start_run_worker(command("run-late")),
+            RunWorkerStart::ForceRequested
+        );
+
+        let before = router
+            .inner
+            .store
+            .lock()
+            .await
+            .high_water()
+            .expect("read pre-admission high-water");
+        let rejected = router
+            .admit_script_output(
+                &run_id,
+                Vec::new(),
+                crate::scripts::unobserved_process_result(false),
+            )
+            .await
+            .expect_err("Force must close script output admission");
+        assert_eq!(rejected.code, "not_allowed");
+        let after = router
+            .inner
+            .store
+            .lock()
+            .await
+            .high_water()
+            .expect("read post-admission high-water");
+        assert_eq!(after, before, "force admitted no script child events");
+        assert!(!cleanup_completed.load(Ordering::SeqCst));
+        assert!(
+            timeout_at(Instant::now() + Duration::from_millis(50), &mut force)
+                .await
+                .is_err(),
+            "Force must wait for the registered Run worker"
+        );
+
+        release_tx.send(()).expect("release Run worker cleanup");
+        timeout_at(Instant::now() + Duration::from_secs(2), &mut force)
+            .await
+            .expect("Force joins the completed Run worker")
+            .expect("Force worker task completes");
+        assert!(cleanup_completed.load(Ordering::SeqCst));
+        assert_eq!(
+            router.start_run_worker(command("run-late")),
+            RunWorkerStart::ForceRequested
+        );
+        assert!(router.inner.run_workers.lock_recover().is_empty());
+    }
+    #[test]
+    fn run_rpc_is_limited_to_own_command_get() {
+        let principal = run_principal();
+        assert!(authorize_rpc_method(&principal, "command.get").is_ok());
+        assert!(authorize_rpc_method(&principal, "command.submit").is_err());
+        assert!(authorize_command_read(&principal, &command("run-1")).is_ok());
+        assert!(authorize_command_read(&principal, &command("run-2")).is_err());
     }
 }

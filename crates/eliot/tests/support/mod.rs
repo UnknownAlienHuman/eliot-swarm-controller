@@ -42,6 +42,7 @@ impl Captured {
         Self::spawn_with_stdout(command, None)
     }
 
+    #[allow(dead_code)] // Used by another integration target; support is compiled per target.
     pub fn spawn_stdout_file(command: Command, path: &Path) -> Self {
         Self::spawn_with_stdout(command, Some(path))
     }
