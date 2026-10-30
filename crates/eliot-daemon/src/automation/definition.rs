@@ -10,7 +10,6 @@ use eliot_core::{
 use globset::{Glob, GlobMatcher};
 use regex::Regex;
 use serde::de::Error as _;
-use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -72,76 +71,35 @@ struct TriggerDefinition {
     compiled_matches: BTreeMap<String, CompiledMatch>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+enum AgentActionDefinition {
+    Stop {
+        target: Value,
+        expected_generation: Value,
+    },
+    Send {
+        target: Value,
+        expected_generation: Value,
+        text: Value,
+    },
+    Interrupt {
+        target: Value,
+        expected_generation: Value,
+        expected_turn_id: Value,
+    },
+    Steer {
+        target: Value,
+        expected_generation: Value,
+        expected_turn_id: Value,
+        text: Value,
+    },
+}
+
 #[derive(Clone, Debug)]
 enum ActionDefinition {
-    Stop {
-        target: Value,
-        expected_generation: Value,
-    },
-    Send {
-        target: Value,
-        expected_generation: Value,
-        text: Value,
-    },
-    Interrupt {
-        target: Value,
-        expected_generation: Value,
-        expected_turn_id: Value,
-    },
-    Run {
-        definition: RunDefinitionArgs,
-    },
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
-enum LegacyActionDefinition {
-    Stop {
-        target: Value,
-        expected_generation: Value,
-    },
-    Send {
-        target: Value,
-        expected_generation: Value,
-        text: Value,
-    },
-    Interrupt {
-        target: Value,
-        expected_generation: Value,
-        expected_turn_id: Value,
-    },
-}
-
-impl From<LegacyActionDefinition> for ActionDefinition {
-    fn from(value: LegacyActionDefinition) -> Self {
-        match value {
-            LegacyActionDefinition::Stop {
-                target,
-                expected_generation,
-            } => Self::Stop {
-                target,
-                expected_generation,
-            },
-            LegacyActionDefinition::Send {
-                target,
-                expected_generation,
-                text,
-            } => Self::Send {
-                target,
-                expected_generation,
-                text,
-            },
-            LegacyActionDefinition::Interrupt {
-                target,
-                expected_generation,
-                expected_turn_id,
-            } => Self::Interrupt {
-                target,
-                expected_generation,
-                expected_turn_id,
-            },
-        }
-    }
+    Agent(AgentActionDefinition),
+    Run { definition: RunDefinitionArgs },
 }
 
 impl<'de> Deserialize<'de> for ActionDefinition {
@@ -165,8 +123,8 @@ impl<'de> Deserialize<'de> for ActionDefinition {
                 serde_json::from_value(Value::Object(fields)).map_err(D::Error::custom)?;
             return Ok(Self::Run { definition });
         }
-        serde_json::from_value::<LegacyActionDefinition>(value)
-            .map(Self::from)
+        serde_json::from_value::<AgentActionDefinition>(value)
+            .map(Self::Agent)
             .map_err(D::Error::custom)
     }
 }
@@ -176,63 +134,22 @@ impl Serialize for ActionDefinition {
     where
         S: serde::Serializer,
     {
-        let field_count = match self {
-            Self::Stop { .. } => 3,
-            Self::Send { .. } | Self::Interrupt { .. } => 4,
-            Self::Run { definition } => {
-                let mut count = 3;
-                if definition.cwd.is_some() {
-                    count += 1;
-                }
-                if definition.timeout.is_some() {
-                    count += 1;
-                }
-                count
-            }
-        };
-        let mut object = serializer.serialize_map(Some(field_count))?;
         match self {
-            Self::Stop {
-                target,
-                expected_generation,
-            } => {
-                object.serialize_entry("action", "stop")?;
-                object.serialize_entry("target", target)?;
-                object.serialize_entry("expected_generation", expected_generation)?;
-            }
-            Self::Send {
-                target,
-                expected_generation,
-                text,
-            } => {
-                object.serialize_entry("action", "send")?;
-                object.serialize_entry("target", target)?;
-                object.serialize_entry("expected_generation", expected_generation)?;
-                object.serialize_entry("text", text)?;
-            }
-            Self::Interrupt {
-                target,
-                expected_generation,
-                expected_turn_id,
-            } => {
-                object.serialize_entry("action", "interrupt")?;
-                object.serialize_entry("target", target)?;
-                object.serialize_entry("expected_generation", expected_generation)?;
-                object.serialize_entry("expected_turn_id", expected_turn_id)?;
-            }
+            Self::Agent(action) => action.serialize(serializer),
             Self::Run { definition } => {
-                object.serialize_entry("action", "run")?;
-                object.serialize_entry("cmd", &definition.cmd)?;
-                if let Some(cwd) = &definition.cwd {
-                    object.serialize_entry("cwd", cwd)?;
-                }
-                if let Some(timeout) = &definition.timeout {
-                    object.serialize_entry("timeout", timeout)?;
-                }
-                object.serialize_entry("env", &definition.env)?;
+                let mut fields =
+                    match serde_json::to_value(definition).map_err(serde::ser::Error::custom)? {
+                        Value::Object(fields) => fields,
+                        _ => {
+                            return Err(serde::ser::Error::custom(
+                                "run definition must serialize as an object",
+                            ));
+                        }
+                    };
+                fields.insert("action".to_owned(), Value::String("run".to_owned()));
+                Value::Object(fields).serialize(serializer)
             }
         }
-        object.end()
     }
 }
 
@@ -272,17 +189,17 @@ impl CompiledMatch {
     }
 }
 
-impl ActionDefinition {
-    fn target(&self) -> Option<&Value> {
+impl AgentActionDefinition {
+    fn target(&self) -> &Value {
         match self {
             Self::Stop { target, .. }
             | Self::Send { target, .. }
-            | Self::Interrupt { target, .. } => Some(target),
-            Self::Run { .. } => None,
+            | Self::Interrupt { target, .. }
+            | Self::Steer { target, .. } => target,
         }
     }
 
-    fn expected_generation(&self) -> Option<&Value> {
+    fn expected_generation(&self) -> &Value {
         match self {
             Self::Stop {
                 expected_generation,
@@ -295,8 +212,30 @@ impl ActionDefinition {
             | Self::Interrupt {
                 expected_generation,
                 ..
-            } => Some(expected_generation),
-            Self::Run { .. } => None,
+            }
+            | Self::Steer {
+                expected_generation,
+                ..
+            } => expected_generation,
+        }
+    }
+
+    fn text(&self) -> Option<&Value> {
+        match self {
+            Self::Send { text, .. } | Self::Steer { text, .. } => Some(text),
+            _ => None,
+        }
+    }
+
+    fn turn_binding(&self) -> Option<(&Value, &'static str)> {
+        match self {
+            Self::Interrupt {
+                expected_turn_id, ..
+            } => Some((expected_turn_id, "interrupt")),
+            Self::Steer {
+                expected_turn_id, ..
+            } => Some((expected_turn_id, "steer")),
+            _ => None,
         }
     }
 
@@ -305,7 +244,7 @@ impl ActionDefinition {
             Self::Stop { .. } => "stop",
             Self::Send { .. } => "send",
             Self::Interrupt { .. } => "interrupt",
-            Self::Run { .. } => "run",
+            Self::Steer { .. } => "steer",
         }
     }
 }
@@ -497,23 +436,20 @@ pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<SubmitCom
         .actions
         .first()
         .ok_or_else(|| Error::new("invalid", "rule has no action"))?;
-    if let ActionDefinition::Run { definition } = action {
-        return submit_run_command(definition).map(Some);
-    }
+    let action = match action {
+        ActionDefinition::Run { definition } => return submit_run_command(definition).map(Some),
+        ActionDefinition::Agent(action) => action,
+    };
     let roots = TemplateRoots {
         event: &event_value,
         subject,
         data: &event.data,
     };
-    let target_source = action
-        .target()
-        .ok_or_else(|| Error::new("invalid", "Agent action target is missing"))?;
+    let target_source = action.target();
     let target = render_agent_target(target_source, &roots)?;
     parse_agent_id(&target)
         .map_err(|_| Error::new("invalid", "action target is not a canonical Agent id"))?;
-    let generation_source = action
-        .expected_generation()
-        .ok_or_else(|| Error::new("invalid", "Agent action generation is missing"))?;
+    let generation_source = action.expected_generation();
     let generation = render_generation(generation_source, &roots)?;
     let generation = generation
         .as_i64()
@@ -533,39 +469,15 @@ pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<SubmitCom
             "rule action must match the event-time Agent and generation",
         ));
     }
-    let (args, expected_turn_id) = match action {
-        ActionDefinition::Stop { .. } => (json!({}), None),
-        ActionDefinition::Send { text, .. } => (json!({"text": render_text(text, &roots)?}), None),
-        ActionDefinition::Interrupt {
-            expected_turn_id, ..
-        } => {
-            let rendered_turn_id = render_exact_string(expected_turn_id, &roots)?;
-            let event_turn_id = event
-                .data
-                .get("turn_id")
-                .and_then(Value::as_str)
-                .filter(|turn_id| !turn_id.trim().is_empty())
-                .ok_or_else(|| {
-                    Error::new(
-                        "invalid",
-                        "interrupt requires event.data.turn_id as a string",
-                    )
-                })?;
-            if rendered_turn_id != event_turn_id {
-                return Err(Error::new(
-                    "invalid",
-                    "interrupt expected_turn_id must match event.data.turn_id",
-                ));
-            }
-            (json!({}), Some(event_turn_id.to_owned()))
-        }
-        ActionDefinition::Run { .. } => {
-            return Err(Error::new(
-                "unsupported",
-                "run action must use targetless command evaluation",
-            ));
-        }
-    };
+    let args = action
+        .text()
+        .map(|text| render_text(text, &roots))
+        .transpose()?
+        .map_or_else(|| json!({}), |text| json!({"text": text}));
+    let expected_turn_id = action
+        .turn_binding()
+        .map(|(source, verb)| render_event_turn_id(source, &roots, event, verb))
+        .transpose()?;
 
     Ok(Some(submit_command(
         action.verb(),
@@ -574,6 +486,33 @@ pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<SubmitCom
         args,
         expected_turn_id,
     )))
+}
+
+fn render_event_turn_id(
+    source: &Value,
+    roots: &TemplateRoots<'_>,
+    event: &Event,
+    verb: &str,
+) -> Result<String, Error> {
+    let rendered_turn_id = render_exact_string(source, roots)?;
+    let event_turn_id = event
+        .data
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .filter(|turn_id| !turn_id.trim().is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                "invalid",
+                format!("{verb} requires event.data.turn_id as a string"),
+            )
+        })?;
+    if rendered_turn_id != event_turn_id {
+        return Err(Error::new(
+            "invalid",
+            format!("{verb} expected_turn_id must match event.data.turn_id"),
+        ));
+    }
+    Ok(event_turn_id.to_owned())
 }
 
 fn submit_run_command(definition: &RunDefinitionArgs) -> Result<SubmitCommand, Error> {
@@ -626,7 +565,7 @@ fn reject_unimplemented_options(raw: &toml::Value) -> Result<(), Error> {
                         .and_then(|action| action.get("action"))
                         .and_then(toml::Value::as_str)
                         .is_some_and(|action| {
-                            !matches!(action, "stop" | "send" | "interrupt" | "run")
+                            !matches!(action, "stop" | "send" | "interrupt" | "steer" | "run")
                         })
                 })
             });
@@ -770,18 +709,16 @@ fn is_match_scalar(value: &Value) -> bool {
 }
 
 fn validate_event_action(action: &ActionDefinition) -> Result<(), Error> {
-    if let ActionDefinition::Run { definition } = action {
-        return definition.validate();
-    }
+    let action = match action {
+        ActionDefinition::Run { definition } => return definition.validate(),
+        ActionDefinition::Agent(action) => action,
+    };
     let target = action
         .target()
-        .and_then(Value::as_str)
+        .as_str()
         .ok_or_else(|| Error::new("invalid", "Agent action requires a string target"))?;
     validate_template(target, true)?;
-    match action
-        .expected_generation()
-        .ok_or_else(|| Error::new("invalid", "Agent action generation is missing"))?
-    {
+    match action.expected_generation() {
         Value::String(value) => {
             let parts = parse_template(value)?;
             if !is_whole_template(&parts) {
@@ -799,21 +736,21 @@ fn validate_event_action(action: &ActionDefinition) -> Result<(), Error> {
             ));
         }
     }
-    if let ActionDefinition::Send { text, .. } = action {
+    if let Some(text) = action.text() {
         validate_text_template(text, true)?;
     }
-    if let ActionDefinition::Interrupt {
-        expected_turn_id, ..
-    } = action
-    {
-        let source = expected_turn_id
-            .as_str()
-            .ok_or_else(|| Error::new("invalid", "interrupt expected_turn_id must be a string"))?;
+    if let Some((expected_turn_id, verb)) = action.turn_binding() {
+        let source = expected_turn_id.as_str().ok_or_else(|| {
+            Error::new(
+                "invalid",
+                format!("{verb} expected_turn_id must be a string"),
+            )
+        })?;
         let parts = parse_template(source)?;
         if source.trim().is_empty() || (has_templates(&parts) && !is_whole_template(&parts)) {
             return Err(Error::new(
                 "invalid",
-                "interrupt expected_turn_id must be a literal or whole-value template",
+                format!("{verb} expected_turn_id must be a literal or whole-value template"),
             ));
         }
     }
@@ -825,13 +762,16 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
         .actions
         .first()
         .ok_or_else(|| Error::new("invalid", "rule has no action"))?;
-    let (target_value, generation_value, args) = match action {
+    let action = match action {
         ActionDefinition::Run { definition } => return submit_run_command(definition),
-        ActionDefinition::Stop {
+        ActionDefinition::Agent(action) => action,
+    };
+    let (target_value, generation_value, args) = match action {
+        AgentActionDefinition::Stop {
             target,
             expected_generation,
         } => (target, expected_generation, json!({})),
-        ActionDefinition::Send {
+        AgentActionDefinition::Send {
             target,
             expected_generation,
             text,
@@ -843,10 +783,16 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
                 json!({"text": text.as_str().expect("validated send text")}),
             )
         }
-        ActionDefinition::Interrupt { .. } => {
+        AgentActionDefinition::Interrupt { .. } => {
             return Err(Error::new(
                 "unsupported",
                 "interrupt actions require an event trigger",
+            ));
+        }
+        AgentActionDefinition::Steer { .. } => {
+            return Err(Error::new(
+                "unsupported",
+                "steer actions require an event trigger",
             ));
         }
     };
@@ -1244,6 +1190,13 @@ on = { event = 'turn.started' }
 do = [{ action = 'interrupt', target = '${event.agent}', expected_generation = '${event.generation}', expected_turn_id = '${event.data.turn_id}' }]
 "#;
 
+    const STEER_RULE: &str = r#"
+[[rule]]
+id = 'steer-on-turn-start'
+on = { event = 'turn.started' }
+do = [{ action = 'steer', target = '${event.agent}', expected_generation = '${event.generation}', expected_turn_id = '${event.data.turn_id}', text = 'Steer: ${data.status}' }]
+"#;
+
     const PROJECT_RUN_RULE: &str = r#"
 [[rule]]
 id = 'run-on-result'
@@ -1420,6 +1373,16 @@ do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${eve
         );
         command.validate().unwrap();
 
+        assert_eq!(
+            serde_json::to_value(&rule).unwrap()["do"][0],
+            json!({
+                "action": "run",
+                "cmd": ["pwsh", ".eliot/scripts/check.ps1", "-Changed"],
+                "cwd": ".",
+                "timeout": "10m",
+                "env": {"CI": "true"}
+            })
+        );
         let saved = serde_json::to_string(&rule).unwrap();
         let restored = RuleDefinition::deserialize_saved(&saved).unwrap();
         assert_eq!(
@@ -1639,12 +1602,74 @@ do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${eve
     }
 
     #[test]
+    fn steer_binds_event_turn_and_renders_frozen_text() {
+        let rule = load(Cursor::new(STEER_RULE)).unwrap().remove(0);
+        let mut event = event();
+        event.kind = "turn.started".to_owned();
+        let command = evaluate(&rule, &event).unwrap().unwrap();
+
+        assert_eq!(command.verb, "steer");
+        assert_eq!(command.target.as_deref(), Some("a7"));
+        assert_eq!(command.expected_generation, Some(3));
+        assert_eq!(command.expected_turn_id.as_deref(), Some("turn-id"));
+        assert_eq!(command.args, json!({"text":"Steer: completed"}));
+
+        assert_eq!(
+            serde_json::to_value(&rule).unwrap()["do"][0],
+            json!({
+                "action": "steer",
+                "target": "${event.agent}",
+                "expected_generation": "${event.generation}",
+                "expected_turn_id": "${event.data.turn_id}",
+                "text": "Steer: ${data.status}"
+            })
+        );
+        let saved = serde_json::to_string(&rule).unwrap();
+        let restored = RuleDefinition::deserialize_saved(&saved).unwrap();
+        assert_eq!(
+            restored.semantic_digest().unwrap(),
+            rule.semantic_digest().unwrap()
+        );
+    }
+
+    #[test]
+    fn steer_rejects_a_turn_id_different_from_the_captured_event() {
+        let source = STEER_RULE.replace(
+            "expected_turn_id = '${event.data.turn_id}'",
+            "expected_turn_id = '${event.data.other_turn}'",
+        );
+        let rule = load(Cursor::new(source)).unwrap().remove(0);
+        let mut event = event();
+        event.kind = "turn.started".to_owned();
+        event.data["other_turn"] = json!("stale-turn");
+
+        let error = evaluate(&rule, &event).unwrap_err();
+        assert_eq!(error.code, "invalid");
+        assert_eq!(
+            error.message,
+            "steer expected_turn_id must match event.data.turn_id"
+        );
+    }
+
+    #[test]
     fn interrupt_action_is_unsupported_for_timers() {
         let timer = INTERVAL_TIMER.replace(
             "action = 'stop'",
             "action = 'interrupt', expected_turn_id = '${event.data.turn_id}'",
         );
         assert_eq!(load(Cursor::new(timer)).unwrap_err().code, "unsupported");
+    }
+
+    #[test]
+    fn steer_action_is_unsupported_for_timers() {
+        let timer_steer = INTERVAL_TIMER.replace(
+            "action = 'stop', target = 'a7', expected_generation = 3",
+            "action = 'steer', target = 'a7', expected_generation = 3, expected_turn_id = 'turn-id', text = 'continue'",
+        );
+        assert_eq!(
+            load(Cursor::new(timer_steer)).unwrap_err().code,
+            "unsupported"
+        );
     }
 
     #[test]

@@ -1173,6 +1173,63 @@ fn project_fake_interrupt_requires_explicit_action_approval() {
 }
 
 #[test]
+fn project_fake_steer_requires_explicit_approval_and_keeps_exact_turn_binding() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let project = "project-fake-steer-approval";
+    let principal = format!("project:{project}");
+    let agent = ready_agent(&mut store, project, now);
+    let turn_id = start_fake_turn(&mut store, &agent, now + 1);
+    let checkout = format!("/synthetic/{project}");
+    let mut registration = ProjectRegistrationInput {
+        id: project.to_owned(),
+        checkout: checkout.clone(),
+        repo_common_dir: format!("{checkout}/.git"),
+        profiles: vec!["fake".to_owned()],
+        actions: vec!["send".to_owned()],
+        interpreters: BTreeMap::new(),
+        run_env: Vec::new(),
+    };
+    store
+        .upsert_project_registration("owner", &registration, now + 2)
+        .expect("register project without STEER approval");
+
+    let mut denied = SubmitCommand::new(Ulid::new().to_string(), "steer");
+    denied.target = Some(agent.clone());
+    denied.args = json!({"text":"project steer"});
+    denied.expected_generation = Some(1);
+    denied.expected_turn_id = Some(turn_id.clone());
+    let denied_id = denied.id.clone();
+    let high_water_before_denial = store.high_water().unwrap();
+    assert_eq!(
+        store.submit(&principal, denied, now + 3).unwrap_err().code,
+        "not_allowed"
+    );
+    assert!(store.get_command(&denied_id).unwrap().is_none());
+    assert_eq!(store.high_water().unwrap(), high_water_before_denial);
+
+    registration.actions.push("steer".to_owned());
+    store
+        .upsert_project_registration("owner", &registration, now + 4)
+        .expect("approve project STEER explicitly");
+    let mut approved = SubmitCommand::new(Ulid::new().to_string(), "steer");
+    approved.target = Some(agent.clone());
+    approved.args = json!({"text":"project steer"});
+    approved.expected_generation = Some(1);
+    approved.expected_turn_id = Some(turn_id.clone());
+    let approved_id = approved.id.clone();
+    let admission = store
+        .submit(&principal, approved, now + 5)
+        .expect("admit project STEER with its approved exact turn");
+    assert_eq!(admission.command.turn_id.as_deref(), Some(turn_id.as_str()));
+    assert_eq!(admission.command.args, json!({"text":"project steer"}));
+    assert_eq!(
+        store.dispatch(&approved_id, now + 6).unwrap().value.state,
+        CommandState::Dispatched
+    );
+}
+
+#[test]
 fn fake_interrupt_admits_and_dispatches_only_for_its_exact_active_turn() {
     let mut store = Store::open(Path::new(":memory:")).expect("open Store");
     let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
@@ -1192,6 +1249,63 @@ fn fake_interrupt_admits_and_dispatches_only_for_its_exact_active_turn() {
         store.dispatch(&interrupt_id, now + 5).unwrap().value.state,
         CommandState::Dispatched
     );
+}
+
+#[test]
+fn fake_steer_admits_and_dispatches_exact_turn_text_without_retargeting() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let agent = ready_agent(&mut store, "fake-steer-current-turn", now);
+    let turn_id = start_fake_turn(&mut store, &agent, now + 1);
+
+    let mut steer = SubmitCommand::new(Ulid::new().to_string(), "steer");
+    steer.target = Some(agent.clone());
+    steer.args = json!({"text":"continue this turn"});
+    steer.expected_generation = Some(1);
+    steer.expected_turn_id = Some(turn_id.clone());
+    let steer_id = steer.id.clone();
+    let admitted = store
+        .submit("owner", steer, now + 4)
+        .expect("Fake supports exact-turn STEER");
+    assert_eq!(admitted.command.verb, "steer");
+    assert_eq!(admitted.command.target.as_deref(), Some(agent.as_str()));
+    assert_eq!(admitted.command.generation, Some(1));
+    assert_eq!(admitted.command.turn_id.as_deref(), Some(turn_id.as_str()));
+    assert_eq!(admitted.command.args, json!({"text":"continue this turn"}));
+    assert_eq!(
+        store.dispatch(&steer_id, now + 5).unwrap().value.state,
+        CommandState::Dispatched
+    );
+
+    let mut stale_turn = SubmitCommand::new(Ulid::new().to_string(), "steer");
+    stale_turn.target = Some(agent.clone());
+    stale_turn.args = json!({"text":"must not retarget"});
+    stale_turn.expected_generation = Some(1);
+    stale_turn.expected_turn_id = Some("fake-turn-old".to_owned());
+    let stale_turn_id = stale_turn.id.clone();
+    let high_water = store.high_water().unwrap();
+    assert_eq!(
+        store.submit("owner", stale_turn, now + 6).unwrap_err().code,
+        "stale_generation"
+    );
+    assert!(store.get_command(&stale_turn_id).unwrap().is_none());
+    assert_eq!(store.high_water().unwrap(), high_water);
+
+    let mut stale_generation = SubmitCommand::new(Ulid::new().to_string(), "steer");
+    stale_generation.target = Some(agent.clone());
+    stale_generation.args = json!({"text":"must not retarget"});
+    stale_generation.expected_generation = Some(2);
+    stale_generation.expected_turn_id = Some(turn_id.clone());
+    let stale_generation_id = stale_generation.id.clone();
+    assert_eq!(
+        store
+            .submit("owner", stale_generation, now + 7)
+            .unwrap_err()
+            .code,
+        "stale_generation"
+    );
+    assert!(store.get_command(&stale_generation_id).unwrap().is_none());
+    assert_eq!(store.high_water().unwrap(), high_water);
 }
 
 #[test]
@@ -1232,14 +1346,10 @@ fn fake_interrupt_rejects_stale_bindings_and_keeps_other_controls_unsupported() 
     assert!(store.get_command(&stale_generation_id).unwrap().is_none());
     assert_eq!(store.high_water().unwrap(), before_stale_generation);
 
-    for verb in ["steer", "approve", "deny", "answer"] {
+    for verb in ["approve", "deny", "answer"] {
         let mut request = SubmitCommand::new(Ulid::new().to_string(), verb);
         request.target = Some(agent.clone());
-        request.args = if verb == "steer" {
-            json!({"text":"unsupported Fake steer"})
-        } else {
-            json!({})
-        };
+        request.args = json!({});
         request.expected_generation = Some(1);
         request.expected_turn_id = Some(turn_id.clone());
         let command_id = request.id.clone();

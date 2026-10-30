@@ -2053,10 +2053,13 @@ impl Router {
                     ));
                 }
             }
-        } else if !matches!(request.verb.as_str(), "stop" | "send" | "interrupt") {
+        } else if !matches!(
+            request.verb.as_str(),
+            "stop" | "send" | "steer" | "interrupt"
+        ) {
             return Err(Error::new(
                 "invalid",
-                "rule firing must contain one prepared stop, send, interrupt, or project Run",
+                "rule firing must contain one prepared stop, send, steer, interrupt, or project Run",
             ));
         }
         let admission = {
@@ -3269,7 +3272,10 @@ impl Router {
                 self.reject_undispatched(&id, &error.code).await;
                 return;
             }
-            if matches!(command.verb.as_str(), "stop" | "send" | "interrupt") {
+            if matches!(
+                command.verb.as_str(),
+                "stop" | "send" | "steer" | "interrupt"
+            ) {
                 let (Some(target), Some(generation)) =
                     (command.target.as_deref(), command.generation)
                 else {
@@ -5097,11 +5103,13 @@ fn authorize_command(principal: &Principal, request: &mut SubmitCommand) -> Resu
             }
             return Ok(());
         }
-        if !matches!(request.verb.as_str(), "stop" | "send" | "interrupt")
-            || !registration
-                .actions
-                .iter()
-                .any(|action| action == &request.verb)
+        if !matches!(
+            request.verb.as_str(),
+            "stop" | "send" | "steer" | "interrupt"
+        ) || !registration
+            .actions
+            .iter()
+            .any(|action| action == &request.verb)
         {
             return Err(Error::new(
                 "not_allowed",
@@ -8520,6 +8528,202 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 .unwrap()
                 .state,
             CommandState::Applied
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_event_rule_steer_admits_the_exact_trigger_turn() {
+        let router = router();
+        let rule_id = "owner-steer-exact-turn";
+        let definition = json!({
+            "id":rule_id,
+            "enabled":true,
+            "on":{"event":"turn.started"},
+            "do":[{"action":"steer", "target":"a1",
+                "expected_generation":1, "expected_turn_id":"turn-1", "text":"follow-up"}],
+        });
+        let input = eliot_store::RuleDefinitionInput {
+            id: rule_id.to_owned(),
+            canonical_definition: serde_json::to_string(&definition).unwrap(),
+            definition_digest: eliot_core::canonical_json_sha256(&definition).unwrap(),
+            enabled: true,
+        };
+
+        let (agent, state, trigger_id) = {
+            let mut store = router.inner.store.lock().await;
+            let state = store.ensure_rule_state("owner", &input, now_ms()).unwrap();
+            let (agent, trigger_id) = result_fixture(&mut store);
+            (agent, state, trigger_id)
+        };
+        let event = {
+            let store = router.inner.store.lock().await;
+            store
+                .read_events(0, 1_000, None)
+                .unwrap()
+                .into_iter()
+                .find(|event| {
+                    event.kind == "turn.started"
+                        && event.data.get("command_id").and_then(Value::as_str)
+                            == Some(trigger_id.as_str())
+                })
+                .expect("exact started-turn event")
+        };
+        let turn_id = event.data["turn_id"].as_str().unwrap().to_owned();
+        let mut action = SubmitCommand::new(String::new(), "steer");
+        action.target = event.agent.clone();
+        action.args = json!({"text":"follow-up"});
+        action.expected_generation = event.generation;
+        action.expected_turn_id = Some(turn_id.clone());
+
+        let prepared = router.prepare_owner_submission(action).await.unwrap();
+        let mut committed = router.subscribe_rule_events();
+        let admission = router
+            .admit_rule_action("owner", None, &state, event.seq, prepared)
+            .await
+            .unwrap()
+            .expect("Owner event STEER is admitted");
+        assert!(admission.is_new);
+        let parent = admission.parent.expect("retained rule parent");
+        let child = admission.child.expect("admitted STEER child");
+        assert_eq!(child.verb, "steer");
+        assert_eq!(child.target.as_deref(), Some(agent.as_str()));
+        assert_eq!(child.generation, Some(1));
+        assert_eq!(child.args, json!({"text":"follow-up"}));
+        assert_eq!(
+            parent.outcome.as_ref().unwrap()["children"],
+            json!([child.id])
+        );
+        assert_eq!(
+            router
+                .inner
+                .store
+                .lock()
+                .await
+                .get_command(&child.id)
+                .unwrap()
+                .unwrap()
+                .generation,
+            Some(1)
+        );
+        assert_eq!(turn_id, "turn-1");
+    }
+
+    #[test]
+    fn project_rule_steer_requires_an_explicit_grant_and_keeps_its_fences() {
+        let checkout = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let registration = eliot_core::api::ProjectRegistrationView {
+            id: "steer-project".to_owned(),
+            checkout: checkout.clone(),
+            repo_common_dir: checkout,
+            profiles: vec!["fake".to_owned()],
+            actions: vec!["steer".to_owned()],
+            interpreters: std::collections::BTreeMap::new(),
+            run_env: Vec::new(),
+            revision: 1,
+        };
+        let mut request = SubmitCommand::new(String::new(), "steer");
+        request.target = Some("a1".to_owned());
+        request.args = json!({"text":"follow-up"});
+        request.expected_generation = Some(7);
+        request.expected_turn_id = Some("turn-captured".to_owned());
+
+        authorize_command(
+            &Principal::ProjectRule {
+                registration: registration.clone(),
+            },
+            &mut request,
+        )
+        .expect("explicit project STEER grant");
+        assert_eq!(request.target.as_deref(), Some("a1"));
+        assert_eq!(request.expected_generation, Some(7));
+        assert_eq!(request.expected_turn_id.as_deref(), Some("turn-captured"));
+
+        let mut revoked = registration;
+        revoked.actions = vec!["send".to_owned()];
+        let error = authorize_command(
+            &Principal::ProjectRule {
+                registration: revoked,
+            },
+            &mut request,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "not_allowed");
+    }
+
+    #[tokio::test]
+    async fn project_rule_steer_rejects_a_stale_registration_before_admission() {
+        let router = router();
+        let project_id = "steer-race";
+        let checkout = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let current = {
+            let mut store = router.inner.store.lock().await;
+            store
+                .upsert_project_registration(
+                    "owner",
+                    &eliot_store::ProjectRegistrationInput {
+                        id: project_id.to_owned(),
+                        checkout: checkout.clone(),
+                        repo_common_dir: checkout,
+                        profiles: vec!["fake".to_owned()],
+                        actions: vec!["send".to_owned()],
+                        interpreters: std::collections::BTreeMap::new(),
+                        run_env: Vec::new(),
+                    },
+                    now_ms(),
+                )
+                .unwrap()
+                .value
+        };
+        let mut captured = current;
+        captured.actions = vec!["steer".to_owned()];
+        let state = eliot_core::api::RuleStateView {
+            id: "steer-race-rule".to_owned(),
+            project: Some(project_id.to_owned()),
+            revision: 1,
+            current_cursor: 0,
+            retiring_revision: None,
+            retiring_cursor: None,
+            retire_through: None,
+            enabled: true,
+            paused_reason: None,
+        };
+        let mut action = SubmitCommand::new(String::new(), "steer");
+        action.target = Some("a1".to_owned());
+        action.args = json!({"text":"follow-up"});
+        action.expected_generation = Some(1);
+        action.expected_turn_id = Some("turn-captured".to_owned());
+        authorize_command(
+            &Principal::ProjectRule {
+                registration: captured.clone(),
+            },
+            &mut action,
+        )
+        .expect("captured project snapshot grants STEER");
+
+        let before = router.inner.store.lock().await.high_water().unwrap();
+        let error = router
+            .admit_rule_action(
+                &format!("project:{project_id}"),
+                Some(&captured),
+                &state,
+                1,
+                PreparedSubmission {
+                    request: action,
+                    workspace: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "not_allowed");
+        assert_eq!(
+            router.inner.store.lock().await.high_water().unwrap(),
+            before
         );
     }
 

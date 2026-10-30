@@ -336,7 +336,7 @@ pub(crate) fn load_project_registration_config(
             offset,
             id,
             "actions",
-            |action| matches!(action, "stop" | "send" | "interrupt" | "run"),
+            |action| matches!(action, "stop" | "send" | "steer" | "interrupt" | "run"),
         )?;
         let run_grant = normalize_run_grant(
             &entry.interpreters,
@@ -540,7 +540,7 @@ fn normalize_project_allowlist(
                 offset,
                 &format!("projects.{project_id}.{field}"),
                 if field == "actions" {
-                    "only implemented stop, send, interrupt and run actions may be approved"
+                    "only implemented stop, send, steer, interrupt and run actions may be approved"
                 } else {
                     "must name an existing global profile"
                 },
@@ -1426,6 +1426,25 @@ mod tests {
                 run_env: Vec::new(),
             }]
         );
+    }
+
+    #[test]
+    fn project_steer_is_an_explicit_action_allowlist_grant() {
+        let fixture = AutomationConfigFixture::new();
+        let project_path = format!("{:?}", fixture.root.to_string_lossy());
+        fixture.write(&format!(
+            "[projects.sample]\npath = {project_path}\nprofiles = ['fake']\nactions = ['steer']\n"
+        ));
+
+        let configured = load_project_registration_config(&fixture.root).unwrap();
+        assert_eq!(configured.len(), 1);
+        assert_eq!(configured[0].actions, vec!["steer"]);
+
+        fixture.write(&format!(
+            "[projects.sample]\npath = {project_path}\nprofiles = ['fake']\nactions = ['send']\n"
+        ));
+        let without_steer = load_project_registration_config(&fixture.root).unwrap();
+        assert_eq!(without_steer[0].actions, vec!["send"]);
     }
 
     #[test]
