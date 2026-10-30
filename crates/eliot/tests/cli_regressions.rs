@@ -7028,7 +7028,7 @@ fn cli_event_rule_steers_exact_held_turn_in_global_and_project_scopes() {
         assert_eq!(firing["data"]["revision"], rule_state.revision);
         match project_id {
             Some(project_id) => assert_eq!(firing["data"]["project"], project_id),
-            None => assert!(firing["data"].get("project").map_or(true, Value::is_null)),
+            None => assert!(firing["data"].get("project").is_none_or(Value::is_null)),
         }
 
         let parent_id = firing["data"]["parent_command"]
