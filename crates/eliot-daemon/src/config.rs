@@ -15,7 +15,7 @@
 use eliot_core as core;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::Read;
 use std::path::Path;
@@ -61,6 +61,8 @@ pub(crate) struct ProjectRegistrationConfig {
     pub path: String,
     pub profiles: Vec<String>,
     pub actions: Vec<String>,
+    pub interpreters: BTreeMap<String, core::api::ScriptInterpreter>,
+    pub run_env: Vec<String>,
 }
 
 #[cfg(test)]
@@ -228,6 +230,10 @@ struct ProjectEntry {
     profiles: Vec<String>,
     #[serde(default)]
     actions: Vec<String>,
+    #[serde(default)]
+    interpreters: BTreeMap<String, core::api::ScriptInterpreter>,
+    #[serde(default)]
+    run_env: Vec<String>,
 }
 
 /// Read only owner-configured project registrations. Paths and Git identity are
@@ -259,6 +265,14 @@ pub(crate) fn load_project_registration_config(
         .keys()
         .map(String::as_str)
         .chain(std::iter::once(FAKE_PROFILE))
+        .collect();
+    let route_credential_env_names: Vec<String> = config
+        .proxies
+        .values()
+        .filter_map(|proxy| proxy.get_ref().api_key_env.as_deref())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
         .collect();
     let mut projects = Vec::with_capacity(config.projects.len());
     for (id, spanned) in &config.projects {
@@ -303,7 +317,16 @@ pub(crate) fn load_project_registration_config(
             offset,
             id,
             "actions",
-            |action| matches!(action, "stop" | "send" | "interrupt"),
+            |action| matches!(action, "stop" | "send" | "interrupt" | "run"),
+        )?;
+        let interpreters =
+            normalize_project_interpreters(&entry.interpreters, &source, offset, id)?;
+        let run_env = normalize_project_run_env(
+            &entry.run_env,
+            &route_credential_env_names,
+            &source,
+            offset,
+            id,
         )?;
 
         projects.push(ProjectRegistrationConfig {
@@ -311,10 +334,151 @@ pub(crate) fn load_project_registration_config(
             path: path.to_owned(),
             profiles,
             actions,
+            interpreters,
+            run_env,
         });
     }
     projects.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(projects)
+}
+
+fn normalize_project_interpreters(
+    interpreters: &BTreeMap<String, core::api::ScriptInterpreter>,
+    source: &str,
+    offset: usize,
+    project_id: &str,
+) -> core::Result<BTreeMap<String, core::api::ScriptInterpreter>> {
+    let mut normalized = BTreeMap::new();
+    for (reference, interpreter) in interpreters {
+        let field = format!("projects.{project_id}.interpreters.{reference}");
+        if validate_profile_name(reference).is_err() {
+            return Err(config_error_at(
+                source,
+                offset,
+                &field,
+                "interpreter reference must use letters, digits, hyphen and underscore",
+                "profile_error",
+            ));
+        }
+        interpreter.validate().map_err(|_| {
+            config_error_at(
+                source,
+                offset,
+                &field,
+                "must specify an absolute program path and a NUL-free argv_prefix",
+                "profile_error",
+            )
+        })?;
+        normalized.insert(reference.clone(), interpreter.clone());
+    }
+    Ok(normalized)
+}
+
+fn normalize_project_run_env(
+    names: &[String],
+    route_credential_env_names: &[String],
+    source: &str,
+    offset: usize,
+    project_id: &str,
+) -> core::Result<Vec<String>> {
+    let field = format!("projects.{project_id}.run_env");
+    if names.len() > MAX_PASS_ENV_ENTRIES {
+        return Err(config_error_at(
+            source,
+            offset,
+            &field,
+            "exceeds 64 entries",
+            "profile_error",
+        ));
+    }
+
+    let mut normalized = Vec::with_capacity(names.len());
+    let mut seen = HashSet::with_capacity(names.len());
+    for raw in names {
+        let name = raw.trim();
+        if !valid_environment_name(name) {
+            return Err(config_error_at(
+                source,
+                offset,
+                &field,
+                "names must use 1-256 letters, digits and underscores, starting with a letter or underscore",
+                "profile_error",
+            ));
+        }
+        if forbidden_project_run_env_name(name, route_credential_env_names) {
+            return Err(config_error_at(
+                source,
+                offset,
+                &field,
+                "cannot include identity, credential, route, native-store, Git or reserved environment names",
+                "profile_error",
+            ));
+        }
+        let key = if cfg!(windows) {
+            name.to_ascii_uppercase()
+        } else {
+            name.to_owned()
+        };
+        if !seen.insert(key) {
+            return Err(config_error_at(
+                source,
+                offset,
+                &field,
+                "contains a duplicate environment name",
+                "profile_error",
+            ));
+        }
+        normalized.push(name.to_owned());
+    }
+    normalized.sort();
+    Ok(normalized)
+}
+
+fn forbidden_project_run_env_name(name: &str, route_credential_env_names: &[String]) -> bool {
+    let uppercase = name.to_ascii_uppercase();
+    uppercase.starts_with("ELIOT_")
+        || uppercase.starts_with("GIT_")
+        || env_names_equal(name, "PATH")
+        || native_store_selector(name).is_some()
+        || route_credential_env_names
+            .iter()
+            .any(|credential| env_names_equal(name, credential))
+        || uppercase.split('_').any(|part| {
+            matches!(
+                part,
+                "ROLE" | "TOKEN" | "CREDENTIAL" | "CREDENTIALS" | "PASSWORD" | "SECRET" | "AUTH"
+            )
+        })
+        || [
+            "_API_KEY",
+            "_ACCESS_KEY",
+            "_PRIVATE_KEY",
+            "_BASE_URL",
+            "_ENDPOINT",
+            "_ROUTE",
+            "_ACCOUNT",
+        ]
+        .iter()
+        .any(|suffix| uppercase.ends_with(suffix))
+}
+
+fn env_names_equal(left: &str, right: &str) -> bool {
+    if cfg!(windows) {
+        left.eq_ignore_ascii_case(right)
+    } else {
+        left == right
+    }
+}
+
+fn valid_environment_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > MAX_ENV_NAME_LEN {
+        return false;
+    }
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|character| character.is_ascii_alphabetic() || character == '_')
+        && chars.all(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
 fn normalize_project_allowlist(
@@ -335,7 +499,7 @@ fn normalize_project_allowlist(
                 offset,
                 &format!("projects.{project_id}.{field}"),
                 if field == "actions" {
-                    "only implemented stop, send and interrupt actions may be approved"
+                    "only implemented stop, send, interrupt and run actions may be approved"
                 } else {
                     "must name an existing global profile"
                 },
@@ -912,28 +1076,13 @@ fn validate_pass_env(
     let mut out = Vec::with_capacity(names.len());
     for raw in names {
         let name = raw.trim();
-        if name.is_empty() || name.len() > MAX_ENV_NAME_LEN {
+        if !valid_environment_name(name) {
             return Err(profile_field_error(
                 source,
                 offset,
                 profile,
                 "pass_env",
                 "names must be 1-256 characters",
-                "profile_error",
-            ));
-        }
-        let mut chars = name.chars();
-        let first_ok = chars
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
-        let rest_ok = chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
-        if !first_ok || !rest_ok {
-            return Err(profile_field_error(
-                source,
-                offset,
-                profile,
-                "pass_env",
-                "names must use letters, digits and underscore",
                 "profile_error",
             ));
         }
@@ -1228,7 +1377,89 @@ mod tests {
                 path: fixture.root.to_string_lossy().into_owned(),
                 profiles: vec!["fake".to_owned()],
                 actions: vec!["stop".to_owned()],
+                interpreters: BTreeMap::new(),
+                run_env: Vec::new(),
             }]
+        );
+    }
+
+    #[test]
+    fn project_run_configuration_uses_owner_approved_interpreters_and_safe_env() {
+        let fixture = AutomationConfigFixture::new();
+        let project_path = fixture.root.to_string_lossy();
+        let program = std::env::current_exe()
+            .expect("current executable path")
+            .to_string_lossy()
+            .into_owned();
+        fixture.write(&format!(
+            "[projects.sample]\npath = {project_path:?}\nactions = [\"run\"]\n\
+             run_env = [\"CI\", \"BUILD_ID\"]\n\
+             [projects.sample.interpreters.pwsh]\nprogram = {program:?}\n\
+             argv_prefix = [\"-NoProfile\"]\n"
+        ));
+
+        let configured = load_project_registration_config(&fixture.root)
+            .expect("load owner-approved project run configuration");
+        assert_eq!(configured.len(), 1);
+        assert_eq!(configured[0].actions, vec!["run"]);
+        assert_eq!(
+            configured[0].interpreters.get("pwsh"),
+            Some(&core::api::ScriptInterpreter {
+                program,
+                argv_prefix: vec!["-NoProfile".to_owned()],
+            })
+        );
+        assert_eq!(configured[0].run_env, vec!["BUILD_ID", "CI"]);
+
+        assert!(forbidden_project_run_env_name("ELIOT_RUN_TOKEN", &[]));
+        assert!(forbidden_project_run_env_name("USER_ROLE", &[]));
+        assert!(forbidden_project_run_env_name("GITHUB_TOKEN", &[]));
+        assert!(forbidden_project_run_env_name("SERVICE_CREDENTIAL", &[]));
+        assert!(forbidden_project_run_env_name("SERVICE_SECRET", &[]));
+        assert!(forbidden_project_run_env_name("OPENAI_API_KEY", &[]));
+        assert!(forbidden_project_run_env_name("PROVIDER_BASE_URL", &[]));
+        assert!(forbidden_project_run_env_name("CUSTOM_ENDPOINT", &[]));
+        assert!(forbidden_project_run_env_name("CUSTOM_ROUTE", &[]));
+        assert!(forbidden_project_run_env_name("CUSTOM_ACCOUNT", &[]));
+        assert!(forbidden_project_run_env_name("CODEX_HOME", &[]));
+        assert!(forbidden_project_run_env_name("CODEX_SQLITE_HOME", &[]));
+        assert!(forbidden_project_run_env_name("GIT_AUTHOR_NAME", &[]));
+        assert!(forbidden_project_run_env_name("PATH", &[]));
+        if cfg!(windows) {
+            assert!(forbidden_project_run_env_name(
+                "runtime_key",
+                &["RUNTIME_KEY".to_owned()]
+            ));
+        } else {
+            assert!(!forbidden_project_run_env_name(
+                "runtime_key",
+                &["RUNTIME_KEY".to_owned()]
+            ));
+        }
+
+        fixture.write(&format!(
+            "[projects.sample]\npath = {project_path:?}\nactions = [\"run\"]\n\
+             run_env = [\"PATH\"]\n"
+        ));
+        assert!(load_project_registration_config(&fixture.root).is_err());
+
+        fixture.write(&format!(
+            "[projects.sample]\npath = {project_path:?}\nactions = [\"run\"]\n\
+             run_env = [\"RUNTIME_KEY\"]\n\
+             [proxies.route]\nattach = \"http://127.0.0.1:10300\"\n\
+             health = \"/health\"\napi_key_env = \"RUNTIME_KEY \"\n\
+             base_url_for.codex = \"http://127.0.0.1:10300/v1\"\n"
+        ));
+        assert!(load_project_registration_config(&fixture.root).is_err());
+
+        fixture.write(&format!(
+            "[projects.sample]\npath = {project_path:?}\nactions = [\"run\"]\n\
+             run_env = [\"CI\", \"ci\"]\n"
+        ));
+        assert_eq!(
+            load_project_registration_config(&fixture.root).is_err(),
+            cfg!(windows),
+            "environment-name duplicate checks follow the platform's case rules"
         );
     }
 

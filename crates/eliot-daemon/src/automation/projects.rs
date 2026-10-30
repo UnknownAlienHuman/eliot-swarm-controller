@@ -8,9 +8,9 @@ use crate::{
     git_monitor::reject_links,
     workspace_git::WorkspaceGit,
 };
-use eliot_core::{Error, Result};
+use eliot_core::{Error, Result, api::ScriptInterpreter};
 use serde_json::Value;
-use std::{fs, io::ErrorKind, path::Path};
+use std::{collections::BTreeMap, fs, io::ErrorKind, path::Path};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct RegistrationSnapshot {
@@ -19,6 +19,8 @@ pub(super) struct RegistrationSnapshot {
     pub repo_common_dir: String,
     pub profiles: Vec<String>,
     pub actions: Vec<String>,
+    pub interpreters: BTreeMap<String, ScriptInterpreter>,
+    pub run_env: Vec<String>,
 }
 
 pub(super) struct LoadedProjectRules {
@@ -171,6 +173,8 @@ async fn resolve_registration(
         repo_common_dir,
         profiles: project.profiles,
         actions: project.actions,
+        interpreters: project.interpreters,
+        run_env: project.run_env,
     })
 }
 
@@ -331,6 +335,8 @@ mod tests {
             .expect("parse default-deny registration");
         assert!(configured[0].profiles.is_empty());
         assert!(configured[0].actions.is_empty());
+        assert!(configured[0].interpreters.is_empty());
+        assert!(configured[0].run_env.is_empty());
         let unapproved = sole_registration(&fixture).await;
         let error = load_project_rules(&fixture.data_root, unapproved)
             .await
@@ -390,6 +396,8 @@ mod tests {
             repo_common_dir: "C:/registered/.git".to_owned(),
             profiles: vec!["fake".to_owned()],
             actions: vec!["interrupt".to_owned(), "send".to_owned(), "stop".to_owned()],
+            interpreters: BTreeMap::new(),
+            run_env: Vec::new(),
         };
         let input = |action: &str| {
             let (event, action_definition) = match action {
@@ -562,6 +570,8 @@ mod tests {
             repo_common_dir: registered_common_dir.clone(),
             profiles: vec!["fake".to_owned()],
             actions: vec!["stop".to_owned()],
+            interpreters: BTreeMap::new(),
+            run_env: Vec::new(),
         };
         let workspace = eliot_core::WorkspacePreparation {
             agent: "a1".to_owned(),

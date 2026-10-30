@@ -1,13 +1,13 @@
 //! Public Agent/daemon read grammar and pure reply binding checks.
 //! Store authorization and the exact workspace target remain Router decisions.
 
-use super::{GitView, ObservationView};
+use super::{GitView, ObservationView, ScriptInterpreter};
 use crate::{
     Agent, AgentEdit, AgentState, CommandState, Error, ProcessIdentity, ProcessRecord, Result,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const PROCESS_CURSOR_MAX_BYTES: usize = 2_048;
 const EDIT_CURSOR_MAX_BYTES: usize = 64 * 1_024;
@@ -500,12 +500,15 @@ pub struct WorkspaceCustodyView {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectRegistrationView {
     pub id: String,
     pub checkout: String,
     pub repo_common_dir: String,
     pub profiles: Vec<String>,
     pub actions: Vec<String>,
+    pub interpreters: BTreeMap<String, ScriptInterpreter>,
+    pub run_env: Vec<String>,
     pub revision: i64,
 }
 
@@ -523,7 +526,23 @@ impl ProjectRegistrationView {
             ));
         }
         validate_project_allowset(&self.profiles, "profiles")?;
-        validate_project_allowset(&self.actions, "actions")
+        validate_project_allowset(&self.actions, "actions")?;
+        validate_project_run_env(&self.run_env)?;
+        for (reference, interpreter) in &self.interpreters {
+            if reference.is_empty()
+                || reference.len() > 128
+                || !reference
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || "-_".contains(character))
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "project interpreter reference is invalid",
+                ));
+            }
+            interpreter.validate()?;
+        }
+        Ok(())
     }
 }
 
@@ -677,6 +696,29 @@ fn validate_project_allowset(values: &[String], field: &str) -> Result<()> {
         return Err(Error::new(
             "invalid",
             format!("project {field} must contain unique nonempty values"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_project_run_env(values: &[String]) -> Result<()> {
+    let mut unique = BTreeSet::new();
+    if values.iter().any(|value| {
+        let mut characters = value.chars();
+        let valid = characters
+            .next()
+            .is_some_and(|character| character.is_ascii_alphabetic() || character == '_')
+            && characters.all(|character| character.is_ascii_alphanumeric() || character == '_');
+        let key = if cfg!(windows) {
+            value.to_ascii_uppercase()
+        } else {
+            value.clone()
+        };
+        !valid || !unique.insert(key)
+    }) {
+        return Err(Error::new(
+            "invalid",
+            "project run_env must contain unique environment names",
         ));
     }
     Ok(())
@@ -895,16 +937,23 @@ mod tests {
             repo_common_dir: r"C:\work\project-a\.git".to_owned(),
             profiles: Vec::new(),
             actions: Vec::new(),
+            interpreters: BTreeMap::new(),
+            run_env: Vec::new(),
             revision: 1,
         };
         view.validate().unwrap();
         let wire = serde_json::to_value(&view).unwrap();
         assert_eq!(wire["profiles"], json!([]));
         assert_eq!(wire["actions"], json!([]));
+        assert_eq!(wire["interpreters"], json!({}));
+        assert_eq!(wire["run_env"], json!([]));
         assert_eq!(
-            serde_json::from_value::<ProjectRegistrationView>(wire).unwrap(),
+            serde_json::from_value::<ProjectRegistrationView>(wire.clone()).unwrap(),
             view
         );
+        let mut unknown = wire;
+        unknown["future"] = json!(true);
+        assert!(serde_json::from_value::<ProjectRegistrationView>(unknown).is_err());
 
         let mut invalid = view.clone();
         invalid.profiles = vec!["fake".to_owned(), "fake".to_owned()];

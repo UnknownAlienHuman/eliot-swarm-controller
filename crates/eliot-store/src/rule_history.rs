@@ -222,11 +222,23 @@ impl Store {
                     continue;
                 }
             };
-            if let Some(code) = rule_action_binding_error(&trigger, action_request) {
+            let binding_error = if action_request.verb == "run" {
+                rule_run_action_binding_error(
+                    &tx,
+                    principal,
+                    &request.rule,
+                    state.revision,
+                    action.event_seq,
+                    action_request,
+                )?
+            } else {
+                rule_action_binding_error(&trigger, action_request)
+            };
+            if let Some(code) = binding_error {
                 rejected.push((action.event_seq, code));
                 continue;
             }
-            if should_suppress_own_event_send_tx(
+            if should_suppress_own_event_send_or_run_tx(
                 &tx,
                 principal,
                 &request.rule,
@@ -244,17 +256,16 @@ impl Store {
                 }
                 return Err(error);
             }
-            let target = action_request.target.as_deref().ok_or_else(|| {
-                Error::new("invalid", "rule catch-up action has no frozen Agent target")
-            })?;
+            let target = action_request.target.as_deref();
             let (scoped_count, global_count) =
-                rule_action_counts(&tx, principal, &request.rule, Some(target), &limit, now)?;
+                rule_action_counts(&tx, principal, &request.rule, target, &limit, now)?;
             let bucket = match limit.per {
-                core::api::RuleLimitScope::Rule => String::new(),
-                core::api::RuleLimitScope::Agent => target.to_owned(),
+                core::api::RuleLimitScope::Rule => Some(String::new()),
+                core::api::RuleLimitScope::Agent => target.map(str::to_owned),
             };
-            let scoped_total =
-                scoped_count.saturating_add(*scoped_added.get(&bucket).unwrap_or(&0));
+            let scoped_total = bucket.as_ref().map_or(0, |bucket| {
+                scoped_count.saturating_add(*scoped_added.get(bucket).unwrap_or(&0))
+            });
             if rule_limit_reached(scoped_total, limit.max)
                 || global_count.saturating_add(global_added) >= GLOBAL_RULE_ACTION_LIMIT
             {
@@ -311,7 +322,9 @@ impl Store {
                 admission,
                 cause,
             });
-            *scoped_added.entry(bucket).or_default() += 1;
+            if let Some(bucket) = bucket {
+                *scoped_added.entry(bucket).or_default() += 1;
+            }
             global_added += 1;
         }
 

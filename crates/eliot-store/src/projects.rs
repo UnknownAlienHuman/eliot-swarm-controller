@@ -2,7 +2,7 @@
 
 use super::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 const PROJECT_PRINCIPAL_PREFIX: &str = "project:";
 
@@ -13,6 +13,8 @@ pub struct ProjectRegistrationInput {
     pub repo_common_dir: String,
     pub profiles: Vec<String>,
     pub actions: Vec<String>,
+    pub interpreters: BTreeMap<String, core::api::ScriptInterpreter>,
+    pub run_env: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,6 +193,9 @@ pub(super) fn capture_project_command_binding_tx(
             generation,
             command.verb,
         )?
+    } else if command.verb == "run" {
+        require_project_registration_action(&registration, "run")?;
+        targetless_project_run_binding(registration.revision)
     } else {
         if !matches!(command.verb, "rule" | "timer.run" | "rule.catch_up") {
             return Err(Error::new(
@@ -198,15 +203,7 @@ pub(super) fn capture_project_command_binding_tx(
                 "project principals may only create rule and catch-up parents",
             ));
         }
-        ProjectCommandBinding {
-            registration_revision: registration.revision,
-            profile: None,
-            workspace: None,
-            repo_path: None,
-            repo_common_dir: None,
-            workspace_phase: None,
-            workspace_target_generation: None,
-        }
+        targetless_project_run_binding(registration.revision)
     };
     encode_json(&binding).map(Some)
 }
@@ -242,6 +239,19 @@ pub(super) fn validate_project_command_dispatch_tx(
             "project registration changed after command admission",
         ));
     }
+    let registration = load_project_registration(tx, &project_id)?
+        .ok_or_else(|| Error::new("not_allowed", "project registration was removed"))?
+        .view;
+    if command.target.is_none() && command.command.verb == "run" {
+        require_project_registration_action(&registration, "run")?;
+        if binding != targetless_project_run_binding(registration.revision) {
+            return Err(Error::new(
+                "not_allowed",
+                "project run binding does not match its saved registration",
+            ));
+        }
+        return Ok(());
+    }
     let target = command
         .target
         .ok_or_else(|| Error::new("not_allowed", "project command has no Agent target"))?;
@@ -249,9 +259,6 @@ pub(super) fn validate_project_command_dispatch_tx(
         .command
         .generation
         .ok_or_else(|| Error::new("not_allowed", "project command has no generation"))?;
-    let registration = load_project_registration(tx, &project_id)?
-        .ok_or_else(|| Error::new("not_allowed", "project registration was removed"))?
-        .view;
     let current = project_binding_for_agent_tx(
         tx,
         &registration,
@@ -263,6 +270,41 @@ pub(super) fn validate_project_command_dispatch_tx(
         return Err(Error::new(
             "not_allowed",
             "project Agent, workspace, profile or repository binding changed",
+        ));
+    }
+    Ok(())
+}
+
+fn targetless_project_run_binding(registration_revision: i64) -> ProjectCommandBinding {
+    ProjectCommandBinding {
+        registration_revision,
+        profile: None,
+        workspace: None,
+        repo_path: None,
+        repo_common_dir: None,
+        workspace_phase: None,
+        workspace_target_generation: None,
+    }
+}
+
+fn require_project_registration_action(
+    registration: &core::api::ProjectRegistrationView,
+    action: &str,
+) -> Result<()> {
+    if !is_supported_project_registration_action(action) {
+        return Err(Error::new(
+            "unsupported",
+            "project registration action is not implemented",
+        ));
+    }
+    if !registration
+        .actions
+        .iter()
+        .any(|approved| approved == action)
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "project registration does not approve this action",
         ));
     }
     Ok(())
@@ -387,11 +429,24 @@ fn require_project_owner(principal: &str) -> Result<()> {
 fn normalize_registration(input: &ProjectRegistrationInput) -> Result<ProjectRegistrationInput> {
     let mut profiles = input.profiles.clone();
     let mut actions = input.actions.clone();
+    let interpreters = input.interpreters.clone();
+    let mut run_env = input.run_env.clone();
     normalize_allowset(&mut profiles, "project profiles")?;
     normalize_allowset(&mut actions, "project actions")?;
+    normalize_allowset(&mut run_env, "project run_env")?;
+    for (reference, interpreter) in &interpreters {
+        require_nonempty(reference, "project interpreter reference")?;
+        if reference.trim() != reference || reference.contains('\0') {
+            return Err(Error::new(
+                "invalid",
+                "project interpreter reference is malformed",
+            ));
+        }
+        interpreter.validate()?;
+    }
     if actions
         .iter()
-        .any(|action| !is_supported_project_action(action))
+        .any(|action| !is_supported_project_registration_action(action))
     {
         return Err(Error::new(
             "unsupported",
@@ -404,6 +459,8 @@ fn normalize_registration(input: &ProjectRegistrationInput) -> Result<ProjectReg
         repo_common_dir: input.repo_common_dir.clone(),
         profiles: profiles.clone(),
         actions: actions.clone(),
+        interpreters: interpreters.clone(),
+        run_env: run_env.clone(),
         revision: 1,
     };
     view.validate()?;
@@ -413,11 +470,17 @@ fn normalize_registration(input: &ProjectRegistrationInput) -> Result<ProjectReg
         repo_common_dir: input.repo_common_dir.clone(),
         profiles,
         actions,
+        interpreters,
+        run_env,
     })
 }
 
 fn is_supported_project_action(action: &str) -> bool {
     matches!(action, "stop" | "send" | "interrupt")
+}
+
+fn is_supported_project_registration_action(action: &str) -> bool {
+    is_supported_project_action(action) || action == "run"
 }
 
 fn normalize_allowset(values: &mut [String], name: &str) -> Result<()> {
@@ -444,6 +507,8 @@ fn upsert_project_registration_tx(
             && existing.view.repo_common_dir == input.repo_common_dir
             && existing.view.profiles == input.profiles
             && existing.view.actions == input.actions
+            && existing.view.interpreters == input.interpreters
+            && existing.view.run_env == input.run_env
         {
             return Ok(existing.view);
         }
@@ -462,15 +527,20 @@ fn upsert_project_registration_tx(
     }
     let profiles = encode_json(&input.profiles)?;
     let actions = encode_json(&input.actions)?;
+    let interpreters = encode_json(&input.interpreters)?;
+    let run_env = encode_json(&input.run_env)?;
     tx.execute(
-        "INSERT INTO project_registrations(id, checkout, repo_common_dir, profiles, actions)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO project_registrations(
+             id, checkout, repo_common_dir, profiles, actions, interpreters, run_env
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             input.id,
             input.checkout,
             input.repo_common_dir,
             profiles,
             actions,
+            interpreters,
+            run_env,
         ],
     )
     .map_err(sql_error)?;
@@ -497,7 +567,7 @@ fn list_project_registrations_tx(
 ) -> Result<Vec<core::api::ProjectRegistrationView>> {
     let mut statement = connection
         .prepare(
-            "SELECT revision, id, checkout, repo_common_dir, profiles, actions
+            "SELECT revision, id, checkout, repo_common_dir, profiles, actions, interpreters, run_env
              FROM project_registrations
              WHERE ?1 IS NULL OR id > ?1
              ORDER BY id LIMIT ?2",
@@ -522,7 +592,7 @@ fn load_project_registration(
 ) -> Result<Option<ProjectRegistrationRow>> {
     connection
         .query_row(
-            "SELECT revision, id, checkout, repo_common_dir, profiles, actions
+            "SELECT revision, id, checkout, repo_common_dir, profiles, actions, interpreters, run_env
              FROM project_registrations WHERE id = ?1",
             [id],
             project_registration_from_row,
@@ -552,6 +622,8 @@ fn project_registration_from_row(
     let repo_common_dir: String = row.get(3)?;
     let profiles_text: String = row.get(4)?;
     let actions_text: String = row.get(5)?;
+    let interpreters_text: String = row.get(6)?;
+    let run_env_text: String = row.get(7)?;
     let profiles = serde_json::from_str(&profiles_text).map_err(|_| {
         rusqlite::Error::FromSqlConversionFailure(
             4,
@@ -572,6 +644,26 @@ fn project_registration_from_row(
             )),
         )
     })?;
+    let interpreters = serde_json::from_str(&interpreters_text).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            6,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid project interpreters",
+            )),
+        )
+    })?;
+    let run_env = serde_json::from_str(&run_env_text).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            7,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid project run environment",
+            )),
+        )
+    })?;
     Ok(ProjectRegistrationRow {
         view: core::api::ProjectRegistrationView {
             id,
@@ -579,6 +671,8 @@ fn project_registration_from_row(
             repo_common_dir,
             profiles,
             actions,
+            interpreters,
+            run_env,
             revision,
         },
     })

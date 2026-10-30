@@ -1,6 +1,8 @@
 use eliot_core::{
     Error, Event, SubmitCommand,
-    api::{CatchUp, RuleLimit, RuleLimitScope, TimerSchedule},
+    api::{
+        CatchUp, CommandSubmitRequest, RuleLimit, RuleLimitScope, RunDefinitionArgs, TimerSchedule,
+    },
     canonical_json_sha256,
     limits::MAX_EVENT_BYTES,
     parse_agent_id,
@@ -8,6 +10,7 @@ use eliot_core::{
 use globset::{Glob, GlobMatcher};
 use regex::Regex;
 use serde::de::Error as _;
+use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -69,8 +72,7 @@ struct TriggerDefinition {
     compiled_matches: BTreeMap<String, CompiledMatch>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Clone, Debug)]
 enum ActionDefinition {
     Stop {
         target: Value,
@@ -86,6 +88,152 @@ enum ActionDefinition {
         expected_generation: Value,
         expected_turn_id: Value,
     },
+    Run {
+        definition: RunDefinitionArgs,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+enum LegacyActionDefinition {
+    Stop {
+        target: Value,
+        expected_generation: Value,
+    },
+    Send {
+        target: Value,
+        expected_generation: Value,
+        text: Value,
+    },
+    Interrupt {
+        target: Value,
+        expected_generation: Value,
+        expected_turn_id: Value,
+    },
+}
+
+impl From<LegacyActionDefinition> for ActionDefinition {
+    fn from(value: LegacyActionDefinition) -> Self {
+        match value {
+            LegacyActionDefinition::Stop {
+                target,
+                expected_generation,
+            } => Self::Stop {
+                target,
+                expected_generation,
+            },
+            LegacyActionDefinition::Send {
+                target,
+                expected_generation,
+                text,
+            } => Self::Send {
+                target,
+                expected_generation,
+                text,
+            },
+            LegacyActionDefinition::Interrupt {
+                target,
+                expected_generation,
+                expected_turn_id,
+            } => Self::Interrupt {
+                target,
+                expected_generation,
+                expected_turn_id,
+            },
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ActionDefinition {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| D::Error::custom("rule action must be an object"))?;
+        let action = object
+            .get("action")
+            .and_then(Value::as_str)
+            .ok_or_else(|| D::Error::custom("rule action kind is missing"))?
+            .to_owned();
+        if action == "run" {
+            let mut fields = object.clone();
+            fields.remove("action");
+            let definition =
+                serde_json::from_value(Value::Object(fields)).map_err(D::Error::custom)?;
+            return Ok(Self::Run { definition });
+        }
+        serde_json::from_value::<LegacyActionDefinition>(value)
+            .map(Self::from)
+            .map_err(D::Error::custom)
+    }
+}
+
+impl Serialize for ActionDefinition {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let field_count = match self {
+            Self::Stop { .. } => 3,
+            Self::Send { .. } | Self::Interrupt { .. } => 4,
+            Self::Run { definition } => {
+                let mut count = 3;
+                if definition.cwd.is_some() {
+                    count += 1;
+                }
+                if definition.timeout.is_some() {
+                    count += 1;
+                }
+                count
+            }
+        };
+        let mut object = serializer.serialize_map(Some(field_count))?;
+        match self {
+            Self::Stop {
+                target,
+                expected_generation,
+            } => {
+                object.serialize_entry("action", "stop")?;
+                object.serialize_entry("target", target)?;
+                object.serialize_entry("expected_generation", expected_generation)?;
+            }
+            Self::Send {
+                target,
+                expected_generation,
+                text,
+            } => {
+                object.serialize_entry("action", "send")?;
+                object.serialize_entry("target", target)?;
+                object.serialize_entry("expected_generation", expected_generation)?;
+                object.serialize_entry("text", text)?;
+            }
+            Self::Interrupt {
+                target,
+                expected_generation,
+                expected_turn_id,
+            } => {
+                object.serialize_entry("action", "interrupt")?;
+                object.serialize_entry("target", target)?;
+                object.serialize_entry("expected_generation", expected_generation)?;
+                object.serialize_entry("expected_turn_id", expected_turn_id)?;
+            }
+            Self::Run { definition } => {
+                object.serialize_entry("action", "run")?;
+                object.serialize_entry("cmd", &definition.cmd)?;
+                if let Some(cwd) = &definition.cwd {
+                    object.serialize_entry("cwd", cwd)?;
+                }
+                if let Some(timeout) = &definition.timeout {
+                    object.serialize_entry("timeout", timeout)?;
+                }
+                object.serialize_entry("env", &definition.env)?;
+            }
+        }
+        object.end()
+    }
 }
 
 #[derive(Deserialize)]
@@ -125,15 +273,16 @@ impl CompiledMatch {
 }
 
 impl ActionDefinition {
-    fn target(&self) -> &Value {
+    fn target(&self) -> Option<&Value> {
         match self {
             Self::Stop { target, .. }
             | Self::Send { target, .. }
-            | Self::Interrupt { target, .. } => target,
+            | Self::Interrupt { target, .. } => Some(target),
+            Self::Run { .. } => None,
         }
     }
 
-    fn expected_generation(&self) -> &Value {
+    fn expected_generation(&self) -> Option<&Value> {
         match self {
             Self::Stop {
                 expected_generation,
@@ -146,7 +295,8 @@ impl ActionDefinition {
             | Self::Interrupt {
                 expected_generation,
                 ..
-            } => expected_generation,
+            } => Some(expected_generation),
+            Self::Run { .. } => None,
         }
     }
 
@@ -155,6 +305,7 @@ impl ActionDefinition {
             Self::Stop { .. } => "stop",
             Self::Send { .. } => "send",
             Self::Interrupt { .. } => "interrupt",
+            Self::Run { .. } => "run",
         }
     }
 }
@@ -346,15 +497,24 @@ pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<SubmitCom
         .actions
         .first()
         .ok_or_else(|| Error::new("invalid", "rule has no action"))?;
+    if let ActionDefinition::Run { definition } = action {
+        return submit_run_command(definition).map(Some);
+    }
     let roots = TemplateRoots {
         event: &event_value,
         subject,
         data: &event.data,
     };
-    let target = render_agent_target(action.target(), &roots)?;
+    let target_source = action
+        .target()
+        .ok_or_else(|| Error::new("invalid", "Agent action target is missing"))?;
+    let target = render_agent_target(target_source, &roots)?;
     parse_agent_id(&target)
         .map_err(|_| Error::new("invalid", "action target is not a canonical Agent id"))?;
-    let generation = render_generation(action.expected_generation(), &roots)?;
+    let generation_source = action
+        .expected_generation()
+        .ok_or_else(|| Error::new("invalid", "Agent action generation is missing"))?;
+    let generation = render_generation(generation_source, &roots)?;
     let generation = generation
         .as_i64()
         .filter(|generation| *generation >= 0)
@@ -399,6 +559,12 @@ pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<SubmitCom
             }
             (json!({}), Some(event_turn_id.to_owned()))
         }
+        ActionDefinition::Run { .. } => {
+            return Err(Error::new(
+                "unsupported",
+                "run action must use targetless command evaluation",
+            ));
+        }
     };
 
     Ok(Some(submit_command(
@@ -408,6 +574,16 @@ pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<SubmitCom
         args,
         expected_turn_id,
     )))
+}
+
+fn submit_run_command(definition: &RunDefinitionArgs) -> Result<SubmitCommand, Error> {
+    definition.validate()?;
+    let args = serde_json::to_value(definition)
+        .map_err(|_| Error::new("invalid", "run definition cannot be encoded"))?;
+    let mut command = CommandSubmitRequest::new(String::new(), "run");
+    command.args = args;
+    command.validate()?;
+    Ok(command)
 }
 
 /// Inspect only known later-slice knobs before typed deserialization so they get an
@@ -449,7 +625,9 @@ fn reject_unimplemented_options(raw: &toml::Value) -> Result<(), Error> {
                         .as_table()
                         .and_then(|action| action.get("action"))
                         .and_then(toml::Value::as_str)
-                        .is_some_and(|action| !matches!(action, "stop" | "send" | "interrupt"))
+                        .is_some_and(|action| {
+                            !matches!(action, "stop" | "send" | "interrupt" | "run")
+                        })
                 })
             });
     if has_unsupported_trigger || has_unsupported_selector || has_unsupported_action {
@@ -592,12 +770,18 @@ fn is_match_scalar(value: &Value) -> bool {
 }
 
 fn validate_event_action(action: &ActionDefinition) -> Result<(), Error> {
+    if let ActionDefinition::Run { definition } = action {
+        return definition.validate();
+    }
     let target = action
         .target()
-        .as_str()
+        .and_then(Value::as_str)
         .ok_or_else(|| Error::new("invalid", "Agent action requires a string target"))?;
     validate_template(target, true)?;
-    match action.expected_generation() {
+    match action
+        .expected_generation()
+        .ok_or_else(|| Error::new("invalid", "Agent action generation is missing"))?
+    {
         Value::String(value) => {
             let parts = parse_template(value)?;
             if !is_whole_template(&parts) {
@@ -642,6 +826,12 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
         .first()
         .ok_or_else(|| Error::new("invalid", "rule has no action"))?;
     let (target_value, generation_value, args) = match action {
+        ActionDefinition::Run { .. } => {
+            return Err(Error::new(
+                "unsupported",
+                "run actions are unsupported for timers in this increment",
+            ));
+        }
         ActionDefinition::Stop {
             target,
             expected_generation,
@@ -1059,6 +1249,13 @@ on = { event = 'turn.started' }
 do = [{ action = 'interrupt', target = '${event.agent}', expected_generation = '${event.generation}', expected_turn_id = '${event.data.turn_id}' }]
 "#;
 
+    const PROJECT_RUN_RULE: &str = r#"
+[[rule]]
+id = 'run-on-result'
+on = { event = 'turn.completed' }
+do = [{ action = 'run', cmd = ['pwsh', '.eliot/scripts/check.ps1', '-Changed'], cwd = '.', timeout = '10m', env = { CI = 'true' } }]
+"#;
+
     const INTERVAL_TIMER: &str = r#"
 [[rule]]
 id = 'interval-stop'
@@ -1125,7 +1322,7 @@ do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${eve
         );
 
         let unsupported = [
-            RULE.replace("action = 'stop'", "action = 'run'"),
+            RULE.replace("action = 'stop'", "action = 'notify'"),
             RULE.replace("'subject.harness' = 'fake'", "'subject.labels.role' = 'writer'"),
             RULE.replace("'subject.harness' = 'fake'", "'event.parent' = 'command-id'"),
             RULE.replace(
@@ -1159,6 +1356,91 @@ do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${eve
             "event = 'turn.completed', every = '30m'",
         );
         assert_eq!(load(Cursor::new(mixed)).unwrap_err().code, "invalid");
+    }
+
+    #[test]
+    fn legacy_stop_send_interrupt_wire_shapes_and_digests_are_stable() {
+        let fixtures = [
+            (
+                RULE,
+                json!({
+                    "action":"stop",
+                    "target":"${event.agent}",
+                    "expected_generation":"${event.generation}"
+                }),
+            ),
+            (
+                SEND_RULE,
+                json!({
+                    "action":"send",
+                    "target":"${event.agent}",
+                    "expected_generation":"${event.generation}",
+                    "text":"Result: ${data.status}"
+                }),
+            ),
+            (
+                INTERRUPT_RULE,
+                json!({
+                    "action":"interrupt",
+                    "target":"${event.agent}",
+                    "expected_generation":"${event.generation}",
+                    "expected_turn_id":"${event.data.turn_id}"
+                }),
+            ),
+        ];
+        for (source, expected_action) in fixtures {
+            let rule = load(Cursor::new(source)).unwrap().remove(0);
+            let wire = serde_json::to_value(&rule).unwrap();
+            assert_eq!(wire["do"][0], expected_action);
+            assert!(wire["do"][0].get("definition").is_none());
+
+            let saved = serde_json::to_string(&rule).unwrap();
+            let restored = RuleDefinition::deserialize_saved(&saved).unwrap();
+            assert_eq!(
+                restored.semantic_digest().unwrap(),
+                rule.semantic_digest().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn event_run_emits_raw_targetless_command_and_timer_run_stays_unsupported() {
+        let rule = load(Cursor::new(PROJECT_RUN_RULE)).unwrap().remove(0);
+        let command = evaluate(&rule, &event()).unwrap().unwrap();
+        assert_eq!(command.id, "");
+        assert_eq!(command.verb, "run");
+        assert_eq!(command.target, None);
+        assert_eq!(command.expected_generation, None);
+        assert_eq!(command.expected_turn_id, None);
+        assert_eq!(command.request_id, None);
+        assert!(!command.probe);
+        assert_eq!(
+            command.args,
+            json!({
+                "cmd":["pwsh",".eliot/scripts/check.ps1","-Changed"],
+                "cwd":".",
+                "timeout":"10m",
+                "env":{"CI":"true"}
+            })
+        );
+        command.validate().unwrap();
+
+        let saved = serde_json::to_string(&rule).unwrap();
+        let restored = RuleDefinition::deserialize_saved(&saved).unwrap();
+        assert_eq!(
+            restored.semantic_digest().unwrap(),
+            rule.semantic_digest().unwrap()
+        );
+
+        let timer = INTERVAL_TIMER.replace(
+            "action = 'stop', target = 'a7', expected_generation = 3",
+            "action = 'run', cmd = ['pwsh', '.eliot/scripts/check.ps1'], timeout = '10m'",
+        );
+        assert_eq!(load(Cursor::new(timer)).unwrap_err().code, "unsupported");
+
+        let unknown =
+            PROJECT_RUN_RULE.replace("timeout = '10m'", "timeout = '10m', principal = 'owner'");
+        assert_eq!(load(Cursor::new(unknown)).unwrap_err().code, "invalid");
     }
 
     #[test]

@@ -42,6 +42,7 @@ impl Captured {
         Self::spawn_with_stdout(command, None)
     }
 
+    #[allow(dead_code)] // Used by another integration target; support is compiled per target.
     pub fn spawn_stdout_file(command: Command, path: &Path) -> Self {
         Self::spawn_with_stdout(command, Some(path))
     }
@@ -255,14 +256,18 @@ impl Fixture {
         let deadline = Instant::now() + WAIT;
         loop {
             let command = self.json(&["cmd", "show", id]);
-            if command["state"] == expected {
+            let state = command["state"].as_str();
+            // Run tests use "terminal" to inspect any retained outcome, including unknown.
+            let any_outcome = expected == "terminal"
+                && matches!(
+                    state,
+                    Some("applied" | "rejected" | "failed" | "unknown" | "cancelled")
+                );
+            if state == Some(expected) || any_outcome {
                 return command;
             }
             assert!(
-                matches!(
-                    command["state"].as_str(),
-                    Some("accepted" | "queued" | "dispatched")
-                ),
+                matches!(state, Some("accepted" | "queued" | "dispatched")),
                 "unexpected command state {}; private outcome deliberately omitted",
                 command["state"]
             );

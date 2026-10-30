@@ -17,6 +17,27 @@ revoked credentials reject, never become owner. No manual `--owner` step is requ
 This prevents accidental attribution errors; it is not isolation from hostile processes
 of the same OS user. Reads are scoped as well as writes.
 
+A running script has a distinct `Run` principal, bound to exactly one run command and
+its saved originating principal/scope. The daemon creates a random 256-bit token for that
+command and keeps only its SHA-256 hash in an in-memory registry with the command id and
+saved scope. It is never persisted in command/event data or logs. The child receives
+`ELIOT_RUN_COMMAND_ID` and `ELIOT_RUN_TOKEN`; its RPC `_auth` must contain exactly
+`kind:"run"`, that `run_command_id` and the matching `credential`. A Run caller may call
+only `command.get` for that exact command id while the token is registered, and may make
+that its first RPC. That read returns the standard Core `Command` DTO for that id, as the
+ordinary API/CLI `command.get` path does, including its usual secret-free semantic args.
+This preserves the existing typed `eliot cmd show` response validation. The Run token and
+secret environment values are never stored in command data. It cannot
+submit commands or read its parent, siblings or another command. This is a scoped variant of the existing
+auth envelope and Router, not a separate security platform.
+
+If any Run identity variable is present, the complete Run pair is required. Partial,
+mismatched, unknown or conflicting Run/Agent/Owner authentication fields fail closed;
+they never retry as Owner. The token hash is revoked at direct script exit or cleanup and
+is lost on daemon restart. Validated stdout actions are admitted by the controller under
+the saved principal/scope after the process exits; they do not use the Run caller's RPC
+authority.
+
 Frames are at most 4 MiB, semantic fields smaller. Multiplex requests so one wait does
 not block unrelated calls. Bound all lists and histories; never hold a read transaction
 open while waiting for a client or native process.
@@ -211,7 +232,10 @@ unknown fields and wrong types are `invalid`. Optional `target`, `expected_gener
 may be omitted or `null` to mean absent. `args` defaults to `{}` only when omitted and
 must be a JSON object; explicit `null` or another type is `invalid`. Absent expectations
 remain absent. All six response members remain present, including nullable binding,
-outcome and linked-command values; `fanout` is not part of the current response.
+outcome and linked-command values; `fanout` is not part of the current response. A
+`verb:"run"` request is targetless: `target`, generation/turn/request bindings are absent
+or `null`, and `probe` is false. Its script inputs stay in `args` and follow the owning
+[automation contract](automation.md#frozen-script-inputs).
 
 Resolve the target and validate principal/capability/state before persisting the command
 binding and events. Each verb checks `expected_generation` at its defined admission or

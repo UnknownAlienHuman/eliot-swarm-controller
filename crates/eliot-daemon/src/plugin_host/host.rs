@@ -1971,6 +1971,7 @@ const BASE_ENVIRONMENT_NAMES: &[&str] = &[
     "HOME",
     "LOCALAPPDATA",
     "SystemRoot",
+    "PATHEXT",
     "PATH",
     "TEMP",
 ];

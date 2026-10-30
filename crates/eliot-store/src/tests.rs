@@ -2,7 +2,9 @@ use super::{
     BatchCommit, ProjectRegistrationInput, RuleCatchUpAction, RuleCatchUpAdmission,
     RuleCursorOutcome, RuleDefinitionInput, RuleEventAdmission, Store, contains_secret_marker,
 };
-use eliot_core::api::{ProviderClearHoldRequest, ProviderCorrectiveEvidence, RuleCatchUpRequest};
+use eliot_core::api::{
+    ProviderClearHoldRequest, ProviderCorrectiveEvidence, RuleCatchUpRequest, ScriptInterpreter,
+};
 use eliot_core::{
     AgentState, CommandState, EventCause, NativeEvent, NativeStoreBinding, ProviderHoldState,
     ProviderRestrictionKind, SourceBatch, SourceGap, SubmitCommand, TurnState,
@@ -12,6 +14,7 @@ use eliot_core::{
 };
 use serde_json::json;
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -363,6 +366,8 @@ fn project_command_binding_is_captured_and_revalidated_before_dispatch() {
         repo_common_dir: "synthetic-repository".to_owned(),
         profiles: vec!["fake".to_owned()],
         actions: vec!["stop".to_owned()],
+        interpreters: BTreeMap::new(),
+        run_env: Vec::new(),
     };
     let registered = store
         .upsert_project_registration("owner", &registration, now + 1)
@@ -528,6 +533,8 @@ fn project_stop_rejects_setup_ready_next_generation() {
         repo_common_dir: repo_common_dir.to_owned(),
         profiles: vec!["fake".to_owned()],
         actions: vec!["stop".to_owned()],
+        interpreters: BTreeMap::new(),
+        run_env: Vec::new(),
     };
     store
         .upsert_project_registration("owner", &registration, now + 2)
@@ -691,6 +698,8 @@ fn project_stop_cannot_cancel_a_new_workspace_generation_after_dispatch_admissio
         repo_common_dir: repo_common_dir.to_owned(),
         profiles: vec!["project-profile".to_owned()],
         actions: vec!["stop".to_owned()],
+        interpreters: BTreeMap::new(),
+        run_env: Vec::new(),
     };
     store
         .upsert_project_registration("owner", &registration, now + 6)
@@ -814,6 +823,8 @@ fn project_approved_send_uses_existing_store_admission_and_dispatch() {
                 repo_common_dir: format!("{checkout}/.git"),
                 profiles: vec![profile.to_owned()],
                 actions: vec!["send".to_owned()],
+                interpreters: BTreeMap::new(),
+                run_env: Vec::new(),
             },
             now + 5,
         )
@@ -866,6 +877,8 @@ fn live_project_rule_send_rejects_other_valid_agent_at_same_generation() {
                 repo_common_dir: format!("{checkout}/.git"),
                 profiles: vec![profile.to_owned()],
                 actions: vec!["send".to_owned()],
+                interpreters: BTreeMap::new(),
+                run_env: Vec::new(),
             },
             now + 20,
         )
@@ -942,6 +955,8 @@ fn history_project_rule_send_rejects_rebinding_old_event_to_current_generation()
                 repo_common_dir: format!("{checkout}/.git"),
                 profiles: vec![profile.to_owned()],
                 actions: vec!["send".to_owned()],
+                interpreters: BTreeMap::new(),
+                run_env: Vec::new(),
             },
             now + 5,
         )
@@ -1116,6 +1131,8 @@ fn project_fake_interrupt_requires_explicit_action_approval() {
         repo_common_dir: "synthetic-workspace/.git".to_owned(),
         profiles: vec!["fake".to_owned()],
         actions: vec!["send".to_owned()],
+        interpreters: BTreeMap::new(),
+        run_env: Vec::new(),
     };
     store
         .upsert_project_registration("owner", &registration, now + 4)
@@ -1254,6 +1271,8 @@ fn project_send_requires_the_approved_action_and_rejects_unknown_registration_ac
                 repo_common_dir: common.clone(),
                 profiles: vec![profile.to_owned()],
                 actions: vec!["resume".to_owned()],
+                interpreters: BTreeMap::new(),
+                run_env: Vec::new(),
             },
             now + 5,
         )
@@ -1270,6 +1289,8 @@ fn project_send_requires_the_approved_action_and_rejects_unknown_registration_ac
                 repo_common_dir: common,
                 profiles: vec![profile.to_owned()],
                 actions: vec!["stop".to_owned()],
+                interpreters: BTreeMap::new(),
+                run_env: Vec::new(),
             },
             now + 6,
         )
@@ -1313,6 +1334,215 @@ fn project_send_requires_the_approved_action_and_rejects_unknown_registration_ac
 }
 
 #[test]
+fn project_run_registration_roundtrips_and_rechecks_targetless_approval() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let project = "project-run-registration";
+    let program = std::env::current_exe()
+        .expect("current executable path")
+        .to_string_lossy()
+        .into_owned();
+    let interpreter = ScriptInterpreter {
+        program,
+        argv_prefix: vec!["-NoProfile".to_owned()],
+    };
+    let mut registration = ProjectRegistrationInput {
+        id: project.to_owned(),
+        checkout: "/synthetic/project-run".to_owned(),
+        repo_common_dir: "/synthetic/project-run/.git".to_owned(),
+        profiles: Vec::new(),
+        actions: Vec::new(),
+        interpreters: BTreeMap::from([("pwsh".to_owned(), interpreter.clone())]),
+        run_env: vec!["CI".to_owned()],
+    };
+    let default_deny = store
+        .upsert_project_registration("owner", &registration, now)
+        .expect("register project with no approved actions")
+        .value;
+    assert!(default_deny.actions.is_empty());
+    assert_eq!(default_deny.run_env, vec!["CI"]);
+    assert_eq!(
+        store
+            .get_project_registration("owner", project)
+            .expect("read default-deny project"),
+        Some(default_deny.clone())
+    );
+    assert_eq!(
+        store
+            .upsert_project_registration("owner", &registration, now + 1)
+            .expect("repeat unchanged registration")
+            .value
+            .revision,
+        default_deny.revision,
+        "an identical approval snapshot does not create a new revision"
+    );
+
+    let principal = format!("project:{project}");
+    let request = SubmitCommand::new(Ulid::new().to_string(), "run");
+    let payload_digest = [0_u8; 32];
+    let command = super::CommandInsert {
+        id: &request.id,
+        principal: &principal,
+        method: "command.submit",
+        payload_digest: &payload_digest,
+        target: None,
+        expected_generation: None,
+        generation: None,
+        expected_turn_id: None,
+        parent_command: None,
+        link_kind: None,
+        ordinal: None,
+        turn_id: None,
+        request_id: None,
+        probe: false,
+        verb: &request.verb,
+        args: &request.args,
+        state: CommandState::Accepted,
+        outcome: None,
+        created_at: now,
+        updated_at: now,
+    };
+    let denied = {
+        let tx = store
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .expect("open registration read transaction");
+        super::projects::capture_project_command_binding_tx(&tx, &command)
+            .expect_err("run must be denied without owner action approval")
+    };
+    assert_eq!(denied.code, "not_allowed");
+
+    registration.actions.push("run".to_owned());
+    let approved = store
+        .upsert_project_registration("owner", &registration, now + 2)
+        .expect("approve project run")
+        .value;
+    assert!(approved.revision > default_deny.revision);
+    assert_eq!(approved.interpreters.get("pwsh"), Some(&interpreter));
+    assert_eq!(approved.actions, vec!["run"]);
+    assert_eq!(
+        store
+            .list_project_registrations("owner", None, 10)
+            .expect("read approved registration list"),
+        vec![approved.clone()]
+    );
+
+    let binding = {
+        let tx = store
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .expect("open targetless binding transaction");
+        super::projects::capture_project_command_binding_tx(&tx, &command)
+            .expect("capture approved targetless project run")
+            .expect("project principal binding")
+    };
+    let binding: serde_json::Value =
+        serde_json::from_str(&binding).expect("decode project run binding");
+    assert_eq!(binding["registration_revision"], json!(approved.revision));
+    assert!(binding["profile"].is_null());
+    assert!(binding["workspace"].is_null());
+    assert!(binding["repo_path"].is_null());
+    assert!(binding["repo_common_dir"].is_null());
+    assert!(binding["workspace_phase"].is_null());
+    assert!(binding["workspace_target_generation"].is_null());
+    assert_eq!(command.target, None);
+    assert_eq!(command.generation, None);
+
+    registration
+        .interpreters
+        .get_mut("pwsh")
+        .expect("approved interpreter")
+        .argv_prefix
+        .push("-NoLogo".to_owned());
+    let interpreter_changed = store
+        .upsert_project_registration("owner", &registration, now + 3)
+        .expect("update approved interpreter prefix")
+        .value;
+    assert!(interpreter_changed.revision > approved.revision);
+    assert_eq!(
+        interpreter_changed.interpreters["pwsh"].argv_prefix,
+        vec!["-NoProfile", "-NoLogo"]
+    );
+
+    registration.run_env.push("BUILD_ID".to_owned());
+    let revised = store
+        .upsert_project_registration("owner", &registration, now + 4)
+        .expect("update approved run environment")
+        .value;
+    assert!(revised.revision > interpreter_changed.revision);
+    assert_eq!(revised.run_env, vec!["BUILD_ID", "CI"]);
+    assert_eq!(
+        store
+            .get_project_registration("owner", project)
+            .expect("read revised project registration"),
+        Some(revised.clone())
+    );
+
+    registration.actions.clear();
+    let revoked = store
+        .upsert_project_registration("owner", &registration, now + 5)
+        .expect("revoke project run approval")
+        .value;
+    assert!(revoked.revision > revised.revision);
+    assert!(revoked.actions.is_empty());
+    let error = {
+        let tx = store
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .expect("open revoked binding transaction");
+        super::projects::capture_project_command_binding_tx(&tx, &command)
+            .expect_err("revoked run approval must reject a new binding")
+    };
+    assert_eq!(error.code, "not_allowed");
+}
+
+#[test]
+fn project_registration_migration_defaults_legacy_run_authority_to_deny() {
+    let path = capacity_store_path();
+    {
+        let legacy = rusqlite::Connection::open(&path).expect("create version 14 Store fixture");
+        legacy
+            .execute_batch(
+                r#"CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY);
+                   INSERT INTO schema_migrations(version) VALUES
+                       (1),(2),(3),(4),(5),(6),(7),(8),(9),(10),(11),(12),(13),(14);
+                   CREATE TABLE project_registrations(
+                       revision INTEGER PRIMARY KEY AUTOINCREMENT,
+                       id TEXT NOT NULL UNIQUE,
+                       checkout TEXT NOT NULL,
+                       repo_common_dir TEXT NOT NULL,
+                       profiles TEXT NOT NULL,
+                       actions TEXT NOT NULL
+                   );
+                   INSERT INTO project_registrations(
+                       id, checkout, repo_common_dir, profiles, actions
+                   ) VALUES (
+                       'legacy-run', '/legacy-run', '/legacy-run/.git', '[]', '["stop"]'
+                   );"#,
+            )
+            .expect("insert pre-migration project registration");
+    }
+
+    let store = Store::open(&path).expect("apply registration migration 15");
+    let version: i64 = store
+        .connection
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .expect("read Store migration version");
+    assert_eq!(version, 15);
+    let legacy = store
+        .get_project_registration("owner", "legacy-run")
+        .expect("read migrated registration")
+        .expect("legacy registration remains present");
+    assert_eq!(legacy.actions, vec!["stop"]);
+    assert!(legacy.interpreters.is_empty());
+    assert!(legacy.run_env.is_empty());
+    drop(store);
+    remove_capacity_store_files(&path);
+}
+
+#[test]
 fn project_registration_list_rejects_oversized_whole_value_without_truncation() {
     let mut store = Store::open(Path::new(":memory:")).expect("open Store");
     let profile_body = "p".repeat(470 * 1024);
@@ -1323,6 +1553,8 @@ fn project_registration_list_rejects_oversized_whole_value_without_truncation() 
             repo_common_dir: format!("/synthetic/{id}/.git"),
             profiles: vec![format!("{profile_body}-{id}")],
             actions: vec!["stop".to_owned()],
+            interpreters: BTreeMap::new(),
+            run_env: Vec::new(),
         };
         store
             .upsert_project_registration("owner", &registration, 0)

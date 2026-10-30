@@ -37,8 +37,11 @@ never from an Agent worktree. Their principal is `project:ID`. Router authorizat
 Store admission/dispatch fences revalidate the registration's canonical checkout and
 repository common directory, profile allowlist and action allowlist before effects.
 `Agent.project` is a label and never establishes project authority. Project rules use
-global profile definitions; project files cannot override native profiles, executables,
-model, route, environment, permissions, workspace mode or Git identity.
+global profile definitions; project files cannot define or override native profiles,
+interpreter executables or fixed argv prefixes, model/effort, route/account, credentials,
+permissions, workspace mode or Git identity. A project `run.env` may supply only literal
+values for owner-approved names under [project registration](configuration.md#project-registration-and-rule-authority);
+it cannot select or override credentials, routes, accounts or reserved identity.
 
 Owner `rule.get`, `rule.catch_up`, `timer.get` and `timer.run` accept an optional project
 scope. Supplying one selects its project principal even though the caller is Owner; an
@@ -86,11 +89,13 @@ commands continue. Explicit catch-up fails `history_gap`
 when its requested history has already been pruned. A lagging rule cannot pin storage
 indefinitely.
 
-During explicit history catch-up, a deterministic per-event action refusal emits
-`rule.rejected`; the retained catch-up parent remains `applied` and lists only admitted
-children. Store or persistence failure rolls back the whole request, leaving no partial
-parent or child set. A retained same-ID request returns its parent before current gates,
-as documented for `rule.catch_up` in the API.
+During explicit history catch-up, project Run actions use the same freeze path as live firing,
+capturing each matching event and the validated current rule revision. Project authorization
+preflights the complete rendered request set; deterministic per-event preparation refusals emit
+`rule.rejected`. The retained catch-up parent remains `applied` and lists only admitted
+children. Store or persistence failure rolls back the whole request, leaving no partial parent or
+child set. A retained same-ID request returns its parent before current gates, as documented for
+`rule.catch_up` in the API.
 
 ## Triggers
 
@@ -234,15 +239,20 @@ advance commit atomically with any admitted command set; Store failure commits n
 Disabled rules advance their skipped range without firing.
 
 Backlog, explicit history catch-up, and rate-limit semantics are defined in
-[Retention and bounded backlog](#retention-and-bounded-backlog). This connected event-rule
-subset supports ordinary `stop`, `send` and event-only `interrupt` commands. SEND uses the
-existing Router path, keeps its exact target generation and turn association, and
-`applied` does not assert task completion. `allow_self` defaults to false, suppressing a
-rule's own causal SEND result; set it true only to opt into feedback, still subject to
-cause-depth and rate limits. Other action verbs, scripts, Goals, and project configuration
-overlays remain unsupported.
-Cause-depth suppression is silent and does not emit an endlessly retriggerable rejection
-event.
+[Retention and bounded backlog](#retention-and-bounded-backlog).
+This connected event-rule subset supports ordinary `stop`, `send` and event-only
+`interrupt`, plus project event-rule `run` during both live evaluation and explicit history
+catch-up; both paths use the frozen inputs in [Frozen script inputs](#frozen-script-inputs).
+Each catch-up Run freezes the exact captured event and validated current rule revision before
+ordinary command admission. Run actions on timer rules and global event rules remain unsupported
+in this first slice. The full L4.2 action contract is cumulative: global `run` and the other
+actions listed below remain required, and this project contour does not complete or remove that
+requirement. SEND uses the existing Router path, keeps its exact target generation and turn
+association, and `applied` does not assert task completion. `allow_self` defaults to
+false; see [Guardrails](#guardrails) for the same-principal self-cause behavior for SEND
+and Run. Goal actions and project configuration overlays remain outside
+this connected event-rule contour.
+Cause-depth suppression is silent and does not emit an endlessly retriggerable rejection event.
 
 ## Matching and rendering
 
@@ -285,7 +295,7 @@ hidden wait/acceptance state to the router.
 | --- | --- |
 | Agent verb | router with generation/turn/request binding |
 | `msg.send`, `var.set` | scoped coordination command; available after L5 |
-| `run` | bounded child process under the rule's authority |
+| `run` | targetless `SubmitCommand` via Router; bounded child under saved authority; emitted commands become ordered children |
 | `notify`, `emit` | bounded log/desktop or approved named webhook; persisted `x.user.*` event |
 | `git.fetch`, `git.push`, `git.worktree` | optional native Git wrapper with frozen intent/readback below |
 
@@ -336,20 +346,133 @@ Hold later writes to the same repository behind an unknown write; unrelated work
 
 ## Frozen script inputs
 
-A project script is inside registered `.eliot/scripts` and uses an approved interpreter.
-Capture small entry-file bytes or canonical allowed path/size/digest at admission.
-Verify before execution; changed bytes fail rather than silently replacing queued work.
-Do not claim that this freezes an arbitrary interpreter's entire dependency graph.
+A `run` action (global or project) is an ordinary targetless `SubmitCommand` in existing
+`commands`, with `verb="run"` and no Agent target or generation/turn/request binding. It
+uses the existing Router for admission and dispatch; it adds no executor, run table or
+workflow. Its raw input and frozen command args use Core `RunDefinitionArgs` and
+`FrozenScriptRun`, respectively, defined in [the Core script DTO module](../../crates/eliot-core/src/api/scripts.rs).
+Those DTOs own their field catalogs; this spec defines their run semantics.
 
-`run` fields are `cmd:[executable,arg,...]`, `cwd?`, `timeout?`, `env?`; project rules
-resolve these through the approved interpreter/script/root policy, not arbitrary event
-text. Default timeout is 10 minutes; output and environment are bounded.
+For project event rules, `RunDefinitionArgs.cmd` is a literal argv vector: element 0 is
+the exact owner-approved key in `interpreters`; element 1 is a literal relative entry
+path below the registered checkout's `.eliot/scripts/`; later elements are literal script
+arguments. The entry must resolve to a canonical regular file under that directory, with
+no path escape, symlink/reparse point, device or alternate stream. Before spawn, authorize
+the project `run` action and resolve element 0 to its approved interpreter. The executable
+path and fixed argv prefix come only from owner configuration. Event data cannot change
+argv or become a shell command string. Eliot invokes the executable directly with the
+configured prefix, the script-entry argument from the frozen canonical receipt via the
+[setup::file_argument helper](../../crates/eliot-daemon/src/setup.rs), and the remaining
+literal arguments. On Windows only, the helper may normalize argv spelling after
+link/reparse checks and a canonical round-trip prove it resolves to the same file; the
+frozen canonical entry receipt and digest remain unchanged. Event-derived values are
+available on stdin only. See [Project registration and rule authority](configuration.md#project-registration-and-rule-authority).
 
-`run` receives bounded JSON `{event,subject,rule,command}` on stdin and may emit at most
-1 MiB of NDJSON actions. Wait for successful exit, validate all actions under the parent
-principal, then admit them atomically as ordered command children. Execute no action
-while stdout is still incomplete. A scoped run token never falls back to owner.
-Timeout terminates owned custody; an uncertain script result is not rerun.
+`cwd` defaults to the registered canonical project checkout. A supplied literal relative
+path must resolve inside that checkout after canonicalization and link/reparse checks.
+`timeout` uses the humantime duration grammar and positive-millisecond validation already
+used for timer intervals. It must represent a positive whole number of milliseconds and
+allow a checked runtime deadline; when omitted it defaults to `10m`. This contract adds
+no fixed run-specific maximum. `env`, when present, is a bounded map of literal strings
+whose names are in the owner's `run_env` allowlist. No template substitution is allowed
+in `cmd`, `cwd`, `timeout` or `env`; an absent or empty `run_env` permits no
+action-supplied environment keys. Names also follow the credential, route, identity and
+reserved-variable exclusions in
+[Environment and secrets](configuration.md#environment-and-secrets).
+
+`cmd` and `env` reuse existing process/config validation and bounds; do not add a
+script-specific numeric limit registry. Implementers should use the shared Core constants
+`MAX_FRAME_BYTES`, `MAX_TEXT_BYTES`, `MAX_EVENT_BYTES` and `MAX_COMMAND_ID_BYTES` from
+[Core limits](../../crates/eliot-core/src/limits.rs), and the existing config validators
+and constants `MAX_CMD_LEN`, `MAX_ENV_NAME_LEN` and `MAX_PASS_ENV_ENTRIES` from
+[daemon config](../../crates/eliot-daemon/src/config.rs), as applicable. The setup-only
+`MAX_TIMEOUT_MS` does not set a Run timeout maximum. Timer duration parsing is in
+[the existing schedule module](../../crates/eliot-daemon/src/automation/schedule.rs).
+
+The ordinary command args store Core `FrozenScriptRun`, which carries the resolved
+interpreter snapshot, entry receipt and frozen event/rule context. Entry and executable
+receipts reuse Core `FrozenSetupFile`; see [the Core model](../../crates/eliot-core/src/lib.rs).
+Before spawn, dispatch revalidates the owner project grant and both file receipts. A
+changed registration, executable or entry fails closed instead of replacing queued
+inputs. This freezes explicit references, not an interpreter's imported dependency graph.
+
+The controller serializes bounded JSON before spawn and rejects input larger than 1 MiB.
+The child stdin uses the Core `ScriptInputContext` DTO from [the Core script DTO module](../../crates/eliot-core/src/api/scripts.rs).
+Its event, event-time subject and rule id/revision are the captured snapshots. The
+`ScriptCommandContext` member is the minimal run command id/verb projection assembled
+after Store assigns the id; it never serializes the full Core `Command` or its args.
+The input excludes recursive stdin/context payload, environment, principal/scope and
+bearer values, including the Run token. Its stdout is UTF-8 NDJSON, at most 1 MiB including line endings: each nonempty
+line is one JSON object, LF or CRLF terminated; a final complete object may end at EOF.
+Empty lines, malformed JSON, invalid UTF-8, truncated capture or excess output invalidate
+the entire stream. Each line must deserialize as the strict Core `ScriptActionRecord`
+DTO; that type owns the closed flat record field catalog and converts to an ordinary
+`SubmitCommand`. The effective send-text limit is Core `MAX_EVENT_BYTES` (64 KiB) from
+[Core limits](../../crates/eliot-core/src/limits.rs). Unknown, missing, `null`, nested,
+extra or wrong-type fields fail validation. Targets and generation/turn bindings are
+literal and must pass ordinary command validation. Records cannot supply command `id`, `principal`, `parent_command`, `ordinal`,
+`executable`, `cmd`, `cwd`, `timeout`, `env` or token fields.
+
+After successful exit, validate each actually emitted record separately against the
+project action allowlist, Router authorization and generation/turn checks. All records
+must pass before atomic admission; the rule loader does not statically analyze possible
+script output.
+
+The Core [`ScriptRunApplied` outcome](../../crates/eliot-core/src/api/scripts.rs) carries
+the current child ID list and a per-run [`ScriptProcessResult`](../../crates/eliot-core/src/api/scripts.rs).
+Its direct-exit state distinguishes an unobserved exit from an observed signal exit with
+no numeric code. Its custody value is platform-specific: Windows reports `exact` only
+after the owned Job is empty; Linux may report `degraded` when the direct exit is known
+zero and the owned process group is observed empty. Degraded Linux quiescence does not
+prove every descendant exited: a descendant may escape the process group with `setsid`.
+Do not claim those descendants were killed or classify that limit alone as `unknown`.
+See [existing process custody](../../crates/eliot-daemon/src/platform/custody.rs).
+
+Before child admission, require direct exit code zero, complete valid stdout NDJSON and
+quiescence proven by the platform's custody guarantee. Exact and degraded quiescence
+both permit an applied result when the direct exit and stdout are proven; unknown custody
+does not. Then admit all validated records atomically as ordered command children; the
+applied outcome retains their IDs, not recursive Command objects. Empty stdout admits an
+empty child set.
+
+The same `ScriptProcessResult` is used for process-backed failed-capture diagnostics;
+the existing failure code/cause remains authoritative, with no separate stderr DTO.
+Its optional bounded Core [`StderrSnapshot`](../../crates/eliot-core/src/diagnostics.rs)
+is diagnostic only. A stderr read/truncation condition does not invalidate an otherwise
+known direct exit, complete stdout result and custody result.
+
+A known unsuccessful direct exit, including timeout/cancellation with a confirmed
+unsuccessful exit and quiescence, or a conclusive output-limit violation or fully observed
+invalid stream with confirmed quiescence is `failed` and may follow partial script
+effects. A truncated/lost required stdout stream, unobserved exit, unproven platform
+quiescence or indeterminate final child-set commit is `unknown`. A known child-set
+rejection/rollback is `failed`. Failed and unknown runs are never replayed; retrying the
+same command id never starts the script again.
+
+The contract is interpreter-agnostic; this Windows example uses the owner's PowerShell
+interpreter approval, a registered script entry and one stdout record:
+
+```text
+# <data_dir>/config.toml
+[projects.app]
+path = "C:/src/app"
+profiles = ["codex-luna"]
+actions = ["run", "send"]
+run_env = ["CI"]
+
+[projects.app.interpreters.pwsh]
+program = "C:/Program Files/PowerShell/7/pwsh.exe"
+argv_prefix = ["-NoProfile", "-NonInteractive", "-File"]
+
+# <checkout>/.eliot/rules/check.toml
+[[rule]]
+id = "check-completed-turn"
+on = { event = "turn.completed" }
+do = [{ action = "run", cmd = ["pwsh", ".eliot/scripts/check.ps1", "-Changed"], cwd = ".", timeout = "10m", env = { CI = "true" } }]
+
+# stdout from check.ps1 (one NDJSON record)
+{"action":"send","target":"a1","expected_generation":7,"text":"check completed"}
+```
 
 ## Approvals and hooks
 
@@ -409,9 +532,10 @@ reconstructs old provenance from a current Agent row. Cause depth above 5 silent
 advances the cursor without a parent/action command or a new event, so suppression is
 quiescent. Default per-rule limit is 10/minute, global
 120 actions/minute; configured windows must fit retained accounting history. SEND
-self-triggering defaults off. Store suppresses only when the originating command/parent
-rows prove the same principal and rule; `EventCause.rule` alone is not authority.
-`allow_self=true` opts a rule into its own SEND feedback, still subject to cause-depth
-and rate limits.
+Self-triggering SEND and Run default off. Store suppresses a SEND or Run only when
+Store-verified cause and origin command/parent rows prove the same principal and rule;
+it checks Run before invoking the script. `EventCause.rule` alone is not authority.
+`allow_self=true` permits intentional SEND or Run feedback, still subject to the existing
+cause-depth and rate limits.
 Draining or paused automation admits no new firings. Every action uses normal router
 checks. These are execution limits, not a task approval process.

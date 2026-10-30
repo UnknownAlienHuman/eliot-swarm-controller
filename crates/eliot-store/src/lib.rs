@@ -7,6 +7,7 @@ mod capacity;
 mod projects;
 mod provider_holds;
 mod rules;
+mod scripts;
 
 pub use projects::ProjectRegistrationInput;
 pub use rules::{
@@ -14,6 +15,7 @@ pub use rules::{
     RuleDefinitionInput, RuleEventAdmission, RuleProcessingState, TimerDefinitionInput,
     TimerSlotAdmission, TimerSlotCommit,
 };
+pub use scripts::ScriptRunAdmission;
 
 use eliot_core::{
     self as core, Agent, AgentEdit, AgentState, BatchAck, Command, CommandState, Effect, Event,
@@ -139,7 +141,7 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(sql_error)?;
-        if current > 14 {
+        if current > 15 {
             return Err(Error::new(
                 "unsupported",
                 format!("Store schema version {current} is newer than this binary"),
@@ -557,6 +559,21 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
+        if current < 15 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE project_registrations
+                     ADD COLUMN interpreters TEXT NOT NULL DEFAULT '{}';
+                 ALTER TABLE project_registrations
+                     ADD COLUMN run_env TEXT NOT NULL DEFAULT '[]';
+                 INSERT INTO schema_migrations(version) VALUES (15);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
         Ok(())
     }
 
@@ -636,6 +653,12 @@ fn submit_tx(
     derived_rule: bool,
 ) -> Result<Admission> {
     require_nonempty(principal, "principal")?;
+    if request.verb == "run" && !derived_rule {
+        return Err(Error::new(
+            "not_allowed",
+            "run commands must be admitted by an event-rule firing",
+        ));
+    }
     if !request.args.is_object() {
         return Err(Error::new("invalid", "command args must be a JSON object"));
     }
@@ -758,6 +781,27 @@ fn submit_tx(
     let linked = match request.verb.as_str() {
         "attach" | "detach" => {
             observer::admit(tx, principal, &request, &payload_digest, now, &mut events)?;
+            None
+        }
+        "run" => {
+            if request.target.is_some()
+                || request.expected_generation.is_some()
+                || request.expected_turn_id.is_some()
+                || request.request_id.is_some()
+                || request.probe
+                || preparation.is_some()
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "run is a targetless command without Agent bindings",
+                ));
+            }
+            scripts::decode_frozen_run(&request.args)?;
+            events.push(admit_command(
+                tx,
+                &CommandInsert::targetless_admitted(principal, &request, &payload_digest, now),
+                json!({"command_id": request.id, "verb": "run"}),
+            )?);
             None
         }
         "launch" => {
@@ -1524,6 +1568,50 @@ impl Store {
                 "native store binding can be appended only at launch dispatch",
             ));
         }
+        if command.command.verb == "run" {
+            if command.target.is_some()
+                || command.command.generation.is_some()
+                || command.command.expected_generation.is_some()
+                || command.command.turn_id.is_some()
+                || command.command.request_id.is_some()
+            {
+                return Err(Error::new(
+                    "source_integrity",
+                    "stored run command has an Agent binding",
+                ));
+            }
+            projects::validate_project_command_dispatch_tx(&tx, &command)?;
+            scripts::validate_run_dispatch_tx(&tx, &command)?;
+            match rules::gate_rule_action_dispatch_tx(&tx, id, now, &mut events)? {
+                rules::RuleActionDispatchGate::Ready => {}
+                rules::RuleActionDispatchGate::Held | rules::RuleActionDispatchGate::Cancelled => {
+                    let command = load_command(&tx, id)?
+                        .ok_or_else(|| Error::new("internal", "gated command disappeared"))?;
+                    commit_transaction(tx, &self.write_faulted)?;
+                    return Ok(Change {
+                        value: command,
+                        events,
+                    });
+                }
+            }
+            update_command_state(&tx, id, CommandState::Dispatched, None, None, now)?;
+            events.push(insert_daemon_command_event(
+                &tx,
+                now,
+                "command.dispatched",
+                None,
+                None,
+                id,
+                json!({"command_id": id, "verb": "run"}),
+            )?);
+            let command = load_command(&tx, id)?
+                .ok_or_else(|| Error::new("internal", "dispatched run command disappeared"))?;
+            commit_transaction(tx, &self.write_faulted)?;
+            return Ok(Change {
+                value: command,
+                events,
+            });
+        }
         let agent_num = command.target.ok_or_else(|| {
             Error::new("bad_state", "L1 dispatch requires a concrete Agent target")
         })?;
@@ -2027,6 +2115,16 @@ impl Store {
         now: i64,
     ) -> Result<Change<Command>> {
         self.ensure_writer_healthy()?;
+        if state == CommandState::Applied
+            && self
+                .get_command(id)?
+                .is_some_and(|command| command.verb == "run")
+        {
+            return Err(Error::new(
+                "bad_state",
+                "a Run is applied only with its atomic fixed child-set commit",
+            ));
+        }
         let result = self.settle_inner(id, state, outcome, now);
         self.fault_on_persistence_error(&result);
         result
@@ -5980,6 +6078,36 @@ impl<'a> CommandInsert<'a> {
             turn_id: None,
             request_id: None,
             probe: request.probe,
+            verb: &request.verb,
+            args: &request.args,
+            state: CommandState::Accepted,
+            outcome: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn targetless_admitted(
+        principal: &'a str,
+        request: &'a SubmitCommand,
+        payload_digest: &'a [u8],
+        now: i64,
+    ) -> Self {
+        Self {
+            id: &request.id,
+            principal,
+            method: COMMAND_METHOD,
+            payload_digest,
+            target: None,
+            expected_generation: None,
+            generation: None,
+            expected_turn_id: None,
+            parent_command: None,
+            link_kind: None,
+            ordinal: None,
+            turn_id: None,
+            request_id: None,
+            probe: false,
             verb: &request.verb,
             args: &request.args,
             state: CommandState::Accepted,

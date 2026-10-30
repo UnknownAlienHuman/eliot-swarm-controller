@@ -3,6 +3,13 @@
 pub mod api;
 pub mod limits;
 
+pub use api::{
+    FrozenScriptContext, FrozenScriptInterpreter, FrozenScriptRun, RunDefinitionArgs,
+    ScriptActionRecord, ScriptCommandContext, ScriptCustody, ScriptDirectExit, ScriptInputContext,
+    ScriptInterpreter, ScriptProcessResult, ScriptRuleContext, ScriptRunApplied,
+    bound_script_outcome_stderr,
+};
+
 mod agent_start;
 mod canonical;
 mod command;

@@ -312,6 +312,8 @@ fn project_registration_input(
         repo_common_dir: registration.repo_common_dir.clone(),
         profiles: registration.profiles.clone(),
         actions: registration.actions.clone(),
+        interpreters: registration.interpreters.clone(),
+        run_env: registration.run_env.clone(),
     }
 }
 
@@ -324,6 +326,8 @@ fn project_registration_snapshot(
         repo_common_dir: registration.repo_common_dir.clone(),
         profiles: registration.profiles.clone(),
         actions: registration.actions.clone(),
+        interpreters: registration.interpreters.clone(),
+        run_env: registration.run_env.clone(),
     }
 }
 
@@ -1307,13 +1311,18 @@ async fn process_rule_cursor(
             if !router.rule_firings_open() {
                 return Ok(false);
             }
-            let prepared_result = match rule.project.as_ref() {
-                Some(project) => {
-                    router
-                        .prepare_project_rule_submission(action, project)
-                        .await
+            let prepared_result = if action.verb == "run" {
+                prepare_project_run_submission(router, rule, retiring, &definition, &event, action)
+                    .await
+            } else {
+                match rule.project.as_ref() {
+                    Some(project) => {
+                        router
+                            .prepare_project_rule_submission(action, project)
+                            .await
+                    }
+                    None => router.prepare_owner_submission(action).await,
                 }
-                None => router.prepare_owner_submission(action).await,
             };
             let prepared = match prepared_result {
                 Ok(prepared) => prepared,
@@ -1352,6 +1361,59 @@ async fn process_rule_cursor(
     Ok(true)
 }
 
+async fn prepare_project_run_submission(
+    router: &Router,
+    rule: &ActiveRule,
+    retiring: bool,
+    definition: &RuleDefinition,
+    event: &Event,
+    action: eliot_core::SubmitCommand,
+) -> Result<crate::router::PreparedSubmission> {
+    let project = rule.project.as_ref().ok_or_else(|| {
+        Error::new(
+            "unsupported",
+            "global script runs are not supported in this increment",
+        )
+    })?;
+    let revision = if retiring {
+        rule.retiring
+            .as_ref()
+            .map(|retiring| retiring.revision)
+            .ok_or_else(|| Error::new("source_integrity", "retiring run revision is absent"))?
+    } else {
+        rule.state.revision
+    };
+    let action = freeze_project_run_action(router, project, definition, event, revision, action)?;
+    router
+        .prepare_project_rule_submission(action, project)
+        .await
+}
+
+fn freeze_project_run_action(
+    router: &Router,
+    project: &ProjectRegistrationView,
+    definition: &RuleDefinition,
+    event: &Event,
+    revision: i64,
+    mut action: eliot_core::SubmitCommand,
+) -> Result<eliot_core::SubmitCommand> {
+    let raw_definition: eliot_core::RunDefinitionArgs = serde_json::from_value(action.args.clone())
+        .map_err(|_| Error::new("invalid", "run definition is malformed"))?;
+    let context = eliot_core::FrozenScriptContext {
+        event: event.clone(),
+        subject: event.subject.clone(),
+        rule: eliot_core::ScriptRuleContext {
+            id: definition.id.clone(),
+            revision,
+        },
+    };
+    let policy = router.secret_policy_snapshot();
+    let frozen =
+        crate::scripts::freeze_project_run(raw_definition, project, context, policy.as_ref())?;
+    action.args = serde_json::to_value(frozen)
+        .map_err(|_| Error::new("invalid", "frozen run inputs cannot be encoded"))?;
+    Ok(action)
+}
 fn rule_cursor(rule: &ActiveRule, retiring: bool) -> Option<i64> {
     if retiring {
         rule.retiring.as_ref().map(|state| state.cursor)
@@ -1624,6 +1686,7 @@ fn timer_wake_delay(timer: &ActiveTimer, now: i64) -> Option<Duration> {
 pub(crate) async fn prepare_rule_catch_up_actions(
     router: &Router,
     definition: &RuleDefinition,
+    rule_revision: i64,
     events: &[Event],
     project: Option<&ProjectRegistrationView>,
 ) -> Result<Vec<eliot_store::RuleCatchUpAction>> {
@@ -1641,7 +1704,7 @@ pub(crate) async fn prepare_rule_catch_up_actions(
             }
             Err(error) => return Err(error),
         };
-        rendered.push((event.seq, request));
+        rendered.push((event.clone(), request));
     }
 
     if let Some(project) = project {
@@ -1654,8 +1717,40 @@ pub(crate) async fn prepare_rule_catch_up_actions(
             .await?;
     }
 
-    for (event_seq, request) in rendered {
-        if let Some(project) = project {
+    for (event, request) in rendered {
+        let event_seq = event.seq;
+        let request = if request.verb == "run" {
+            match project {
+                Some(project) => freeze_project_run_action(
+                    router,
+                    project,
+                    definition,
+                    &event,
+                    rule_revision,
+                    request,
+                ),
+                None => Err(Error::new(
+                    "unsupported",
+                    "global script runs are not supported in this increment",
+                )),
+            }
+        } else {
+            Ok(request)
+        };
+        let request = match request {
+            Ok(request) => request,
+            Err(error) if is_deterministic_pre_admission_rejection(&error.code) => {
+                actions.push(eliot_store::RuleCatchUpAction::rejected(
+                    event_seq, error.code,
+                ));
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+
+        if let Some(project) = project
+            && request.verb != "run"
+        {
             let target = request
                 .target
                 .as_deref()
@@ -1693,6 +1788,7 @@ pub(crate) async fn prepare_rule_catch_up_actions(
                 Err(error) => return Err(error),
             }
         }
+
         let prepared = match project {
             Some(project) => {
                 router
@@ -1717,7 +1813,6 @@ pub(crate) async fn prepare_rule_catch_up_actions(
     actions.sort_by_key(|action| action.event_seq);
     Ok(actions)
 }
-
 #[cfg(test)]
 mod timer_tests {
     use super::*;
@@ -1815,6 +1910,8 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 repo_common_dir: format!("{checkout}/.git"),
                 profiles: vec!["fake".to_owned()],
                 actions: vec!["stop".to_owned()],
+                interpreters: std::collections::BTreeMap::new(),
+                run_env: Vec::new(),
             }])
             .await
             .unwrap()
@@ -2099,5 +2196,140 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
 
         timer.blocked = true;
         assert_eq!(timer_wake_delay(&timer, 135), None);
+    }
+    #[tokio::test]
+    async fn project_run_catch_up_prepares_frozen_targetless_command() {
+        use eliot_core::{AgentState, EventSubject, FrozenScriptRun};
+        use std::{fs, io::Cursor, path::Path};
+
+        let root =
+            std::env::temp_dir().join(format!("eliot-project-run-catch-up-{}", ulid::Ulid::new()));
+        let checkout = root.join("checkout");
+        let data_root = root.join("owner-data");
+        let scripts = checkout.join(".eliot").join("scripts");
+        let tools = checkout.join("tools");
+        fs::create_dir_all(&scripts).unwrap();
+        fs::create_dir_all(&tools).unwrap();
+        fs::create_dir_all(&data_root).unwrap();
+
+        let executable = tools.join(if cfg!(windows) { "pwsh.exe" } else { "pwsh" });
+        fs::write(&executable, b"fixture interpreter").unwrap();
+        fs::write(scripts.join("check.ps1"), b"Write-Output 'ok'").unwrap();
+        let git_init = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&checkout)
+            .status()
+            .unwrap();
+        assert!(git_init.success(), "initialize project fixture repository");
+
+        fs::write(
+            data_root.join("config.toml"),
+            format!(
+                concat!(
+                    "[projects.script-catch-up]\n",
+                    "path = {checkout:?}\n",
+                    "profiles = [\"fake\"]\n",
+                    "actions = [\"run\"]\n",
+                    "run_env = [\"CI\"]\n\n",
+                    "[projects.script-catch-up.interpreters.pwsh]\n",
+                    "program = {program:?}\n",
+                    "argv_prefix = [\"-NoProfile\", \"-NonInteractive\", \"-File\"]\n",
+                ),
+                checkout = checkout.to_string_lossy(),
+                program = executable.to_string_lossy(),
+            ),
+        )
+        .unwrap();
+
+        let loaded = projects::load_registrations(&data_root).await.unwrap();
+        let input = project_registration_input(&loaded[0]);
+        let store = Arc::new(tokio::sync::Mutex::new(
+            eliot_store::Store::open(Path::new(":memory:")).unwrap(),
+        ));
+        let router = Router::new(
+            data_root.clone(),
+            "catch-up-run-fixture-owner".to_owned(),
+            store,
+            crate::bus::Bus::new(16),
+        );
+        let registration = router
+            .reconcile_project_registrations(&[input])
+            .await
+            .unwrap()
+            .remove(0);
+
+        let definition = definition::load(Cursor::new(
+            r#"
+[[rule]]
+id = "project-catch-up-run"
+on = { event = "turn.completed" }
+do = [{ action = "run", cmd = ["pwsh", ".eliot/scripts/check.ps1", "-Changed"], cwd = ".", timeout = "10m", env = { CI = "true" } }]
+"#,
+        ))
+        .unwrap()
+        .remove(0);
+        let subject = EventSubject {
+            project: registration.id.clone(),
+            harness: "fake".to_owned(),
+            profile: "fake".to_owned(),
+            state: AgentState::Busy,
+            workspace: Some(registration.checkout.clone()),
+        };
+        let event = Event {
+            seq: 41,
+            ts: 100,
+            kind: "turn.completed".to_owned(),
+            agent: Some("a1".to_owned()),
+            subject: Some(subject),
+            generation: Some(3),
+            source: "stream".to_owned(),
+            native_id: Some("fixture:turn.completed".to_owned()),
+            data: json!({"status":"complete"}),
+            cause: None,
+        };
+        let rule_revision = 17;
+        let actions = prepare_rule_catch_up_actions(
+            &router,
+            &definition,
+            rule_revision,
+            std::slice::from_ref(&event),
+            Some(&registration),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].event_seq, event.seq);
+        let request = match &actions[0].outcome {
+            eliot_store::RuleCatchUpActionOutcome::Command(request) => request,
+            outcome => panic!("expected prepared Run command, got {outcome:?}"),
+        };
+        assert_eq!(request.verb, "run");
+        assert_eq!(request.target, None);
+        assert_eq!(request.expected_generation, None);
+        let frozen: FrozenScriptRun = serde_json::from_value(request.args.clone()).unwrap();
+        frozen.validate().unwrap();
+        assert_eq!(frozen.context.event, event);
+        assert_eq!(frozen.context.subject, event.subject);
+        assert_eq!(frozen.context.rule.id, definition.id);
+        assert_eq!(frozen.context.rule.revision, rule_revision);
+        assert_eq!(frozen.definition.cmd[0], "pwsh");
+        assert_eq!(frozen.definition.cmd[1], ".eliot/scripts/check.ps1");
+
+        let global_actions = prepare_rule_catch_up_actions(
+            &router,
+            &definition,
+            rule_revision,
+            std::slice::from_ref(&event),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            &global_actions[0].outcome,
+            eliot_store::RuleCatchUpActionOutcome::Rejected { code } if code == "unsupported"
+        ));
+
+        fs::remove_dir_all(root).unwrap();
     }
 }
