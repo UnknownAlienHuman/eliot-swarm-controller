@@ -2068,6 +2068,10 @@ fn manual_timer_runs_send_and_replay_after_grant_revocation_in_both_scopes() {
         });
     }
 
+    let generation_arg = generation.to_string();
+    let stop = fixture.json(&["stop", &agent, "--generation", &generation_arg]);
+    let stop_id = stop["command_id"].as_str().expect("Fake stop command");
+    fixture.wait_command(stop_id, "applied");
     fixture.stop(false);
     for replay in &replay_cases {
         let source = fs::read_to_string(&replay.rule_path).expect("read timer rule before disable");
