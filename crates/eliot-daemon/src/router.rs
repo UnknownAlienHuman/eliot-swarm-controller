@@ -7376,7 +7376,11 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             .repository_identity(&checkout_input)
             .await
             .unwrap();
-        let interpreter_program = std::env::current_exe()
+        let tools_dir = root.join("tools");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        let interpreter_path = tools_dir.join(if cfg!(windows) { "pwsh.exe" } else { "pwsh" });
+        std::fs::write(&interpreter_path, b"fixture interpreter").unwrap();
+        let interpreter_program = std::fs::canonicalize(interpreter_path)
             .unwrap()
             .to_string_lossy()
             .into_owned();
