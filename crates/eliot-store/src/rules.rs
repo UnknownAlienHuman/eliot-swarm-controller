@@ -5783,6 +5783,160 @@ mod tests {
     }
 
     #[test]
+    fn finite_history_catch_up_launch_page_overflow_rolls_back() {
+        const ACTION_COUNT: usize = 8;
+
+        let mut store = store();
+        let request_id = Ulid::new();
+        let now = i64::try_from(request_id.timestamp_ms()).unwrap() + 10;
+        let workspace = std::env::temp_dir()
+            .join("eliot-owner-catch-up-launch")
+            .display()
+            .to_string();
+        let rule_id = "owner-catch-up-launch-page";
+        let rule_value = json!({
+            "id": rule_id,
+            "enabled": true,
+            "on": {"event": "command.accepted"},
+            "do": [{"action": "launch", "profile": "fake", "workspace": workspace}],
+            "limit": {
+                "max": RULE_ACTION_LIMIT as u64,
+                "per": "rule",
+                "window_ms": RULE_ACTION_WINDOW_MS,
+            },
+        });
+        let rule = RuleDefinitionInput {
+            id: rule_id.to_owned(),
+            canonical_definition: serde_json::to_string(&rule_value).unwrap(),
+            definition_digest: core::canonical_json_sha256(&rule_value).unwrap(),
+            enabled: true,
+        };
+        let launch_text = "x".repeat(MAX_EVENT_BYTES - 4 * 1024);
+        assert_eq!(launch_text.len(), 60 * 1024);
+        assert!(launch_text.len() < MAX_INPUT_BYTES);
+        assert!(ACTION_COUNT < RULE_ACTION_LIMIT as usize);
+        assert!(ACTION_COUNT < GLOBAL_RULE_ACTION_LIMIT as usize);
+        let pair_text_bytes = launch_text.len() * 2;
+        assert!(
+            pair_text_bytes + 16 * 1024 < MAX_PAGE_BYTES,
+            "one Launch plus its linked SEND remains below the page bound"
+        );
+        assert!(
+            pair_text_bytes * ACTION_COUNT > MAX_PAGE_BYTES,
+            "all eight Launch+SEND pairs exceed the full admission-page bound"
+        );
+
+        let mut event_seqs = Vec::with_capacity(ACTION_COUNT);
+        for _ in 0..ACTION_COUNT {
+            event_seqs.push(insert_test_event(&mut store, "command.accepted", now - 1));
+        }
+        let state = store.ensure_rule_state("owner", &rule, now).unwrap();
+        let captured_through = state.current_cursor;
+        assert!(
+            event_seqs
+                .last()
+                .is_some_and(|seq| *seq <= captured_through)
+        );
+
+        let actions = event_seqs
+            .iter()
+            .map(|event_seq| {
+                let mut launch = SubmitCommand::new(Ulid::new().to_string(), "launch");
+                launch.args = json!({
+                    "project": workspace,
+                    "harness": "fake",
+                    "profile": "fake",
+                    "profile_snapshot": {},
+                    "workspace": workspace,
+                    "text": launch_text,
+                });
+                launch.expected_generation = Some(0);
+                assert!(valid_targetless_rule_launch_request(&launch));
+                assert!(
+                    serde_json::to_vec(&launch).unwrap().len() <= MAX_FRAME_BYTES,
+                    "each targetless launch request remains inside its frame bound"
+                );
+                RuleCatchUpAction::command(*event_seq, launch)
+            })
+            .collect::<Vec<_>>();
+        let encoded_actions = serde_json::to_vec(&actions).unwrap();
+        assert!(
+            encoded_actions.len() <= MAX_PAGE_BYTES,
+            "the complete catch-up request remains inside its 900 KiB bound"
+        );
+
+        let request = core::api::RuleCatchUpRequest::new(
+            request_id.to_string(),
+            rule_id,
+            event_seqs[0] - 1,
+            Some(captured_through),
+        );
+        let commands_before: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+            .unwrap();
+        let agents_before = store.agent_count().unwrap();
+        let events_before: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        let high_water_before = store.high_water().unwrap();
+        let cursor_before = state.current_cursor;
+
+        let error = store
+            .admit_rule_catch_up("owner", &request, &state, captured_through, &actions, now)
+            .expect_err("oversized whole launch admission set must roll back");
+        assert_eq!(error.code, "frame_too_large");
+        assert!(
+            error
+                .message
+                .contains("recovered rule admissions exceed the page byte bound"),
+            "failure must come from the full catch-up admission-page check: {}",
+            error.message
+        );
+
+        assert!(store.get_command(&request.id).unwrap().is_none());
+        for event_seq in &event_seqs {
+            let launch_id =
+                derived_rule_id("action-0", "owner", rule_id, state.revision, *event_seq).unwrap();
+            assert!(store.get_command(&launch_id).unwrap().is_none());
+            assert!(
+                store
+                    .get_command(&format!("{launch_id}/send"))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM commands", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            commands_before
+        );
+        assert_eq!(store.agent_count().unwrap(), agents_before);
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM events", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            events_before
+        );
+        assert_eq!(store.high_water().unwrap(), high_water_before);
+        assert_eq!(
+            store
+                .get_rule_state("owner", rule_id)
+                .unwrap()
+                .unwrap()
+                .current_cursor,
+            cursor_before
+        );
+        assert!(!store.is_write_faulted());
+    }
+
+    #[test]
     fn finite_history_catch_up_allows_cursor_only_progress() {
         let mut store = store();
         let request_id = Ulid::new();
