@@ -6,7 +6,7 @@ use crate::{
         MAX_COMMAND_ID_BYTES, MAX_CREDENTIAL_BYTES, MAX_DISCOVER_PAGE_BYTES,
         MAX_DISCOVER_PAGE_ENTRIES, MAX_EVENT_BYTES, MAX_TEXT_BYTES, ObservationPage,
         ObservationQuery, ObserverAttachParams, ObserverDetachParams, ObserverSnapshotParams,
-        RpcError, RpcRequest, empty_object, fake_manifest,
+        PluginManifest, RpcError, RpcRequest, empty_object, fake_manifest,
     },
 };
 use eliot_core::{
@@ -530,6 +530,17 @@ fn reject_observer_control(state: &FakeState) -> Result<(), RpcError> {
     Ok(())
 }
 
+fn fake_runtime_manifest() -> PluginManifest {
+    let mut manifest = fake_manifest();
+    manifest
+        .verbs
+        .extend(["steer", "approve", "deny", "answer"].map(str::to_owned));
+    if let Some(sources) = manifest.sources.get_mut("controlled") {
+        sources.insert("request".to_owned(), "stream".to_owned());
+    }
+    manifest
+}
+
 fn handle_initialize(params: &Value, state: &mut FakeState) -> Result<Value, RpcError> {
     let params: InitializeParams = decode_params(params)?;
     if params.protocol != "eliot-plugin/1" {
@@ -560,14 +571,7 @@ fn handle_initialize(params: &Value, state: &mut FakeState) -> Result<Value, Rpc
         state.credential = Some(params.credential);
     }
 
-    let mut manifest = fake_manifest();
-    manifest
-        .verbs
-        .extend(["steer", "approve", "deny", "answer"].map(str::to_owned));
-    if let Some(sources) = manifest.sources.get_mut("controlled") {
-        sources.insert("request".to_owned(), "stream".to_owned());
-    }
-    serde_json::to_value(manifest)
+    serde_json::to_value(fake_runtime_manifest())
         .map_err(|_| domain_error("internal", -32603, "plugin manifest could not be encoded"))
 }
 
@@ -1528,21 +1532,23 @@ fn source_secret_policy(
     SecretPolicy::new(known)
 }
 
-async fn exercise_source_handoff(
-    state: &mut FakeState,
+fn controlled_handoff_fixture(
     command: &AgentCommandParams,
     credential: &str,
-    client: &PeerClient,
-) -> Result<(), RpcError> {
-    let mut handoff = SourceHandoff {
+) -> Result<SourceHandoff, RpcError> {
+    let manifest = fake_runtime_manifest();
+    let controlled = manifest.sources.get("controlled").ok_or_else(|| {
+        domain_error(
+            "internal",
+            -32603,
+            "fake manifest has no controlled source plan",
+        )
+    })?;
+    Ok(SourceHandoff {
         agent_id: command.agent_id.clone(),
         generation: command.generation,
         source: "stream".to_owned(),
-        families: vec![
-            "message".to_owned(),
-            "session".to_owned(),
-            "turn".to_owned(),
-        ],
+        families: controlled.keys().cloned().collect(),
         successor: "transcript".to_owned(),
         mechanism: "fake_recovery".to_owned(),
         cursor: None,
@@ -1555,7 +1561,16 @@ async fn exercise_source_handoff(
             from: None,
             to: None,
         }),
-    };
+    })
+}
+
+async fn exercise_source_handoff(
+    state: &mut FakeState,
+    command: &AgentCommandParams,
+    credential: &str,
+    client: &PeerClient,
+) -> Result<(), RpcError> {
+    let mut handoff = controlled_handoff_fixture(command, credential)?;
     handoff
         .prepare(&state.source_policy)
         .map_err(core_error_to_rpc)?;
@@ -1985,6 +2000,35 @@ mod provider_hold_tests {
             turn_id: Some(turn_id.to_owned()),
             request_id: None,
         }
+    }
+
+    #[test]
+    fn controlled_handoff_covers_every_initialized_controlled_family() {
+        let mut state = FakeState::default();
+        let manifest = handle_initialize(
+            &json!({
+                "protocol":"eliot-plugin/1",
+                "credential":"fixture-credential",
+                "instance_dir":"fake-instance"
+            }),
+            &mut state,
+        )
+        .unwrap_or_else(|error| panic!("unexpected RPC error code {}", error.code));
+        let controlled = manifest["sources"]["controlled"].as_object().unwrap();
+        let mut params = command(HANDOFF_FIXTURE_INPUT);
+        params.agent_id = "a1".to_owned();
+        let handoff = controlled_handoff_fixture(&params, "fixture-credential")
+            .unwrap_or_else(|error| panic!("unexpected RPC error code {}", error.code));
+        assert_eq!(
+            handoff.families,
+            controlled.keys().cloned().collect::<Vec<_>>()
+        );
+        assert_eq!(handoff.families.len(), 4);
+        assert!(handoff.families.iter().any(|family| family == "request"));
+        assert!(controlled.values().all(|mechanism| mechanism == "stream"));
+        assert_eq!(handoff.source, "stream");
+        assert_eq!(handoff.successor, "transcript");
+        handoff.validate().unwrap();
     }
 
     fn request_fixture_state(marker: &str) -> (FakeState, AgentCommandParams) {

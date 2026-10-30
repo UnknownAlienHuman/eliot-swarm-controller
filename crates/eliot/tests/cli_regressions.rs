@@ -2246,7 +2246,7 @@ fn assert_fake_source_handoff(
 ) {
     let before: AgentGetResponse =
         serde_json::from_value(fixture.json(&["show", agent])).expect("before handoff view");
-    let families = ["message", "session", "turn"];
+    let families = ["message", "request", "session", "turn"];
     let unrelated_before: HashSet<_> = before
         .source_states
         .iter()
@@ -7478,7 +7478,11 @@ fn cli_event_rules_reply_to_exact_fake_requests_in_global_and_project_scopes() {
             std::thread::sleep(Duration::from_millis(25));
         };
         assert_eq!(opened["subject"]["harness"], "fake");
-        assert_eq!(opened["subject"]["project"], PROJECT_ID);
+        assert_eq!(
+            opened["subject"]["project"].as_str(),
+            Some(registration.checkout.as_str()),
+            "event subject project is the registered checkout label, not its authority ID"
+        );
         assert_eq!(opened["data"]["command_id"], send_id);
         assert_eq!(opened["data"]["kind"], request_kind);
         assert_eq!(opened["data"]["turn_id"], turn_id);

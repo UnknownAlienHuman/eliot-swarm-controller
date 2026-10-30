@@ -65,18 +65,22 @@ fn ready_agent(store: &mut Store, project: &str, now: i64) -> String {
     agent
 }
 
-fn ready_fake_agent_with_request_stream(store: &mut Store, project: &str, now: i64) -> String {
-    let agent = ready_agent(store, project, now);
-    let agent_num = eliot_core::parse_agent_id(&agent).expect("Fake Agent ID");
-    store
-        .connection
-        .execute(
-            "INSERT INTO source_owners(agent, generation, family, source, mechanism)
-             VALUES (?1, 1, 'request', 'stream', 'stream')",
-            [agent_num],
-        )
-        .expect("initialize Fake's manifest-owned request family on its stream");
-    agent
+#[test]
+fn initial_source_families_match_fake_and_codex_harness_boundaries() {
+    assert_eq!(
+        super::source_families_for_harness("fake").unwrap(),
+        &["session", "turn", "message", "request"][..]
+    );
+    assert_eq!(
+        super::source_families_for_harness("codex").unwrap(),
+        &["session", "turn", "message", "tool", "request"][..]
+    );
+    assert_eq!(
+        super::source_families_for_harness("other")
+            .unwrap_err()
+            .code,
+        "unsupported"
+    );
 }
 
 fn ready_managed_codex_agent(
@@ -1348,7 +1352,14 @@ fn fake_steer_admits_and_dispatches_exact_turn_text_without_retargeting() {
 fn fake_interrupt_rejects_stale_bindings_and_dispatches_exact_request_replies() {
     let mut store = Store::open(Path::new(":memory:")).expect("open Store");
     let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
-    let agent = ready_fake_agent_with_request_stream(&mut store, "fake-interrupt-stale-turn", now);
+    let agent = ready_agent(&mut store, "fake-interrupt-stale-turn", now);
+    let sources = store.list_source_states(&agent, 1).unwrap();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0]["source"], "stream");
+    assert_eq!(
+        sources[0]["families"],
+        json!(["message", "request", "session", "turn"])
+    );
     let turn_id = start_fake_turn(&mut store, &agent, now + 1);
 
     let mut stale_turn = SubmitCommand::new(Ulid::new().to_string(), "interrupt");
@@ -2844,7 +2855,7 @@ fn project_event_reply_requires_the_explicit_per_verb_grant() {
     let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64") + 100;
     let project = "project-event-reply-grant";
     let principal = format!("project:{project}");
-    let agent = ready_fake_agent_with_request_stream(&mut store, project, now);
+    let agent = ready_agent(&mut store, project, now);
     let turn_id = start_fake_turn(&mut store, &agent, now + 1);
     let send_id = turn_id
         .strip_prefix("fake-turn-")

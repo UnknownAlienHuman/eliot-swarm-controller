@@ -7124,7 +7124,7 @@ fn install_initial_source_plan(
 
 fn source_families_for_harness(harness: &str) -> Result<&'static [&'static str]> {
     match harness {
-        "fake" => Ok(&["session", "turn", "message"]),
+        "fake" => Ok(&["session", "turn", "message", "request"]),
         "codex" => Ok(&["session", "turn", "message", "tool", "request"]),
         other => Err(Error::new(
             "unsupported",

@@ -2067,8 +2067,7 @@ impl Router {
             if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
                 return Ok(None);
             }
-            let request_reply =
-                matches!(request.verb.as_str(), "approve" | "deny" | "answer");
+            let request_reply = matches!(request.verb.as_str(), "approve" | "deny" | "answer");
             // Let Store resolve a retained reply parent before checking current
             // registration and pending-request authority for a new admission.
             if !request_reply && let Some(expected) = project {
@@ -8788,10 +8787,15 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         assert!(rejected.child.is_none());
         let parent = rejected.parent.expect("metadata-only rejected parent");
         assert_eq!(parent.state, CommandState::Rejected);
-        assert_eq!(parent.outcome.as_ref().unwrap()["code"], "secret_in_payload");
-        assert!(!serde_json::to_string(&parent)
-            .unwrap()
-            .contains("secret-answer-marker"));
+        assert_eq!(
+            parent.outcome.as_ref().unwrap()["code"],
+            "secret_in_payload"
+        );
+        assert!(
+            !serde_json::to_string(&parent)
+                .unwrap()
+                .contains("secret-answer-marker")
+        );
         assert_eq!(rejected.state.current_cursor, event.seq);
         assert_eq!(
             rejected
@@ -9041,7 +9045,9 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 .upsert_project_registration("owner", &registration_input, now_ms())
                 .unwrap()
                 .value;
-            let state = store.ensure_rule_state(&principal, &input, now_ms()).unwrap();
+            let state = store
+                .ensure_rule_state(&principal, &input, now_ms())
+                .unwrap();
             let (agent, send_id) = result_fixture(&mut store);
             (state, registration, agent, send_id)
         };

@@ -792,6 +792,13 @@ mod tests {
         }
     }
 
+    fn handoff_all_fake_families(agent: &str) -> SourceHandoff {
+        handoff(
+            agent,
+            crate::source_families_for_harness("fake").expect("Fake source plan"),
+        )
+    }
+
     fn with_gap(mut request: SourceHandoff) -> SourceHandoff {
         request.cursor = None;
         request.gap = Some(SourceHandoffGap {
@@ -1043,7 +1050,7 @@ mod tests {
             "source_integrity"
         );
         assert_eq!(store.high_water().unwrap(), high_water);
-        let request = handoff(&agent, &["session", "turn", "message"]);
+        let request = handoff_all_fake_families(&agent);
         let ack = store
             .record_source_handoff(request.clone(), now + 2)
             .unwrap()
@@ -1191,7 +1198,12 @@ mod tests {
 
     #[test]
     fn native_exit_gaps_group_current_owners_and_never_gap_a_zero_family_predecessor() {
-        for families in [vec!["message"], vec!["session", "turn", "message"]] {
+        for families in [
+            vec!["message"],
+            crate::source_families_for_harness("fake")
+                .expect("Fake source plan")
+                .to_vec(),
+        ] {
             let (mut store, agent, now) = fixture("fake");
             store
                 .record_source_handoff(handoff(&agent, &families), now + 1)
@@ -1215,7 +1227,10 @@ mod tests {
                     .iter()
                     .find(|event| event.data["source"] == "stream")
                     .unwrap();
-                assert_eq!(predecessor_gap.data["families"], json!(["session", "turn"]));
+                assert_eq!(
+                    predecessor_gap.data["families"],
+                    json!(["request", "session", "turn"])
+                );
             } else {
                 assert!(store.read_source_state(&agent, 1, "stream").unwrap()["gap_id"].is_null());
             }
@@ -1346,10 +1361,7 @@ mod tests {
         let (mut store, agent, now) = fixture("fake");
         store.ensure_process_source(&agent, 1, now).unwrap();
         store
-            .record_source_handoff(
-                with_gap(handoff(&agent, &["session", "turn", "message"])),
-                now + 1,
-            )
+            .record_source_handoff(with_gap(handoff_all_fake_families(&agent)), now + 1)
             .unwrap();
         let command = admit_send(&mut store, &agent, now + 2);
         store
@@ -1455,7 +1467,7 @@ mod tests {
     fn confirmed_terminal_fact_suppresses_gap_but_not_unavailable_source_metadata() {
         let (mut store, agent, now) = fixture("fake");
         store
-            .record_source_handoff(handoff(&agent, &["session", "turn", "message"]), now + 1)
+            .record_source_handoff(handoff_all_fake_families(&agent), now + 1)
             .unwrap();
         store
             .put_batch(
