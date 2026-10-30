@@ -4,7 +4,7 @@ use eliot_core::{
         CatchUp, CommandSubmitRequest, RuleLimit, RuleLimitScope, RunDefinitionArgs, TimerSchedule,
     },
     canonical_json_sha256,
-    limits::MAX_EVENT_BYTES,
+    limits::{MAX_EVENT_BYTES, MAX_TEXT_BYTES},
     parse_agent_id,
 };
 use globset::{Glob, GlobMatcher};
@@ -220,9 +220,10 @@ impl AgentActionDefinition {
         }
     }
 
-    fn text(&self) -> Option<&Value> {
+    fn text(&self) -> Option<(&Value, usize, &'static str)> {
         match self {
-            Self::Send { text, .. } | Self::Steer { text, .. } => Some(text),
+            Self::Send { text, .. } => Some((text, MAX_EVENT_BYTES, "64 KiB persisted-text bound")),
+            Self::Steer { text, .. } => Some((text, MAX_TEXT_BYTES, "512 KiB text bound")),
             _ => None,
         }
     }
@@ -469,9 +470,12 @@ pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<SubmitCom
             "rule action must match the event-time Agent and generation",
         ));
     }
+    let verb = action.verb();
     let args = action
         .text()
-        .map(|text| render_text(text, &roots))
+        .map(|(text, max_bytes, limit_label)| {
+            render_text(text, &roots, max_bytes, verb, limit_label)
+        })
         .transpose()?
         .map_or_else(|| json!({}), |text| json!({"text": text}));
     let expected_turn_id = action
@@ -736,8 +740,8 @@ fn validate_event_action(action: &ActionDefinition) -> Result<(), Error> {
             ));
         }
     }
-    if let Some(text) = action.text() {
-        validate_text_template(text, true)?;
+    if let Some((text, max_bytes, limit_label)) = action.text() {
+        validate_text_template(text, true, max_bytes, action.verb(), limit_label)?;
     }
     if let Some((expected_turn_id, verb)) = action.turn_binding() {
         let source = expected_turn_id.as_str().ok_or_else(|| {
@@ -776,7 +780,8 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
             expected_generation,
             text,
         } => {
-            validate_text_template(text, false)?;
+            let (_, max_bytes, limit_label) = action.text().expect("Send action has text");
+            validate_text_template(text, false, max_bytes, action.verb(), limit_label)?;
             (
                 target,
                 expected_generation,
@@ -845,21 +850,27 @@ fn submit_command(
     }
 }
 
-fn validate_text_template(value: &Value, allow_templates: bool) -> Result<(), Error> {
+fn validate_text_template(
+    value: &Value,
+    allow_templates: bool,
+    max_bytes: usize,
+    verb: &str,
+    limit_label: &str,
+) -> Result<(), Error> {
     let text = value
         .as_str()
-        .ok_or_else(|| Error::new("invalid", "send action text must be a string"))?;
-    if text.len() > MAX_EVENT_BYTES {
+        .ok_or_else(|| Error::new("invalid", format!("{verb} action text must be a string")))?;
+    if text.len() > max_bytes {
         return Err(Error::new(
             "invalid",
-            "send action text exceeds the 64 KiB persisted-text bound",
+            format!("{verb} action text exceeds the {limit_label}"),
         ));
     }
     let parts = parse_template(text)?;
     if !allow_templates && has_templates(&parts) {
         Err(Error::new(
             "invalid",
-            "timer send text cannot use templates without event data",
+            format!("timer {verb} text cannot use templates without event data"),
         ))
     } else {
         Ok(())
@@ -1111,10 +1122,16 @@ fn render_exact_string(value: &Value, roots: &TemplateRoots<'_>) -> Result<Strin
     Ok(rendered.to_owned())
 }
 
-fn render_text(value: &Value, roots: &TemplateRoots<'_>) -> Result<String, Error> {
+fn render_text(
+    value: &Value,
+    roots: &TemplateRoots<'_>,
+    max_bytes: usize,
+    verb: &str,
+    limit_label: &str,
+) -> Result<String, Error> {
     let source = value
         .as_str()
-        .ok_or_else(|| Error::new("invalid", "send action text must be a string"))?;
+        .ok_or_else(|| Error::new("invalid", format!("{verb} action text must be a string")))?;
     let parts = parse_template(source)?;
     if let [TemplatePart::Placeholder(path)] = parts.as_slice() {
         let text = lookup(path, roots.event, roots.subject, roots.data)
@@ -1122,13 +1139,13 @@ fn render_text(value: &Value, roots: &TemplateRoots<'_>) -> Result<String, Error
             .ok_or_else(|| {
                 Error::new(
                     "invalid",
-                    "send text template is unavailable or not a string",
+                    format!("{verb} text template is unavailable or not a string"),
                 )
             })?;
-        if text.len() > MAX_EVENT_BYTES {
+        if text.len() > max_bytes {
             return Err(Error::new(
                 "invalid",
-                "rendered send text exceeds the 64 KiB persisted-text bound",
+                format!("rendered {verb} text exceeds the {limit_label}"),
             ));
         }
         return Ok(text.to_owned());
@@ -1143,20 +1160,26 @@ fn render_text(value: &Value, roots: &TemplateRoots<'_>) -> Result<String, Error
                 .ok_or_else(|| {
                     Error::new(
                         "invalid",
-                        "send text template is unavailable or not a string",
+                        format!("{verb} text template is unavailable or not a string"),
                     )
                 })?,
         };
-        push_bounded_text(&mut rendered, fragment)?;
+        push_bounded_text(&mut rendered, fragment, max_bytes, verb, limit_label)?;
     }
     Ok(rendered)
 }
 
-fn push_bounded_text(target: &mut String, fragment: &str) -> Result<(), Error> {
-    if fragment.len() > MAX_EVENT_BYTES.saturating_sub(target.len()) {
+fn push_bounded_text(
+    target: &mut String,
+    fragment: &str,
+    max_bytes: usize,
+    verb: &str,
+    limit_label: &str,
+) -> Result<(), Error> {
+    if fragment.len() > max_bytes.saturating_sub(target.len()) {
         return Err(Error::new(
             "invalid",
-            "rendered send text exceeds the 64 KiB persisted-text bound",
+            format!("rendered {verb} text exceeds the {limit_label}"),
         ));
     }
     target.push_str(fragment);
@@ -1648,6 +1671,49 @@ do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${eve
         assert_eq!(
             error.message,
             "steer expected_turn_id must match event.data.turn_id"
+        );
+    }
+
+    #[test]
+    fn steer_uses_core_text_bound_for_literal_and_rendered_text() {
+        let literal = "x".repeat(MAX_EVENT_BYTES + 1);
+        let literal_action = format!("text = '{literal}'");
+        let literal_source = STEER_RULE.replace("text = 'Steer: ${data.status}'", &literal_action);
+        assert!(literal_source.len() < MAX_RULE_FILE_BYTES);
+        let literal_rule = load(Cursor::new(literal_source)).unwrap().remove(0);
+        let mut literal_event = event();
+        literal_event.kind = "turn.started".to_owned();
+        let literal_command = evaluate(&literal_rule, &literal_event).unwrap().unwrap();
+        assert_eq!(
+            literal_command.args["text"].as_str().unwrap(),
+            literal.as_str()
+        );
+
+        let event_text = "t".repeat(60_000);
+        let mut event = event();
+        event.kind = "turn.started".to_owned();
+        event.data["status"] = Value::String(event_text.clone());
+        assert!(serde_json::to_vec(&event.data).unwrap().len() < MAX_EVENT_BYTES);
+
+        let accepted_source =
+            STEER_RULE.replace("Steer: ${data.status}", "${data.status}${data.status}");
+        let accepted = load(Cursor::new(accepted_source)).unwrap().remove(0);
+        let accepted_text = evaluate(&accepted, &event).unwrap().unwrap().args["text"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(accepted_text.len() > MAX_EVENT_BYTES);
+        assert!(accepted_text.len() <= MAX_TEXT_BYTES);
+        assert_eq!(accepted_text, event_text.repeat(2));
+
+        let oversized_template = "${data.status}".repeat(9);
+        let oversized_source = STEER_RULE.replace("Steer: ${data.status}", &oversized_template);
+        let oversized = load(Cursor::new(oversized_source)).unwrap().remove(0);
+        let error = evaluate(&oversized, &event).unwrap_err();
+        assert_eq!(error.code, "invalid");
+        assert_eq!(
+            error.message,
+            "rendered steer text exceeds the 512 KiB text bound"
         );
     }
 
