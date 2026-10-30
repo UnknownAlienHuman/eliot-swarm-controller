@@ -394,6 +394,79 @@ fn command_events<'a>(events: &'a [Value], kind: &str, command_id: &str) -> Vec<
         .collect()
 }
 
+fn wait_for_run_outcome(fixture: &Fixture, run_id: &str) -> CoreCommand {
+    serde_json::from_value(fixture.wait_command(run_id, "terminal"))
+        .expect("typed settled Run command")
+}
+
+fn run_outcome_code(command: &CoreCommand, field: &str) -> String {
+    command
+        .outcome
+        .as_ref()
+        .and_then(|outcome| outcome.get(field))
+        .and_then(Value::as_str)
+        .filter(|value| {
+            value.len() <= 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        })
+        .unwrap_or("missing")
+        .to_owned()
+}
+
+fn assert_run_state(command: &CoreCommand, expected: CommandState) {
+    if command.state == expected {
+        return;
+    }
+
+    let process = command
+        .outcome
+        .as_ref()
+        .and_then(|outcome| outcome.get("process"));
+    let direct_exit = process.and_then(|process| process.get("direct_exit"));
+    let stderr = process.and_then(|process| process.get("stderr"));
+    let quiescent = process
+        .and_then(|process| process.get("quiescent"))
+        .and_then(Value::as_bool)
+        .map_or_else(|| "missing".to_owned(), |value| value.to_string());
+    let exit_success = direct_exit
+        .and_then(|exit| exit.get("success"))
+        .and_then(Value::as_bool)
+        .map_or_else(|| "missing".to_owned(), |value| value.to_string());
+    let exit_code = direct_exit
+        .and_then(|exit| exit.get("exit_code"))
+        .and_then(Value::as_i64)
+        .map_or_else(|| "none".to_owned(), |value| value.to_string());
+    let stderr_flag = |name| {
+        stderr
+            .and_then(|snapshot| snapshot.get(name))
+            .and_then(Value::as_bool)
+            .map_or_else(|| "missing".to_owned(), |value| value.to_string())
+    };
+    let custody = process
+        .and_then(|process| process.get("custody"))
+        .and_then(Value::as_str)
+        .filter(|value| matches!(*value, "exact" | "degraded" | "unknown"))
+        .unwrap_or("other");
+    let exit_state = direct_exit
+        .and_then(|exit| exit.get("state"))
+        .and_then(Value::as_str)
+        .filter(|value| matches!(*value, "unknown" | "exited"))
+        .unwrap_or("other");
+
+    panic!(
+        "Run state mismatch: expected={expected:?} actual={:?} code={} cause={} custody={custody} quiescent={quiescent} direct_exit_state={exit_state} direct_exit_success={exit_success} direct_exit_code={exit_code} stderr_present={} stderr_truncated={} stderr_eof={} stderr_read_error={}",
+        command.state,
+        run_outcome_code(command, "code"),
+        run_outcome_code(command, "cause"),
+        stderr.is_some_and(|snapshot| !snapshot.is_null()),
+        stderr_flag("truncated"),
+        stderr_flag("eof"),
+        stderr_flag("read_error"),
+    );
+}
+
 fn script_context(
     path: &std::path::Path,
     trigger_command_id: &str,
@@ -475,15 +548,14 @@ fn project_event_run_reads_own_command_and_admits_one_scoped_send() {
     assert_eq!(rule_children.len(), 1);
     assert_eq!(rule_children[0].as_str(), Some(run_id.as_str()));
 
-    let run: CoreCommand = serde_json::from_value(fixture.wait_command(&run_id, "applied"))
-        .expect("typed successful targetless Run command");
+    let run = wait_for_run_outcome(&fixture, &run_id);
     assert_eq!(run.id, run_id);
     assert_eq!(run.verb, "run");
     assert_eq!(run.target, None);
     assert_eq!(run.expected_generation, None);
     assert_eq!(run.generation, None);
     assert_eq!(run.principal, project_principal);
-    assert_eq!(run.state, CommandState::Applied);
+    assert_run_state(&run, CommandState::Applied);
     let applied: ScriptRunApplied =
         serde_json::from_value(run.outcome.as_ref().expect("applied Run outcome").clone())
             .expect("typed applied Run outcome");
@@ -647,11 +719,10 @@ fn project_event_run_rejects_late_invalid_record_before_any_send_dispatch() {
         .as_str()
         .expect("firing's Run command")
         .to_owned();
-    let run: CoreCommand = serde_json::from_value(fixture.wait_command(&run_id, "failed"))
-        .expect("typed failed Run command");
+    let run = wait_for_run_outcome(&fixture, &run_id);
     assert_eq!(run.verb, "run");
     assert_eq!(run.principal, format!("project:{PROJECT_ID}"));
-    assert_eq!(run.state, CommandState::Failed);
+    assert_run_state(&run, CommandState::Failed);
     assert_eq!(
         run.outcome
             .as_ref()
