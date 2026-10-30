@@ -40,6 +40,7 @@ const PROVIDER_QUOTA_FIXTURE_INPUT: &str = "[eliot_fake_provider_quota]";
 const PROVIDER_AUTH_FIXTURE_INPUT: &str = "[eliot_fake_provider_auth]";
 const PROVIDER_MODEL_REMOVED_FIXTURE_INPUT: &str = "[eliot_fake_provider_model_removed]";
 const HANDOFF_FIXTURE_INPUT: &str = "[fake:source-handoff]";
+const HOLD_TURN_FIXTURE_INPUT: &str = "[fake:hold-turn]";
 const LIVE_OBSERVER_SUBJECT: &str = "fake-discovered-2";
 const LIVE_OBSERVER_TS: i64 = 1_730_000_000_000;
 
@@ -660,11 +661,14 @@ async fn handle_command(
     let params: AgentCommandParams = decode_params(raw_params)?;
     validate_agent_identity(&params.agent_id, params.generation, &params.command_id)?;
     validate_existing_binding(state, &params.agent_id, params.generation)?;
+    if params.verb == "interrupt" {
+        return handle_interrupt(&params, state, client).await;
+    }
     if params.verb != "send" {
         return Err(domain_error(
             "unsupported",
             -32602,
-            "fake plugin implements only the send verb",
+            "fake plugin implements only the send and interrupt verbs",
         ));
     }
     if state.batch_unknown {
@@ -741,7 +745,12 @@ async fn handle_command(
             return Err(error);
         }
     }
-    let mut batch = send_batch(&params, &turn_id, text);
+    let hold_turn = text == HOLD_TURN_FIXTURE_INPUT;
+    let mut batch = if hold_turn {
+        held_turn_batch(&params, &turn_id)
+    } else {
+        send_batch(&params, &turn_id, text)
+    };
     batch.source = state
         .publish_source
         .as_deref()
@@ -753,6 +762,11 @@ async fn handle_command(
     state.active_command_id = Some(params.command_id.clone());
     match commit_batch(state, batch, &credential, client).await {
         Ok(_) => {
+            if hold_turn {
+                // `turn.started` committed the ordinary SEND association. Keep
+                // this one explicit fixture turn open for an exact INTERRUPT.
+                return Ok(json!({"state":"applied", "turn_id":turn_id}));
+            }
             state.phase = SessionPhase::Idle;
             state.active_turn = None;
             state.active_command_id = None;
@@ -787,6 +801,88 @@ async fn handle_command(
     }
 }
 
+fn interrupt_rejection(state: &FakeState, params: &AgentCommandParams) -> Option<Value> {
+    let (code, reason) = if params.request_id.is_some()
+        || !params.args.as_object().is_some_and(|args| args.is_empty())
+    {
+        ("invalid", "interrupt accepts no request id or arguments")
+    } else if state.phase != SessionPhase::Busy
+        || state.active_turn.as_deref() != params.turn_id.as_deref()
+        || state.active_command_id.is_none()
+    {
+        (
+            "stale_generation",
+            "interrupt turn does not match the exact active turn",
+        )
+    } else {
+        return None;
+    };
+    Some(json!({
+        "state":"rejected",
+        "code":code,
+        "message":reason,
+        "command_id":params.command_id,
+        "turn_id":params.turn_id,
+    }))
+}
+
+async fn handle_interrupt(
+    params: &AgentCommandParams,
+    state: &mut FakeState,
+    client: &PeerClient,
+) -> Result<Value, RpcError> {
+    if state.batch_unknown || state.phase == SessionPhase::Unknown {
+        return Err(unknown_effect());
+    }
+    if let Some(rejection) = interrupt_rejection(state, params) {
+        return Ok(rejection);
+    }
+    let turn_id = params
+        .turn_id
+        .as_deref()
+        .ok_or_else(|| domain_error("stale_generation", -32033, "interrupt turn id is absent"))?;
+    let source_command_id = state
+        .active_command_id
+        .as_deref()
+        .ok_or_else(|| domain_error("source_integrity", -32603, "active SEND binding is absent"))?;
+    let credential = state.credential.clone().ok_or_else(not_initialized)?;
+    let mut batch = interrupted_turn_batch(
+        &params.agent_id,
+        params.generation,
+        &params.command_id,
+        source_command_id,
+        turn_id,
+    );
+    batch.source = state
+        .publish_source
+        .as_deref()
+        .unwrap_or("stream")
+        .to_owned();
+    state.phase = SessionPhase::Stopping;
+
+    match commit_batch(state, batch, &credential, client).await {
+        Ok(_) => {
+            state.phase = SessionPhase::Idle;
+            state.active_turn = None;
+            state.active_command_id = None;
+            Ok(json!({
+                "state":"applied",
+                "command_id":params.command_id,
+                "turn_id":turn_id,
+            }))
+        }
+        Err(failure) => {
+            state.phase = if failure.uncertain {
+                state.batch_unknown = true;
+                SessionPhase::Unknown
+            } else {
+                SessionPhase::Busy
+            };
+            Err(failure.error)
+        }
+    }
+}
+
 async fn handle_stop(
     raw_params: &Value,
     state: &mut FakeState,
@@ -804,39 +900,69 @@ async fn handle_stop(
         return Ok(json!({"state": "applied"}));
     }
     // Service stop promptly, but never publish a second batch over an unknown one.
-    if state.batch_unknown {
+    if state.batch_unknown || state.phase == SessionPhase::Unknown {
         return Err(unknown_effect());
     }
-    if state.phase != SessionPhase::Idle {
-        return Err(domain_error(
-            "bad_state",
-            -32028,
-            "stop requires a ready session with no unresolved batch",
-        ));
-    }
+    let busy_turn = match state.phase {
+        SessionPhase::Idle => None,
+        SessionPhase::Busy => {
+            let turn_id = state.active_turn.clone().ok_or_else(|| {
+                domain_error(
+                    "bad_state",
+                    -32028,
+                    "busy stop requires an exact active turn",
+                )
+            })?;
+            let send_command_id = state.active_command_id.clone().ok_or_else(|| {
+                domain_error(
+                    "bad_state",
+                    -32028,
+                    "busy stop requires its active SEND binding",
+                )
+            })?;
+            Some((turn_id, send_command_id))
+        }
+        _ => {
+            return Err(domain_error(
+                "bad_state",
+                -32028,
+                "stop requires an idle session or exact active turn",
+            ));
+        }
+    };
+    let was_busy = busy_turn.is_some();
 
     let credential = state.credential.clone().ok_or_else(not_initialized)?;
-    let mut batch = session_ended_batch(&params.agent_id, params.generation);
+    let mut batch = match busy_turn {
+        Some((turn_id, send_command_id)) => busy_stop_batch(
+            &params.agent_id,
+            params.generation,
+            &params.command_id,
+            &send_command_id,
+            &turn_id,
+        ),
+        None => session_ended_batch(&params.agent_id, params.generation),
+    };
     batch.source = state
         .publish_source
         .as_deref()
         .unwrap_or("stream")
         .to_owned();
     state.phase = SessionPhase::Stopping;
-    state.stop_command_id = Some(params.command_id);
 
     match commit_batch(state, batch, &credential, client).await {
         Ok(_) => {
             state.phase = SessionPhase::Stopped;
             state.active_turn = None;
             state.active_command_id = None;
+            state.stop_command_id = Some(params.command_id);
             Ok(json!({"state": "applied"}))
         }
         Err(failure) => {
-            state.phase = if failure.uncertain {
-                SessionPhase::Unknown
-            } else {
-                SessionPhase::Idle
+            state.phase = match (failure.uncertain, was_busy) {
+                (true, _) => SessionPhase::Unknown,
+                (false, true) => SessionPhase::Busy,
+                (false, false) => SessionPhase::Idle,
             };
             Err(failure.error)
         }
@@ -919,6 +1045,73 @@ fn session_ready_batch(agent_id: &str, generation: i64) -> SourceBatch {
         }],
         cursor: None,
     }
+}
+
+fn held_turn_batch(params: &AgentCommandParams, turn_id: &str) -> SourceBatch {
+    let prefix = format!(
+        "fake:{}:{}:{}",
+        params.agent_id, params.generation, params.command_id
+    );
+    SourceBatch {
+        batch_id: format!("{prefix}:held-turn"),
+        agent_id: params.agent_id.clone(),
+        generation: params.generation,
+        source: "stream".to_owned(),
+        events: vec![NativeEvent {
+            kind: "turn.started".to_owned(),
+            native_id: format!("{prefix}:turn.started"),
+            ts: None,
+            data: json!({"command_id":params.command_id, "turn_id":turn_id}),
+        }],
+        cursor: None,
+    }
+}
+
+fn interrupted_turn_batch(
+    agent_id: &str,
+    generation: i64,
+    terminal_command_id: &str,
+    send_command_id: &str,
+    turn_id: &str,
+) -> SourceBatch {
+    let prefix = format!("fake:{agent_id}:{generation}:{send_command_id}");
+    SourceBatch {
+        batch_id: format!("{prefix}:terminal:{terminal_command_id}"),
+        agent_id: agent_id.to_owned(),
+        generation,
+        source: "stream".to_owned(),
+        events: vec![NativeEvent {
+            kind: "turn.completed".to_owned(),
+            native_id: format!("{prefix}:turn.completed"),
+            ts: None,
+            data: json!({
+                "command_id":send_command_id,
+                "turn_id":turn_id,
+                "status":"interrupted",
+            }),
+        }],
+        cursor: None,
+    }
+}
+
+fn busy_stop_batch(
+    agent_id: &str,
+    generation: i64,
+    stop_command_id: &str,
+    send_command_id: &str,
+    turn_id: &str,
+) -> SourceBatch {
+    let mut batch = interrupted_turn_batch(
+        agent_id,
+        generation,
+        stop_command_id,
+        send_command_id,
+        turn_id,
+    );
+    batch
+        .events
+        .extend(session_ended_batch(agent_id, generation).events);
+    batch
 }
 
 fn send_batch(params: &AgentCommandParams, turn_id: &str, text: &str) -> SourceBatch {
@@ -1479,6 +1672,86 @@ mod provider_hold_tests {
             .data
             .clone();
         (completed, batch.events)
+    }
+
+    fn interrupt(turn_id: &str) -> AgentCommandParams {
+        AgentCommandParams {
+            agent_id: "fake-agent".to_owned(),
+            generation: 1,
+            command_id: "interrupt-1".to_owned(),
+            verb: "interrupt".to_owned(),
+            args: json!({}),
+            turn_id: Some(turn_id.to_owned()),
+            request_id: None,
+        }
+    }
+
+    #[test]
+    fn hold_turn_fixture_commits_only_its_exact_started_turn() {
+        let mut command = command(HOLD_TURN_FIXTURE_INPUT);
+        command.command_id = "send-held".to_owned();
+        let batch = held_turn_batch(&command, "turn-held");
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0].kind, "turn.started");
+        assert_eq!(batch.events[0].data["command_id"], "send-held");
+        assert_eq!(batch.events[0].data["turn_id"], "turn-held");
+    }
+
+    #[test]
+    fn interrupt_requires_exact_active_turn_and_never_retargets_mismatch() {
+        let state = FakeState {
+            phase: SessionPhase::Busy,
+            active_turn: Some("turn-current".to_owned()),
+            active_command_id: Some("send-current".to_owned()),
+            ..FakeState::default()
+        };
+        let mismatched = interrupt("turn-old");
+        let rejected = interrupt_rejection(&state, &mismatched).unwrap();
+        assert_eq!(rejected["state"], "rejected");
+        assert_eq!(rejected["code"], "stale_generation");
+        assert_eq!(rejected["turn_id"], "turn-old");
+        assert!(matches!(state.phase, SessionPhase::Busy));
+        assert_eq!(state.active_turn.as_deref(), Some("turn-current"));
+        assert_eq!(state.active_command_id.as_deref(), Some("send-current"));
+
+        assert!(interrupt_rejection(&state, &interrupt("turn-current")).is_none());
+    }
+
+    #[test]
+    fn interrupt_terminal_event_binds_the_original_send_and_exact_turn() {
+        let interrupt = interrupt("turn-current");
+        let batch = interrupted_turn_batch(
+            &interrupt.agent_id,
+            interrupt.generation,
+            &interrupt.command_id,
+            "send-current",
+            "turn-current",
+        );
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0].kind, "turn.completed");
+        assert_eq!(batch.events[0].data["command_id"], "send-current");
+        assert_eq!(batch.events[0].data["turn_id"], "turn-current");
+        assert_eq!(batch.events[0].data["status"], "interrupted");
+    }
+
+    #[test]
+    fn busy_stop_binds_interrupted_turn_to_send_before_ending_session() {
+        let batch = busy_stop_batch(
+            "fake-agent",
+            1,
+            "stop-current",
+            "send-current",
+            "turn-current",
+        );
+        assert_eq!(batch.agent_id, "fake-agent");
+        assert_eq!(batch.generation, 1);
+        assert_eq!(batch.events.len(), 2);
+        assert_eq!(batch.events[0].kind, "turn.completed");
+        assert_eq!(batch.events[0].data["command_id"], "send-current");
+        assert_eq!(batch.events[0].data["turn_id"], "turn-current");
+        assert_eq!(batch.events[0].data["status"], "interrupted");
+        assert_eq!(batch.events[1].kind, "session.ended");
+        assert_eq!(batch.events[1].data, empty_object());
     }
 
     #[test]

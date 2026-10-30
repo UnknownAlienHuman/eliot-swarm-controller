@@ -164,6 +164,37 @@ fn send_request(agent: &str, generation: i64, text: &str) -> SubmitCommand {
     request
 }
 
+fn start_fake_turn(store: &mut Store, agent: &str, now: i64) -> String {
+    let send = send_request(agent, 1, "fake interrupt turn");
+    let send_id = send.id.clone();
+    store
+        .submit("owner", send, now)
+        .expect("admit Fake turn input");
+    store
+        .dispatch(&send_id, now + 1)
+        .expect("dispatch Fake turn input");
+    let turn_id = format!("fake-turn-{send_id}");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("fake-interrupt-{send_id}"),
+                agent_id: agent.to_owned(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "turn.started".to_owned(),
+                    native_id: format!("fake-interrupt-{send_id}:started"),
+                    data: json!({"command_id":send_id,"turn_id":turn_id.clone()}),
+                }],
+                cursor: None,
+            },
+            now + 2,
+        )
+        .expect("commit Fake active turn");
+    turn_id
+}
+
 fn project_send_rule_input(id: &str) -> RuleDefinitionInput {
     let value = json!({
         "id": id,
@@ -1069,6 +1100,141 @@ fn history_project_rule_send_rejects_rebinding_old_event_to_current_generation()
         event_seq,
         "history rejection does not rewind or move the live cursor",
     );
+}
+
+#[test]
+fn project_fake_interrupt_requires_explicit_action_approval() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let project = "fake-interrupt-approval";
+    let principal = format!("project:{project}");
+    let agent = ready_agent(&mut store, project, now);
+    let turn_id = start_fake_turn(&mut store, &agent, now + 1);
+    let mut registration = ProjectRegistrationInput {
+        id: project.to_owned(),
+        checkout: "synthetic-workspace".to_owned(),
+        repo_common_dir: "synthetic-workspace/.git".to_owned(),
+        profiles: vec!["fake".to_owned()],
+        actions: vec!["send".to_owned()],
+    };
+    store
+        .upsert_project_registration("owner", &registration, now + 4)
+        .expect("register Fake profile with SEND only");
+
+    let mut denied = SubmitCommand::new(Ulid::new().to_string(), "interrupt");
+    denied.target = Some(agent.clone());
+    denied.args = json!({});
+    denied.expected_generation = Some(1);
+    denied.expected_turn_id = Some(turn_id.clone());
+    let denied_id = denied.id.clone();
+    let before_denial = store.high_water().expect("read event high water");
+    assert_eq!(
+        store.submit(&principal, denied, now + 5).unwrap_err().code,
+        "not_allowed"
+    );
+    assert!(store.get_command(&denied_id).unwrap().is_none());
+    assert_eq!(store.high_water().unwrap(), before_denial);
+
+    registration.actions = vec!["interrupt".to_owned()];
+    store
+        .upsert_project_registration("owner", &registration, now + 6)
+        .expect("approve the interrupt action explicitly");
+    let mut approved = SubmitCommand::new(Ulid::new().to_string(), "interrupt");
+    approved.target = Some(agent);
+    approved.args = json!({});
+    approved.expected_generation = Some(1);
+    approved.expected_turn_id = Some(turn_id.clone());
+    let approved_id = approved.id.clone();
+    let admission = store
+        .submit(&principal, approved, now + 7)
+        .expect("admit explicitly approved project interrupt");
+    assert_eq!(admission.command.turn_id.as_deref(), Some(turn_id.as_str()));
+    assert_eq!(
+        store.dispatch(&approved_id, now + 8).unwrap().value.state,
+        CommandState::Dispatched
+    );
+}
+
+#[test]
+fn fake_interrupt_admits_and_dispatches_only_for_its_exact_active_turn() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let agent = ready_agent(&mut store, "fake-interrupt-current-turn", now);
+    let turn_id = start_fake_turn(&mut store, &agent, now + 1);
+    let mut interrupt = SubmitCommand::new(Ulid::new().to_string(), "interrupt");
+    interrupt.target = Some(agent);
+    interrupt.args = json!({});
+    interrupt.expected_generation = Some(1);
+    interrupt.expected_turn_id = Some(turn_id.clone());
+    let interrupt_id = interrupt.id.clone();
+    let admitted = store
+        .submit("owner", interrupt, now + 4)
+        .expect("admit exact Fake interrupt");
+    assert_eq!(admitted.command.turn_id.as_deref(), Some(turn_id.as_str()));
+    assert_eq!(
+        store.dispatch(&interrupt_id, now + 5).unwrap().value.state,
+        CommandState::Dispatched
+    );
+}
+
+#[test]
+fn fake_interrupt_rejects_stale_bindings_and_keeps_other_controls_unsupported() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let agent = ready_agent(&mut store, "fake-interrupt-stale-turn", now);
+    let turn_id = start_fake_turn(&mut store, &agent, now + 1);
+
+    let mut stale_turn = SubmitCommand::new(Ulid::new().to_string(), "interrupt");
+    stale_turn.target = Some(agent.clone());
+    stale_turn.args = json!({});
+    stale_turn.expected_generation = Some(1);
+    stale_turn.expected_turn_id = Some("fake-turn-old".to_owned());
+    let stale_turn_id = stale_turn.id.clone();
+    let before_stale_turn = store.high_water().unwrap();
+    assert_eq!(
+        store.submit("owner", stale_turn, now + 4).unwrap_err().code,
+        "stale_generation"
+    );
+    assert!(store.get_command(&stale_turn_id).unwrap().is_none());
+    assert_eq!(store.high_water().unwrap(), before_stale_turn);
+
+    let mut stale_generation = SubmitCommand::new(Ulid::new().to_string(), "interrupt");
+    stale_generation.target = Some(agent.clone());
+    stale_generation.args = json!({});
+    stale_generation.expected_generation = Some(2);
+    stale_generation.expected_turn_id = Some(turn_id.clone());
+    let stale_generation_id = stale_generation.id.clone();
+    let before_stale_generation = store.high_water().unwrap();
+    assert_eq!(
+        store
+            .submit("owner", stale_generation, now + 5)
+            .unwrap_err()
+            .code,
+        "stale_generation"
+    );
+    assert!(store.get_command(&stale_generation_id).unwrap().is_none());
+    assert_eq!(store.high_water().unwrap(), before_stale_generation);
+
+    for verb in ["steer", "approve", "deny", "answer"] {
+        let mut request = SubmitCommand::new(Ulid::new().to_string(), verb);
+        request.target = Some(agent.clone());
+        request.args = if verb == "steer" {
+            json!({"text":"unsupported Fake steer"})
+        } else {
+            json!({})
+        };
+        request.expected_generation = Some(1);
+        request.expected_turn_id = Some(turn_id.clone());
+        let command_id = request.id.clone();
+        let before_unsupported = store.high_water().unwrap();
+        assert_eq!(
+            store.submit("owner", request, now + 6).unwrap_err().code,
+            "unsupported",
+            "Fake {verb} remains unsupported",
+        );
+        assert!(store.get_command(&command_id).unwrap().is_none());
+        assert_eq!(store.high_water().unwrap(), before_unsupported);
+    }
 }
 
 #[test]

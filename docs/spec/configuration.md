@@ -146,7 +146,7 @@ fingerprint_max_bytes = 67108864
 [projects.app]
 path = "C:/src/app"
 profiles = ["codex-luna"]
-actions = ["send", "stop"]
+actions = ["interrupt", "send", "stop"]
 
 [accounts.codex-main]
 max_live = 8

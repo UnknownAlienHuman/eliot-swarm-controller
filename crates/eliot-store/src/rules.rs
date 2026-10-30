@@ -1147,7 +1147,7 @@ impl Store {
         let mut parent = None;
         let mut child = None;
         if let Some(action) = slot.action {
-            let rejected = if !valid_rule_action_request(&action) {
+            let rejected = if !valid_rule_action_request(&action, false) {
                 Some("rule_action_binding_invalid".to_owned())
             } else {
                 match validate_project_rule_action_tx(&tx, principal, &action) {
@@ -1317,7 +1317,7 @@ impl Store {
             ));
         }
         validate_id_age(&request.id, now)?;
-        if !valid_rule_action_request(&action) {
+        if !valid_rule_action_request(&action, false) {
             return Err(Error::new(
                 "invalid",
                 "timer action is not a valid rule action",
@@ -2114,7 +2114,7 @@ fn validate_timer_slot(slot: &TimerSlotCommit, now: i64) -> Result<()> {
     Ok(())
 }
 
-fn valid_rule_action_request(request: &SubmitCommand) -> bool {
+fn valid_rule_action_request(request: &SubmitCommand, allow_interrupt: bool) -> bool {
     if request.validate().is_err()
         || !request
             .target
@@ -2123,7 +2123,6 @@ fn valid_rule_action_request(request: &SubmitCommand) -> bool {
         || !request
             .expected_generation
             .is_some_and(|generation| generation >= 0)
-        || request.expected_turn_id.is_some()
         || request.request_id.is_some()
         || request.probe
     {
@@ -2131,14 +2130,26 @@ fn valid_rule_action_request(request: &SubmitCommand) -> bool {
     }
 
     match request.verb.as_str() {
-        "stop" => request.args.as_object().is_some_and(|args| {
-            args.iter()
-                .all(|(key, value)| key == "force" && value == &Value::Bool(false))
-        }),
-        "send" => request
-            .args
-            .as_object()
-            .is_some_and(|args| args.len() == 1 && args.get("text").is_some_and(Value::is_string)),
+        "stop" => {
+            request.expected_turn_id.is_none()
+                && request.args.as_object().is_some_and(|args| {
+                    args.iter()
+                        .all(|(key, value)| key == "force" && value == &Value::Bool(false))
+                })
+        }
+        "send" => {
+            request.expected_turn_id.is_none()
+                && request.args.as_object().is_some_and(|args| {
+                    args.len() == 1 && args.get("text").is_some_and(Value::is_string)
+                })
+        }
+        "interrupt" if allow_interrupt => {
+            request
+                .expected_turn_id
+                .as_deref()
+                .is_some_and(|turn_id| !turn_id.is_empty())
+                && request.args.as_object().is_some_and(|args| args.is_empty())
+        }
         _ => false,
     }
 }
@@ -2678,7 +2689,10 @@ fn derived_manual_timer_id(principal: &str, rule: &str, mutation_id: &str) -> Re
 
 fn load_rule_trigger(tx: &Transaction<'_>, event_seq: i64) -> Result<StoredRuleTrigger> {
     tx.query_row(
-        "SELECT kind, agent, generation, cause FROM events WHERE seq = ?1",
+        "SELECT kind, agent, generation, cause,
+                CASE WHEN json_type(data, '$.turn_id') = 'text'
+                     THEN json_extract(data, '$.turn_id') END
+         FROM events WHERE seq = ?1",
         [event_seq],
         |row| {
             Ok(StoredRuleTrigger {
@@ -2686,6 +2700,7 @@ fn load_rule_trigger(tx: &Transaction<'_>, event_seq: i64) -> Result<StoredRuleT
                 agent: row.get(1)?,
                 generation: row.get(2)?,
                 encoded_cause: row.get(3)?,
+                turn_id: row.get(4)?,
                 cause: None,
             })
         },
@@ -2704,15 +2719,18 @@ struct StoredRuleTrigger {
     agent: Option<i64>,
     generation: Option<i64>,
     encoded_cause: Option<String>,
+    turn_id: Option<String>,
     cause: Option<core::EventCause>,
 }
 
 fn rule_action_binding_error(event: &StoredRuleTrigger, request: &SubmitCommand) -> Option<String> {
-    if !valid_rule_action_request(request) {
+    if !valid_rule_action_request(request, true) {
         return Some("rule_action_binding_invalid".to_owned());
     }
     if request.target != event.agent.map(format_agent_id)
         || request.expected_generation != event.generation
+        || (request.verb == "interrupt"
+            && request.expected_turn_id.as_deref() != event.turn_id.as_deref())
     {
         return Some("rule_action_binding_invalid".to_owned());
     }
@@ -3252,6 +3270,365 @@ mod tests {
         request.target = Some(agent.to_owned());
         request.expected_generation = Some(1);
         request
+    }
+
+    fn interrupt_request(agent: &str, generation: i64, turn_id: Option<&str>) -> SubmitCommand {
+        let mut request = SubmitCommand::new("", "interrupt");
+        request.target = Some(agent.to_owned());
+        request.expected_generation = Some(generation);
+        request.expected_turn_id = turn_id.map(str::to_owned);
+        request
+    }
+
+    fn set_interrupt_test_turn(store: &mut Store, agent: i64, turn_id: &str) {
+        store
+            .connection
+            .execute(
+                "UPDATE agents SET harness = 'codex', state = 'busy', active_turn = ?1
+                 WHERE id = ?2",
+                params![turn_id, agent],
+            )
+            .unwrap();
+    }
+
+    fn insert_test_interrupt_event(
+        store: &mut Store,
+        agent: i64,
+        generation: i64,
+        turn_id: Option<&str>,
+        now: i64,
+    ) -> i64 {
+        let data = match turn_id {
+            Some(turn_id) => json!({"turn_id": turn_id}),
+            None => json!({}),
+        };
+        let tx = store
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let event = insert_event(
+            &tx,
+            EventInsert {
+                ts: now,
+                kind: "turn.started",
+                family: Some("turn"),
+                agent: Some(agent),
+                generation: Some(generation),
+                source: "stream",
+                native_id: None,
+                cursor: None,
+                payload_digest: None,
+                subject: None,
+                cause: None,
+                data,
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        event.seq
+    }
+
+    #[test]
+    fn event_interrupt_binds_exact_turn_and_replays_the_same_child() {
+        let mut store = store();
+        let (agent, agent_id) = insert_test_agent(&mut store);
+        set_interrupt_test_turn(&mut store, agent, "turn-captured");
+        let rule = definition("interrupt-rule", true);
+        let state = store.ensure_rule_state("owner", &rule, 10).unwrap();
+        let event_seq =
+            insert_test_interrupt_event(&mut store, agent, 1, Some("turn-captured"), 11);
+        let request = interrupt_request(&agent_id, 1, Some("turn-captured"));
+        assert!(valid_rule_action_request(&request, true));
+        assert!(!valid_rule_action_request(&request, false));
+
+        let first = store
+            .admit_rule_action("owner", &state, event_seq, request.clone(), 12)
+            .unwrap();
+        assert!(first.is_new);
+        let parent_id = first.parent.as_ref().expect("admitted parent").id.clone();
+        let child = first.child.as_ref().expect("admitted interrupt child");
+        assert_eq!(child.verb, "interrupt");
+        assert_eq!(child.target.as_deref(), Some(agent_id.as_str()));
+        assert_eq!(child.expected_generation, Some(1));
+        assert_eq!(child.turn_id.as_deref(), Some("turn-captured"));
+        assert_eq!(child.state, CommandState::Accepted);
+        let child_id = child.id.clone();
+        let retained_expected_turn: Option<String> = store
+            .connection
+            .query_row(
+                "SELECT expected_turn_id FROM commands WHERE id = ?1",
+                [&child_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained_expected_turn.as_deref(), Some("turn-captured"));
+
+        let replay = store
+            .admit_rule_action("owner", &state, event_seq, request, 13)
+            .unwrap();
+        assert!(!replay.is_new);
+        assert_eq!(replay.parent.as_ref().unwrap().id, parent_id);
+        assert_eq!(replay.child.as_ref().unwrap().id, child_id);
+        assert!(replay.events.is_empty());
+        assert!(store.get_command(&child_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn event_interrupt_rejects_wrong_agent_generation_or_missing_captured_turn() {
+        for mismatch in [
+            "agent",
+            "generation",
+            "missing_event_turn",
+            "missing_request_turn",
+        ] {
+            let mut store = store();
+            let (agent, agent_id) = insert_test_agent(&mut store);
+            set_interrupt_test_turn(&mut store, agent, "turn-captured");
+            if mismatch == "generation" {
+                store
+                    .connection
+                    .execute("UPDATE agents SET generation = 2 WHERE id = ?1", [agent])
+                    .unwrap();
+            }
+            let other = if mismatch == "agent" {
+                let (other, other_id) = insert_test_agent(&mut store);
+                set_interrupt_test_turn(&mut store, other, "turn-captured");
+                Some(other_id)
+            } else {
+                None
+            };
+            let rule = definition("interrupt-negative", true);
+            let state = store.ensure_rule_state("owner", &rule, 20).unwrap();
+            let event_turn = (mismatch != "missing_event_turn").then_some("turn-captured");
+            let event_seq = insert_test_interrupt_event(&mut store, agent, 1, event_turn, 21);
+            let (target, generation) = match mismatch {
+                "agent" => (other.as_deref().unwrap(), 1),
+                "generation" => (agent_id.as_str(), 2),
+                "missing_event_turn" | "missing_request_turn" => (agent_id.as_str(), 1),
+                _ => unreachable!(),
+            };
+            let request_turn = (mismatch != "missing_request_turn").then_some("turn-captured");
+            let request = interrupt_request(target, generation, request_turn);
+
+            let admission = store
+                .admit_rule_action("owner", &state, event_seq, request, 22)
+                .unwrap();
+            assert!(admission.child.is_none(), "{mismatch} created a child");
+            assert_eq!(admission.state.current_cursor, event_seq);
+            let parent = admission.parent.expect("committed rejection parent");
+            assert_eq!(parent.state, CommandState::Rejected);
+            assert_eq!(parent.outcome.as_ref().unwrap()["children"], json!([]));
+            assert_eq!(
+                parent.outcome.as_ref().unwrap()["code"],
+                "rule_action_binding_invalid"
+            );
+            let child_id =
+                derived_rule_id("action-0", "owner", &rule.id, state.revision, event_seq).unwrap();
+            assert!(store.get_command(&child_id).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn historical_interrupt_does_not_retarget_a_new_active_turn() {
+        let mut store = store();
+        let request_id = Ulid::new();
+        let now = i64::try_from(request_id.timestamp_ms()).unwrap() + 10;
+        let (agent, agent_id) = insert_test_agent(&mut store);
+        set_interrupt_test_turn(&mut store, agent, "turn-current");
+        let rule = definition("history-interrupt", true);
+        let state = store.ensure_rule_state("owner", &rule, now - 2).unwrap();
+        let event_seq =
+            insert_test_interrupt_event(&mut store, agent, 1, Some("turn-historical"), now - 1);
+        let advanced = store
+            .advance_rule_cursor("owner", &state, event_seq, RuleCursorOutcome::NoMatch, now)
+            .unwrap();
+        let request = core::api::RuleCatchUpRequest::new(
+            request_id.to_string(),
+            rule.id.as_str(),
+            state.current_cursor,
+            Some(event_seq),
+        );
+        let actions = [RuleCatchUpAction {
+            event_seq,
+            request: interrupt_request(&agent_id, 1, Some("turn-historical")),
+        }];
+        let high_water = store.high_water().unwrap();
+
+        let first = store
+            .admit_rule_catch_up(
+                "owner",
+                &request,
+                &advanced.value,
+                event_seq,
+                &actions,
+                now + 1,
+            )
+            .unwrap();
+        assert!(first.is_new);
+        assert_eq!(first.parent.state, CommandState::Applied);
+        assert!(first.children.is_empty());
+        let outcome = first.parent.outcome.as_ref().expect("catch-up outcome");
+        assert_eq!(outcome["children"], json!([]));
+        assert!(outcome.get("code").is_none());
+        let rejected = first
+            .events
+            .iter()
+            .find(|event| {
+                event.kind == "rule.rejected"
+                    && event.data["parent_command"] == request.id
+                    && event.data["event_seq"] == event_seq
+            })
+            .expect("stale historical interrupt rejection marker");
+        assert_eq!(rejected.data["code"], "stale_generation");
+        assert_eq!(
+            first
+                .events
+                .iter()
+                .filter(|event| {
+                    event.kind == "rule.rejected"
+                        && event.data["parent_command"] == request.id
+                        && event.data["event_seq"] == event_seq
+                })
+                .count(),
+            1
+        );
+        let child_id =
+            derived_rule_id("action-0", "owner", &rule.id, state.revision, event_seq).unwrap();
+        assert!(store.get_command(&child_id).unwrap().is_none());
+        let committed_high_water = store.high_water().unwrap();
+        assert!(committed_high_water > high_water);
+        assert_eq!(
+            store
+                .get_rule_state("owner", &rule.id)
+                .unwrap()
+                .unwrap()
+                .current_cursor,
+            event_seq
+        );
+
+        let replay = store
+            .admit_rule_catch_up(
+                "owner",
+                &request,
+                &advanced.value,
+                event_seq,
+                &actions,
+                now + 2,
+            )
+            .unwrap();
+        assert!(!replay.is_new);
+        assert_eq!(replay.parent.id, first.parent.id);
+        assert_eq!(replay.parent.state, CommandState::Applied);
+        assert!(replay.children.is_empty());
+        assert!(replay.events.is_empty());
+        assert_eq!(store.high_water().unwrap(), committed_high_water);
+    }
+
+    #[test]
+    fn catch_up_failed_first_submit_does_not_consume_rate_limit() {
+        let mut store = store();
+        let request_id = Ulid::new();
+        let now = i64::try_from(request_id.timestamp_ms()).unwrap() + 10;
+        let (agent, agent_id) = insert_test_agent(&mut store);
+        set_interrupt_test_turn(&mut store, agent, "turn-current");
+
+        let mut rule = definition("history-interrupt-limit", true);
+        let mut canonical: Value = serde_json::from_str(&rule.canonical_definition).unwrap();
+        canonical["limit"] = json!({
+            "max": 1,
+            "per": "rule",
+            "window_ms": RULE_ACTION_WINDOW_MS,
+        });
+        rule.canonical_definition = serde_json::to_string(&canonical).unwrap();
+        rule.definition_digest = core::canonical_json_sha256(&canonical).unwrap();
+
+        let state = store.ensure_rule_state("owner", &rule, now - 3).unwrap();
+        let stale_event =
+            insert_test_interrupt_event(&mut store, agent, 1, Some("turn-historical"), now - 2);
+        let current_event =
+            insert_test_interrupt_event(&mut store, agent, 1, Some("turn-current"), now - 1);
+        assert!(stale_event < current_event);
+        let advanced = store
+            .advance_rule_cursor(
+                "owner",
+                &state,
+                current_event,
+                RuleCursorOutcome::NoMatch,
+                now,
+            )
+            .unwrap();
+        let request = core::api::RuleCatchUpRequest::new(
+            request_id.to_string(),
+            rule.id.as_str(),
+            state.current_cursor,
+            Some(current_event),
+        );
+        let actions = [
+            RuleCatchUpAction {
+                event_seq: stale_event,
+                request: interrupt_request(&agent_id, 1, Some("turn-historical")),
+            },
+            RuleCatchUpAction {
+                event_seq: current_event,
+                request: interrupt_request(&agent_id, 1, Some("turn-current")),
+            },
+        ];
+
+        let admission = store
+            .admit_rule_catch_up(
+                "owner",
+                &request,
+                &advanced.value,
+                current_event,
+                &actions,
+                now + 1,
+            )
+            .unwrap();
+        assert!(admission.is_new);
+        assert_eq!(admission.parent.state, CommandState::Applied);
+        assert_eq!(admission.children.len(), 1);
+        let admitted_child = &admission.children[0];
+        assert_eq!(admitted_child.verb, "interrupt");
+        assert_eq!(admitted_child.turn_id.as_deref(), Some("turn-current"));
+        assert_eq!(
+            admission.parent.outcome.as_ref().unwrap()["children"],
+            json!([admitted_child.id.clone()])
+        );
+        let stale_child_id =
+            derived_rule_id("action-0", "owner", &rule.id, state.revision, stale_event).unwrap();
+        assert!(store.get_command(&stale_child_id).unwrap().is_none());
+
+        let rejected = admission
+            .events
+            .iter()
+            .find(|event| {
+                event.kind == "rule.rejected"
+                    && event.data["event_seq"] == stale_event
+                    && event.data["parent_command"] == request.id
+            })
+            .expect("failed first action has a rejection marker");
+        assert_eq!(rejected.data["code"], "stale_generation");
+        let fired = admission
+            .events
+            .iter()
+            .find(|event| {
+                event.kind == "rule.fired"
+                    && event.data["event_seq"] == current_event
+                    && event.data["child_command"] == admitted_child.id
+            })
+            .expect("valid second action is admitted");
+        assert_eq!(fired.data["parent_command"], request.id);
+
+        let linked_children: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM commands
+                 WHERE parent_command = ?1 AND link_kind = 'rule_action'",
+                [&admission.parent.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(linked_children, 1);
     }
 
     #[test]

@@ -352,6 +352,63 @@ pub(crate) fn validate_private_file(path: &Path) -> Result<()> {
     validate_current_user_acl(path, false)
 }
 
+#[cfg(test)]
+pub(super) fn set_test_untrusted_file_acl(path: &Path) -> Result<()> {
+    let sddl_wide: Vec<u16> = "D:P(A;;FA;;;WD)".encode_utf16().chain(Some(0)).collect();
+    let mut raw_descriptor = null_mut();
+    // SAFETY: sddl_wide is NUL-terminated and raw_descriptor is writable.
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl_wide.as_ptr(),
+            1,
+            &mut raw_descriptor,
+            null_mut(),
+        )
+    } == 0
+    {
+        return Err(io_error(
+            "build test-only untrusted ACL",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    let descriptor = LocalSecurityDescriptor(raw_descriptor);
+    let mut present = 0;
+    let mut defaulted = 0;
+    let mut dacl = null_mut();
+    // SAFETY: the descriptor is valid and all output pointers are writable.
+    if unsafe { GetSecurityDescriptorDacl(descriptor.0, &mut present, &mut dacl, &mut defaulted) }
+        == 0
+        || present == 0
+        || dacl.is_null()
+    {
+        return Err(Error::new(
+            "platform_acl",
+            "Windows did not produce the test-only DACL",
+        ));
+    }
+
+    let path_wide = wide_path(path);
+    // SAFETY: the path and descriptor remain live through the ACL update.
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            path_wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            dacl,
+            null(),
+        )
+    };
+    if status != 0 {
+        return Err(io_error(
+            "install test-only untrusted ACL",
+            std::io::Error::from_raw_os_error(status as i32),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn replace_file(source: &Path, target: &Path) -> Result<()> {
     let source_wide = wide_path(source);
     let target_wide = wide_path(target);

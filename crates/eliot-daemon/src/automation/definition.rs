@@ -81,6 +81,11 @@ enum ActionDefinition {
         expected_generation: Value,
         text: Value,
     },
+    Interrupt {
+        target: Value,
+        expected_generation: Value,
+        expected_turn_id: Value,
+    },
 }
 
 #[derive(Deserialize)]
@@ -122,7 +127,9 @@ impl CompiledMatch {
 impl ActionDefinition {
     fn target(&self) -> &Value {
         match self {
-            Self::Stop { target, .. } | Self::Send { target, .. } => target,
+            Self::Stop { target, .. }
+            | Self::Send { target, .. }
+            | Self::Interrupt { target, .. } => target,
         }
     }
 
@@ -135,6 +142,10 @@ impl ActionDefinition {
             | Self::Send {
                 expected_generation,
                 ..
+            }
+            | Self::Interrupt {
+                expected_generation,
+                ..
             } => expected_generation,
         }
     }
@@ -143,6 +154,7 @@ impl ActionDefinition {
         match self {
             Self::Stop { .. } => "stop",
             Self::Send { .. } => "send",
+            Self::Interrupt { .. } => "interrupt",
         }
     }
 }
@@ -361,9 +373,32 @@ pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<SubmitCom
             "rule action must match the event-time Agent and generation",
         ));
     }
-    let args = match action {
-        ActionDefinition::Stop { .. } => json!({}),
-        ActionDefinition::Send { text, .. } => json!({"text": render_text(text, &roots)?}),
+    let (args, expected_turn_id) = match action {
+        ActionDefinition::Stop { .. } => (json!({}), None),
+        ActionDefinition::Send { text, .. } => (json!({"text": render_text(text, &roots)?}), None),
+        ActionDefinition::Interrupt {
+            expected_turn_id, ..
+        } => {
+            let rendered_turn_id = render_exact_string(expected_turn_id, &roots)?;
+            let event_turn_id = event
+                .data
+                .get("turn_id")
+                .and_then(Value::as_str)
+                .filter(|turn_id| !turn_id.trim().is_empty())
+                .ok_or_else(|| {
+                    Error::new(
+                        "invalid",
+                        "interrupt requires event.data.turn_id as a string",
+                    )
+                })?;
+            if rendered_turn_id != event_turn_id {
+                return Err(Error::new(
+                    "invalid",
+                    "interrupt expected_turn_id must match event.data.turn_id",
+                ));
+            }
+            (json!({}), Some(event_turn_id.to_owned()))
+        }
     };
 
     Ok(Some(submit_command(
@@ -371,6 +406,7 @@ pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<SubmitCom
         target,
         generation,
         args,
+        expected_turn_id,
     )))
 }
 
@@ -413,7 +449,7 @@ fn reject_unimplemented_options(raw: &toml::Value) -> Result<(), Error> {
                         .as_table()
                         .and_then(|action| action.get("action"))
                         .and_then(toml::Value::as_str)
-                        .is_some_and(|action| !matches!(action, "stop" | "send"))
+                        .is_some_and(|action| !matches!(action, "stop" | "send" | "interrupt"))
                 })
             });
     if has_unsupported_trigger || has_unsupported_selector || has_unsupported_action {
@@ -582,6 +618,21 @@ fn validate_event_action(action: &ActionDefinition) -> Result<(), Error> {
     if let ActionDefinition::Send { text, .. } = action {
         validate_text_template(text, true)?;
     }
+    if let ActionDefinition::Interrupt {
+        expected_turn_id, ..
+    } = action
+    {
+        let source = expected_turn_id
+            .as_str()
+            .ok_or_else(|| Error::new("invalid", "interrupt expected_turn_id must be a string"))?;
+        let parts = parse_template(source)?;
+        if source.trim().is_empty() || (has_templates(&parts) && !is_whole_template(&parts)) {
+            return Err(Error::new(
+                "invalid",
+                "interrupt expected_turn_id must be a literal or whole-value template",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -590,8 +641,31 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
         .actions
         .first()
         .ok_or_else(|| Error::new("invalid", "rule has no action"))?;
-    let target = action
-        .target()
+    let (target_value, generation_value, args) = match action {
+        ActionDefinition::Stop {
+            target,
+            expected_generation,
+        } => (target, expected_generation, json!({})),
+        ActionDefinition::Send {
+            target,
+            expected_generation,
+            text,
+        } => {
+            validate_text_template(text, false)?;
+            (
+                target,
+                expected_generation,
+                json!({"text": text.as_str().expect("validated send text")}),
+            )
+        }
+        ActionDefinition::Interrupt { .. } => {
+            return Err(Error::new(
+                "unsupported",
+                "interrupt actions require an event trigger",
+            ));
+        }
+    };
+    let target = target_value
         .as_str()
         .ok_or_else(|| Error::new("invalid", "timer action target must be a string"))?;
     if has_templates(&parse_template(target)?) {
@@ -603,8 +677,7 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
     ensure_agent_id_capacity(target.len())?;
     parse_agent_id(target)
         .map_err(|_| Error::new("invalid", "timer action target is not a canonical Agent id"))?;
-    let expected_generation = action
-        .expected_generation()
+    let expected_generation = generation_value
         .as_i64()
         .filter(|generation| *generation >= 0)
         .ok_or_else(|| {
@@ -613,29 +686,29 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
                 "timer action generation must be a nonnegative integer without templates",
             )
         })?;
-    let args = match action {
-        ActionDefinition::Stop { .. } => json!({}),
-        ActionDefinition::Send { text, .. } => {
-            validate_text_template(text, false)?;
-            json!({"text": text.as_str().expect("validated send text")})
-        }
-    };
     Ok(submit_command(
         action.verb(),
         target.to_owned(),
         expected_generation,
         args,
+        None,
     ))
 }
 
-fn submit_command(verb: &str, target: String, generation: i64, args: Value) -> SubmitCommand {
+fn submit_command(
+    verb: &str,
+    target: String,
+    generation: i64,
+    args: Value,
+    expected_turn_id: Option<String>,
+) -> SubmitCommand {
     SubmitCommand {
         id: String::new(),
         target: Some(target),
         verb: verb.to_owned(),
         args,
         expected_generation: Some(generation),
-        expected_turn_id: None,
+        expected_turn_id,
         request_id: None,
         probe: false,
     }
@@ -876,6 +949,37 @@ fn render_generation(value: &Value, roots: &TemplateRoots<'_>) -> Result<Value, 
         .ok_or_else(|| Error::new("invalid", "action generation template is unavailable"))
 }
 
+fn render_exact_string(value: &Value, roots: &TemplateRoots<'_>) -> Result<String, Error> {
+    let source = value
+        .as_str()
+        .ok_or_else(|| Error::new("invalid", "interrupt expected_turn_id must be a string"))?;
+    let parts = parse_template(source)?;
+    let rendered = match parts.as_slice() {
+        [TemplatePart::Placeholder(path)] => lookup(path, roots.event, roots.subject, roots.data)
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                Error::new(
+                    "invalid",
+                    "interrupt expected_turn_id template is unavailable or not a string",
+                )
+            })?,
+        [TemplatePart::Literal(_)] => source,
+        _ => {
+            return Err(Error::new(
+                "invalid",
+                "interrupt expected_turn_id must occupy the whole value",
+            ));
+        }
+    };
+    if rendered.trim().is_empty() {
+        return Err(Error::new(
+            "invalid",
+            "interrupt expected_turn_id cannot be empty",
+        ));
+    }
+    Ok(rendered.to_owned())
+}
+
 fn render_text(value: &Value, roots: &TemplateRoots<'_>) -> Result<String, Error> {
     let source = value
         .as_str()
@@ -946,6 +1050,13 @@ do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${eve
 id = 'send-on-result'
 on = { event = 'turn.completed' }
 do = [{ action = 'send', target = '${event.agent}', expected_generation = '${event.generation}', text = 'Result: ${data.status}' }]
+"#;
+
+    const INTERRUPT_RULE: &str = r#"
+[[rule]]
+id = 'interrupt-on-turn-start'
+on = { event = 'turn.started' }
+do = [{ action = 'interrupt', target = '${event.agent}', expected_generation = '${event.generation}', expected_turn_id = '${event.data.turn_id}' }]
 "#;
 
     const INTERVAL_TIMER: &str = r#"
@@ -1191,6 +1302,59 @@ do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${eve
             "text = '${agent.turn_id}'",
         );
         assert_eq!(load(Cursor::new(unknown_root)).unwrap_err().code, "invalid");
+    }
+
+    #[test]
+    fn interrupt_action_uses_exact_persisted_event_turn_id() {
+        let rule = load(Cursor::new(INTERRUPT_RULE)).unwrap().remove(0);
+        let mut event = event();
+        event.kind = "turn.started".to_owned();
+        let command = evaluate(&rule, &event).unwrap().unwrap();
+        assert_eq!(command.id, "");
+        assert_eq!(command.verb, "interrupt");
+        assert_eq!(command.target.as_deref(), Some("a7"));
+        assert_eq!(command.expected_generation, Some(3));
+        assert_eq!(command.expected_turn_id.as_deref(), Some("turn-id"));
+        assert_eq!(command.request_id, None);
+        assert_eq!(command.args, json!({}));
+        assert_eq!(rule.evaluate_timer().unwrap_err().code, "unsupported");
+    }
+
+    #[test]
+    fn interrupt_action_rejects_missing_mismatched_and_nonstring_turn_ids() {
+        let rule = load(Cursor::new(INTERRUPT_RULE)).unwrap().remove(0);
+
+        let mut missing = event();
+        missing.kind = "turn.started".to_owned();
+        missing.data.as_object_mut().unwrap().remove("turn_id");
+        assert_eq!(evaluate(&rule, &missing).unwrap_err().code, "invalid");
+
+        let mismatched_rule = INTERRUPT_RULE.replace(
+            "expected_turn_id = '${event.data.turn_id}'",
+            "expected_turn_id = '${event.data.other_turn}'",
+        );
+        let mismatched_rule = load(Cursor::new(mismatched_rule)).unwrap().remove(0);
+        let mut mismatched = event();
+        mismatched.kind = "turn.started".to_owned();
+        mismatched.data["other_turn"] = json!("other-turn");
+        assert_eq!(
+            evaluate(&mismatched_rule, &mismatched).unwrap_err().code,
+            "invalid"
+        );
+
+        let mut nonstring = event();
+        nonstring.kind = "turn.started".to_owned();
+        nonstring.data["turn_id"] = json!(1);
+        assert_eq!(evaluate(&rule, &nonstring).unwrap_err().code, "invalid");
+    }
+
+    #[test]
+    fn interrupt_action_is_unsupported_for_timers() {
+        let timer = INTERVAL_TIMER.replace(
+            "action = 'stop'",
+            "action = 'interrupt', expected_turn_id = '${event.data.turn_id}'",
+        );
+        assert_eq!(load(Cursor::new(timer)).unwrap_err().code, "unsupported");
     }
 
     #[test]

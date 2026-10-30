@@ -1573,10 +1573,10 @@ impl Router {
         prepared: PreparedSubmission,
     ) -> Result<Option<eliot_store::RuleEventAdmission>> {
         let PreparedSubmission { request, workspace } = prepared;
-        if !matches!(request.verb.as_str(), "stop" | "send") || workspace.is_some() {
+        if !matches!(request.verb.as_str(), "stop" | "send" | "interrupt") || workspace.is_some() {
             return Err(Error::new(
                 "invalid",
-                "rule firing must contain one prepared stop or send command",
+                "rule firing must contain one prepared stop, send, or interrupt command",
             ));
         }
         let admission = {
@@ -2627,7 +2627,7 @@ impl Router {
                 self.reject_undispatched(&id, &error.code).await;
                 return;
             }
-            if matches!(command.verb.as_str(), "stop" | "send") {
+            if matches!(command.verb.as_str(), "stop" | "send" | "interrupt") {
                 let (Some(target), Some(generation)) =
                     (command.target.as_deref(), command.generation)
                 else {
@@ -4263,7 +4263,7 @@ fn is_native_control_verb(verb: &str) -> bool {
 
 fn authorize_command(principal: &Principal, request: &mut SubmitCommand) -> Result<()> {
     if let Principal::ProjectRule { registration } = principal {
-        if !matches!(request.verb.as_str(), "stop" | "send")
+        if !matches!(request.verb.as_str(), "stop" | "send" | "interrupt")
             || !registration
                 .actions
                 .iter()

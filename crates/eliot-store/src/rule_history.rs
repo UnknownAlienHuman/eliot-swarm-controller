@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 struct PlannedAction {
     event_seq: i64,
     child_id: String,
-    request: SubmitCommand,
+    admission: Admission,
     cause: core::EventCause,
 }
 
@@ -268,10 +268,33 @@ impl Store {
                 rule: Some(request.rule.clone()),
                 depth,
             };
+            tx.execute_batch("SAVEPOINT rule_catch_up_action")
+                .map_err(sql_error)?;
+            let mut admission = match submit_tx(&tx, principal, child_request, None, now, true) {
+                Ok(admission) if admission.is_new => admission,
+                Ok(_) => {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "new rule catch-up child already exists",
+                    ));
+                }
+                Err(error) if deterministic_rule_rejection(&error) => {
+                    tx.execute_batch(
+                        "ROLLBACK TO rule_catch_up_action; RELEASE rule_catch_up_action",
+                    )
+                    .map_err(sql_error)?;
+                    rejected.push((action.event_seq, error.code));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            annotate_rule_command_event(&tx, &child_id, &mut admission.events, cause.clone())?;
+            tx.execute_batch("RELEASE rule_catch_up_action")
+                .map_err(sql_error)?;
             planned.push(PlannedAction {
                 event_seq: action.event_seq,
                 child_id,
-                request: child_request,
+                admission,
                 cause,
             });
             *scoped_added.entry(bucket).or_default() += 1;
@@ -306,20 +329,13 @@ impl Store {
         let mut events = Vec::new();
         let mut fired = Vec::with_capacity(planned.len());
         for action in planned {
-            let mut admission = submit_tx(&tx, principal, action.request, None, now, true)?;
-            if !admission.is_new {
-                return Err(Error::new(
-                    "source_integrity",
-                    "new rule catch-up child already exists",
-                ));
-            }
+            let PlannedAction {
+                event_seq,
+                admission,
+                cause,
+                ..
+            } = action;
             let child = admission.command;
-            annotate_rule_command_event(
-                &tx,
-                &child.id,
-                &mut admission.events,
-                action.cause.clone(),
-            )?;
             let linked = tx
                 .execute(
                     "UPDATE commands SET parent_command = ?1, link_kind = 'rule_action', ordinal = ?2
@@ -335,7 +351,7 @@ impl Store {
                 ));
             }
             events.extend(admission.events);
-            fired.push((action.event_seq, child.id.clone(), action.cause));
+            fired.push((event_seq, child.id.clone(), cause));
             children.push(child);
         }
         events.push(parent_event);

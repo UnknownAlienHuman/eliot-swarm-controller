@@ -171,7 +171,7 @@ impl DataDir {
             Err(error) => return Err(io_error("inspect daemon metadata", error)),
             Ok(_) => {}
         }
-        ensure_private_file(&path)?;
+        validate_private_file(&path)?;
         let bytes = fs::read(&path).map_err(|error| io_error("read daemon metadata", error))?;
         let info: DaemonInfo = serde_json::from_slice(&bytes)
             .map_err(|error| Error::new("daemon_metadata", error.to_string()))?;
@@ -529,4 +529,77 @@ fn io_error(action: &str, error: std::io::Error) -> Error {
 
 fn unavailable(message: &str) -> Error {
     Error::new("data_dir_unavailable", message)
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    struct TestRoot {
+        base: PathBuf,
+        path: PathBuf,
+    }
+
+    impl TestRoot {
+        fn new() -> Self {
+            let base = fs::canonicalize(std::env::temp_dir()).expect("canonical temp directory");
+            let path = base.join(format!("eliot-daemon-read-acl-{}", ulid::Ulid::new()));
+            fs::create_dir(&path).expect("create private metadata test root");
+            Self { base, path }
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            if self.path.parent() == Some(self.base.as_path())
+                && self
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("eliot-daemon-read-acl-"))
+            {
+                let _ = fs::remove_dir_all(&self.path);
+            }
+        }
+    }
+
+    #[test]
+    fn daemon_metadata_read_rejects_and_preserves_unsafe_acl() {
+        let root = TestRoot::new();
+        let data = DataDir::open(&root.path).expect("initialize private data directory");
+        let metadata_path = data.path().join(DAEMON_INFO_FILE);
+        let metadata = DaemonInfo {
+            boot_id: "test-boot".to_owned(),
+            pid: 1,
+            process_birth: "test-birth".to_owned(),
+            endpoint: "test-endpoint".to_owned(),
+            diagnostic_version: "test-version".to_owned(),
+        };
+        fs::write(
+            &metadata_path,
+            serde_json::to_vec(&metadata).expect("encode fixture daemon metadata"),
+        )
+        .expect("write fixture daemon metadata");
+        super::super::windows::set_test_untrusted_file_acl(&metadata_path)
+            .expect("install deterministic Everyone DACL");
+
+        assert_eq!(
+            validate_private_file(&metadata_path)
+                .expect_err("fixture DACL must be rejected before read")
+                .code,
+            "unsafe_data_dir"
+        );
+        assert_eq!(
+            data.read_daemon_info()
+                .expect_err("read must not repair an unsafe metadata ACL")
+                .code,
+            "unsafe_data_dir"
+        );
+        assert_eq!(
+            validate_private_file(&metadata_path)
+                .expect_err("read must leave the unsafe DACL in place")
+                .code,
+            "unsafe_data_dir"
+        );
+    }
 }
