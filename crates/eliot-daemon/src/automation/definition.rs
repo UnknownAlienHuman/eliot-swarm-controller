@@ -94,6 +94,25 @@ enum AgentActionDefinition {
         expected_turn_id: Value,
         text: Value,
     },
+    Approve {
+        target: Value,
+        expected_generation: Value,
+        expected_turn_id: Value,
+        request_id: Value,
+    },
+    Deny {
+        target: Value,
+        expected_generation: Value,
+        expected_turn_id: Value,
+        request_id: Value,
+    },
+    Answer {
+        target: Value,
+        expected_generation: Value,
+        expected_turn_id: Value,
+        request_id: Value,
+        answers: BTreeMap<String, Value>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -195,7 +214,10 @@ impl AgentActionDefinition {
             Self::Stop { target, .. }
             | Self::Send { target, .. }
             | Self::Interrupt { target, .. }
-            | Self::Steer { target, .. } => target,
+            | Self::Steer { target, .. }
+            | Self::Approve { target, .. }
+            | Self::Deny { target, .. }
+            | Self::Answer { target, .. } => target,
         }
     }
 
@@ -214,6 +236,18 @@ impl AgentActionDefinition {
                 ..
             }
             | Self::Steer {
+                expected_generation,
+                ..
+            }
+            | Self::Approve {
+                expected_generation,
+                ..
+            }
+            | Self::Deny {
+                expected_generation,
+                ..
+            }
+            | Self::Answer {
                 expected_generation,
                 ..
             } => expected_generation,
@@ -236,6 +270,31 @@ impl AgentActionDefinition {
             Self::Steer {
                 expected_turn_id, ..
             } => Some((expected_turn_id, "steer")),
+            Self::Approve {
+                expected_turn_id, ..
+            } => Some((expected_turn_id, "approve")),
+            Self::Deny {
+                expected_turn_id, ..
+            } => Some((expected_turn_id, "deny")),
+            Self::Answer {
+                expected_turn_id, ..
+            } => Some((expected_turn_id, "answer")),
+            _ => None,
+        }
+    }
+
+    fn request_binding(&self) -> Option<(&Value, &'static str)> {
+        match self {
+            Self::Approve { request_id, .. } => Some((request_id, "approve")),
+            Self::Deny { request_id, .. } => Some((request_id, "deny")),
+            Self::Answer { request_id, .. } => Some((request_id, "answer")),
+            _ => None,
+        }
+    }
+
+    fn answers(&self) -> Option<&BTreeMap<String, Value>> {
+        match self {
+            Self::Answer { answers, .. } => Some(answers),
             _ => None,
         }
     }
@@ -246,6 +305,9 @@ impl AgentActionDefinition {
             Self::Send { .. } => "send",
             Self::Interrupt { .. } => "interrupt",
             Self::Steer { .. } => "steer",
+            Self::Approve { .. } => "approve",
+            Self::Deny { .. } => "deny",
+            Self::Answer { .. } => "answer",
         }
     }
 }
@@ -477,10 +539,20 @@ pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<SubmitCom
             render_text(text, &roots, max_bytes, verb, limit_label)
         })
         .transpose()?
-        .map_or_else(|| json!({}), |text| json!({"text": text}));
+        .map(|text| json!({"text": text}))
+        .or_else(|| action.answers().map(|answers| json!({"answers": answers})))
+        .unwrap_or_else(|| json!({}));
     let expected_turn_id = action
         .turn_binding()
-        .map(|(source, verb)| render_event_turn_id(source, &roots, event, verb))
+        .map(|(source, verb)| {
+            render_event_binding(source, &roots, event, verb, "turn_id", "expected_turn_id")
+        })
+        .transpose()?;
+    let request_id = action
+        .request_binding()
+        .map(|(source, verb)| {
+            render_event_binding(source, &roots, event, verb, "request_id", "request_id")
+        })
         .transpose()?;
 
     Ok(Some(submit_command(
@@ -489,31 +561,34 @@ pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<SubmitCom
         generation,
         args,
         expected_turn_id,
+        request_id,
     )))
 }
 
-fn render_event_turn_id(
+fn render_event_binding(
     source: &Value,
     roots: &TemplateRoots<'_>,
     event: &Event,
     verb: &str,
+    event_field: &str,
+    action_field: &str,
 ) -> Result<String, Error> {
-    let rendered_turn_id = render_exact_string(source, roots)?;
+    let rendered_event_field = render_exact_string(source, roots, verb, action_field)?;
     let event_turn_id = event
         .data
-        .get("turn_id")
+        .get(event_field)
         .and_then(Value::as_str)
         .filter(|turn_id| !turn_id.trim().is_empty())
         .ok_or_else(|| {
             Error::new(
                 "invalid",
-                format!("{verb} requires event.data.turn_id as a string"),
+                format!("{verb} requires event.data.{event_field} as a string"),
             )
         })?;
-    if rendered_turn_id != event_turn_id {
+    if rendered_event_field != event_turn_id {
         return Err(Error::new(
             "invalid",
-            format!("{verb} expected_turn_id must match event.data.turn_id"),
+            format!("{verb} {action_field} must match event.data.{event_field}"),
         ));
     }
     Ok(event_turn_id.to_owned())
@@ -569,7 +644,17 @@ fn reject_unimplemented_options(raw: &toml::Value) -> Result<(), Error> {
                         .and_then(|action| action.get("action"))
                         .and_then(toml::Value::as_str)
                         .is_some_and(|action| {
-                            !matches!(action, "stop" | "send" | "interrupt" | "steer" | "run")
+                            !matches!(
+                                action,
+                                "stop"
+                                    | "send"
+                                    | "interrupt"
+                                    | "steer"
+                                    | "approve"
+                                    | "deny"
+                                    | "answer"
+                                    | "run"
+                            )
                         })
                 })
             });
@@ -613,6 +698,14 @@ fn validate_rule(rule: &mut RuleDefinition) -> Result<(), Error> {
         }
         if !is_default_catch_up(&rule.catch_up) {
             return Err(Error::new("invalid", "catch_up requires a timer trigger"));
+        }
+        if matches!(action, ActionDefinition::Agent(agent) if agent.request_binding().is_some())
+            && event != "request.opened"
+        {
+            return Err(Error::new(
+                "invalid",
+                "request reply actions require a request.opened trigger",
+            ));
         }
         validate_event_matches(&mut rule.trigger)?;
         validate_event_action(action)?;
@@ -744,19 +837,28 @@ fn validate_event_action(action: &ActionDefinition) -> Result<(), Error> {
         validate_text_template(text, true, max_bytes, action.verb(), limit_label)?;
     }
     if let Some((expected_turn_id, verb)) = action.turn_binding() {
-        let source = expected_turn_id.as_str().ok_or_else(|| {
-            Error::new(
-                "invalid",
-                format!("{verb} expected_turn_id must be a string"),
-            )
-        })?;
-        let parts = parse_template(source)?;
-        if source.trim().is_empty() || (has_templates(&parts) && !is_whole_template(&parts)) {
-            return Err(Error::new(
-                "invalid",
-                format!("{verb} expected_turn_id must be a literal or whole-value template"),
-            ));
-        }
+        validate_event_binding_template(expected_turn_id, verb, "expected_turn_id")?;
+    }
+    if let Some((request_id, verb)) = action.request_binding() {
+        validate_event_binding_template(request_id, verb, "request_id")?;
+    }
+    Ok(())
+}
+
+fn validate_event_binding_template(
+    value: &Value,
+    verb: &str,
+    action_field: &str,
+) -> Result<(), Error> {
+    let source = value
+        .as_str()
+        .ok_or_else(|| Error::new("invalid", format!("{verb} {action_field} must be a string")))?;
+    let parts = parse_template(source)?;
+    if source.trim().is_empty() || (has_templates(&parts) && !is_whole_template(&parts)) {
+        return Err(Error::new(
+            "invalid",
+            format!("{verb} {action_field} must be a literal or whole-value template"),
+        ));
     }
     Ok(())
 }
@@ -800,6 +902,14 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
                 "steer actions require an event trigger",
             ));
         }
+        AgentActionDefinition::Approve { .. }
+        | AgentActionDefinition::Deny { .. }
+        | AgentActionDefinition::Answer { .. } => {
+            return Err(Error::new(
+                "unsupported",
+                "request reply actions require an event trigger",
+            ));
+        }
     };
     let target = target_value
         .as_str()
@@ -828,6 +938,7 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
         expected_generation,
         args,
         None,
+        None,
     ))
 }
 
@@ -837,6 +948,7 @@ fn submit_command(
     generation: i64,
     args: Value,
     expected_turn_id: Option<String>,
+    request_id: Option<String>,
 ) -> SubmitCommand {
     SubmitCommand {
         id: String::new(),
@@ -845,7 +957,7 @@ fn submit_command(
         args,
         expected_generation: Some(generation),
         expected_turn_id,
-        request_id: None,
+        request_id,
         probe: false,
     }
 }
@@ -1091,10 +1203,15 @@ fn render_generation(value: &Value, roots: &TemplateRoots<'_>) -> Result<Value, 
         .ok_or_else(|| Error::new("invalid", "action generation template is unavailable"))
 }
 
-fn render_exact_string(value: &Value, roots: &TemplateRoots<'_>) -> Result<String, Error> {
+fn render_exact_string(
+    value: &Value,
+    roots: &TemplateRoots<'_>,
+    verb: &str,
+    field: &str,
+) -> Result<String, Error> {
     let source = value
         .as_str()
-        .ok_or_else(|| Error::new("invalid", "interrupt expected_turn_id must be a string"))?;
+        .ok_or_else(|| Error::new("invalid", format!("{verb} {field} must be a string")))?;
     let parts = parse_template(source)?;
     let rendered = match parts.as_slice() {
         [TemplatePart::Placeholder(path)] => lookup(path, roots.event, roots.subject, roots.data)
@@ -1102,21 +1219,21 @@ fn render_exact_string(value: &Value, roots: &TemplateRoots<'_>) -> Result<Strin
             .ok_or_else(|| {
                 Error::new(
                     "invalid",
-                    "interrupt expected_turn_id template is unavailable or not a string",
+                    format!("{verb} {field} template is unavailable or not a string"),
                 )
             })?,
         [TemplatePart::Literal(_)] => source,
         _ => {
             return Err(Error::new(
                 "invalid",
-                "interrupt expected_turn_id must occupy the whole value",
+                format!("{verb} {field} must occupy the whole value"),
             ));
         }
     };
     if rendered.trim().is_empty() {
         return Err(Error::new(
             "invalid",
-            "interrupt expected_turn_id cannot be empty",
+            format!("{verb} {field} cannot be empty"),
         ));
     }
     Ok(rendered.to_owned())
@@ -1220,6 +1337,13 @@ on = { event = 'turn.started' }
 do = [{ action = 'steer', target = '${event.agent}', expected_generation = '${event.generation}', expected_turn_id = '${event.data.turn_id}', text = 'Steer: ${data.status}' }]
 "#;
 
+    const APPROVE_REQUEST_RULE: &str = r#"
+[[rule]]
+id = 'approve-on-request'
+on = { event = 'request.opened' }
+do = [{ action = 'approve', target = '${event.agent}', expected_generation = '${event.generation}', expected_turn_id = '${event.data.turn_id}', request_id = '${event.data.request_id}' }]
+"#;
+
     const PROJECT_RUN_RULE: &str = r#"
 [[rule]]
 id = 'run-on-result'
@@ -1282,6 +1406,17 @@ do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${eve
             native_id: Some("fake:turn.completed".to_owned()),
             data: json!({"command_id":"send-id", "turn_id":"turn-id", "status":"completed"}),
         }
+    }
+
+    fn request_opened_event() -> Event {
+        let mut event = event();
+        event.kind = "request.opened".to_owned();
+        event.data = json!({
+            "request_id": "request-id",
+            "turn_id": "turn-id",
+            "kind": "question"
+        });
+        event
     }
 
     #[test]
@@ -1715,6 +1850,107 @@ do = [{ action = 'stop', target = '${event.agent}', expected_generation = '${eve
             error.message,
             "rendered steer text exceeds the 512 KiB text bound"
         );
+    }
+
+    #[test]
+    fn request_reply_actions_bind_the_opened_request_and_keep_answers_literal() {
+        let deny_source = APPROVE_REQUEST_RULE.replace("action = 'approve'", "action = 'deny'");
+        let answer_source = APPROVE_REQUEST_RULE
+            .replace("action = 'approve'", "action = 'answer'")
+            .replace(
+                "request_id = '${event.data.request_id}' }]",
+                "request_id = '${event.data.request_id}', answers = { 'question-id' = { answers = ['${data.status}'] } } }]",
+            );
+        let cases = [
+            (APPROVE_REQUEST_RULE.to_owned(), "approve", json!({})),
+            (deny_source, "deny", json!({})),
+            (
+                answer_source,
+                "answer",
+                json!({
+                    "answers": {"question-id": {"answers": ["${data.status}"]}}
+                }),
+            ),
+        ];
+        let event = request_opened_event();
+
+        for (source, verb, expected_args) in cases {
+            let rule = load(Cursor::new(source)).unwrap().remove(0);
+            let command = evaluate(&rule, &event)
+                .unwrap()
+                .expect("request reply command");
+            assert_eq!(command.verb, verb);
+            assert_eq!(command.target.as_deref(), Some("a7"));
+            assert_eq!(command.expected_generation, Some(3));
+            assert_eq!(command.expected_turn_id.as_deref(), Some("turn-id"));
+            assert_eq!(command.request_id.as_deref(), Some("request-id"));
+            assert_eq!(command.args, expected_args);
+
+            let wire_action = serde_json::to_value(&rule).unwrap()["do"][0].clone();
+            assert_eq!(wire_action["action"], verb);
+            assert_eq!(wire_action["target"], "${event.agent}");
+            assert_eq!(wire_action["expected_generation"], "${event.generation}");
+            assert_eq!(wire_action["expected_turn_id"], "${event.data.turn_id}");
+            assert_eq!(wire_action["request_id"], "${event.data.request_id}");
+            assert!(wire_action.get("definition").is_none());
+            if verb == "answer" {
+                assert_eq!(wire_action["answers"], expected_args["answers"]);
+            }
+            let saved = serde_json::to_string(&rule).unwrap();
+            let restored = RuleDefinition::deserialize_saved(&saved).unwrap();
+            assert_eq!(
+                restored.semantic_digest().unwrap(),
+                rule.semantic_digest().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn request_reply_actions_reject_wrong_trigger_and_captured_bindings() {
+        let wrong_trigger =
+            APPROVE_REQUEST_RULE.replace("event = 'request.opened'", "event = 'turn.completed'");
+        assert_eq!(
+            load(Cursor::new(wrong_trigger)).unwrap_err().code,
+            "invalid"
+        );
+
+        let event = request_opened_event();
+        let mismatches = [
+            ("target = '${event.agent}'", "target = 'a8'"),
+            (
+                "expected_generation = '${event.generation}'",
+                "expected_generation = 2",
+            ),
+            (
+                "expected_turn_id = '${event.data.turn_id}'",
+                "expected_turn_id = 'stale-turn'",
+            ),
+            (
+                "request_id = '${event.data.request_id}'",
+                "request_id = 'stale-request'",
+            ),
+        ];
+        for (old, replacement) in mismatches {
+            let source = APPROVE_REQUEST_RULE.replace(old, replacement);
+            let rule = load(Cursor::new(source)).unwrap().remove(0);
+            assert_eq!(evaluate(&rule, &event).unwrap_err().code, "invalid");
+        }
+    }
+
+    #[test]
+    fn request_reply_actions_remain_unsupported_for_timers() {
+        let timer_actions = [
+            "action = 'approve', target = 'a7', expected_generation = 3, expected_turn_id = 'turn-id', request_id = 'request-id'",
+            "action = 'deny', target = 'a7', expected_generation = 3, expected_turn_id = 'turn-id', request_id = 'request-id'",
+            "action = 'answer', target = 'a7', expected_generation = 3, expected_turn_id = 'turn-id', request_id = 'request-id', answers = { 'question-id' = { answers = ['Continue'] } }",
+        ];
+        for action in timer_actions {
+            let source = INTERVAL_TIMER.replace(
+                "action = 'stop', target = 'a7', expected_generation = 3",
+                action,
+            );
+            assert_eq!(load(Cursor::new(source)).unwrap_err().code, "unsupported");
+        }
     }
 
     #[test]

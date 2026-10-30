@@ -1636,7 +1636,7 @@ mod tests {
 
     #[test]
     fn native_health_follows_successor_and_ignores_empty_predecessor() {
-        let (store, agent) = handoff_health_fixture(&["session", "turn", "message"]);
+        let (store, agent) = handoff_health_fixture(&["message", "request", "session", "turn"]);
         let mut states = store.list_source_states(&agent, 1).unwrap();
         let predecessor = states
             .iter_mut()
@@ -1674,7 +1674,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             predecessor["families"],
-            serde_json::json!(["session", "turn"])
+            serde_json::json!(["request", "session", "turn"])
         );
         predecessor["health"] = serde_json::json!("stale");
         assert_eq!(native_sources_healthy(states.clone()), Some(false));
@@ -1688,7 +1688,7 @@ mod tests {
 
     #[test]
     fn native_health_ignores_unrelated_sources_and_empty_ownership() {
-        let (mut store, agent) = handoff_health_fixture(&["session", "turn", "message"]);
+        let (mut store, agent) = handoff_health_fixture(&["message", "request", "session", "turn"]);
         store.ensure_process_source(&agent, 1, 1003).unwrap();
         store
             .set_process_source_status(&agent, 1, "stale", false, 1004)

@@ -6,12 +6,13 @@ use crate::{
         MAX_COMMAND_ID_BYTES, MAX_CREDENTIAL_BYTES, MAX_DISCOVER_PAGE_BYTES,
         MAX_DISCOVER_PAGE_ENTRIES, MAX_EVENT_BYTES, MAX_TEXT_BYTES, ObservationPage,
         ObservationQuery, ObserverAttachParams, ObserverDetachParams, ObserverSnapshotParams,
-        RpcError, RpcRequest, empty_object, fake_manifest,
+        PluginManifest, RpcError, RpcRequest, empty_object, fake_manifest,
     },
 };
 use eliot_core::{
-    BatchAck, Error as CoreError, NativeEvent, ProviderRestriction, ProviderRestrictionKind,
-    SecretPolicy, SourceBatch, SourceHandoff, SourceHandoffGap, SourceHealthUpdate,
+    BatchAck, Error as CoreError, NativeEvent, PendingRequest, ProviderRestriction,
+    ProviderRestrictionKind, SecretPolicy, SourceBatch, SourceHandoff, SourceHandoffGap,
+    SourceHealthUpdate,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -41,6 +42,10 @@ const PROVIDER_AUTH_FIXTURE_INPUT: &str = "[eliot_fake_provider_auth]";
 const PROVIDER_MODEL_REMOVED_FIXTURE_INPUT: &str = "[eliot_fake_provider_model_removed]";
 const HANDOFF_FIXTURE_INPUT: &str = "[fake:source-handoff]";
 const HOLD_TURN_FIXTURE_INPUT: &str = "[fake:hold-turn]";
+const COMMAND_APPROVAL_FIXTURE_INPUT: &str = "[fake:request-command-approval]";
+const FILE_APPROVAL_FIXTURE_INPUT: &str = "[fake:request-file-approval]";
+const USER_INPUT_FIXTURE_INPUT: &str = "[fake:request-user-input]";
+const REQUEST_FIXTURE_ANSWER: &str = "fixture-answer";
 const LIVE_OBSERVER_SUBJECT: &str = "fake-discovered-2";
 const LIVE_OBSERVER_TS: i64 = 1_730_000_000_000;
 
@@ -525,6 +530,17 @@ fn reject_observer_control(state: &FakeState) -> Result<(), RpcError> {
     Ok(())
 }
 
+fn fake_runtime_manifest() -> PluginManifest {
+    let mut manifest = fake_manifest();
+    manifest
+        .verbs
+        .extend(["steer", "approve", "deny", "answer"].map(str::to_owned));
+    if let Some(sources) = manifest.sources.get_mut("controlled") {
+        sources.insert("request".to_owned(), "stream".to_owned());
+    }
+    manifest
+}
+
 fn handle_initialize(params: &Value, state: &mut FakeState) -> Result<Value, RpcError> {
     let params: InitializeParams = decode_params(params)?;
     if params.protocol != "eliot-plugin/1" {
@@ -555,9 +571,7 @@ fn handle_initialize(params: &Value, state: &mut FakeState) -> Result<Value, Rpc
         state.credential = Some(params.credential);
     }
 
-    let mut manifest = fake_manifest();
-    manifest.verbs.push("steer".to_owned());
-    serde_json::to_value(manifest)
+    serde_json::to_value(fake_runtime_manifest())
         .map_err(|_| domain_error("internal", -32603, "plugin manifest could not be encoded"))
 }
 
@@ -669,11 +683,14 @@ async fn handle_command(
     if params.verb == "steer" {
         return handle_steer(&params, state);
     }
+    if matches!(params.verb.as_str(), "approve" | "deny" | "answer") {
+        return handle_request_reply(&params, state, client).await;
+    }
     if params.verb != "send" {
         return Err(domain_error(
             "unsupported",
             -32602,
-            "fake plugin implements only the send, steer and interrupt verbs",
+            "fake plugin command verb is unsupported",
         ));
     }
     if state.batch_unknown {
@@ -750,12 +767,16 @@ async fn handle_command(
             return Err(error);
         }
     }
-    let hold_turn = text == HOLD_TURN_FIXTURE_INPUT;
+    let pending_request = fixture_pending_request(&params, &turn_id, text);
+    let hold_turn = text == HOLD_TURN_FIXTURE_INPUT || pending_request.is_some();
     let mut batch = if hold_turn {
         held_turn_batch(&params, &turn_id)
     } else {
         send_batch(&params, &turn_id, text)
     };
+    if let Some(pending) = &pending_request {
+        batch.events.push(request_opened_event(&params, pending));
+    }
     batch.source = state
         .publish_source
         .as_deref()
@@ -765,11 +786,15 @@ async fn handle_command(
     state.phase = SessionPhase::Busy;
     state.active_turn = Some(turn_id.clone());
     state.active_command_id = Some(params.command_id.clone());
+    state.pending_request = pending_request;
     match commit_batch(state, batch, &credential, client).await {
         Ok(_) => {
             if hold_turn {
                 // `turn.started` committed the ordinary SEND association. Keep
-                // this one explicit fixture turn open for exact STEER/INTERRUPT.
+                // the fixture turn active while a request or control is handled.
+                if state.pending_request.is_some() {
+                    state.phase = SessionPhase::Waiting;
+                }
                 return Ok(json!({"state":"applied", "turn_id":turn_id}));
             }
             state.phase = SessionPhase::Idle;
@@ -794,7 +819,8 @@ async fn handle_command(
             if !failure.uncertain {
                 state.active_turn = None;
                 state.active_command_id = None;
-            } else {
+                state.pending_request = None;
+            } else if !hold_turn {
                 state.last_turn = Some(LastTurn {
                     command_id: params.command_id,
                     turn_id,
@@ -820,7 +846,7 @@ fn handle_steer(params: &AgentCommandParams, state: &FakeState) -> Result<Value,
         ("invalid", "steer accepts only args.text and no request id")
     } else if text.is_some_and(|text| text.len() > MAX_TEXT_BYTES) {
         ("frame_too_large", "steer input text exceeds 512 KiB")
-    } else if state.phase != SessionPhase::Busy
+    } else if !matches!(state.phase, SessionPhase::Busy | SessionPhase::Waiting)
         || state.active_command_id.is_none()
         || !params.turn_id.as_deref().is_some_and(|turn_id| {
             !turn_id.trim().is_empty() && state.active_turn.as_deref() == Some(turn_id)
@@ -848,12 +874,136 @@ fn handle_steer(params: &AgentCommandParams, state: &FakeState) -> Result<Value,
     }))
 }
 
+fn validate_request_reply<'a>(
+    state: &'a FakeState,
+    params: &AgentCommandParams,
+) -> Result<&'a PendingRequest, RpcError> {
+    if state.batch_unknown || state.phase == SessionPhase::Unknown {
+        return Err(unknown_effect());
+    }
+    require_initialized(state)?;
+    reject_observer_control(state)?;
+    validate_agent_identity(&params.agent_id, params.generation, &params.command_id)?;
+    validate_existing_binding(state, &params.agent_id, params.generation)?;
+    let pending = state.pending_request.as_ref().ok_or_else(|| {
+        domain_error(
+            "not_found",
+            -32034,
+            "fake native request is no longer pending",
+        )
+    })?;
+    if state.phase != SessionPhase::Waiting
+        || state.active_command_id.is_none()
+        || state.active_turn.as_deref() != Some(pending.turn_id.as_str())
+        || params.turn_id.as_deref() != Some(pending.turn_id.as_str())
+        || params.request_id.as_deref() != Some(pending.id.as_str())
+    {
+        return Err(domain_error(
+            "stale_generation",
+            -32033,
+            "reply does not match the exact pending Agent turn and request",
+        ));
+    }
+    match (pending.kind.as_str(), params.verb.as_str()) {
+        ("command_execution_approval" | "file_change_approval", "approve" | "deny") => {
+            if !params.args.as_object().is_some_and(|args| args.is_empty()) {
+                return Err(invalid_params(
+                    "approval replies accept only empty arguments",
+                ));
+            }
+        }
+        ("user_input", "answer") => {
+            if pending
+                .details
+                .get("questions")
+                .and_then(Value::as_array)
+                .is_some_and(|questions| {
+                    questions.iter().any(|question| {
+                        question.get("is_secret").and_then(Value::as_bool) == Some(true)
+                    })
+                })
+            {
+                return Err(domain_error(
+                    "secret_in_payload",
+                    -32602,
+                    "secret question answers are unsupported",
+                ));
+            }
+            if params.args != json!({"answers":{"q1":{"answers":[REQUEST_FIXTURE_ANSWER]}}}) {
+                return Err(invalid_params(
+                    "answer must match the offered q1 fixture answer",
+                ));
+            }
+        }
+        _ => {
+            return Err(domain_error(
+                "unsupported",
+                -32602,
+                "reply verb does not match the pending request kind",
+            ));
+        }
+    }
+    Ok(pending)
+}
+
+async fn handle_request_reply(
+    params: &AgentCommandParams,
+    state: &mut FakeState,
+    client: &PeerClient,
+) -> Result<Value, RpcError> {
+    let pending = validate_request_reply(state, params)?.clone();
+    let credential = state.credential.clone().ok_or_else(not_initialized)?;
+    let mut batch = request_resolved_batch(params, &pending);
+    batch.source = state
+        .publish_source
+        .as_deref()
+        .unwrap_or("stream")
+        .to_owned();
+    let result = commit_batch(state, batch, &credential, client).await;
+    finish_request_reply(state, params, &pending, result)
+}
+
+fn finish_request_reply(
+    state: &mut FakeState,
+    params: &AgentCommandParams,
+    pending: &PendingRequest,
+    result: Result<BatchAck, BatchFailure>,
+) -> Result<Value, RpcError> {
+    match result {
+        Ok(_) => {
+            if state.batch_unknown || state.phase == SessionPhase::Unknown {
+                return Err(unknown_effect());
+            }
+            if state.pending_request.as_ref() != Some(pending) {
+                state.phase = SessionPhase::Unknown;
+                state.batch_unknown = true;
+                return Err(unknown_effect());
+            }
+            state.pending_request = None;
+            state.phase = SessionPhase::Busy;
+            Ok(json!({
+                "state":"applied",
+                "command_id":params.command_id,
+                "request_id":pending.id,
+                "turn_id":pending.turn_id,
+            }))
+        }
+        Err(failure) => {
+            if failure.uncertain {
+                state.phase = SessionPhase::Unknown;
+                state.batch_unknown = true;
+            }
+            Err(failure.error)
+        }
+    }
+}
+
 fn interrupt_rejection(state: &FakeState, params: &AgentCommandParams) -> Option<Value> {
     let (code, reason) = if params.request_id.is_some()
         || !params.args.as_object().is_some_and(|args| args.is_empty())
     {
         ("invalid", "interrupt accepts no request id or arguments")
-    } else if state.phase != SessionPhase::Busy
+    } else if !matches!(state.phase, SessionPhase::Busy | SessionPhase::Waiting)
         || state.active_turn.as_deref() != params.turn_id.as_deref()
         || state.active_command_id.is_none()
     {
@@ -900,11 +1050,13 @@ async fn handle_interrupt(
         source_command_id,
         turn_id,
     );
+    prepend_request_closed(&mut batch, state.pending_request.as_ref());
     batch.source = state
         .publish_source
         .as_deref()
         .unwrap_or("stream")
         .to_owned();
+    let previous_phase = state.phase;
     state.phase = SessionPhase::Stopping;
 
     match commit_batch(state, batch, &credential, client).await {
@@ -912,6 +1064,7 @@ async fn handle_interrupt(
             state.phase = SessionPhase::Idle;
             state.active_turn = None;
             state.active_command_id = None;
+            state.pending_request = None;
             Ok(json!({
                 "state":"applied",
                 "command_id":params.command_id,
@@ -923,7 +1076,7 @@ async fn handle_interrupt(
                 state.batch_unknown = true;
                 SessionPhase::Unknown
             } else {
-                SessionPhase::Busy
+                previous_phase
             };
             Err(failure.error)
         }
@@ -952,7 +1105,7 @@ async fn handle_stop(
     }
     let busy_turn = match state.phase {
         SessionPhase::Idle => None,
-        SessionPhase::Busy => {
+        SessionPhase::Busy | SessionPhase::Waiting => {
             let turn_id = state.active_turn.clone().ok_or_else(|| {
                 domain_error(
                     "bad_state",
@@ -977,7 +1130,7 @@ async fn handle_stop(
             ));
         }
     };
-    let was_busy = busy_turn.is_some();
+    let previous_phase = state.phase;
 
     let credential = state.credential.clone().ok_or_else(not_initialized)?;
     let mut batch = match busy_turn {
@@ -990,6 +1143,7 @@ async fn handle_stop(
         ),
         None => session_ended_batch(&params.agent_id, params.generation),
     };
+    prepend_request_closed(&mut batch, state.pending_request.as_ref());
     batch.source = state
         .publish_source
         .as_deref()
@@ -1002,14 +1156,15 @@ async fn handle_stop(
             state.phase = SessionPhase::Stopped;
             state.active_turn = None;
             state.active_command_id = None;
+            state.pending_request = None;
             state.stop_command_id = Some(params.command_id);
             Ok(json!({"state": "applied"}))
         }
         Err(failure) => {
-            state.phase = match (failure.uncertain, was_busy) {
-                (true, _) => SessionPhase::Unknown,
-                (false, true) => SessionPhase::Busy,
-                (false, false) => SessionPhase::Idle,
+            state.phase = if failure.uncertain {
+                SessionPhase::Unknown
+            } else {
+                previous_phase
             };
             Err(failure.error)
         }
@@ -1091,6 +1246,94 @@ fn session_ready_batch(agent_id: &str, generation: i64) -> SourceBatch {
             data: empty_object(),
         }],
         cursor: None,
+    }
+}
+
+fn fixture_pending_request(
+    params: &AgentCommandParams,
+    turn_id: &str,
+    text: &str,
+) -> Option<PendingRequest> {
+    let item_id = format!("fake-item:{}", params.command_id);
+    let (kind, details) = match text {
+        COMMAND_APPROVAL_FIXTURE_INPUT => (
+            "command_execution_approval",
+            json!({"item_id":item_id,"started_at_ms":0,"approval_kind":"command"}),
+        ),
+        FILE_APPROVAL_FIXTURE_INPUT => (
+            "file_change_approval",
+            json!({"item_id":item_id,"started_at_ms":0}),
+        ),
+        USER_INPUT_FIXTURE_INPUT => (
+            "user_input",
+            json!({
+                "item_id":item_id,
+                "is_blocking":true,
+                "questions":[{
+                    "id":"q1",
+                    "is_secret":false,
+                    "header":"Fixture input",
+                    "question":"Choose the fixture answer",
+                    "is_other":false,
+                    "options":[{"label":REQUEST_FIXTURE_ANSWER,"description":"Accepted fixture answer"}]
+                }],
+            }),
+        ),
+        _ => return None,
+    };
+    Some(PendingRequest {
+        id: format!(
+            "fake-request:{}:{}:{}",
+            params.agent_id, params.generation, params.command_id
+        ),
+        turn_id: turn_id.to_owned(),
+        kind: kind.to_owned(),
+        details,
+    })
+}
+
+fn request_opened_event(params: &AgentCommandParams, pending: &PendingRequest) -> NativeEvent {
+    NativeEvent {
+        kind: "request.opened".to_owned(),
+        native_id: format!("{}:request.opened", pending.id),
+        ts: None,
+        data: json!({
+            "command_id":params.command_id,
+            "request_id":pending.id,
+            "turn_id":pending.turn_id,
+            "kind":pending.kind,
+            "details":pending.details,
+        }),
+    }
+}
+
+fn request_resolved_batch(params: &AgentCommandParams, pending: &PendingRequest) -> SourceBatch {
+    SourceBatch {
+        batch_id: format!("{}:reply:{}", pending.id, params.command_id),
+        agent_id: params.agent_id.clone(),
+        generation: params.generation,
+        source: "stream".to_owned(),
+        events: vec![NativeEvent {
+            kind: "request.resolved".to_owned(),
+            native_id: format!("{}:request.resolved", pending.id),
+            ts: None,
+            data: json!({"command_id":params.command_id,"request_id":pending.id,"turn_id":pending.turn_id}),
+        }],
+        cursor: None,
+    }
+}
+
+fn prepend_request_closed(batch: &mut SourceBatch, pending: Option<&PendingRequest>) {
+    if let Some(pending) = pending {
+        batch.events.insert(
+            0,
+            NativeEvent {
+                kind: "request.closed".to_owned(),
+                native_id: format!("{}:request.closed", pending.id),
+                ts: None,
+                data: json!({"request_id":pending.id,"turn_id":pending.turn_id}),
+            },
+        );
     }
 }
 
@@ -1289,21 +1532,23 @@ fn source_secret_policy(
     SecretPolicy::new(known)
 }
 
-async fn exercise_source_handoff(
-    state: &mut FakeState,
+fn controlled_handoff_fixture(
     command: &AgentCommandParams,
     credential: &str,
-    client: &PeerClient,
-) -> Result<(), RpcError> {
-    let mut handoff = SourceHandoff {
+) -> Result<SourceHandoff, RpcError> {
+    let manifest = fake_runtime_manifest();
+    let controlled = manifest.sources.get("controlled").ok_or_else(|| {
+        domain_error(
+            "internal",
+            -32603,
+            "fake manifest has no controlled source plan",
+        )
+    })?;
+    Ok(SourceHandoff {
         agent_id: command.agent_id.clone(),
         generation: command.generation,
         source: "stream".to_owned(),
-        families: vec![
-            "message".to_owned(),
-            "session".to_owned(),
-            "turn".to_owned(),
-        ],
+        families: controlled.keys().cloned().collect(),
         successor: "transcript".to_owned(),
         mechanism: "fake_recovery".to_owned(),
         cursor: None,
@@ -1316,7 +1561,16 @@ async fn exercise_source_handoff(
             from: None,
             to: None,
         }),
-    };
+    })
+}
+
+async fn exercise_source_handoff(
+    state: &mut FakeState,
+    command: &AgentCommandParams,
+    credential: &str,
+    client: &PeerClient,
+) -> Result<(), RpcError> {
+    let mut handoff = controlled_handoff_fixture(command, credential)?;
     handoff
         .prepare(&state.source_policy)
         .map_err(core_error_to_rpc)?;
@@ -1640,6 +1894,7 @@ struct FakeState {
     phase: SessionPhase,
     active_turn: Option<String>,
     active_command_id: Option<String>,
+    pending_request: Option<PendingRequest>,
     last_turn: Option<LastTurn>,
     last_batch_ack: Option<BatchAck>,
     batch_unknown: bool,
@@ -1668,6 +1923,7 @@ enum SessionPhase {
     Starting,
     Idle,
     Busy,
+    Waiting,
     Stopping,
     Unknown,
     Stopped,
@@ -1680,6 +1936,7 @@ impl SessionPhase {
             Self::Starting => "starting",
             Self::Idle => "idle",
             Self::Busy => "busy",
+            Self::Waiting => "waiting",
             Self::Stopping => "stopping",
             Self::Unknown => "unknown",
             Self::Stopped => "stopped",
@@ -1746,6 +2003,374 @@ mod provider_hold_tests {
     }
 
     #[test]
+    fn controlled_handoff_covers_every_initialized_controlled_family() {
+        let mut state = FakeState::default();
+        let manifest = handle_initialize(
+            &json!({
+                "protocol":"eliot-plugin/1",
+                "credential":"fixture-credential",
+                "instance_dir":"fake-instance"
+            }),
+            &mut state,
+        )
+        .unwrap_or_else(|error| panic!("unexpected RPC error code {}", error.code));
+        let controlled = manifest["sources"]["controlled"].as_object().unwrap();
+        let mut params = command(HANDOFF_FIXTURE_INPUT);
+        params.agent_id = "a1".to_owned();
+        let handoff = controlled_handoff_fixture(&params, "fixture-credential")
+            .unwrap_or_else(|error| panic!("unexpected RPC error code {}", error.code));
+        assert_eq!(
+            handoff.families,
+            controlled.keys().cloned().collect::<Vec<_>>()
+        );
+        assert_eq!(handoff.families.len(), 4);
+        assert!(handoff.families.iter().any(|family| family == "request"));
+        assert!(controlled.values().all(|mechanism| mechanism == "stream"));
+        assert_eq!(handoff.source, "stream");
+        assert_eq!(handoff.successor, "transcript");
+        handoff.validate().unwrap();
+    }
+
+    fn request_fixture_state(marker: &str) -> (FakeState, AgentCommandParams) {
+        let mut send = command(marker);
+        send.agent_id = "a1".to_owned();
+        send.command_id = "send-request".to_owned();
+        let pending = fixture_pending_request(&send, "turn-request", marker)
+            .expect("known pending-request fixture");
+        let state = FakeState {
+            credential: Some("fixture-credential".to_owned()),
+            binding: Some(Binding {
+                agent_id: send.agent_id.clone(),
+                generation: send.generation,
+            }),
+            phase: SessionPhase::Waiting,
+            active_turn: Some(pending.turn_id.clone()),
+            active_command_id: Some(send.command_id.clone()),
+            pending_request: Some(pending),
+            ..FakeState::default()
+        };
+        (state, send)
+    }
+
+    fn fixture_reply(state: &FakeState, verb: &str) -> AgentCommandParams {
+        let pending = state
+            .pending_request
+            .as_ref()
+            .expect("fixture pending request");
+        AgentCommandParams {
+            agent_id: "a1".to_owned(),
+            generation: 1,
+            command_id: format!("{verb}-request"),
+            verb: verb.to_owned(),
+            args: if verb == "answer" {
+                json!({"answers":{"q1":{"answers":[REQUEST_FIXTURE_ANSWER]}}})
+            } else {
+                json!({})
+            },
+            turn_id: Some(pending.turn_id.clone()),
+            request_id: Some(pending.id.clone()),
+        }
+    }
+
+    #[test]
+    fn pending_request_fixtures_open_after_the_original_send_turn() {
+        for (marker, kind) in [
+            (COMMAND_APPROVAL_FIXTURE_INPUT, "command_execution_approval"),
+            (FILE_APPROVAL_FIXTURE_INPUT, "file_change_approval"),
+            (USER_INPUT_FIXTURE_INPUT, "user_input"),
+        ] {
+            let (state, send) = request_fixture_state(marker);
+            let pending = state.pending_request.as_ref().expect("pending fixture");
+            let mut batch = held_turn_batch(&send, &pending.turn_id);
+            batch.events.push(request_opened_event(&send, pending));
+            assert_eq!(batch.events.len(), 2);
+            assert_eq!(batch.events[0].kind, "turn.started");
+            assert_eq!(batch.events[1].kind, "request.opened");
+            assert_eq!(
+                batch.events[1].data,
+                json!({
+                    "command_id":"send-request",
+                    "request_id":pending.id,
+                    "turn_id":"turn-request",
+                    "kind":kind,
+                    "details":pending.details,
+                })
+            );
+            assert!(pending.details.get("transport_id").is_none());
+            assert!(pending.details.get("native_method").is_none());
+            let mut agent = eliot_core::Agent::new("a1", "fixture", "fake", "fake", 0);
+            agent.generation = 1;
+            agent.state = eliot_core::AgentState::Idle;
+            agent = eliot_core::apply(&agent, &batch.events[0], 1).unwrap().0;
+            assert_eq!(agent.state, eliot_core::AgentState::Busy);
+            assert!(agent.pending.is_empty());
+            agent = eliot_core::apply(&agent, &batch.events[1], 2).unwrap().0;
+            assert_eq!(agent.state, eliot_core::AgentState::Waiting);
+            assert_eq!(agent.pending, vec![pending.clone()]);
+            assert_eq!(agent.active_turn.as_deref(), Some("turn-request"));
+        }
+        let send = command(HOLD_TURN_FIXTURE_INPUT);
+        assert!(fixture_pending_request(&send, "turn-held", HOLD_TURN_FIXTURE_INPUT).is_none());
+        assert!(
+            fixture_pending_request(&send, "turn-held", "[fake:request-user-input] extra")
+                .is_none()
+        );
+        let (state, _) = request_fixture_state(USER_INPUT_FIXTURE_INPUT);
+        let question = &state.pending_request.as_ref().unwrap().details["questions"][0];
+        assert_eq!(question["id"], "q1");
+        assert_eq!(question["is_secret"], false);
+        assert_eq!(question["is_other"], false);
+        assert_eq!(question["options"][0]["label"], REQUEST_FIXTURE_ANSWER);
+    }
+
+    #[test]
+    fn request_replies_resolve_only_the_named_pending_and_keep_the_original_turn_busy() {
+        for (marker, verb) in [
+            (COMMAND_APPROVAL_FIXTURE_INPUT, "approve"),
+            (COMMAND_APPROVAL_FIXTURE_INPUT, "deny"),
+            (FILE_APPROVAL_FIXTURE_INPUT, "approve"),
+            (FILE_APPROVAL_FIXTURE_INPUT, "deny"),
+            (USER_INPUT_FIXTURE_INPUT, "answer"),
+        ] {
+            let (mut state, _) = request_fixture_state(marker);
+            let params = fixture_reply(&state, verb);
+            let pending = validate_request_reply(&state, &params)
+                .unwrap_or_else(|error| panic!("unexpected RPC error code {}", error.code))
+                .clone();
+            let batch = request_resolved_batch(&params, &pending);
+            assert_eq!(batch.events.len(), 1);
+            assert_eq!(batch.events[0].kind, "request.resolved");
+            assert_eq!(
+                batch.events[0].data,
+                json!({
+                    "command_id":params.command_id,
+                    "request_id":pending.id,
+                    "turn_id":pending.turn_id,
+                })
+            );
+            assert_ne!(batch.events[0].data["command_id"], "send-request");
+            let mut agent = eliot_core::Agent::new("a1", "fixture", "fake", "fake", 0);
+            agent.state = eliot_core::AgentState::Waiting;
+            agent.active_turn = Some(pending.turn_id.clone());
+            agent.pending = vec![pending.clone()];
+            let resolved = eliot_core::apply(&agent, &batch.events[0], 3).unwrap().0;
+            assert_eq!(resolved.state, eliot_core::AgentState::Busy);
+            assert!(resolved.pending.is_empty());
+            assert_eq!(resolved.active_turn, agent.active_turn);
+            let response = finish_request_reply(
+                &mut state,
+                &params,
+                &pending,
+                Ok(BatchAck {
+                    first_seq: 3,
+                    last_seq: 3,
+                    cursor: None,
+                }),
+            )
+            .unwrap_or_else(|error| panic!("unexpected RPC error code {}", error.code));
+            assert_eq!(
+                response,
+                json!({
+                    "state":"applied", "command_id":params.command_id,
+                    "request_id":pending.id, "turn_id":pending.turn_id,
+                })
+            );
+            assert!(state.pending_request.is_none());
+            assert!(matches!(state.phase, SessionPhase::Busy));
+            assert_eq!(state.active_turn.as_deref(), Some("turn-request"));
+            assert_eq!(state.active_command_id.as_deref(), Some("send-request"));
+            assert!(state.last_turn.is_none());
+            assert_eq!(
+                validate_request_reply(&state, &params)
+                    .unwrap_err()
+                    .data
+                    .unwrap()["code"],
+                "not_found"
+            );
+        }
+    }
+
+    #[test]
+    fn request_replies_refuse_stale_bindings_kind_and_arguments_without_state_changes() {
+        let (state, _) = request_fixture_state(COMMAND_APPROVAL_FIXTURE_INPUT);
+        let pending = state.pending_request.clone();
+        for change in 0..6 {
+            let mut params = fixture_reply(&state, "approve");
+            match change {
+                0 => params.agent_id = "a2".to_owned(),
+                1 => params.generation = 2,
+                2 => params.turn_id = Some("other-turn".to_owned()),
+                3 => params.request_id = Some("other-request".to_owned()),
+                4 => params.turn_id = None,
+                _ => params.request_id = None,
+            }
+            assert_eq!(
+                validate_request_reply(&state, &params)
+                    .unwrap_err()
+                    .data
+                    .unwrap()["code"],
+                "stale_generation"
+            );
+        }
+        let mut params = fixture_reply(&state, "answer");
+        assert_eq!(
+            validate_request_reply(&state, &params)
+                .unwrap_err()
+                .data
+                .unwrap()["code"],
+            "unsupported"
+        );
+        params = fixture_reply(&state, "approve");
+        params.args = json!({"decision":"accept"});
+        assert_eq!(
+            validate_request_reply(&state, &params)
+                .unwrap_err()
+                .data
+                .unwrap()["code"],
+            "invalid"
+        );
+        assert_eq!(state.pending_request, pending);
+        assert!(matches!(state.phase, SessionPhase::Waiting));
+        assert_eq!(state.active_command_id.as_deref(), Some("send-request"));
+
+        let (mut state, _) = request_fixture_state(USER_INPUT_FIXTURE_INPUT);
+        for args in [
+            json!({}),
+            json!({"answers":{"q2":{"answers":[REQUEST_FIXTURE_ANSWER]}}}),
+            json!({"answers":{"q1":{"answers":["wrong-answer"]}}}),
+            json!({"answers":{"q1":{"answers":[REQUEST_FIXTURE_ANSWER],"extra":true}}}),
+            json!({"answers":{"q1":{"answers":[REQUEST_FIXTURE_ANSWER]}},"extra":true}),
+        ] {
+            let mut params = fixture_reply(&state, "answer");
+            params.args = args;
+            assert_eq!(
+                validate_request_reply(&state, &params)
+                    .unwrap_err()
+                    .data
+                    .unwrap()["code"],
+                "invalid"
+            );
+        }
+        assert_eq!(
+            validate_request_reply(&state, &fixture_reply(&state, "deny"))
+                .unwrap_err()
+                .data
+                .unwrap()["code"],
+            "unsupported"
+        );
+        state.pending_request.as_mut().unwrap().details["questions"][0]["is_secret"] = json!(true);
+        assert_eq!(
+            validate_request_reply(&state, &fixture_reply(&state, "answer"))
+                .unwrap_err()
+                .data
+                .unwrap()["code"],
+            "secret_in_payload"
+        );
+    }
+
+    #[test]
+    fn request_reply_unknown_commit_cannot_apply_or_replay_or_clear_another_pending() {
+        let (mut state, _) = request_fixture_state(COMMAND_APPROVAL_FIXTURE_INPUT);
+        let params = fixture_reply(&state, "approve");
+        let pending = state.pending_request.clone().unwrap();
+        let result = finish_request_reply(
+            &mut state,
+            &params,
+            &pending,
+            Err(BatchFailure {
+                error: unknown_effect(),
+                uncertain: true,
+            }),
+        );
+        assert_eq!(result.unwrap_err().data.unwrap()["code"], "unknown");
+        assert!(state.batch_unknown);
+        assert!(matches!(state.phase, SessionPhase::Unknown));
+        assert_eq!(state.pending_request.as_ref(), Some(&pending));
+        assert_eq!(
+            validate_request_reply(&state, &params)
+                .unwrap_err()
+                .data
+                .unwrap()["code"],
+            "unknown"
+        );
+        assert_eq!(
+            finish_request_reply(
+                &mut state,
+                &params,
+                &pending,
+                Ok(BatchAck {
+                    first_seq: 3,
+                    last_seq: 3,
+                    cursor: None
+                })
+            )
+            .unwrap_err()
+            .data
+            .unwrap()["code"],
+            "unknown"
+        );
+
+        let (mut state, _) = request_fixture_state(COMMAND_APPROVAL_FIXTURE_INPUT);
+        state.pending_request.as_mut().unwrap().id = "another-request".to_owned();
+        assert!(
+            finish_request_reply(
+                &mut state,
+                &params,
+                &pending,
+                Ok(BatchAck {
+                    first_seq: 3,
+                    last_seq: 3,
+                    cursor: None
+                })
+            )
+            .is_err()
+        );
+        assert_eq!(
+            state.pending_request.as_ref().unwrap().id,
+            "another-request"
+        );
+    }
+
+    #[test]
+    fn pending_request_cleanup_precedes_interrupt_or_stop_without_acknowledging_a_reply() {
+        let (state, send) = request_fixture_state(COMMAND_APPROVAL_FIXTURE_INPUT);
+        let pending = state.pending_request.as_ref().unwrap();
+        assert!(interrupt_rejection(&state, &interrupt("turn-request")).is_none());
+        let mut interrupt =
+            interrupted_turn_batch("a1", 1, "interrupt-request", "send-request", "turn-request");
+        prepend_request_closed(&mut interrupt, Some(pending));
+        let mut stop = busy_stop_batch("a1", 1, "stop-request", "send-request", "turn-request");
+        prepend_request_closed(&mut stop, Some(pending));
+        for batch in [interrupt, stop] {
+            assert_eq!(batch.events[0].kind, "request.closed");
+            assert_eq!(
+                batch.events[0].data,
+                json!({"request_id":pending.id,"turn_id":pending.turn_id})
+            );
+            assert!(batch.events[0].data.get("command_id").is_none());
+            assert_eq!(batch.events[1].kind, "turn.completed");
+            assert_eq!(batch.events[1].data["command_id"], "send-request");
+            let mut agent = eliot_core::Agent::new("a1", "fixture", "fake", "fake", 0);
+            agent.state = eliot_core::AgentState::Idle;
+            agent = eliot_core::apply(&agent, &held_turn_batch(&send, "turn-request").events[0], 1)
+                .unwrap()
+                .0;
+            agent = eliot_core::apply(&agent, &request_opened_event(&send, pending), 2)
+                .unwrap()
+                .0;
+            agent = eliot_core::apply(&agent, &batch.events[0], 3).unwrap().0;
+            assert!(agent.pending.is_empty());
+            assert_eq!(agent.state, eliot_core::AgentState::Busy);
+            assert_eq!(agent.active_turn.as_deref(), Some("turn-request"));
+            for event in batch.events.iter().skip(1) {
+                agent = eliot_core::apply(&agent, event, 4).unwrap().0;
+            }
+            assert!(agent.active_turn.is_none());
+            assert!(agent.pending.is_empty());
+        }
+    }
+
+    #[test]
     fn steer_applies_to_held_turn_without_completing_original_send() {
         let mut state = FakeState::default();
         let manifest = handle_initialize(
@@ -1769,6 +2394,10 @@ mod provider_hold_tests {
                 .unwrap()
                 .contains(&json!("interrupt"))
         );
+        for verb in ["approve", "deny", "answer"] {
+            assert!(manifest["verbs"].as_array().unwrap().contains(&json!(verb)));
+        }
+        assert_eq!(manifest["sources"]["controlled"]["request"], "stream");
 
         let mut held = command(HOLD_TURN_FIXTURE_INPUT);
         held.agent_id = "a1".to_owned();

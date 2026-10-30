@@ -2246,7 +2246,7 @@ fn assert_fake_source_handoff(
 ) {
     let before: AgentGetResponse =
         serde_json::from_value(fixture.json(&["show", agent])).expect("before handoff view");
-    let families = ["message", "session", "turn"];
+    let families = ["message", "request", "session", "turn"];
     let unrelated_before: HashSet<_> = before
         .source_states
         .iter()
@@ -7203,6 +7203,543 @@ fn cli_event_rule_steers_exact_held_turn_in_global_and_project_scopes() {
         );
         assert_eq!(fault_dispatches(&events_after_restart, &steer.id), 1);
         assert_eq!(fault_dispatches(&events_after_restart, send_id), 1);
+    }
+    fixture.stop(false);
+}
+
+#[test]
+fn cli_event_rules_reply_to_exact_fake_requests_in_global_and_project_scopes() {
+    const PROJECT_ID: &str = "request-reply-fixture";
+    const COMMAND_APPROVAL: &str = "[fake:request-command-approval]";
+    const FILE_APPROVAL: &str = "[fake:request-file-approval]";
+    const USER_INPUT: &str = "[fake:request-user-input]";
+
+    let mut fixture = Fixture::new("event request replies");
+    assert!(
+        fixture
+            .git(&["init", "--initial-branch=main"])
+            .status
+            .success(),
+        "initialize registered request-reply project"
+    );
+    fs::write(
+        fixture.workspace.join("seed.txt"),
+        "request reply fixture\n",
+    )
+    .expect("write registered project seed");
+    fs::create_dir_all(fixture.workspace.join(".eliot").join("rules"))
+        .expect("create registered project rule directory");
+    assert!(fixture.git(&["add", "--all"]).status.success());
+    assert!(
+        fixture
+            .git(&["commit", "-m", "Request reply event fixture"])
+            .status
+            .success(),
+        "commit registered request-reply project"
+    );
+
+    fixture.start();
+    fixture.stop(false);
+    let global_rules = fixture.data.join("rules");
+    let project_rules = fixture.workspace.join(".eliot").join("rules");
+    fs::create_dir_all(&global_rules).expect("create global rule directory");
+    fs::create_dir_all(&project_rules).expect("create registered project rule directory");
+
+    let project_path = serde_json::to_string(&fixture.workspace.display().to_string())
+        .expect("encode registered project path");
+    fs::write(
+        fixture.data.join("config.toml"),
+        format!(
+            concat!(
+                "[projects.{project_id}]\n",
+                "path = {path}\n",
+                "profiles = [\"fake\"]\n",
+                "actions = [\"approve\", \"deny\", \"answer\"]\n",
+            ),
+            project_id = PROJECT_ID,
+            path = project_path,
+        ),
+    )
+    .expect("write Owner Project reply approvals");
+
+    let cases = [
+        (
+            None,
+            "global-command-approval",
+            "approve",
+            COMMAND_APPROVAL,
+            "command_execution_approval",
+        ),
+        (
+            None,
+            "global-file-denial",
+            "deny",
+            FILE_APPROVAL,
+            "file_change_approval",
+        ),
+        (
+            None,
+            "global-user-answer",
+            "answer",
+            USER_INPUT,
+            "user_input",
+        ),
+        (
+            Some(PROJECT_ID),
+            "project-command-approval",
+            "approve",
+            COMMAND_APPROVAL,
+            "command_execution_approval",
+        ),
+        (
+            Some(PROJECT_ID),
+            "project-file-denial",
+            "deny",
+            FILE_APPROVAL,
+            "file_change_approval",
+        ),
+        (
+            Some(PROJECT_ID),
+            "project-user-answer",
+            "answer",
+            USER_INPUT,
+            "user_input",
+        ),
+    ];
+    let send_ids = (0..cases.len())
+        .map(|_| ulid::Ulid::new().to_string())
+        .collect::<Vec<_>>();
+    let encode = |value: &str| serde_json::to_string(value).expect("encode TOML string");
+    let rule_source = |rule_id: &str, send_id: &str, action: &str, request_kind: &str| {
+        let answers = if action == "answer" {
+            ", answers = { q1 = { answers = [\"fixture-answer\"] } }"
+        } else {
+            ""
+        };
+        format!(
+            concat!(
+                "[[rule]]\n",
+                "id = {rule_id}\n",
+                "on = {{ event = \"request.opened\", match = {{ ",
+                "\"subject.harness\" = \"fake\", ",
+                "\"event.data.command_id\" = {send_id}, ",
+                "\"event.data.kind\" = {request_kind} }} }}\n",
+                "do = [{{ action = {action}, target = \"${{event.agent}}\", ",
+                "expected_generation = \"${{event.generation}}\", ",
+                "expected_turn_id = \"${{event.data.turn_id}}\", ",
+                "request_id = \"${{event.data.request_id}}\"{answers} }}]\n",
+            ),
+            rule_id = encode(rule_id),
+            send_id = encode(send_id),
+            request_kind = encode(request_kind),
+            action = encode(action),
+            answers = answers,
+        )
+    };
+    let mut global_source = String::new();
+    let mut project_source = String::new();
+    for (index, &(project_id, rule_id, action, _marker, request_kind)) in cases.iter().enumerate() {
+        let source = rule_source(rule_id, &send_ids[index], action, request_kind);
+        match project_id {
+            Some(_) => project_source.push_str(&source),
+            None => global_source.push_str(&source),
+        }
+    }
+    fs::write(global_rules.join("request-replies.toml"), global_source)
+        .expect("write Owner request-reply rules");
+    fs::write(project_rules.join("request-replies.toml"), project_source)
+        .expect("write registered Project request-reply rules");
+
+    fixture.start();
+    let registration: ProjectRegistrationView =
+        serde_json::from_value(fixture.json(&["project", "show", PROJECT_ID]))
+            .expect("typed request-reply project registration");
+    for action in ["approve", "deny", "answer"] {
+        assert!(
+            registration
+                .actions
+                .iter()
+                .any(|approved| approved == action),
+            "project registration must approve {action}"
+        );
+    }
+
+    let mut rule_states = Vec::with_capacity(cases.len());
+    for &(project_id, rule_id, _, _, _) in &cases {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let state: RuleStateView = loop {
+            let reply = match project_id {
+                Some(project_id) => cli(
+                    &fixture.data,
+                    &["rule", "show", rule_id, "--project", project_id],
+                ),
+                None => cli(&fixture.data, &["rule", "show", rule_id]),
+            };
+            if reply.status.success() {
+                break serde_json::from_str(&reply.stdout).expect("typed request-reply rule");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "request-reply rule load deadline for {rule_id}; bounded stderr={:?}",
+                reply.stderr.chars().take(2048).collect::<String>()
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        assert_eq!(state.id, rule_id);
+        assert_eq!(state.project.as_deref(), project_id);
+        assert!(state.enabled);
+        rule_states.push(state);
+    }
+
+    let launch = fixture.json(&[
+        "launch",
+        "--profile",
+        "fake",
+        "--workspace",
+        fixture
+            .workspace
+            .to_str()
+            .expect("registered workspace path"),
+    ]);
+    let agent = launch["target"].as_str().expect("Fake Agent").to_owned();
+    let generation = launch["generation"].as_i64().expect("Fake generation");
+    let generation_arg = generation.to_string();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("request-reply readback runtime");
+    let mut retained = Vec::with_capacity(cases.len());
+
+    for (index, &(project_id, rule_id, action, marker, request_kind)) in cases.iter().enumerate() {
+        let send_id = send_ids[index].as_str();
+        let send_result = cli(
+            &fixture.data,
+            &[
+                "--id",
+                send_id,
+                "send",
+                &agent,
+                "--generation",
+                &generation_arg,
+                "--",
+                marker,
+            ],
+        );
+        assert!(
+            send_result.status.success(),
+            "Fake request SEND failed for {rule_id}; bounded stdout={:?}; bounded stderr={:?}",
+            send_result.stdout.chars().take(2048).collect::<String>(),
+            send_result.stderr.chars().take(2048).collect::<String>()
+        );
+        let send: CoreCommand = serde_json::from_value(fixture.wait_command(send_id, "applied"))
+            .expect("applied Fake request SEND");
+        assert_eq!(send.id, send_id);
+        assert_eq!(send.verb, "send");
+        assert_eq!(send.target.as_deref(), Some(agent.as_str()));
+        assert_eq!(send.expected_generation, Some(generation));
+        assert_eq!(send.generation, Some(generation));
+        let turn_id = send
+            .turn_id
+            .as_deref()
+            .expect("original SEND turn ID")
+            .to_owned();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let (opened, firing) = loop {
+            let events = fixture.events();
+            let opened = events
+                .iter()
+                .find(|event| {
+                    event["kind"] == "request.opened"
+                        && event["agent"] == agent
+                        && event["generation"] == generation
+                        && event["data"]["command_id"] == send_id
+                        && event["data"]["kind"] == request_kind
+                })
+                .cloned();
+            if let Some(opened) = opened {
+                let event_seq = opened["seq"].as_i64().expect("request-opened sequence");
+                if let Some(firing) = events
+                    .iter()
+                    .find(|event| {
+                        event["kind"] == "rule.fired"
+                            && event["data"]["rule"] == rule_id
+                            && event["data"]["event_seq"] == event_seq
+                    })
+                    .cloned()
+                {
+                    break (opened, firing);
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "request-reply firing deadline for {rule_id}"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        assert_eq!(opened["subject"]["harness"], "fake");
+        assert_eq!(
+            opened["subject"]["project"].as_str(),
+            Some(registration.checkout.as_str()),
+            "event subject project is the registered checkout label, not its authority ID"
+        );
+        assert_eq!(opened["data"]["command_id"], send_id);
+        assert_eq!(opened["data"]["kind"], request_kind);
+        assert_eq!(opened["data"]["turn_id"], turn_id);
+        let request_id = opened["data"]["request_id"]
+            .as_str()
+            .expect("actual opened request ID")
+            .to_owned();
+        let event_seq = opened["seq"].as_i64().expect("request-opened sequence");
+        assert_eq!(firing["data"]["revision"], rule_states[index].revision);
+        match project_id {
+            Some(project_id) => assert_eq!(firing["data"]["project"], project_id),
+            None => assert!(firing["data"].get("project").is_none_or(Value::is_null)),
+        }
+
+        let parent_id = firing["data"]["parent_command"]
+            .as_str()
+            .expect("request-reply parent command")
+            .to_owned();
+        let reply_id = firing["data"]["child_command"]
+            .as_str()
+            .expect("request-reply child command")
+            .to_owned();
+        let principal = project_id.map_or_else(
+            || "owner".to_owned(),
+            |project_id| format!("project:{project_id}"),
+        );
+        let parent: CoreCommand =
+            serde_json::from_value(fixture.wait_command(&parent_id, "applied"))
+                .expect("applied request-reply parent");
+        assert_eq!(parent.verb, "rule");
+        assert_eq!(parent.principal, principal);
+        assert_eq!(parent.args["rule"], rule_id);
+        assert_eq!(
+            parent
+                .outcome
+                .as_ref()
+                .expect("request-reply parent outcome")["children"],
+            json!([reply_id])
+        );
+        let reply: CoreCommand = serde_json::from_value(fixture.wait_command(&reply_id, "applied"))
+            .expect("applied Router request-reply child");
+        assert_eq!(reply.id, reply_id);
+        assert_eq!(reply.verb, action);
+        assert_eq!(reply.state, CommandState::Applied);
+        assert_eq!(reply.principal, principal);
+        assert_eq!(reply.target.as_deref(), Some(agent.as_str()));
+        assert_eq!(reply.expected_generation, Some(generation));
+        assert_eq!(reply.generation, Some(generation));
+        assert_eq!(reply.turn_id.as_deref(), Some(turn_id.as_str()));
+        assert_eq!(reply.request_id.as_deref(), Some(request_id.as_str()));
+        let expected_args = if action == "answer" {
+            json!({"answers":{"q1":{"answers":["fixture-answer"]}}})
+        } else {
+            json!({})
+        };
+        assert_eq!(reply.args, expected_args);
+        let outcome = reply.outcome.as_ref().expect("retained reply outcome");
+        assert_eq!(outcome["command_id"], reply_id);
+        assert_eq!(outcome["request_id"], request_id);
+        assert_eq!(outcome["turn_id"], turn_id);
+
+        let after_reply = fixture.events();
+        assert_eq!(
+            after_reply
+                .iter()
+                .filter(|event| {
+                    event["kind"] == "rule.fired"
+                        && event["data"]["rule"] == rule_id
+                        && event["data"]["event_seq"] == event_seq
+                })
+                .count(),
+            1,
+            "one firing is bound to the exact request.opened event"
+        );
+        assert_eq!(fault_dispatches(&after_reply, &reply_id), 1);
+        let resolved: Vec<_> = after_reply
+            .iter()
+            .filter(|event| {
+                event["kind"] == "request.resolved"
+                    && event["agent"] == agent
+                    && event["generation"] == generation
+                    && event["data"]["command_id"] == reply_id
+                    && event["data"]["request_id"] == request_id
+                    && event["data"]["turn_id"] == turn_id
+            })
+            .collect();
+        assert_eq!(resolved.len(), 1, "reply resolves its exact opened request");
+
+        let agent_view: AgentGetResponse = serde_json::from_value(fixture.json(&["show", &agent]))
+            .expect("typed Agent state after request reply");
+        assert_eq!(agent_view.agent.state, AgentState::Busy);
+        assert_eq!(
+            agent_view.agent.active_turn.as_deref(),
+            Some(turn_id.as_str())
+        );
+        assert!(agent_view.agent.pending.is_empty());
+        let turn_request = TurnGetRequest::new(agent.clone(), generation, turn_id.clone());
+        let turn: CoreTurn = serde_json::from_value(
+            public_rpc(
+                &runtime,
+                &fixture,
+                "turn.get",
+                serde_json::to_value(turn_request).expect("encode running-turn request"),
+            )
+            .expect("read original turn after request reply"),
+        )
+        .expect("typed original turn after request reply");
+        assert_eq!(turn.turn_id, turn_id);
+        assert_eq!(turn.state, TurnState::Running);
+        assert!(!after_reply.iter().any(|event| {
+            event["kind"] == "turn.completed"
+                && event["data"]["command_id"] == send_id
+                && event["data"]["turn_id"] == turn_id
+        }));
+
+        let interrupt_id = ulid::Ulid::new().to_string();
+        let interrupt_result = cli(
+            &fixture.data,
+            &[
+                "--id",
+                &interrupt_id,
+                "interrupt",
+                &agent,
+                "--generation",
+                &generation_arg,
+                "--turn",
+                &turn_id,
+            ],
+        );
+        assert!(
+            interrupt_result.status.success(),
+            "exact request-turn cleanup failed for {rule_id}; bounded stdout={:?}; bounded stderr={:?}",
+            interrupt_result
+                .stdout
+                .chars()
+                .take(2048)
+                .collect::<String>(),
+            interrupt_result
+                .stderr
+                .chars()
+                .take(2048)
+                .collect::<String>()
+        );
+        let interrupt: CoreCommand =
+            serde_json::from_value(fixture.wait_command(&interrupt_id, "applied"))
+                .expect("applied exact-turn interrupt cleanup");
+        assert_eq!(interrupt.turn_id.as_deref(), Some(turn_id.as_str()));
+        let after_interrupt = fixture.events();
+        let terminal: Vec<_> = after_interrupt
+            .iter()
+            .filter(|event| {
+                event["kind"] == "turn.completed"
+                    && event["data"]["command_id"] == send_id
+                    && event["data"]["turn_id"] == turn_id
+            })
+            .collect();
+        assert_eq!(terminal.len(), 1, "only exact interrupt completes the turn");
+        assert_eq!(terminal[0]["data"]["status"], "interrupted");
+        assert!(fixture.json(&["show", &agent])["active_turn"].is_null());
+
+        retained.push((
+            rule_id.to_owned(),
+            event_seq,
+            parent,
+            reply,
+            send,
+            interrupt,
+            request_id,
+            turn_id,
+            request_kind.to_owned(),
+        ));
+    }
+
+    let stop_id = ulid::Ulid::new().to_string();
+    let stop_result = cli(
+        &fixture.data,
+        &[
+            "--id",
+            &stop_id,
+            "stop",
+            &agent,
+            "--generation",
+            &generation_arg,
+        ],
+    );
+    assert!(
+        stop_result.status.success(),
+        "exact Fake stop cleanup failed; bounded stdout={:?}; bounded stderr={:?}",
+        stop_result.stdout.chars().take(2048).collect::<String>(),
+        stop_result.stderr.chars().take(2048).collect::<String>()
+    );
+    fixture.wait_command(&stop_id, "applied");
+    fixture.stop(false);
+    fixture.start();
+
+    let events_after_restart = fixture.events();
+    for (rule_id, event_seq, parent, reply, send, interrupt, request_id, turn_id, request_kind) in
+        &retained
+    {
+        let retained_parent: CoreCommand =
+            serde_json::from_value(fixture.json(&["cmd", "show", &parent.id]))
+                .expect("retained request-reply parent");
+        let retained_reply: CoreCommand =
+            serde_json::from_value(fixture.json(&["cmd", "show", &reply.id]))
+                .expect("retained request-reply child");
+        let retained_send: CoreCommand =
+            serde_json::from_value(fixture.json(&["cmd", "show", &send.id]))
+                .expect("retained original SEND");
+        let retained_interrupt: CoreCommand =
+            serde_json::from_value(fixture.json(&["cmd", "show", &interrupt.id]))
+                .expect("retained exact-turn interrupt");
+        assert_eq!(&retained_parent, parent);
+        assert_eq!(&retained_reply, reply);
+        assert_eq!(&retained_send, send);
+        assert_eq!(&retained_interrupt, interrupt);
+        assert_eq!(
+            events_after_restart
+                .iter()
+                .filter(|event| {
+                    event["kind"] == "rule.fired"
+                        && event["data"]["rule"].as_str() == Some(rule_id.as_str())
+                        && event["data"]["event_seq"].as_i64() == Some(*event_seq)
+                        && event["data"]["parent_command"].as_str() == Some(parent.id.as_str())
+                })
+                .count(),
+            1,
+            "restart did not refire the retained request.opened event"
+        );
+        assert_eq!(
+            events_after_restart
+                .iter()
+                .filter(|event| {
+                    event["kind"] == "request.opened"
+                        && event["data"]["command_id"].as_str() == Some(send.id.as_str())
+                        && event["data"]["request_id"].as_str() == Some(request_id.as_str())
+                        && event["data"]["kind"].as_str() == Some(request_kind.as_str())
+                })
+                .count(),
+            1,
+            "restart did not duplicate the native request"
+        );
+        assert_eq!(
+            events_after_restart
+                .iter()
+                .filter(|event| {
+                    event["kind"] == "request.resolved"
+                        && event["data"]["command_id"].as_str() == Some(reply.id.as_str())
+                        && event["data"]["request_id"].as_str() == Some(request_id.as_str())
+                        && event["data"]["turn_id"].as_str() == Some(turn_id.as_str())
+                })
+                .count(),
+            1,
+            "restart did not duplicate the exact reply resolution"
+        );
+        assert_eq!(fault_dispatches(&events_after_restart, &send.id), 1);
+        assert_eq!(fault_dispatches(&events_after_restart, &reply.id), 1);
+        assert_eq!(fault_dispatches(&events_after_restart, &interrupt.id), 1);
     }
     fixture.stop(false);
 }

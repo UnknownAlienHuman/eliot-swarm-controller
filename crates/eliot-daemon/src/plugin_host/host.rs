@@ -1931,7 +1931,7 @@ fn manifest_source_plan(manifest: &PluginManifest, harness: &str) -> Result<Valu
         .get("controlled")
         .ok_or_else(unsupported_manifest)?;
     let tool_expected = harness == "codex";
-    let request_expected = harness == "codex";
+    let request_expected = matches!(harness, "fake" | "codex");
     let expected_count = expected_families.len()
         + if tool_expected { 1 } else { 0 }
         + if request_expected { 1 } else { 0 };
@@ -2515,6 +2515,74 @@ mod tests {
         require_proxy_capability(&routed, &manifest).unwrap();
     }
 
+    #[test]
+    fn controlled_fake_manifest_requires_exact_request_stream_family() {
+        let mut fake = eliot_plugin::protocol::fake_manifest();
+        assert_eq!(
+            manifest_source_plan(&fake, "fake").unwrap_err().code,
+            "unsupported"
+        );
+        fake.sources
+            .get_mut("controlled")
+            .expect("Fake controlled sources")
+            .insert("request".to_owned(), "stream".to_owned());
+
+        let plan = manifest_source_plan(&fake, "fake").expect("Fake request stream is supported");
+        assert_eq!(plan.as_object().unwrap().len(), 4);
+        for family in ["message", "request", "session", "turn"] {
+            assert_eq!(plan[family], "stream");
+        }
+
+        let mut wrong_mechanism = fake.clone();
+        wrong_mechanism
+            .sources
+            .get_mut("controlled")
+            .unwrap()
+            .insert("request".to_owned(), "native_read".to_owned());
+        assert_eq!(
+            manifest_source_plan(&wrong_mechanism, "fake")
+                .unwrap_err()
+                .code,
+            "unsupported"
+        );
+
+        let mut extra_tool = fake.clone();
+        extra_tool
+            .sources
+            .get_mut("controlled")
+            .unwrap()
+            .insert("tool".to_owned(), "stream".to_owned());
+        assert_eq!(
+            manifest_source_plan(&extra_tool, "fake").unwrap_err().code,
+            "unsupported"
+        );
+
+        let mut codex = fake.clone();
+        codex.name = "codex".to_owned();
+        codex.harness_version = "0.161.0".to_owned();
+        codex
+            .sources
+            .get_mut("controlled")
+            .unwrap()
+            .insert("tool".to_owned(), "stream".to_owned());
+        assert_eq!(
+            manifest_source_plan(&codex, "codex")
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .len(),
+            5
+        );
+        let mut unknown_harness = codex.clone();
+        unknown_harness.name = "unknown-harness".to_owned();
+        assert_eq!(
+            manifest_source_plan(&unknown_harness, "unknown-harness")
+                .unwrap_err()
+                .code,
+            "unsupported"
+        );
+    }
+
     const SECRET: &str = "__payload_guard_secret__";
     const SECRET_ERROR: &str =
         "native source payload contains a known secret in immutable metadata";
@@ -3035,6 +3103,13 @@ mod tests {
                     && owner["source"] == "transcript"
                     && owner["mechanism"] == "fake_recovery")
         );
+        assert!(
+            state["owners"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|owner| owner["family"] == "request" && owner["source"] == "stream")
+        );
         assert_eq!(
             client
                 .call("source.handoff", handoff.clone(), deadline())
@@ -3061,7 +3136,7 @@ mod tests {
         );
         assert_eq!(store.lock().await.high_water().unwrap(), committed);
         let mut remainder = handoff.clone();
-        remainder["families"] = json!(["session"]);
+        remainder["families"] = json!(["request", "session"]);
         remainder["cursor"] = json!("edge-1");
         let final_ack = client
             .call("source.handoff", remainder, deadline())
@@ -3090,6 +3165,17 @@ mod tests {
         assert_eq!(predecessor["families"], json!([]));
         assert_eq!(predecessor["state"], json!("open"));
         assert_eq!(predecessor["last_handoff"], final_ack);
+        assert!(
+            predecessor["owners"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|owner| {
+                    owner["family"] == "request"
+                        && owner["source"] == "transcript"
+                        && owner["mechanism"] == "fake_recovery"
+                })
+        );
 
         let send_id = Ulid::new().to_string();
         {
@@ -3172,7 +3258,7 @@ mod tests {
         let mut families: Vec<String> =
             serde_json::from_value(gap.data["families"].clone()).unwrap();
         families.sort();
-        assert_eq!(families, ["message", "session", "turn"]);
+        assert_eq!(families, ["message", "request", "session", "turn"]);
         for source in ["stream", "transcript"] {
             assert_eq!(
                 store.read_source_state(&agent_id, 1, source).unwrap()["state"],

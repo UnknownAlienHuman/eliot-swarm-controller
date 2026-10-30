@@ -395,6 +395,7 @@ Add hooks only for a missing native fact/decision. Config is session-scoped; dec
 bind exact generation/request/deadline. Timeout uses the safe native default; late
 approval is discarded, not queued. Hooks do not duplicate the authoritative stream.
 
-The initial fake echoes turns over this same transport. Add request/crash/child/recovery
-steps with their real caller. Record/replay and common conformance are completed in L7,
-not a separate framework blocking L2. CI never calls a model.
+The initial Fake echoes turns and emits request callbacks over this same transport.
+Add crash/child/recovery steps with their real caller. Record/replay and common
+conformance are completed in L7, not a separate framework blocking L2. CI never calls a
+model.
