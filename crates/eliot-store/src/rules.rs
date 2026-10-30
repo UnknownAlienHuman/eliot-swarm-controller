@@ -3228,6 +3228,8 @@ mod tests {
                     repo_common_dir: format!("synthetic-common-{project}"),
                     profiles: vec!["fake".to_owned()],
                     actions: vec!["stop".to_owned()],
+                    interpreters: std::collections::BTreeMap::new(),
+                    run_env: Vec::new(),
                 },
                 now,
             )

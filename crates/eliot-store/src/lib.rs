@@ -139,7 +139,7 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(sql_error)?;
-        if current > 14 {
+        if current > 15 {
             return Err(Error::new(
                 "unsupported",
                 format!("Store schema version {current} is newer than this binary"),
@@ -553,6 +553,21 @@ impl Store {
                  INSERT INTO rule_history_coverage(singleton, pruned_through)
                      VALUES (1, 0);
                  INSERT INTO schema_migrations(version) VALUES (14);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 15 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE project_registrations
+                     ADD COLUMN interpreters TEXT NOT NULL DEFAULT '{}';
+                 ALTER TABLE project_registrations
+                     ADD COLUMN run_env TEXT NOT NULL DEFAULT '[]';
+                 INSERT INTO schema_migrations(version) VALUES (15);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

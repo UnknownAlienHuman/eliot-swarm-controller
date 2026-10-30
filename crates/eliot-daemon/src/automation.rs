@@ -312,6 +312,8 @@ fn project_registration_input(
         repo_common_dir: registration.repo_common_dir.clone(),
         profiles: registration.profiles.clone(),
         actions: registration.actions.clone(),
+        interpreters: registration.interpreters.clone(),
+        run_env: registration.run_env.clone(),
     }
 }
 
@@ -324,6 +326,8 @@ fn project_registration_snapshot(
         repo_common_dir: registration.repo_common_dir.clone(),
         profiles: registration.profiles.clone(),
         actions: registration.actions.clone(),
+        interpreters: registration.interpreters.clone(),
+        run_env: registration.run_env.clone(),
     }
 }
 
@@ -1815,6 +1819,8 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 repo_common_dir: format!("{checkout}/.git"),
                 profiles: vec!["fake".to_owned()],
                 actions: vec!["stop".to_owned()],
+                interpreters: std::collections::BTreeMap::new(),
+                run_env: Vec::new(),
             }])
             .await
             .unwrap()
