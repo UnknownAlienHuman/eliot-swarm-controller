@@ -10,11 +10,17 @@ use eliot_core::{
     Turn as CoreTurn, TurnState,
 };
 use serde_json::{Value, json};
-use std::{fs, path::PathBuf, thread, time::Duration};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    thread,
+    time::Duration,
+};
 use support::{CLI, Fixture, cli};
 
 const PROJECT_ID: &str = "script-fixture";
 const RULE_ID: &str = "project-script-on-completed";
+const GLOBAL_RULE_ID: &str = "global-script-on-completed";
 const SEND_TEXT: &str = "script-event-send";
 const INVALID_SEND_TEXT: &str = "must-not-dispatch";
 
@@ -166,6 +172,66 @@ fn setup_registered_project(fixture: &mut Fixture) -> ApprovedInterpreter {
     interpreter
 }
 
+fn setup_global_run_fixture(fixture: &mut Fixture, interpreter: &ApprovedInterpreter) -> PathBuf {
+    assert!(
+        fixture
+            .git(&["init", "--initial-branch=main"])
+            .status
+            .success(),
+        "initialize owner workspace"
+    );
+    fs::write(
+        fixture.workspace.join("seed.txt"),
+        "global script fixture\n",
+    )
+    .expect("write owner workspace seed");
+    assert!(fixture.git(&["add", "--all"]).status.success());
+    assert!(
+        fixture
+            .git(&["commit", "-m", "Global script fixture"])
+            .status
+            .success(),
+        "commit owner workspace fixture"
+    );
+
+    // Initialize the private data root before installing owner Run approval.
+    fixture.start();
+    fixture.stop(false);
+
+    let scripts = fixture.data.join("scripts");
+    fs::create_dir_all(&scripts).expect("create private global script directory");
+    fs::create_dir_all(fixture.data.join("rules")).expect("create private global rule directory");
+    let entry = interpreter
+        .entry
+        .rsplit('/')
+        .next()
+        .expect("script entry filename");
+    fs::write(scripts.join(entry), SCRIPT_FIXTURE).expect("install global script fixture");
+    write_global_run_config(fixture, interpreter, true);
+    fixture.start();
+
+    fs::canonicalize(scripts).expect("canonical private global script root")
+}
+
+fn write_global_run_config(
+    fixture: &Fixture,
+    interpreter: &ApprovedInterpreter,
+    approve_interpreter: bool,
+) {
+    let interpreter_table = if approve_interpreter {
+        format!(
+            "\n[automation.run.interpreters.{}]\nprogram = {}\nargv_prefix = {}\n",
+            interpreter.reference,
+            toml_string(&interpreter.program),
+            toml_array(&interpreter.argv_prefix),
+        )
+    } else {
+        String::new()
+    };
+    let config = format!("[automation.run]\nrun_env = [\"CI\"]\n{interpreter_table}");
+    fs::write(fixture.data.join("config.toml"), config).expect("write owner global Run grant");
+}
+
 struct RunRuleCase<'a> {
     mode: &'a str,
     agent: &'a str,
@@ -239,6 +305,57 @@ fn write_run_rule(fixture: &Fixture, interpreter: &ApprovedInterpreter, case: Ru
         );
         thread::sleep(Duration::from_millis(25));
     }
+}
+
+struct GlobalRunRuleCase<'a> {
+    agent: &'a str,
+    generation: i64,
+    trigger_command_id: &'a str,
+    context_path: &'a Path,
+    own_command_path: &'a Path,
+    cwd: &'a Path,
+}
+
+fn write_global_run_rule(
+    fixture: &Fixture,
+    interpreter: &ApprovedInterpreter,
+    case: GlobalRunRuleCase<'_>,
+) {
+    let entry = interpreter
+        .entry
+        .rsplit('/')
+        .next()
+        .expect("script entry filename");
+    let arguments = vec![
+        interpreter.reference.clone(),
+        entry.to_owned(),
+        "success".to_owned(),
+        CLI.to_owned(),
+        fixture.data.display().to_string(),
+        case.agent.to_owned(),
+        case.generation.to_string(),
+        case.trigger_command_id.to_owned(),
+        case.context_path.display().to_string(),
+        case.own_command_path.display().to_string(),
+        case.cwd.display().to_string(),
+    ];
+    let source = format!(
+        concat!(
+            "[[rule]]\n",
+            "id = \"{rule_id}\"\n",
+            "on = {{ event = \"turn.completed\", match = {{ \"subject.harness\" = \"fake\" }} }}\n",
+            "do = [{{ action = \"run\", cmd = {cmd}, cwd = {cwd}, env = {{ CI = \"script-approved\" }} }}]\n",
+        ),
+        cmd = toml_array(&arguments),
+        cwd = toml_string(&case.cwd.display().to_string()),
+        rule_id = GLOBAL_RULE_ID,
+    );
+    fs::write(
+        fixture.data.join("rules").join("global-script.toml"),
+        source,
+    )
+    .expect("write owner global event rule");
+    wait_for_global_rule(fixture);
 }
 
 fn owner_send(fixture: &Fixture, id: &str, agent: &str, generation: i64, text: &str) -> CoreTurn {
@@ -333,6 +450,54 @@ fn wait_for_firing(fixture: &Fixture, trigger_command_id: &str) -> (Value, Vec<V
     }
 }
 
+fn wait_for_global_rule(fixture: &Fixture) -> RuleStateView {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let reply = cli(&fixture.data, &["rule", "show", GLOBAL_RULE_ID]);
+        if reply.status.success() {
+            let state: RuleStateView =
+                serde_json::from_str(&reply.stdout).expect("typed global rule state");
+            assert_eq!(state.id, GLOBAL_RULE_ID);
+            assert_eq!(state.project, None);
+            return state;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "global event rule load deadline; stderr={:?}",
+            reply.stderr.chars().take(2048).collect::<String>()
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_for_global_firing(fixture: &Fixture, trigger_command_id: &str) -> (Value, Vec<Value>) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let events = fixture.events();
+        let trigger_seq = events
+            .iter()
+            .find(|event| {
+                event["kind"] == "turn.completed"
+                    && event["data"]["command_id"] == trigger_command_id
+            })
+            .and_then(|event| event["seq"].as_i64());
+        if let Some(trigger_seq) = trigger_seq
+            && let Some(firing) = events.iter().find(|event| {
+                event["kind"] == "rule.fired"
+                    && event["data"]["rule"] == GLOBAL_RULE_ID
+                    && event["data"]["event_seq"] == trigger_seq
+            })
+        {
+            return (firing.clone(), events);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "global event rule firing deadline"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
 fn wait_for_rule_cursor(fixture: &Fixture, through: i64) -> Vec<Value> {
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
@@ -351,6 +516,27 @@ fn wait_for_rule_cursor(fixture: &Fixture, through: i64) -> Vec<Value> {
         assert!(
             std::time::Instant::now() < deadline,
             "project rule cursor did not reach event sequence {through}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_for_global_rule_cursor(fixture: &Fixture, through: i64) -> Vec<Value> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let events = fixture.events();
+        let reply = cli(&fixture.data, &["rule", "show", GLOBAL_RULE_ID]);
+        if reply.status.success() {
+            let state: RuleStateView =
+                serde_json::from_str(&reply.stdout).expect("typed global rule cursor");
+            assert_eq!(state.project, None);
+            if state.current_cursor >= through {
+                return events;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "global rule cursor did not reach event sequence {through}"
         );
         thread::sleep(Duration::from_millis(25));
     }
@@ -473,6 +659,7 @@ fn script_context(
     run_id: &str,
     agent: &str,
     generation: i64,
+    expected_rule_id: &str,
 ) -> Value {
     let bytes = fs::read(path).expect("script's bounded stdin artifact");
     assert!(
@@ -486,7 +673,7 @@ fn script_context(
     assert_eq!(context["event"]["agent"], agent);
     assert_eq!(context["event"]["generation"], generation);
     assert_eq!(context["subject"]["harness"], "fake");
-    assert_eq!(context["rule"]["id"], RULE_ID);
+    assert_eq!(context["rule"]["id"], expected_rule_id);
     assert_eq!(context["command"]["id"], run_id);
     assert_eq!(context["command"]["verb"], "run");
     context
@@ -593,7 +780,14 @@ fn project_event_run_reads_own_command_and_admits_one_scoped_send() {
     assert_eq!(own_command.verb, "run");
     assert_eq!(own_command.principal, project_principal);
     assert_eq!(own_command.target, None);
-    script_context(&context_path, &trigger_id, &run_id, &agent, generation);
+    script_context(
+        &context_path,
+        &trigger_id,
+        &run_id,
+        &agent,
+        generation,
+        RULE_ID,
+    );
 
     let (child_terminal, _) =
         wait_for_turn_terminal(&fixture, &agent, generation, send_id, &child_turn.turn_id);
@@ -678,6 +872,505 @@ fn project_event_run_reads_own_command_and_admits_one_scoped_send() {
 }
 
 #[test]
+fn global_event_run_reads_own_command_and_admits_one_owner_send() {
+    let mut fixture = Fixture::new("global script run success");
+    let interpreter = approved_interpreter();
+    let scripts_root = setup_global_run_fixture(&mut fixture, &interpreter);
+    let owner_cwd = fs::canonicalize(&fixture.workspace).expect("canonical owner cwd");
+    assert!(owner_cwd.is_absolute());
+    assert!(
+        !owner_cwd.starts_with(&scripts_root),
+        "owner cwd must be outside the private script-entry root"
+    );
+
+    let launch = fixture.json(&[
+        "launch",
+        "--profile",
+        "fake",
+        "--workspace",
+        fixture.workspace.to_str().expect("workspace path"),
+    ]);
+    let agent = launch["target"].as_str().expect("Fake Agent").to_owned();
+    let generation = launch["generation"].as_i64().expect("Fake generation");
+    let trigger_id = ulid::Ulid::new().to_string();
+    let context_path = fixture.root.join("global script context.json");
+    let own_command_path = fixture.root.join("global own run command.json");
+    write_global_run_rule(
+        &fixture,
+        &interpreter,
+        GlobalRunRuleCase {
+            agent: &agent,
+            generation,
+            trigger_command_id: &trigger_id,
+            context_path: &context_path,
+            own_command_path: &own_command_path,
+            cwd: &owner_cwd,
+        },
+    );
+
+    let trigger = owner_send(
+        &fixture,
+        &trigger_id,
+        &agent,
+        generation,
+        "global-script-trigger",
+    );
+    let (firing, _) = wait_for_global_firing(&fixture, &trigger_id);
+    let run_id = firing["data"]["child_command"]
+        .as_str()
+        .expect("firing's Run command")
+        .to_owned();
+    let rule_parent_id = firing["data"]["parent_command"]
+        .as_str()
+        .expect("firing's retained parent")
+        .to_owned();
+
+    let rule_parent: CoreCommand =
+        serde_json::from_value(fixture.wait_command(&rule_parent_id, "applied"))
+            .expect("typed global rule parent");
+    assert_eq!(rule_parent.verb, "rule");
+    assert_eq!(rule_parent.principal, "owner");
+    let rule_children = rule_parent
+        .outcome
+        .as_ref()
+        .and_then(|outcome| outcome.get("children"))
+        .and_then(Value::as_array)
+        .expect("retained global rule action child set");
+    assert_eq!(rule_children.len(), 1);
+    assert_eq!(rule_children[0].as_str(), Some(run_id.as_str()));
+
+    let run = wait_for_run_outcome(&fixture, &run_id);
+    assert_eq!(run.id, run_id);
+    assert_eq!(run.verb, "run");
+    assert_eq!(run.target, None);
+    assert_eq!(run.expected_generation, None);
+    assert_eq!(run.generation, None);
+    assert_eq!(run.principal, "owner");
+    assert_run_state(&run, CommandState::Applied);
+    let applied: ScriptRunApplied =
+        serde_json::from_value(run.outcome.as_ref().expect("applied Run outcome").clone())
+            .expect("typed applied Run outcome");
+    applied.validate().expect("valid per-Run process result");
+    assert_eq!(applied.children.len(), 1);
+    #[cfg(windows)]
+    assert_eq!(applied.process.custody, ScriptCustody::Exact);
+    #[cfg(target_os = "linux")]
+    assert_eq!(applied.process.custody, ScriptCustody::Degraded);
+    assert!(applied.process.quiescent);
+    assert_eq!(
+        applied.process.direct_exit,
+        ScriptDirectExit::Exited {
+            success: true,
+            exit_code: Some(0),
+        }
+    );
+
+    let send_id = &applied.children[0];
+    let sent: CoreCommand = serde_json::from_value(fixture.wait_command(send_id, "applied"))
+        .expect("typed ordinary owner SEND child");
+    assert_eq!(sent.verb, "send");
+    assert_eq!(sent.principal, "owner");
+    assert_eq!(sent.target.as_deref(), Some(agent.as_str()));
+    assert_eq!(sent.expected_generation, Some(generation));
+    assert_eq!(sent.generation, Some(generation));
+    assert_eq!(sent.args, json!({"text": SEND_TEXT}));
+    let child_turn = exact_result(&fixture, &agent, generation, &sent, SEND_TEXT);
+    assert_eq!(trigger.state, TurnState::Completed);
+
+    let own_command: CoreCommand = serde_json::from_slice(
+        &fs::read(&own_command_path).expect("Run's own command.get stdout capture"),
+    )
+    .expect("standard Core Command DTO from first Run RPC");
+    assert_eq!(own_command.id, run_id);
+    assert_eq!(own_command.verb, "run");
+    assert_eq!(own_command.principal, "owner");
+    assert_eq!(own_command.target, None);
+    let context = script_context(
+        &context_path,
+        &trigger_id,
+        &run_id,
+        &agent,
+        generation,
+        GLOBAL_RULE_ID,
+    );
+    assert_eq!(context["event"]["seq"], firing["data"]["event_seq"]);
+
+    let (child_terminal, _) =
+        wait_for_turn_terminal(&fixture, &agent, generation, send_id, &child_turn.turn_id);
+    let events = wait_for_global_rule_cursor(&fixture, child_terminal);
+    let firings: Vec<_> = events
+        .iter()
+        .filter(|event| event["kind"] == "rule.fired" && event["data"]["rule"] == GLOBAL_RULE_ID)
+        .collect();
+    assert_eq!(
+        firings.len(),
+        1,
+        "default self-suppression prevents a global Run auto-loop"
+    );
+    assert_eq!(firings[0]["data"]["child_command"], run_id);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                event["kind"] == "turn.completed"
+                    && event["agent"] == agent
+                    && event["generation"] == generation
+            })
+            .count(),
+        2,
+        "one trigger turn and one emitted SEND turn were completed"
+    );
+    assert_eq!(
+        command_events(&events, "command.dispatched", &run_id).len(),
+        1
+    );
+    assert_eq!(
+        command_events(&events, "command.dispatched", send_id).len(),
+        1
+    );
+    assert!(!events.iter().any(|event| {
+        event["kind"] == "rule.rejected"
+            && event["data"]["rule"] == GLOBAL_RULE_ID
+            && event["data"]["event_seq"] == child_terminal
+    }));
+
+    let generation_arg = generation.to_string();
+    let stop = fixture.json(&["stop", &agent, "--generation", &generation_arg]);
+    let stop_id = stop["command_id"].as_str().expect("Fake stop command");
+    fixture.wait_command(stop_id, "applied");
+    fixture.stop(false);
+    fixture.start();
+
+    let retained_run: CoreCommand = serde_json::from_value(fixture.json(&["cmd", "show", &run_id]))
+        .expect("typed global Run readback after daemon restart");
+    assert_eq!(retained_run.state, CommandState::Applied);
+    let retained_applied: ScriptRunApplied = serde_json::from_value(
+        retained_run
+            .outcome
+            .as_ref()
+            .expect("retained applied Run outcome")
+            .clone(),
+    )
+    .expect("retained typed Run process result");
+    assert_eq!(retained_applied, applied);
+    let events_after_restart = fixture.events();
+    assert_eq!(
+        events_after_restart
+            .iter()
+            .filter(|event| {
+                event["kind"] == "rule.fired" && event["data"]["rule"] == GLOBAL_RULE_ID
+            })
+            .count(),
+        1,
+        "restart retains the original global Run without refiring its event"
+    );
+    assert_eq!(
+        command_events(&events_after_restart, "command.dispatched", &run_id).len(),
+        1
+    );
+}
+
+#[test]
+fn global_event_run_history_catch_up_emits_one_send_and_replays_quietly() {
+    let mut fixture = Fixture::new("global script history catch-up");
+    let interpreter = approved_interpreter();
+    let scripts_root = setup_global_run_fixture(&mut fixture, &interpreter);
+    let owner_cwd = fs::canonicalize(&fixture.workspace).expect("canonical owner cwd");
+    assert!(owner_cwd.is_absolute());
+    assert!(!owner_cwd.starts_with(&scripts_root));
+
+    let launch = fixture.json(&[
+        "launch",
+        "--profile",
+        "fake",
+        "--workspace",
+        fixture.workspace.to_str().expect("workspace path"),
+    ]);
+    let agent = launch["target"].as_str().expect("Fake Agent").to_owned();
+    let generation = launch["generation"].as_i64().expect("Fake generation");
+    let trigger_id = ulid::Ulid::new().to_string();
+    let trigger = owner_send(
+        &fixture,
+        &trigger_id,
+        &agent,
+        generation,
+        "global-history-trigger",
+    );
+    let (trigger_seq, events_before_rule) =
+        wait_for_turn_terminal(&fixture, &agent, generation, &trigger_id, &trigger.turn_id);
+    let trigger_event = events_before_rule
+        .iter()
+        .find(|event| event["seq"] == trigger_seq)
+        .cloned()
+        .expect("captured Fake terminal event");
+    assert_eq!(trigger_event["kind"], "turn.completed");
+    assert_eq!(trigger_event["data"]["command_id"], trigger_id);
+
+    let context_path = fixture.root.join("global catch-up script context.json");
+    let own_command_path = fixture.root.join("global catch-up own command.json");
+    write_global_run_rule(
+        &fixture,
+        &interpreter,
+        GlobalRunRuleCase {
+            agent: &agent,
+            generation,
+            trigger_command_id: &trigger_id,
+            context_path: &context_path,
+            own_command_path: &own_command_path,
+            cwd: &owner_cwd,
+        },
+    );
+    let rule_state = wait_for_global_rule(&fixture);
+    assert!(rule_state.current_cursor >= trigger_seq);
+
+    let after_seq = trigger_seq - 1;
+    let after_arg = after_seq.to_string();
+    let through_arg = trigger_seq.to_string();
+    let catchup_id = ulid::Ulid::new().to_string();
+    let catchup_args = [
+        "--id",
+        catchup_id.as_str(),
+        "rule",
+        "catch-up",
+        GLOBAL_RULE_ID,
+        "--after",
+        after_arg.as_str(),
+        "--through",
+        through_arg.as_str(),
+    ];
+    let catchup_reply = cli(&fixture.data, &catchup_args);
+    assert!(
+        catchup_reply.status.success(),
+        "global history catch-up failed; bounded stdout={:?}; bounded stderr={:?}",
+        catchup_reply.stdout.chars().take(2048).collect::<String>(),
+        catchup_reply.stderr.chars().take(2048).collect::<String>()
+    );
+    let catchup: CoreCommand =
+        serde_json::from_str(&catchup_reply.stdout).expect("typed global catch-up parent");
+    assert_eq!(catchup.id, catchup_id);
+    assert_eq!(catchup.verb, "rule.catch_up");
+    assert_eq!(catchup.principal, "owner");
+    assert_eq!(catchup.state, CommandState::Applied);
+    assert_eq!(catchup.args["rule"], GLOBAL_RULE_ID);
+    assert_eq!(catchup.args["after_seq"], after_seq);
+    assert_eq!(catchup.args["through_seq"], trigger_seq);
+    assert_eq!(catchup.args["revision"], rule_state.revision);
+    assert_eq!(
+        catchup.outcome.as_ref().expect("catch-up outcome")["children"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+
+    let (firing, _) = wait_for_global_firing(&fixture, &trigger_id);
+    assert_eq!(firing["data"]["parent_command"], catchup_id);
+    assert_eq!(firing["data"]["event_seq"], trigger_seq);
+    assert_eq!(firing["data"]["revision"], rule_state.revision);
+    let run_id = firing["data"]["child_command"]
+        .as_str()
+        .expect("catch-up firing's Run child")
+        .to_owned();
+    assert_eq!(
+        catchup.outcome.as_ref().unwrap()["children"],
+        json!([run_id])
+    );
+
+    let run = wait_for_run_outcome(&fixture, &run_id);
+    assert_eq!(run.id, run_id);
+    assert_eq!(run.verb, "run");
+    assert_eq!(run.state, CommandState::Applied);
+    assert_eq!(run.principal, "owner");
+    assert_eq!(run.target, None);
+    assert_eq!(run.args["context"]["event"], trigger_event);
+    assert_eq!(run.args["context"]["rule"]["id"], GLOBAL_RULE_ID);
+    assert_eq!(run.args["context"]["rule"]["revision"], rule_state.revision);
+    let applied: ScriptRunApplied =
+        serde_json::from_value(run.outcome.as_ref().expect("applied Run outcome").clone())
+            .expect("typed global catch-up Run outcome");
+    applied.validate().expect("valid per-Run process result");
+    assert_eq!(applied.children.len(), 1);
+
+    let send_id = &applied.children[0];
+    let sent: CoreCommand = serde_json::from_value(fixture.wait_command(send_id, "applied"))
+        .expect("typed catch-up SEND child");
+    assert_eq!(sent.verb, "send");
+    assert_eq!(sent.principal, "owner");
+    assert_eq!(sent.target.as_deref(), Some(agent.as_str()));
+    assert_eq!(sent.expected_generation, Some(generation));
+    assert_eq!(sent.generation, Some(generation));
+    assert_eq!(sent.args, json!({"text": SEND_TEXT}));
+    let send_turn = exact_result(&fixture, &agent, generation, &sent, SEND_TEXT);
+
+    let own_command: CoreCommand = serde_json::from_slice(
+        &fs::read(&own_command_path).expect("Run's own command.get stdout capture"),
+    )
+    .expect("standard Core Command DTO from first Run RPC");
+    assert_eq!(own_command.id, run_id);
+    assert_eq!(own_command.principal, "owner");
+    let context = script_context(
+        &context_path,
+        &trigger_id,
+        &run_id,
+        &agent,
+        generation,
+        GLOBAL_RULE_ID,
+    );
+    assert_eq!(context["event"], trigger_event);
+    assert_eq!(context["rule"]["revision"], rule_state.revision);
+
+    let (send_terminal_seq, _) =
+        wait_for_turn_terminal(&fixture, &agent, generation, send_id, &send_turn.turn_id);
+    let events = wait_for_global_rule_cursor(&fixture, send_terminal_seq);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                event["kind"] == "rule.fired" && event["data"]["rule"] == GLOBAL_RULE_ID
+            })
+            .count(),
+        1,
+        "the catch-up SEND does not self-trigger another Run"
+    );
+    assert_eq!(
+        command_events(&events, "command.dispatched", &run_id).len(),
+        1
+    );
+    assert_eq!(
+        command_events(&events, "command.dispatched", send_id).len(),
+        1
+    );
+
+    let replay_reply = cli(&fixture.data, &catchup_args);
+    assert!(
+        replay_reply.status.success(),
+        "same-ID global catch-up replay failed; bounded stdout={:?}; bounded stderr={:?}",
+        replay_reply.stdout.chars().take(2048).collect::<String>(),
+        replay_reply.stderr.chars().take(2048).collect::<String>()
+    );
+    let replay: CoreCommand =
+        serde_json::from_str(&replay_reply.stdout).expect("typed same-ID global catch-up replay");
+    assert_eq!(replay, catchup);
+    let after_replay = fixture.events();
+    assert_eq!(
+        after_replay
+            .iter()
+            .filter(|event| {
+                event["kind"] == "rule.fired"
+                    && event["data"]["rule"] == GLOBAL_RULE_ID
+                    && event["data"]["parent_command"] == catchup_id
+            })
+            .count(),
+        1,
+        "same-ID replay did not repeat the catch-up firing"
+    );
+    assert_eq!(
+        command_events(&after_replay, "command.dispatched", &run_id).len(),
+        1
+    );
+    assert_eq!(
+        command_events(&after_replay, "command.dispatched", send_id).len(),
+        1
+    );
+}
+
+#[test]
+fn global_event_run_without_interpreter_grant_rejects_before_effects() {
+    let mut fixture = Fixture::new("global script run revoked grant");
+    let interpreter = approved_interpreter();
+    let scripts_root = setup_global_run_fixture(&mut fixture, &interpreter);
+    let owner_cwd = fs::canonicalize(&fixture.workspace).expect("canonical owner cwd");
+    assert!(owner_cwd.is_absolute());
+    assert!(
+        !owner_cwd.starts_with(&scripts_root),
+        "owner cwd must be outside the private script-entry root"
+    );
+
+    let trigger_id = ulid::Ulid::new().to_string();
+    let context_path = fixture.root.join("revoked global script context.json");
+    let own_command_path = fixture.root.join("revoked global own command.json");
+    let unused_agent = ulid::Ulid::new().to_string();
+    write_global_run_rule(
+        &fixture,
+        &interpreter,
+        GlobalRunRuleCase {
+            agent: &unused_agent,
+            generation: 1,
+            trigger_command_id: &trigger_id,
+            context_path: &context_path,
+            own_command_path: &own_command_path,
+            cwd: &owner_cwd,
+        },
+    );
+
+    fixture.stop(false);
+    write_global_run_config(&fixture, &interpreter, false);
+    fixture.start();
+    wait_for_global_rule(&fixture);
+
+    let launch = fixture.json(&[
+        "launch",
+        "--profile",
+        "fake",
+        "--workspace",
+        fixture.workspace.to_str().expect("workspace path"),
+    ]);
+    let agent = launch["target"].as_str().expect("Fake Agent").to_owned();
+    let generation = launch["generation"].as_i64().expect("Fake generation");
+    let trigger = owner_send(
+        &fixture,
+        &trigger_id,
+        &agent,
+        generation,
+        "revoked-global-script-trigger",
+    );
+    assert_eq!(trigger.state, TurnState::Completed);
+
+    let trigger_seq = fixture
+        .events()
+        .iter()
+        .find(|event| {
+            event["kind"] == "turn.completed" && event["data"]["command_id"] == trigger_id
+        })
+        .and_then(|event| event["seq"].as_i64())
+        .expect("fresh Fake terminal event");
+    let events = wait_for_global_rule_cursor(&fixture, trigger_seq);
+    let rejected = events
+        .iter()
+        .find(|event| {
+            event["kind"] == "rule.rejected"
+                && event["data"]["rule"] == GLOBAL_RULE_ID
+                && event["data"]["through_seq"] == trigger_seq
+        })
+        .expect("revoked owner grant rejects the global Run before admission");
+    assert_eq!(rejected["data"]["code"], "not_allowed");
+    assert!(!events.iter().any(|event| {
+        event["kind"] == "rule.fired"
+            && event["data"]["rule"] == GLOBAL_RULE_ID
+            && event["data"]["event_seq"] == trigger_seq
+    }));
+    assert!(
+        !context_path.exists(),
+        "revoked Run never starts the script"
+    );
+    assert!(
+        !own_command_path.exists(),
+        "revoked Run has no Run-role RPC"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                event["kind"] == "turn.completed"
+                    && event["agent"] == agent
+                    && event["generation"] == generation
+            })
+            .count(),
+        1,
+        "revoked Run creates no script SEND turn"
+    );
+}
+
+#[test]
 fn project_event_run_rejects_late_invalid_record_before_any_send_dispatch() {
     let mut fixture = Fixture::new("project script run invalid output");
     let interpreter = setup_registered_project(&mut fixture);
@@ -753,7 +1446,14 @@ fn project_event_run_rejects_late_invalid_record_before_any_send_dispatch() {
     assert_eq!(own_command.id, run_id);
     assert_eq!(own_command.verb, "run");
     assert_eq!(own_command.principal, format!("project:{PROJECT_ID}"));
-    script_context(&context_path, &trigger_id, &run_id, &agent, generation);
+    script_context(
+        &context_path,
+        &trigger_id,
+        &run_id,
+        &agent,
+        generation,
+        RULE_ID,
+    );
 
     let events = fixture.events();
     assert_eq!(

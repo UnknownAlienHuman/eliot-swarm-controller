@@ -1312,7 +1312,7 @@ async fn process_rule_cursor(
                 return Ok(false);
             }
             let prepared_result = if action.verb == "run" {
-                prepare_project_run_submission(router, rule, retiring, &definition, &event, action)
+                prepare_event_run_submission(router, rule, retiring, &definition, &event, action)
                     .await
             } else {
                 match rule.project.as_ref() {
@@ -1361,7 +1361,7 @@ async fn process_rule_cursor(
     Ok(true)
 }
 
-async fn prepare_project_run_submission(
+async fn prepare_event_run_submission(
     router: &Router,
     rule: &ActiveRule,
     retiring: bool,
@@ -1369,12 +1369,6 @@ async fn prepare_project_run_submission(
     event: &Event,
     action: eliot_core::SubmitCommand,
 ) -> Result<crate::router::PreparedSubmission> {
-    let project = rule.project.as_ref().ok_or_else(|| {
-        Error::new(
-            "unsupported",
-            "global script runs are not supported in this increment",
-        )
-    })?;
     let revision = if retiring {
         rule.retiring
             .as_ref()
@@ -1383,10 +1377,42 @@ async fn prepare_project_run_submission(
     } else {
         rule.state.revision
     };
-    let action = freeze_project_run_action(router, project, definition, event, revision, action)?;
-    router
-        .prepare_project_rule_submission(action, project)
-        .await
+    match rule.project.as_ref() {
+        Some(project) => {
+            let action =
+                freeze_project_run_action(router, project, definition, event, revision, action)?;
+            router
+                .prepare_project_rule_submission(action, project)
+                .await
+        }
+        None if rule.principal == "owner" => {
+            router
+                .prepare_owner_rule_run_submission(
+                    action,
+                    frozen_script_context(definition, event, revision),
+                )
+                .await
+        }
+        None => Err(Error::new(
+            "not_allowed",
+            "global event Run requires the Owner rule principal",
+        )),
+    }
+}
+
+fn frozen_script_context(
+    definition: &RuleDefinition,
+    event: &Event,
+    revision: i64,
+) -> eliot_core::FrozenScriptContext {
+    eliot_core::FrozenScriptContext {
+        event: event.clone(),
+        subject: event.subject.clone(),
+        rule: eliot_core::ScriptRuleContext {
+            id: definition.id.clone(),
+            revision,
+        },
+    }
 }
 
 fn freeze_project_run_action(
@@ -1399,14 +1425,7 @@ fn freeze_project_run_action(
 ) -> Result<eliot_core::SubmitCommand> {
     let raw_definition: eliot_core::RunDefinitionArgs = serde_json::from_value(action.args.clone())
         .map_err(|_| Error::new("invalid", "run definition is malformed"))?;
-    let context = eliot_core::FrozenScriptContext {
-        event: event.clone(),
-        subject: event.subject.clone(),
-        rule: eliot_core::ScriptRuleContext {
-            id: definition.id.clone(),
-            revision,
-        },
-    };
+    let context = frozen_script_context(definition, event, revision);
     let policy = router.secret_policy_snapshot();
     let frozen =
         crate::scripts::freeze_project_run(raw_definition, project, context, policy.as_ref())?;
@@ -1712,42 +1731,15 @@ pub(crate) async fn prepare_rule_catch_up_actions(
             .iter()
             .map(|(_, request)| request.clone())
             .collect::<Vec<_>>();
-        router
-            .verify_project_rule_submission_authority(&requests, project)
-            .await?;
+        if !requests.is_empty() {
+            router
+                .verify_project_rule_submission_authority(&requests, project)
+                .await?;
+        }
     }
 
     for (event, request) in rendered {
         let event_seq = event.seq;
-        let request = if request.verb == "run" {
-            match project {
-                Some(project) => freeze_project_run_action(
-                    router,
-                    project,
-                    definition,
-                    &event,
-                    rule_revision,
-                    request,
-                ),
-                None => Err(Error::new(
-                    "unsupported",
-                    "global script runs are not supported in this increment",
-                )),
-            }
-        } else {
-            Ok(request)
-        };
-        let request = match request {
-            Ok(request) => request,
-            Err(error) if is_deterministic_pre_admission_rejection(&error.code) => {
-                actions.push(eliot_store::RuleCatchUpAction::rejected(
-                    event_seq, error.code,
-                ));
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
-
         if let Some(project) = project
             && request.verb != "run"
         {
@@ -1789,13 +1781,41 @@ pub(crate) async fn prepare_rule_catch_up_actions(
             }
         }
 
-        let prepared = match project {
-            Some(project) => {
-                router
-                    .prepare_project_rule_submission_after_authority(request, project)
-                    .await
+        let prepared = if request.verb == "run" {
+            match project {
+                Some(project) => match freeze_project_run_action(
+                    router,
+                    project,
+                    definition,
+                    &event,
+                    rule_revision,
+                    request,
+                ) {
+                    Ok(action) => {
+                        router
+                            .prepare_project_rule_submission_after_authority(action, project)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                },
+                None => {
+                    router
+                        .prepare_owner_rule_run_submission(
+                            request,
+                            frozen_script_context(definition, &event, rule_revision),
+                        )
+                        .await
+                }
             }
-            None => router.prepare_owner_submission(request).await,
+        } else {
+            match project {
+                Some(project) => {
+                    router
+                        .prepare_project_rule_submission_after_authority(request, project)
+                        .await
+                }
+                None => router.prepare_owner_submission(request).await,
+            }
         };
         match prepared {
             Ok(prepared) => actions.push(eliot_store::RuleCatchUpAction::command(
@@ -2198,7 +2218,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         assert_eq!(timer_wake_delay(&timer, 135), None);
     }
     #[tokio::test]
-    async fn project_run_catch_up_prepares_frozen_targetless_command() {
+    async fn event_run_catch_up_prepares_project_and_granted_global_commands() {
         use eliot_core::{AgentState, EventSubject, FrozenScriptRun};
         use std::{fs, io::Cursor, path::Path};
 
@@ -2222,24 +2242,42 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             .unwrap();
         assert!(git_init.success(), "initialize project fixture repository");
 
-        fs::write(
-            data_root.join("config.toml"),
-            format!(
+        let write_config = |project_actions: &[&str], grant_global_run: bool| {
+            let project_actions = project_actions
+                .iter()
+                .map(|action| serde_json::to_string(action).unwrap())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut source = format!(
                 concat!(
                     "[projects.script-catch-up]\n",
                     "path = {checkout:?}\n",
                     "profiles = [\"fake\"]\n",
-                    "actions = [\"run\"]\n",
+                    "actions = [{actions}]\n",
                     "run_env = [\"CI\"]\n\n",
                     "[projects.script-catch-up.interpreters.pwsh]\n",
                     "program = {program:?}\n",
                     "argv_prefix = [\"-NoProfile\", \"-NonInteractive\", \"-File\"]\n",
                 ),
                 checkout = checkout.to_string_lossy(),
+                actions = project_actions,
                 program = executable.to_string_lossy(),
-            ),
-        )
-        .unwrap();
+            );
+            if grant_global_run {
+                source.push_str(&format!(
+                    concat!(
+                        "\n[automation.run]\n",
+                        "run_env = [\"CI\"]\n\n",
+                        "[automation.run.interpreters.pwsh]\n",
+                        "program = {program:?}\n",
+                        "argv_prefix = [\"-NoProfile\", \"-NonInteractive\", \"-File\"]\n",
+                    ),
+                    program = executable.to_string_lossy(),
+                ));
+            }
+            fs::write(data_root.join("config.toml"), source).unwrap();
+        };
+        write_config(&["run"], false);
 
         let loaded = projects::load_registrations(&data_root).await.unwrap();
         let input = project_registration_input(&loaded[0]);
@@ -2249,7 +2287,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         let router = Router::new(
             data_root.clone(),
             "catch-up-run-fixture-owner".to_owned(),
-            store,
+            store.clone(),
             crate::bus::Bus::new(16),
         );
         let registration = router
@@ -2288,6 +2326,11 @@ do = [{ action = "run", cmd = ["pwsh", ".eliot/scripts/check.ps1", "-Changed"], 
             cause: None,
         };
         let rule_revision = 17;
+
+        let global_scripts = data_root.join("scripts");
+        fs::create_dir_all(&global_scripts).unwrap();
+        fs::copy(scripts.join("check.ps1"), global_scripts.join("check.ps1")).unwrap();
+
         let actions = prepare_rule_catch_up_actions(
             &router,
             &definition,
@@ -2316,7 +2359,14 @@ do = [{ action = "run", cmd = ["pwsh", ".eliot/scripts/check.ps1", "-Changed"], 
         assert_eq!(frozen.definition.cmd[0], "pwsh");
         assert_eq!(frozen.definition.cmd[1], ".eliot/scripts/check.ps1");
 
-        let global_actions = prepare_rule_catch_up_actions(
+        let events_before_global_prepare = {
+            let store = store.lock().await;
+            (
+                store.high_water().unwrap(),
+                store.read_events(0, 1_000, None).unwrap(),
+            )
+        };
+        let ungranted_global_actions = prepare_rule_catch_up_actions(
             &router,
             &definition,
             rule_revision,
@@ -2326,9 +2376,122 @@ do = [{ action = "run", cmd = ["pwsh", ".eliot/scripts/check.ps1", "-Changed"], 
         .await
         .unwrap();
         assert!(matches!(
-            &global_actions[0].outcome,
-            eliot_store::RuleCatchUpActionOutcome::Rejected { code } if code == "unsupported"
+            &ungranted_global_actions[0].outcome,
+            eliot_store::RuleCatchUpActionOutcome::Rejected { code } if code == "not_allowed"
         ));
+        {
+            let store = store.lock().await;
+            assert_eq!(store.high_water().unwrap(), events_before_global_prepare.0);
+            assert_eq!(
+                store.read_events(0, 1_000, None).unwrap(),
+                events_before_global_prepare.1,
+                "ungranted Owner Run preparation does not write Store effects"
+            );
+        }
+
+        write_config(&["run"], true);
+        let owner_cwd = serde_json::to_string(&data_root.to_string_lossy().into_owned()).unwrap();
+        let global_definition = definition::load(Cursor::new(format!(
+            concat!(
+                "[[rule]]\n",
+                "id = \"owner-catch-up-run\"\n",
+                "on = {{ event = \"turn.completed\" }}\n",
+                "do = [{{ action = \"run\", cmd = [\"pwsh\", \"check.ps1\", \"-Changed\"], ",
+                "cwd = {owner_cwd}, timeout = \"10m\", env = {{ CI = \"true\" }} }}]\n",
+            ),
+            owner_cwd = owner_cwd,
+        )))
+        .unwrap()
+        .remove(0);
+        let events_before_granted_global_prepare = {
+            let store = store.lock().await;
+            (
+                store.high_water().unwrap(),
+                store.read_events(0, 1_000, None).unwrap(),
+            )
+        };
+        let granted_global_actions = prepare_rule_catch_up_actions(
+            &router,
+            &global_definition,
+            rule_revision,
+            std::slice::from_ref(&event),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(granted_global_actions.len(), 1);
+        assert_eq!(granted_global_actions[0].event_seq, event.seq);
+        let global_request = match &granted_global_actions[0].outcome {
+            eliot_store::RuleCatchUpActionOutcome::Command(request) => request,
+            outcome => panic!("expected granted Owner Run command, got {outcome:?}"),
+        };
+        assert_eq!(global_request.verb, "run");
+        assert_eq!(global_request.target, None);
+        assert_eq!(global_request.expected_generation, None);
+        let global_frozen: FrozenScriptRun =
+            serde_json::from_value(global_request.args.clone()).unwrap();
+        global_frozen.validate().unwrap();
+        assert_eq!(global_frozen.context.event, event);
+        assert_eq!(global_frozen.context.subject, event.subject);
+        assert_eq!(global_frozen.context.rule.id, global_definition.id);
+        assert_eq!(global_frozen.context.rule.revision, rule_revision);
+        assert_eq!(global_frozen.definition.cmd[1], "check.ps1");
+        assert_eq!(
+            global_frozen.definition.cwd.as_deref(),
+            Some(data_root.to_str().unwrap())
+        );
+        {
+            let store = store.lock().await;
+            assert_eq!(
+                store.high_water().unwrap(),
+                events_before_granted_global_prepare.0
+            );
+            assert_eq!(
+                store.read_events(0, 1_000, None).unwrap(),
+                events_before_granted_global_prepare.1,
+                "granted Owner Run preparation does not write Store effects"
+            );
+        }
+
+        write_config(&["send"], true);
+        let revoked_registration =
+            project_registration_input(&projects::load_registrations(&data_root).await.unwrap()[0]);
+        let revoked_registration = router
+            .reconcile_project_registrations(std::slice::from_ref(&revoked_registration))
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let events_before_revoked_project_preflight = {
+            let store = store.lock().await;
+            (
+                store.high_water().unwrap(),
+                store.read_events(0, 1_000, None).unwrap(),
+            )
+        };
+        let error = prepare_rule_catch_up_actions(
+            &router,
+            &definition,
+            rule_revision,
+            std::slice::from_ref(&event),
+            Some(&revoked_registration),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "not_allowed");
+        {
+            let store = store.lock().await;
+            assert_eq!(
+                store.high_water().unwrap(),
+                events_before_revoked_project_preflight.0
+            );
+            assert_eq!(
+                store.read_events(0, 1_000, None).unwrap(),
+                events_before_revoked_project_preflight.1,
+                "revoked project Run approval fails request-wide before admission"
+            );
+        }
 
         fs::remove_dir_all(root).unwrap();
     }

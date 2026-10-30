@@ -6,15 +6,56 @@
 
 use eliot_core::{
     Error, FrozenScriptContext, FrozenScriptInterpreter, FrozenScriptRun, FrozenSetupFile, Result,
-    RunDefinitionArgs, SecretPolicy, api::ProjectRegistrationView,
+    RunDefinitionArgs, SecretPolicy,
+    api::{ProjectRegistrationView, ScriptInterpreter},
 };
 use std::{
-    collections::HashSet,
-    path::{Path, PathBuf},
+    collections::{BTreeMap, HashSet},
+    path::{Component, Path, PathBuf},
     process::Stdio,
     time::{Duration, Instant},
 };
 use tokio::process::Command;
+
+#[derive(Clone, Copy)]
+enum CwdPolicy {
+    Project,
+    Owner,
+}
+
+struct RunScope<'a> {
+    interpreters: &'a BTreeMap<String, ScriptInterpreter>,
+    run_env: &'a [String],
+    entry_base: &'a Path,
+    entry_root: &'a Path,
+    cwd_policy: CwdPolicy,
+}
+
+impl<'a> RunScope<'a> {
+    fn project(
+        registration: &'a ProjectRegistrationView,
+        checkout: &'a Path,
+        scripts_root: &'a Path,
+    ) -> Self {
+        Self {
+            interpreters: &registration.interpreters,
+            run_env: &registration.run_env,
+            entry_base: checkout,
+            entry_root: scripts_root,
+            cwd_policy: CwdPolicy::Project,
+        }
+    }
+
+    fn owner(grant: &'a crate::config::RunGrantConfig, scripts_root: &'a Path) -> Self {
+        Self {
+            interpreters: &grant.interpreters,
+            run_env: &grant.run_env,
+            entry_base: scripts_root,
+            entry_root: scripts_root,
+            cwd_policy: CwdPolicy::Owner,
+        }
+    }
+}
 
 /// Resolve and freeze one project event-rule run before ordinary command admission.
 pub(crate) fn freeze_project_run(
@@ -25,24 +66,67 @@ pub(crate) fn freeze_project_run(
 ) -> Result<FrozenScriptRun> {
     registration.validate()?;
     authorize_run(registration)?;
+    let (checkout, scripts_root) = project_script_roots(registration)?;
+    freeze_run_in_scope(
+        definition,
+        RunScope::project(registration, &checkout, &scripts_root),
+        context,
+        policy,
+    )
+}
+
+/// Resolve and freeze one owner-global event-rule run before ordinary command admission.
+pub(crate) fn freeze_global_run(
+    definition: RunDefinitionArgs,
+    grant: &crate::config::RunGrantConfig,
+    data_root: &Path,
+    context: FrozenScriptContext,
+    policy: &SecretPolicy,
+) -> Result<FrozenScriptRun> {
+    let scripts_root = global_script_root(data_root)?;
+    freeze_run_in_scope(
+        definition,
+        RunScope::owner(grant, &scripts_root),
+        context,
+        policy,
+    )
+}
+
+fn freeze_run_in_scope(
+    definition: RunDefinitionArgs,
+    scope: RunScope<'_>,
+    context: FrozenScriptContext,
+    policy: &SecretPolicy,
+) -> Result<FrozenScriptRun> {
     definition.validate()?;
     context.validate()?;
-    validate_run_environment(&definition, registration)?;
+    validate_run_environment(&definition, scope.run_env, scope.cwd_policy)?;
     reject_known_secrets(&definition, policy)?;
     reject_known_secrets(&context, policy)?;
 
     let reference = definition.cmd[0].clone();
-    let configured = registration
+    let configured = scope
         .interpreters
         .get(&reference)
-        .ok_or_else(|| not_allowed("project interpreter is no longer approved"))?;
+        .ok_or_else(|| match scope.cwd_policy {
+            CwdPolicy::Project => not_allowed("project interpreter is no longer approved"),
+            CwdPolicy::Owner => not_allowed("global interpreter is not approved"),
+        })?;
     configured.validate()?;
-    crate::setup::check_program(Path::new(&configured.program))
-        .map_err(|_| not_allowed("project interpreter path is invalid"))?;
+    crate::setup::check_program(Path::new(&configured.program)).map_err(|_| {
+        match scope.cwd_policy {
+            CwdPolicy::Project => not_allowed("project interpreter path is invalid"),
+            CwdPolicy::Owner => not_allowed("global interpreter path is invalid"),
+        }
+    })?;
 
-    let (checkout, scripts_root) = project_script_roots(registration)?;
-    let entry_path = project_script_path(&checkout, &scripts_root, &definition)?;
-    let entry = capture_file(&entry_path, Some(&scripts_root))?;
+    let entry_path = script_entry_path(
+        scope.entry_base,
+        scope.entry_root,
+        &definition,
+        scope.cwd_policy,
+    )?;
+    let entry = capture_file(&entry_path, Some(scope.entry_root))?;
     let executable = capture_file(Path::new(&configured.program), None)?;
 
     let frozen = FrozenScriptRun {
@@ -58,7 +142,7 @@ pub(crate) fn freeze_project_run(
     frozen.validate()?;
     project_run_timeout(&frozen)?;
     reject_known_secrets(&frozen, policy)?;
-    resolve_project_cwd(&checkout, frozen.definition.cwd.as_deref())?;
+    resolve_run_cwd(&scope, frozen.definition.cwd.as_deref())?;
     Ok(frozen)
 }
 
@@ -70,14 +154,42 @@ pub(crate) fn verify_project_run(
 ) -> Result<Command> {
     registration.validate()?;
     authorize_run(registration)?;
+    let (checkout, scripts_root) = project_script_roots(registration)?;
+    verify_run_in_scope(
+        frozen,
+        RunScope::project(registration, &checkout, &scripts_root),
+        policy,
+    )
+}
+
+/// Verify the current owner grant and frozen file receipts for one global run.
+pub(crate) fn verify_global_run(
+    frozen: &FrozenScriptRun,
+    grant: &crate::config::RunGrantConfig,
+    data_root: &Path,
+    policy: &SecretPolicy,
+) -> Result<Command> {
+    let scripts_root = global_script_root(data_root)
+        .map_err(|_| source_changed("global script root is unavailable or unsafe"))?;
+    verify_run_in_scope(frozen, RunScope::owner(grant, &scripts_root), policy)
+}
+
+fn verify_run_in_scope(
+    frozen: &FrozenScriptRun,
+    scope: RunScope<'_>,
+    policy: &SecretPolicy,
+) -> Result<Command> {
     frozen.validate()?;
-    validate_run_environment(&frozen.definition, registration)?;
+    validate_run_environment(&frozen.definition, scope.run_env, scope.cwd_policy)?;
     reject_known_secrets(frozen, policy)?;
 
-    let configured = registration
+    let configured = scope
         .interpreters
         .get(&frozen.interpreter.reference)
-        .ok_or_else(|| not_allowed("frozen project interpreter is no longer approved"))?;
+        .ok_or_else(|| match scope.cwd_policy {
+            CwdPolicy::Project => not_allowed("frozen project interpreter is no longer approved"),
+            CwdPolicy::Owner => not_allowed("frozen global interpreter is no longer approved"),
+        })?;
     configured.validate()?;
     if configured.argv_prefix != frozen.interpreter.argv_prefix {
         return Err(source_changed("approved interpreter argv_prefix changed"));
@@ -85,26 +197,45 @@ pub(crate) fn verify_project_run(
     crate::setup::check_program(Path::new(&configured.program))
         .map_err(|_| source_changed("approved interpreter executable path changed"))?;
 
-    let (checkout, scripts_root) = project_script_roots(registration)?;
     let current_executable = capture_file(Path::new(&configured.program), None)
         .map_err(|_| source_changed("approved interpreter executable is unavailable"))?;
     if current_executable != frozen.interpreter.executable {
         return Err(source_changed("approved interpreter executable changed"));
     }
 
-    let current_entry_path = project_script_path(&checkout, &scripts_root, &frozen.definition)
-        .map_err(|_| source_changed("registered script entry path changed"))?;
-    let current_entry = capture_file(&current_entry_path, Some(&scripts_root))
-        .map_err(|_| source_changed("registered script entry is unavailable"))?;
+    let current_entry_path = script_entry_path(
+        scope.entry_base,
+        scope.entry_root,
+        &frozen.definition,
+        scope.cwd_policy,
+    )
+    .map_err(|_| match scope.cwd_policy {
+        CwdPolicy::Project => source_changed("registered script entry path changed"),
+        CwdPolicy::Owner => source_changed("global script entry path changed"),
+    })?;
+    let current_entry =
+        capture_file(&current_entry_path, Some(scope.entry_root)).map_err(|_| {
+            match scope.cwd_policy {
+                CwdPolicy::Project => source_changed("registered script entry is unavailable"),
+                CwdPolicy::Owner => source_changed("global script entry is unavailable"),
+            }
+        })?;
     if current_entry != frozen.entry {
-        return Err(source_changed("registered script entry changed"));
+        let message = match scope.cwd_policy {
+            CwdPolicy::Project => "registered script entry changed",
+            CwdPolicy::Owner => "global script entry changed",
+        };
+        return Err(source_changed(message));
     }
 
-    let cwd = resolve_project_cwd(&checkout, frozen.definition.cwd.as_deref())?;
+    let cwd = resolve_run_cwd(&scope, frozen.definition.cwd.as_deref())?;
     project_run_timeout(frozen)?;
 
-    let entry_argument = crate::setup::file_argument(&frozen.entry)
-        .map_err(|_| source_changed("registered script entry argument path changed"))?;
+    let entry_argument =
+        crate::setup::file_argument(&frozen.entry).map_err(|_| match scope.cwd_policy {
+            CwdPolicy::Project => source_changed("registered script entry argument path changed"),
+            CwdPolicy::Owner => source_changed("global script entry argument path changed"),
+        })?;
     let mut command = Command::new(&frozen.interpreter.executable.canonical_path);
     command
         .args(&frozen.interpreter.argv_prefix)
@@ -155,22 +286,28 @@ fn authorize_run(registration: &ProjectRegistrationView) -> Result<()> {
 
 fn validate_run_environment(
     definition: &RunDefinitionArgs,
-    registration: &ProjectRegistrationView,
+    approved_names: &[String],
+    cwd_policy: CwdPolicy,
 ) -> Result<()> {
     let mut seen = HashSet::new();
     for (name, value) in &definition.env {
-        if !registration
-            .run_env
+        if !approved_names
             .iter()
             .any(|approved| environment_names_equal(name, approved))
         {
-            return Err(not_allowed("project run environment name is not approved"));
+            let message = match cwd_policy {
+                CwdPolicy::Project => "project run environment name is not approved",
+                CwdPolicy::Owner => "global run environment name is not approved",
+            };
+            return Err(not_allowed(message));
         }
         #[cfg(windows)]
         if environment_names_equal(name, "SystemRoot") {
-            return Err(not_allowed(
-                "project run environment cannot override SystemRoot",
-            ));
+            let message = match cwd_policy {
+                CwdPolicy::Project => "project run environment cannot override SystemRoot",
+                CwdPolicy::Owner => "global run environment cannot override SystemRoot",
+            };
+            return Err(not_allowed(message));
         }
         let key = if cfg!(windows) {
             name.to_ascii_uppercase()
@@ -208,10 +345,24 @@ fn project_script_roots(registration: &ProjectRegistrationView) -> Result<(PathB
     Ok((checkout, scripts_root))
 }
 
-fn project_script_path(
-    checkout: &Path,
-    scripts_root: &Path,
+fn global_script_root(data_root: &Path) -> Result<PathBuf> {
+    let data_root = crate::setup::canonical_directory(data_root)
+        .map_err(|_| not_allowed("global data root is unavailable or unsafe"))?;
+    let scripts_root = crate::setup::canonical_directory(&data_root.join("scripts"))
+        .map_err(|_| not_allowed("global scripts directory is unavailable or unsafe"))?;
+    if !crate::setup::inside(&data_root, &scripts_root) {
+        return Err(not_allowed(
+            "global scripts directory is outside the data root",
+        ));
+    }
+    Ok(scripts_root)
+}
+
+fn script_entry_path(
+    entry_base: &Path,
+    entry_root: &Path,
     definition: &RunDefinitionArgs,
+    cwd_policy: CwdPolicy,
 ) -> Result<PathBuf> {
     let raw = definition
         .cmd
@@ -219,19 +370,34 @@ fn project_script_path(
         .ok_or_else(|| invalid("run cmd requires a script entry"))?;
     let relative = Path::new(raw);
     if relative.is_absolute() || relative.has_root() {
-        return Err(not_allowed(
-            "project script entry must be relative to the registered checkout",
-        ));
+        let message = match cwd_policy {
+            CwdPolicy::Project => {
+                "project script entry must be relative to the registered checkout"
+            }
+            CwdPolicy::Owner => "global script entry must be relative to the scripts directory",
+        };
+        return Err(not_allowed(message));
     }
-    let candidate = checkout.join(relative);
-    let canonical = std::fs::canonicalize(&candidate)
-        .map_err(|_| not_allowed("project script entry is unavailable"))?;
-    if !crate::setup::inside(scripts_root, &canonical) {
-        return Err(not_allowed(
-            "project script entry is outside registered .eliot/scripts",
-        ));
+    let candidate = entry_base.join(relative);
+    let canonical = std::fs::canonicalize(&candidate).map_err(|_| match cwd_policy {
+        CwdPolicy::Project => not_allowed("project script entry is unavailable"),
+        CwdPolicy::Owner => not_allowed("global script entry is unavailable"),
+    })?;
+    if !crate::setup::inside(entry_root, &canonical) {
+        let message = match cwd_policy {
+            CwdPolicy::Project => "project script entry is outside registered .eliot/scripts",
+            CwdPolicy::Owner => "global script entry is outside the scripts directory",
+        };
+        return Err(not_allowed(message));
     }
     Ok(candidate)
+}
+
+fn resolve_run_cwd(scope: &RunScope<'_>, cwd: Option<&str>) -> Result<PathBuf> {
+    match scope.cwd_policy {
+        CwdPolicy::Project => resolve_project_cwd(scope.entry_base, cwd),
+        CwdPolicy::Owner => resolve_owner_cwd(scope.entry_root, cwd),
+    }
 }
 
 fn resolve_project_cwd(checkout: &Path, cwd: Option<&str>) -> Result<PathBuf> {
@@ -252,6 +418,39 @@ fn resolve_project_cwd(checkout: &Path, cwd: Option<&str>) -> Result<PathBuf> {
     if !same_path(checkout, &canonical) && !crate::setup::inside(checkout, &canonical) {
         return Err(not_allowed(
             "project run cwd is outside the registered checkout",
+        ));
+    }
+    Ok(canonical)
+}
+
+fn resolve_owner_cwd(scripts_root: &Path, cwd: Option<&str>) -> Result<PathBuf> {
+    let Some(value) = cwd else {
+        return Ok(scripts_root.to_path_buf());
+    };
+    if value.trim().is_empty() {
+        return Err(not_allowed("global run cwd must be a nonempty path"));
+    }
+
+    let requested = Path::new(value);
+    if requested.is_absolute() {
+        return crate::setup::canonical_directory(requested)
+            .map_err(|_| not_allowed("global run cwd is unavailable or unsafe"));
+    }
+    if requested.has_root()
+        || requested
+            .components()
+            .any(|component| matches!(component, Component::Prefix(_)))
+    {
+        return Err(not_allowed(
+            "global relative run cwd must not contain a path root",
+        ));
+    }
+
+    let canonical = crate::setup::canonical_directory(&scripts_root.join(requested))
+        .map_err(|_| not_allowed("global run cwd is unavailable or unsafe"))?;
+    if !same_path(scripts_root, &canonical) && !crate::setup::inside(scripts_root, &canonical) {
+        return Err(not_allowed(
+            "global relative run cwd is outside the scripts directory",
         ));
     }
     Ok(canonical)
@@ -384,6 +583,29 @@ mod tests {
                 timeout: Some("10m".to_owned()),
                 env: std::collections::BTreeMap::from([("CI".to_owned(), "true".to_owned())]),
             }
+        }
+
+        fn global_data_root(&self) -> PathBuf {
+            let data_root = self.root.join("owner-data");
+            let scripts_root = data_root.join("scripts");
+            fs::create_dir_all(&scripts_root).expect("create global scripts root");
+            fs::copy(&self.entry, scripts_root.join("check.ps1"))
+                .expect("copy global script entry");
+            data_root
+        }
+
+        fn global_grant(&self) -> crate::config::RunGrantConfig {
+            crate::config::RunGrantConfig {
+                interpreters: self.registration.interpreters.clone(),
+                run_env: self.registration.run_env.clone(),
+            }
+        }
+
+        fn global_definition(&self) -> RunDefinitionArgs {
+            let mut definition = self.definition();
+            definition.cmd[1] = "check.ps1".to_owned();
+            definition.cwd = None;
+            definition
         }
 
         fn context(&self) -> FrozenScriptContext {
@@ -642,5 +864,126 @@ mod tests {
         let mut zero = frozen;
         zero.definition.timeout = Some("0s".to_owned());
         assert!(project_run_timeout(&zero).is_err());
+    }
+
+    #[test]
+    fn global_run_empty_grant_denies_execution() {
+        let fixture = ProjectFixture::new();
+        let data_root = fixture.global_data_root();
+        let mut definition = fixture.global_definition();
+        definition.env.clear();
+
+        assert!(
+            freeze_global_run(
+                definition,
+                &crate::config::RunGrantConfig::default(),
+                &data_root,
+                fixture.context(),
+                &policy(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn global_run_allows_safe_absolute_cwd_outside_scripts_root() {
+        let fixture = ProjectFixture::new();
+        let data_root = fixture.global_data_root();
+        let scripts_root =
+            fs::canonicalize(data_root.join("scripts")).expect("canonical global scripts root");
+        let grant = fixture.global_grant();
+
+        let frozen = freeze_global_run(
+            fixture.global_definition(),
+            &grant,
+            &data_root,
+            fixture.context(),
+            &policy(),
+        )
+        .expect("freeze global run with default cwd");
+        let command = verify_global_run(&frozen, &grant, &data_root, &policy())
+            .expect("verify global run with default cwd");
+        assert_eq!(
+            command.as_std().get_current_dir(),
+            Some(scripts_root.as_path())
+        );
+
+        let absolute_cwd = fixture.root.join("owner-cwd");
+        fs::create_dir(&absolute_cwd).expect("create owner-approved cwd");
+        let relative_escape = data_root.join("owner-cwd");
+        fs::create_dir(&relative_escape).expect("create cwd outside scripts root");
+        let canonical_cwd = fs::canonicalize(&absolute_cwd).expect("canonical owner cwd");
+
+        let mut definition = fixture.global_definition();
+        definition.cwd = Some("../owner-cwd".to_owned());
+        assert!(
+            freeze_global_run(definition, &grant, &data_root, fixture.context(), &policy(),)
+                .is_err()
+        );
+
+        let mut definition = fixture.global_definition();
+        definition.cwd = Some(absolute_cwd.to_string_lossy().into_owned());
+        let frozen =
+            freeze_global_run(definition, &grant, &data_root, fixture.context(), &policy())
+                .expect("freeze global run with absolute owner cwd");
+        let command = verify_global_run(&frozen, &grant, &data_root, &policy())
+            .expect("verify global run with absolute owner cwd");
+        assert_eq!(
+            command.as_std().get_current_dir(),
+            Some(canonical_cwd.as_path())
+        );
+    }
+
+    #[test]
+    fn global_run_rejects_entry_escape_from_scripts_root() {
+        let fixture = ProjectFixture::new();
+        let data_root = fixture.global_data_root();
+        fs::write(data_root.join("outside.ps1"), b"outside scripts root")
+            .expect("create escaping entry target");
+        let mut definition = fixture.global_definition();
+        definition.cmd[1] = "../outside.ps1".to_owned();
+
+        assert!(
+            freeze_global_run(
+                definition,
+                &fixture.global_grant(),
+                &data_root,
+                fixture.context(),
+                &policy(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn global_run_rechecks_interpreter_and_environment_grants_before_spawn() {
+        let fixture = ProjectFixture::new();
+        let data_root = fixture.global_data_root();
+        let grant = fixture.global_grant();
+        let frozen = freeze_global_run(
+            fixture.global_definition(),
+            &grant,
+            &data_root,
+            fixture.context(),
+            &policy(),
+        )
+        .expect("freeze global run");
+
+        let mut removed_interpreter = grant.clone();
+        removed_interpreter.interpreters.clear();
+        assert!(verify_global_run(&frozen, &removed_interpreter, &data_root, &policy()).is_err());
+
+        let mut changed_prefix = grant.clone();
+        changed_prefix
+            .interpreters
+            .get_mut("pwsh")
+            .expect("approved interpreter")
+            .argv_prefix
+            .push("-NoLogo".to_owned());
+        assert!(verify_global_run(&frozen, &changed_prefix, &data_root, &policy()).is_err());
+
+        let mut removed_environment = grant;
+        removed_environment.run_env.clear();
+        assert!(verify_global_run(&frozen, &removed_environment, &data_root, &policy()).is_err());
     }
 }

@@ -11,6 +11,7 @@ use std::{
 /// Host-derived authority retained for a Run after its caller credential expires.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SavedRunPrincipal {
+    Owner,
     ProjectRule {
         registration: ProjectRegistrationView,
     },
