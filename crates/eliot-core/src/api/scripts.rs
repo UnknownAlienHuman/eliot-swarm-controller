@@ -3,7 +3,7 @@
 //! This module contains data and pure validation only. The daemon owns config
 //! resolution, duration parsing, file reads, process custody and admission.
 
-use super::{mutations::CommandSubmitRequest, reads::CommandGetRequest};
+use super::{TimerSchedule, mutations::CommandSubmitRequest, reads::CommandGetRequest};
 use crate::{
     Error, Event, EventSubject, FrozenSetupFile, Result, StderrDiagnostic, StderrSnapshot,
     StderrSource, SubmitCommand, bound_stderr_diagnostics, limits::MAX_EVENT_BYTES, parse_agent_id,
@@ -191,13 +191,72 @@ pub struct FrozenScriptInterpreter {
     pub argv_prefix: Vec<String>,
 }
 
-/// Frozen project/event context stored with the ordinary run command args.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// Why the owner-authorized timer invocation was admitted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ScriptTimerInvocation {
+    Scheduled { scheduled_at_ms: i64 },
+    Manual { parent_command_id: String },
+}
+
+impl ScriptTimerInvocation {
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            Self::Scheduled { .. } => Ok(()),
+            Self::Manual { parent_command_id } => {
+                CommandGetRequest::new(parent_command_id.clone()).validate()
+            }
+        }
+    }
+}
+
+/// Timer schedule snapshot and invocation metadata captured for a script Run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct FrozenScriptContext {
-    pub event: Event,
-    pub subject: Option<EventSubject>,
-    pub rule: ScriptRuleContext,
+pub struct ScriptTimerContext {
+    pub schedule_revision: i64,
+    pub schedule: TimerSchedule,
+    pub anchor: i64,
+    pub invocation: ScriptTimerInvocation,
+}
+
+impl ScriptTimerContext {
+    pub fn validate(&self) -> Result<()> {
+        if self.schedule_revision < 0 {
+            return Err(invalid(
+                "script timer schedule_revision must be nonnegative",
+            ));
+        }
+        self.schedule.validate()?;
+        let invalid_anchor = match &self.schedule {
+            TimerSchedule::Interval {
+                anchor: Some(schedule_anchor),
+                ..
+            } => self.anchor != *schedule_anchor,
+            _ => false,
+        };
+        if invalid_anchor {
+            return Err(invalid(
+                "script timer anchor does not match its interval schedule",
+            ));
+        }
+        self.invocation.validate()
+    }
+}
+
+/// Frozen event or timer context stored with the ordinary Run command args.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum FrozenScriptContext {
+    Event {
+        event: Box<Event>,
+        subject: Option<EventSubject>,
+        rule: ScriptRuleContext,
+    },
+    Timer {
+        timer: ScriptTimerContext,
+        rule: ScriptRuleContext,
+    },
 }
 
 /// Rule identity captured when the event rule matched.
@@ -220,8 +279,39 @@ impl ScriptRuleContext {
 }
 
 impl FrozenScriptContext {
+    pub fn rule(&self) -> &ScriptRuleContext {
+        match self {
+            Self::Event { rule, .. } | Self::Timer { rule, .. } => rule,
+        }
+    }
+
+    pub fn event(&self) -> Option<&Event> {
+        match self {
+            Self::Event { event, .. } => Some(event.as_ref()),
+            Self::Timer { .. } => None,
+        }
+    }
+
+    pub fn subject(&self) -> Option<&EventSubject> {
+        match self {
+            Self::Event { subject, .. } => subject.as_ref(),
+            Self::Timer { .. } => None,
+        }
+    }
+
+    pub fn timer(&self) -> Option<&ScriptTimerContext> {
+        match self {
+            Self::Event { .. } => None,
+            Self::Timer { timer, .. } => Some(timer),
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
-        self.rule.validate()
+        self.rule().validate()?;
+        if let Some(timer) = self.timer() {
+            timer.validate()?;
+        }
+        Ok(())
     }
 }
 
@@ -283,12 +373,19 @@ pub struct ScriptCommandContext {
 
 /// Runtime stdin envelope assembled after Store assigns the run command id.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ScriptInputContext {
-    pub event: Event,
-    pub subject: Option<EventSubject>,
-    pub rule: ScriptRuleContext,
-    pub command: ScriptCommandContext,
+#[serde(untagged, deny_unknown_fields)]
+pub enum ScriptInputContext {
+    Event {
+        event: Box<Event>,
+        subject: Option<EventSubject>,
+        rule: ScriptRuleContext,
+        command: ScriptCommandContext,
+    },
+    Timer {
+        timer: ScriptTimerContext,
+        rule: ScriptRuleContext,
+        command: ScriptCommandContext,
+    },
 }
 
 impl ScriptInputContext {
@@ -297,23 +394,68 @@ impl ScriptInputContext {
         context: &FrozenScriptContext,
         command_id: impl Into<String>,
     ) -> Result<Self> {
-        let input = Self {
-            event: context.event.clone(),
-            subject: context.subject.clone(),
-            rule: context.rule.clone(),
-            command: ScriptCommandContext {
-                id: command_id.into(),
-                verb: "run".to_owned(),
+        let command = ScriptCommandContext {
+            id: command_id.into(),
+            verb: "run".to_owned(),
+        };
+        let input = match context {
+            FrozenScriptContext::Event {
+                event,
+                subject,
+                rule,
+            } => Self::Event {
+                event: event.clone(),
+                subject: subject.clone(),
+                rule: rule.clone(),
+                command,
+            },
+            FrozenScriptContext::Timer { timer, rule } => Self::Timer {
+                timer: timer.clone(),
+                rule: rule.clone(),
+                command,
             },
         };
         input.validate()?;
         Ok(input)
     }
 
+    pub fn rule(&self) -> &ScriptRuleContext {
+        match self {
+            Self::Event { rule, .. } | Self::Timer { rule, .. } => rule,
+        }
+    }
+
+    pub fn event(&self) -> Option<&Event> {
+        match self {
+            Self::Event { event, .. } => Some(event.as_ref()),
+            Self::Timer { .. } => None,
+        }
+    }
+
+    pub fn subject(&self) -> Option<&EventSubject> {
+        match self {
+            Self::Event { subject, .. } => subject.as_ref(),
+            Self::Timer { .. } => None,
+        }
+    }
+
+    pub fn timer(&self) -> Option<&ScriptTimerContext> {
+        match self {
+            Self::Event { .. } => None,
+            Self::Timer { timer, .. } => Some(timer),
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
-        self.rule.validate()?;
-        CommandGetRequest::new(self.command.id.clone()).validate()?;
-        if self.command.verb != "run" {
+        self.rule().validate()?;
+        if let Some(timer) = self.timer() {
+            timer.validate()?;
+        }
+        let command = match self {
+            Self::Event { command, .. } | Self::Timer { command, .. } => command,
+        };
+        CommandGetRequest::new(command.id.clone()).validate()?;
+        if command.verb != "run" {
             return Err(invalid("script stdin command verb must be run"));
         }
         Ok(())
@@ -660,6 +802,10 @@ mod tests {
             data: json!({"result":"ok"}),
             cause: None,
         };
+        let rule = ScriptRuleContext {
+            id: "check-completed-turn".to_owned(),
+            revision: 2,
+        };
         let snapshot = FrozenScriptRun {
             definition: RunDefinitionArgs {
                 cmd: vec!["pwsh".to_owned(), ".eliot/scripts/check.ps1".to_owned()],
@@ -690,28 +836,206 @@ mod tests {
                 size: 321,
                 sha256: "cd".repeat(32),
             },
-            context: FrozenScriptContext {
-                event,
+            context: FrozenScriptContext::Event {
+                event: Box::new(event),
                 subject: None,
-                rule: ScriptRuleContext {
-                    id: "check-completed-turn".to_owned(),
-                    revision: 2,
-                },
+                rule: rule.clone(),
             },
         };
         snapshot.validate().unwrap();
         let stored = serde_json::to_value(&snapshot).unwrap();
         assert!(stored.get("command").is_none());
         assert_eq!(stored["entry"]["sha256"], "cd".repeat(32));
+        let expected_context = json!({
+            "event": {
+                "seq": 8,
+                "ts": 10,
+                "kind": "turn.completed",
+                "agent": "a7",
+                "generation": 4,
+                "source": "fake",
+                "native_id": null,
+                "data": {"result":"ok"}
+            },
+            "subject": null,
+            "rule": {"id":"check-completed-turn","revision":2}
+        });
+        assert_eq!(stored["context"], expected_context);
+        let decoded_context =
+            serde_json::from_value::<FrozenScriptContext>(stored["context"].clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(decoded_context).unwrap(),
+            expected_context
+        );
 
         let input = ScriptInputContext::for_run_command(&snapshot.context, "run-1").unwrap();
-        let wire = serde_json::to_value(input).unwrap();
+        let wire = serde_json::to_value(&input).unwrap();
+        assert_eq!(wire["event"], stored["context"]["event"]);
+        assert_eq!(wire["subject"], json!(null));
+        assert!(wire.get("timer").is_none());
         assert_eq!(wire["command"], json!({"id":"run-1","verb":"run"}));
-        assert_eq!(
-            wire["rule"],
-            json!({"id":"check-completed-turn","revision":2})
-        );
+        assert_eq!(wire["rule"], serde_json::to_value(rule).unwrap());
         assert!(wire["command"].get("args").is_none());
+        assert_eq!(wire.as_object().unwrap().len(), 4);
+        let decoded_input = serde_json::from_value::<ScriptInputContext>(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded_input).unwrap(), wire);
+    }
+
+    #[test]
+    fn timer_script_contexts_roundtrip_both_invocations_without_event_fields() {
+        let scheduled = ScriptTimerContext {
+            schedule_revision: 3,
+            schedule: TimerSchedule::Once {
+                at: 1_800_000_000_000,
+            },
+            anchor: 1_700_000_000_000,
+            invocation: ScriptTimerInvocation::Scheduled {
+                scheduled_at_ms: 1_800_000_000_000,
+            },
+        };
+        scheduled.validate().unwrap();
+        let scheduled_wire = serde_json::to_value(&scheduled).unwrap();
+        assert_eq!(
+            scheduled_wire["invocation"],
+            json!({"kind":"scheduled","scheduled_at_ms":1_800_000_000_000_i64})
+        );
+        assert_eq!(
+            serde_json::from_value::<ScriptTimerContext>(scheduled_wire.clone()).unwrap(),
+            scheduled
+        );
+
+        let manual = ScriptTimerContext {
+            invocation: ScriptTimerInvocation::Manual {
+                parent_command_id: "parent-command-1".to_owned(),
+            },
+            ..scheduled.clone()
+        };
+        manual.validate().unwrap();
+        let manual_wire = serde_json::to_value(&manual).unwrap();
+        assert_eq!(
+            manual_wire["invocation"],
+            json!({"kind":"manual","parent_command_id":"parent-command-1"})
+        );
+        assert_eq!(
+            serde_json::from_value::<ScriptTimerContext>(manual_wire.clone()).unwrap(),
+            manual
+        );
+
+        for invalid in [
+            json!({"kind":"scheduled","scheduled_at_ms":1,"extra":true}),
+            json!({"kind":"manual","parent_command_id":"parent-1","scheduled_at_ms":1}),
+            json!({"kind":"unknown","scheduled_at_ms":1}),
+        ] {
+            assert!(serde_json::from_value::<ScriptTimerInvocation>(invalid).is_err());
+        }
+        assert!(
+            ScriptTimerInvocation::Manual {
+                parent_command_id: " ".to_owned(),
+            }
+            .validate()
+            .is_err()
+        );
+        let mut mismatched = manual.clone();
+        mismatched.schedule_revision = -1;
+        assert!(mismatched.validate().is_err());
+
+        let rule = ScriptRuleContext {
+            id: "hourly-check".to_owned(),
+            revision: 7,
+        };
+        let frozen = FrozenScriptContext::Timer {
+            timer: scheduled.clone(),
+            rule: rule.clone(),
+        };
+        frozen.validate().unwrap();
+        let frozen_wire = json!({
+            "timer": scheduled_wire,
+            "rule": {"id":"hourly-check","revision":7}
+        });
+        assert_eq!(serde_json::to_value(&frozen).unwrap(), frozen_wire);
+        assert_eq!(
+            serde_json::from_value::<FrozenScriptContext>(frozen_wire.clone()).unwrap(),
+            frozen
+        );
+        assert!(frozen.event().is_none());
+        assert!(frozen.subject().is_none());
+        assert_eq!(frozen.timer(), Some(&scheduled));
+        assert_eq!(frozen.rule(), &rule);
+
+        let input = ScriptInputContext::for_run_command(&frozen, "timer-run-1").unwrap();
+        input.validate().unwrap();
+        let input_wire = serde_json::to_value(&input).unwrap();
+        assert_eq!(input_wire["timer"], frozen_wire["timer"]);
+        assert_eq!(input_wire["rule"], frozen_wire["rule"]);
+        assert_eq!(
+            input_wire["command"],
+            json!({"id":"timer-run-1","verb":"run"})
+        );
+        assert!(input_wire.get("event").is_none());
+        assert!(input_wire.get("subject").is_none());
+        assert!(input_wire["command"].get("args").is_none());
+        assert_eq!(input_wire.as_object().unwrap().len(), 3);
+        assert!(input.event().is_none());
+        assert!(input.subject().is_none());
+        assert_eq!(input.timer(), Some(&scheduled));
+        assert_eq!(input.rule(), &rule);
+        assert_eq!(
+            serde_json::to_value(
+                serde_json::from_value::<ScriptInputContext>(input_wire.clone()).unwrap()
+            )
+            .unwrap(),
+            input_wire
+        );
+    }
+
+    #[test]
+    fn script_context_unions_reject_unknown_and_ambiguous_fields() {
+        let event = Event {
+            seq: 1,
+            ts: 2,
+            kind: "timer.test".to_owned(),
+            agent: None,
+            subject: None,
+            generation: None,
+            source: "fake".to_owned(),
+            native_id: None,
+            data: json!({}),
+            cause: None,
+        };
+        let event_wire = serde_json::to_value(event).unwrap();
+        let timer = ScriptTimerContext {
+            schedule_revision: 1,
+            schedule: TimerSchedule::Once { at: 5 },
+            anchor: 4,
+            invocation: ScriptTimerInvocation::Scheduled { scheduled_at_ms: 5 },
+        };
+        let timer_wire = serde_json::to_value(timer).unwrap();
+        let rule = json!({"id":"timer-rule","revision":1});
+        let command = json!({"id":"run-command-1","verb":"run"});
+
+        let event_context = json!({
+            "event": event_wire,
+            "subject": null,
+            "rule": rule.clone()
+        });
+        let timer_context = json!({"timer":timer_wire,"rule":rule});
+        let mut unknown_frozen = event_context.clone();
+        unknown_frozen["unexpected"] = json!(true);
+        let mut ambiguous_frozen = event_context.clone();
+        ambiguous_frozen["timer"] = timer_context["timer"].clone();
+        for invalid in [unknown_frozen, ambiguous_frozen] {
+            assert!(serde_json::from_value::<FrozenScriptContext>(invalid).is_err());
+        }
+
+        let mut unknown_input = event_context.clone();
+        unknown_input["command"] = command.clone();
+        unknown_input["unexpected"] = json!(true);
+        let mut ambiguous_input = event_context;
+        ambiguous_input["command"] = command;
+        ambiguous_input["timer"] = timer_context["timer"].clone();
+        for invalid in [unknown_input, ambiguous_input] {
+            assert!(serde_json::from_value::<ScriptInputContext>(invalid).is_err());
+        }
     }
 
     #[test]

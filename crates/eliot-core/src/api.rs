@@ -49,7 +49,7 @@ pub use scripts::{
     FrozenScriptContext, FrozenScriptInterpreter, FrozenScriptRun, RunDefinitionArgs,
     ScriptActionRecord, ScriptCommandContext, ScriptCustody, ScriptDirectExit, ScriptInputContext,
     ScriptInterpreter, ScriptProcessResult, ScriptRuleContext, ScriptRunApplied,
-    bound_script_outcome_stderr,
+    ScriptTimerContext, ScriptTimerInvocation, bound_script_outcome_stderr,
 };
 pub use timers::{CatchUp, TimerGetRequest, TimerRunRequest, TimerSchedule, TimerStateView};
 
