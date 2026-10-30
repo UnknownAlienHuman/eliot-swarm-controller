@@ -851,7 +851,12 @@ impl Store {
                 is_new: true,
             });
         }
-        if let Some(code) = rule_action_binding_error(&trigger, &request) {
+        let binding_error = if request.verb == "run" {
+            rule_run_action_binding_error(&tx, principal, &state.id, revision, event_seq, &request)?
+        } else {
+            rule_action_binding_error(&trigger, &request)
+        };
+        if let Some(code) = binding_error {
             request.id = key.child_id.clone();
             return reject_rule_event(tx, &self.write_faulted, &key, &code, now);
         }
@@ -1628,6 +1633,15 @@ fn validate_project_rule_action_tx(
     principal: &str,
     request: &SubmitCommand,
 ) -> Result<Option<core::api::ProjectRegistrationView>> {
+    if request.verb == "run" {
+        if rule_project_id(principal)?.is_none() {
+            return Ok(None);
+        }
+        let payload_digest = [0_u8; 32];
+        let command = CommandInsert::targetless_admitted(principal, request, &payload_digest, 0);
+        super::projects::capture_project_command_binding_tx(tx, &command)?;
+        return Ok(None);
+    }
     if rule_project_id(principal)?.is_none() {
         return Ok(None);
     }
@@ -2043,7 +2057,11 @@ fn rule_catch_up(rule: &StoredRuleState) -> Result<core::api::CatchUp> {
 }
 
 fn rule_action_limit(rule: &StoredRuleState) -> Result<core::api::RuleLimit> {
-    let value: Value = serde_json::from_str(&rule.canonical_definition)
+    rule_action_limit_for_definition(&rule.canonical_definition)
+}
+
+fn rule_action_limit_for_definition(definition: &str) -> Result<core::api::RuleLimit> {
+    let value: Value = serde_json::from_str(definition)
         .map_err(|_| Error::new("source_integrity", "stored rule definition is invalid"))?;
     rule_limit_from_value(&value)
         .map_err(|_| Error::new("source_integrity", "stored rule limit is invalid"))
@@ -2054,6 +2072,214 @@ fn rule_action_limit(rule: &StoredRuleState) -> Result<core::api::RuleLimit> {
                 window_ms: RULE_ACTION_WINDOW_MS,
             })
         })
+}
+
+pub(super) struct ScriptRunOrigin {
+    pub principal: String,
+    pub rule: String,
+    pub cause: core::EventCause,
+    limit: core::api::RuleLimit,
+}
+
+pub(super) fn resolve_script_run_origin_tx(
+    tx: &Transaction<'_>,
+    run: &Command,
+    frozen: &core::api::FrozenScriptRun,
+) -> Result<ScriptRunOrigin> {
+    let link: Option<(Option<String>, Option<String>, Option<i64>)> = tx
+        .query_row(
+            "SELECT parent_command, link_kind, ordinal FROM commands WHERE id = ?1",
+            [&run.id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let (Some(parent_id), Some(link_kind), Some(ordinal)) = link.ok_or_else(|| {
+        Error::new(
+            "source_integrity",
+            "script Run command has no stored parent link",
+        )
+    })?
+    else {
+        return Err(Error::new(
+            "source_integrity",
+            "script Run command has incomplete parent ordering metadata",
+        ));
+    };
+    if link_kind != "rule_action" || ordinal < 0 {
+        return Err(Error::new(
+            "source_integrity",
+            "script Run command is not an ordered rule action",
+        ));
+    }
+    let parent = load_command_record(tx, &parent_id)?
+        .ok_or_else(|| Error::new("source_integrity", "script Run rule parent is missing"))?;
+    if !matches!(parent.command.verb.as_str(), "rule" | "rule.catch_up")
+        || parent.command.principal != run.principal
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "script Run has an unsupported or differently-authorized rule parent",
+        ));
+    }
+    let firing_children = parent
+        .command
+        .outcome
+        .as_ref()
+        .and_then(|outcome| outcome.get("children"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::new("source_integrity", "script rule parent has no child set"))?;
+    if !firing_children
+        .iter()
+        .any(|child| child.as_str() == Some(run.id.as_str()))
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "script Run is absent from its rule parent's fixed child set",
+        ));
+    }
+    let rule = parent
+        .command
+        .args
+        .get("rule")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::new("source_integrity", "script rule parent has no rule id"))?
+        .to_owned();
+    let revision = parent
+        .command
+        .args
+        .get("revision")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| Error::new("source_integrity", "script rule parent has no revision"))?;
+    let event_seq = match parent.command.verb.as_str() {
+        "rule" => parent
+            .command
+            .args
+            .get("event_seq")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| Error::new("source_integrity", "script rule parent has no event id"))?,
+        "rule.catch_up" => {
+            let after_seq = parent
+                .command
+                .args
+                .get("after_seq")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| {
+                    Error::new("source_integrity", "catch-up parent has no lower bound")
+                })?;
+            let through_seq = parent
+                .command
+                .args
+                .get("through_seq")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| {
+                    Error::new("source_integrity", "catch-up parent has no upper bound")
+                })?;
+            let event_seq = frozen.context.event.seq;
+            if event_seq <= after_seq || event_seq > through_seq {
+                return Err(Error::new(
+                    "source_integrity",
+                    "script Run event is outside its stored catch-up range",
+                ));
+            }
+            event_seq
+        }
+        _ => unreachable!("parent verb was checked above"),
+    };
+    if frozen.context.rule.id != rule
+        || frozen.context.rule.revision != revision
+        || frozen.context.event.seq != event_seq
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "stored script context differs from its rule parent",
+        ));
+    }
+    let event = scripts::load_event_tx(tx, event_seq)?;
+    if frozen.context.event != event || frozen.context.subject != event.subject {
+        return Err(Error::new(
+            "source_integrity",
+            "stored script context differs from its committed event",
+        ));
+    }
+
+    let cause = command_cause_tx(tx, &run.id)?
+        .ok_or_else(|| Error::new("source_integrity", "script Run has no stored cause"))?;
+    let expected_depth = next_rule_cause_depth(event.cause.as_ref());
+    if cause.command_id != run.id
+        || cause.rule.as_deref() != Some(rule.as_str())
+        || cause.depth != expected_depth
+        || cause.depth > 5
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "script Run cause does not match its verified rule and event",
+        ));
+    }
+    let parent_cause = command_cause_tx(tx, &parent_id)?
+        .ok_or_else(|| Error::new("source_integrity", "script rule parent has no cause"))?;
+    let parent_depth_matches = match parent.command.verb.as_str() {
+        "rule" => parent_cause.depth == cause.depth,
+        "rule.catch_up" => parent_cause.depth == 1,
+        _ => false,
+    };
+    if parent_cause.command_id != parent_id
+        || parent_cause.rule.as_deref() != Some(rule.as_str())
+        || !parent_depth_matches
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "script Run cause differs from its stored rule parent",
+        ));
+    }
+
+    let stored = load_rule_state(tx, &run.principal, &rule)?
+        .ok_or_else(|| Error::new("source_integrity", "script rule state was removed"))?;
+    let definition = if stored.view.revision == revision {
+        stored.canonical_definition.as_str()
+    } else if stored.view.retiring_revision == Some(revision) {
+        stored
+            .retiring_definition
+            .as_deref()
+            .ok_or_else(|| Error::new("source_integrity", "retiring script rule is absent"))?
+    } else {
+        return Err(Error::new(
+            "source_integrity",
+            "script rule revision is no longer retained",
+        ));
+    };
+    let limit = rule_action_limit_for_definition(definition)?;
+    Ok(ScriptRunOrigin {
+        principal: run.principal.clone(),
+        rule,
+        cause,
+        limit,
+    })
+}
+
+pub(super) fn validate_script_output_rate_tx(
+    tx: &Transaction<'_>,
+    origin: &ScriptRunOrigin,
+    target_agent: Option<&str>,
+    now: i64,
+) -> Result<()> {
+    let (scoped_count, global_count) = rule_action_counts(
+        tx,
+        &origin.principal,
+        &origin.rule,
+        target_agent,
+        &origin.limit,
+        now,
+    )?;
+    if rule_limit_reached(scoped_count, origin.limit.max)
+        || global_count >= GLOBAL_RULE_ACTION_LIMIT
+    {
+        return Err(Error::new(
+            "rate_limited",
+            "script output exceeds the saved rule action rate limit",
+        ));
+    }
+    Ok(())
 }
 
 fn catch_up_name(catch_up: core::api::CatchUp) -> &'static str {
@@ -2136,7 +2362,7 @@ fn validate_timer_slot(slot: &TimerSlotCommit, now: i64) -> Result<()> {
     Ok(())
 }
 
-fn valid_rule_action_request(request: &SubmitCommand, allow_interrupt: bool) -> bool {
+pub(super) fn valid_rule_action_request(request: &SubmitCommand, allow_interrupt: bool) -> bool {
     if request.validate().is_err()
         || !request
             .target
@@ -2173,6 +2399,42 @@ fn valid_rule_action_request(request: &SubmitCommand, allow_interrupt: bool) -> 
                 && request.args.as_object().is_some_and(|args| args.is_empty())
         }
         _ => false,
+    }
+}
+
+fn valid_targetless_rule_run_request(request: &SubmitCommand) -> bool {
+    request.validate().is_ok()
+        && request.verb == "run"
+        && request.target.is_none()
+        && request.expected_generation.is_none()
+        && request.expected_turn_id.is_none()
+        && request.request_id.is_none()
+        && !request.probe
+        && request.args.is_object()
+}
+
+pub(super) fn rule_run_action_binding_error(
+    tx: &Transaction<'_>,
+    principal: &str,
+    rule: &str,
+    revision: i64,
+    event_seq: i64,
+    request: &SubmitCommand,
+) -> Result<Option<String>> {
+    if !valid_targetless_rule_run_request(request) {
+        return Ok(Some("rule_action_binding_invalid".to_owned()));
+    }
+    match scripts::validate_rule_run_context_tx(
+        tx,
+        principal,
+        rule,
+        revision,
+        event_seq,
+        &request.args,
+    ) {
+        Ok(()) => Ok(None),
+        Err(error) if error.code == "invalid" => Ok(Some("rule_action_binding_invalid".to_owned())),
+        Err(error) => Err(error),
     }
 }
 
@@ -2217,11 +2479,17 @@ pub(super) fn gate_rule_action_dispatch_tx(
         .ok_or_else(|| Error::new("source_integrity", "rule-action parent is missing"))?;
     if !matches!(
         parent.command.verb.as_str(),
-        "rule" | "timer.run" | "rule.catch_up"
+        "rule" | "timer.run" | "rule.catch_up" | "run"
     ) {
         return Err(Error::new(
             "source_integrity",
             "rule-action parent has an unsupported verb",
+        ));
+    }
+    if parent.command.verb == "run" && parent.command.state != CommandState::Applied {
+        return Err(Error::new(
+            "source_integrity",
+            "script output children cannot dispatch before the Run child set is committed",
         ));
     }
     let expected_children = parent
@@ -2380,8 +2648,21 @@ fn has_open_rule_actions_tx(tx: &Transaction<'_>, principal: &str, rule: &str) -
              JOIN commands parent ON parent.id = child.parent_command
              WHERE child.link_kind = 'rule_action' AND child.ordinal IS NOT NULL
                AND child.state IN ('accepted','queued','dispatched','unknown')
-               AND parent.principal = ?1
-               AND json_extract(parent.args, '$.rule') = ?2
+                AND (
+                    (parent.principal = ?1
+                     AND json_extract(parent.args, '$.rule') = ?2)
+                    OR EXISTS (
+                        SELECT 1 FROM commands root
+                        WHERE parent.verb = 'run'
+                          AND parent.principal = ?1
+                          AND parent.link_kind = 'rule_action'
+                          AND parent.ordinal IS NOT NULL
+                          AND root.id = parent.parent_command
+                          AND root.principal = ?1
+                          AND root.verb IN ('rule','rule.catch_up')
+                          AND json_extract(root.args, '$.rule') = ?2
+                    )
+                )
          )",
         params![principal, rule],
         |row| row.get(0),
@@ -2807,6 +3088,20 @@ fn should_suppress_own_event_send_tx(
                          AND parent.verb IN ('rule','timer.run','rule.catch_up')
                          AND json_extract(parent.args, '$.rule') = ?3
                    )
+                    OR EXISTS (
+                        SELECT 1 FROM commands run
+                        JOIN commands root ON root.id = run.parent_command
+                        WHERE run.id = origin.parent_command
+                          AND origin.link_kind = 'rule_action'
+                          AND origin.ordinal IS NOT NULL
+                          AND run.verb = 'run'
+                          AND run.principal = ?2
+                          AND run.link_kind = 'rule_action'
+                          AND run.ordinal IS NOT NULL
+                          AND root.principal = ?2
+                          AND root.verb IN ('rule','rule.catch_up')
+                          AND json_extract(root.args, '$.rule') = ?3
+                    )
                )
          )",
         params![cause.command_id, principal, rule],
@@ -2835,31 +3130,59 @@ fn rule_action_counts(
                  JOIN commands parent ON parent.id = action.parent_command
                  WHERE action.link_kind = 'rule_action' AND action.ordinal IS NOT NULL
                    AND action.created_at >= ?1 AND action.created_at <= ?2
-                   AND parent.principal = ?3
-                   AND json_extract(parent.args, '$.rule') = ?4",
+                    AND EXISTS (
+                        SELECT 1 FROM commands root
+                        WHERE root.principal = ?3
+                          AND root.verb IN ('rule','timer.run','rule.catch_up')
+                          AND json_extract(root.args, '$.rule') = ?4
+                          AND (
+                              root.id = parent.id
+                              OR (parent.verb = 'run'
+                                  AND parent.parent_command = root.id
+                                  AND parent.principal = root.principal
+                                  AND parent.link_kind = 'rule_action'
+                                  AND parent.ordinal IS NOT NULL)
+                          )
+                          AND action.principal = root.principal
+                    )",
                 params![since, now, principal, rule],
                 |row| row.get(0),
             )
             .map_err(sql_error)?,
-        core::api::RuleLimitScope::Agent => {
-            let target_agent = target_agent.ok_or_else(|| {
-                Error::new("invalid", "per-agent rule limit requires a frozen target")
-            })?;
-            let target_agent = parse_agent_id(target_agent)?;
-            tx.query_row(
-                "SELECT COUNT(*)
-                 FROM commands action
-                 JOIN commands parent ON parent.id = action.parent_command
-                 WHERE action.link_kind = 'rule_action' AND action.ordinal IS NOT NULL
-                   AND action.created_at >= ?1 AND action.created_at <= ?2
-                   AND parent.principal = ?3
-                   AND json_extract(parent.args, '$.rule') = ?4
-                   AND action.target = ?5",
-                params![since, now, principal, rule, target_agent],
-                |row| row.get(0),
-            )
-            .map_err(sql_error)?
-        }
+        core::api::RuleLimitScope::Agent => match target_agent {
+            // A targetless Run consumes rule/global capacity, but it has no
+            // Agent target and must not inherit one from its trigger event.
+            None => 0,
+            Some(target_agent) => {
+                let target_agent = parse_agent_id(target_agent)?;
+                tx.query_row(
+                    "SELECT COUNT(*)
+                     FROM commands action
+                     JOIN commands parent ON parent.id = action.parent_command
+                     WHERE action.link_kind = 'rule_action' AND action.ordinal IS NOT NULL
+                       AND action.created_at >= ?1 AND action.created_at <= ?2
+                        AND EXISTS (
+                            SELECT 1 FROM commands root
+                            WHERE root.principal = ?3
+                              AND root.verb IN ('rule','timer.run','rule.catch_up')
+                              AND json_extract(root.args, '$.rule') = ?4
+                              AND (
+                                  root.id = parent.id
+                                  OR (parent.verb = 'run'
+                                      AND parent.parent_command = root.id
+                                      AND parent.principal = root.principal
+                                      AND parent.link_kind = 'rule_action'
+                                      AND parent.ordinal IS NOT NULL)
+                              )
+                        )
+                        AND action.principal = ?3
+                        AND action.target = ?5",
+                    params![since, now, principal, rule, target_agent],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?
+            }
+        },
     };
     // The global guard spans owner and project principals and stays fixed at
     // 120 admitted action children per minute.
@@ -3007,7 +3330,7 @@ fn admit_rule_action_tx(
     Ok((parent, child, events))
 }
 
-fn annotate_rule_command_event(
+pub(super) fn annotate_rule_command_event(
     tx: &Transaction<'_>,
     command_id: &str,
     events: &mut [Event],
