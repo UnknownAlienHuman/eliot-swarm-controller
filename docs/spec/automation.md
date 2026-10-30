@@ -42,6 +42,8 @@ interpreter executables or fixed argv prefixes, model/effort, route/account, cre
 permissions, workspace mode or Git identity. A project `run.env` may supply only literal
 values for owner-approved names under [project registration](configuration.md#project-registration-and-rule-authority);
 it cannot select or override credentials, routes, accounts or reserved identity.
+Project request-reply actions are granted per verb: a rule requires the exact `approve`,
+`deny` or `answer` entry in `actions`; one reply grant does not authorize another.
 
 Owner `rule.get`, `rule.catch_up`, `timer.get` and `timer.run` accept an optional project
 scope. Supplying one selects its project principal even though the caller is Owner; an
@@ -122,8 +124,8 @@ Global and registered-project timers use their namespace's startup-loaded rule f
 the existing command router. The connected timer slice admits ordinary `stop`, `send` and `run` children for global and
 registered-project interval, cron and once firings, including manual `timer.run`. See
 [Timer Run invocation context](#timer-run-invocation-context).
-The event-rule `interrupt` and `steer` actions remain unsupported for scheduled or manual
-timer runs.
+The event-rule `interrupt`, `steer` and request-reply actions remain unsupported for
+scheduled or manual timer runs.
 Other action verbs remain future work.
 
 ```toml
@@ -212,14 +214,41 @@ do = [{ action = "stop", target = "${event.agent}", expected_generation = "${eve
 
 Whole-value rendering preserves JSON type. Templates cannot choose the action, action
 name, executable, environment, credential or authority. For event-triggered `stop`,
-`send`, `interrupt` and `steer`, the rendered target and `expected_generation` must exactly
-match the captured `Event.agent` and `Event.generation`; an absent or different binding is
-rejected before action-child admission. Event-rule `interrupt` and `steer` must also bind
-`expected_turn_id` to that event's nonempty string `data.turn_id`. Store revalidates that
-exact turn at admission and at the dispatch effect boundary; a historical or queued
-action whose turn is no longer active is refused without retargeting current work.
-SEND and STEER text is rendered once and frozen from that captured event, with no later
-Agent-row lookup to fill or retarget the command. An unresolved placeholder fails admission.
+`send`, `interrupt`, `steer`, `approve`, `deny` and `answer`, the rendered target and
+`expected_generation` must exactly match the captured `Event.agent` and `Event.generation`;
+an absent or different binding is rejected before action-child admission. Event-rule
+`interrupt` and `steer` must also bind `expected_turn_id` to that event's nonempty string
+`data.turn_id`. Store revalidates that exact turn at admission and at the dispatch effect
+boundary; a historical or queued action whose turn is no longer active is refused without
+retargeting current work. SEND and STEER text is rendered once and frozen from that captured
+event, with no later Agent-row lookup to fill or retarget the command. An unresolved
+placeholder fails admission.
+
+`approve`, `deny` and `answer` are event-only request replies and require
+`on.event = "request.opened"`. Each binds `expected_turn_id` to the captured event's
+nonempty string `data.turn_id` and `request_id` to its nonempty string `data.request_id`;
+both may be literal values or whole-value templates, but must equal the captured fields.
+Rule rendering uses only that event and never fills a missing id or retargets another
+request; Router/Store revalidate the exact current request before the effect. `approve`
+and `deny` produce empty command args. `answer` accepts a literal answers map, passes it unchanged
+under `SubmitCommand.args.answers`, and does not template-expand question ids or values.
+Each question id maps to an object containing its native `answers` array. For one answer,
+`SubmitCommand.args` is `{"answers":{"question-id":{"answers":["Continue"]}}}`.
+
+```toml
+[[rule]]
+id = "answer-open-request"
+on = { event = "request.opened" }
+do = [{ action = "answer", target = "${event.agent}", expected_generation = "${event.generation}", expected_turn_id = "${event.data.turn_id}", request_id = "${event.data.request_id}", answers = { "question-id" = { answers = ["Continue"] } } }]
+```
+
+Global request-reply rules use Owner authority. Project request-reply rules require the
+matching per-verb project action grant described above. An `applied` reply child records
+that exact native write; the rule parent's `applied` still means admission only. Core's
+`request.resolved` event remains bound to the reply command.
+`request.closed` is cleanup without `command_id`, and `turn.completed` is a
+separate turn fact; neither substitutes for reply acknowledgement. An unknown reply is
+never replayed. Request replies are not available to timer rules or script stdout records.
 The action definition is owned by [the rule definition module](../../crates/eliot-daemon/src/automation/definition.rs).
 One firing atomically admits its Store-only parent and ordinary action child; the
 parent's fixed child set is durable, and `applied` means admission rather than task completion.
@@ -250,10 +279,11 @@ Disabled rules advance their skipped range without firing.
 
 Backlog, explicit history catch-up, and rate-limit semantics are defined in
 [Retention and bounded backlog](#retention-and-bounded-backlog).
-This connected event-rule subset supports ordinary `stop`, `send` and event-only
-`interrupt` and `steer`, plus project event-rule `run` during live evaluation and explicit
-history catch-up. The global event-rule `run` contract below uses owner-global approval
-and the shared frozen execution path. Other full L4.2 action requirements remain cumulative. SEND uses the
+This connected event-rule subset supports event actions `stop`, `send`, `interrupt`,
+`steer`, `approve`, `deny` and `answer`, plus project event-rule `run` during live
+evaluation and explicit history catch-up. The global event-rule `run` contract below uses
+owner-global approval and the shared frozen execution path. Other full L4.2 action
+requirements remain cumulative. SEND uses the
 existing Router path, keeps its exact target generation and turn association, and
 `applied` does not assert task completion. `allow_self` defaults to false; see [Guardrails](#guardrails)
 for the same-principal self-cause behavior for SEND and Run. Goal actions and project
@@ -473,7 +503,8 @@ line is one JSON object, LF or CRLF terminated; a final complete object may end 
 Empty lines, malformed JSON, invalid UTF-8, truncated capture or excess output invalidate
 the entire stream. Each line must deserialize as the strict Core `ScriptActionRecord`
 DTO; that type owns the closed flat record field catalog and converts to an ordinary
-`SubmitCommand`. Event-rule STEER does not extend the script stdout action set.
+`SubmitCommand`. Event-rule STEER and request-reply actions do not extend the script stdout
+action set.
 The effective send-text limit is Core `MAX_EVENT_BYTES` (64 KiB) from
 [Core limits](../../crates/eliot-core/src/limits.rs). Unknown, missing, `null`, nested,
 extra or wrong-type fields fail validation. Targets and generation/turn bindings are
