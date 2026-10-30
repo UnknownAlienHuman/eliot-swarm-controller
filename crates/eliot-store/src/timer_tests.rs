@@ -293,6 +293,105 @@ fn ready_agent(store: &mut Store, project: &str, now: i64) -> String {
     agent
 }
 
+fn timer_launch_action(project: &str, text: Option<&str>) -> SubmitCommand {
+    let mut action = SubmitCommand::new(Ulid::new().to_string(), "launch");
+    action.args = json!({
+        "project": project,
+        "workspace": format!("synthetic-timer-{project}"),
+    });
+    if let Some(text) = text {
+        action.args["text"] = json!(text);
+    }
+    action.expected_generation = Some(0);
+    action
+}
+
+fn commit_scheduled_timer_launch(
+    store: &mut Store,
+    timer: &eliot_core::api::TimerStateView,
+    scheduled_at_ms: i64,
+    next_due_at_ms: Option<i64>,
+    project: &str,
+    text: Option<&str>,
+    now: i64,
+) -> super::TimerSlotAdmission {
+    store
+        .commit_timer_slot(
+            "owner",
+            timer,
+            TimerSlotCommit {
+                scheduled_at_ms,
+                next_due_at_ms,
+                action: Some(timer_launch_action(project, text)),
+                skip_code: None,
+            },
+            now,
+        )
+        .unwrap()
+}
+
+fn ready_timer_launch(store: &mut Store, launch_id: &str, agent_id: &str, now: i64) {
+    store.dispatch(launch_id, now).unwrap();
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("timer-launch-ready-{launch_id}"),
+                agent_id: agent_id.to_owned(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ready".to_owned(),
+                    native_id: format!("timer-launch-ready-{launch_id}"),
+                    data: json!({"command_id": launch_id}),
+                }],
+                cursor: None,
+            },
+            now + 1,
+        )
+        .unwrap();
+    store
+        .settle(launch_id, CommandState::Applied, None, now + 2)
+        .unwrap();
+}
+
+fn apply_timer_launch_input_in_running_turn(
+    store: &mut Store,
+    agent_id: &str,
+    send_id: &str,
+    now: i64,
+) -> String {
+    let turn_id = format!("timer-launch-turn-{send_id}");
+    store.dispatch(send_id, now).unwrap();
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("timer-launch-turn-started-{send_id}"),
+                agent_id: agent_id.to_owned(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "turn.started".to_owned(),
+                    native_id: format!("timer-launch-turn-started-{send_id}"),
+                    data: json!({"command_id": send_id, "turn_id": turn_id}),
+                }],
+                cursor: None,
+            },
+            now + 1,
+        )
+        .unwrap();
+    let send = store.get_command(send_id).unwrap().unwrap();
+    assert_eq!(send.state, CommandState::Applied);
+    assert_eq!(send.turn_id.as_deref(), Some(turn_id.as_str()));
+    let turn = store
+        .get_turn(agent_id, 1, &turn_id)
+        .unwrap()
+        .expect("turn.started associates the linked SEND");
+    assert_eq!(turn.state, eliot_core::TurnState::Running);
+    turn_id
+}
+
 fn stop_request(agent: &str) -> SubmitCommand {
     let mut request = SubmitCommand::new(Ulid::new().to_string(), "stop");
     request.target = Some(agent.to_owned());
@@ -361,7 +460,11 @@ fn slot_child_and_cursor_roll_back_together_on_persistence_failure() {
             first_due,
         )
         .unwrap();
-    let child = committed.child.as_ref().expect("ordinary stop child");
+    let child = &committed
+        .child
+        .as_ref()
+        .expect("ordinary stop child")
+        .command;
     assert_eq!(committed.state.last_key, Some(first_due));
     assert_eq!(
         committed.parent.as_ref().unwrap().outcome.as_ref().unwrap()["children"][0],
@@ -433,6 +536,7 @@ fn scheduled_cursor_is_monotonic_and_pending_children_block_next_slots() {
         .child
         .as_ref()
         .expect("ordinary stop child")
+        .command
         .id
         .clone();
     let next_due = first.state.next_due_at.unwrap();
@@ -622,7 +726,7 @@ fn manual_run_revision_fences_new_admission_but_not_retained_replay() {
         )
         .unwrap();
     assert!(admitted.is_new);
-    let child = admitted.child.as_ref().expect("new action child");
+    let child = &admitted.child.as_ref().expect("new action child").command;
     assert_eq!(child.target.as_deref(), Some(new_agent.as_str()));
     assert_eq!(admitted.state, before);
 
@@ -639,7 +743,7 @@ fn manual_run_revision_fences_new_admission_but_not_retained_replay() {
         .unwrap();
     assert!(!replay.is_new);
     assert_eq!(replay.parent.as_ref().unwrap().id, request.id);
-    assert_eq!(replay.child.as_ref().unwrap().id, child.id);
+    assert_eq!(replay.child.as_ref().unwrap().command.id, child.id);
     assert_eq!(store.high_water().unwrap(), high_water_after_admission);
 }
 
@@ -686,6 +790,7 @@ fn once_at_registration_allows_manual_run_without_consuming_schedule() {
         .child
         .as_ref()
         .expect("one ordinary stop child")
+        .command
         .id
         .clone();
 
@@ -711,7 +816,7 @@ fn once_at_registration_allows_manual_run_without_consuming_schedule() {
         .unwrap();
     assert!(!replay.is_new);
     assert_eq!(replay.parent.as_ref().unwrap().id, request.id);
-    assert_eq!(replay.child.as_ref().unwrap().id, child_id);
+    assert_eq!(replay.child.as_ref().unwrap().command.id, child_id);
     let children_after: i64 = store
         .connection
         .query_row(
@@ -750,7 +855,7 @@ fn rate_limit_counts_each_admitted_child_once_and_excludes_parents() {
                 .connection
                 .execute(
                     "UPDATE commands SET state = 'applied' WHERE id = ?1",
-                    [&child.id],
+                    [&child.command.id],
                 )
                 .unwrap();
         } else {
@@ -789,7 +894,7 @@ fn assert_scheduled_timer_run_context(
         next_due,
     );
     let parent = admitted.parent.expect("scheduled timer parent");
-    let run = admitted.child.expect("scheduled timer Run child");
+    let run = admitted.child.expect("scheduled timer Run child").command;
     let rule_revision = store
         .get_rule_state("owner", id)
         .unwrap()
@@ -851,7 +956,7 @@ fn assert_scheduled_timer_run_context(
     assert!(!replay.is_new);
     assert!(replay.events.is_empty());
     assert_eq!(replay.parent.as_ref().unwrap().id, parent.id);
-    assert_eq!(replay.child.as_ref().unwrap().id, run.id);
+    assert_eq!(replay.child.as_ref().unwrap().command.id, run.id);
     assert_eq!(replay.state.last_key, Some(scheduled_at_ms));
     let replay_context: FrozenScriptContext = serde_json::from_value(
         replay.parent.as_ref().unwrap().outcome.as_ref().unwrap()["script_context"].clone(),
@@ -1038,7 +1143,7 @@ fn manual_timer_run_uses_external_parent_id_and_replays_its_saved_context() {
         .unwrap();
     assert!(first.is_new);
     let parent = first.parent.unwrap();
-    let run = first.child.unwrap();
+    let run = first.child.unwrap().command;
     assert_eq!(parent.verb, "timer.run");
     assert_eq!(parent.id, request.id);
     assert_eq!(parent.args, json!({"rule": rule_id}));
@@ -1105,7 +1210,7 @@ fn manual_timer_run_uses_external_parent_id_and_replays_its_saved_context() {
         replay.parent.unwrap().outcome.unwrap()["script_context"],
         saved_context
     );
-    assert_eq!(replay.child.unwrap().id, run.id);
+    assert_eq!(replay.child.unwrap().command.id, run.id);
     assert_eq!(store.high_water().unwrap(), before_replay);
     assert_eq!(
         store
@@ -1145,7 +1250,7 @@ fn manual_timer_run_unknown_send_descendant_holds_scheduled_and_manual_firings()
         )
         .unwrap();
     let parent_id = admitted.parent.as_ref().unwrap().id.clone();
-    let run = admitted.child.unwrap();
+    let run = admitted.child.unwrap().command;
     store.dispatch(&run.id, registration_ms + 2).unwrap();
     let output = store
         .admit_script_output(
@@ -1175,7 +1280,7 @@ fn manual_timer_run_unknown_send_descendant_holds_scheduled_and_manual_firings()
     assert!(!replay.is_new);
     assert!(replay.events.is_empty());
     assert_eq!(replay.parent.as_ref().unwrap().id, parent_id);
-    assert_eq!(replay.child.as_ref().unwrap().id, run.id);
+    assert_eq!(replay.child.as_ref().unwrap().command.id, run.id);
     assert_eq!(store.high_water().unwrap(), high_water_before_replay);
 
     let output_replay = store
@@ -1223,6 +1328,461 @@ fn manual_timer_run_unknown_send_descendant_holds_scheduled_and_manual_firings()
     assert!(manual.blocked);
     assert!(manual.parent.is_none());
     assert!(manual.child.is_none());
+}
+
+#[test]
+fn scheduled_and_manual_timer_launch_inputs_hold_following_firings() {
+    let period_ms = 1_000;
+    for manual_initial in [false, true] {
+        for input_state in ["accepted", "queued", "dispatched", "unknown"] {
+            let mut store = store();
+            let registration_ms = now_ms();
+            let mode = if manual_initial {
+                "manual"
+            } else {
+                "scheduled"
+            };
+            let rule_id = format!("timer-launch-gate-{mode}-{input_state}");
+            let timer = ensure_interval(&mut store, &rule_id, registration_ms, period_ms);
+            let revision = rule_revision(&store, &rule_id);
+            let first_due = timer.next_due_at.expect("first launch slot");
+            let project = format!("{rule_id}-initial");
+            let action = timer_launch_action(&project, Some("initial launch input"));
+            assert!(action.target.is_none());
+            assert_eq!(action.expected_generation, Some(0));
+
+            let (timer_after_initial, launch_child) = if manual_initial {
+                let request = TimerRunRequest::new(Ulid::new().to_string(), &rule_id);
+                let admitted = store
+                    .admit_manual_timer_run(
+                        "owner",
+                        &request,
+                        &timer,
+                        revision,
+                        action,
+                        registration_ms + 1,
+                    )
+                    .unwrap();
+                assert!(!admitted.blocked);
+                (
+                    admitted.state,
+                    admitted.child.expect("manual targetless launch child"),
+                )
+            } else {
+                let admitted = commit_scheduled_timer_launch(
+                    &mut store,
+                    &timer,
+                    first_due,
+                    Some(first_due + period_ms),
+                    &project,
+                    Some("initial launch input"),
+                    first_due,
+                );
+                assert!(!admitted.blocked);
+                (
+                    admitted.state,
+                    admitted.child.expect("scheduled targetless launch child"),
+                )
+            };
+            let launch_id = launch_child.command.id.clone();
+            let input_id = format!("{launch_id}/send");
+            let linked = launch_child
+                .linked_command
+                .as_ref()
+                .expect("launch owns its initial SEND");
+            assert_eq!(linked.id, input_id);
+            let agent_id = launch_child
+                .command
+                .target
+                .clone()
+                .expect("Store binds the launch to its new Agent");
+            ready_timer_launch(&mut store, &launch_id, &agent_id, first_due + 1);
+
+            match input_state {
+                "accepted" | "queued" => {
+                    store
+                        .connection
+                        .execute(
+                            "UPDATE commands SET state = ?1 WHERE id = ?2",
+                            rusqlite::params![input_state, input_id],
+                        )
+                        .unwrap();
+                }
+                "dispatched" => {
+                    assert_eq!(
+                        store
+                            .dispatch(&input_id, first_due + 4)
+                            .unwrap()
+                            .value
+                            .state,
+                        CommandState::Dispatched
+                    );
+                }
+                "unknown" => {
+                    store.dispatch(&input_id, first_due + 4).unwrap();
+                    store
+                        .settle(&input_id, CommandState::Unknown, None, first_due + 5)
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let expected_send_state = match input_state {
+                "accepted" => CommandState::Accepted,
+                "queued" => CommandState::Queued,
+                "dispatched" => CommandState::Dispatched,
+                "unknown" => CommandState::Unknown,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                store.get_command(&input_id).unwrap().unwrap().state,
+                expected_send_state
+            );
+            assert_eq!(
+                store.get_command(&launch_id).unwrap().unwrap().state,
+                CommandState::Applied
+            );
+
+            let next_slot = timer_after_initial
+                .next_due_at
+                .expect("timer retains its next slot");
+            let commands_before: i64 = store
+                .connection
+                .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+                .unwrap();
+            let high_water_before = store.high_water().unwrap();
+            let scheduled_project = format!("{rule_id}-scheduled-next");
+            let scheduled = commit_scheduled_timer_launch(
+                &mut store,
+                &timer_after_initial,
+                next_slot,
+                Some(next_slot + period_ms),
+                &scheduled_project,
+                None,
+                next_slot + 1,
+            );
+            assert!(scheduled.blocked, "{mode} launch input in {input_state}");
+            assert!(scheduled.parent.is_none());
+            assert!(scheduled.child.is_none());
+            assert!(scheduled.events.is_empty());
+            assert_eq!(scheduled.state.last_key, timer_after_initial.last_key);
+            assert_eq!(scheduled.state.next_due_at, timer_after_initial.next_due_at);
+
+            let request = TimerRunRequest::new(Ulid::new().to_string(), &rule_id);
+            let manual_project = format!("{rule_id}-manual-next");
+            let manual = store
+                .admit_manual_timer_run(
+                    "owner",
+                    &request,
+                    &timer_after_initial,
+                    revision,
+                    timer_launch_action(&manual_project, None),
+                    next_slot + 2,
+                )
+                .unwrap();
+            assert!(manual.blocked, "{mode} launch input in {input_state}");
+            assert!(manual.parent.is_none());
+            assert!(manual.child.is_none());
+            assert!(manual.events.is_empty());
+            assert_eq!(manual.state, timer_after_initial);
+            assert_eq!(
+                store
+                    .connection
+                    .query_row("SELECT COUNT(*) FROM commands", [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                commands_before
+            );
+            assert_eq!(store.high_water().unwrap(), high_water_before);
+        }
+    }
+}
+
+#[test]
+fn applied_timer_launch_input_releases_gate_while_its_turn_runs() {
+    let mut store = store();
+    let registration_ms = now_ms();
+    let rule_id = "timer-launch-applied-input";
+    let period_ms = 1_000;
+    let timer = ensure_interval(&mut store, rule_id, registration_ms, period_ms);
+    let revision = rule_revision(&store, rule_id);
+    let first_due = timer.next_due_at.unwrap();
+    let initial = commit_scheduled_timer_launch(
+        &mut store,
+        &timer,
+        first_due,
+        Some(first_due + period_ms),
+        "timer-launch-applied-input",
+        Some("initial launch input"),
+        first_due,
+    );
+    let timer_after_initial = initial.state;
+    let launch_child = initial.child.expect("scheduled launch child");
+    let launch_id = launch_child.command.id.clone();
+    let input_id = launch_child
+        .linked_command
+        .as_ref()
+        .expect("launch owns its initial SEND")
+        .id
+        .clone();
+    let agent_id = launch_child.command.target.unwrap();
+    ready_timer_launch(&mut store, &launch_id, &agent_id, first_due + 1);
+    let turn_id =
+        apply_timer_launch_input_in_running_turn(&mut store, &agent_id, &input_id, first_due + 4);
+    assert_eq!(
+        store.get_command(&input_id).unwrap().unwrap().state,
+        CommandState::Applied
+    );
+
+    let next_slot = timer_after_initial.next_due_at.unwrap();
+    let scheduled = commit_scheduled_timer_launch(
+        &mut store,
+        &timer_after_initial,
+        next_slot,
+        Some(next_slot + period_ms),
+        "timer-launch-after-applied-input",
+        None,
+        next_slot + 1,
+    );
+    assert!(!scheduled.blocked);
+    assert!(scheduled.parent.is_some());
+    let scheduled_child = scheduled.child.as_ref().expect("scheduled launch child");
+    assert!(scheduled_child.linked_command.is_none());
+    store
+        .connection
+        .execute(
+            "UPDATE commands SET state = 'applied' WHERE id = ?1",
+            [&scheduled_child.command.id],
+        )
+        .unwrap();
+
+    let request = TimerRunRequest::new(Ulid::new().to_string(), rule_id);
+    let manual = store
+        .admit_manual_timer_run(
+            "owner",
+            &request,
+            &scheduled.state,
+            revision,
+            timer_launch_action("timer-launch-after-applied-input-manual", None),
+            next_slot + 3,
+        )
+        .unwrap();
+    assert!(!manual.blocked);
+    assert!(manual.parent.is_some());
+    assert!(manual.child.is_some());
+    assert_eq!(
+        store
+            .get_turn(&agent_id, 1, &turn_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        eliot_core::TurnState::Running
+    );
+}
+
+#[test]
+fn applied_timer_launch_recovery_returns_only_queued_linked_input() {
+    for input_state in ["queued", "dispatched", "unknown"] {
+        let mut store = store();
+        let registration_ms = now_ms();
+        let rule_id = format!("timer-launch-recovery-{input_state}");
+        let period_ms = 1_000;
+        let timer = ensure_interval(&mut store, &rule_id, registration_ms, period_ms);
+        let first_due = timer.next_due_at.unwrap();
+        let project = format!("{rule_id}-project");
+        let initial = commit_scheduled_timer_launch(
+            &mut store,
+            &timer,
+            first_due,
+            Some(first_due + period_ms),
+            &project,
+            Some("recoverable launch input"),
+            first_due,
+        );
+        let launch_child = initial.child.expect("scheduled launch child");
+        let launch_id = launch_child.command.id.clone();
+        let input_id = format!("{launch_id}/send");
+        let agent_id = launch_child.command.target.unwrap();
+        ready_timer_launch(&mut store, &launch_id, &agent_id, first_due + 1);
+
+        match input_state {
+            "queued" => {
+                store
+                    .connection
+                    .execute(
+                        "UPDATE commands SET state = 'queued' WHERE id = ?1",
+                        [&input_id],
+                    )
+                    .unwrap();
+            }
+            "dispatched" => {
+                assert_eq!(
+                    store
+                        .dispatch(&input_id, first_due + 4)
+                        .unwrap()
+                        .value
+                        .state,
+                    CommandState::Dispatched
+                );
+            }
+            "unknown" => {
+                store.dispatch(&input_id, first_due + 4).unwrap();
+                store
+                    .settle(&input_id, CommandState::Unknown, None, first_due + 5)
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let input_before = store.get_command(&input_id).unwrap().unwrap();
+        let high_water_before = store.high_water().unwrap();
+        let recovered = store.recover_rule_children(None, 100).unwrap();
+
+        if input_state == "queued" {
+            assert_eq!(recovered.len(), 1);
+            let launch = &recovered[0];
+            assert_eq!(launch.command.id, launch_id);
+            assert_eq!(launch.command.state, CommandState::Applied);
+            let input = launch
+                .linked_command
+                .as_ref()
+                .expect("recovered launch retains its linked input");
+            assert_eq!(input.id, format!("{launch_id}/send"));
+            assert_eq!(input.state, CommandState::Queued);
+            let (parent_id, link_kind, ordinal): (Option<String>, Option<String>, Option<i64>) =
+                store
+                    .connection
+                    .query_row(
+                        "SELECT parent_command, link_kind, ordinal FROM commands WHERE id = ?1",
+                        [&input_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .unwrap();
+            assert_eq!(parent_id.as_deref(), Some(launch_id.as_str()));
+            assert_eq!(link_kind.as_deref(), Some("send"));
+            assert_eq!(ordinal, Some(0));
+        } else {
+            assert!(
+                recovered
+                    .iter()
+                    .all(|launch| launch.command.id != launch_id),
+                "{input_state} launch input must not be replayed"
+            );
+        }
+        assert_eq!(store.get_command(&input_id).unwrap().unwrap(), input_before);
+        assert_eq!(store.high_water().unwrap(), high_water_before);
+    }
+}
+
+#[test]
+fn timer_launch_and_linked_input_count_as_one_rule_action() {
+    let mut store = store();
+    let registration_ms = now_ms();
+    let rule_id = "timer-launch-count";
+    let period_ms = 1_000;
+    let timer = ensure_interval(&mut store, rule_id, registration_ms, period_ms);
+    store
+        .ensure_rule_state(
+            "owner",
+            &rule_input_with_limit(rule_id, 2),
+            registration_ms + 1,
+        )
+        .unwrap();
+    let first_due = timer.next_due_at.unwrap();
+    let first = commit_scheduled_timer_launch(
+        &mut store,
+        &timer,
+        first_due,
+        Some(first_due + period_ms),
+        "timer-launch-count-first",
+        Some("first launch input"),
+        first_due,
+    );
+    let timer_after_first = first.state;
+    let first_child = first.child.expect("first launch action child");
+    let first_launch_id = first_child.command.id.clone();
+    let first_input_id = first_child
+        .linked_command
+        .as_ref()
+        .expect("first launch owns one linked SEND")
+        .id
+        .clone();
+    let first_agent = first_child.command.target.unwrap();
+    ready_timer_launch(&mut store, &first_launch_id, &first_agent, first_due + 1);
+    apply_timer_launch_input_in_running_turn(
+        &mut store,
+        &first_agent,
+        &first_input_id,
+        first_due + 4,
+    );
+
+    let action_count: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM commands WHERE link_kind = 'rule_action' AND ordinal IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        action_count, 1,
+        "the nested launch SEND is not another rule action"
+    );
+
+    let second_due = timer_after_first.next_due_at.unwrap();
+    let second = commit_scheduled_timer_launch(
+        &mut store,
+        &timer_after_first,
+        second_due,
+        Some(second_due + period_ms),
+        "timer-launch-count-second",
+        None,
+        second_due,
+    );
+    assert!(!second.blocked);
+    let second_child = second.child.as_ref().expect("second launch action child");
+    assert_eq!(second_child.command.verb, "launch");
+    assert!(second_child.linked_command.is_none());
+    let second_launch_id = second_child.command.id.clone();
+    let action_count: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM commands WHERE link_kind = 'rule_action' AND ordinal IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(action_count, 2);
+    store
+        .connection
+        .execute(
+            "UPDATE commands SET state = 'applied' WHERE id = ?1",
+            [&second_launch_id],
+        )
+        .unwrap();
+
+    let third_due = second.state.next_due_at.unwrap();
+    let rejected = commit_scheduled_timer_launch(
+        &mut store,
+        &second.state,
+        third_due,
+        Some(third_due + period_ms),
+        "timer-launch-count-third",
+        None,
+        third_due,
+    );
+    assert!(!rejected.blocked);
+    assert!(rejected.child.is_none());
+    let parent = rejected.parent.as_ref().expect("rate-limited timer parent");
+    assert_eq!(parent.state, CommandState::Rejected);
+    assert_eq!(parent.outcome.as_ref().unwrap()["code"], "rate_limited");
+    let action_count: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM commands WHERE link_kind = 'rule_action' AND ordinal IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(action_count, 2);
 }
 
 #[test]
@@ -1282,7 +1842,7 @@ fn project_timer_run_reuses_registration_authority_at_dispatch() {
             scheduled_at_ms,
         )
         .unwrap();
-    let run = admitted.child.unwrap();
+    let run = admitted.child.unwrap().command;
     assert_eq!(run.principal, principal);
     assert!(run.target.is_none());
 
@@ -1302,7 +1862,7 @@ fn project_timer_run_reuses_registration_authority_at_dispatch() {
         replay.parent.as_ref().unwrap().id,
         admitted.parent.unwrap().id
     );
-    assert_eq!(replay.child.as_ref().unwrap().id, run.id);
+    assert_eq!(replay.child.as_ref().unwrap().command.id, run.id);
     assert_eq!(
         store
             .dispatch(&run.id, scheduled_at_ms + 2)

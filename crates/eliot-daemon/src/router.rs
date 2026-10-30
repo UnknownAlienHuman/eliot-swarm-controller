@@ -663,7 +663,10 @@ impl Router {
         &self,
         request: SubmitCommand,
     ) -> Result<PreparedSubmission> {
-        self.prepare_submission(request, &Principal::Owner).await
+        validate_rule_launch_action(&request, None)?;
+        let prepared = self.prepare_submission(request, &Principal::Owner).await?;
+        validate_rule_launch_preparation(&prepared)?;
+        Ok(prepared)
     }
 
     /// Prepare a targetless global rule Run under the current Owner Run grant.
@@ -773,6 +776,7 @@ impl Router {
         let mut prepared = Vec::with_capacity(requests.len());
         for request in requests {
             let prepared_request = self.prepare_submission(request, &principal).await?;
+            validate_rule_launch_preparation(&prepared_request)?;
             if let (Some(target), Some(generation)) = (
                 prepared_request.request.target.as_deref(),
                 prepared_request.request.expected_generation,
@@ -809,11 +813,15 @@ impl Router {
         request: SubmitCommand,
         registration: &ProjectRegistrationView,
     ) -> Result<PreparedSubmission> {
+        validate_rule_launch_action(&request, Some(registration))?;
         let principal = Principal::ProjectRule {
             registration: registration.clone(),
         };
-        self.prepare_submission_after_authorization(request, &principal, true)
-            .await
+        let prepared = self
+            .prepare_submission_after_authorization(request, &principal, true)
+            .await?;
+        validate_rule_launch_preparation(&prepared)?;
+        Ok(prepared)
     }
 
     async fn verify_project_rule_target(
@@ -1634,14 +1642,17 @@ impl Router {
         expected_rule_revision: i64,
         prepared: PreparedSubmission,
     ) -> Result<Option<TimerSlotAdmission>> {
+        validate_rule_launch_preparation(&prepared)?;
         let PreparedSubmission {
             request: action,
             workspace,
         } = prepared;
-        if !matches!(action.verb.as_str(), "stop" | "send" | "run") || workspace.is_some() {
+        if !matches!(action.verb.as_str(), "stop" | "send" | "launch" | "run")
+            || workspace.is_some()
+        {
             return Err(Error::new(
                 "invalid",
-                "timer firing must contain one prepared stop, send, or Run command",
+                "timer firing must contain one prepared stop, send, launch, or Run command",
             ));
         }
         if action.verb == "run" {
@@ -1705,9 +1716,8 @@ impl Router {
         };
         if admission.is_new
             && let Some(child) = &admission.child
-            && matches!(child.state, CommandState::Accepted | CommandState::Queued)
         {
-            self.schedule_command(child.id.clone(), None);
+            self.schedule_rule_admission(child);
         }
         if admission.is_new {
             self.signal_progress();
@@ -1912,6 +1922,9 @@ impl Router {
             if let Some(admission) = store.replay_timer_slot(principal, state, scheduled_at_ms)? {
                 admission
             } else {
+                if let Some(action) = slot.action.as_ref() {
+                    validate_prepared_rule_launch_command(action)?;
+                }
                 if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
                     return Ok(None);
                 }
@@ -1935,9 +1948,8 @@ impl Router {
         };
         if admission.is_new
             && let Some(child) = &admission.child
-            && matches!(child.state, CommandState::Accepted | CommandState::Queued)
         {
-            self.schedule_command(child.id.clone(), None);
+            self.schedule_rule_admission(child);
         }
         if admission.is_new {
             self.signal_progress();
@@ -1964,6 +1976,20 @@ impl Router {
             .lock()
             .await
             .read_events(after, limit, Some(through))
+    }
+
+    pub(crate) async fn replay_rule_event_action(
+        &self,
+        principal: &str,
+        state: &RuleStateView,
+        revision: i64,
+        event_seq: i64,
+    ) -> Result<Option<eliot_store::RuleEventAdmission>> {
+        self.inner
+            .store
+            .lock()
+            .await
+            .replay_rule_event_action(principal, state, revision, event_seq)
     }
 
     pub(crate) fn rule_firings_open(&self) -> bool {
@@ -2004,6 +2030,7 @@ impl Router {
         event_seq: i64,
         prepared: PreparedSubmission,
     ) -> Result<Option<eliot_store::RuleEventAdmission>> {
+        validate_rule_launch_preparation(&prepared)?;
         let PreparedSubmission { request, workspace } = prepared;
         if workspace.is_some() {
             return Err(Error::new(
@@ -2053,13 +2080,15 @@ impl Router {
                     ));
                 }
             }
-        } else if !matches!(
-            request.verb.as_str(),
-            "stop" | "send" | "steer" | "interrupt" | "approve" | "deny" | "answer"
-        ) {
+        } else if request.verb != "launch"
+            && !matches!(
+                request.verb.as_str(),
+                "stop" | "send" | "steer" | "interrupt" | "approve" | "deny" | "answer"
+            )
+        {
             return Err(Error::new(
                 "invalid",
-                "rule firing must contain a prepared stop, send, steer, interrupt, reply, or Run action",
+                "rule firing must contain a prepared stop, send, launch, steer, interrupt, reply, or Run action",
             ));
         }
         let admission = {
@@ -2067,10 +2096,12 @@ impl Router {
             if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
                 return Ok(None);
             }
-            let request_reply = matches!(request.verb.as_str(), "approve" | "deny" | "answer");
-            // Let Store resolve a retained reply parent before checking current
-            // registration and pending-request authority for a new admission.
-            if !request_reply && let Some(expected) = project {
+            let replay_first_action = matches!(
+                request.verb.as_str(),
+                "launch" | "approve" | "deny" | "answer"
+            );
+            // Store resolves retained launch/reply parents before current gates.
+            if !replay_first_action && let Some(expected) = project {
                 let current = store
                     .get_project_registration("owner", &expected.id)?
                     .ok_or_else(|| Error::new("not_allowed", "project registration was removed"))?;
@@ -2088,9 +2119,8 @@ impl Router {
         };
         if admission.is_new
             && let Some(child) = &admission.child
-            && matches!(child.state, CommandState::Accepted | CommandState::Queued)
         {
-            self.schedule_command(child.id.clone(), None);
+            self.schedule_rule_admission(child);
         }
         self.signal_progress();
         Ok(Some(admission))
@@ -2162,10 +2192,8 @@ impl Router {
             admission
         };
         if admission.is_new {
-            if let Some(child) = admission.children.first()
-                && matches!(child.state, CommandState::Accepted | CommandState::Queued)
-            {
-                self.schedule_command(child.id.clone(), None);
+            if let Some(child) = admission.children.first() {
+                self.schedule_rule_admission(child);
             }
             self.signal_progress();
         }
@@ -2179,18 +2207,12 @@ impl Router {
                 let store = self.inner.store.lock().await;
                 store.recover_rule_children(after.as_deref(), limit)?
             };
-            let page_len = children.len();
-            if page_len == 0 {
+            if children.is_empty() {
                 break;
             }
-            for child in children {
-                after = Some(child.id.clone());
-                if matches!(child.state, CommandState::Accepted | CommandState::Queued) {
-                    self.schedule_command(child.id, None);
-                }
-            }
-            if page_len < limit {
-                break;
+            for admission in children {
+                after = Some(admission.command.id.clone());
+                self.schedule_rule_admission(&admission);
             }
         }
         Ok(())
@@ -3219,6 +3241,12 @@ impl Router {
         tokio::spawn(self.clone().process_command(id, linked_id));
     }
 
+    fn schedule_rule_admission(&self, admission: &eliot_store::Admission) {
+        if let Some((id, linked_id)) = rule_admission_dispatch_plan(admission) {
+            self.schedule_command(id, linked_id);
+        }
+    }
+
     fn process_command(self, id: String, linked_id: Option<String>) -> BoxFuture<'static, ()> {
         Box::pin(self.process_command_inner(id, linked_id))
     }
@@ -3275,7 +3303,12 @@ impl Router {
                 self.reject_undispatched(&id, &error.code).await;
                 return;
             }
-            if matches!(
+            if command.verb == "launch" {
+                if let Err(error) = validate_project_rule_launch_command(&registration, &command) {
+                    self.reject_undispatched(&id, &error.code).await;
+                    return;
+                }
+            } else if matches!(
                 command.verb.as_str(),
                 "stop" | "send" | "steer" | "interrupt" | "approve" | "deny" | "answer"
             ) {
@@ -4523,10 +4556,254 @@ fn validate_observer_command_result(
     Ok(value)
 }
 
+fn rule_admission_dispatch_plan(
+    admission: &eliot_store::Admission,
+) -> Option<(String, Option<String>)> {
+    let command = &admission.command;
+    if matches!(command.state, CommandState::Accepted | CommandState::Queued) {
+        let linked_id = admission
+            .linked_command
+            .as_ref()
+            .filter(|linked| matches!(linked.state, CommandState::Accepted | CommandState::Queued))
+            .map(|linked| linked.id.clone());
+        return Some((command.id.clone(), linked_id));
+    }
+    if command.verb == "launch"
+        && command.state == CommandState::Applied
+        && let Some(linked) = &admission.linked_command
+        && matches!(linked.state, CommandState::Accepted | CommandState::Queued)
+    {
+        return Some((linked.id.clone(), None));
+    }
+    None
+}
+
 fn encoded_event_cost(event: &Event) -> Result<usize> {
     let encoded = serde_json::to_vec(event)
         .map_err(|error| Error::new("internal", format!("encode event page entry: {error}")))?;
     Ok(encoded.len().saturating_add(1))
+}
+
+fn validate_rule_launch_action(
+    request: &SubmitCommand,
+    project: Option<&ProjectRegistrationView>,
+) -> Result<()> {
+    if request.verb != "launch" {
+        return Ok(());
+    }
+    if !request.id.is_empty()
+        || request.target.is_some()
+        || request.expected_generation != Some(0)
+        || request.expected_turn_id.is_some()
+        || request.request_id.is_some()
+        || request.probe
+    {
+        return Err(Error::new(
+            "invalid",
+            "rule launch must be targetless, generation 0, and unbound",
+        ));
+    }
+    let args = request
+        .args
+        .as_object()
+        .ok_or_else(|| Error::new("invalid", "rule launch args must be an object"))?;
+    if args
+        .keys()
+        .any(|key| !matches!(key.as_str(), "profile" | "workspace" | "text"))
+    {
+        return Err(Error::new(
+            "invalid",
+            "rule launch accepts only profile, workspace, and optional text",
+        ));
+    }
+    let profile = args
+        .get("profile")
+        .and_then(Value::as_str)
+        .filter(|profile| {
+            !profile.trim().is_empty()
+                && profile.trim() == *profile
+                && !profile.contains(concat!("$", "{"))
+        })
+        .ok_or_else(|| Error::new("invalid", "rule launch profile must be a literal name"))?;
+    let workspace = args
+        .get("workspace")
+        .and_then(Value::as_str)
+        .filter(|workspace| {
+            !workspace.trim().is_empty()
+                && workspace.trim() == *workspace
+                && !workspace.contains(concat!("$", "{"))
+        })
+        .ok_or_else(|| Error::new("invalid", "rule launch workspace must be a literal path"))?;
+    let text = match args.get("text") {
+        None => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .filter(|text| !text.trim().is_empty())
+                .ok_or_else(|| Error::new("invalid", "rule launch text must be nonempty"))?,
+        ),
+    };
+    if let Some(registration) = project {
+        registration.validate()?;
+        if !registration.actions.iter().any(|action| action == "launch") {
+            return Err(Error::new(
+                "not_allowed",
+                "project rule is not approved for launch",
+            ));
+        }
+        if !registration
+            .profiles
+            .iter()
+            .any(|approved| approved == profile)
+        {
+            return Err(Error::new(
+                "not_allowed",
+                "project registration does not approve the launch profile",
+            ));
+        }
+        if workspace != registration.checkout.as_str() {
+            return Err(Error::new(
+                "not_allowed",
+                "project launch must use the registered checkout",
+            ));
+        }
+        if text.is_some() && !registration.actions.iter().any(|action| action == "send") {
+            return Err(Error::new(
+                "not_allowed",
+                "project launch text requires the send action grant",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_rule_launch_preparation(prepared: &PreparedSubmission) -> Result<()> {
+    if prepared.request.verb != "launch" {
+        return Ok(());
+    }
+    validate_prepared_rule_launch_command(&prepared.request)?;
+    if prepared.workspace.is_some() {
+        return Err(Error::new(
+            "unsupported",
+            "rule launch requires an existing workspace without worktree preparation",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_prepared_rule_launch_command(request: &SubmitCommand) -> Result<()> {
+    if request.verb != "launch" {
+        return Ok(());
+    }
+    if !request.id.is_empty()
+        || request.target.is_some()
+        || request.expected_generation != Some(0)
+        || request.expected_turn_id.is_some()
+        || request.request_id.is_some()
+        || request.probe
+    {
+        return Err(Error::new(
+            "invalid",
+            "rule launch must be targetless, generation 0, and unbound",
+        ));
+    }
+    let args = request
+        .args
+        .as_object()
+        .ok_or_else(|| Error::new("invalid", "prepared rule launch args must be an object"))?;
+    if args.contains_key("workspace_preparation")
+        || args.contains_key("worktree")
+        || args.contains_key("base")
+        || args
+            .get("profile_snapshot")
+            .and_then(|snapshot| snapshot.get("setup"))
+            .and_then(Value::as_array)
+            .is_some_and(|setup| !setup.is_empty())
+    {
+        return Err(Error::new(
+            "unsupported",
+            "rule launch cannot prepare a worktree or run profile setup",
+        ));
+    }
+    let workspace = args
+        .get("workspace")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::new("invalid", "prepared rule launch has no workspace"))?;
+    if args.get("project").and_then(Value::as_str) != Some(workspace) {
+        return Err(Error::new(
+            "source_integrity",
+            "prepared rule launch project and workspace differ",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_project_rule_launch_command(
+    registration: &ProjectRegistrationView,
+    command: &Command,
+) -> Result<()> {
+    if command.verb != "launch" {
+        return Ok(());
+    }
+    registration.validate()?;
+    if !registration.actions.iter().any(|action| action == "launch") {
+        return Err(Error::new(
+            "not_allowed",
+            "project registration no longer approves launch",
+        ));
+    }
+    let profile = command
+        .args
+        .get("profile")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::new("source_integrity", "project launch has no frozen profile"))?;
+    if !registration
+        .profiles
+        .iter()
+        .any(|approved| approved == profile)
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "project registration no longer approves the launch profile",
+        ));
+    }
+    let workspace = command
+        .args
+        .get("workspace")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::new("source_integrity", "project launch has no workspace"))?;
+    if workspace != registration.checkout.as_str()
+        || command.args.get("project").and_then(Value::as_str) != Some(workspace)
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "project launch workspace differs from the registered checkout",
+        ));
+    }
+    if command.args.get("workspace_preparation").is_some()
+        || command.args.get("worktree").is_some()
+        || command.args.get("base").is_some()
+        || command
+            .args
+            .get("profile_snapshot")
+            .and_then(|snapshot| snapshot.get("setup"))
+            .and_then(Value::as_array)
+            .is_some_and(|setup| !setup.is_empty())
+    {
+        return Err(Error::new(
+            "unsupported",
+            "project rule launch cannot prepare a worktree or run profile setup",
+        ));
+    }
+    if command.args.get("text").is_some()
+        && !registration.actions.iter().any(|action| action == "send")
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "project launch text requires the send action grant",
+        ));
+    }
+    Ok(())
 }
 
 fn normalize_launch(request: &mut SubmitCommand) -> Result<()> {
@@ -5106,6 +5383,9 @@ fn authorize_command(principal: &Principal, request: &mut SubmitCommand) -> Resu
             }
             return Ok(());
         }
+        if request.verb == "launch" {
+            return validate_rule_launch_action(request, Some(registration));
+        }
         if !matches!(
             request.verb.as_str(),
             "stop" | "send" | "steer" | "interrupt" | "approve" | "deny" | "answer"
@@ -5414,6 +5694,84 @@ mod tests {
             Arc::new(AsyncMutex::new(store)),
             Bus::new(16),
         )
+    }
+
+    fn command_with_state(id: &str, verb: &str, state: CommandState) -> Command {
+        Command {
+            id: id.to_owned(),
+            principal: "owner".to_owned(),
+            method: "command.submit".to_owned(),
+            verb: verb.to_owned(),
+            target: None,
+            expected_generation: (verb == "launch").then_some(0),
+            generation: None,
+            args: json!({}),
+            state,
+            turn_id: None,
+            request_id: None,
+            outcome: None,
+            created_at: 0,
+            updated_at: 0,
+            probe: false,
+        }
+    }
+
+    fn rule_admission(command: Command, linked_command: Option<Command>) -> eliot_store::Admission {
+        eliot_store::Admission {
+            command,
+            linked_command,
+            events: Vec::new(),
+            is_new: true,
+        }
+    }
+
+    #[test]
+    fn rule_admission_dispatch_plan_keeps_linked_send_and_never_replays_uncertain_work() {
+        let accepted_launch = rule_admission(
+            command_with_state("launch-accepted", "launch", CommandState::Accepted),
+            Some(command_with_state(
+                "send-queued",
+                "send",
+                CommandState::Queued,
+            )),
+        );
+        assert_eq!(
+            rule_admission_dispatch_plan(&accepted_launch),
+            Some(("launch-accepted".to_owned(), Some("send-queued".to_owned())))
+        );
+
+        let applied_launch = rule_admission(
+            command_with_state("launch-applied", "launch", CommandState::Applied),
+            Some(command_with_state(
+                "send-accepted",
+                "send",
+                CommandState::Accepted,
+            )),
+        );
+        assert_eq!(
+            rule_admission_dispatch_plan(&applied_launch),
+            Some(("send-accepted".to_owned(), None))
+        );
+
+        for launch_state in [CommandState::Dispatched, CommandState::Unknown] {
+            let uncertain_launch = rule_admission(
+                command_with_state("launch-uncertain", "launch", launch_state),
+                Some(command_with_state(
+                    "send-pending",
+                    "send",
+                    CommandState::Accepted,
+                )),
+            );
+            assert_eq!(rule_admission_dispatch_plan(&uncertain_launch), None);
+        }
+
+        for send_state in [CommandState::Dispatched, CommandState::Unknown] {
+            let uncertain_input = rule_admission(
+                command_with_state("launch-applied", "launch", CommandState::Applied),
+                Some(command_with_state("send-uncertain", "send", send_state)),
+            );
+            assert_eq!(rule_admission_dispatch_plan(&uncertain_input), None);
+        }
     }
 
     #[tokio::test]
@@ -7059,9 +7417,12 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 )
                 .unwrap();
             assert_eq!(admission.children.len(), 2);
-            assert_ne!(admission.children[0].target, admission.children[1].target);
-            let first_child_id = admission.children[0].id.clone();
-            let second_child_id = admission.children[1].id.clone();
+            assert_ne!(
+                admission.children[0].command.target,
+                admission.children[1].command.target
+            );
+            let first_child_id = admission.children[0].command.id.clone();
+            let second_child_id = admission.children[1].command.id.clone();
             let first_dispatch = store.dispatch(&first_child_id, now + 1).unwrap();
             assert_eq!(first_dispatch.value.state, CommandState::Dispatched);
             (
@@ -7806,10 +8167,11 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 .parent
                 .as_ref()
                 .expect("committed rule firing parent");
-            let run = firing
+            let run_admission = firing
                 .child
                 .as_ref()
                 .expect("committed targetless Run child");
+            let run = &run_admission.command;
             assert_eq!(parent.verb, "rule");
             assert_eq!(parent.state, CommandState::Applied);
             assert_eq!(run.verb, "run");
@@ -8026,7 +8388,11 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 .unwrap();
             assert!(firing.is_new);
             let parent = firing.parent.as_ref().expect("committed Owner rule firing");
-            let run = firing.child.as_ref().expect("committed Owner Run child");
+            let run = &firing
+                .child
+                .as_ref()
+                .expect("committed Owner Run child")
+                .command;
             assert_eq!(parent.verb, "rule");
             assert_eq!(parent.state, CommandState::Applied);
             assert_eq!(run.verb, "run");
@@ -8244,8 +8610,8 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 .unwrap();
             let terminal_id = admission.parent.id.clone();
             assert_eq!(admission.parent.state, CommandState::Applied);
-            let first_id = admission.children[0].id.clone();
-            let queued_id = admission.children[1].id.clone();
+            let first_id = admission.children[0].command.id.clone();
+            let queued_id = admission.children[1].command.id.clone();
             let dispatched = store.dispatch(&first_id, now_ms()).unwrap();
             assert_eq!(dispatched.value.state, CommandState::Dispatched);
             let queued = store.dispatch(&queued_id, now_ms()).unwrap();
@@ -8501,7 +8867,10 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             .unwrap()
             .expect("the rule SEND is admitted");
         assert!(admission.is_new);
-        let child = admission.child.expect("the admitted firing has one child");
+        let child = admission
+            .child
+            .expect("the admitted firing has one child")
+            .command;
         assert_eq!(child.verb, "send");
         assert_eq!(child.target.as_deref(), Some(agent.as_str()));
         assert_eq!(child.generation, Some(1));
@@ -8598,7 +8967,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             .expect("Owner event STEER is admitted");
         assert!(admission.is_new);
         let parent = admission.parent.expect("retained rule parent");
-        let child = admission.child.expect("admitted STEER child");
+        let child = admission.child.expect("admitted STEER child").command;
         assert_eq!(child.verb, "steer");
         assert_eq!(child.target.as_deref(), Some(agent.as_str()));
         assert_eq!(child.generation, Some(1));
@@ -8696,7 +9065,10 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             .await
             .unwrap()
             .expect("Owner request reply is admitted");
-        let child = admission.child.expect("the firing has one reply command");
+        let child = admission
+            .child
+            .expect("the firing has one reply command")
+            .command;
         assert_eq!(child.verb, "approve");
         assert_eq!(child.target.as_deref(), Some(agent.as_str()));
         assert_eq!(child.generation, Some(1));
@@ -8837,6 +9209,173 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         assert_eq!(
             router.inner.store.lock().await.high_water().unwrap(),
             before_replay
+        );
+    }
+
+    #[test]
+    fn project_rule_launch_requires_launch_profile_checkout_and_send_grants() {
+        let checkout = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let registration = eliot_core::api::ProjectRegistrationView {
+            id: "launch-project".to_owned(),
+            checkout: checkout.clone(),
+            repo_common_dir: checkout.clone(),
+            profiles: vec!["fake".to_owned()],
+            actions: vec!["launch".to_owned(), "send".to_owned()],
+            interpreters: std::collections::BTreeMap::new(),
+            run_env: Vec::new(),
+            revision: 1,
+        };
+        let mut request = SubmitCommand::new(String::new(), "launch");
+        request.expected_generation = Some(0);
+        request.args = json!({
+            "profile":"fake",
+            "workspace":checkout,
+            "text":"review this result",
+        });
+        validate_rule_launch_action(&request, Some(&registration))
+            .expect("the registered project grants launch, profile and linked send");
+
+        let mut without_send = registration.clone();
+        without_send.actions = vec!["launch".to_owned()];
+        assert_eq!(
+            validate_rule_launch_action(&request, Some(&without_send))
+                .unwrap_err()
+                .code,
+            "not_allowed"
+        );
+
+        let mut without_launch = registration.clone();
+        without_launch.actions = vec!["send".to_owned()];
+        assert_eq!(
+            validate_rule_launch_action(&request, Some(&without_launch))
+                .unwrap_err()
+                .code,
+            "not_allowed"
+        );
+
+        let mut unapproved_profile = request.clone();
+        unapproved_profile.args["profile"] = Value::String("other".to_owned());
+        assert_eq!(
+            validate_rule_launch_action(&unapproved_profile, Some(&registration))
+                .unwrap_err()
+                .code,
+            "not_allowed"
+        );
+
+        let mut other_checkout = request.clone();
+        other_checkout.args["workspace"] = Value::String("other-checkout".to_owned());
+        assert_eq!(
+            validate_rule_launch_action(&other_checkout, Some(&registration))
+                .unwrap_err()
+                .code,
+            "not_allowed"
+        );
+    }
+
+    #[test]
+    fn project_rule_launch_dispatch_rejects_present_null_preparation_fields() {
+        let checkout = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let registration = eliot_core::api::ProjectRegistrationView {
+            id: "launch-project".to_owned(),
+            checkout: checkout.clone(),
+            repo_common_dir: checkout.clone(),
+            profiles: vec!["fake".to_owned()],
+            actions: vec!["launch".to_owned(), "send".to_owned()],
+            interpreters: std::collections::BTreeMap::new(),
+            run_env: Vec::new(),
+            revision: 1,
+        };
+        let command = Command {
+            id: "launch-command".to_owned(),
+            principal: "project:launch-project".to_owned(),
+            method: "command.submit".to_owned(),
+            verb: "launch".to_owned(),
+            target: None,
+            expected_generation: Some(0),
+            generation: None,
+            args: json!({
+                "profile":"fake",
+                "workspace":checkout,
+                "project":checkout,
+                "profile_snapshot":{"harness":"fake", "setup":[]},
+                "text":"review this result",
+            }),
+            state: CommandState::Accepted,
+            turn_id: None,
+            request_id: None,
+            outcome: None,
+            created_at: 0,
+            updated_at: 0,
+            probe: false,
+        };
+        validate_project_rule_launch_command(&registration, &command)
+            .expect("the frozen existing-checkout launch is permitted");
+
+        for field in ["workspace_preparation", "worktree", "base"] {
+            let mut malformed = command.clone();
+            malformed.args[field] = Value::Null;
+            assert_eq!(
+                validate_project_rule_launch_command(&registration, &malformed)
+                    .unwrap_err()
+                    .code,
+                "unsupported",
+                "present null field {field} must remain rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rule_launch_preparation_rejects_workspace_preparation_and_profile_setup() {
+        let workspace = std::env::current_dir()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let mut request = SubmitCommand::new(String::new(), "launch");
+        request.expected_generation = Some(0);
+        request.args = json!({
+            "profile":"fake",
+            "workspace":workspace,
+            "project":workspace,
+            "profile_snapshot":{"harness":"fake", "setup":[]},
+        });
+        let mut prepared = PreparedSubmission {
+            request,
+            workspace: None,
+        };
+        validate_rule_launch_preparation(&prepared)
+            .expect("a prepared existing-workspace launch is allowed");
+
+        prepared.request.args["profile_snapshot"]["setup"] = json!([{}]);
+        assert_eq!(
+            validate_rule_launch_preparation(&prepared)
+                .unwrap_err()
+                .code,
+            "unsupported"
+        );
+        prepared.request.args["profile_snapshot"]["setup"] = json!([]);
+        prepared.workspace = Some(eliot_core::WorkspacePreparationInput {
+            project: "project".to_owned(),
+            repo_path: "repo".to_owned(),
+            repo_common_dir: "repo".to_owned(),
+            requested_branch: "codex/test".to_owned(),
+            base_ref: None,
+            base_oid: "0".repeat(40),
+            worktree_path: "worktree".to_owned(),
+            frozen_setup: Vec::new(),
+        });
+        assert_eq!(
+            validate_rule_launch_preparation(&prepared)
+                .unwrap_err()
+                .code,
+            "unsupported"
         );
     }
 
@@ -9108,7 +9647,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             .admit_rule_action(&principal, &state, event.seq, action.clone(), now_ms())
             .unwrap();
         let first_parent = first.parent.expect("the project firing parent");
-        let first_child = first.child.expect("the admitted project reply");
+        let first_child = first.child.expect("the admitted project reply").command;
         assert_eq!(first_child.verb, "approve");
 
         let mut revoked = registration_input;
@@ -9137,7 +9676,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         assert!(!replay.is_new);
         assert!(replay.events.is_empty());
         assert_eq!(replay.parent.as_ref().unwrap().id, first_parent.id);
-        assert_eq!(replay.child.as_ref().unwrap().id, first_child.id);
+        assert_eq!(replay.child.as_ref().unwrap().command.id, first_child.id);
         assert_eq!(
             router.inner.store.lock().await.high_water().unwrap(),
             before_replay

@@ -776,13 +776,7 @@ impl Store {
         }
         let stored = load_rule_state(&self.connection, principal, &state.id)?
             .ok_or_else(|| Error::new("not_found", "rule state was not found"))?;
-        load_retained_rule_event_action(
-            &self.connection,
-            principal,
-            &stored,
-            revision,
-            event_seq,
-        )
+        load_retained_rule_event_action(&self.connection, principal, &stored, revision, event_seq)
     }
 
     fn admit_rule_action_inner(
@@ -866,12 +860,7 @@ impl Store {
                 is_new: true,
             });
         }
-        if has_open_rule_actions_tx(&tx, principal, &state.id)? {
-            return Err(Error::new(
-                "bad_state",
-                "an open or unknown rule child blocks a new firing",
-            ));
-        }
+
         let binding_error = if request.verb == "run" {
             rule_run_action_binding_error(&tx, principal, &state.id, revision, event_seq, &request)?
         } else {
@@ -932,7 +921,8 @@ impl Store {
         // submit_tx validates and admits the ordinary rule action. Its verb path
         // performs the normal deterministic checks before inserting the child;
         // the surrounding transaction rolls every write back on persistence failure.
-        let (parent, child_admission, events) = match admit_rule_action_tx(&tx, &key, request, now) {
+        let (parent, child_admission, events) = match admit_rule_action_tx(&tx, &key, request, now)
+        {
             Ok(admission) => admission,
             Err(error) if core::is_deterministic_pre_admission_rejection(&error.code) => {
                 return reject_rule_event(tx, &self.write_faulted, &key, &error.code, now);
@@ -951,7 +941,11 @@ impl Store {
         })
     }
 
-    pub fn recover_rule_children(&self, after: Option<&str>, limit: usize) -> Result<Vec<Admission>> {
+    pub fn recover_rule_children(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Admission>> {
         validate_limit(limit)?;
         if let Some(after) = after {
             validate_ulid(after)?;
@@ -1005,7 +999,7 @@ impl Store {
             let command = command_from_raw(row.map_err(sql_error)?)?.command;
             admissions.push(retained_action_admission(&self.connection, command)?);
         }
-        ensure_admission_page(&admissions)?;
+        trim_recovery_admission_page(&mut admissions)?;
         Ok(admissions)
     }
 
@@ -3139,9 +3133,9 @@ pub(super) fn gate_rule_action_dispatch_tx(
                 if let Some(linked_send) = linked_send {
                     match linked_send.state {
                         CommandState::Applied => {}
-                        CommandState::Rejected
-                        | CommandState::Failed
-                        | CommandState::Cancelled => predecessor_failed = true,
+                        CommandState::Rejected | CommandState::Failed | CommandState::Cancelled => {
+                            predecessor_failed = true
+                        }
                         CommandState::Accepted
                         | CommandState::Queued
                         | CommandState::Dispatched
@@ -3155,9 +3149,8 @@ pub(super) fn gate_rule_action_dispatch_tx(
             break;
         }
         if predecessor_pending {
-            let current = load_command_record(tx, command_id)?.ok_or_else(|| {
-                Error::new("source_integrity", "rule-action child disappeared")
-            })?;
+            let current = load_command_record(tx, command_id)?
+                .ok_or_else(|| Error::new("source_integrity", "rule-action child disappeared"))?;
             if current.state == CommandState::Accepted {
                 let target = current.target.ok_or_else(|| {
                     Error::new("source_integrity", "rule-action child has no target")
@@ -3939,7 +3932,7 @@ fn admit_rule_action_tx(
         ));
     }
 
-    let mut events = child_admission.events.iter().cloned().collect::<Vec<_>>();
+    let mut events = std::mem::take(&mut child_admission.events);
     events.push(parent_event);
     events.push(insert_rule_event_with_cause(
         tx,
@@ -4028,9 +4021,8 @@ fn load_rule_child(
             "rule parent child id does not match its deterministic action id",
         ));
     }
-    let command = load_command(connection, &child_id)?.ok_or_else(|| {
-        Error::new("source_integrity", "rule parent child command is missing")
-    })?;
+    let command = load_command(connection, &child_id)?
+        .ok_or_else(|| Error::new("source_integrity", "rule parent child command is missing"))?;
     Ok(Some(retained_action_admission(connection, command)?))
 }
 
@@ -4040,10 +4032,8 @@ fn retained_action_admission(connection: &Connection, command: Command) -> Resul
     } else {
         None
     };
-    let expects_linked_send = command
-        .args
-        .get("text")
-        .is_some_and(|text| !text.is_null());
+    let expects_linked_send =
+        command.verb == "launch" && command.args.get("text").is_some_and(|text| !text.is_null());
     match (expects_linked_send, linked_command.as_ref()) {
         (true, Some(linked))
             if linked.id == format!("{}/send", command.id)
@@ -4069,6 +4059,49 @@ fn retained_action_admission(connection: &Connection, command: Command) -> Resul
     })
 }
 
+fn trim_recovery_admission_page(admissions: &mut Vec<Admission>) -> Result<()> {
+    let mut command_bytes = 2_usize;
+    let mut linked_bytes = 2_usize;
+    let mut has_linked_command = false;
+    let mut keep = 0_usize;
+
+    for (index, admission) in admissions.iter().enumerate() {
+        if index == MAX_PAGE_ENTRIES {
+            break;
+        }
+        let command_len = serde_json::to_vec(&admission.command)
+            .map_err(|_| Error::new("internal", "recovered command cannot be encoded"))?
+            .len();
+        let next_command_bytes = command_bytes
+            .saturating_add(command_len)
+            .saturating_add(if index == 0 { 0 } else { 1 });
+        let mut next_linked_bytes = linked_bytes;
+        let mut next_has_linked_command = has_linked_command;
+        if let Some(linked) = &admission.linked_command {
+            let linked_len = serde_json::to_vec(linked)
+                .map_err(|_| Error::new("internal", "recovered linked command cannot be encoded"))?
+                .len();
+            next_linked_bytes = next_linked_bytes
+                .saturating_add(linked_len)
+                .saturating_add(if has_linked_command { 1 } else { 0 });
+            next_has_linked_command = true;
+        }
+        if next_command_bytes.saturating_add(next_linked_bytes) > MAX_PAGE_BYTES {
+            // Preserve one already-admitted launch and its linked input as a singleton.
+            if keep == 0 {
+                keep = index + 1;
+            }
+            break;
+        }
+        command_bytes = next_command_bytes;
+        linked_bytes = next_linked_bytes;
+        has_linked_command = next_has_linked_command;
+        keep = index + 1;
+    }
+
+    admissions.truncate(keep);
+    Ok(())
+}
 fn ensure_admission_page(admissions: &[Admission]) -> Result<()> {
     if admissions.len() > MAX_PAGE_ENTRIES {
         return Err(Error::new(
@@ -4466,7 +4499,11 @@ mod tests {
             .unwrap();
         assert!(first.is_new);
         let parent_id = first.parent.as_ref().expect("admitted parent").id.clone();
-        let child = &first.child.as_ref().expect("admitted interrupt child").command;
+        let child = &first
+            .child
+            .as_ref()
+            .expect("admitted interrupt child")
+            .command;
         assert_eq!(child.verb, "interrupt");
         assert_eq!(child.target.as_deref(), Some(agent_id.as_str()));
         assert_eq!(child.expected_generation, Some(1));
@@ -4566,7 +4603,7 @@ mod tests {
             .unwrap();
         assert!(first.is_new);
         let parent_id = first.parent.as_ref().unwrap().id.clone();
-        let child = first.child.as_ref().expect("admitted STEER child");
+        let child = &first.child.as_ref().expect("admitted STEER child").command;
         assert_eq!(child.verb, "steer");
         assert_eq!(child.target.as_deref(), Some(agent_id.as_str()));
         assert_eq!(child.expected_generation, Some(1));
@@ -4596,7 +4633,7 @@ mod tests {
             .unwrap();
         assert!(!replay.is_new);
         assert_eq!(replay.parent.as_ref().unwrap().id, parent_id);
-        assert_eq!(replay.child.as_ref().unwrap().id, child_id);
+        assert_eq!(replay.child.as_ref().unwrap().command.id, child_id);
         assert!(replay.events.is_empty());
         assert_eq!(store.high_water().unwrap(), high_water_before_replay);
 
@@ -5999,7 +6036,7 @@ mod tests {
             assert!(
                 !recoverable
                     .iter()
-                    .any(|command| command.id == second_child_id),
+                    .any(|command| command.command.id == second_child_id),
                 "child 2 became recoverable while child 1 was {predecessor_state}"
             );
             let held = store
@@ -6060,7 +6097,7 @@ mod tests {
         assert!(
             recoverable
                 .iter()
-                .any(|command| command.id == second_child_id)
+                .any(|command| command.command.id == second_child_id)
         );
         assert_eq!(
             store
@@ -6115,8 +6152,8 @@ mod tests {
                 .admit_rule_catch_up("owner", &request, &state, captured_through, &actions, now)
                 .unwrap();
             assert_eq!(admission.children.len(), 2);
-            let first_child_id = admission.children[0].id.clone();
-            let second_child_id = admission.children[1].id.clone();
+            let first_child_id = admission.children[0].command.id.clone();
+            let second_child_id = admission.children[1].command.id.clone();
 
             let expected_predecessor_state = match terminal_predecessor {
                 "failed" => {
@@ -6157,7 +6194,7 @@ mod tests {
             assert!(
                 recoverable
                     .iter()
-                    .any(|command| command.id == second_child_id),
+                    .any(|command| command.command.id == second_child_id),
                 "Store recovery must surface the terminal follower for cancellation"
             );
             let cancelled = store.dispatch(&second_child_id, now + 3).unwrap();
@@ -6175,7 +6212,7 @@ mod tests {
             assert!(
                 !recoverable_after_cancel
                     .iter()
-                    .any(|command| command.id == second_child_id)
+                    .any(|command| command.command.id == second_child_id)
             );
             assert_eq!(
                 store.get_command(&second_child_id).unwrap().unwrap().state,
@@ -6239,7 +6276,11 @@ mod tests {
                 now + 2,
             )
             .unwrap();
-        let project_child = project_source.child.as_ref().expect("project rule child");
+        let project_child = &project_source
+            .child
+            .as_ref()
+            .expect("project rule child")
+            .command;
         let project_cause = command_cause_tx(&store.connection, &project_child.id)
             .unwrap()
             .expect("Store-verified project rule cause");
@@ -6283,10 +6324,11 @@ mod tests {
                 now + 5,
             )
             .unwrap();
-        let foreign_send = cross_namespace
+        let foreign_send = &cross_namespace
             .child
             .as_ref()
-            .expect("different principal is not a self send");
+            .expect("different principal is not a self send")
+            .command;
         assert_eq!(foreign_send.verb, "send");
         assert_eq!(
             foreign_send.args["text"],
@@ -6311,7 +6353,11 @@ mod tests {
                 now + 8,
             )
             .unwrap();
-        let owner_child = owner_source.child.as_ref().expect("owner rule child");
+        let owner_child = &owner_source
+            .child
+            .as_ref()
+            .expect("owner rule child")
+            .command;
         let owner_cause = command_cause_tx(&store.connection, &owner_child.id)
             .unwrap()
             .expect("Store-verified owner rule cause");
@@ -6392,7 +6438,7 @@ mod tests {
             let admission = store
                 .admit_rule_action("owner", &state, event_seq, stop_request(&agent_id), now + 1)
                 .unwrap();
-            let child = admission.child.expect("caused stop child");
+            let child = admission.child.expect("caused stop child").command;
             let child_cause = command_cause_tx(&store.connection, &child.id)
                 .unwrap()
                 .expect("verified Store cause");
@@ -6419,10 +6465,11 @@ mod tests {
         let admission = store
             .admit_rule_action("owner", &state, send_event, send, now + 1)
             .unwrap();
-        let send_child = admission
+        let send_child = &admission
             .child
             .as_ref()
-            .expect("allow_self sends at depth five");
+            .expect("allow_self sends at depth five")
+            .command;
         assert_eq!(send_child.verb, "send");
         assert_eq!(send_child.args["text"], "bounded self send");
         let send_cause = command_cause_tx(&store.connection, &send_child.id)
@@ -6496,7 +6543,11 @@ mod tests {
         let live_admission = store
             .admit_rule_action("owner", &live_state, live_event, live_send.clone(), now + 2)
             .unwrap();
-        let live_child = live_admission.child.as_ref().expect("live send child");
+        let live_child = &live_admission
+            .child
+            .as_ref()
+            .expect("live send child")
+            .command;
         let live_child_id = live_child.id.clone();
         assert_eq!(live_child.verb, "send");
         store.dispatch(&live_child_id, now + 3).unwrap();
@@ -6516,7 +6567,7 @@ mod tests {
         assert!(
             !live_recovery
                 .iter()
-                .any(|command| command.id == live_child_id)
+                .any(|command| command.command.id == live_child_id)
         );
 
         let commands_before_live_replay: i64 = store
@@ -6532,7 +6583,7 @@ mod tests {
             live_replay.parent.unwrap().id,
             live_admission.parent.unwrap().id
         );
-        assert_eq!(live_replay.child.unwrap().id, live_child_id);
+        assert_eq!(live_replay.child.unwrap().command.id, live_child_id);
         assert!(live_replay.events.is_empty());
         assert_eq!(
             store
@@ -6572,7 +6623,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(history_admission.children.len(), 1);
-        let history_child_id = history_admission.children[0].id.clone();
+        let history_child_id = history_admission.children[0].command.id.clone();
         store.dispatch(&history_child_id, history_now + 1).unwrap();
         store
             .settle(
@@ -6594,16 +6645,17 @@ mod tests {
         assert!(!history_replay.is_new);
         assert_eq!(history_replay.parent.id, history_request.id);
         assert_eq!(history_replay.children.len(), 1);
-        assert_eq!(history_replay.children[0].id, history_child_id);
-        assert_eq!(history_replay.children[0].state, CommandState::Unknown);
+        assert_eq!(history_replay.children[0].command.id, history_child_id);
+        assert_eq!(
+            history_replay.children[0].command.state,
+            CommandState::Unknown
+        );
         assert!(history_replay.events.is_empty());
 
         let recovered = store.recover_rule_children(None, 100).unwrap();
-        assert!(
-            !recovered
-                .iter()
-                .any(|command| { command.id == live_child_id || command.id == history_child_id })
-        );
+        assert!(!recovered.iter().any(|command| {
+            command.command.id == live_child_id || command.command.id == history_child_id
+        }));
         assert_eq!(
             store
                 .connection
@@ -6725,7 +6777,7 @@ mod tests {
         let admission = store
             .admit_rule_action("owner", &state, event_seq, stop_request(&agent_id), 3)
             .unwrap();
-        let child = admission.child.unwrap();
+        let child = admission.child.unwrap().command;
         store
             .connection
             .execute(
@@ -6768,7 +6820,11 @@ mod tests {
                 .admit_rule_action("owner", &state, event_seq, stop_request(&agent_id), now)
                 .unwrap();
             assert!(admission.is_new);
-            let child = admission.child.as_ref().expect("admitted stop child");
+            let child = &admission
+                .child
+                .as_ref()
+                .expect("admitted stop child")
+                .command;
             assert_eq!(child.verb, "stop");
             let parent = admission.parent.as_ref().expect("admitted rule parent");
             assert_eq!(parent.state, CommandState::Applied);
@@ -6875,10 +6931,10 @@ mod tests {
 
         let first_page = store.recover_rule_children(None, 4).unwrap();
         assert_eq!(first_page.len(), 4);
-        let after = first_page.last().unwrap().id.clone();
+        let after = first_page.last().unwrap().command.id.clone();
         let second_page = store.recover_rule_children(Some(&after), 100).unwrap();
         assert_eq!(second_page.len(), RULE_ACTION_LIMIT as usize - 4);
-        assert!(second_page.first().unwrap().id > after);
+        assert!(second_page.first().unwrap().command.id > after);
         let pending_after_pages = first_page
             .into_iter()
             .chain(second_page)
@@ -6887,20 +6943,23 @@ mod tests {
         assert!(
             pending_after_pages
                 .iter()
-                .all(|command| command.state == CommandState::Accepted)
+                .all(|command| command.command.state == CommandState::Accepted)
         );
 
         store
             .connection
             .execute(
                 "UPDATE commands SET state = 'dispatched' WHERE id = ?1",
-                [&pending_after_pages[0].id],
+                [&pending_after_pages[0].command.id],
             )
             .unwrap();
         let pending_after_dispatch = store.recover_rule_children(None, 100).unwrap();
         assert_eq!(pending_after_dispatch.len(), RULE_ACTION_LIMIT as usize - 1);
         assert!(pending_after_dispatch.iter().all(|command| {
-            matches!(command.state, CommandState::Accepted | CommandState::Queued)
+            matches!(
+                command.command.state,
+                CommandState::Accepted | CommandState::Queued
+            )
         }));
     }
 
@@ -6916,14 +6975,14 @@ mod tests {
         assert!(
             seeded
                 .iter()
-                .all(|command| command.state == CommandState::Accepted)
+                .all(|command| command.command.state == CommandState::Accepted)
         );
         store
             .connection
             .execute(
                 // Seed both states accepted by recovery without building a predecessor chain.
                 "UPDATE commands SET state = 'queued' WHERE id = ?1",
-                [&seeded[0].id],
+                [&seeded[0].command.id],
             )
             .unwrap();
 
@@ -6932,12 +6991,12 @@ mod tests {
         assert!(
             healthy
                 .iter()
-                .any(|command| command.state == CommandState::Accepted)
+                .any(|command| command.command.state == CommandState::Accepted)
         );
         assert!(
             healthy
                 .iter()
-                .any(|command| command.state == CommandState::Queued)
+                .any(|command| command.command.state == CommandState::Queued)
         );
 
         store.write_faulted.set(true);
@@ -6946,13 +7005,13 @@ mod tests {
 
         let accepted = healthy
             .iter()
-            .find(|command| command.state == CommandState::Accepted)
+            .find(|command| command.command.state == CommandState::Accepted)
             .unwrap();
-        let error = store.dispatch(&accepted.id, 102).unwrap_err();
+        let error = store.dispatch(&accepted.command.id, 102).unwrap_err();
         assert_eq!(error.code, "unavailable");
         for command in &healthy {
-            let retained = store.get_command(&command.id).unwrap().unwrap();
-            assert_eq!(retained.state, command.state);
+            let retained = store.get_command(&command.command.id).unwrap().unwrap();
+            assert_eq!(retained.state, command.command.state);
         }
         let dispatched: i64 = store
             .connection

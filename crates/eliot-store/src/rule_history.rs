@@ -7,6 +7,7 @@ struct PlannedAction {
     event_seq: i64,
     child_id: String,
     admission: Admission,
+    events: Vec<Event>,
     cause: core::EventCause,
 }
 
@@ -314,12 +315,26 @@ impl Store {
                 Err(error) => return Err(error),
             };
             annotate_rule_command_event(&tx, &child_id, &mut admission.events, cause.clone())?;
+            if let Some(linked_command) = &admission.linked_command {
+                annotate_rule_command_event(
+                    &tx,
+                    &linked_command.id,
+                    &mut admission.events,
+                    core::EventCause {
+                        command_id: linked_command.id.clone(),
+                        rule: cause.rule.clone(),
+                        depth: cause.depth,
+                    },
+                )?;
+            }
             tx.execute_batch("RELEASE rule_catch_up_action")
                 .map_err(sql_error)?;
+            let action_events = std::mem::take(&mut admission.events);
             planned.push(PlannedAction {
                 event_seq: action.event_seq,
                 child_id,
                 admission,
+                events: action_events,
                 cause,
             });
             if let Some(bucket) = bucket {
@@ -359,16 +374,17 @@ impl Store {
             let PlannedAction {
                 event_seq,
                 admission,
+                events: mut action_events,
                 cause,
                 ..
             } = action;
-            let child = admission.command;
+            let child_id = admission.command.id.clone();
             let linked = tx
                 .execute(
                     "UPDATE commands SET parent_command = ?1, link_kind = 'rule_action', ordinal = ?2
                      WHERE id = ?3 AND parent_command IS NULL
                        AND link_kind IS NULL AND ordinal IS NULL",
-                    params![parent.id, children.len() as i64, child.id],
+                    params![parent.id, children.len() as i64, child_id],
                 )
                 .map_err(sql_error)?;
             if linked != 1 {
@@ -377,9 +393,9 @@ impl Store {
                     "catch-up child could not be bound to its request parent",
                 ));
             }
-            events.extend(admission.events);
-            fired.push((event_seq, child.id.clone(), cause));
-            children.push(child);
+            events.append(&mut action_events);
+            fired.push((event_seq, child_id, cause));
+            children.push(admission);
         }
         events.push(parent_event);
         let mut markers = Vec::with_capacity(fired.len() + rejected.len());
@@ -423,7 +439,7 @@ impl Store {
                 Some(cause),
             )?);
         }
-        ensure_full_catch_up_result(&children)?;
+        super::ensure_admission_page(&children)?;
         ensure_full_catch_up_result(&events)?;
         commit_transaction(tx, &self.write_faulted)?;
         Ok(RuleCatchUpAdmission {
@@ -573,7 +589,7 @@ fn replay_rule_catch_up_tx(
         .collect::<Result<Vec<_>>>()?;
     if children
         .iter()
-        .map(|child| child.id.clone())
+        .map(|child| child.command.id.clone())
         .collect::<Vec<_>>()
         != expected
     {
@@ -590,7 +606,7 @@ fn replay_rule_catch_up_tx(
     }))
 }
 
-fn load_catch_up_children(connection: &Connection, parent_id: &str) -> Result<Vec<Command>> {
+fn load_catch_up_children(connection: &Connection, parent_id: &str) -> Result<Vec<Admission>> {
     let mut statement = connection
         .prepare(
             "SELECT id, principal, method, target, expected_generation, generation,
@@ -606,9 +622,10 @@ fn load_catch_up_children(connection: &Connection, parent_id: &str) -> Result<Ve
         .map_err(sql_error)?;
     let mut children = Vec::new();
     for row in rows {
-        children.push(command_from_raw(row.map_err(sql_error)?)?.command);
+        let command = command_from_raw(row.map_err(sql_error)?)?.command;
+        children.push(super::retained_action_admission(connection, command)?);
     }
-    ensure_full_catch_up_result(&children)?;
+    super::ensure_admission_page(&children)?;
     Ok(children)
 }
 

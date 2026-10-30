@@ -309,26 +309,49 @@ to an existing workspace. Neither accepts templates. `text` is optional; for eve
 its value is rendered once from the captured event context and frozen into the launch
 command. Timer launch uses the same action shape, but its optional text must be literal.
 Launch text follows the ordinary launch/linked-send 64 KiB persisted-text bound. A
-nonblank text value uses the normal linked `send` admission and dispatch path.
+nonblank text value uses the normal linked `send` admission and dispatch path. The launch
+and its linked initial `send` are one configured launch action and consume one configured-
+action counter; the generated `send` is not a second configured action.
+
+Launch readiness, linked-input application and turn completion are separate outcomes of the
+existing command and turn path, not additional wire statuses. The ordinary launch result
+reports session readiness. The linked `<id>/send` uses its existing command state: `applied`
+means its input was associated with the exact turn, and its existing `command.applied`
+event/readback carries that association. It does not mean the turn completed; read the turn's
+terminal result separately through the existing turn readback. While the linked `send` is
+`accepted`, `queued`, `dispatched` or `unknown`, hold the next timer firing and any later
+ordered action. `applied` closes the input-application gate without waiting for the turn to
+finish. A linked send that is `rejected`, `failed` or `cancelled` cancels undispatched ordered
+successors under the existing sibling semantics. `unknown` remains blocking and is never
+replayed.
 
 The emitted command has `target = null`, `expected_generation = 0`, and no turn or request
 binding. Event Agent/generation fields do not select or retarget the new Agent. The rule
 worker and Store retain the authoritative triggering event identity and verified cause
-with the action admission; they are not copied into launch args. No `project` field grants
-authority: `Agent.project` remains descriptive.
+with the action admission; they are not copied into launch args. For the linked initial `send`,
+verify causal ancestry from the launch command to that `send`; `EventCause.rule` alone does not
+prove the relationship. No `project` field grants authority: `Agent.project` remains descriptive.
 
-Owner rules use Owner authority. Project rules require the explicit `launch` action grant,
-an approved named profile, and revalidation of the current canonical project registration
-and checkout. A supplied initial text also requires an explicit `send` grant; nonblank text
-creates the ordinary linked send. The selected profile supplies model, effort, permissions,
+Owner rules use Owner authority. Project launch requires all of the explicit `launch` action
+grant, an approved named profile, and revalidation of the current canonical project registration
+and checkout. Nonblank initial text additionally requires the explicit `send` grant and creates
+the ordinary linked send. The selected profile supplies model, effort, permissions,
 executable and other profile settings; a rule cannot override them. A profile that requires
 setup is refused. Workspace paths are checked by normal launch admission. Managed
 worktree/base fields and per-action overrides are unsupported and rejected; unrecognized
 fields remain errors rather than being discarded.
 
-Launch readiness, linked input association and the eventual turn result are distinct
-outcomes. An uncertain launch is not replayed and cannot silently choose another profile
-or workspace.
+For an existing request ID, return the retained admission/result before resolving or freezing
+current profile or workspace values. This replay does not re-dispatch an uncertain external
+effect or silently choose another profile or workspace.
+
+Rate accounting uses the configured `RuleLimit` scope. With `per = "agent"`, targetless `run`
+and `launch` have no target Agent and contribute no Agent-scope count; never borrow the
+triggering event's Agent. With `per = "rule"`, the configured launch counts once, including
+its linked initial `send`; the `send` is not counted again. The existing global action guard
+also counts the configured launch once. Only the selected `RuleLimit` scope applies, so
+`per = "agent"` does not additionally impose a per-rule count. The `RuleLimit` configuration
+is unchanged, and this does not introduce a quota or accounting key.
 
 ## Matching and rendering
 

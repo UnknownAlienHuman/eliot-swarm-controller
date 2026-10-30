@@ -235,6 +235,22 @@ fn project_send_rule_input(id: &str) -> RuleDefinitionInput {
     }
 }
 
+fn rule_input_with_limit(id: &str, max: u64, workspace: &str) -> RuleDefinitionInput {
+    let value = json!({
+        "id": id,
+        "enabled": true,
+        "on": {"event":"command.accepted"},
+        "do": [{"action":"launch","profile":"fake","workspace":workspace}],
+        "limit": {"max":max,"per":"rule","window_ms":60_000}
+    });
+    RuleDefinitionInput {
+        id: id.to_owned(),
+        canonical_definition: serde_json::to_string(&value).expect("encode limited rule"),
+        definition_digest: eliot_core::canonical_json_sha256(&value).expect("digest limited rule"),
+        enabled: true,
+    }
+}
+
 fn assert_no_rule_action_children(store: &Store, parent_id: &str) {
     let children: i64 = store
         .connection
@@ -289,6 +305,100 @@ fn assert_history_send_binding_rejection(
     assert_no_rule_action_children(store, &admission.parent.id);
 }
 
+fn targetless_rule_launch_request(
+    project: &str,
+    workspace: &str,
+    text: Option<&str>,
+) -> SubmitCommand {
+    let mut request = SubmitCommand::new(Ulid::new().to_string(), "launch");
+    request.args = json!({
+        "project": project,
+        "harness": "fake",
+        "profile": "fake",
+        "profile_snapshot": {},
+        "workspace": workspace,
+    });
+    if let Some(text) = text {
+        request.args["text"] = json!(text);
+    }
+    request.expected_generation = Some(0);
+    request
+}
+fn launch_event_seq_for_agent(store: &Store, agent: &str) -> i64 {
+    let agent_num = eliot_core::parse_agent_id(agent).expect("valid trigger Agent ID");
+    store
+        .connection
+        .query_row(
+            "SELECT seq FROM events
+             WHERE agent = ?1 AND kind = 'command.accepted'
+               AND json_extract(data, '$.verb') = 'launch'
+             ORDER BY seq DESC LIMIT 1",
+            [agent_num],
+            |row| row.get(0),
+        )
+        .expect("read trigger launch event sequence")
+}
+
+fn recovered_admission_page_bytes(page: &[super::Admission]) -> usize {
+    let commands = page
+        .iter()
+        .map(|admission| &admission.command)
+        .collect::<Vec<_>>();
+    let linked = page
+        .iter()
+        .filter_map(|admission| admission.linked_command.as_ref())
+        .collect::<Vec<_>>();
+    serde_json::to_vec(&commands)
+        .expect("encode recovered launch commands")
+        .len()
+        .saturating_add(
+            serde_json::to_vec(&linked)
+                .expect("encode recovered linked sends")
+                .len(),
+        )
+}
+fn record_recovered_launch_page(
+    page: &[super::Admission],
+    expected_launch_ids: &[String],
+    expected_send_ids: &[String],
+    seen_launch_ids: &mut Vec<String>,
+    seen_send_ids: &mut Vec<String>,
+    launch_text: &str,
+) {
+    assert!(
+        !page.is_empty(),
+        "recovery must advance with a nonempty prefix"
+    );
+    assert!(recovered_admission_page_bytes(page) <= super::MAX_PAGE_BYTES);
+    for admission in page {
+        let launch_id = admission.command.id.clone();
+        assert!(expected_launch_ids.contains(&launch_id));
+        assert!(
+            !seen_launch_ids.contains(&launch_id),
+            "launch recovered twice"
+        );
+        assert_eq!(admission.command.verb, "launch");
+        assert_eq!(admission.command.expected_generation, Some(0));
+        let linked = admission
+            .linked_command
+            .as_ref()
+            .expect("recovery preserves the launch linked SEND");
+        let send_id = linked.id.clone();
+        assert!(expected_send_ids.contains(&send_id));
+        assert!(
+            !seen_send_ids.contains(&send_id),
+            "linked SEND recovered twice"
+        );
+        assert_eq!(send_id, format!("{launch_id}/send"));
+        assert_eq!(linked.verb, "send");
+        assert_eq!(linked.expected_generation, Some(1));
+        assert_eq!(linked.generation, Some(1));
+        assert_eq!(linked.args["text"].as_str(), Some(launch_text));
+        assert!(admission.events.is_empty());
+        seen_launch_ids.push(launch_id);
+        seen_send_ids.push(send_id);
+    }
+}
 fn capacity_launch_request(
     project: &str,
     profile: &str,
@@ -1558,6 +1668,440 @@ fn project_send_requires_the_approved_action_and_rejects_unknown_registration_ac
 }
 
 #[test]
+fn project_event_launch_requires_both_grants_and_only_linked_send_uses_next_generation() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64") + 1_000;
+    let project = "project-launch-contract";
+    let rule_id = "project-launch-contract-rule";
+    let checkout_path = std::env::temp_dir().join("eliot-store-project-launch-contract");
+    let checkout = checkout_path.display().to_string();
+    let mut registration = ProjectRegistrationInput {
+        id: project.to_owned(),
+        checkout: checkout.clone(),
+        repo_common_dir: checkout_path.join(".git").display().to_string(),
+        profiles: vec!["fake".to_owned()],
+        actions: vec!["launch".to_owned()],
+        interpreters: BTreeMap::new(),
+        run_env: Vec::new(),
+    };
+    store
+        .upsert_project_registration("owner", &registration, now)
+        .expect("register default-deny launch project");
+    let principal = format!("project:{project}");
+    let state = store
+        .ensure_rule_state(
+            &principal,
+            &rule_input_with_limit(rule_id, 5, &checkout),
+            now,
+        )
+        .expect("ensure project launch rule");
+    let trigger_agent = ready_agent(&mut store, "project-launch-trigger", now + 1);
+    let launch_event_seq = launch_event_seq_for_agent(&store, &trigger_agent);
+    let agents_before = store.agent_count().unwrap();
+
+    registration.actions.clear();
+    store
+        .upsert_project_registration("owner", &registration, now + 2)
+        .expect("revoke Launch before testing missing grant");
+    let missing_launch = store
+        .admit_rule_action(
+            &principal,
+            &state,
+            launch_event_seq,
+            targetless_rule_launch_request(&checkout, &checkout, None),
+            now + 3,
+        )
+        .expect("record missing launch grant");
+    let missing_launch_parent = missing_launch.parent.as_ref().unwrap();
+    assert_eq!(missing_launch_parent.state, CommandState::Rejected);
+    assert_eq!(
+        missing_launch_parent.outcome.as_ref().unwrap()["code"],
+        "not_allowed"
+    );
+    assert_eq!(
+        missing_launch_parent.outcome.as_ref().unwrap()["children"],
+        json!([])
+    );
+    assert!(missing_launch.child.is_none());
+    assert_eq!(store.agent_count().unwrap(), agents_before);
+
+    registration.actions = vec!["launch".to_owned()];
+    store
+        .upsert_project_registration("owner", &registration, now + 4)
+        .expect("approve launch without SEND");
+    let trigger_send = store
+        .submit(
+            "owner",
+            send_request(&trigger_agent, 1, "project SEND-grant event"),
+            now + 5,
+        )
+        .expect("admit trigger SEND event");
+    let send_event = trigger_send
+        .events
+        .iter()
+        .find(|event| {
+            event
+                .data
+                .get("command_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(trigger_send.command.id.as_str())
+        })
+        .expect("trigger SEND command event");
+    let missing_send = store
+        .admit_rule_action(
+            &principal,
+            &missing_launch.state,
+            send_event.seq,
+            targetless_rule_launch_request(&checkout, &checkout, Some("unapproved input")),
+            now + 6,
+        )
+        .expect("record missing SEND grant");
+    let missing_send_parent = missing_send.parent.as_ref().unwrap();
+    assert_eq!(missing_send_parent.state, CommandState::Rejected);
+    assert_eq!(
+        missing_send_parent.outcome.as_ref().unwrap()["code"],
+        "not_allowed"
+    );
+    assert_eq!(
+        missing_send_parent.outcome.as_ref().unwrap()["children"],
+        json!([])
+    );
+    assert!(missing_send.child.is_none());
+    assert_eq!(store.agent_count().unwrap(), agents_before);
+
+    registration.actions = vec!["launch".to_owned(), "send".to_owned()];
+    store
+        .upsert_project_registration("owner", &registration, now + 7)
+        .expect("approve launch and SEND");
+    let second_trigger_send = store
+        .submit(
+            "owner",
+            send_request(&trigger_agent, 1, "approved project launch event"),
+            now + 8,
+        )
+        .expect("admit second trigger SEND event");
+    let approved_event = second_trigger_send
+        .events
+        .iter()
+        .find(|event| {
+            event
+                .data
+                .get("command_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(second_trigger_send.command.id.as_str())
+        })
+        .expect("approved trigger command event");
+    let approved = store
+        .admit_rule_action(
+            &principal,
+            &missing_send.state,
+            approved_event.seq,
+            targetless_rule_launch_request(
+                &checkout,
+                &checkout,
+                Some("approved project initial input"),
+            ),
+            now + 9,
+        )
+        .expect("admit project launch with both grants");
+    assert!(approved.is_new);
+    let parent = approved.parent.as_ref().expect("project launch parent");
+    let action = approved.child.as_ref().expect("project launch action");
+    let launch = &action.command;
+    let linked = action
+        .linked_command
+        .as_ref()
+        .expect("SEND grant admits linked initial input");
+    let launch_id = launch.id.clone();
+    let linked_id = linked.id.clone();
+    let target = launch.target.clone().expect("allocated project Agent");
+    assert_eq!(parent.principal, principal);
+    assert_eq!(launch.principal, principal);
+    assert_eq!(linked.principal, principal);
+    assert_ne!(target, trigger_agent);
+    assert_eq!(launch.args["workspace"], checkout);
+    assert_eq!(launch.expected_generation, Some(0));
+    assert_eq!(launch.generation, Some(0));
+    assert_eq!(linked.target.as_deref(), Some(target.as_str()));
+    assert_eq!(linked.expected_generation, Some(1));
+    assert_eq!(linked.generation, Some(1));
+    assert_eq!(linked.args["text"], "approved project initial input");
+    assert_eq!(linked.state, CommandState::Queued);
+    let target_num = eliot_core::parse_agent_id(&target).unwrap();
+    let stored_generation: i64 = store
+        .connection
+        .query_row(
+            "SELECT generation FROM agents WHERE id = ?1",
+            [target_num],
+            |row| row.get(0),
+        )
+        .expect("read created project Agent generation");
+    assert_eq!(stored_generation, 0);
+
+    let ordinary_future_send = send_request(&target, 1, "ordinary future-generation SEND");
+    let ordinary_future_send_id = ordinary_future_send.id.clone();
+    let high_water_before_ordinary_send = store.high_water().unwrap();
+    assert_eq!(
+        store
+            .submit(&principal, ordinary_future_send, now + 10)
+            .unwrap_err()
+            .code,
+        "stale_generation"
+    );
+    assert!(
+        store
+            .get_command(&ordinary_future_send_id)
+            .expect("read rejected future SEND")
+            .is_none()
+    );
+    assert_eq!(store.high_water().unwrap(), high_water_before_ordinary_send);
+
+    store
+        .dispatch(&launch_id, now + 11)
+        .expect("dispatch project launch");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: Ulid::new().to_string(),
+                agent_id: target.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ready".to_owned(),
+                    native_id: Ulid::new().to_string(),
+                    data: json!({"command_id":launch_id.clone()}),
+                }],
+                cursor: None,
+            },
+            now + 12,
+        )
+        .expect("commit project launch readiness");
+    store
+        .settle(&launch_id, CommandState::Applied, None, now + 13)
+        .expect("settle project launch");
+    assert_eq!(
+        store.dispatch(&linked_id, now + 14).unwrap().value.state,
+        CommandState::Dispatched,
+        "only the linked initial SEND crosses the stored generation-0 to generation-1 boundary"
+    );
+}
+#[test]
+fn recover_rule_children_byte_trims_launch_prefix_and_paginates_each_link_once() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64") + 1_000;
+    let rule_id = "large-recovery-launches";
+    let launch_count = 12_usize;
+    let launch_text = "x".repeat(60_000);
+    assert!(launch_count * 2 * launch_text.len() > super::MAX_PAGE_BYTES);
+    let rule_workspace = "synthetic-recovery-action";
+    let mut state = store
+        .ensure_rule_state(
+            "owner",
+            &rule_input_with_limit(
+                rule_id,
+                u64::try_from(launch_count + 1).unwrap(),
+                rule_workspace,
+            ),
+            now,
+        )
+        .expect("ensure paginated recovery rule");
+    let mut expected_launch_ids = Vec::with_capacity(launch_count);
+    let mut expected_send_ids = Vec::with_capacity(launch_count);
+
+    for index in 0..launch_count {
+        let trigger_workspace = format!("synthetic-recovery-trigger-{index}");
+        let trigger = store
+            .submit(
+                "owner",
+                targetless_rule_launch_request(&trigger_workspace, &trigger_workspace, None),
+                now + i64::try_from(index * 3).unwrap() + 1,
+            )
+            .expect("admit external trigger launch");
+        let trigger_event = trigger
+            .events
+            .iter()
+            .find(|event| {
+                event.kind == "command.accepted"
+                    && event
+                        .data
+                        .get("command_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(trigger.command.id.as_str())
+            })
+            .expect("trigger launch command event");
+        let workspace = format!("synthetic-recovery-action-{index}");
+        let request = targetless_rule_launch_request(&workspace, &workspace, Some(&launch_text));
+        let admission = store
+            .admit_rule_action(
+                "owner",
+                &state,
+                trigger_event.seq,
+                request,
+                now + i64::try_from(index * 3).unwrap() + 2,
+            )
+            .expect("admit large linked launch action");
+        let action = admission.child.as_ref().expect("launch action");
+        expected_launch_ids.push(action.command.id.clone());
+        expected_send_ids.push(
+            action
+                .linked_command
+                .as_ref()
+                .expect("large launch input is linked")
+                .id
+                .clone(),
+        );
+        state = admission.state;
+    }
+
+    let mut seen_launch_ids = Vec::new();
+    let mut seen_send_ids = Vec::new();
+    let first_page = store
+        .recover_rule_children(None, 100)
+        .expect("return bounded nonempty recovery prefix");
+    assert!(
+        first_page.len() < launch_count,
+        "byte bound must split the page"
+    );
+    let mut after = Some(
+        first_page
+            .last()
+            .expect("first recovery page is nonempty")
+            .command
+            .id
+            .clone(),
+    );
+    let cursor_id = after.as_ref().unwrap().clone();
+    assert_ne!(
+        cursor_id,
+        first_page
+            .last()
+            .unwrap()
+            .linked_command
+            .as_ref()
+            .unwrap()
+            .id,
+        "recovery cursor remains the launch ULID, not the linked SEND ID"
+    );
+    record_recovered_launch_page(
+        &first_page,
+        &expected_launch_ids,
+        &expected_send_ids,
+        &mut seen_launch_ids,
+        &mut seen_send_ids,
+        &launch_text,
+    );
+
+    let mut page_count = 1;
+    loop {
+        let page = store
+            .recover_rule_children(after.as_deref(), 100)
+            .expect("continue after the last returned launch ULID");
+        if page.is_empty() {
+            break;
+        }
+        page_count += 1;
+        after = Some(page.last().unwrap().command.id.clone());
+        record_recovered_launch_page(
+            &page,
+            &expected_launch_ids,
+            &expected_send_ids,
+            &mut seen_launch_ids,
+            &mut seen_send_ids,
+            &launch_text,
+        );
+    }
+    assert!(page_count > 1, "recovery exercised multiple bounded pages");
+    assert_eq!(seen_launch_ids.len(), launch_count);
+    assert_eq!(seen_send_ids.len(), launch_count);
+    assert!(
+        expected_launch_ids
+            .iter()
+            .all(|id| seen_launch_ids.contains(id))
+    );
+    assert!(
+        expected_send_ids
+            .iter()
+            .all(|id| seen_send_ids.contains(id))
+    );
+}
+
+#[test]
+fn recover_rule_children_returns_valid_oversized_launch_pair_as_singleton() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64") + 1_000;
+    let rule_id = "oversized-single-recovery-launch";
+    let workspace = "synthetic-oversized-recovery-action";
+    let state = store
+        .ensure_rule_state("owner", &rule_input_with_limit(rule_id, 2, workspace), now)
+        .expect("ensure oversized recovery rule");
+    let trigger_workspace = "synthetic-oversized-recovery-trigger";
+    let trigger = store
+        .submit(
+            "owner",
+            targetless_rule_launch_request(trigger_workspace, trigger_workspace, None),
+            now + 1,
+        )
+        .expect("admit external trigger launch");
+    let trigger_event = trigger
+        .events
+        .iter()
+        .find(|event| {
+            event.kind == "command.accepted"
+                && event
+                    .data
+                    .get("command_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(trigger.command.id.as_str())
+        })
+        .expect("trigger launch event");
+
+    let launch_text = "i".repeat(60_000);
+    let mut request = targetless_rule_launch_request(workspace, workspace, Some(&launch_text));
+    request.args["profile_snapshot"]["recovery_fixture"] = json!("p".repeat(820_000));
+    assert!(
+        serde_json::to_vec(&request).unwrap().len() <= super::MAX_FRAME_BYTES,
+        "launch request remains inside the existing admission frame bound"
+    );
+    let admission = store
+        .admit_rule_action("owner", &state, trigger_event.seq, request, now + 2)
+        .expect("admit valid large launch and linked SEND");
+    let launch_id = admission.child.as_ref().unwrap().command.id.clone();
+    let send_id = admission
+        .child
+        .as_ref()
+        .unwrap()
+        .linked_command
+        .as_ref()
+        .unwrap()
+        .id
+        .clone();
+
+    let page = store
+        .recover_rule_children(None, 100)
+        .expect("preserve a valid oversized singleton");
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].command.id, launch_id);
+    assert_eq!(page[0].linked_command.as_ref().unwrap().id, send_id);
+    let launch_bytes = serde_json::to_vec(&page[0].command).unwrap().len();
+    let send_bytes = serde_json::to_vec(page[0].linked_command.as_ref().unwrap())
+        .unwrap()
+        .len();
+    assert!(launch_bytes <= super::MAX_FRAME_BYTES);
+    assert!(send_bytes <= super::MAX_FRAME_BYTES);
+    assert!(
+        recovered_admission_page_bytes(&page) > super::MAX_PAGE_BYTES,
+        "single valid Launch+SEND pair exceeds the recovery batch target"
+    );
+    assert!(
+        store
+            .recover_rule_children(Some(&launch_id), 100)
+            .expect("resume after launch cursor")
+            .is_empty(),
+        "recovery cursor remains the launch ULID"
+    );
+}
+#[test]
 fn project_run_registration_roundtrips_and_rechecks_targetless_approval() {
     let mut store = Store::open(Path::new(":memory:")).expect("open Store");
     let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
@@ -2619,6 +3163,422 @@ fn secret_question_answer_is_rejected_before_command_persistence() {
 }
 
 #[test]
+fn owner_event_launch_links_one_send_counts_once_and_replays_unknown() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64") + 1_000;
+    let rule_id = "owner-launch-linked-input";
+    let workspace = "synthetic-owner-rule-launch";
+    let state = store
+        .ensure_rule_state("owner", &rule_input_with_limit(rule_id, 2, workspace), now)
+        .expect("ensure per-rule launch limit");
+    let trigger_agent = ready_agent(&mut store, "launch-trigger", now + 1);
+    let trigger_agent_num = eliot_core::parse_agent_id(&trigger_agent).expect("trigger Agent ID");
+    let trigger_event_seq: i64 = store
+        .connection
+        .query_row(
+            "SELECT seq FROM events
+             WHERE agent = ?1 AND kind = 'command.accepted'
+               AND json_extract(data, '$.verb') = 'launch'
+             ORDER BY seq DESC LIMIT 1",
+            [trigger_agent_num],
+            |row| row.get(0),
+        )
+        .expect("read trigger launch event");
+
+    let request =
+        targetless_rule_launch_request(workspace, workspace, Some("initial launch input"));
+    assert!(request.target.is_none());
+    assert_eq!(request.expected_generation, Some(0));
+    let first = store
+        .admit_rule_action("owner", &state, trigger_event_seq, request.clone(), now + 2)
+        .expect("admit targetless owner launch");
+    assert!(first.is_new);
+    let parent = first.parent.as_ref().expect("rule firing parent");
+    assert_eq!(parent.principal, "owner");
+    assert_eq!(parent.state, CommandState::Applied);
+    let action = first.child.as_ref().expect("launch action admission");
+    assert!(
+        action.events.is_empty(),
+        "events belong to the outer admission"
+    );
+    let launch = &action.command;
+    let linked = action
+        .linked_command
+        .as_ref()
+        .expect("nonblank launch text creates one linked SEND");
+    let launch_id = launch.id.clone();
+    let linked_id = linked.id.clone();
+    let launch_target = launch.target.clone().expect("Store allocated new Agent");
+    assert_eq!(launch.principal, "owner");
+    assert_ne!(launch_target, trigger_agent);
+    assert_eq!(launch.verb, "launch");
+    assert_eq!(launch.expected_generation, Some(0));
+    assert_eq!(launch.generation, Some(0));
+    assert_eq!(launch.args["project"], workspace);
+    assert_eq!(linked.id, format!("{launch_id}/send"));
+    assert_eq!(linked.principal, "owner");
+    assert_eq!(linked.target.as_deref(), Some(launch_target.as_str()));
+    assert_eq!(linked.verb, "send");
+    assert_eq!(linked.expected_generation, Some(1));
+    assert_eq!(linked.generation, Some(1));
+    assert_eq!(linked.args, json!({"text":"initial launch input"}));
+    assert_eq!(linked.state, CommandState::Queued);
+    assert_eq!(
+        parent.outcome.as_ref().unwrap()["children"],
+        json!([launch_id])
+    );
+
+    let (launch_parent, launch_link, launch_ordinal): (
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+    ) = store
+        .connection
+        .query_row(
+            "SELECT parent_command, link_kind, ordinal FROM commands WHERE id = ?1",
+            [&launch_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read rule launch link");
+    assert_eq!(launch_parent.as_deref(), Some(parent.id.as_str()));
+    assert_eq!(launch_link.as_deref(), Some("rule_action"));
+    assert_eq!(launch_ordinal, Some(0));
+    let (send_parent, send_link, send_ordinal): (Option<String>, Option<String>, Option<i64>) =
+        store
+            .connection
+            .query_row(
+                "SELECT parent_command, link_kind, ordinal FROM commands WHERE id = ?1",
+                [&linked_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read linked initial SEND link");
+    assert_eq!(send_parent.as_deref(), Some(launch_id.as_str()));
+    assert_eq!(send_link.as_deref(), Some("send"));
+    assert_eq!(send_ordinal, Some(0));
+
+    let command_cause = |command_id: &str| {
+        first
+            .events
+            .iter()
+            .find(|event| {
+                event
+                    .data
+                    .get("command_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(command_id)
+            })
+            .and_then(|event| event.cause.as_ref())
+            .expect("command event has its own causal identity")
+            .clone()
+    };
+    for command_id in [&parent.id, &launch_id, &linked_id] {
+        let cause = command_cause(command_id);
+        assert_eq!(cause.command_id, *command_id);
+        assert_eq!(cause.rule.as_deref(), Some(rule_id));
+        assert_eq!(cause.depth, 1);
+    }
+
+    let configured_action_children: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM commands
+             WHERE parent_command = ?1 AND link_kind = 'rule_action' AND ordinal IS NOT NULL",
+            [&parent.id],
+            |row| row.get(0),
+        )
+        .expect("count configured launch action children");
+    let global_action_children: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM commands
+             WHERE link_kind = 'rule_action' AND ordinal IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count global configured action children");
+    assert_eq!(configured_action_children, 1);
+    assert_eq!(global_action_children, 1);
+
+    let queued_recovery = store
+        .recover_rule_children(None, 100)
+        .expect("recover accepted launch action");
+    assert_eq!(
+        queued_recovery
+            .iter()
+            .find(|command| command.command.id == launch_id)
+            .expect("launch is recoverable while accepted")
+            .command
+            .state,
+        CommandState::Accepted
+    );
+    assert!(
+        !queued_recovery
+            .iter()
+            .any(|command| command.command.id == linked_id),
+        "the linked SEND is carried by its launch admission, not its own recovery cursor"
+    );
+
+    let trigger_send = store
+        .submit(
+            "owner",
+            send_request(&trigger_agent, 1, "next rule event"),
+            now + 3,
+        )
+        .expect("create second trigger event");
+    let second_event = trigger_send
+        .events
+        .iter()
+        .find(|event| {
+            event
+                .data
+                .get("command_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(trigger_send.command.id.as_str())
+        })
+        .expect("trigger SEND command event");
+    let mut stop = SubmitCommand::new(Ulid::new().to_string(), "stop");
+    stop.target = Some(trigger_agent.clone());
+    stop.expected_generation = Some(1);
+    let second_action = store
+        .admit_rule_action("owner", &first.state, second_event.seq, stop, now + 4)
+        .expect("per-rule limit counts the launch once, not its linked SEND");
+    assert!(second_action.is_new);
+    assert_eq!(second_action.child.as_ref().unwrap().command.verb, "stop");
+    store
+        .settle(
+            &second_action.child.as_ref().unwrap().command.id,
+            CommandState::Rejected,
+            Some(json!({"reason": "close stop counter fixture"})),
+            now + 5,
+        )
+        .expect("close second configured action");
+
+    let commands_before_replay: i64 = store
+        .connection
+        .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+        .expect("count commands before retained replay");
+    let events_before_replay = store.high_water().unwrap();
+    let replay = store
+        .admit_rule_action(
+            "owner",
+            &second_action.state,
+            trigger_event_seq,
+            request.clone(),
+            now + 6,
+        )
+        .expect("replay retained launch before current gates");
+    assert!(!replay.is_new);
+    assert!(replay.events.is_empty());
+    let replay_action = replay.child.as_ref().expect("retained launch admission");
+    assert!(replay_action.events.is_empty());
+    assert_eq!(replay_action.command.id, launch_id);
+    assert_eq!(replay_action.linked_command.as_ref().unwrap().id, linked_id);
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        commands_before_replay
+    );
+    assert_eq!(store.high_water().unwrap(), events_before_replay);
+
+    store
+        .dispatch(&launch_id, now + 7)
+        .expect("dispatch admitted launch");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: Ulid::new().to_string(),
+                agent_id: launch_target.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ready".to_owned(),
+                    native_id: Ulid::new().to_string(),
+                    data: json!({"command_id":launch_id.clone()}),
+                }],
+                cursor: None,
+            },
+            now + 8,
+        )
+        .expect("commit launch readiness");
+    store
+        .settle(&launch_id, CommandState::Applied, None, now + 9)
+        .expect("settle launch readiness");
+    let applied_recovery = store
+        .recover_rule_children(None, 100)
+        .expect("recover applied launch with queued linked SEND");
+    assert_eq!(
+        applied_recovery
+            .iter()
+            .find(|command| command.command.id == launch_id)
+            .expect("applied launch remains recoverable while linked SEND is queued")
+            .command
+            .state,
+        CommandState::Applied
+    );
+    store
+        .dispatch(&linked_id, now + 10)
+        .expect("dispatch linked SEND");
+    store
+        .settle(
+            &linked_id,
+            CommandState::Unknown,
+            Some(json!({"reason": "fixture uncertain initial input"})),
+            now + 11,
+        )
+        .expect("retain uncertain linked SEND");
+
+    let commands_before_unknown_replay: i64 = store
+        .connection
+        .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+        .unwrap();
+    let events_before_unknown_replay = store.high_water().unwrap();
+    let unknown_replay = store
+        .admit_rule_action(
+            "owner",
+            &second_action.state,
+            trigger_event_seq,
+            request,
+            now + 12,
+        )
+        .expect("replay launch with retained Unknown linked SEND");
+    assert!(!unknown_replay.is_new);
+    assert!(unknown_replay.events.is_empty());
+    let retained = unknown_replay.child.as_ref().unwrap();
+    assert_eq!(retained.command.state, CommandState::Applied);
+    assert_eq!(
+        retained.linked_command.as_ref().unwrap().state,
+        CommandState::Unknown
+    );
+    let recovery_after_unknown = store.recover_rule_children(None, 100).unwrap();
+    assert!(
+        !recovery_after_unknown
+            .iter()
+            .any(|command| command.command.id == launch_id || command.command.id == linked_id)
+    );
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        commands_before_unknown_replay
+    );
+    assert_eq!(store.high_water().unwrap(), events_before_unknown_replay);
+}
+#[test]
+fn targetless_launch_does_not_borrow_trigger_agent_for_agent_limit() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64") + 1_000;
+    let rule_id = "targetless-agent-limit";
+    let value = json!({
+        "id": rule_id,
+        "enabled": true,
+        "limit": {"max":1,"per":"agent","window_ms":60_000}
+    });
+    let definition = RuleDefinitionInput {
+        id: rule_id.to_owned(),
+        canonical_definition: serde_json::to_string(&value).unwrap(),
+        definition_digest: eliot_core::canonical_json_sha256(&value).unwrap(),
+        enabled: true,
+    };
+    let state = store
+        .ensure_rule_state("owner", &definition, now)
+        .expect("ensure per-agent rule limit");
+    let trigger_agent = ready_agent(&mut store, "targetless-agent-trigger", now + 1);
+
+    let first_trigger = store
+        .submit(
+            "owner",
+            send_request(&trigger_agent, 1, "seed trigger-agent bucket"),
+            now + 2,
+        )
+        .expect("admit first trigger event");
+    let first_event = first_trigger
+        .events
+        .iter()
+        .find(|event| {
+            event
+                .data
+                .get("command_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(first_trigger.command.id.as_str())
+        })
+        .expect("first trigger command event");
+    let mut stop = SubmitCommand::new(Ulid::new().to_string(), "stop");
+    stop.target = Some(trigger_agent.clone());
+    stop.expected_generation = Some(1);
+    let prior = store
+        .admit_rule_action("owner", &state, first_event.seq, stop, now + 3)
+        .expect("admit trigger-agent stop");
+    let prior_child = prior.child.as_ref().unwrap().command.id.clone();
+    store
+        .settle(
+            &prior_child,
+            CommandState::Rejected,
+            Some(json!({"reason": "seed target bucket"})),
+            now + 4,
+        )
+        .expect("close trigger-agent bucket action");
+
+    let second_trigger = store
+        .submit(
+            "owner",
+            send_request(&trigger_agent, 1, "targetless launch event"),
+            now + 5,
+        )
+        .expect("admit second trigger event");
+    let second_event = second_trigger
+        .events
+        .iter()
+        .find(|event| {
+            event
+                .data
+                .get("command_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(second_trigger.command.id.as_str())
+        })
+        .expect("second trigger command event");
+    let request = targetless_rule_launch_request(
+        "synthetic-agent-limit-launch",
+        "synthetic-agent-limit-launch",
+        Some("linked input"),
+    );
+    assert!(request.target.is_none());
+    let launch = store
+        .admit_rule_action("owner", &prior.state, second_event.seq, request, now + 6)
+        .expect("targetless launch has no Agent bucket to borrow");
+    assert!(launch.is_new);
+    let launch_action = launch.child.as_ref().expect("admitted targetless launch");
+    let launch_command = &launch_action.command;
+    let trigger_agent_num = eliot_core::parse_agent_id(&trigger_agent).unwrap();
+    assert_ne!(
+        launch_command.target.as_deref(),
+        Some(trigger_agent.as_str())
+    );
+    let trigger_bucket_count: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM commands
+             WHERE link_kind = 'rule_action' AND ordinal IS NOT NULL AND target = ?1",
+            [trigger_agent_num],
+            |row| row.get(0),
+        )
+        .expect("read existing trigger-agent rule bucket");
+    assert_eq!(trigger_bucket_count, 1);
+    assert_eq!(
+        launch_action
+            .linked_command
+            .as_ref()
+            .expect("targetless launch linked SEND")
+            .generation,
+        Some(1)
+    );
+}
+#[test]
 fn event_rule_replies_bind_open_request_turn_and_replay_without_competing_reply() {
     let mut store = Store::open(Path::new(":memory:")).expect("open Store");
     let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64") + 100;
@@ -2770,7 +3730,7 @@ fn event_rule_replies_bind_open_request_turn_and_replay_without_competing_reply(
         )
         .unwrap();
     let approved_parent_id = approved.parent.as_ref().unwrap().id.clone();
-    let approved_child = approved.child.as_ref().unwrap().clone();
+    let approved_child = approved.child.as_ref().unwrap().command.clone();
     assert_eq!(approved_child.verb, "approve");
     assert_eq!(
         approved_child.request_id.as_deref(),
@@ -2802,7 +3762,7 @@ fn event_rule_replies_bind_open_request_turn_and_replay_without_competing_reply(
     assert!(!replay.is_new);
     assert!(replay.events.is_empty());
     assert_eq!(replay.parent.as_ref().unwrap().id, approved_parent_id);
-    assert_eq!(replay.child.as_ref().unwrap().id, approved_child.id);
+    assert_eq!(replay.child.as_ref().unwrap().command.id, approved_child.id);
     assert_eq!(store.high_water().unwrap(), high_water_before_replay);
 
     let mut competing = reply("approve", "request-approve", None);
@@ -2823,9 +3783,9 @@ fn event_rule_replies_bind_open_request_turn_and_replay_without_competing_reply(
             now + 18,
         )
         .unwrap();
-    assert_eq!(denied.child.as_ref().unwrap().verb, "deny");
+    assert_eq!(denied.child.as_ref().unwrap().command.verb, "deny");
     assert_eq!(
-        denied.child.as_ref().unwrap().request_id.as_deref(),
+        denied.child.as_ref().unwrap().command.request_id.as_deref(),
         Some("request-deny")
     );
 
@@ -2838,13 +3798,19 @@ fn event_rule_replies_bind_open_request_turn_and_replay_without_competing_reply(
             now + 19,
         )
         .unwrap();
-    assert_eq!(answered.child.as_ref().unwrap().verb, "answer");
+    assert_eq!(answered.child.as_ref().unwrap().command.verb, "answer");
     assert_eq!(
-        answered.child.as_ref().unwrap().request_id.as_deref(),
+        answered
+            .child
+            .as_ref()
+            .unwrap()
+            .command
+            .request_id
+            .as_deref(),
         Some("request-answer")
     );
     assert_eq!(
-        answered.child.as_ref().unwrap().args,
+        answered.child.as_ref().unwrap().command.args,
         json!({"text":"ordinary answer"})
     );
 }
@@ -2981,7 +3947,10 @@ fn project_event_reply_requires_the_explicit_per_verb_grant() {
             now + 10,
         )
         .unwrap();
-    let child = approved.child.expect("approved project reply child");
+    let child = approved
+        .child
+        .expect("approved project reply child")
+        .command;
     assert_eq!(child.verb, "approve");
     assert_eq!(child.principal, principal);
     assert_eq!(child.turn_id.as_deref(), Some(turn_id.as_str()));

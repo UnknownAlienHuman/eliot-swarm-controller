@@ -339,7 +339,15 @@ pub(crate) fn load_project_registration_config(
             |action| {
                 matches!(
                     action,
-                    "stop" | "send" | "steer" | "interrupt" | "approve" | "deny" | "answer" | "run"
+                    "launch"
+                        | "stop"
+                        | "send"
+                        | "steer"
+                        | "interrupt"
+                        | "approve"
+                        | "deny"
+                        | "answer"
+                        | "run"
                 )
             },
         )?;
@@ -545,7 +553,7 @@ fn normalize_project_allowlist(
                 offset,
                 &format!("projects.{project_id}.{field}"),
                 if field == "actions" {
-                    "only implemented stop, send, steer, interrupt, approve, deny, answer and run actions may be approved"
+                    "only implemented launch, stop, send, steer, interrupt, approve, deny, answer and run actions may be approved"
                 } else {
                     "must name an existing global profile"
                 },
@@ -1465,6 +1473,26 @@ mod tests {
             assert_eq!(configured.len(), 1);
             assert_eq!(configured[0].actions, vec![action.to_owned()]);
         }
+    }
+
+    #[test]
+    fn project_launch_is_an_explicit_action_grant_and_uses_approved_profile_allowlist() {
+        let fixture = AutomationConfigFixture::new();
+        let project_path = format!("{:?}", fixture.root.to_string_lossy());
+        fixture.write(&format!(
+            "[projects.sample]\npath = {project_path}\nprofiles = ['fake']\nactions = ['launch']\n"
+        ));
+
+        let configured = load_project_registration_config(&fixture.root).unwrap();
+        assert_eq!(configured.len(), 1);
+        assert_eq!(configured[0].profiles, vec!["fake"]);
+        assert_eq!(configured[0].actions, vec!["launch"]);
+
+        fixture.write(&format!(
+            "[projects.sample]\npath = {project_path}\nprofiles = ['fake']\nactions = ['send']\n"
+        ));
+        let without_launch = load_project_registration_config(&fixture.root).unwrap();
+        assert_eq!(without_launch[0].actions, vec!["send"]);
     }
 
     #[test]

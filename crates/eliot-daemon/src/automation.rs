@@ -1288,6 +1288,23 @@ async fn process_rule_cursor(
             if event.seq <= rule_cursor(rule, retiring).unwrap_or(through) {
                 continue;
             }
+            let revision = if retiring {
+                rule.retiring
+                    .as_ref()
+                    .map(|retiring| retiring.revision)
+                    .ok_or_else(|| Error::new("source_integrity", "retiring rule is absent"))?
+            } else {
+                rule.state.revision
+            };
+            if let Some(admission) = router
+                .replay_rule_event_action(&rule.principal, &rule.state, revision, event.seq)
+                .await?
+            {
+                rule.state = admission.state;
+                refresh_retiring(rule)?;
+                no_match_through = None;
+                continue;
+            }
             let action = match definition::evaluate(&definition, &event) {
                 Ok(Some(action)) => action,
                 Ok(None) => {
@@ -1787,7 +1804,7 @@ pub(crate) async fn prepare_rule_catch_up_actions(
     for (event, request) in rendered {
         let event_seq = event.seq;
         if let Some(project) = project
-            && request.verb != "run"
+            && !matches!(request.verb.as_str(), "run" | "launch")
         {
             let target = request
                 .target
@@ -2624,5 +2641,204 @@ do = [{ action = "run", cmd = ["pwsh", ".eliot/scripts/check.ps1", "-Changed"], 
         }
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn owner_event_launch_uses_normal_preparation_and_replays_linked_send() {
+        use std::{io::Cursor, path::Path, sync::Arc};
+
+        let root = std::env::temp_dir().join(format!("eliot-rule-launch-{}", ulid::Ulid::new()));
+        let data_root = root.join("owner-data");
+        std::fs::create_dir_all(&data_root).unwrap();
+        let workspace = std::env::current_dir()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let store = Arc::new(tokio::sync::Mutex::new(
+            eliot_store::Store::open(Path::new(":memory:")).unwrap(),
+        ));
+        let router = Router::new(
+            data_root.clone(),
+            "owner-event-launch-fixture".to_owned(),
+            Arc::clone(&store),
+            crate::bus::Bus::new(16),
+        );
+        let rule_value = serde_json::json!({
+            "id":"launch-on-session-end",
+            "enabled":true,
+            "on":{"event":"session.ended"},
+            "do":[{"action":"launch", "profile":"fake", "workspace":workspace,
+                "text":"Review ${data.status}"}],
+        });
+        let input = eliot_store::RuleDefinitionInput {
+            id: "launch-on-session-end".to_owned(),
+            canonical_definition: serde_json::to_string(&rule_value).unwrap(),
+            definition_digest: eliot_core::canonical_json_sha256(&rule_value).unwrap(),
+            enabled: true,
+        };
+
+        let (state, event, trigger_agent) = {
+            let mut store = store.lock().await;
+            let seed_id = ulid::Ulid::new().to_string();
+            let mut seed = SubmitCommand::new(&seed_id, "launch");
+            seed.expected_generation = Some(0);
+            seed.args = serde_json::json!({
+                "project":workspace,
+                "workspace":workspace,
+                "harness":"fake",
+                "profile":"fake",
+                "profile_snapshot":{"harness":"fake"},
+            });
+            let agent = store
+                .submit("owner", seed, now_ms())
+                .unwrap()
+                .command
+                .target
+                .unwrap();
+            store.dispatch(&seed_id, now_ms()).unwrap();
+            store
+                .put_batch(
+                    eliot_core::SourceBatch {
+                        batch_id: ulid::Ulid::new().to_string(),
+                        agent_id: agent.clone(),
+                        generation: 1,
+                        source: "stream".to_owned(),
+                        events: vec![eliot_core::NativeEvent {
+                            ts: None,
+                            kind: "session.ready".to_owned(),
+                            native_id: ulid::Ulid::new().to_string(),
+                            data: serde_json::json!({
+                                "native_scope":"launch-rule-scope",
+                                "native_ref":"launch-rule-ref"
+                            }),
+                        }],
+                        cursor: None,
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            store
+                .settle(&seed_id, eliot_core::CommandState::Applied, None, now_ms())
+                .unwrap();
+            let state = store.ensure_rule_state("owner", &input, now_ms()).unwrap();
+            let trigger_agent = agent.clone();
+            store
+                .put_batch(
+                    eliot_core::SourceBatch {
+                        batch_id: ulid::Ulid::new().to_string(),
+                        agent_id: agent,
+                        generation: 1,
+                        source: "stream".to_owned(),
+                        events: vec![eliot_core::NativeEvent {
+                            ts: None,
+                            kind: "session.ended".to_owned(),
+                            native_id: ulid::Ulid::new().to_string(),
+                            data: serde_json::json!({"status":"complete"}),
+                        }],
+                        cursor: None,
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            let event = store
+                .read_events(0, 1_000, None)
+                .unwrap()
+                .into_iter()
+                .find(|event| event.kind == "session.ended")
+                .expect("the post-seed session-ended event is retained");
+            (state, event, trigger_agent)
+        };
+
+        let workspace_literal = serde_json::to_string(&workspace).unwrap();
+        let source = format!(
+            "[[rule]]\nid = 'launch-on-session-end'\non = {{ event = 'session.ended' }}\ndo = [{{ action = 'launch', profile = 'fake', workspace = {workspace_literal}, text = 'Review ${{data.status}}' }}]\n"
+        );
+        let definition = definition::load(Cursor::new(source.as_bytes()))
+            .unwrap()
+            .remove(0);
+        let action = definition::evaluate(&definition, &event)
+            .unwrap()
+            .expect("the captured event matches the launch rule");
+        assert_eq!(action.args["text"], "Review complete");
+
+        let prepared = router.prepare_owner_submission(action).await.unwrap();
+        assert!(prepared.workspace.is_none());
+        assert_eq!(prepared.request.target, None);
+        assert_eq!(prepared.request.expected_generation, Some(0));
+        assert_eq!(prepared.request.args["workspace"], workspace);
+        assert_eq!(prepared.request.args["project"], workspace);
+        assert_eq!(prepared.request.args["profile"], "fake");
+        assert_eq!(prepared.request.args["text"], "Review complete");
+
+        let firing = store
+            .lock()
+            .await
+            .admit_rule_action("owner", &state, event.seq, prepared.request, now_ms())
+            .unwrap();
+        assert!(firing.is_new);
+        let child = firing
+            .child
+            .expect("the firing retains its launch admission");
+        assert_eq!(child.command.verb, "launch");
+        let launch_agent = child
+            .command
+            .target
+            .clone()
+            .expect("Store allocates the launch Agent at admission");
+        assert_ne!(launch_agent, trigger_agent);
+        assert_eq!(child.command.generation, Some(0));
+        assert_eq!(child.command.expected_generation, Some(0));
+        assert_eq!(child.command.state, eliot_core::CommandState::Accepted);
+        assert_eq!(child.command.args["text"], "Review complete");
+        let new_agent = store
+            .lock()
+            .await
+            .get_agent(&launch_agent)
+            .unwrap()
+            .expect("Store created the launch target at admission");
+        assert_eq!(new_agent.id, launch_agent);
+        assert_eq!(new_agent.generation, 0);
+        assert_eq!(new_agent.state, eliot_core::AgentState::Created);
+        let linked = child
+            .linked_command
+            .as_ref()
+            .expect("nonblank launch text is the normal linked send");
+        assert_eq!(linked.verb, "send");
+        assert_eq!(linked.target.as_deref(), Some(launch_agent.as_str()));
+        assert_eq!(linked.generation, Some(1));
+        assert_eq!(linked.expected_generation, Some(1));
+        assert_eq!(linked.state, eliot_core::CommandState::Queued);
+        assert_eq!(linked.args["text"], "Review complete");
+        let launch_id = child.command.id.clone();
+        let linked_id = linked.id.clone();
+
+        let replay = router
+            .replay_rule_event_action("owner", &state, state.revision, event.seq)
+            .await
+            .unwrap()
+            .expect("the committed event firing replays before preparation");
+        assert!(!replay.is_new);
+        assert!(replay.events.is_empty());
+        let replayed_child = replay.child.expect("replay retains its child admission");
+        assert_eq!(replayed_child.command.id, launch_id);
+        assert_eq!(
+            replayed_child.command.target.as_deref(),
+            Some(launch_agent.as_str())
+        );
+        assert_eq!(replayed_child.command.generation, Some(0));
+        assert_eq!(
+            replayed_child.linked_command.as_ref().unwrap().id,
+            linked_id
+        );
+        let replayed_linked = replayed_child.linked_command.as_ref().unwrap();
+        assert_eq!(
+            replayed_linked.target.as_deref(),
+            Some(launch_agent.as_str())
+        );
+        assert_eq!(replayed_linked.generation, Some(1));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
