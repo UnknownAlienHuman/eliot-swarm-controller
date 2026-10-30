@@ -1352,7 +1352,7 @@ fn project_run_registration_roundtrips_and_rechecks_targetless_approval() {
         repo_common_dir: "/synthetic/project-run/.git".to_owned(),
         profiles: Vec::new(),
         actions: Vec::new(),
-        interpreters: BTreeMap::from([("pwsh".to_owned(), interpreter)]),
+        interpreters: BTreeMap::from([("pwsh".to_owned(), interpreter.clone())]),
         run_env: vec!["CI".to_owned()],
     };
     let default_deny = store
