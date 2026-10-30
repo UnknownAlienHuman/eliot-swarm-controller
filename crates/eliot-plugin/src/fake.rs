@@ -555,7 +555,9 @@ fn handle_initialize(params: &Value, state: &mut FakeState) -> Result<Value, Rpc
         state.credential = Some(params.credential);
     }
 
-    serde_json::to_value(fake_manifest())
+    let mut manifest = fake_manifest();
+    manifest.verbs.push("steer".to_owned());
+    serde_json::to_value(manifest)
         .map_err(|_| domain_error("internal", -32603, "plugin manifest could not be encoded"))
 }
 
@@ -664,11 +666,14 @@ async fn handle_command(
     if params.verb == "interrupt" {
         return handle_interrupt(&params, state, client).await;
     }
+    if params.verb == "steer" {
+        return handle_steer(&params, state);
+    }
     if params.verb != "send" {
         return Err(domain_error(
             "unsupported",
             -32602,
-            "fake plugin implements only the send and interrupt verbs",
+            "fake plugin implements only the send, steer and interrupt verbs",
         ));
     }
     if state.batch_unknown {
@@ -764,7 +769,7 @@ async fn handle_command(
         Ok(_) => {
             if hold_turn {
                 // `turn.started` committed the ordinary SEND association. Keep
-                // this one explicit fixture turn open for an exact INTERRUPT.
+                // this one explicit fixture turn open for exact STEER/INTERRUPT.
                 return Ok(json!({"state":"applied", "turn_id":turn_id}));
             }
             state.phase = SessionPhase::Idle;
@@ -799,6 +804,48 @@ async fn handle_command(
             Err(failure.error)
         }
     }
+}
+
+fn handle_steer(params: &AgentCommandParams, state: &FakeState) -> Result<Value, RpcError> {
+    if state.batch_unknown || state.phase == SessionPhase::Unknown {
+        return Err(unknown_effect());
+    }
+    let text = params
+        .args
+        .as_object()
+        .filter(|args| args.len() == 1)
+        .and_then(|args| args.get("text"))
+        .and_then(Value::as_str);
+    let (code, reason) = if params.request_id.is_some() || text.is_none() {
+        ("invalid", "steer accepts only args.text and no request id")
+    } else if text.is_some_and(|text| text.len() > MAX_TEXT_BYTES) {
+        ("frame_too_large", "steer input text exceeds 512 KiB")
+    } else if state.phase != SessionPhase::Busy
+        || state.active_command_id.is_none()
+        || !params.turn_id.as_deref().is_some_and(|turn_id| {
+            !turn_id.trim().is_empty() && state.active_turn.as_deref() == Some(turn_id)
+        })
+    {
+        (
+            "stale_generation",
+            "steer turn does not match the exact active turn",
+        )
+    } else {
+        // The existing control response is authoritative. Steer does not emit a
+        // terminal fact or replace the original SEND/turn binding.
+        return Ok(json!({
+            "state":"applied",
+            "command_id":params.command_id,
+            "turn_id":params.turn_id,
+        }));
+    };
+    Ok(json!({
+        "state":"rejected",
+        "code":code,
+        "message":reason,
+        "command_id":params.command_id,
+        "turn_id":params.turn_id,
+    }))
 }
 
 fn interrupt_rejection(state: &FakeState, params: &AgentCommandParams) -> Option<Value> {
@@ -1684,6 +1731,178 @@ mod provider_hold_tests {
             turn_id: Some(turn_id.to_owned()),
             request_id: None,
         }
+    }
+
+    fn steer(turn_id: &str, text: &str) -> AgentCommandParams {
+        AgentCommandParams {
+            agent_id: "a1".to_owned(),
+            generation: 1,
+            command_id: "steer-1".to_owned(),
+            verb: "steer".to_owned(),
+            args: json!({"text": text}),
+            turn_id: Some(turn_id.to_owned()),
+            request_id: None,
+        }
+    }
+
+    #[test]
+    fn steer_applies_to_held_turn_without_completing_original_send() {
+        let mut state = FakeState::default();
+        let manifest = handle_initialize(
+            &json!({
+                "protocol":"eliot-plugin/1",
+                "credential":"fixture-credential",
+                "instance_dir":"fake-instance"
+            }),
+            &mut state,
+        )
+        .unwrap_or_else(|error| panic!("unexpected RPC error code {}", error.code));
+        assert!(
+            manifest["verbs"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("steer"))
+        );
+        assert!(
+            manifest["verbs"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("interrupt"))
+        );
+
+        let mut held = command(HOLD_TURN_FIXTURE_INPUT);
+        held.agent_id = "a1".to_owned();
+        held.command_id = "send-held".to_owned();
+        let batch = held_turn_batch(&held, "turn-held");
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0].kind, "turn.started");
+        state.binding = Some(Binding {
+            agent_id: held.agent_id,
+            generation: held.generation,
+        });
+        state.phase = SessionPhase::Busy;
+        state.active_turn = Some("turn-held".to_owned());
+        state.active_command_id = Some(held.command_id);
+        state.last_batch_ack = Some(BatchAck {
+            first_seq: 7,
+            last_seq: 7,
+            cursor: None,
+        });
+
+        validate_existing_binding(&state, "a1", 1)
+            .unwrap_or_else(|error| panic!("unexpected RPC error code {}", error.code));
+        assert!(validate_existing_binding(&state, "a1", 2).is_err());
+        assert_eq!(
+            handle_steer(
+                &steer("turn-held", "continue with the current task"),
+                &state
+            )
+            .unwrap_or_else(|error| panic!("unexpected RPC error code {}", error.code)),
+            json!({"state":"applied","command_id":"steer-1","turn_id":"turn-held"})
+        );
+        let boundary_text = "é".repeat(MAX_TEXT_BYTES / 2);
+        assert_eq!(boundary_text.len(), MAX_TEXT_BYTES);
+        assert_eq!(
+            handle_steer(&steer("turn-held", &boundary_text), &state)
+                .unwrap_or_else(|error| panic!("unexpected RPC error code {}", error.code))["state"],
+            "applied"
+        );
+        assert!(matches!(state.phase, SessionPhase::Busy));
+        assert_eq!(state.active_turn.as_deref(), Some("turn-held"));
+        assert_eq!(state.active_command_id.as_deref(), Some("send-held"));
+        assert!(state.last_turn.is_none());
+        assert_eq!(state.last_batch_ack.as_ref().unwrap().last_seq, 7);
+        assert!(!state.batch_unknown);
+    }
+
+    #[test]
+    fn steer_refuses_mismatched_or_missing_turn_without_retargeting() {
+        let state = FakeState {
+            phase: SessionPhase::Busy,
+            active_turn: Some("turn-current".to_owned()),
+            active_command_id: Some("send-current".to_owned()),
+            ..FakeState::default()
+        };
+        for turn_id in [Some("turn-old"), None, Some("")] {
+            let mut params = steer("turn-current", "steer text");
+            params.turn_id = turn_id.map(str::to_owned);
+            let response = handle_steer(&params, &state)
+                .unwrap_or_else(|error| panic!("unexpected RPC error code {}", error.code));
+            assert_eq!(response["state"], "rejected");
+            assert_eq!(response["code"], "stale_generation");
+            assert_eq!(response["turn_id"], json!(turn_id));
+        }
+        assert!(matches!(state.phase, SessionPhase::Busy));
+        assert_eq!(state.active_turn.as_deref(), Some("turn-current"));
+        assert_eq!(state.active_command_id.as_deref(), Some("send-current"));
+        assert!(state.last_turn.is_none());
+        assert!(state.last_batch_ack.is_none());
+    }
+
+    #[test]
+    fn steer_refuses_malformed_text_request_binding_and_oversized_input() {
+        let state = FakeState {
+            phase: SessionPhase::Busy,
+            active_turn: Some("turn-current".to_owned()),
+            active_command_id: Some("send-current".to_owned()),
+            ..FakeState::default()
+        };
+        for args in [
+            json!({}),
+            json!({"text":null}),
+            json!({"text":17}),
+            json!({"text":"steer text","extra":true}),
+            json!(["steer text"]),
+        ] {
+            let mut params = steer("turn-current", "steer text");
+            params.args = args;
+            let response = handle_steer(&params, &state)
+                .unwrap_or_else(|error| panic!("unexpected RPC error code {}", error.code));
+            assert_eq!(response["state"], "rejected");
+            assert_eq!(response["code"], "invalid");
+        }
+        let mut params = steer("turn-current", "steer text");
+        params.request_id = Some("request-1".to_owned());
+        let response = handle_steer(&params, &state)
+            .unwrap_or_else(|error| panic!("unexpected RPC error code {}", error.code));
+        assert_eq!(response["state"], "rejected");
+        assert_eq!(response["code"], "invalid");
+
+        let oversized_text = "é".repeat(MAX_TEXT_BYTES / 2 + 1);
+        let response = handle_steer(&steer("turn-current", &oversized_text), &state)
+            .unwrap_or_else(|error| panic!("unexpected RPC error code {}", error.code));
+        assert_eq!(response["state"], "rejected");
+        assert_eq!(response["code"], "frame_too_large");
+        assert!(matches!(state.phase, SessionPhase::Busy));
+        assert_eq!(state.active_turn.as_deref(), Some("turn-current"));
+        assert_eq!(state.active_command_id.as_deref(), Some("send-current"));
+    }
+
+    #[test]
+    fn steer_cannot_apply_while_source_outcome_is_unknown() {
+        let mut state = FakeState {
+            phase: SessionPhase::Busy,
+            active_turn: Some("turn-current".to_owned()),
+            active_command_id: Some("send-current".to_owned()),
+            batch_unknown: true,
+            ..FakeState::default()
+        };
+        let params = steer("turn-current", "steer text");
+        assert_eq!(
+            handle_steer(&params, &state).unwrap_err().data.unwrap()["code"],
+            "unknown"
+        );
+        assert!(state.batch_unknown);
+        assert!(matches!(state.phase, SessionPhase::Busy));
+        state.batch_unknown = false;
+        state.phase = SessionPhase::Unknown;
+        assert_eq!(
+            handle_steer(&params, &state).unwrap_err().data.unwrap()["code"],
+            "unknown"
+        );
+        assert!(matches!(state.phase, SessionPhase::Unknown));
+        assert_eq!(state.active_turn.as_deref(), Some("turn-current"));
+        assert_eq!(state.active_command_id.as_deref(), Some("send-current"));
     }
 
     #[test]

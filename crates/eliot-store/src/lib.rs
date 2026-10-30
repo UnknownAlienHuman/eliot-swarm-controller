@@ -7917,7 +7917,7 @@ fn is_turn_control(verb: &str) -> bool {
 }
 
 fn supports_control_verb(harness: &str, verb: &str) -> bool {
-    harness == "codex" || (harness == "fake" && verb == "interrupt")
+    harness == "codex" || (harness == "fake" && matches!(verb, "interrupt" | "steer"))
 }
 
 fn contains_secret_marker(value: &Value) -> bool {

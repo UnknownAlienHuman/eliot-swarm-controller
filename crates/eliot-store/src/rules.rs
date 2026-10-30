@@ -2789,6 +2789,30 @@ pub(super) fn valid_rule_action_request(request: &SubmitCommand, allow_interrupt
     }
 }
 
+fn valid_event_rule_action_request(request: &SubmitCommand) -> bool {
+    if request.verb != "steer" {
+        return valid_rule_action_request(request, true);
+    }
+    request.validate().is_ok()
+        && request
+            .target
+            .as_deref()
+            .is_some_and(|target| core::parse_agent_id(target).is_ok())
+        && request
+            .expected_generation
+            .is_some_and(|generation| generation >= 0)
+        && request
+            .expected_turn_id
+            .as_deref()
+            .is_some_and(|turn_id| !turn_id.is_empty())
+        && request.request_id.is_none()
+        && !request.probe
+        && request
+            .args
+            .as_object()
+            .is_some_and(|args| args.len() == 1 && args.get("text").is_some_and(Value::is_string))
+}
+
 fn valid_targetless_rule_run_request(request: &SubmitCommand) -> bool {
     request.validate().is_ok()
         && request.verb == "run"
@@ -3468,12 +3492,12 @@ struct StoredRuleTrigger {
 }
 
 fn rule_action_binding_error(event: &StoredRuleTrigger, request: &SubmitCommand) -> Option<String> {
-    if !valid_rule_action_request(request, true) {
+    if !valid_event_rule_action_request(request) {
         return Some("rule_action_binding_invalid".to_owned());
     }
     if request.target != event.agent.map(format_agent_id)
         || request.expected_generation != event.generation
-        || (request.verb == "interrupt"
+        || (matches!(request.verb.as_str(), "interrupt" | "steer")
             && request.expected_turn_id.as_deref() != event.turn_id.as_deref())
     {
         return Some("rule_action_binding_invalid".to_owned());
@@ -4068,6 +4092,15 @@ mod tests {
         request
     }
 
+    fn steer_request(agent: &str, generation: i64, turn_id: &str, text: &str) -> SubmitCommand {
+        let mut request = SubmitCommand::new("", "steer");
+        request.target = Some(agent.to_owned());
+        request.expected_generation = Some(generation);
+        request.expected_turn_id = Some(turn_id.to_owned());
+        request.args = json!({"text": text});
+        request
+    }
+
     fn set_interrupt_test_turn(store: &mut Store, agent: i64, turn_id: &str) {
         store
             .connection
@@ -4214,6 +4247,123 @@ mod tests {
                 derived_rule_id("action-0", "owner", &rule.id, state.revision, event_seq).unwrap();
             assert!(store.get_command(&child_id).unwrap().is_none());
         }
+    }
+
+    #[test]
+    fn event_steer_binds_exact_committed_turn_replays_and_never_retargets() {
+        let mut store = store();
+        let (agent, agent_id) = insert_test_agent(&mut store);
+        set_interrupt_test_turn(&mut store, agent, "turn-captured");
+        let rule = definition("steer-rule", true);
+        let state = store.ensure_rule_state("owner", &rule, 30).unwrap();
+        let event_seq =
+            insert_test_interrupt_event(&mut store, agent, 1, Some("turn-captured"), 31);
+        let request = steer_request(&agent_id, 1, "turn-captured", "continue this turn");
+        assert!(valid_event_rule_action_request(&request));
+        assert!(!valid_rule_action_request(&request, true));
+
+        let first = store
+            .admit_rule_action("owner", &state, event_seq, request.clone(), 32)
+            .unwrap();
+        assert!(first.is_new);
+        let parent_id = first.parent.as_ref().unwrap().id.clone();
+        let child = first.child.as_ref().expect("admitted STEER child");
+        assert_eq!(child.verb, "steer");
+        assert_eq!(child.target.as_deref(), Some(agent_id.as_str()));
+        assert_eq!(child.expected_generation, Some(1));
+        assert_eq!(child.turn_id.as_deref(), Some("turn-captured"));
+        assert_eq!(child.args, json!({"text":"continue this turn"}));
+        let child_id = child.id.clone();
+        let retained_expected_turn: Option<String> = store
+            .connection
+            .query_row(
+                "SELECT expected_turn_id FROM commands WHERE id = ?1",
+                [&child_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained_expected_turn.as_deref(), Some("turn-captured"));
+
+        store
+            .connection
+            .execute(
+                "UPDATE agents SET active_turn = 'turn-new' WHERE id = ?1",
+                [agent],
+            )
+            .unwrap();
+        let high_water_before_replay = store.high_water().unwrap();
+        let replay = store
+            .admit_rule_action("owner", &state, event_seq, request, 33)
+            .unwrap();
+        assert!(!replay.is_new);
+        assert_eq!(replay.parent.as_ref().unwrap().id, parent_id);
+        assert_eq!(replay.child.as_ref().unwrap().id, child_id);
+        assert!(replay.events.is_empty());
+        assert_eq!(store.high_water().unwrap(), high_water_before_replay);
+
+        assert_eq!(
+            store.dispatch(&child_id, 34).unwrap_err().code,
+            "stale_generation"
+        );
+        assert_eq!(
+            store.get_command(&child_id).unwrap().unwrap().state,
+            CommandState::Accepted
+        );
+    }
+
+    #[test]
+    fn event_steer_rejects_forged_event_turn_and_stale_current_turn() {
+        let mut store = store();
+        let (agent, agent_id) = insert_test_agent(&mut store);
+        set_interrupt_test_turn(&mut store, agent, "turn-current");
+        let rule = definition("steer-binding-rule", true);
+        let state = store.ensure_rule_state("owner", &rule, 40).unwrap();
+
+        let forged_event =
+            insert_test_interrupt_event(&mut store, agent, 1, Some("turn-event"), 41);
+        let forged = store
+            .admit_rule_action(
+                "owner",
+                &state,
+                forged_event,
+                steer_request(&agent_id, 1, "turn-forged", "must not retarget"),
+                42,
+            )
+            .unwrap();
+        assert!(forged.child.is_none());
+        assert_eq!(
+            forged.parent.unwrap().outcome.unwrap()["code"],
+            "rule_action_binding_invalid"
+        );
+
+        let stale_event =
+            insert_test_interrupt_event(&mut store, agent, 1, Some("turn-historical"), 43);
+        let current = store.get_rule_state("owner", &rule.id).unwrap().unwrap();
+        let stale = store
+            .admit_rule_action(
+                "owner",
+                &current,
+                stale_event,
+                steer_request(&agent_id, 1, "turn-historical", "must remain stale"),
+                44,
+            )
+            .unwrap();
+        assert!(stale.child.is_none());
+        assert_eq!(
+            stale.parent.unwrap().outcome.unwrap()["code"],
+            "stale_generation"
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM commands WHERE verb = 'steer'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

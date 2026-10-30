@@ -6804,3 +6804,405 @@ fn cli_fake_timer_send_scheduled_and_manual_replay_keep_exact_turns() {
     fixture.wait_command(&stop.command_id, "applied");
     fixture.stop(false);
 }
+
+#[test]
+fn cli_event_rule_steers_exact_held_turn_in_global_and_project_scopes() {
+    const PROJECT_ID: &str = "steer-fixture";
+    const GLOBAL_RULE_ID: &str = "global-event-steer";
+    const PROJECT_RULE_ID: &str = "project-event-steer";
+    const HOLD_TURN: &str = "[fake:hold-turn]";
+    const GLOBAL_TEXT: &str = "global-event-steer-text";
+    const PROJECT_TEXT: &str = "project-event-steer-text";
+
+    let mut fixture = Fixture::new("steer");
+    assert!(
+        fixture
+            .git(&["init", "--initial-branch=main"])
+            .status
+            .success(),
+        "initialize registered Steer project"
+    );
+    fs::write(fixture.workspace.join("seed.txt"), "steer fixture\n")
+        .expect("write registered project seed");
+    fs::create_dir_all(fixture.workspace.join(".eliot").join("rules"))
+        .expect("create registered project rule directory");
+    assert!(fixture.git(&["add", "--all"]).status.success());
+    assert!(
+        fixture
+            .git(&["commit", "-m", "Steer event fixture"])
+            .status
+            .success(),
+        "commit registered Steer project"
+    );
+
+    fixture.start();
+    fixture.stop(false);
+    let global_rules = fixture.data.join("rules");
+    let project_rules = fixture.workspace.join(".eliot").join("rules");
+    fs::create_dir_all(&global_rules).expect("create global rule directory");
+    fs::create_dir_all(&project_rules).expect("create registered project rule directory");
+
+    let project_path = serde_json::to_string(&fixture.workspace.display().to_string())
+        .expect("encode registered project path");
+    fs::write(
+        fixture.data.join("config.toml"),
+        format!(
+            concat!(
+                "[projects.{project_id}]\n",
+                "path = {path}\n",
+                "profiles = [\"fake\"]\n",
+                "actions = [\"interrupt\", \"send\", \"steer\", \"stop\"]\n",
+            ),
+            project_id = PROJECT_ID,
+            path = project_path,
+        ),
+    )
+    .expect("write Owner Project Steer approval");
+
+    let global_send_id = ulid::Ulid::new().to_string();
+    let project_send_id = ulid::Ulid::new().to_string();
+    let encode = |value: &str| serde_json::to_string(value).expect("encode TOML string");
+    let steer_rule = |rule_id: &str, send_id: &str, text: &str| {
+        format!(
+            concat!(
+                "[[rule]]\n",
+                "id = {rule_id}\n",
+                "on = {{ event = \"turn.started\", match = {{ ",
+                "\"subject.harness\" = \"fake\", ",
+                "\"event.data.command_id\" = {command_id} }} }}\n",
+                "do = [{{ action = \"steer\", target = {target}, ",
+                "expected_generation = {generation}, expected_turn_id = {turn_id}, ",
+                "text = {text} }}]\n",
+            ),
+            rule_id = encode(rule_id),
+            command_id = encode(send_id),
+            target = encode("${event.agent}"),
+            generation = encode("${event.generation}"),
+            turn_id = encode("${event.data.turn_id}"),
+            text = encode(text),
+        )
+    };
+    fs::write(
+        global_rules.join("global-steer.toml"),
+        steer_rule(GLOBAL_RULE_ID, &global_send_id, GLOBAL_TEXT),
+    )
+    .expect("write Owner global Steer rule");
+    fs::write(
+        project_rules.join("project-steer.toml"),
+        steer_rule(PROJECT_RULE_ID, &project_send_id, PROJECT_TEXT),
+    )
+    .expect("write registered Project Steer rule");
+
+    fixture.start();
+    let registration: ProjectRegistrationView =
+        serde_json::from_value(fixture.json(&["project", "show", PROJECT_ID]))
+            .expect("typed Steer project registration");
+    assert!(
+        registration.actions.iter().any(|action| action == "steer"),
+        "project registration carries the Steer action approval"
+    );
+
+    let mut rule_states = Vec::new();
+    for (rule_id, project_id) in [(GLOBAL_RULE_ID, None), (PROJECT_RULE_ID, Some(PROJECT_ID))] {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let state: RuleStateView = loop {
+            let reply = match project_id {
+                Some(project_id) => cli(
+                    &fixture.data,
+                    &["rule", "show", rule_id, "--project", project_id],
+                ),
+                None => cli(&fixture.data, &["rule", "show", rule_id]),
+            };
+            if reply.status.success() {
+                break serde_json::from_str(&reply.stdout).expect("typed event Steer rule");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "event Steer rule load deadline; bounded stderr={:?}",
+                reply.stderr.chars().take(2048).collect::<String>()
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        assert_eq!(state.id, rule_id);
+        assert_eq!(state.project.as_deref(), project_id);
+        rule_states.push(state);
+    }
+
+    let launch = fixture.json(&[
+        "launch",
+        "--profile",
+        "fake",
+        "--workspace",
+        fixture
+            .workspace
+            .to_str()
+            .expect("registered workspace path"),
+    ]);
+    let agent = launch["target"].as_str().expect("Fake Agent").to_owned();
+    let generation = launch["generation"].as_i64().expect("Fake generation");
+    let generation_arg = generation.to_string();
+    let cases = [
+        (
+            None,
+            GLOBAL_RULE_ID,
+            global_send_id.as_str(),
+            GLOBAL_TEXT,
+            0_usize,
+        ),
+        (
+            Some(PROJECT_ID),
+            PROJECT_RULE_ID,
+            project_send_id.as_str(),
+            PROJECT_TEXT,
+            1_usize,
+        ),
+    ];
+    let mut retained = Vec::new();
+    for (project_id, rule_id, send_id, steer_text, state_index) in cases {
+        let rule_state = &rule_states[state_index];
+        let send_reply = cli(
+            &fixture.data,
+            &[
+                "--id",
+                send_id,
+                "send",
+                &agent,
+                "--generation",
+                &generation_arg,
+                "--",
+                HOLD_TURN,
+            ],
+        );
+        assert!(
+            send_reply.status.success(),
+            "Fake hold-turn SEND failed; bounded stdout={:?}; bounded stderr={:?}",
+            send_reply.stdout.chars().take(2048).collect::<String>(),
+            send_reply.stderr.chars().take(2048).collect::<String>()
+        );
+        let send: CoreCommand = serde_json::from_value(fixture.wait_command(send_id, "applied"))
+            .expect("applied Fake hold-turn SEND");
+        assert_eq!(send.id, send_id);
+        assert_eq!(send.verb, "send");
+        assert_eq!(send.target.as_deref(), Some(agent.as_str()));
+        assert_eq!(send.expected_generation, Some(generation));
+        let turn_id = send
+            .turn_id
+            .as_deref()
+            .expect("held SEND turn ID")
+            .to_owned();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let (started, firing, event_seq) = loop {
+            let events = fixture.events();
+            let started = events
+                .iter()
+                .find(|event| {
+                    event["kind"] == "turn.started"
+                        && event["data"]["command_id"] == send_id
+                        && event["agent"] == agent
+                        && event["generation"] == generation
+                })
+                .cloned();
+            if let Some(started) = started {
+                let event_seq = started["seq"].as_i64().expect("held turn start sequence");
+                if let Some(firing) = events
+                    .iter()
+                    .find(|event| {
+                        event["kind"] == "rule.fired"
+                            && event["data"]["rule"] == rule_id
+                            && event["data"]["event_seq"] == event_seq
+                    })
+                    .cloned()
+                {
+                    break (started, firing, event_seq);
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "event Steer firing deadline for {rule_id}"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        assert_eq!(started["subject"]["harness"], "fake");
+        assert_eq!(started["data"]["turn_id"], turn_id);
+        assert_eq!(firing["data"]["revision"], rule_state.revision);
+        match project_id {
+            Some(project_id) => assert_eq!(firing["data"]["project"], project_id),
+            None => assert!(firing["data"].get("project").is_none_or(Value::is_null)),
+        }
+
+        let parent_id = firing["data"]["parent_command"]
+            .as_str()
+            .expect("Steer rule parent command")
+            .to_owned();
+        let steer_id = firing["data"]["child_command"]
+            .as_str()
+            .expect("Steer child command")
+            .to_owned();
+        let principal = project_id.map_or_else(
+            || "owner".to_owned(),
+            |project_id| format!("project:{project_id}"),
+        );
+        let parent: CoreCommand =
+            serde_json::from_value(fixture.wait_command(&parent_id, "applied"))
+                .expect("applied event Steer parent");
+        assert_eq!(parent.verb, "rule");
+        assert_eq!(parent.principal, principal);
+        assert_eq!(parent.args["rule"], rule_id);
+        assert_eq!(
+            parent.outcome.as_ref().expect("Steer parent outcome")["children"],
+            json!([steer_id])
+        );
+        let steer: CoreCommand = serde_json::from_value(fixture.wait_command(&steer_id, "applied"))
+            .expect("applied Router Steer child");
+        assert_eq!(steer.id, steer_id);
+        assert_eq!(steer.verb, "steer");
+        assert_eq!(steer.state, CommandState::Applied);
+        assert_eq!(steer.principal, principal);
+        assert_eq!(steer.target.as_deref(), Some(agent.as_str()));
+        assert_eq!(steer.expected_generation, Some(generation));
+        assert_eq!(steer.generation, Some(generation));
+        assert_eq!(steer.turn_id.as_deref(), Some(turn_id.as_str()));
+        assert_eq!(steer.args, json!({"text": steer_text}));
+        assert_eq!(
+            steer.outcome.as_ref().expect("retained control outcome")["turn_id"],
+            turn_id
+        );
+
+        let events_after_steer = fixture.events();
+        assert_eq!(fault_dispatches(&events_after_steer, &steer_id), 1);
+        assert_eq!(
+            events_after_steer
+                .iter()
+                .filter(|event| {
+                    event["kind"] == "command.applied" && event["data"]["command_id"] == steer_id
+                })
+                .count(),
+            1,
+            "the applied control outcome is durably readable"
+        );
+        assert_eq!(
+            events_after_steer
+                .iter()
+                .filter(|event| {
+                    event["kind"] == "turn.started" && event["data"]["command_id"] == send_id
+                })
+                .count(),
+            1,
+            "Steer keeps the original turn without starting another"
+        );
+        assert!(!events_after_steer.iter().any(|event| {
+            event["kind"] == "turn.completed"
+                && event["data"]["command_id"] == send_id
+                && event["data"]["turn_id"] == turn_id
+        }));
+        assert_eq!(
+            fixture.json(&["show", &agent])["active_turn"].as_str(),
+            Some(turn_id.as_str()),
+            "Steer leaves the original Fake turn active"
+        );
+
+        let interrupt_id = ulid::Ulid::new().to_string();
+        let interrupt_reply = cli(
+            &fixture.data,
+            &[
+                "--id",
+                &interrupt_id,
+                "interrupt",
+                &agent,
+                "--generation",
+                &generation_arg,
+                "--turn",
+                &turn_id,
+            ],
+        );
+        assert!(
+            interrupt_reply.status.success(),
+            "exact Fake interrupt cleanup failed; bounded stdout={:?}; bounded stderr={:?}",
+            interrupt_reply
+                .stdout
+                .chars()
+                .take(2048)
+                .collect::<String>(),
+            interrupt_reply
+                .stderr
+                .chars()
+                .take(2048)
+                .collect::<String>()
+        );
+        let interrupt: CoreCommand =
+            serde_json::from_value(fixture.wait_command(&interrupt_id, "applied"))
+                .expect("applied exact-turn interrupt cleanup");
+        assert_eq!(interrupt.turn_id.as_deref(), Some(turn_id.as_str()));
+        let after_interrupt = fixture.events();
+        let terminal = after_interrupt
+            .iter()
+            .find(|event| {
+                event["kind"] == "turn.completed"
+                    && event["data"]["command_id"] == send_id
+                    && event["data"]["turn_id"] == turn_id
+            })
+            .expect("interrupt terminal event for the original turn");
+        assert_eq!(terminal["data"]["status"], "interrupted");
+        assert!(fixture.json(&["show", &agent])["active_turn"].is_null());
+
+        retained.push((
+            rule_id.to_owned(),
+            event_seq,
+            parent_id,
+            parent,
+            steer,
+            send_id.to_owned(),
+        ));
+    }
+
+    let stop_id = ulid::Ulid::new().to_string();
+    let stop_reply = cli(
+        &fixture.data,
+        &[
+            "--id",
+            &stop_id,
+            "stop",
+            &agent,
+            "--generation",
+            &generation_arg,
+        ],
+    );
+    assert!(
+        stop_reply.status.success(),
+        "exact Fake stop cleanup failed; bounded stdout={:?}; bounded stderr={:?}",
+        stop_reply.stdout.chars().take(2048).collect::<String>(),
+        stop_reply.stderr.chars().take(2048).collect::<String>()
+    );
+    fixture.wait_command(&stop_id, "applied");
+    fixture.stop(false);
+    fixture.start();
+
+    let events_after_restart = fixture.events();
+    for (rule_id, event_seq, parent_id, parent, steer, send_id) in &retained {
+        let retained_parent: CoreCommand =
+            serde_json::from_value(fixture.json(&["cmd", "show", parent_id]))
+                .expect("retained Steer rule parent");
+        let retained_steer: CoreCommand =
+            serde_json::from_value(fixture.json(&["cmd", "show", &steer.id]))
+                .expect("retained Steer child");
+        assert_eq!(&retained_parent, parent);
+        assert_eq!(&retained_steer, steer);
+        assert_eq!(
+            events_after_restart
+                .iter()
+                .filter(|event| {
+                    event["kind"] == "rule.fired"
+                        && event["data"]["rule"].as_str() == Some(rule_id.as_str())
+                        && event["data"]["event_seq"].as_i64() == Some(*event_seq)
+                        && event["data"]["parent_command"].as_str() == Some(parent_id.as_str())
+                })
+                .count(),
+            1,
+            "restart did not refire the retained turn.started event"
+        );
+        assert_eq!(fault_dispatches(&events_after_restart, &steer.id), 1);
+        assert_eq!(fault_dispatches(&events_after_restart, send_id), 1);
+    }
+    fixture.stop(false);
+}
