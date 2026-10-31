@@ -13,7 +13,7 @@ use std::{
 pub(crate) enum SavedRunPrincipal {
     Owner,
     ProjectRule {
-        registration: ProjectRegistrationView,
+        registration: Box<ProjectRegistrationView>,
     },
 }
 
@@ -168,7 +168,7 @@ mod tests {
 
     fn project_principal() -> SavedRunPrincipal {
         SavedRunPrincipal::ProjectRule {
-            registration: ProjectRegistrationView {
+            registration: Box::new(ProjectRegistrationView {
                 id: "sample".to_owned(),
                 checkout: "C:\\work\\sample".to_owned(),
                 repo_common_dir: "C:\\work".to_owned(),
@@ -176,8 +176,9 @@ mod tests {
                 actions: vec!["run".to_owned()],
                 interpreters: Default::default(),
                 run_env: Vec::new(),
+                git: None,
                 revision: 4,
-            },
+            }),
         }
     }
     #[test]

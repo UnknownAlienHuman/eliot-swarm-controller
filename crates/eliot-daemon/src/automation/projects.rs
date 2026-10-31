@@ -8,7 +8,10 @@ use crate::{
     git_monitor::reject_links,
     workspace_git::WorkspaceGit,
 };
-use eliot_core::{Error, Result, api::ScriptInterpreter};
+use eliot_core::{
+    Error, Result,
+    api::{ProjectGitView, ScriptInterpreter},
+};
 use serde_json::Value;
 use std::{collections::BTreeMap, fs, io::ErrorKind, path::Path};
 
@@ -19,6 +22,7 @@ pub(super) struct RegistrationSnapshot {
     pub repo_common_dir: String,
     pub profiles: Vec<String>,
     pub actions: Vec<String>,
+    pub git: Option<ProjectGitView>,
     pub interpreters: BTreeMap<String, ScriptInterpreter>,
     pub run_env: Vec<String>,
 }
@@ -227,6 +231,7 @@ async fn resolve_registration(
         repo_common_dir,
         profiles: project.profiles,
         actions: project.actions,
+        git: project.git,
         interpreters: project.interpreters,
         run_env: project.run_env,
     })
@@ -450,6 +455,7 @@ mod tests {
             repo_common_dir: "C:/registered/.git".to_owned(),
             profiles: vec!["fake".to_owned()],
             actions: vec!["interrupt".to_owned(), "send".to_owned(), "stop".to_owned()],
+            git: None,
             interpreters: BTreeMap::new(),
             run_env: Vec::new(),
         };
@@ -624,6 +630,7 @@ mod tests {
             repo_common_dir: registered_common_dir.clone(),
             profiles: vec!["fake".to_owned()],
             actions: vec!["stop".to_owned()],
+            git: None,
             interpreters: BTreeMap::new(),
             run_env: Vec::new(),
         };
@@ -764,6 +771,7 @@ mod tests {
             repo_common_dir: registered_common_dir.clone(),
             profiles: vec!["fake".to_owned()],
             actions: vec!["resume".to_owned()],
+            git: None,
             interpreters: BTreeMap::new(),
             run_env: Vec::new(),
         };

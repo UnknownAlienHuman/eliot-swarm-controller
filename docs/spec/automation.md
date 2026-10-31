@@ -455,21 +455,61 @@ hidden wait/acceptance state to the router.
 | `msg.send`, `var.set` | scoped coordination command; available after L5 |
 | `run` | targetless `SubmitCommand` via Router; bounded child under saved authority; emitted commands become ordered children |
 | `notify`, `emit` | bounded log/desktop or approved named webhook; persisted `x.user.*` event |
-| `git.fetch`, `git.push`, `git.worktree` | optional native Git wrapper with frozen intent/readback below |
+| `git.fetch` | targetless ordinary `SubmitCommand` through Router/Store with frozen intent and readback |
+| `git.push`, `git.worktree` | unsupported in this fetch-only increment |
 
 Scripts/commands that finish unsuccessfully can have partial effects. `failed` does not
 mean rollback; uncertain outcomes stay `unknown`, and neither is automatically rerun.
 
 ## Git actions
 
-Implement these wrappers only with a concrete automation recipe. They do not intercept
-Git used by a coding harness, and do not block the first Codex or rule/timer path.
-There is no generic built-in pull; project integration belongs to an explicit script.
+This increment connects only the concrete `git.fetch` recipe below, as a native effect on
+the existing Router/Store command path. Owner-global and registered-project event/timer
+actions use the same targetless `git.fetch` command; it is not a `run` wrapper or a second
+executor. Project authority comes from the saved principal and canonical registration, not
+from action args. The literal `repository` names an owner registration ID; Owner rules may
+select any registration, and a project principal `project:ID` must match that ID. These
+actions do not intercept Git used by a coding harness. There is no generic built-in pull;
+merge, rebase and repository integration remain explicit script/workflow work, while
+`git.fetch` is the bounded project fetch wrapper. `git.push` and `git.worktree` remain
+unsupported here. Both action callers use the existing Router/Store admission path and
+ordinary `Store::dispatch`/`Store::settle` methods; no parallel admission API is added.
 
-Validate an owner-registered repository, approved remote, full refs and exact OIDs.
-Reject option/control-character injection and custom unapproved helper schemes.
-Read raw fetch URL and pushurls separately; applicable `insteadOf`/`pushInsteadOf`
-requires direct approved endpoints rather than guessing a second rewrite.
+Validate an owner-registered repository, approved remote and exact OIDs. `source_ref` is a
+full valid ref. `tracking_ref` must be a full valid ref under `refs/remotes/` with a
+nonempty valid suffix; refs under `refs/heads/` or `refs/tags/` are rejected. Freeze also
+rejects a symbolic tracking target. Reject option/control-character injection, credentials
+embedded in URLs, unresolved `insteadOf`/`pushInsteadOf` rewrites and unapproved helper
+schemes. The repository's raw
+fetch URL must exactly match the approved direct endpoint. Read pushurls separately and
+never substitute a pushurl for the fetch endpoint.
+This first connected fetch supports approved HTTPS/HTTP/native Git/file URLs and absolute
+local paths; SSH is unsupported until a selected owner-approved frozen SSH-settings caller
+exists, with no ambient SSH configuration fallback.
+
+The raw arguments are Core [`GitFetchDefinitionArgs`](../../crates/eliot-core/src/api/git.rs);
+all supplied values are literal and do not accept event or subject templates. Optional
+`timeout` uses humantime, must be positive with whole-millisecond precision and fit a
+checked platform `Instant` deadline (unrepresentable values are `invalid`, never panic),
+and defaults to 10 minutes when omitted. This registered-project timer example uses the
+`app` owner configuration in [configuration](configuration.md#project-registration-and-rule-authority).
+
+```toml
+[[rule]]
+id = "refresh-origin-main"
+on = { every = "1h" }
+do = [{ action = "git.fetch", repository = "app", remote = "origin", source_ref = "refs/heads/main", tracking_ref = "refs/remotes/origin/main" }]
+```
+
+Before Store admission, Router resolves the registered canonical checkout/common directory,
+the saved registration and remote binding, direct endpoint, and the current target tracking
+OID. A read-only `git ls-remote --refs` observation freezes the exact advertised source OID.
+The resulting Core [`FrozenGitFetch`](../../crates/eliot-core/src/api/git.rs) is persisted
+in the ordinary command args, binding the selected registration and transport snapshot,
+advertised source, expected target state and timeout before admission; no execution table
+or API method is added. When
+`expected_old_oid` is `None`, the target ref must be absent and the update is create-only
+compare-and-set.
 
 ### Isolated transport view
 
@@ -480,27 +520,55 @@ object database through standard Git object-directory/alternate mechanisms. Reva
 its saved config before network dispatch/readback. No Git workflow service or global
 artifact store is needed.
 
-### Frozen desired state
+The selected transport config must match the frozen endpoint/helper values and the fixed
+safe-config builder. Revalidate repository identity and that config before dispatch and
+readback. Use explicit Git argv, bounded stdout/stderr and the existing
+[`WorkspaceGit::repository_identity`](../../crates/eliot-daemon/src/workspace_git.rs),
+[`git_path_argument`](../../crates/eliot-daemon/src/git_monitor.rs) and
+[`OwnedChild::spawn`](../../crates/eliot-daemon/src/platform/custody.rs) helpers. The
+optional `manager` credential helper is an explicit canonical file receipt, runs headless,
+and reuses only the existing noninteractive manager login. Its receipt is never persisted
+as a secret or sent on stdin/logs; omission disables helpers and there is no authentication
+fallback or global/auth configuration change.
 
-Before an effect, retain:
+### Frozen fetch state and ref update
 
-- fetch: direct endpoint, source ref and advertised OID, destination tracking ref and
-  expected old OID;
-- push: frozen local OID, destination ref, pre-push remote observation and all approved
-  push endpoints;
-- worktree: exact repository/path/branch/base OID.
-
-Fetch to a private ref, verify the advertised OID, then CAS-update the real tracking ref
-with hooks disabled. A moved remote fails without updating the real ref. Push uses
-`<frozen-local-oid>:<destination-ref>`, never a mutable source branch and never force.
+Core [`FrozenGitFetch`](../../crates/eliot-core/src/api/git.rs) owns the frozen intent; this
+spec does not copy its field catalog. Fetch into a private ref, verify the received OID is
+the frozen advertised OID, then CAS-update the real tracking ref with hooks disabled and
+`git update-ref --no-deref`. `expected_old_oid = None` means create only if the tracking
+ref is absent. Freeze rejects a symbolic tracking target, and `--no-deref` prevents a
+later symbolic ref from redirecting the CAS. A moved remote or failed CAS leaves the real
+tracking ref unchanged; `HEAD`, local branches and the worktree are unchanged.
 
 ### Unknown readback
 
-After proving the process stopped, read back through the same frozen configuration.
-Fetch is settled by the target tracking OID; push by the destination at every endpoint;
-worktree by exact registered path/branch/intended OID. Readback proves the desired state,
-not unique authorship of an indistinguishable concurrent change. No proof means unknown.
-Hold later writes to the same repository behind an unknown write; unrelated work runs.
+After proving the process stopped, read back the tracking ref through the same frozen
+configuration and canonical common directory. Unknown settlement is read-only: it never
+fetches again, performs another CAS, or retries the effect. Only readback confirming the
+frozen advertised OID may produce Core [`GitFetchOutcome`](../../crates/eliot-core/src/api/git.rs);
+ordinary command state and error remain authoritative for failed/unknown results. Readback
+proves desired state, not unique authorship of an indistinguishable concurrent change; no
+proof means unknown. The common-directory fence applies symmetrically to native controller
+Git mutations: `git.fetch` and native worktree add/remove share one fence across all
+worktrees of that repository, indexed by `$.common_dir`. Fetch uses its ordinary durable
+command dispatch state; worktree add/remove use a minimal durable native-Git-dispatch marker
+in existing Core [`WorkspaceCreationOutcome`/`WorkspaceRemovalOutcome`](../../crates/eliot-core/src/lib.rs),
+settled by the existing [Store workspace path](../../crates/eliot-store/src/lib.rs) and run
+by [`WorkspaceManager`](../../crates/eliot-daemon/src/workspaces.rs). Unknown from retained-
+Ready Resume identity readback or pre-mutator source drain/inspection is read-only and does
+not mark a possible Git write. New worktree intents and pre-native outcomes persist an
+explicit no-dispatch fact; the actual add/remove boundary durably marks may-have-begun before
+spawn, and settlement preserves it. An absent marker on a legacy Unknown creation/removal is
+ambiguous and remains fenced unless existing `reuse`/`resume_previous` or exact read-only
+facts prove no write. A persisted marker after its native phase is complete does not keep a
+fence active; Store uses the current workspace phase/stage. See the Core workspace outcomes
+and [workspace preparation](../../crates/eliot-core/src/lib.rs), Store settlement, and
+[`WorkspaceManager`](../../crates/eliot-daemon/src/workspaces.rs). Git invoked inside
+harnesses or explicit Run/setup scripts is not intercepted by this fence. A marked possible
+write that remains unknown blocks later native controller Git mutations in both directions
+for that common directory; unrelated repositories continue. Store owns the transaction
+fence; Git I/O stays outside Store locks.
 
 ## Frozen script inputs
 

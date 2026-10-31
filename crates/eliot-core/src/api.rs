@@ -2,6 +2,7 @@
 //! admission and effect handling remain in the Router and Store.
 
 mod agent_views;
+mod git;
 mod monitor_views;
 mod mutation_validation;
 mod mutations;
@@ -18,8 +19,12 @@ pub use agent_views::{
     AgentEditsRequest, AgentEditsResponse, AgentGetRequest, AgentGetResponse, AgentGitRequest,
     AgentGitResponse, AgentListRequest, AgentListResponse, AgentListRow, AgentProcessesRequest,
     AgentProcessesResponse, AgentStatsRequest, AgentStatsResponse, DaemonStatusRequest,
-    DaemonStatusResponse, PROCESS_CURSOR_MAX_BYTES, ProcessPageCursor, ProjectRegistrationView,
-    SourceOwner, SourceState, StatusBlocker, UnsettledCommandSummary, WorkspaceCustodyView,
+    DaemonStatusResponse, GitCredentialHelper, PROCESS_CURSOR_MAX_BYTES, ProcessPageCursor,
+    ProjectGitView, ProjectRegistrationView, SourceOwner, SourceState, StatusBlocker,
+    UnsettledCommandSummary, WorkspaceCustodyView,
+};
+pub use git::{
+    DEFAULT_GIT_FETCH_TIMEOUT_MS, FrozenGitFetch, GitFetchDefinitionArgs, GitFetchOutcome,
 };
 pub use monitor_views::{
     FilesystemInvalidationState, FilesystemInvalidationView, GitObservation, GitView,

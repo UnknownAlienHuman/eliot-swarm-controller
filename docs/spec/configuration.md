@@ -147,8 +147,12 @@ fingerprint_max_bytes = 67108864
 [projects.app]
 path = "C:/src/app"
 profiles = ["codex-luna"]
-actions = ["run", "interrupt", "send", "stop"]
+actions = ["run", "interrupt", "send", "stop", "git.fetch"]
 run_env = ["CI"]
+
+[projects.app.git]
+fetch_remotes = { origin = "https://github.com/example/app.git" }
+credential_helper = "manager"
 
 [projects.app.interpreters.pwsh]
 program = "C:/Program Files/PowerShell/7/pwsh.exe"
@@ -212,8 +216,27 @@ allowlist. Project Run remains confined to its separate registered-checkout
 Only owner-global `[projects.ID]` entries register projects. `path` names the canonical
 Git checkout; `profiles` and `actions` are explicit allowlists over existing global
 profiles and implemented actions. Missing or empty allowlists deny all. Project
-registration readback uses the canonical Core `ProjectRegistrationView`; project identity
-includes the canonical checkout and Git common directory, not an Agent's project label.
+registration readback uses the canonical Core [`ProjectRegistrationView`](../../crates/eliot-core/src/api/agent_views.rs);
+project identity includes the canonical checkout and Git common directory, not an Agent's
+project label.
+
+The optional owner-global `[projects.ID.git]` table binds fetch authority to that
+registration. `fetch_remotes` maps exact remote names to approved direct endpoints without
+embedded credentials; the repository's raw fetch URL must match the selected endpoint.
+`credential_helper` may be omitted or set to `"manager"`; omission disables helpers and
+does not fall back to ambient Git/auth configuration. `"manager"` serializes as Core
+`GitCredentialHelper::Manager`; when selected, its executable is frozen as a canonical
+file receipt, not secret material.
+Core `ProjectRegistrationView.git` is `Option<ProjectGitView>`; `ProjectGitView` and
+`GitCredentialHelper` live in
+[`agent_views.rs`](../../crates/eliot-core/src/api/agent_views.rs) and are exported by
+[`api.rs`](../../crates/eliot-core/src/api.rs). These approvals are part of the saved
+registration revision and cannot be changed by project rule files.
+
+For `git.fetch`, a project rule must be granted `git.fetch` and its literal `repository`
+must equal the ID in its saved `project:ID` principal. Owner-global rules may select any
+owner-registered repository and use that registration's saved Git approvals. Authority
+comes from the saved principal and registration, never from action args.
 
 Project run uses two additional owner-global approvals. Each
 `[projects.ID.interpreters.NAME]` table requires an absolute `program` executable path

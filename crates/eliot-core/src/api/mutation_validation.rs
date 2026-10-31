@@ -7,6 +7,17 @@ use crate::{CommandState, Error, Result};
 
 impl CommandSubmitRequest {
     pub fn validate_response(&self, response: &CommandSubmitResponse) -> Result<()> {
+        if self.verb == "git.fetch" {
+            if self.validate().is_err()
+                || response.command_id != self.id
+                || response.agent.is_some()
+                || response.generation.is_some()
+                || response.linked_command.is_some()
+            {
+                return Err(binding_mismatch());
+            }
+            return Ok(());
+        }
         // Every currently admitted verb resolves a concrete Agent. Generation 0
         // is valid before dispatch or after failed workspace preparation.
         if response.command_id != self.id
@@ -219,6 +230,48 @@ mod tests {
         }
         reply.command_id = request.id.to_ascii_lowercase();
         assert_unknown(request.validate_response(&reply));
+    }
+
+    #[test]
+    fn git_fetch_response_requires_exact_targetless_command_binding() {
+        let agent_request = request("stop", None, None);
+        let request = request("git.fetch", None, None);
+        let mut reply = response(&request);
+        reply.agent = None;
+        reply.generation = None;
+        for state in [
+            CommandState::Accepted,
+            CommandState::Queued,
+            CommandState::Dispatched,
+            CommandState::Applied,
+            CommandState::Rejected,
+            CommandState::Failed,
+            CommandState::Unknown,
+            CommandState::Cancelled,
+        ] {
+            let mut retained = reply.clone();
+            retained.state = state;
+            retained.outcome = Some(json!({"opaque_fetch_outcome":true}));
+            request.validate_response(&retained).unwrap();
+        }
+
+        let mut wrong = reply.clone();
+        wrong.command_id = "another-command".to_owned();
+        assert_unknown(request.validate_response(&wrong));
+        let mut wrong = reply.clone();
+        wrong.agent = Some("a1".to_owned());
+        assert_unknown(request.validate_response(&wrong));
+        let mut wrong = reply.clone();
+        wrong.generation = Some(0);
+        assert_unknown(request.validate_response(&wrong));
+        let mut wrong = reply.clone();
+        wrong.linked_command = Some(format!("{}/send", request.id));
+        assert_unknown(request.validate_response(&wrong));
+
+        let mut bound = request.clone();
+        bound.target = Some("a1".to_owned());
+        assert_unknown(bound.validate_response(&reply));
+        assert_unknown(agent_request.validate_response(&reply));
     }
 
     #[test]

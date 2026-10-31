@@ -61,6 +61,7 @@ pub(crate) struct ProjectRegistrationConfig {
     pub path: String,
     pub profiles: Vec<String>,
     pub actions: Vec<String>,
+    pub git: Option<core::api::ProjectGitView>,
     pub interpreters: BTreeMap<String, core::api::ScriptInterpreter>,
     pub run_env: Vec<String>,
 }
@@ -257,6 +258,8 @@ struct ProjectEntry {
     #[serde(default)]
     actions: Vec<String>,
     #[serde(default)]
+    git: Option<core::api::ProjectGitView>,
+    #[serde(default)]
     interpreters: BTreeMap<String, core::api::ScriptInterpreter>,
     #[serde(default)]
     run_env: Vec<String>,
@@ -343,6 +346,7 @@ pub(crate) fn load_project_registration_config(
                         | "resume"
                         | "stop"
                         | "send"
+                        | "git.fetch"
                         | "steer"
                         | "interrupt"
                         | "approve"
@@ -352,6 +356,10 @@ pub(crate) fn load_project_registration_config(
                 )
             },
         )?;
+        let git = entry.git.clone();
+        if let Some(git) = &git {
+            validate_project_git_config(git, &source, offset, id)?;
+        }
         let run_grant = normalize_run_grant(
             &entry.interpreters,
             &entry.run_env,
@@ -366,6 +374,7 @@ pub(crate) fn load_project_registration_config(
             path: path.to_owned(),
             profiles,
             actions,
+            git,
             interpreters: run_grant.interpreters,
             run_env: run_grant.run_env,
         });
@@ -554,7 +563,7 @@ fn normalize_project_allowlist(
                 offset,
                 &format!("projects.{project_id}.{field}"),
                 if field == "actions" {
-                    "only implemented launch, resume, stop, send, steer, interrupt, approve, deny, answer and run actions may be approved"
+                    "only implemented launch, resume, stop, send, git.fetch, steer, interrupt, approve, deny, answer and run actions may be approved"
                 } else {
                     "must name an existing global profile"
                 },
@@ -575,6 +584,75 @@ fn normalize_project_allowlist(
     normalized.sort();
     Ok(normalized)
 }
+
+fn validate_project_git_config(
+    git: &core::api::ProjectGitView,
+    source: &str,
+    offset: usize,
+    project_id: &str,
+) -> core::Result<()> {
+    git.validate().map_err(|_| {
+        config_error_at(
+            source,
+            offset,
+            &format!("projects.{project_id}.git"),
+            "contains an invalid Git fetch approval",
+            "profile_error",
+        )
+    })?;
+    for (remote, endpoint) in &git.fetch_remotes {
+        if !is_direct_project_fetch_endpoint(endpoint) {
+            return Err(config_error_at(
+                source,
+                offset,
+                &format!("projects.{project_id}.git.fetch_remotes.{remote}"),
+                "must be an absolute local path or direct HTTP, HTTPS, Git, or file URL without credentials or helper schemes; SSH is unsupported",
+                "profile_error",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_direct_project_fetch_endpoint(endpoint: &str) -> bool {
+    if endpoint.trim() != endpoint
+        || endpoint.starts_with('-')
+        || endpoint.len() > MAX_PROJECT_PATH_LEN
+        || endpoint.chars().any(char::is_control)
+        || has_git_remote_helper_delimiter(endpoint)
+    {
+        return false;
+    }
+    if Path::new(endpoint).is_absolute() {
+        return true;
+    }
+    let Ok(url) = reqwest::Url::parse(endpoint) else {
+        return false;
+    };
+    matches!(url.scheme(), "file" | "git" | "http" | "https")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && !project_git_endpoint_has_userinfo(endpoint)
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && (url.scheme() == "file" || url.host_str().is_some_and(|host| !host.is_empty()))
+}
+
+fn project_git_endpoint_has_userinfo(endpoint: &str) -> bool {
+    let Some((_, rest)) = endpoint.split_once("://") else {
+        return false;
+    };
+    rest.split(['/', '?', '#'])
+        .next()
+        .is_some_and(|authority| authority.contains('@'))
+}
+
+fn has_git_remote_helper_delimiter(endpoint: &str) -> bool {
+    endpoint
+        .find("::")
+        .is_some_and(|delimiter| endpoint.find("://").is_none_or(|scheme| delimiter < scheme))
+}
+
 pub(crate) fn resolve_profile(data_root: &Path, name: &str) -> core::Result<Value> {
     validate_profile_name(name)?;
     let Some((config, source)) = read_config(data_root)? else {
@@ -1436,10 +1514,106 @@ mod tests {
                 path: fixture.root.to_string_lossy().into_owned(),
                 profiles: vec!["fake".to_owned()],
                 actions: vec!["stop".to_owned()],
+                git: None,
                 interpreters: BTreeMap::new(),
                 run_env: Vec::new(),
             }]
         );
+    }
+
+    #[test]
+    fn project_git_config_keeps_only_direct_approved_fetch_endpoints() {
+        let fixture = AutomationConfigFixture::new();
+        let project_path = format!("{:?}", fixture.root.to_string_lossy());
+        let remote = fixture
+            .root
+            .join("origin.git")
+            .to_string_lossy()
+            .into_owned();
+        fixture.write(&format!(
+            concat!(
+                "[projects.sample]\n",
+                "path = {project_path}\n",
+                "profiles = ['fake']\n",
+                "actions = ['git.fetch']\n",
+                "[projects.sample.git]\n",
+                "fetch_remotes = {{ origin = {remote:?}, ",
+                "http = \"http://git.example.test/team/repo.git\", ",
+                "https = \"https://git.example.test/team/repo.git\", ",
+                "git = \"git://git.example.test/team/repo.git\", ",
+                "file = \"file:///tmp/repository.git\" }}\n",
+                "credential_helper = 'manager'\n",
+            ),
+            project_path = project_path,
+            remote = remote,
+        ));
+        let configured = load_project_registration_config(&fixture.root).unwrap();
+        assert_eq!(configured[0].actions, ["git.fetch"]);
+        assert_eq!(
+            configured[0].git,
+            Some(core::api::ProjectGitView {
+                fetch_remotes: BTreeMap::from([
+                    ("file".to_owned(), "file:///tmp/repository.git".to_owned()),
+                    (
+                        "git".to_owned(),
+                        "git://git.example.test/team/repo.git".to_owned(),
+                    ),
+                    (
+                        "http".to_owned(),
+                        "http://git.example.test/team/repo.git".to_owned(),
+                    ),
+                    (
+                        "https".to_owned(),
+                        "https://git.example.test/team/repo.git".to_owned(),
+                    ),
+                    ("origin".to_owned(), remote),
+                ]),
+                credential_helper: Some(core::api::GitCredentialHelper::Manager),
+            })
+        );
+        assert_eq!(
+            configured[0].git.as_ref().unwrap().fetch_remotes["http"],
+            "http://git.example.test/team/repo.git"
+        );
+        assert_eq!(
+            configured[0].git.as_ref().unwrap().fetch_remotes["https"],
+            "https://git.example.test/team/repo.git"
+        );
+        assert_eq!(
+            configured[0].git.as_ref().unwrap().fetch_remotes["git"],
+            "git://git.example.test/team/repo.git"
+        );
+        assert_eq!(
+            configured[0].git.as_ref().unwrap().fetch_remotes["file"],
+            "file:///tmp/repository.git"
+        );
+
+        for endpoint in [
+            "https://user:secret@example.test/repo.git",
+            "https://example.test/repo.git?token=secret",
+            "ext::ssh -i key",
+            "ssh://git.example.test/team/repo.git",
+            "../relative.git",
+            "git+custom://example.test/repo.git",
+        ] {
+            fixture.write(&format!(
+                concat!(
+                    "[projects.sample]\n",
+                    "path = {project_path}\n",
+                    "actions = ['git.fetch']\n",
+                    "[projects.sample.git]\n",
+                    "fetch_remotes = {{ origin = {endpoint:?} }}\n",
+                ),
+                project_path = project_path,
+                endpoint = endpoint,
+            ));
+            assert_eq!(
+                load_project_registration_config(&fixture.root)
+                    .expect_err("unsafe project fetch endpoint must be rejected")
+                    .code,
+                "profile_error"
+            );
+        }
     }
 
     #[test]

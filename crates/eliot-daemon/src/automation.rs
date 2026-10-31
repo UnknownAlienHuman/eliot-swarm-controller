@@ -8,9 +8,19 @@ use crate::{common::now_ms, logging, router::Router};
 use eliot_core::{
     Error, Event, FrozenScriptContext, Result, ScriptRuleContext, ScriptTimerContext,
     ScriptTimerInvocation, SecretPolicy,
-    api::{CatchUp, ProjectRegistrationView, RuleStateView, TimerSchedule, TimerStateView},
+    api::{
+        CatchUp, ProjectGitView, ProjectRegistrationView, RuleStateView, TimerSchedule,
+        TimerStateView,
+    },
     canonical_json_sha256, is_deterministic_pre_admission_rejection,
 };
+
+pub(crate) fn git_fetch_timeout_ms(timeout: Option<&str>) -> Result<i64> {
+    match timeout {
+        Some(timeout) => schedule::parse_positive_duration_ms(timeout),
+        None => Ok(eliot_core::api::DEFAULT_GIT_FETCH_TIMEOUT_MS),
+    }
+}
 use eliot_store::{
     RuleCursorOutcome, RuleDefinitionInput, RuleProcessingState, TimerDefinitionInput,
     TimerSlotCommit,
@@ -173,6 +183,9 @@ pub(crate) async fn initialize_project_rules(
             return Ok(Vec::new());
         }
     };
+    for registration in &registrations {
+        validate_project_git_endpoints(registration.git.as_ref())?;
+    }
     let inputs = registrations
         .iter()
         .map(project_registration_input)
@@ -311,6 +324,7 @@ fn project_registration_input(
         id: registration.id.clone(),
         checkout: registration.checkout.clone(),
         repo_common_dir: registration.repo_common_dir.clone(),
+        git: registration.git.clone(),
         profiles: registration.profiles.clone(),
         actions: registration.actions.clone(),
         interpreters: registration.interpreters.clone(),
@@ -325,6 +339,7 @@ fn project_registration_snapshot(
         id: registration.id.clone(),
         checkout: registration.checkout.clone(),
         repo_common_dir: registration.repo_common_dir.clone(),
+        git: registration.git.clone(),
         profiles: registration.profiles.clone(),
         actions: registration.actions.clone(),
         interpreters: registration.interpreters.clone(),
@@ -337,7 +352,17 @@ pub(crate) async fn verify_project_registration(
     registration: &ProjectRegistrationView,
 ) -> Result<()> {
     registration.validate()?;
+    validate_project_git_endpoints(registration.git.as_ref())?;
     projects::verify_registration(data_root, &project_registration_snapshot(registration)).await
+}
+
+fn validate_project_git_endpoints(git: Option<&ProjectGitView>) -> Result<()> {
+    if let Some(git) = git {
+        for endpoint in git.fetch_remotes.values() {
+            crate::git_actions::validate_approved_endpoint(endpoint)?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) async fn verify_managed_project_workspace(
@@ -2008,6 +2033,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 id: "backlog-project".to_owned(),
                 checkout: checkout.clone(),
                 repo_common_dir: format!("{checkout}/.git"),
+                git: None,
                 profiles: vec!["fake".to_owned()],
                 actions: vec!["stop".to_owned()],
                 interpreters: std::collections::BTreeMap::new(),

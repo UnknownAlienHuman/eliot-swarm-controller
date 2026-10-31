@@ -566,6 +566,7 @@ mod tests {
                     },
                 )]),
                 run_env: vec!["CI".to_owned()],
+                git: None,
                 revision: 1,
             };
             Self {

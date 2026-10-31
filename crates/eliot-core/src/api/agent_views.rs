@@ -499,6 +499,43 @@ pub struct WorkspaceCustodyView {
     pub orphan_possible: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitCredentialHelper {
+    Manager,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectGitView {
+    #[serde(default)]
+    pub fetch_remotes: BTreeMap<String, String>,
+    #[serde(default)]
+    pub credential_helper: Option<GitCredentialHelper>,
+}
+
+impl ProjectGitView {
+    pub fn validate(&self) -> Result<()> {
+        if self.fetch_remotes.iter().any(|(remote, endpoint)| {
+            remote.is_empty()
+                || remote.len() > 128
+                || remote.starts_with('-')
+                || remote
+                    .chars()
+                    .any(|character| character.is_whitespace() || character.is_control())
+                || endpoint.trim().is_empty()
+                || endpoint.len() > 4_096
+                || endpoint.chars().any(char::is_control)
+        }) {
+            return Err(Error::new(
+                "invalid",
+                "project Git fetch remotes must be bounded nonempty literals",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectRegistrationView {
@@ -509,6 +546,8 @@ pub struct ProjectRegistrationView {
     pub actions: Vec<String>,
     pub interpreters: BTreeMap<String, ScriptInterpreter>,
     pub run_env: Vec<String>,
+    #[serde(default)]
+    pub git: Option<ProjectGitView>,
     pub revision: i64,
 }
 
@@ -528,6 +567,9 @@ impl ProjectRegistrationView {
         validate_project_allowset(&self.profiles, "profiles")?;
         validate_project_allowset(&self.actions, "actions")?;
         validate_project_run_env(&self.run_env)?;
+        if let Some(git) = &self.git {
+            git.validate()?;
+        }
         for (reference, interpreter) in &self.interpreters {
             if reference.is_empty()
                 || reference.len() > 128
@@ -939,6 +981,7 @@ mod tests {
             actions: Vec::new(),
             interpreters: BTreeMap::new(),
             run_env: Vec::new(),
+            git: None,
             revision: 1,
         };
         view.validate().unwrap();
@@ -947,9 +990,18 @@ mod tests {
         assert_eq!(wire["actions"], json!([]));
         assert_eq!(wire["interpreters"], json!({}));
         assert_eq!(wire["run_env"], json!([]));
+        assert_eq!(wire["git"], Value::Null);
         assert_eq!(
             serde_json::from_value::<ProjectRegistrationView>(wire.clone()).unwrap(),
             view
+        );
+        let mut old_wire = wire.clone();
+        old_wire.as_object_mut().unwrap().remove("git");
+        assert_eq!(
+            serde_json::from_value::<ProjectRegistrationView>(old_wire)
+                .unwrap()
+                .git,
+            None
         );
         let mut unknown = wire;
         unknown["future"] = json!(true);
@@ -961,6 +1013,40 @@ mod tests {
         invalid = view;
         invalid.actions = vec!["stop".to_owned(), " ".to_owned()];
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn project_git_view_roundtrips_only_approved_literal_endpoints_and_helper() {
+        let view = ProjectGitView {
+            fetch_remotes: BTreeMap::from([(
+                "origin".to_owned(),
+                "https://git.example.test/team/repo.git".to_owned(),
+            )]),
+            credential_helper: Some(GitCredentialHelper::Manager),
+        };
+        view.validate().unwrap();
+        let wire = serde_json::to_value(&view).unwrap();
+        assert_eq!(
+            wire["fetch_remotes"]["origin"],
+            "https://git.example.test/team/repo.git"
+        );
+        assert_eq!(wire["credential_helper"], "manager");
+        assert_eq!(
+            serde_json::from_value::<ProjectGitView>(wire).unwrap(),
+            view
+        );
+
+        for (remote, endpoint) in [
+            ("--upload-pack=evil", "https://git.example.test/repo.git"),
+            ("origin", " "),
+            ("origin", "https://git.example.test/\nrepo.git"),
+        ] {
+            let invalid = ProjectGitView {
+                fetch_remotes: BTreeMap::from([(remote.to_owned(), endpoint.to_owned())]),
+                credential_helper: None,
+            };
+            assert_eq!(invalid.validate().unwrap_err().code, "invalid");
+        }
     }
 
     #[test]
