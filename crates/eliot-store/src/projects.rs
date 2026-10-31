@@ -187,6 +187,33 @@ pub(super) fn validate_project_rule_launch_action_tx(
     Ok(Some(registration))
 }
 
+pub(super) fn validate_project_resume_action_tx(
+    tx: &Transaction<'_>,
+    principal: &str,
+    target_agent: &str,
+    generation: i64,
+    expected_generation: Option<i64>,
+    has_linked_input: bool,
+) -> Result<Option<core::api::ProjectRegistrationView>> {
+    let Some(project_id) = project_id_from_principal(principal)? else {
+        return Ok(None);
+    };
+    if expected_generation.is_some_and(|expected| expected != generation) {
+        return Err(Error::new(
+            "stale_generation",
+            "project resume expected generation does not match the current Agent",
+        ));
+    }
+    let registration = load_project_registration(tx, &project_id)?
+        .ok_or_else(|| Error::new("not_allowed", "project registration is absent"))?
+        .view;
+    if has_linked_input {
+        require_project_registration_action(&registration, "send")?;
+    }
+    project_binding_for_agent_tx(tx, &registration, target_agent, generation, "resume")?;
+    Ok(Some(registration))
+}
+
 pub(super) fn capture_project_command_binding_tx(
     tx: &Transaction<'_>,
     command: &CommandInsert<'_>,
@@ -202,7 +229,7 @@ pub(super) fn capture_project_command_binding_tx(
             validate_project_launch_args(&registration, command.args)?;
         }
         if command.verb == "send" && command.link_kind == Some("send") {
-            project_launch_input_binding_tx(tx, &registration, command, target)?
+            project_start_input_binding_tx(tx, &registration, command, target)?
         } else {
             let generation = command.generation.ok_or_else(|| {
                 Error::new("not_allowed", "project command has no frozen generation")
@@ -267,6 +294,34 @@ pub(super) fn validate_project_command_dispatch_tx(
     if command.command.verb == "launch" {
         validate_project_launch_args(&registration, &command.command.args)?;
     }
+    if command.command.verb == "resume" {
+        let target = command
+            .target
+            .ok_or_else(|| Error::new("not_allowed", "project resume has no Agent target"))?;
+        let generation = command
+            .command
+            .expected_generation
+            .or(command.command.generation)
+            .ok_or_else(|| Error::new("not_allowed", "project resume has no old generation"))?;
+        let next_generation = generation
+            .checked_add(1)
+            .ok_or_else(|| Error::new("bad_state", "Agent generation cannot be incremented"))?;
+        let current = project_resume_binding_for_dispatch_tx(
+            tx,
+            &registration,
+            target,
+            &command.command.id,
+            generation,
+            next_generation,
+        )?;
+        if current != binding {
+            return Err(Error::new(
+                "not_allowed",
+                "project resume Agent, workspace or repository binding changed",
+            ));
+        }
+        return Ok(());
+    }
     if command.target.is_none() && command.command.verb == "run" {
         require_project_registration_action(&registration, "run")?;
         if binding != targetless_project_run_binding(registration.revision) {
@@ -298,6 +353,86 @@ pub(super) fn validate_project_command_dispatch_tx(
         ));
     }
     Ok(())
+}
+
+fn project_resume_binding_for_dispatch_tx(
+    tx: &Transaction<'_>,
+    registration: &core::api::ProjectRegistrationView,
+    target: i64,
+    command_id: &str,
+    old_generation: i64,
+    next_generation: i64,
+) -> Result<ProjectCommandBinding> {
+    require_project_registration_action(registration, "resume")?;
+    let agent = load_agent_by_num(tx, target)?
+        .ok_or_else(|| Error::new("not_found", "project resume Agent was not found"))?;
+    if agent.generation != old_generation || !agent.is_terminal() || agent.active_turn.is_some() {
+        return Err(Error::new(
+            "not_allowed",
+            "project resume no longer targets its retained terminal generation",
+        ));
+    }
+    if !registration
+        .profiles
+        .iter()
+        .any(|approved| approved == &agent.profile)
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "project registration does not approve the retained profile",
+        ));
+    }
+    let workspace_path = agent
+        .workspace
+        .as_deref()
+        .ok_or_else(|| Error::new("not_allowed", "project Agent has no frozen workspace"))?;
+    let (repo_path, repo_common_dir, workspace_phase, workspace_target_generation) =
+        match load_workspace(tx, target)? {
+            Some(workspace)
+                if workspace.project == registration.checkout
+                    && workspace.repo_path == registration.checkout
+                    && workspace.repo_common_dir == registration.repo_common_dir
+                    && workspace.worktree_path == workspace_path
+                    && workspace.start_command_id == command_id
+                    && workspace.phase == WorkspacePhase::Ready
+                    && workspace.target_generation == next_generation
+                    && workspace.setup_index == workspace.frozen_setup.len() =>
+            {
+                (
+                    workspace.repo_path,
+                    workspace.repo_common_dir,
+                    Some(WorkspacePhase::Ready),
+                    Some(old_generation),
+                )
+            }
+            Some(_) => {
+                return Err(Error::new(
+                    "not_allowed",
+                    "managed resume workspace is not ready at its exact next generation",
+                ));
+            }
+            None if workspace_path == registration.checkout => (
+                registration.checkout.clone(),
+                registration.repo_common_dir.clone(),
+                None,
+                None,
+            ),
+            None => {
+                return Err(Error::new(
+                    "not_allowed",
+                    "project Agent workspace is not the registered checkout",
+                ));
+            }
+        };
+    Ok(ProjectCommandBinding {
+        registration_revision: registration.revision,
+        profile: Some(agent.profile),
+        workspace: Some(workspace_path.to_owned()),
+        repo_path: Some(repo_path),
+        repo_common_dir: Some(repo_common_dir),
+        workspace_phase,
+        workspace_target_generation,
+    })
 }
 
 fn targetless_project_run_binding(registration_revision: i64) -> ProjectCommandBinding {
@@ -373,7 +508,7 @@ fn validate_project_launch_args(
     Ok(())
 }
 
-fn project_launch_input_binding_tx(
+fn project_start_input_binding_tx(
     tx: &Transaction<'_>,
     registration: &core::api::ProjectRegistrationView,
     command: &CommandInsert<'_>,
@@ -387,47 +522,116 @@ fn project_launch_input_binding_tx(
     })?;
     let parent = load_command_record(tx, parent_id)?
         .ok_or_else(|| Error::new("source_integrity", "project launch input parent is missing"))?;
+    let is_launch = parent.command.verb == "launch";
+    let is_resume = parent.command.verb == "resume";
+    if !is_launch && !is_resume {
+        return Err(Error::new(
+            "source_integrity",
+            "project linked input parent is not a launch or resume",
+        ));
+    }
+    let old_generation = if is_launch {
+        0
+    } else {
+        parent
+            .command
+            .expected_generation
+            .or(parent.command.generation)
+            .ok_or_else(|| {
+                Error::new(
+                    "source_integrity",
+                    "project resume has no retained old generation",
+                )
+            })?
+    };
+    let next_generation = old_generation
+        .checked_add(1)
+        .ok_or_else(|| Error::new("source_integrity", "project start generation overflow"))?;
+    let target_id = format_agent_id(target);
+    let linked_text = command.args.get("text").and_then(Value::as_str);
     let launch_text = parent.command.args.get("text").and_then(Value::as_str);
     if command.link_kind != Some("send")
         || command.ordinal != Some(0)
         || command.id != format!("{parent_id}/send")
         || command.target != Some(target)
-        || command.expected_generation != Some(1)
-        || command.generation != Some(1)
+        || command.expected_generation != Some(next_generation)
+        || command.generation != Some(next_generation)
         || command.expected_turn_id.is_some()
+        || command.turn_id.is_some()
         || command.request_id.is_some()
         || command.probe
         || command.state != CommandState::Queued
-        || launch_text.is_none()
-        || command.args.get("text").and_then(Value::as_str) != launch_text
+        || !command
+            .args
+            .as_object()
+            .is_some_and(|args| args.len() == 1 && args.get("text").is_some_and(Value::is_string))
         || parent.command.method != command.method
         || parent.command.principal != command.principal
-        || parent.command.verb != "launch"
+        || parent.command.target.as_deref() != Some(target_id.as_str())
         || parent.state != CommandState::Accepted
         || parent.target != Some(target)
-        || parent.command.generation != Some(0)
-        || parent
-            .command
-            .expected_generation
-            .is_some_and(|generation| generation != 0)
+        || parent.command.generation != Some(old_generation)
+        || (is_launch
+            && parent
+                .command
+                .expected_generation
+                .is_some_and(|generation| generation != old_generation))
+        || (is_resume
+            && parent
+                .command
+                .expected_generation
+                .is_some_and(|generation| generation != old_generation))
     {
         return Err(Error::new(
             "source_integrity",
-            "project linked input does not match its exact queued launch and next generation",
+            "project linked input does not match its exact queued start and next generation",
         ));
     }
-    validate_project_launch_args(registration, &parent.command.args)?;
+    if is_launch {
+        if launch_text.is_none() || linked_text != launch_text {
+            return Err(Error::new(
+                "source_integrity",
+                "project launch input differs from its retained launch text",
+            ));
+        }
+        validate_project_launch_args(registration, &parent.command.args)?;
+    } else {
+        if !super::resume_parent_payload_matches(tx, &parent.command, command.args)? {
+            return Err(Error::new(
+                "source_integrity",
+                "project resume input differs from its retained resume request",
+            ));
+        }
+        require_project_registration_action(registration, "resume")?;
+    }
     require_project_registration_action(registration, "send")?;
     let agent = load_agent_by_num(tx, target)?
-        .ok_or_else(|| Error::new("not_found", "project launch Agent was not found"))?;
-    if agent.generation != 0 || agent.state != AgentState::Created {
+        .ok_or_else(|| Error::new("not_found", "project start Agent was not found"))?;
+    let target_is_ready = if is_launch {
+        agent.generation == 0 && agent.state == AgentState::Created
+    } else {
+        agent.generation == old_generation
+            && agent.is_terminal()
+            && agent.active_turn.is_none()
+            && matches!(agent.harness.as_str(), "codex" | "fake")
+            && agent
+                .native_scope
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            && agent
+                .native_ref
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+    };
+    if !target_is_ready {
         return Err(Error::new(
             "not_allowed",
-            "project launch input is not bound to the next generation of a created Agent",
+            "project linked input is not bound to the next generation of its retained Agent",
         ));
     }
-    let binding =
-        project_binding_for_agent_tx(tx, registration, &format_agent_id(target), 0, "launch")?;
+    let action = if is_launch { "launch" } else { "resume" };
+    let mut binding =
+        project_binding_for_agent_tx(tx, registration, &target_id, old_generation, action)?;
     let encoded: Option<String> = tx
         .query_row(
             "SELECT project_binding FROM commands WHERE id = ?1",
@@ -444,8 +648,11 @@ fn project_launch_input_binding_tx(
     if saved != binding {
         return Err(Error::new(
             "source_integrity",
-            "project linked input differs from its launch registration binding",
+            "project linked input differs from its start registration binding",
         ));
+    }
+    if is_resume && binding.workspace_phase == Some(WorkspacePhase::Ready) {
+        binding.workspace_target_generation = Some(next_generation);
     }
     Ok(binding)
 }
@@ -618,7 +825,15 @@ fn normalize_registration(input: &ProjectRegistrationInput) -> Result<ProjectReg
 fn is_supported_project_action(action: &str) -> bool {
     matches!(
         action,
-        "launch" | "stop" | "send" | "interrupt" | "steer" | "approve" | "deny" | "answer"
+        "launch"
+            | "resume"
+            | "stop"
+            | "send"
+            | "interrupt"
+            | "steer"
+            | "approve"
+            | "deny"
+            | "answer"
     )
 }
 

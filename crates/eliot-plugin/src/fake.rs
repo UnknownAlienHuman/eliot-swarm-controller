@@ -575,45 +575,111 @@ fn handle_initialize(params: &Value, state: &mut FakeState) -> Result<Value, Rpc
         .map_err(|_| domain_error("internal", -32603, "plugin manifest could not be encoded"))
 }
 
-async fn handle_start(
-    raw_params: &Value,
-    state: &mut FakeState,
-    client: &PeerClient,
-) -> Result<Value, RpcError> {
-    require_initialized(state)?;
-    reject_observer_control(state)?;
-    let params: AgentStartParams = decode_params(raw_params)?;
+fn synthetic_native_subject(agent_id: &str) -> RetainedNativeSubject {
+    RetainedNativeSubject {
+        agent_id: agent_id.to_owned(),
+        native_scope: format!("fake:synthetic:scope:{agent_id}"),
+        native_ref: format!("fake:synthetic:session:{agent_id}"),
+    }
+}
+
+fn decode_resume_subject(value: &Value, agent_id: &str) -> Result<RetainedNativeSubject, RpcError> {
+    let Some(object) = value.as_object().filter(|object| object.len() == 2) else {
+        return Err(invalid_params(
+            "resume_from must contain exactly native_scope and native_ref",
+        ));
+    };
+    let native_scope = object
+        .get("native_scope")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| invalid_params("resume_from native_scope is invalid"))?;
+    let native_ref = object
+        .get("native_ref")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| invalid_params("resume_from native_ref is invalid"))?;
+    Ok(RetainedNativeSubject {
+        agent_id: agent_id.to_owned(),
+        native_scope: native_scope.to_owned(),
+        native_ref: native_ref.to_owned(),
+    })
+}
+
+fn prepare_fake_start(
+    state: &FakeState,
+    params: &AgentStartParams,
+) -> Result<Option<FakeStartPlan>, RpcError> {
     validate_agent_identity(&params.agent_id, params.generation, &params.command_id)?;
-    if params.initial.is_some() || params.resume_from.is_some() {
+    if params.initial.is_some() {
         return Err(domain_error(
             "unsupported",
             -32602,
-            "fake plugin does not support input-created start or resume",
+            "fake plugin does not support input-created start",
         ));
     }
-    if let Some(binding) = &state.binding
-        && (binding.agent_id != params.agent_id || binding.generation != params.generation)
-    {
-        return Err(domain_error(
-            "stale_generation",
-            -32033,
-            "start does not match the bound Agent generation",
-        ));
+
+    match &state.binding {
+        None => {
+            if state.phase != SessionPhase::New || state.retained_subject.is_some() {
+                return Err(domain_error(
+                    "bad_state",
+                    -32024,
+                    "fake session cannot start without its retained binding",
+                ));
+            }
+            if (params.resume_from.is_none() && params.generation != 1)
+                || (params.resume_from.is_some() && params.generation < 2)
+            {
+                return Err(domain_error(
+                    "stale_generation",
+                    -32033,
+                    "fake launch or resume does not match the Agent generation",
+                ));
+            }
+        }
+        Some(binding)
+            if binding.agent_id == params.agent_id && binding.generation == params.generation => {}
+        Some(_) => {
+            return Err(domain_error(
+                "stale_generation",
+                -32033,
+                "start does not match the bound Agent generation",
+            ));
+        }
     }
+
     if state.batch_unknown {
         return Err(unknown_effect());
     }
 
+    let requested_resume = params
+        .resume_from
+        .as_ref()
+        .map(|value| decode_resume_subject(value, &params.agent_id))
+        .transpose()?;
+
     if state.phase == SessionPhase::Idle
         && state.start_command_id.as_deref() == Some(params.command_id.as_str())
     {
-        return Ok(json!({
-            "agent_id": params.agent_id,
-            "generation": params.generation,
-            "command_id": params.command_id,
-            "state": "ready"
-        }));
+        if state.start_resume_from != requested_resume || state.retained_subject.is_none() {
+            return Err(domain_error(
+                "source_integrity",
+                -32025,
+                "start command id was reused with different resume context",
+            ));
+        }
+        let expected = synthetic_native_subject(&params.agent_id);
+        if state.retained_subject.as_ref() != Some(&expected) {
+            return Err(domain_error(
+                "source_integrity",
+                -32025,
+                "fake session subject does not match its Agent",
+            ));
+        }
+        return Ok(None);
     }
+
     if state.phase != SessionPhase::New {
         return Err(domain_error(
             "bad_state",
@@ -622,23 +688,92 @@ async fn handle_start(
         ));
     }
     if let Some(command_id) = &state.start_command_id
-        && command_id != &params.command_id
+        && (command_id != &params.command_id || state.start_resume_from != requested_resume)
     {
         return Err(domain_error(
             "source_integrity",
             -32025,
-            "start command id changed for the bound generation",
+            "start command id or resume context changed for the bound generation",
         ));
     }
 
+    let expected = synthetic_native_subject(&params.agent_id);
+    let subject = match requested_resume.as_ref() {
+        Some(requested) => {
+            if requested != &expected
+                || state
+                    .retained_subject
+                    .as_ref()
+                    .is_some_and(|retained| retained != requested)
+            {
+                return Err(domain_error(
+                    "source_integrity",
+                    -32025,
+                    "resume subject does not match the Agent's retained native subject",
+                ));
+            }
+            (*requested).clone()
+        }
+        None => {
+            if let Some(retained) = &state.retained_subject {
+                if retained != &expected {
+                    return Err(domain_error(
+                        "source_integrity",
+                        -32025,
+                        "fake session subject does not match its Agent",
+                    ));
+                }
+                retained.clone()
+            } else {
+                expected
+            }
+        }
+    };
+
+    if state
+        .retained_subject
+        .as_ref()
+        .is_some_and(|retained| retained != &subject)
+    {
+        return Err(domain_error(
+            "source_integrity",
+            -32025,
+            "fake session subject changed across generations",
+        ));
+    }
+
+    Ok(Some(FakeStartPlan {
+        subject,
+        resume_from: requested_resume,
+    }))
+}
+async fn handle_start(
+    raw_params: &Value,
+    state: &mut FakeState,
+    client: &PeerClient,
+) -> Result<Value, RpcError> {
+    require_initialized(state)?;
+    reject_observer_control(state)?;
+    let params: AgentStartParams = decode_params(raw_params)?;
+    let Some(plan) = prepare_fake_start(state, &params)? else {
+        return Ok(json!({
+            "agent_id": params.agent_id,
+            "generation": params.generation,
+            "command_id": params.command_id,
+            "state": "ready"
+        }));
+    };
+
     let credential = state.credential.clone().ok_or_else(not_initialized)?;
-    let batch = session_ready_batch(&params.agent_id, params.generation);
+    let batch = session_ready_batch(&params.agent_id, params.generation, &plan.subject);
 
     state.source_policy = source_secret_policy(
         params.profile.as_ref(),
         params.target_environment.as_ref(),
         &credential,
     );
+    state.retained_subject = Some(plan.subject);
+    state.start_resume_from = plan.resume_from;
     state.binding = Some(Binding {
         agent_id: params.agent_id.clone(),
         generation: params.generation,
@@ -666,7 +801,6 @@ async fn handle_start(
         }
     }
 }
-
 async fn handle_command(
     raw_params: &Value,
     state: &mut FakeState,
@@ -1232,7 +1366,11 @@ fn handle_shutdown(state: &FakeState) -> Result<Value, RpcError> {
     Ok(json!({"state": "shutdown"}))
 }
 
-fn session_ready_batch(agent_id: &str, generation: i64) -> SourceBatch {
+fn session_ready_batch(
+    agent_id: &str,
+    generation: i64,
+    subject: &RetainedNativeSubject,
+) -> SourceBatch {
     let event_id = format!("fake:{agent_id}:{generation}:session.ready");
     SourceBatch {
         batch_id: format!("fake:{agent_id}:{generation}:session-ready"),
@@ -1243,12 +1381,14 @@ fn session_ready_batch(agent_id: &str, generation: i64) -> SourceBatch {
             kind: "session.ready".to_owned(),
             native_id: event_id,
             ts: None,
-            data: empty_object(),
+            data: json!({
+                "native_scope": subject.native_scope,
+                "native_ref": subject.native_ref,
+            }),
         }],
         cursor: None,
     }
 }
-
 fn fixture_pending_request(
     params: &AgentCommandParams,
     turn_id: &str,
@@ -1882,12 +2022,25 @@ fn domain_error(code: &str, rpc_code: i64, message: &str) -> RpcError {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RetainedNativeSubject {
+    agent_id: String,
+    native_scope: String,
+    native_ref: String,
+}
+
+struct FakeStartPlan {
+    subject: RetainedNativeSubject,
+    resume_from: Option<RetainedNativeSubject>,
+}
 #[derive(Default)]
 struct FakeState {
     credential: Option<String>,
     source_policy: SecretPolicy,
     binding: Option<Binding>,
     observer: Option<FakeObserver>,
+    retained_subject: Option<RetainedNativeSubject>,
+    start_resume_from: Option<RetainedNativeSubject>,
     publish_source: Option<String>,
     start_command_id: Option<String>,
     stop_command_id: Option<String>,
@@ -1916,7 +2069,7 @@ struct Binding {
     generation: i64,
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum SessionPhase {
     #[default]
     New,
@@ -2398,6 +2551,12 @@ mod provider_hold_tests {
             assert!(manifest["verbs"].as_array().unwrap().contains(&json!(verb)));
         }
         assert_eq!(manifest["sources"]["controlled"]["request"], "stream");
+        assert!(
+            manifest["verbs"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("resume"))
+        );
 
         let mut held = command(HOLD_TURN_FIXTURE_INPUT);
         held.agent_id = "a1".to_owned();
@@ -2636,5 +2795,247 @@ mod provider_hold_tests {
         let (non_exact, _) = completion("[eliot_fake_provider_rate_limit] extra text");
         assert_eq!(non_exact["status"], "completed");
         assert!(non_exact.get("provider_restriction").is_none());
+    }
+}
+
+#[cfg(test)]
+mod start_resume_tests {
+    use super::*;
+
+    fn start_params(
+        agent_id: &str,
+        generation: i64,
+        command_id: &str,
+        resume_from: Option<Value>,
+        initial: Option<Value>,
+    ) -> AgentStartParams {
+        AgentStartParams {
+            agent_id: agent_id.to_owned(),
+            generation,
+            command_id: command_id.to_owned(),
+            profile: None,
+            workspace: None,
+            target_environment: None,
+            note: None,
+            source_plan: None,
+            source_state: None,
+            resume_from,
+            initial,
+        }
+    }
+
+    fn subject_value(subject: &RetainedNativeSubject) -> Value {
+        json!({
+            "native_scope": subject.native_scope,
+            "native_ref": subject.native_ref,
+        })
+    }
+
+    fn planned_start(state: &FakeState, params: &AgentStartParams) -> FakeStartPlan {
+        prepare_fake_start(state, params)
+            .unwrap_or_else(|error| panic!("unexpected RPC error code {}", error.code))
+            .unwrap_or_else(|| panic!("expected a new start plan"))
+    }
+
+    fn stopped_state(subject: RetainedNativeSubject) -> FakeState {
+        FakeState {
+            binding: Some(Binding {
+                agent_id: subject.agent_id.clone(),
+                generation: 1,
+            }),
+            retained_subject: Some(subject),
+            start_command_id: Some("launch-a7".to_owned()),
+            stop_command_id: Some("stop-a7".to_owned()),
+            phase: SessionPhase::Stopped,
+            ..FakeState::default()
+        }
+    }
+
+    #[test]
+    fn first_start_emits_a_synthetic_subject_bound_to_the_agent() {
+        let plan = planned_start(
+            &FakeState::default(),
+            &start_params("a7", 1, "launch-a7", None, None),
+        );
+
+        assert_eq!(plan.subject.agent_id, "a7");
+        assert_eq!(plan.subject.native_scope, "fake:synthetic:scope:a7");
+        assert_eq!(plan.subject.native_ref, "fake:synthetic:session:a7");
+        let batch = session_ready_batch("a7", 1, &plan.subject);
+        assert_eq!(
+            batch.events[0].data,
+            json!({
+                "native_scope": "fake:synthetic:scope:a7",
+                "native_ref": "fake:synthetic:session:a7",
+            })
+        );
+        assert!(batch.events[0].data.get("text").is_none());
+        assert!(batch.events[0].data.get("input").is_none());
+    }
+
+    #[test]
+    fn fresh_generation_resume_preserves_the_exact_retained_pair() {
+        let first = planned_start(
+            &FakeState::default(),
+            &start_params("a7", 1, "launch-a7", None, None),
+        );
+        let params = start_params(
+            "a7",
+            2,
+            "resume-a7",
+            Some(subject_value(&first.subject)),
+            None,
+        );
+        let plan = planned_start(&FakeState::default(), &params);
+
+        assert_eq!(plan.subject, first.subject);
+        assert_eq!(plan.resume_from, Some(first.subject.clone()));
+        let batch = session_ready_batch("a7", 2, &plan.subject);
+        assert_eq!(batch.generation, 2);
+        assert_eq!(
+            batch.events[0].data,
+            json!({
+                "native_scope": first.subject.native_scope,
+                "native_ref": first.subject.native_ref,
+            })
+        );
+    }
+
+    #[test]
+    fn fresh_resume_rejects_subject_aliases_and_other_agents() {
+        let retained = synthetic_native_subject("a7");
+        let alias = RetainedNativeSubject {
+            native_ref: "fake:synthetic:session:alias".to_owned(),
+            ..retained.clone()
+        };
+        let error = match prepare_fake_start(
+            &FakeState::default(),
+            &start_params("a7", 2, "resume-a7", Some(subject_value(&alias)), None),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a fresh subject alias must be rejected"),
+        };
+        assert_eq!(error.data.unwrap()["code"], "source_integrity");
+
+        let error = match prepare_fake_start(
+            &FakeState::default(),
+            &start_params("a8", 2, "resume-a8", Some(subject_value(&retained)), None),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("another Agent must not claim the retained subject"),
+        };
+        assert_eq!(error.data.unwrap()["code"], "source_integrity");
+    }
+
+    #[test]
+    fn stopped_fake_instance_rejects_a_new_generation() {
+        let retained = synthetic_native_subject("a7");
+        let state = stopped_state(retained.clone());
+        let params = start_params("a7", 2, "resume-a7", Some(subject_value(&retained)), None);
+
+        let error = match prepare_fake_start(&state, &params) {
+            Err(error) => error,
+            Ok(_) => panic!("a stopped Fake instance must remain fenced to its generation"),
+        };
+        assert_eq!(error.data.unwrap()["code"], "stale_generation");
+        assert_eq!(state.binding.as_ref().unwrap().generation, 1);
+        assert_eq!(state.phase, SessionPhase::Stopped);
+    }
+
+    #[test]
+    fn same_start_id_only_acknowledges_the_exact_resume_request() {
+        let retained = synthetic_native_subject("a7");
+        let mut state = FakeState {
+            binding: Some(Binding {
+                agent_id: "a7".to_owned(),
+                generation: 2,
+            }),
+            retained_subject: Some(retained.clone()),
+            start_resume_from: Some(retained.clone()),
+            start_command_id: Some("resume-a7".to_owned()),
+            phase: SessionPhase::Idle,
+            ..FakeState::default()
+        };
+        let exact = start_params("a7", 2, "resume-a7", Some(subject_value(&retained)), None);
+        assert!(matches!(prepare_fake_start(&state, &exact), Ok(None)));
+
+        let alias = RetainedNativeSubject {
+            native_ref: "fake:synthetic:session:alias".to_owned(),
+            ..retained.clone()
+        };
+        let changed = start_params("a7", 2, "resume-a7", Some(subject_value(&alias)), None);
+        let error = match prepare_fake_start(&state, &changed) {
+            Err(error) => error,
+            Ok(_) => panic!("same command id must not change its resume context"),
+        };
+        assert_eq!(error.data.unwrap()["code"], "source_integrity");
+
+        state.batch_unknown = true;
+        let error = match prepare_fake_start(&state, &exact) {
+            Err(error) => error,
+            Ok(_) => panic!("unknown batch must block a same-id acknowledgement"),
+        };
+        assert_eq!(error.data.unwrap()["code"], "unknown");
+        assert_eq!(state.phase, SessionPhase::Idle);
+        assert_eq!(state.binding.as_ref().unwrap().generation, 2);
+        assert_eq!(state.retained_subject.as_ref(), Some(&retained));
+    }
+
+    #[test]
+    fn input_created_start_stays_unsupported_and_resume_never_replays_input() {
+        let initial = start_params(
+            "a7",
+            1,
+            "launch-a7",
+            None,
+            Some(json!({"command_id":"send-old","text":"old input"})),
+        );
+        let error = match prepare_fake_start(&FakeState::default(), &initial) {
+            Err(error) => error,
+            Ok(_) => panic!("input-created start must remain unsupported"),
+        };
+        assert_eq!(error.data.unwrap()["code"], "unsupported");
+
+        let retained = synthetic_native_subject("a7");
+        let plan = planned_start(
+            &FakeState::default(),
+            &start_params("a7", 2, "resume-a7", Some(subject_value(&retained)), None),
+        );
+        let batch = session_ready_batch("a7", 2, &plan.subject);
+        assert_eq!(batch.events[0].data, subject_value(&retained));
+        assert!(
+            batch
+                .events
+                .iter()
+                .all(|event| event.data.get("text").is_none())
+        );
+    }
+
+    #[test]
+    fn unknown_batch_blocks_same_generation_resume_without_changing_identity() {
+        let retained = synthetic_native_subject("a7");
+        let state = FakeState {
+            binding: Some(Binding {
+                agent_id: "a7".to_owned(),
+                generation: 2,
+            }),
+            retained_subject: Some(retained.clone()),
+            start_resume_from: Some(retained.clone()),
+            start_command_id: Some("resume-a7".to_owned()),
+            phase: SessionPhase::Unknown,
+            batch_unknown: true,
+            ..FakeState::default()
+        };
+        let params = start_params("a7", 2, "resume-a7", Some(subject_value(&retained)), None);
+
+        let error = match prepare_fake_start(&state, &params) {
+            Err(error) => error,
+            Ok(_) => panic!("an unknown batch must block resume"),
+        };
+        assert_eq!(error.data.unwrap()["code"], "unknown");
+        assert!(state.batch_unknown);
+        assert_eq!(state.retained_subject.as_ref(), Some(&retained));
+        assert_eq!(state.binding.as_ref().unwrap().generation, 2);
+        assert_eq!(state.phase, SessionPhase::Unknown);
     }
 }

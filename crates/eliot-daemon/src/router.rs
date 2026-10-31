@@ -664,8 +664,10 @@ impl Router {
         request: SubmitCommand,
     ) -> Result<PreparedSubmission> {
         validate_rule_launch_action(&request, None)?;
+        validate_rule_resume_action(&request, None)?;
         let prepared = self.prepare_submission(request, &Principal::Owner).await?;
         validate_rule_launch_preparation(&prepared)?;
+        validate_rule_resume_preparation(&prepared, None)?;
         Ok(prepared)
     }
 
@@ -777,12 +779,18 @@ impl Router {
         for request in requests {
             let prepared_request = self.prepare_submission(request, &principal).await?;
             validate_rule_launch_preparation(&prepared_request)?;
+            validate_rule_resume_preparation(&prepared_request, Some(registration))?;
             if let (Some(target), Some(generation)) = (
                 prepared_request.request.target.as_deref(),
                 prepared_request.request.expected_generation,
             ) {
-                self.verify_project_rule_target(registration, target, generation)
-                    .await?;
+                if prepared_request.request.verb == "resume" {
+                    self.verify_project_rule_resume_target(registration, target, generation)
+                        .await?;
+                } else {
+                    self.verify_project_rule_target(registration, target, generation)
+                        .await?;
+                }
             }
             prepared.push(prepared_request);
         }
@@ -814,6 +822,7 @@ impl Router {
         registration: &ProjectRegistrationView,
     ) -> Result<PreparedSubmission> {
         validate_rule_launch_action(&request, Some(registration))?;
+        validate_rule_resume_action(&request, Some(registration))?;
         let principal = Principal::ProjectRule {
             registration: registration.clone(),
         };
@@ -821,6 +830,16 @@ impl Router {
             .prepare_submission_after_authorization(request, &principal, true)
             .await?;
         validate_rule_launch_preparation(&prepared)?;
+        validate_rule_resume_preparation(&prepared, Some(registration))?;
+        if prepared.request.verb == "resume"
+            && let (Some(target), Some(generation)) = (
+                prepared.request.target.as_deref(),
+                prepared.request.expected_generation,
+            )
+        {
+            self.verify_project_rule_resume_target(registration, target, generation)
+                .await?;
+        }
         Ok(prepared)
     }
 
@@ -848,8 +867,76 @@ impl Router {
         .await
     }
 
-    /// Return false only for a stale captured generation. Workspace/project
-    /// authority failures remain errors for the catch-up request.
+    async fn verify_project_rule_resume_target(
+        &self,
+        registration: &ProjectRegistrationView,
+        target: &str,
+        generation: i64,
+    ) -> Result<()> {
+        let Some((agent, workspace)) = self
+            .project_rule_target_snapshot(target, generation)
+            .await?
+        else {
+            return Err(Error::new(
+                "stale_generation",
+                "project resume generation is stale",
+            ));
+        };
+        self.verify_project_rule_target_workspace(
+            registration,
+            &agent,
+            workspace.as_ref(),
+            generation,
+        )
+        .await?;
+        validate_project_rule_resume_profile(registration, &agent)
+    }
+
+    async fn verify_project_rule_resume_after_admission(
+        &self,
+        registration: &ProjectRegistrationView,
+        command: &Command,
+    ) -> Result<()> {
+        registration.validate()?;
+        let target = command
+            .target
+            .as_deref()
+            .ok_or_else(|| Error::new("invalid", "project resume has no Agent target"))?;
+        let retained_generation = command
+            .generation
+            .ok_or_else(|| Error::new("invalid", "project resume has no retained generation"))?;
+        let Some((agent, workspace)) = self
+            .project_rule_target_snapshot(target, retained_generation)
+            .await?
+        else {
+            return Err(Error::new(
+                "stale_generation",
+                "project resume no longer targets its retained Agent generation",
+            ));
+        };
+        validate_project_rule_resume_profile(registration, &agent)?;
+        match workspace {
+            Some(workspace) => {
+                crate::automation::verify_managed_project_resume_workspace(
+                    registration,
+                    &workspace,
+                    &agent,
+                    command,
+                )
+                .await
+            }
+            None => {
+                self.verify_project_rule_target_workspace(
+                    registration,
+                    &agent,
+                    None,
+                    retained_generation,
+                )
+                .await
+            }
+        }
+    }
+
     pub(crate) async fn verify_project_rule_target_scope(
         &self,
         registration: &ProjectRegistrationView,
@@ -2027,10 +2114,19 @@ impl Router {
         principal: &str,
         project: Option<&ProjectRegistrationView>,
         state: &RuleStateView,
+        revision: i64,
         event_seq: i64,
         prepared: PreparedSubmission,
     ) -> Result<Option<eliot_store::RuleEventAdmission>> {
+        if prepared.request.verb == "resume"
+            && let Some(admission) = self
+                .replay_rule_event_action(principal, state, revision, event_seq)
+                .await?
+        {
+            return Ok(Some(admission));
+        }
         validate_rule_launch_preparation(&prepared)?;
+        validate_rule_resume_preparation(&prepared, project)?;
         let PreparedSubmission { request, workspace } = prepared;
         if workspace.is_some() {
             return Err(Error::new(
@@ -2081,6 +2177,7 @@ impl Router {
                 }
             }
         } else if request.verb != "launch"
+            && request.verb != "resume"
             && !matches!(
                 request.verb.as_str(),
                 "stop" | "send" | "steer" | "interrupt" | "approve" | "deny" | "answer"
@@ -2088,32 +2185,42 @@ impl Router {
         {
             return Err(Error::new(
                 "invalid",
-                "rule firing must contain a prepared stop, send, launch, steer, interrupt, reply, or Run action",
+                "rule firing must contain a prepared stop, send, launch, resume, steer, interrupt, reply, or Run action",
             ));
         }
         let admission = {
             let mut store = self.inner.store.lock().await;
-            if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
-                return Ok(None);
-            }
-            let replay_first_action = matches!(
-                request.verb.as_str(),
-                "launch" | "approve" | "deny" | "answer"
-            );
-            // Store resolves retained launch/reply parents before current gates.
-            if !replay_first_action && let Some(expected) = project {
-                let current = store
-                    .get_project_registration("owner", &expected.id)?
-                    .ok_or_else(|| Error::new("not_allowed", "project registration was removed"))?;
-                if &current != expected {
-                    return Err(Error::new(
-                        "not_allowed",
-                        "project registration changed before rule admission",
-                    ));
+            let retained_resume = if request.verb == "resume" {
+                store.replay_rule_event_action(principal, state, revision, event_seq)?
+            } else {
+                None
+            };
+            let admission = if let Some(admission) = retained_resume {
+                admission
+            } else {
+                if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
+                    return Ok(None);
                 }
-            }
-            let admission =
-                store.admit_rule_action(principal, state, event_seq, request, now_ms())?;
+                let replay_first_action = matches!(
+                    request.verb.as_str(),
+                    "launch" | "approve" | "deny" | "answer"
+                );
+                // Store resolves retained launch/reply parents before current gates.
+                if !replay_first_action && let Some(expected) = project {
+                    let current = store
+                        .get_project_registration("owner", &expected.id)?
+                        .ok_or_else(|| {
+                            Error::new("not_allowed", "project registration was removed")
+                        })?;
+                    if &current != expected {
+                        return Err(Error::new(
+                            "not_allowed",
+                            "project registration changed before rule admission",
+                        ));
+                    }
+                }
+                store.admit_rule_action(principal, state, event_seq, request, now_ms())?
+            };
             self.publish_locked(&admission.events);
             admission
         };
@@ -3308,6 +3415,22 @@ impl Router {
                     self.reject_undispatched(&id, &error.code).await;
                     return;
                 }
+            } else if command.verb == "resume" {
+                if let Err(error) = validate_project_rule_resume_command(
+                    &registration,
+                    &command,
+                    linked_id.is_some(),
+                ) {
+                    self.reject_undispatched(&id, &error.code).await;
+                    return;
+                }
+                if let Err(error) = self
+                    .verify_project_rule_resume_after_admission(&registration, &command)
+                    .await
+                {
+                    self.reject_undispatched(&id, &error.code).await;
+                    return;
+                }
             } else if matches!(
                 command.verb.as_str(),
                 "stop" | "send" | "steer" | "interrupt" | "approve" | "deny" | "answer"
@@ -3330,7 +3453,7 @@ impl Router {
         if matches!(command.verb.as_str(), "launch" | "resume")
             && let Err(error) = self.inner.workspaces.prepare(&id).await
         {
-            self.settle_plugin_error(&id, &error).await;
+            self.settle_workspace_prepare_error(&id, &error).await;
             self.signal_progress();
             return;
         }
@@ -3466,16 +3589,8 @@ impl Router {
                 }
                 Ok(change) => break change.value,
                 Err(error) => {
-                    self.settle_dispatch_error(
-                        &id,
-                        &error,
-                        change.1,
-                        launch_binding.is_some(),
-                        command.verb == "run"
-                            && (command.principal == "owner"
-                                || command.principal.starts_with("project:")),
-                    )
-                    .await;
+                    self.settle_dispatch_error(&id, &error, change.1, launch_binding.is_some())
+                        .await;
                     return;
                 }
             }
@@ -3773,25 +3888,20 @@ impl Router {
         error: &Error,
         write_faulted: bool,
         native_binding: bool,
-        script_run: bool,
     ) {
         // This is only the local Store dispatch result, before any control RPC.
         // A plugin error with the same code still follows post-I/O C1 handling.
-        let revoked_run_authority = script_run
-            && error.code == "not_allowed"
-            && is_deterministic_pre_admission_rejection(&error.code);
         if write_faulted {
             self.note_unknown_if_uncertain(id, "store_dispatch_outcome_unknown")
                 .await;
         } else if matches!(
             error.code.as_str(),
-            "bad_state" | "stale_generation" | "not_found" | "provider_held"
+            "bad_state" | "stale_generation" | "not_found" | "provider_held" | "not_allowed"
         ) || native_binding
             && matches!(
                 error.code.as_str(),
                 "source_integrity" | "frame_too_large" | "invalid"
             )
-            || revoked_run_authority
         {
             self.reject_undispatched(id, &error.code).await;
         }
@@ -3835,57 +3945,16 @@ impl Router {
             let command = store
                 .get_command(command_id)?
                 .ok_or_else(|| Error::new("not_found", "resume command was not found"))?;
-            if command.verb != "resume" {
-                return Err(Error::new("bad_state", "command is not a resume"));
-            }
-            if command.state != CommandState::Accepted {
-                return Err(Error::new(
-                    "bad_state",
-                    "resume source state must be captured before dispatch",
-                ));
-            }
             let agent_id = command
                 .target
-                .ok_or_else(|| Error::new("not_found", "resume target Agent is missing"))?;
-            let generation = command.expected_generation.ok_or_else(|| {
-                Error::new(
-                    "stale_generation",
-                    "resume did not capture its old generation",
-                )
-            })?;
+                .as_deref()
+                .filter(|target| eliot_core::parse_agent_id(target).is_ok())
+                .ok_or_else(|| Error::new("not_found", "resume target Agent is missing"))?
+                .to_owned();
             let agent = store
                 .get_agent(&agent_id)?
                 .ok_or_else(|| Error::new("not_found", "resume Agent was not found"))?;
-            let binding: NativeStoreBinding = agent
-                .profile_snapshot
-                .get("native_store_binding")
-                .cloned()
-                .ok_or_else(|| {
-                    Error::new(
-                        "unsupported",
-                        "resume requires a retained native store binding",
-                    )
-                })
-                .and_then(|value| {
-                    serde_json::from_value(value).map_err(|_| {
-                        Error::new(
-                            "source_integrity",
-                            "retained native store binding is malformed",
-                        )
-                    })
-                })?;
-            if agent.native_scope.as_deref() != Some(binding.native_scope.as_str()) {
-                return Err(Error::new(
-                    "source_integrity",
-                    "resume native scope differs from its retained store binding",
-                ));
-            }
-            if command.generation != Some(generation) {
-                return Err(Error::new(
-                    "stale_generation",
-                    "resume command generation does not match its captured generation",
-                ));
-            }
+            let generation = validate_retained_resume_agent(&agent, &command)?;
             let source =
                 store.read_source_state(&agent_id, generation, CONTROLLED_PLUGIN_SOURCE)?;
             let latest_turn = store
@@ -3920,7 +3989,33 @@ impl Router {
                 Ok(Some(command))
                     if matches!(command.state, CommandState::Accepted | CommandState::Queued) =>
                 {
-                    store.settle(id, CommandState::Rejected, Some(outcome), now_ms())
+                    let workspace_resume = if command.verb == "resume" {
+                        match (
+                            command.target.as_deref(),
+                            command
+                                .generation
+                                .and_then(|generation| generation.checked_add(1)),
+                        ) {
+                            (Some(target), Some(next_generation)) => {
+                                store.get_workspace(target).map(|workspace| {
+                                    workspace.is_some_and(|workspace| {
+                                        workspace.start_command_id == id
+                                            && workspace.target_generation == next_generation
+                                    })
+                                })
+                            }
+                            _ => Ok(false),
+                        }
+                    } else {
+                        Ok(false)
+                    };
+                    match workspace_resume {
+                        Ok(true) => store.reject_workspace_resume(id, reason, now_ms()),
+                        Ok(false) => {
+                            store.settle(id, CommandState::Rejected, Some(outcome), now_ms())
+                        }
+                        Err(error) => Err(error),
+                    }
                 }
                 Ok(_) => return,
                 Err(error) => Err(error),
@@ -4179,6 +4274,48 @@ impl Router {
         }
         self.redact_native_value(&mut outcome);
         let _ = self.settle(id, state, Some(outcome)).await;
+    }
+
+    async fn settle_workspace_prepare_error(&self, id: &str, error: &Error) {
+        // WorkspaceManager persists its typed creation/setup outcomes. A Ready
+        // retained Resume readback is the remaining pre-native Unknown; Store
+        // rechecks that exact pending marker atomically before recording it.
+        if error.code == "unknown" {
+            let mut store = self.inner.store.lock().await;
+            if let Ok(Some(command)) = store.get_command(id)
+                && command.verb == "resume"
+                && matches!(command.state, CommandState::Accepted | CommandState::Queued)
+                && let Some(target_generation) = command
+                    .generation
+                    .and_then(|generation| generation.checked_add(1))
+                && let Ok(change) = store.settle_workspace_creation(
+                    id,
+                    target_generation,
+                    eliot_core::WorkspaceCreationOutcome::Unknown {
+                        code: "workspace_identity_unknown".to_owned(),
+                        message: "retained workspace identity could not be confirmed".to_owned(),
+                    },
+                    now_ms(),
+                )
+            {
+                self.publish_locked(&change.events);
+            }
+        }
+        let secrets = self
+            .inner
+            .secrets
+            .lock_recover()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let error = crate::redaction::redact_error(error.clone(), &secrets);
+        crate::logging::record(
+            &SecretPolicy::new(&secrets),
+            &error.code,
+            &[("command", id)],
+            Some(&error),
+        );
+        self.signal_progress();
     }
 
     pub(crate) async fn settle(
@@ -4568,7 +4705,7 @@ fn rule_admission_dispatch_plan(
             .map(|linked| linked.id.clone());
         return Some((command.id.clone(), linked_id));
     }
-    if command.verb == "launch"
+    if matches!(command.verb.as_str(), "launch" | "resume")
         && command.state == CommandState::Applied
         && let Some(linked) = &admission.linked_command
         && matches!(linked.state, CommandState::Accepted | CommandState::Queued)
@@ -4801,6 +4938,252 @@ fn validate_project_rule_launch_command(
         return Err(Error::new(
             "not_allowed",
             "project launch text requires the send action grant",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_rule_resume_action(
+    request: &SubmitCommand,
+    project: Option<&ProjectRegistrationView>,
+) -> Result<()> {
+    if request.verb != "resume" {
+        return Ok(());
+    }
+    if !request.id.is_empty()
+        || !request
+            .target
+            .as_deref()
+            .is_some_and(|target| eliot_core::parse_agent_id(target).is_ok())
+        || request
+            .expected_generation
+            .is_none_or(|generation| generation < 0)
+        || request.expected_turn_id.is_some()
+        || request.request_id.is_some()
+        || request.probe
+    {
+        return Err(Error::new(
+            "invalid",
+            "rule resume must bind the captured Agent and generation without turn or request fields",
+        ));
+    }
+    let args = request
+        .args
+        .as_object()
+        .ok_or_else(|| Error::new("invalid", "rule resume args must be an object"))?;
+    if args.keys().any(|key| key != "text") {
+        return Err(Error::new(
+            "unsupported",
+            "rule resume accepts only optional new text; profile, subject and workspace are retained",
+        ));
+    }
+    let text = match args.get("text") {
+        None => None,
+        Some(Value::String(text)) if !text.trim().is_empty() => Some(text),
+        Some(_) => {
+            return Err(Error::new(
+                "invalid",
+                "rule resume text must be a nonempty string when supplied",
+            ));
+        }
+    };
+    if text.is_some_and(|text| text.len() > MAX_EVENT_BYTES) {
+        return Err(Error::new(
+            "frame_too_large",
+            "rule resume text exceeds the 64 KiB persisted-text limit",
+        ));
+    }
+    if let Some(registration) = project {
+        registration.validate()?;
+        if !registration.actions.iter().any(|action| action == "resume") {
+            return Err(Error::new(
+                "not_allowed",
+                "project rule is not approved for resume",
+            ));
+        }
+        if text.is_some() && !registration.actions.iter().any(|action| action == "send") {
+            return Err(Error::new(
+                "not_allowed",
+                "project resume text requires the send action grant",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_rule_resume_preparation(
+    prepared: &PreparedSubmission,
+    project: Option<&ProjectRegistrationView>,
+) -> Result<()> {
+    if prepared.request.verb != "resume" {
+        return Ok(());
+    }
+    validate_rule_resume_action(&prepared.request, project)?;
+    if prepared.workspace.is_some() {
+        return Err(Error::new(
+            "unsupported",
+            "rule resume cannot create or prepare a workspace",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_retained_resume_agent(agent: &Agent, command: &Command) -> Result<i64> {
+    if command.verb != "resume" {
+        return Err(Error::new("bad_state", "command is not a resume"));
+    }
+    if !matches!(command.state, CommandState::Accepted | CommandState::Queued) {
+        return Err(Error::new(
+            "bad_state",
+            "resume source state must be captured before dispatch",
+        ));
+    }
+    let target = command
+        .target
+        .as_deref()
+        .filter(|target| eliot_core::parse_agent_id(target).is_ok())
+        .ok_or_else(|| Error::new("not_found", "resume target Agent is missing"))?;
+    if target != agent.id {
+        return Err(Error::new(
+            "source_integrity",
+            "resume command target differs from its retained Agent",
+        ));
+    }
+    if agent.observe_only || agent.state == eliot_core::AgentState::Unknown {
+        return Err(Error::new(
+            "not_allowed",
+            "observe-only or unknown Agents cannot resume",
+        ));
+    }
+    let generation = command
+        .expected_generation
+        .or(command.generation)
+        .ok_or_else(|| {
+            Error::new(
+                "stale_generation",
+                "resume did not capture its old generation",
+            )
+        })?;
+    if agent.generation != generation || command.generation != Some(generation) {
+        return Err(Error::new(
+            "stale_generation",
+            "resume target no longer matches its retained generation",
+        ));
+    }
+    if !matches!(
+        agent.state,
+        eliot_core::AgentState::Stopped
+            | eliot_core::AgentState::Failed
+            | eliot_core::AgentState::Lost
+    ) || agent.active_turn.is_some()
+    {
+        return Err(Error::new(
+            "bad_state",
+            "resume requires a terminal Agent without an active turn",
+        ));
+    }
+    let native_scope = agent
+        .native_scope
+        .as_deref()
+        .filter(|scope| !scope.trim().is_empty())
+        .ok_or_else(|| Error::new("unsupported", "resume has no retained native scope"))?;
+    if agent
+        .native_ref
+        .as_deref()
+        .is_none_or(|native_ref| native_ref.trim().is_empty())
+    {
+        return Err(Error::new(
+            "unsupported",
+            "resume has no retained native subject",
+        ));
+    }
+    match agent.harness.as_str() {
+        "codex" => {
+            let binding: NativeStoreBinding = agent
+                .profile_snapshot
+                .get("native_store_binding")
+                .cloned()
+                .ok_or_else(|| {
+                    Error::new(
+                        "unsupported",
+                        "Codex resume requires a retained native store binding",
+                    )
+                })
+                .and_then(|value| {
+                    serde_json::from_value(value).map_err(|_| {
+                        Error::new(
+                            "source_integrity",
+                            "retained native store binding is malformed",
+                        )
+                    })
+                })?;
+            if native_scope != binding.native_scope {
+                return Err(Error::new(
+                    "source_integrity",
+                    "resume native scope differs from its retained store binding",
+                ));
+            }
+        }
+        "fake" => {
+            if agent.profile_snapshot.get("native_store_binding").is_some() {
+                return Err(Error::new(
+                    "source_integrity",
+                    "Fake resume cannot use a Codex native store binding",
+                ));
+            }
+        }
+        harness => {
+            return Err(Error::new(
+                "unsupported",
+                format!("resume is not supported for the {harness} harness"),
+            ));
+        }
+    }
+    Ok(generation)
+}
+
+fn validate_project_rule_resume_profile(
+    registration: &ProjectRegistrationView,
+    agent: &Agent,
+) -> Result<()> {
+    if !registration
+        .profiles
+        .iter()
+        .any(|approved| approved == &agent.profile)
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "project registration does not approve the retained Agent profile",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_project_rule_resume_command(
+    registration: &ProjectRegistrationView,
+    command: &Command,
+    linked_input_pending: bool,
+) -> Result<()> {
+    if command.verb != "resume" {
+        return Ok(());
+    }
+    registration.validate()?;
+    if !registration.actions.iter().any(|action| action == "resume") {
+        return Err(Error::new(
+            "not_allowed",
+            "project registration no longer approves resume",
+        ));
+    }
+    if linked_input_pending && !registration.actions.iter().any(|action| action == "send") {
+        return Err(Error::new(
+            "not_allowed",
+            "project registration no longer approves the linked resume input",
+        ));
+    }
+    if !command.args.as_object().is_some_and(|args| args.is_empty()) {
+        return Err(Error::new(
+            "source_integrity",
+            "project resume command must retain its input in the linked send",
         ));
     }
     Ok(())
@@ -5386,6 +5769,9 @@ fn authorize_command(principal: &Principal, request: &mut SubmitCommand) -> Resu
         if request.verb == "launch" {
             return validate_rule_launch_action(request, Some(registration));
         }
+        if request.verb == "resume" {
+            return validate_rule_resume_action(request, Some(registration));
+        }
         if !matches!(
             request.verb.as_str(),
             "stop" | "send" | "steer" | "interrupt" | "approve" | "deny" | "answer"
@@ -5753,6 +6139,51 @@ mod tests {
             Some(("send-accepted".to_owned(), None))
         );
 
+        let accepted_resume = rule_admission(
+            command_with_state("resume-accepted", "resume", CommandState::Accepted),
+            Some(command_with_state(
+                "resume-send-queued",
+                "send",
+                CommandState::Queued,
+            )),
+        );
+        assert_eq!(
+            rule_admission_dispatch_plan(&accepted_resume),
+            Some((
+                "resume-accepted".to_owned(),
+                Some("resume-send-queued".to_owned())
+            ))
+        );
+
+        let queued_resume = rule_admission(
+            command_with_state("resume-queued", "resume", CommandState::Queued),
+            Some(command_with_state(
+                "resume-send-held",
+                "send",
+                CommandState::Queued,
+            )),
+        );
+        assert_eq!(
+            rule_admission_dispatch_plan(&queued_resume),
+            Some((
+                "resume-queued".to_owned(),
+                Some("resume-send-held".to_owned())
+            ))
+        );
+
+        let applied_resume = rule_admission(
+            command_with_state("resume-applied", "resume", CommandState::Applied),
+            Some(command_with_state(
+                "resume-send-accepted",
+                "send",
+                CommandState::Accepted,
+            )),
+        );
+        assert_eq!(
+            rule_admission_dispatch_plan(&applied_resume),
+            Some(("resume-send-accepted".to_owned(), None))
+        );
+
         for launch_state in [CommandState::Dispatched, CommandState::Unknown] {
             let uncertain_launch = rule_admission(
                 command_with_state("launch-uncertain", "launch", launch_state),
@@ -5763,6 +6194,16 @@ mod tests {
                 )),
             );
             assert_eq!(rule_admission_dispatch_plan(&uncertain_launch), None);
+
+            let uncertain_resume = rule_admission(
+                command_with_state("resume-uncertain", "resume", launch_state),
+                Some(command_with_state(
+                    "resume-send-pending",
+                    "send",
+                    CommandState::Accepted,
+                )),
+            );
+            assert_eq!(rule_admission_dispatch_plan(&uncertain_resume), None);
         }
 
         for send_state in [CommandState::Dispatched, CommandState::Unknown] {
@@ -5772,6 +6213,98 @@ mod tests {
             );
             assert_eq!(rule_admission_dispatch_plan(&uncertain_input), None);
         }
+    }
+
+    #[test]
+    fn resume_capture_preserves_codex_binding_and_accepts_only_owned_fake_subjects() {
+        let mut fake = Agent::new("a7", "descriptive-project", "fake", "fake", 10);
+        fake.generation = 2;
+        fake.state = eliot_core::AgentState::Stopped;
+        fake.native_scope = Some("fake-scope-a7".to_owned());
+        fake.native_ref = Some("fake-subject-a7".to_owned());
+        let mut resume = command_with_state("resume-fixture", "resume", CommandState::Accepted);
+        resume.target = Some(fake.id.clone());
+        resume.expected_generation = Some(2);
+        resume.generation = Some(2);
+        assert_eq!(validate_retained_resume_agent(&fake, &resume).unwrap(), 2);
+
+        let mut ordinary = resume.clone();
+        ordinary.expected_generation = None;
+        assert_eq!(validate_retained_resume_agent(&fake, &ordinary).unwrap(), 2);
+        let mut queued = ordinary.clone();
+        queued.state = CommandState::Queued;
+        assert_eq!(validate_retained_resume_agent(&fake, &queued).unwrap(), 2);
+        let mut missing_stored_generation = resume.clone();
+        missing_stored_generation.generation = None;
+        assert_eq!(
+            validate_retained_resume_agent(&fake, &missing_stored_generation)
+                .unwrap_err()
+                .code,
+            "stale_generation"
+        );
+
+        let mut observed = fake.clone();
+        observed.observe_only = true;
+        assert_eq!(
+            validate_retained_resume_agent(&observed, &resume)
+                .unwrap_err()
+                .code,
+            "not_allowed"
+        );
+        let mut unknown_agent = fake.clone();
+        unknown_agent.state = AgentState::Unknown;
+        assert_eq!(
+            validate_retained_resume_agent(&unknown_agent, &resume)
+                .unwrap_err()
+                .code,
+            "not_allowed"
+        );
+        let mut unknown_resume = resume.clone();
+        unknown_resume.state = CommandState::Unknown;
+        assert_eq!(
+            validate_retained_resume_agent(&fake, &unknown_resume)
+                .unwrap_err()
+                .code,
+            "bad_state"
+        );
+        let mut nonterminal = fake.clone();
+        nonterminal.state = eliot_core::AgentState::Busy;
+        assert_eq!(
+            validate_retained_resume_agent(&nonterminal, &resume)
+                .unwrap_err()
+                .code,
+            "bad_state"
+        );
+
+        let mut codex = fake.clone();
+        codex.harness = "codex".to_owned();
+        codex.profile = "codex-luna".to_owned();
+        codex.native_scope = Some("codex-scope-a7".to_owned());
+        codex.native_ref = Some("codex-thread-a7".to_owned());
+        let binding = NativeStoreBinding {
+            home: "fixture-home".to_owned(),
+            root: "fixture-root".to_owned(),
+            native_scope: "codex-scope-a7".to_owned(),
+        };
+        codex.profile_snapshot = json!({
+            "native_store_binding": serde_json::to_value(&binding).unwrap()
+        });
+        assert_eq!(validate_retained_resume_agent(&codex, &resume).unwrap(), 2);
+
+        codex.native_scope = Some("different-scope".to_owned());
+        assert_eq!(
+            validate_retained_resume_agent(&codex, &resume)
+                .unwrap_err()
+                .code,
+            "source_integrity"
+        );
+        codex.profile_snapshot = json!({});
+        assert_eq!(
+            validate_retained_resume_agent(&codex, &resume)
+                .unwrap_err()
+                .code,
+            "unsupported"
+        );
     }
 
     #[tokio::test]
@@ -6241,8 +6774,8 @@ do = [{ action = 'interrupt', target = '${event.agent}', expected_generation = '
                             native_id: batch_id,
                             data: json!({
                                 "command_id":resume_id.clone(),
-                                "native_scope":"stale-catch-up-generation-2",
-                                "native_ref":"stale-catch-up-thread-2",
+                                "native_scope":"stale-catch-up-generation-1",
+                                "native_ref":"stale-catch-up-thread-1",
                             }),
                         }],
                         cursor: None,
@@ -6928,7 +7461,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         };
         assert!(!faulted);
         router
-            .settle_dispatch_error(&invalid.id, &error, faulted, true, false)
+            .settle_dispatch_error(&invalid.id, &error, faulted, true)
             .await;
         let store = router.inner.store.lock().await;
         let rejected = store.get_command(&invalid.id).unwrap().unwrap();
@@ -7947,7 +8480,6 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 &Error::new("provider_held", "provider scope is held"),
                 false,
                 false,
-                false,
             )
             .await;
 
@@ -8521,6 +9053,792 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
     }
 
     #[tokio::test]
+    async fn resume_stop_dispatch_race_settlement_cancels_linked_send() {
+        let router = router();
+        let (agent, stop_id, resume_id, linked_id, dispatch_error) = {
+            let mut store = router.inner.store.lock().await;
+            let agent = stopped_fake_agent(&mut store, "resume-stop-dispatch-race");
+
+            let stop_id = ulid::Ulid::new().to_string();
+            let mut stop = SubmitCommand::new(stop_id.clone(), "stop");
+            stop.target = Some(agent.clone());
+            stop.expected_generation = Some(1);
+            store.submit("owner", stop, now_ms()).unwrap();
+
+            let resume_id = ulid::Ulid::new().to_string();
+            let mut resume = SubmitCommand::new(resume_id.clone(), "resume");
+            resume.target = Some(agent.clone());
+            resume.expected_generation = Some(1);
+            resume.args = json!({"text":"resume after the stop gate"});
+            let admission = store.submit("owner", resume, now_ms()).unwrap();
+            let linked = admission
+                .linked_command
+                .expect("Resume text is persisted as linked SEND");
+            let linked_id = linked.id;
+            assert_eq!(admission.command.state, CommandState::Accepted);
+            assert_eq!(linked.state, CommandState::Queued);
+
+            assert_eq!(
+                store.dispatch(&stop_id, now_ms()).unwrap().value.state,
+                CommandState::Dispatched
+            );
+            let dispatch_error = store.dispatch(&resume_id, now_ms()).unwrap_err();
+            assert_eq!(dispatch_error.code, "bad_state");
+            (agent, stop_id, resume_id, linked_id, dispatch_error)
+        };
+
+        router
+            .settle_dispatch_error(&resume_id, &dispatch_error, false, false)
+            .await;
+
+        let store = router.inner.store.lock().await;
+        assert_eq!(
+            store.get_command(&resume_id).unwrap().unwrap().state,
+            CommandState::Rejected
+        );
+        assert_eq!(
+            store.get_command(&linked_id).unwrap().unwrap().state,
+            CommandState::Cancelled
+        );
+        assert!(
+            store
+                .read_events(0, 1_000, None)
+                .unwrap()
+                .iter()
+                .any(|event| {
+                    event.kind == "command.cancelled"
+                        && event.data.get("command_id").and_then(Value::as_str)
+                            == Some(linked_id.as_str())
+                })
+        );
+        assert_eq!(store.get_agent(&agent).unwrap().unwrap().generation, 1);
+        assert_eq!(
+            store.get_command(&stop_id).unwrap().unwrap().state,
+            CommandState::Dispatched
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_resume_rejection_restores_ready_workspace_and_cancels_linked_send() {
+        let router = router();
+        let (agent, launch_id, resume_id, linked_id, previous_workspace) = {
+            let mut store = router.inner.store.lock().await;
+            let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
+                "eliot-managed-resume-rejection-{}",
+                ulid::Ulid::new()
+            ));
+            let checkout = root.join("checkout").to_string_lossy().into_owned();
+            let worktree = root.join("worktree").to_string_lossy().into_owned();
+            let branch = format!("codex/resume-rejection-{}", ulid::Ulid::new());
+            let base_oid = "d".repeat(40);
+            let input = WorkspacePreparationInput {
+                project: checkout.clone(),
+                repo_path: checkout.clone(),
+                repo_common_dir: root.join("checkout/.git").to_string_lossy().into_owned(),
+                requested_branch: branch.clone(),
+                base_ref: Some("HEAD".to_owned()),
+                base_oid: base_oid.clone(),
+                worktree_path: worktree.clone(),
+                frozen_setup: Vec::new(),
+            };
+
+            let launch_id = ulid::Ulid::new().to_string();
+            let mut launch = SubmitCommand::new(launch_id.clone(), "launch");
+            launch.expected_generation = Some(0);
+            launch.args = json!({
+                "project":checkout,
+                "workspace":worktree,
+                "worktree":branch,
+                "harness":"fake",
+                "profile":"fake",
+                "profile_snapshot":{"harness":"fake"},
+            });
+            let accepted = store
+                .submit_with_workspace("owner", launch, input.clone(), now_ms())
+                .unwrap();
+            let agent = accepted.command.target.unwrap();
+            store
+                .settle_workspace_creation(
+                    &launch_id,
+                    1,
+                    eliot_core::WorkspaceCreationOutcome::Verified {
+                        repo_path: input.repo_path.clone(),
+                        repo_common_dir: input.repo_common_dir.clone(),
+                        worktree_path: input.worktree_path.clone(),
+                        branch: input.requested_branch.clone(),
+                        head: base_oid.clone(),
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            store.dispatch(&launch_id, now_ms()).unwrap();
+            read_fixture_event(
+                &mut store,
+                &agent,
+                "session.ready",
+                json!({
+                    "command_id":launch_id,
+                    "native_scope":format!("fake:synthetic:scope:{agent}"),
+                    "native_ref":format!("fake:synthetic:session:{agent}"),
+                }),
+            );
+            store
+                .settle(&launch_id, CommandState::Applied, None, now_ms())
+                .unwrap();
+            read_fixture_event(&mut store, &agent, "session.ended", json!({}));
+            let previous_workspace = store
+                .get_workspace(&agent)
+                .unwrap()
+                .expect("retained managed workspace");
+
+            let resume_id = ulid::Ulid::new().to_string();
+            let mut resume = SubmitCommand::new(resume_id.clone(), "resume");
+            resume.target = Some(agent.clone());
+            resume.expected_generation = Some(1);
+            resume.args = json!({"text":"new input only"});
+            let admission = store.submit("owner", resume, now_ms()).unwrap();
+            let linked_id = admission
+                .linked_command
+                .expect("Resume text is a linked SEND")
+                .id;
+
+            // Exercise the already-prepared marker boundary: routing must use its
+            // exact command and generation ownership even after it reaches Ready.
+            store
+                .settle_workspace_creation(
+                    &resume_id,
+                    2,
+                    eliot_core::WorkspaceCreationOutcome::Verified {
+                        repo_path: input.repo_path.clone(),
+                        repo_common_dir: input.repo_common_dir.clone(),
+                        worktree_path: input.worktree_path.clone(),
+                        branch: input.requested_branch.clone(),
+                        head: base_oid,
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            let ready = store
+                .get_workspace(&agent)
+                .unwrap()
+                .expect("prepared next-generation marker");
+            assert_eq!(ready.phase, WorkspacePhase::Ready);
+            assert_eq!(ready.start_command_id, resume_id);
+            assert_eq!(ready.target_generation, 2);
+            (agent, launch_id, resume_id, linked_id, previous_workspace)
+        };
+
+        router.reject_undispatched(&resume_id, "not_allowed").await;
+
+        let store = router.inner.store.lock().await;
+        assert_eq!(
+            store.get_command(&resume_id).unwrap().unwrap().state,
+            CommandState::Rejected
+        );
+        assert_eq!(
+            store.get_command(&linked_id).unwrap().unwrap().state,
+            CommandState::Cancelled
+        );
+        let restored = store
+            .get_workspace(&agent)
+            .unwrap()
+            .expect("prior managed workspace restored");
+        assert_eq!(restored.start_command_id, launch_id);
+        assert_eq!(restored.target_generation, 1);
+        assert_eq!(restored.phase, WorkspacePhase::Ready);
+        assert_eq!(restored.setup_index, previous_workspace.setup_index);
+        assert_eq!(restored.outcome, previous_workspace.outcome);
+        assert!(
+            store
+                .read_events(0, 1_000, None)
+                .unwrap()
+                .iter()
+                .any(|event| {
+                    event.kind == "command.cancelled"
+                        && event.data.get("command_id").and_then(Value::as_str)
+                            == Some(linked_id.as_str())
+                })
+        );
+    }
+
+    #[tokio::test]
+    async fn project_resume_dispatch_revocation_restores_managed_workspace_and_cancels_send() {
+        const PROJECT_ID: &str = "late-resume-revocation";
+        const RULE_ID: &str = "late-resume-rule";
+
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "eliot-project-resume-revocation-{}",
+            ulid::Ulid::new()
+        ));
+        let checkout_path = root.join("checkout");
+        let data_root = root.join("owner-data");
+        let worktrees_root = data_root.join("worktrees");
+        std::fs::create_dir_all(&checkout_path).unwrap();
+        std::fs::create_dir_all(&worktrees_root).unwrap();
+
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&checkout_path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        };
+        git(&["init", "--quiet", "--initial-branch=main"]);
+        git(&["config", "user.name", "ELIOT test"]);
+        git(&["config", "user.email", "eliot-test@example.invalid"]);
+        std::fs::write(checkout_path.join("seed.txt"), "managed resume seed\n").unwrap();
+        git(&["add", "--", "seed.txt"]);
+        git(&["commit", "--quiet", "-m", "managed resume seed"]);
+        let base_oid = String::from_utf8(git(&["rev-parse", "--verify", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+        let checkout_input = checkout_path.to_string_lossy().into_owned();
+        let (checkout, repo_common_dir) = crate::workspace_git::WorkspaceGit::new()
+            .unwrap()
+            .repository_identity(&checkout_input)
+            .await
+            .unwrap();
+        let branch = format!("codex/late-resume-{}", ulid::Ulid::new());
+        let worktree_input = worktrees_root
+            .join("retained")
+            .to_string_lossy()
+            .into_owned();
+        let worktree_git_arg =
+            crate::git_monitor::git_path_argument(std::path::Path::new(&worktree_input)).unwrap();
+        git(&[
+            "worktree",
+            "add",
+            "--no-guess-remote",
+            "--no-relative-paths",
+            "-b",
+            &branch,
+            "--",
+            &worktree_git_arg,
+            &base_oid,
+        ]);
+        let worktree = std::fs::canonicalize(&worktree_input)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        std::fs::write(
+            data_root.join("config.toml"),
+            format!(
+                concat!(
+                    "[projects.{PROJECT_ID}]\n",
+                    "path = {checkout:?}\n",
+                    "profiles = [\"fake\"]\n",
+                    "actions = [\"resume\", \"send\"]\n",
+                ),
+                PROJECT_ID = PROJECT_ID,
+                checkout = checkout,
+            ),
+        )
+        .unwrap();
+
+        let router = router_with_data_root(data_root.clone());
+        let principal = format!("project:{PROJECT_ID}");
+        let registration_input = ProjectRegistrationInput {
+            id: PROJECT_ID.to_owned(),
+            checkout: checkout.clone(),
+            repo_common_dir: repo_common_dir.clone(),
+            profiles: vec!["fake".to_owned()],
+            actions: vec!["resume".to_owned(), "send".to_owned()],
+            interpreters: std::collections::BTreeMap::new(),
+            run_env: Vec::new(),
+        };
+        let definition = json!({
+            "id":RULE_ID,
+            "enabled":true,
+            "on":{"event":"session.ended"},
+            "do":[{"action":"resume", "target":"${event.agent}",
+                "expected_generation":"${event.generation}", "text":"new project input"}],
+        });
+        let rule_input = eliot_store::RuleDefinitionInput {
+            id: RULE_ID.to_owned(),
+            canonical_definition: serde_json::to_string(&definition).unwrap(),
+            definition_digest: eliot_core::canonical_json_sha256(&definition).unwrap(),
+            enabled: true,
+        };
+        let (registration, rule_state, agent, launch_id, stopped_agent, ready_workspace) = {
+            let mut store = router.inner.store.lock().await;
+            let registration = store
+                .upsert_project_registration("owner", &registration_input, now_ms())
+                .unwrap()
+                .value;
+            let rule_state = store
+                .ensure_rule_state(&principal, &rule_input, now_ms())
+                .unwrap();
+
+            let input = WorkspacePreparationInput {
+                project: checkout.clone(),
+                repo_path: checkout.clone(),
+                repo_common_dir: repo_common_dir.clone(),
+                requested_branch: branch.clone(),
+                base_ref: Some("HEAD".to_owned()),
+                base_oid: base_oid.clone(),
+                worktree_path: worktree.clone(),
+                frozen_setup: Vec::new(),
+            };
+            let launch_id = ulid::Ulid::new().to_string();
+            let mut launch = SubmitCommand::new(launch_id.clone(), "launch");
+            launch.expected_generation = Some(0);
+            launch.args = json!({
+                "project":checkout,
+                "workspace":worktree,
+                "worktree":branch,
+                "harness":"fake",
+                "profile":"fake",
+                "profile_snapshot":{"harness":"fake"},
+            });
+            let accepted = store
+                .submit_with_workspace("owner", launch, input.clone(), now_ms())
+                .unwrap();
+            let agent = accepted.command.target.unwrap();
+            store
+                .settle_workspace_creation(
+                    &launch_id,
+                    1,
+                    eliot_core::WorkspaceCreationOutcome::Verified {
+                        repo_path: input.repo_path,
+                        repo_common_dir: input.repo_common_dir,
+                        worktree_path: input.worktree_path,
+                        branch: input.requested_branch,
+                        head: base_oid,
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            store.dispatch(&launch_id, now_ms()).unwrap();
+            read_fixture_event(
+                &mut store,
+                &agent,
+                "session.ready",
+                json!({
+                    "command_id":launch_id,
+                    "native_scope":format!("fake:synthetic:scope:{agent}"),
+                    "native_ref":format!("fake:synthetic:session:{agent}"),
+                }),
+            );
+            store
+                .settle(&launch_id, CommandState::Applied, None, now_ms())
+                .unwrap();
+            read_fixture_event(&mut store, &agent, "session.ended", json!({}));
+            let stopped_agent = store.get_agent(&agent).unwrap().unwrap();
+            assert!(stopped_agent.is_terminal());
+            let ready_workspace = store
+                .get_workspace(&agent)
+                .unwrap()
+                .expect("retained managed Project worktree");
+            (
+                registration,
+                rule_state,
+                agent,
+                launch_id,
+                stopped_agent,
+                ready_workspace,
+            )
+        };
+
+        crate::automation::verify_project_registration(&data_root, &registration)
+            .await
+            .unwrap();
+        let event = router
+            .inner
+            .store
+            .lock()
+            .await
+            .read_events(0, 1_000, None)
+            .unwrap()
+            .into_iter()
+            .find(|event| {
+                event.kind == "session.ended"
+                    && event.agent.as_deref() == Some(agent.as_str())
+                    && event.generation == Some(1)
+            })
+            .expect("the retained Project Agent end event");
+        let mut request = SubmitCommand::new(String::new(), "resume");
+        request.target = Some(agent.clone());
+        request.expected_generation = Some(1);
+        request.args = json!({"text":"new project input"});
+        let prepared = router
+            .prepare_project_rule_submission(request, &registration)
+            .await
+            .expect("strict Ready/N Project Resume preflight");
+        assert!(prepared.workspace.is_none());
+
+        let firing = {
+            let mut store = router.inner.store.lock().await;
+            store
+                .admit_rule_action(
+                    &principal,
+                    &rule_state,
+                    event.seq,
+                    prepared.request,
+                    now_ms(),
+                )
+                .unwrap()
+        };
+        let child = firing.child.expect("Project rule admitted Resume");
+        let resume = child.command;
+        let resume_id = resume.id.clone();
+        let linked = child
+            .linked_command
+            .expect("Project Resume text is the linked SEND");
+        let linked_id = linked.id.clone();
+        assert_eq!(resume.principal, principal);
+        assert_eq!(resume.expected_generation, Some(1));
+        assert_eq!(resume.generation, Some(1));
+        assert_eq!(resume.args, json!({}));
+        assert_eq!(linked.id, format!("{resume_id}/send"));
+        assert_eq!(linked.state, CommandState::Queued);
+        assert_eq!(linked.generation, Some(2));
+        router
+            .verify_project_rule_resume_after_admission(&registration, &resume)
+            .await
+            .expect("exact accepted command owns the managed N+1 marker");
+
+        let (dispatch_error, write_faulted) = {
+            let mut store = router.inner.store.lock().await;
+            let mut revoked = registration_input.clone();
+            revoked.actions = vec!["send".to_owned()];
+            let updated = store
+                .upsert_project_registration("owner", &revoked, now_ms())
+                .unwrap()
+                .value;
+            assert!(updated.revision > registration.revision);
+            let dispatch_error = store.dispatch(&resume_id, now_ms()).unwrap_err();
+            (dispatch_error, store.is_write_faulted())
+        };
+        assert_eq!(dispatch_error.code, "not_allowed");
+        assert!(!write_faulted);
+        router
+            .settle_dispatch_error(&resume_id, &dispatch_error, write_faulted, false)
+            .await;
+
+        let mut store = router.inner.store.lock().await;
+        let rejected_resume = store.get_command(&resume_id).unwrap().unwrap();
+        assert_eq!(rejected_resume.state, CommandState::Rejected);
+        assert_eq!(
+            rejected_resume.outcome.as_ref().unwrap()["stage"],
+            "workspace_resume_rejected"
+        );
+        assert_eq!(
+            rejected_resume.outcome.as_ref().unwrap()["reason"],
+            "not_allowed"
+        );
+        assert_eq!(
+            store.get_command(&linked_id).unwrap().unwrap().state,
+            CommandState::Cancelled
+        );
+        assert_eq!(store.get_agent(&agent).unwrap().unwrap(), stopped_agent);
+        let restored = store
+            .get_workspace(&agent)
+            .unwrap()
+            .expect("prior Ready/N workspace restored");
+        assert_eq!(restored.start_command_id, launch_id);
+        assert_eq!(restored.target_generation, 1);
+        assert_eq!(restored.phase, WorkspacePhase::Ready);
+        assert_eq!(restored.project, ready_workspace.project);
+        assert_eq!(restored.repo_path, ready_workspace.repo_path);
+        assert_eq!(restored.repo_common_dir, ready_workspace.repo_common_dir);
+        assert_eq!(restored.worktree_path, ready_workspace.worktree_path);
+        assert_eq!(restored.requested_branch, ready_workspace.requested_branch);
+        assert_eq!(restored.frozen_setup, ready_workspace.frozen_setup);
+        assert_eq!(restored.setup_index, ready_workspace.setup_index);
+        assert_eq!(restored.outcome, ready_workspace.outcome);
+        let events = store.read_events(0, 1_000, None).unwrap();
+        assert!(!events.iter().any(|event| {
+            event.kind == "command.dispatched"
+                && event.data.get("command_id").and_then(Value::as_str) == Some(resume_id.as_str())
+        }));
+        assert!(events.iter().any(|event| {
+            event.kind == "command.cancelled"
+                && event.data.get("command_id").and_then(Value::as_str) == Some(linked_id.as_str())
+        }));
+
+        let retry_id = ulid::Ulid::new().to_string();
+        let mut retry = SubmitCommand::new(retry_id.clone(), "resume");
+        retry.target = Some(agent.clone());
+        retry.expected_generation = Some(1);
+        let retry = store.submit("owner", retry, now_ms()).unwrap();
+        assert_eq!(retry.command.state, CommandState::Accepted);
+        let retry_workspace = store
+            .get_workspace(&agent)
+            .unwrap()
+            .expect("released N+1 reservation permits another Resume");
+        assert_eq!(retry_workspace.start_command_id, retry_id);
+        assert_eq!(retry_workspace.target_generation, 2);
+        store
+            .reject_workspace_resume(&retry_id, "test_cleanup", now_ms())
+            .unwrap();
+        let final_workspace = store.get_workspace(&agent).unwrap().unwrap();
+        assert_eq!(final_workspace.start_command_id, launch_id);
+        assert_eq!(final_workspace.target_generation, 1);
+        assert_eq!(final_workspace.phase, WorkspacePhase::Ready);
+        assert_eq!(store.get_agent(&agent).unwrap().unwrap(), stopped_agent);
+
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn losing_managed_workspace_prepare_cannot_overwrite_dispatched_resume() {
+        let router = router();
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "eliot-losing-workspace-prepare-{}",
+            ulid::Ulid::new()
+        ));
+        let checkout = root.join("checkout").to_string_lossy().into_owned();
+        let worktree = root.join("worktree").to_string_lossy().into_owned();
+        let repo_common_dir = root.join("checkout/.git").to_string_lossy().into_owned();
+        let branch = format!("codex/losing-prepare-{}", ulid::Ulid::new());
+        let base_oid = "e".repeat(40);
+        let input = WorkspacePreparationInput {
+            project: checkout.clone(),
+            repo_path: checkout.clone(),
+            repo_common_dir: repo_common_dir.clone(),
+            requested_branch: branch.clone(),
+            base_ref: Some("HEAD".to_owned()),
+            base_oid: base_oid.clone(),
+            worktree_path: worktree.clone(),
+            frozen_setup: Vec::new(),
+        };
+        let (agent, resume_id) = {
+            let mut store = router.inner.store.lock().await;
+            let launch_id = ulid::Ulid::new().to_string();
+            let mut launch = SubmitCommand::new(launch_id.clone(), "launch");
+            launch.expected_generation = Some(0);
+            launch.args = json!({
+                "project":checkout,
+                "workspace":worktree,
+                "worktree":branch,
+                "harness":"fake",
+                "profile":"fake",
+                "profile_snapshot":{"harness":"fake"},
+            });
+            let accepted = store
+                .submit_with_workspace("owner", launch, input.clone(), now_ms())
+                .unwrap();
+            let agent = accepted.command.target.unwrap();
+            store
+                .settle_workspace_creation(
+                    &launch_id,
+                    1,
+                    eliot_core::WorkspaceCreationOutcome::Verified {
+                        repo_path: input.repo_path.clone(),
+                        repo_common_dir: input.repo_common_dir.clone(),
+                        worktree_path: input.worktree_path.clone(),
+                        branch: input.requested_branch.clone(),
+                        head: base_oid.clone(),
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            store.dispatch(&launch_id, now_ms()).unwrap();
+            read_fixture_event(
+                &mut store,
+                &agent,
+                "session.ready",
+                json!({
+                    "command_id":launch_id,
+                    "native_scope":format!("fake:synthetic:scope:{agent}"),
+                    "native_ref":format!("fake:synthetic:session:{agent}"),
+                }),
+            );
+            store
+                .settle(&launch_id, CommandState::Applied, None, now_ms())
+                .unwrap();
+            read_fixture_event(&mut store, &agent, "session.ended", json!({}));
+
+            let resume_id = ulid::Ulid::new().to_string();
+            let mut resume = SubmitCommand::new(resume_id.clone(), "resume");
+            resume.target = Some(agent.clone());
+            resume.expected_generation = Some(1);
+            store.submit("owner", resume, now_ms()).unwrap();
+            store
+                .settle_workspace_creation(
+                    &resume_id,
+                    2,
+                    eliot_core::WorkspaceCreationOutcome::Verified {
+                        repo_path: input.repo_path.clone(),
+                        repo_common_dir: input.repo_common_dir.clone(),
+                        worktree_path: input.worktree_path.clone(),
+                        branch: input.requested_branch.clone(),
+                        head: base_oid.clone(),
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            let winner = store.dispatch(&resume_id, now_ms()).unwrap();
+            assert_eq!(winner.value.state, CommandState::Dispatched);
+            (agent, resume_id)
+        };
+
+        // This is the loser's real preparation entry after the winner committed
+        // N+1. start() must reject the now-dispatched command before Git I/O.
+        let losing_error = router
+            .inner
+            .workspaces
+            .prepare(&resume_id)
+            .await
+            .expect_err("an obsolete preparation cannot proceed after dispatch");
+        assert_eq!(losing_error.code, "stale_generation");
+        router
+            .settle_workspace_prepare_error(&resume_id, &losing_error)
+            .await;
+        {
+            let store = router.inner.store.lock().await;
+            let current = store.get_command(&resume_id).unwrap().unwrap();
+            assert_eq!(current.state, CommandState::Dispatched);
+            assert_eq!(current.outcome, None);
+            assert_eq!(store.get_agent(&agent).unwrap().unwrap().generation, 2);
+            assert!(
+                !store
+                    .read_events(0, 1_000, None)
+                    .unwrap()
+                    .iter()
+                    .any(|event| {
+                        matches!(event.kind.as_str(), "command.unknown" | "command.rejected")
+                            && event.data.get("command_id").and_then(Value::as_str)
+                                == Some(resume_id.as_str())
+                    })
+            );
+        }
+
+        {
+            let mut store = router.inner.store.lock().await;
+            store
+                .put_batch(
+                    eliot_core::SourceBatch {
+                        batch_id: ulid::Ulid::new().to_string(),
+                        agent_id: agent.clone(),
+                        generation: 2,
+                        source: "stream".to_owned(),
+                        events: vec![eliot_core::NativeEvent {
+                            ts: None,
+                            kind: "session.ready".to_owned(),
+                            native_id: format!("fake:{agent}:2:session.ready"),
+                            data: json!({
+                                "native_scope":format!("fake:synthetic:scope:{agent}"),
+                                "native_ref":format!("fake:synthetic:session:{agent}"),
+                            }),
+                        }],
+                        cursor: None,
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+        }
+        router
+            .settle(
+                &resume_id,
+                CommandState::Applied,
+                Some(json!({"state":"ready"})),
+            )
+            .await
+            .expect("the winning start settles after readiness");
+        {
+            let store = router.inner.store.lock().await;
+            assert_eq!(
+                store.get_command(&resume_id).unwrap().unwrap().state,
+                CommandState::Applied
+            );
+            let events = store.read_events(0, 1_000, None).unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| {
+                        event.kind == "command.applied"
+                            && event.data.get("command_id").and_then(Value::as_str)
+                                == Some(resume_id.as_str())
+                    })
+                    .count(),
+                1
+            );
+            assert!(!events.iter().any(|event| {
+                event.kind == "command.unknown"
+                    && event.data.get("command_id").and_then(Value::as_str)
+                        == Some(resume_id.as_str())
+            }));
+        }
+
+        let unknown_resume_id = ulid::Ulid::new().to_string();
+        {
+            let mut store = router.inner.store.lock().await;
+            store
+                .put_batch(
+                    eliot_core::SourceBatch {
+                        batch_id: ulid::Ulid::new().to_string(),
+                        agent_id: agent.clone(),
+                        generation: 2,
+                        source: "stream".to_owned(),
+                        events: vec![eliot_core::NativeEvent {
+                            ts: None,
+                            kind: "session.ended".to_owned(),
+                            native_id: format!("fake:{agent}:2:session.ended"),
+                            data: json!({}),
+                        }],
+                        cursor: None,
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            let mut resume = SubmitCommand::new(unknown_resume_id.clone(), "resume");
+            resume.target = Some(agent.clone());
+            resume.expected_generation = Some(2);
+            store.submit("owner", resume, now_ms()).unwrap();
+            store
+                .settle_workspace_creation(
+                    &unknown_resume_id,
+                    3,
+                    eliot_core::WorkspaceCreationOutcome::Verified {
+                        repo_path: input.repo_path.clone(),
+                        repo_common_dir: input.repo_common_dir.clone(),
+                        worktree_path: input.worktree_path.clone(),
+                        branch: input.requested_branch.clone(),
+                        head: base_oid.clone(),
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            assert_eq!(
+                store.get_workspace(&agent).unwrap().unwrap().phase,
+                WorkspacePhase::Ready
+            );
+        }
+        let readback_error = router
+            .inner
+            .workspaces
+            .prepare(&unknown_resume_id)
+            .await
+            .expect_err("retained Ready identity readback is uncertain");
+        assert_eq!(readback_error.code, "unknown");
+        router
+            .settle_workspace_prepare_error(&unknown_resume_id, &readback_error)
+            .await;
+        let store = router.inner.store.lock().await;
+        assert_eq!(
+            store
+                .get_command(&unknown_resume_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            CommandState::Unknown
+        );
+        let unknown_workspace = store.get_workspace(&agent).unwrap().unwrap();
+        assert_eq!(unknown_workspace.phase, WorkspacePhase::Unknown);
+        assert_eq!(unknown_workspace.target_generation, 3);
+        assert_eq!(store.get_agent(&agent).unwrap().unwrap().generation, 2);
+    }
+
+    #[tokio::test]
     async fn store_write_fault_overlays_unknown_only_for_uncertain_dispatch() {
         let router = router();
         let accepted_id = ulid::Ulid::new().to_string();
@@ -8644,7 +9962,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 .await;
             let dispatch_error = Error::new("internal", "injected Store dispatch failure");
             router
-                .settle_dispatch_error(id, &dispatch_error, true, false, false)
+                .settle_dispatch_error(id, &dispatch_error, true, false)
                 .await;
             let command: Command = serde_json::from_value(
                 router
@@ -8676,7 +9994,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             .await;
         let dispatch_error = Error::new("internal", "injected Store dispatch failure");
         router
-            .settle_dispatch_error(&dispatched_id, &dispatch_error, true, false, false)
+            .settle_dispatch_error(&dispatched_id, &dispatch_error, true, false)
             .await;
         let persisted = router
             .inner
@@ -8862,7 +10180,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
 
         let prepared = router.prepare_owner_submission(action).await.unwrap();
         let admission = router
-            .admit_rule_action("owner", None, &state, event.seq, prepared)
+            .admit_rule_action("owner", None, &state, state.revision, event.seq, prepared)
             .await
             .unwrap()
             .expect("the rule SEND is admitted");
@@ -8961,7 +10279,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
 
         let prepared = router.prepare_owner_submission(action).await.unwrap();
         let admission = router
-            .admit_rule_action("owner", None, &state, event.seq, prepared)
+            .admit_rule_action("owner", None, &state, state.revision, event.seq, prepared)
             .await
             .unwrap()
             .expect("Owner event STEER is admitted");
@@ -8989,6 +10307,238 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             Some(1)
         );
         assert_eq!(turn_id, "turn-1");
+    }
+
+    #[tokio::test]
+    async fn owner_event_resume_uses_post_stop_ack_and_keeps_unknown_input_queued() {
+        let router = router();
+        let workspace = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let launch_id = ulid::Ulid::new().to_string();
+        let stop_id = ulid::Ulid::new().to_string();
+        let rule_value = json!({
+            "id":"resume-after-exact-stop",
+            "enabled":true,
+            "on":{
+                "event":"command.applied",
+                "match":{"event.data.command_id":stop_id},
+            },
+            "do":[{"action":"resume", "target":"${event.agent}",
+                "expected_generation":"${event.generation}", "text":"continue with new input"}],
+        });
+        let input = eliot_store::RuleDefinitionInput {
+            id: "resume-after-exact-stop".to_owned(),
+            canonical_definition: serde_json::to_string(&rule_value).unwrap(),
+            definition_digest: eliot_core::canonical_json_sha256(&rule_value).unwrap(),
+            enabled: true,
+        };
+
+        let (agent, state, event, binding) = {
+            let mut store = router.inner.store.lock().await;
+            let mut launch = SubmitCommand::new(&launch_id, "launch");
+            launch.expected_generation = Some(0);
+            launch.args = json!({
+                "project":"resume-event-fixture",
+                "workspace":workspace,
+                "harness":"codex",
+                "profile":"codex-luna",
+                "profile_snapshot":{
+                    "harness":"codex",
+                    "pass_env":[],
+                    "pass_env_values":{"CODEX_HOME":null,"CODEX_SQLITE_HOME":null},
+                },
+            });
+            let agent = store
+                .submit("owner", launch, now_ms())
+                .unwrap()
+                .command
+                .target
+                .unwrap();
+            let expected_agent = store.get_agent(&agent).unwrap().unwrap();
+            let binding = NativeStoreBinding {
+                home: workspace.clone(),
+                root: workspace,
+                native_scope: "resume-codex-scope".to_owned(),
+            };
+            store
+                .dispatch_with_native_store_binding(&launch_id, now_ms(), &expected_agent, &binding)
+                .unwrap();
+            read_fixture_event(
+                &mut store,
+                &agent,
+                "session.ready",
+                json!({
+                    "native_scope":"resume-codex-scope",
+                    "native_ref":"retained-resume-thread",
+                }),
+            );
+            store
+                .settle(&launch_id, CommandState::Applied, None, now_ms())
+                .unwrap();
+            let state = store.ensure_rule_state("owner", &input, now_ms()).unwrap();
+
+            let mut stop = SubmitCommand::new(&stop_id, "stop");
+            stop.target = Some(agent.clone());
+            stop.expected_generation = Some(1);
+            store.submit("owner", stop, now_ms()).unwrap();
+            store.dispatch(&stop_id, now_ms()).unwrap();
+            read_fixture_event(
+                &mut store,
+                &agent,
+                "session.ended",
+                json!({"command_id":stop_id}),
+            );
+            store
+                .settle(&stop_id, CommandState::Applied, None, now_ms())
+                .unwrap();
+            let event = store
+                .read_events(0, 1_000, None)
+                .unwrap()
+                .into_iter()
+                .find(|event| {
+                    event.kind == "command.applied"
+                        && event.data.get("command_id").and_then(Value::as_str)
+                            == Some(stop_id.as_str())
+                })
+                .expect("the exact stop command applied after session end");
+            (agent, state, event, binding)
+        };
+
+        assert_eq!(event.agent.as_deref(), Some(agent.as_str()));
+        assert_eq!(event.generation, Some(1));
+        let mut action = SubmitCommand::new(String::new(), "resume");
+        action.target = event.agent.clone();
+        action.expected_generation = event.generation;
+        action.args = json!({"text":"continue with new input"});
+        let prepared = router.prepare_owner_submission(action).await.unwrap();
+        assert!(prepared.workspace.is_none());
+        assert_eq!(prepared.request.target.as_deref(), Some(agent.as_str()));
+        assert_eq!(prepared.request.expected_generation, Some(1));
+
+        let firing = router
+            .inner
+            .store
+            .lock()
+            .await
+            .admit_rule_action("owner", &state, event.seq, prepared.request, now_ms())
+            .unwrap();
+        assert!(firing.is_new);
+        let child = firing.child.expect("the rule admitted its Resume");
+        let resume_id = child.command.id.clone();
+        let linked_id = child
+            .linked_command
+            .as_ref()
+            .expect("Resume text becomes a linked SEND")
+            .id
+            .clone();
+        assert_eq!(child.command.verb, "resume");
+        assert_eq!(child.command.target.as_deref(), Some(agent.as_str()));
+        assert_eq!(child.command.expected_generation, Some(1));
+        assert_eq!(child.command.args, json!({}));
+        let linked = child.linked_command.as_ref().unwrap();
+        assert_eq!(linked.verb, "send");
+        assert_eq!(linked.target.as_deref(), Some(agent.as_str()));
+        assert_eq!(linked.expected_generation, Some(2));
+        assert_eq!(linked.generation, Some(2));
+        assert_eq!(linked.state, CommandState::Queued);
+        assert_eq!(linked.args, json!({"text":"continue with new input"}));
+
+        let (retained_profile, source_state) = router
+            .capture_resume_source_state(&resume_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            retained_profile["native_store_binding"],
+            serde_json::to_value(&binding).unwrap()
+        );
+        assert_eq!(
+            retained_profile["native_store_binding"]["native_scope"],
+            "resume-codex-scope"
+        );
+        assert_eq!(source_state["retained_generation"], 1);
+        assert_eq!(
+            source_state["retained_source"]["source"],
+            CONTROLLED_PLUGIN_SOURCE
+        );
+
+        let dispatched = router
+            .inner
+            .store
+            .lock()
+            .await
+            .dispatch(&resume_id, now_ms())
+            .unwrap()
+            .value;
+        assert_eq!(dispatched.state, CommandState::Dispatched);
+        assert_eq!(dispatched.generation, Some(2));
+        assert_eq!(
+            router
+                .inner
+                .store
+                .lock()
+                .await
+                .get_agent(&agent)
+                .unwrap()
+                .unwrap()
+                .generation,
+            2
+        );
+        router
+            .inner
+            .store
+            .lock()
+            .await
+            .settle(
+                &resume_id,
+                CommandState::Unknown,
+                Some(json!({"code":"unknown"})),
+                now_ms(),
+            )
+            .unwrap();
+
+        let replay = router
+            .replay_rule_event_action("owner", &state, state.revision, event.seq)
+            .await
+            .unwrap()
+            .expect("replay resolves the exact event before current generation checks");
+        assert!(!replay.is_new);
+        let replayed_child = replay.child.expect("replay retains the Resume admission");
+        assert_eq!(replayed_child.command.id, resume_id);
+        assert_eq!(replayed_child.command.state, CommandState::Unknown);
+        assert_eq!(
+            replayed_child.command.target.as_deref(),
+            Some(agent.as_str())
+        );
+        assert_eq!(replayed_child.command.generation, Some(2));
+        let replayed_linked = replayed_child.linked_command.as_ref().unwrap();
+        assert_eq!(replayed_linked.id, linked_id);
+        assert_eq!(replayed_linked.target.as_deref(), Some(agent.as_str()));
+        assert_eq!(replayed_linked.generation, Some(2));
+        assert_eq!(replayed_linked.state, CommandState::Queued);
+        assert_eq!(rule_admission_dispatch_plan(&replayed_child), None);
+        assert_eq!(
+            router
+                .inner
+                .store
+                .lock()
+                .await
+                .recover_rule_children(None, 100)
+                .unwrap(),
+            Vec::<eliot_store::Admission>::new()
+        );
+        assert_eq!(
+            router
+                .inner
+                .store
+                .lock()
+                .await
+                .dispatch(&resume_id, now_ms())
+                .unwrap_err()
+                .code,
+            "bad_state"
+        );
     }
 
     #[tokio::test]
@@ -9061,7 +10611,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
 
         let prepared = router.prepare_owner_submission(action).await.unwrap();
         let admission = router
-            .admit_rule_action("owner", None, &state, event.seq, prepared)
+            .admit_rule_action("owner", None, &state, state.revision, event.seq, prepared)
             .await
             .unwrap()
             .expect("Owner request reply is admitted");
@@ -9151,7 +10701,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             .unwrap();
 
         let rejected = router
-            .admit_rule_action("owner", None, &state, event.seq, prepared)
+            .admit_rule_action("owner", None, &state, state.revision, event.seq, prepared)
             .await
             .unwrap()
             .expect("the secret answer refusal advances this firing");
@@ -9193,6 +10743,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 "owner",
                 None,
                 &state,
+                state.revision,
                 event.seq,
                 PreparedSubmission {
                     request: action,
@@ -9209,6 +10760,130 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         assert_eq!(
             router.inner.store.lock().await.high_water().unwrap(),
             before_replay
+        );
+    }
+
+    #[test]
+    fn project_rule_resume_requires_resume_send_and_retained_profile_grants() {
+        let checkout = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let registration = eliot_core::api::ProjectRegistrationView {
+            id: "resume-project".to_owned(),
+            checkout: checkout.clone(),
+            repo_common_dir: checkout,
+            profiles: vec!["fake".to_owned()],
+            actions: vec!["resume".to_owned(), "send".to_owned()],
+            interpreters: std::collections::BTreeMap::new(),
+            run_env: Vec::new(),
+            revision: 1,
+        };
+        let mut request = SubmitCommand::new(String::new(), "resume");
+        request.target = Some("a7".to_owned());
+        request.expected_generation = Some(7);
+        request.args = json!({"text":"resume with new input"});
+        let mut authorized = request.clone();
+        authorize_command(
+            &Principal::ProjectRule {
+                registration: registration.clone(),
+            },
+            &mut authorized,
+        )
+        .expect("Project resume and its linked SEND are explicitly approved");
+
+        let mut without_captured_generation = request.clone();
+        without_captured_generation.expected_generation = None;
+        assert_eq!(
+            validate_rule_resume_action(&without_captured_generation, Some(&registration))
+                .unwrap_err()
+                .code,
+            "invalid",
+            "EventRule Resume must keep its captured generation",
+        );
+
+        let mut without_send = registration.clone();
+        without_send.actions = vec!["resume".to_owned()];
+        assert_eq!(
+            validate_rule_resume_action(&request, Some(&without_send))
+                .unwrap_err()
+                .code,
+            "not_allowed"
+        );
+        let mut without_resume = registration.clone();
+        without_resume.actions = vec!["send".to_owned()];
+        assert_eq!(
+            authorize_command(
+                &Principal::ProjectRule {
+                    registration: without_resume,
+                },
+                &mut request.clone(),
+            )
+            .unwrap_err()
+            .code,
+            "not_allowed"
+        );
+
+        let mut no_input = request.clone();
+        no_input.args = json!({});
+        validate_rule_resume_action(&no_input, Some(&without_send))
+            .expect("resume without new text does not need a SEND grant");
+        let prepared = PreparedSubmission {
+            request: no_input.clone(),
+            workspace: None,
+        };
+        validate_rule_resume_preparation(&prepared, Some(&without_send))
+            .expect("existing-workspace resume has no preparation payload");
+        let mut managed = prepared;
+        managed.workspace = Some(eliot_core::WorkspacePreparationInput {
+            project: "project".to_owned(),
+            repo_path: "repo".to_owned(),
+            repo_common_dir: "repo".to_owned(),
+            requested_branch: "codex/resume".to_owned(),
+            base_ref: None,
+            base_oid: "0".repeat(40),
+            worktree_path: "worktree".to_owned(),
+            frozen_setup: Vec::new(),
+        });
+        assert_eq!(
+            validate_rule_resume_preparation(&managed, Some(&without_send))
+                .unwrap_err()
+                .code,
+            "unsupported"
+        );
+
+        let mut with_override = request.clone();
+        with_override.args["profile"] = Value::String("other".to_owned());
+        assert_eq!(
+            validate_rule_resume_action(&with_override, Some(&registration))
+                .unwrap_err()
+                .code,
+            "unsupported"
+        );
+
+        let agent = Agent::new("a7", "project-label", "fake", "fake", 1);
+        validate_project_rule_resume_profile(&registration, &agent)
+            .expect("the retained Agent profile is on the registration allowlist");
+        let mut unapproved_profile = agent;
+        unapproved_profile.profile = "other".to_owned();
+        assert_eq!(
+            validate_project_rule_resume_profile(&registration, &unapproved_profile)
+                .unwrap_err()
+                .code,
+            "not_allowed"
+        );
+
+        let mut frozen_resume =
+            command_with_state("resume-parent", "resume", CommandState::Accepted);
+        frozen_resume.target = Some("a7".to_owned());
+        frozen_resume.expected_generation = Some(7);
+        frozen_resume.args = json!({});
+        assert!(validate_project_rule_resume_command(&registration, &frozen_resume, true).is_ok());
+        assert_eq!(
+            validate_project_rule_resume_command(&without_send, &frozen_resume, true)
+                .unwrap_err()
+                .code,
+            "not_allowed"
         );
     }
 
@@ -9533,6 +11208,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 &format!("project:{project_id}"),
                 Some(&captured),
                 &state,
+                state.revision,
                 1,
                 PreparedSubmission {
                     request: action,
@@ -9664,6 +11340,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 &principal,
                 Some(&registration),
                 &state,
+                state.revision,
                 event.seq,
                 PreparedSubmission {
                     request: action,
@@ -10280,6 +11957,46 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 now_ms(),
             )
             .unwrap();
+    }
+
+    fn stopped_fake_agent(store: &mut eliot_store::Store, project: &str) -> String {
+        let workspace = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let launch_id = ulid::Ulid::new().to_string();
+        let mut launch = SubmitCommand::new(launch_id.clone(), "launch");
+        launch.expected_generation = Some(0);
+        launch.args = json!({
+            "project":project,
+            "workspace":workspace,
+            "harness":"fake",
+            "profile":"fake",
+            "profile_snapshot":{"harness":"fake"},
+        });
+        let agent = store
+            .submit("owner", launch, now_ms())
+            .unwrap()
+            .command
+            .target
+            .unwrap();
+        store.dispatch(&launch_id, now_ms()).unwrap();
+        read_fixture_event(
+            store,
+            &agent,
+            "session.ready",
+            json!({
+                "command_id":launch_id,
+                "native_scope":format!("fake:synthetic:scope:{agent}"),
+                "native_ref":format!("fake:synthetic:session:{agent}"),
+            }),
+        );
+        store
+            .settle(&launch_id, CommandState::Applied, None, now_ms())
+            .unwrap();
+        read_fixture_event(store, &agent, "session.ended", json!({}));
+        agent
     }
 
     fn result_fixture(store: &mut eliot_store::Store) -> (String, String) {

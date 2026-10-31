@@ -125,8 +125,8 @@ the existing command router. The connected timer slice admits ordinary `stop`, `
 targetless `launch` and `run` children for global and
 registered-project interval, cron and once firings, including manual `timer.run`. See
 [Timer Run invocation context](#timer-run-invocation-context).
-The event-rule `interrupt`, `steer` and request-reply actions remain unsupported for
-scheduled or manual timer runs.
+The event-rule `interrupt`, `steer`, `resume` and request-reply actions remain unsupported
+for scheduled or manual timer runs.
 Other action verbs remain future work.
 
 ```toml
@@ -282,11 +282,12 @@ Disabled rules advance their skipped range without firing.
 
 Backlog, explicit history catch-up, and rate-limit semantics are defined in
 [Retention and bounded backlog](#retention-and-bounded-backlog).
-This connected event-rule subset supports event actions `stop`, `send`, `launch`, `interrupt`,
-`steer`, `approve`, `deny` and `answer`, plus project event-rule `run` during live
-evaluation and explicit history catch-up. The global event-rule `run` contract below uses
-owner-global approval and the shared frozen execution path. Other full L4.2 action
-requirements remain cumulative. SEND uses the
+This connected event-rule subset supports event actions `stop`, `send`, `launch`, `resume`,
+`interrupt`, `steer`, `approve`, `deny` and `answer`, plus project event-rule `run` during live
+evaluation and explicit history catch-up. Event-rule `resume` is available in live evaluation
+and finite `rule.catch_up`; both use the captured event binding and ordinary command admission.
+The global event-rule `run` contract below uses owner-global approval and the shared frozen
+execution path. Other full L4.2 action requirements remain cumulative. SEND uses the
 existing Router path, keeps its exact target generation and turn association, and
 `applied` does not assert task completion. `allow_self` defaults to false; see [Guardrails](#guardrails)
 for the same-principal self-cause behavior for SEND and Run. Goal actions and project
@@ -345,13 +346,53 @@ For an existing request ID, return the retained admission/result before resolvin
 current profile or workspace values. This replay does not re-dispatch an uncertain external
 effect or silently choose another profile or workspace.
 
+### Resume a retained Agent
+
+The `resume` action submits the existing ordinary `resume` command:
+
+```toml
+[[rule]]
+id = "resume-after-known-stop"
+on = { event = "command.applied", match = { "event.data.command_id" = "01ARZ3NDEKTSV4RRFFQ69G5FAV" } }
+do = [{ action = "resume", target = "${event.agent}", expected_generation = "${event.generation}", text = "Continue: ${event.kind}" }]
+```
+
+The match value must be the exact known Stop command ID. Store's `command.applied` event
+provides `event.data.command_id`; this example assumes no `event.data.verb`, does not filter on
+a post-stop `subject.state`, and does not depend on `agent.stopped` being emitted. This is one
+post-stop trigger example, not a restriction on event kinds; other committed events can trigger
+resume when their captured Agent/generation and current Store admission are valid.
+
+`target` and `expected_generation` must resolve exactly to the captured event-time Agent and
+old generation `N`. The ordinary command has no turn/request binding. Store advances that
+same Agent to `N+1` only if it is stopped, failed or lost, has no active turn, and has a
+retained subject resumable by its harness. Native Codex resume keeps its pinned native binding
+and uses normal native readback. The tinyFake verifier uses only a synthetic retained subject
+for deterministic transport exercise; it makes no native L2 qualification claim and never
+substitutes for Codex. Subject grammar remains plugin-owned. A stale event is rejected without
+retargeting. Resume keeps the retained subject, profile and workspace, replays no old input,
+and accepts no profile, workspace, worktree, base, setup, model, effort or permission override.
+
+`text` is optional. Event text is rendered once and frozen under the ordinary persisted-text
+bound. Nonblank text creates the normal linked `<resume-id>/send` for generation `N+1`; it is
+one configured `resume` action, and the linked SEND keeps its own command ID and verified
+cause ancestry. Apply the linked-input ordering gate above: accepted, queued, dispatched or
+unknown input holds later timer/action work; applied confirms input-to-turn association, while
+the turn's terminal result remains separate. An unknown resume or SEND is never replayed.
+
+Owner rules use Owner authority. Project rules require an explicit `resume` action grant and
+the current canonical registration, checkout and approval for the retained profile. Nonblank
+text also requires an explicit `send` grant. `Agent.project` remains descriptive and never
+establishes project authority.
+
 Rate accounting uses the configured `RuleLimit` scope. With `per = "agent"`, targetless `run`
 and `launch` have no target Agent and contribute no Agent-scope count; never borrow the
-triggering event's Agent. With `per = "rule"`, the configured launch counts once, including
-its linked initial `send`; the `send` is not counted again. The existing global action guard
-also counts the configured launch once. Only the selected `RuleLimit` scope applies, so
-`per = "agent"` does not additionally impose a per-rule count. The `RuleLimit` configuration
-is unchanged, and this does not introduce a quota or accounting key.
+triggering event's Agent. Targeted `resume` uses its exact captured Agent. With `per = "rule"`,
+each configured launch or resume counts once; a linked initial SEND is not counted again.
+The existing global action guard also counts each configured action once. Only the selected
+`RuleLimit` scope applies, so `per = "agent"` does not additionally
+impose a per-rule count. The `RuleLimit` configuration is unchanged, and this introduces no
+new quota or accounting key.
 
 ## Matching and rendering
 
@@ -567,8 +608,9 @@ line is one JSON object, LF or CRLF terminated; a final complete object may end 
 Empty lines, malformed JSON, invalid UTF-8, truncated capture or excess output invalidate
 the entire stream. Each line must deserialize as the strict Core `ScriptActionRecord`
 DTO; that type owns the closed flat record field catalog and converts to an ordinary
-`SubmitCommand`. Event-rule STEER and request-reply actions do not extend the script stdout
-action set.
+`SubmitCommand`. Event-rule STEER, resume and request-reply actions do not extend the script
+stdout action set. A `resume` stdout record is invalid under the closed Core DTO; it is never
+silently dropped.
 The effective send-text limit is Core `MAX_EVENT_BYTES` (64 KiB) from
 [Core limits](../../crates/eliot-core/src/limits.rs). Unknown, missing, `null`, nested,
 extra or wrong-type fields fail validation. Targets and generation/turn bindings are

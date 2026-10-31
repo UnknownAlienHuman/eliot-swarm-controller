@@ -134,12 +134,66 @@ pub(super) async fn verify_managed_workspace_identity(
     target_workspace: &str,
     expected_generation: i64,
 ) -> Result<()> {
+    if workspace.phase != eliot_core::WorkspacePhase::Ready
+        || workspace.target_generation != expected_generation
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "managed project workspace snapshot differs from its registration",
+        ));
+    }
+
+    verify_managed_workspace_git_identity(registration, workspace, target_workspace).await
+}
+
+pub(super) async fn verify_managed_project_resume_workspace(
+    registration: &RegistrationSnapshot,
+    workspace: &eliot_core::WorkspacePreparation,
+    agent: &eliot_core::Agent,
+    command: &eliot_core::Command,
+) -> Result<()> {
+    let next_generation = agent.generation.checked_add(1).ok_or_else(|| {
+        Error::new(
+            "not_allowed",
+            "managed project resume generation is out of range",
+        )
+    })?;
+    if command.verb != "resume"
+        || !matches!(
+            command.state,
+            eliot_core::CommandState::Accepted | eliot_core::CommandState::Queued
+        )
+        || command.target.as_deref() != Some(agent.id.as_str())
+        || command.expected_generation != Some(agent.generation)
+        || command.generation != Some(agent.generation)
+        || workspace.agent != agent.id
+        || workspace.start_command_id != command.id
+        || workspace.target_generation != next_generation
+        || !matches!(
+            workspace.phase,
+            eliot_core::WorkspacePhase::Creating | eliot_core::WorkspacePhase::Ready
+        )
+        || workspace.setup_index != workspace.frozen_setup.len()
+        || agent.workspace.as_deref() != Some(workspace.worktree_path.as_str())
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "managed project resume workspace snapshot does not match its accepted command",
+        ));
+    }
+
+    verify_managed_workspace_git_identity(registration, workspace, &workspace.worktree_path).await
+}
+
+async fn verify_managed_workspace_git_identity(
+    registration: &RegistrationSnapshot,
+    workspace: &eliot_core::WorkspacePreparation,
+    target_workspace: &str,
+) -> Result<()> {
     if workspace.project != registration.checkout
         || workspace.repo_path != registration.checkout
         || workspace.repo_common_dir != registration.repo_common_dir
         || workspace.worktree_path != target_workspace
-        || workspace.phase != eliot_core::WorkspacePhase::Ready
-        || workspace.target_generation != expected_generation
     {
         return Err(Error::new(
             "not_allowed",
@@ -662,6 +716,194 @@ mod tests {
             )
             .await
             .expect_err("changed common directory must fail closed")
+            .code,
+            "not_allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_resume_workspace_accepts_only_owned_next_generation_marker() {
+        let fixture = ProjectFixture::new();
+        let checkout = fixture.repository("registered");
+        fixture.run_git(
+            &checkout,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        );
+
+        let worktree = fixture.root.join("managed-worktree");
+        let worktree_text = worktree.to_string_lossy().into_owned();
+        let worktree_git_arg = git_argument_path(&worktree);
+        fixture.run_git(
+            &checkout,
+            &["worktree", "add", "--detach", &worktree_git_arg, "HEAD"],
+        );
+
+        let git = WorkspaceGit::new().expect("resolve Git");
+        let (canonical_checkout, registered_common_dir) = git
+            .repository_identity(&checkout.to_string_lossy())
+            .await
+            .expect("read registered repository identity");
+        let (canonical_worktree, worktree_common_dir) = git
+            .repository_identity(&worktree_text)
+            .await
+            .expect("read managed worktree identity");
+        assert_eq!(worktree_common_dir, registered_common_dir);
+
+        let registration = RegistrationSnapshot {
+            id: "app".to_owned(),
+            checkout: canonical_checkout.clone(),
+            repo_common_dir: registered_common_dir.clone(),
+            profiles: vec!["fake".to_owned()],
+            actions: vec!["resume".to_owned()],
+            interpreters: BTreeMap::new(),
+            run_env: Vec::new(),
+        };
+        let mut agent = eliot_core::Agent::new("a1", "app", "fake", "fake", 0);
+        agent.generation = 7;
+        agent.workspace = Some(canonical_worktree.clone());
+        let command = eliot_core::Command {
+            id: ulid::Ulid::new().to_string(),
+            principal: "project:app".to_owned(),
+            method: "resume".to_owned(),
+            verb: "resume".to_owned(),
+            target: Some(agent.id.clone()),
+            expected_generation: Some(agent.generation),
+            generation: Some(agent.generation),
+            args: serde_json::json!({}),
+            state: eliot_core::CommandState::Accepted,
+            turn_id: None,
+            request_id: None,
+            outcome: None,
+            created_at: 0,
+            updated_at: 0,
+            probe: false,
+        };
+        let workspace = eliot_core::WorkspacePreparation {
+            agent: agent.id.clone(),
+            target_generation: agent.generation + 1,
+            start_command_id: command.id.clone(),
+            project: canonical_checkout.clone(),
+            repo_path: canonical_checkout,
+            repo_common_dir: registered_common_dir,
+            requested_branch: "detached".to_owned(),
+            base_ref: None,
+            base_oid: String::new(),
+            worktree_path: canonical_worktree,
+            frozen_setup: Vec::new(),
+            phase: eliot_core::WorkspacePhase::Creating,
+            setup_index: 0,
+            outcome: None,
+            updated_at: 0,
+        };
+
+        verify_managed_project_resume_workspace(&registration, &workspace, &agent, &command)
+            .await
+            .expect("accept owned Creating marker for the next generation");
+
+        let mut ready = workspace.clone();
+        ready.phase = eliot_core::WorkspacePhase::Ready;
+        let mut queued = command.clone();
+        queued.state = eliot_core::CommandState::Queued;
+        verify_managed_project_resume_workspace(&registration, &ready, &agent, &queued)
+            .await
+            .expect("accept owned Ready marker for the next generation");
+
+        assert_eq!(
+            verify_managed_workspace_identity(
+                &registration,
+                &workspace,
+                &workspace.worktree_path,
+                workspace.target_generation,
+            )
+            .await
+            .expect_err("ordinary verification must reject a Creating marker")
+            .code,
+            "not_allowed"
+        );
+        assert_eq!(
+            verify_managed_workspace_identity(
+                &registration,
+                &ready,
+                &ready.worktree_path,
+                agent.generation,
+            )
+            .await
+            .expect_err("ordinary verification must reject next-generation Ready")
+            .code,
+            "not_allowed"
+        );
+
+        let mut foreign = workspace.clone();
+        foreign.agent = "a2".to_owned();
+        assert_eq!(
+            verify_managed_project_resume_workspace(&registration, &foreign, &agent, &command)
+                .await
+                .expect_err("foreign Agent marker must be rejected")
+                .code,
+            "not_allowed"
+        );
+
+        let mut stale = workspace.clone();
+        stale.target_generation = agent.generation;
+        assert_eq!(
+            verify_managed_project_resume_workspace(&registration, &stale, &agent, &command)
+                .await
+                .expect_err("stale generation marker must be rejected")
+                .code,
+            "not_allowed"
+        );
+
+        let mut unknown = workspace.clone();
+        unknown.phase = eliot_core::WorkspacePhase::Unknown;
+        assert_eq!(
+            verify_managed_project_resume_workspace(&registration, &unknown, &agent, &command)
+                .await
+                .expect_err("unknown workspace marker must be rejected")
+                .code,
+            "not_allowed"
+        );
+
+        let mut unknown_command = command.clone();
+        unknown_command.state = eliot_core::CommandState::Unknown;
+        assert_eq!(
+            verify_managed_project_resume_workspace(
+                &registration,
+                &workspace,
+                &agent,
+                &unknown_command,
+            )
+            .await
+            .expect_err("unknown Resume command must be rejected")
+            .code,
+            "not_allowed"
+        );
+
+        let mut foreign_workspace = agent.clone();
+        foreign_workspace.workspace = Some(
+            fixture
+                .root
+                .join("other-worktree")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        assert_eq!(
+            verify_managed_project_resume_workspace(
+                &registration,
+                &workspace,
+                &foreign_workspace,
+                &command,
+            )
+            .await
+            .expect_err("Agent workspace mismatch must be rejected")
             .code,
             "not_allowed"
         );

@@ -340,6 +340,7 @@ pub(crate) fn load_project_registration_config(
                 matches!(
                     action,
                     "launch"
+                        | "resume"
                         | "stop"
                         | "send"
                         | "steer"
@@ -553,7 +554,7 @@ fn normalize_project_allowlist(
                 offset,
                 &format!("projects.{project_id}.{field}"),
                 if field == "actions" {
-                    "only implemented launch, stop, send, steer, interrupt, approve, deny, answer and run actions may be approved"
+                    "only implemented launch, resume, stop, send, steer, interrupt, approve, deny, answer and run actions may be approved"
                 } else {
                     "must name an existing global profile"
                 },
@@ -1487,6 +1488,15 @@ mod tests {
         assert_eq!(configured.len(), 1);
         assert_eq!(configured[0].profiles, vec!["fake"]);
         assert_eq!(configured[0].actions, vec!["launch"]);
+
+        fixture.write(&format!(
+            "[projects.sample]\npath = {project_path}\nprofiles = ['fake']\nactions = ['resume', 'send']\n"
+        ));
+        let with_resume = load_project_registration_config(&fixture.root).unwrap();
+        assert_eq!(
+            with_resume[0].actions,
+            vec!["resume".to_owned(), "send".to_owned()]
+        );
 
         fixture.write(&format!(
             "[projects.sample]\npath = {project_path}\nprofiles = ['fake']\nactions = ['send']\n"

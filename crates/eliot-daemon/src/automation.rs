@@ -356,6 +356,22 @@ pub(crate) async fn verify_managed_project_workspace(
     .await
 }
 
+pub(crate) async fn verify_managed_project_resume_workspace(
+    registration: &ProjectRegistrationView,
+    workspace: &eliot_core::WorkspacePreparation,
+    agent: &eliot_core::Agent,
+    command: &eliot_core::Command,
+) -> Result<()> {
+    registration.validate()?;
+    projects::verify_managed_project_resume_workspace(
+        &project_registration_snapshot(registration),
+        workspace,
+        agent,
+        command,
+    )
+    .await
+}
+
 async fn refresh_project_namespaces(
     router: &Router,
     data_root: &Path,
@@ -1363,6 +1379,7 @@ async fn process_rule_cursor(
                     &rule.principal,
                     rule.project.as_ref(),
                     &rule.state,
+                    revision,
                     event.seq,
                     prepared,
                 )

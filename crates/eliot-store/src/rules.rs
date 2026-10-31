@@ -963,7 +963,7 @@ impl Store {
                  WHERE link_kind = 'rule_action' AND ordinal IS NOT NULL
                    AND (
                        state IN ('accepted','queued')
-                       OR (verb = 'launch' AND state = 'applied'
+                       OR (verb IN ('launch','resume') AND state = 'applied'
                            AND EXISTS (
                                SELECT 1 FROM commands input
                                WHERE input.parent_command = commands.id
@@ -978,7 +978,8 @@ impl Store {
                          AND earlier.ordinal < commands.ordinal
                          AND (
                              earlier.state IN ('accepted','queued','dispatched','unknown')
-                             OR (earlier.verb = 'launch' AND earlier.state = 'applied'
+                             OR (earlier.verb IN ('launch','resume')
+                                 AND earlier.state = 'applied'
                                  AND EXISTS (
                                      SELECT 1 FROM commands input
                                      WHERE input.parent_command = earlier.id
@@ -1819,6 +1820,28 @@ fn validate_project_rule_action_tx(
         let command = CommandInsert::targetless_admitted(principal, request, &payload_digest, 0);
         super::projects::capture_project_command_binding_tx(tx, &command)?;
         return Ok(None);
+    }
+    if request.verb == "resume" {
+        let target = request
+            .target
+            .as_deref()
+            .ok_or_else(|| Error::new("not_allowed", "project resume has no Agent target"))?;
+        let generation = request.expected_generation.ok_or_else(|| {
+            Error::new("not_allowed", "project resume has no exact old generation")
+        })?;
+        let has_linked_input = request
+            .args
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.trim().is_empty());
+        return super::projects::validate_project_resume_action_tx(
+            tx,
+            principal,
+            target,
+            generation,
+            request.expected_generation,
+            has_linked_input,
+        );
     }
     if rule_project_id(principal)?.is_none() {
         return Ok(None);
@@ -2816,6 +2839,13 @@ pub(super) fn valid_rule_action_request(request: &SubmitCommand, allow_interrupt
                     args.len() == 1 && args.get("text").is_some_and(Value::is_string)
                 })
         }
+        "resume" => {
+            request.expected_turn_id.is_none()
+                && request.args.as_object().is_some_and(|args| {
+                    args.iter()
+                        .all(|(key, value)| key == "text" && (value.is_string() || value.is_null()))
+                })
+        }
         "interrupt" if allow_interrupt => {
             request
                 .expected_turn_id
@@ -2887,10 +2917,12 @@ fn valid_targetless_rule_launch_request(request: &SubmitCommand) -> bool {
 }
 
 fn valid_timer_action_request(request: &SubmitCommand) -> bool {
-    if request.verb == "launch" {
-        valid_targetless_rule_launch_request(request)
-    } else {
-        valid_rule_action_request(request, false)
+    match request.verb.as_str() {
+        "launch" => valid_targetless_rule_launch_request(request),
+        // Timer definitions and their action renderer do not expose resume.
+        // Keep the Store boundary aligned with that owning grammar.
+        "resume" => false,
+        _ => valid_rule_action_request(request, false),
     }
 }
 
@@ -2971,6 +3003,48 @@ pub(super) fn rule_run_action_binding_error(
         Err(error) if error.code == "invalid" => Ok(Some("rule_action_binding_invalid".to_owned())),
         Err(error) => Err(error),
     }
+}
+
+fn resume_workspace_stop_pending_tx(
+    tx: &Transaction<'_>,
+    resume_id: &str,
+    target: i64,
+    old_generation: i64,
+) -> Result<bool> {
+    let Some(workspace) = super::load_workspace(tx, target)? else {
+        return Ok(false);
+    };
+    if workspace.start_command_id != resume_id || !super::workspace_cancel_requested(&workspace) {
+        return Ok(false);
+    }
+    let next_generation = old_generation
+        .checked_add(1)
+        .ok_or_else(|| Error::new("source_integrity", "resume generation overflow"))?;
+    let stop_id = workspace
+        .outcome
+        .as_ref()
+        .and_then(|outcome| outcome.get("stop_command_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::new("source_integrity", "workspace cancel marker has no Stop"))?;
+    let stop = load_command_record(tx, stop_id)?
+        .ok_or_else(|| Error::new("source_integrity", "workspace cancel Stop disappeared"))?;
+    if workspace.target_generation != next_generation
+        || !matches!(
+            workspace.phase,
+            WorkspacePhase::Creating | WorkspacePhase::Ready
+        )
+        || stop.command.verb != "stop"
+        || stop.target != Some(target)
+        || stop.command.generation != Some(old_generation)
+        || stop.expected_turn_id.is_some()
+        || !matches!(stop.state, CommandState::Dispatched | CommandState::Unknown)
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "workspace cancel marker does not retain its exact pending Stop",
+        ));
+    }
+    Ok(true)
 }
 
 /// Gate a rule-action child at the Store dispatch boundary. A held successor is
@@ -3117,20 +3191,9 @@ pub(super) fn gate_rule_action_dispatch_tx(
             let predecessor = load_command_record(tx, &row.0)?.ok_or_else(|| {
                 Error::new("source_integrity", "rule-action predecessor disappeared")
             })?;
-            if predecessor.command.verb == "launch" {
-                let expects_linked_send = predecessor
-                    .command
-                    .args
-                    .get("text")
-                    .is_some_and(|text| !text.is_null());
-                let linked_send = load_linked_command(tx, &row.0)?;
-                if expects_linked_send != linked_send.is_some() {
-                    return Err(Error::new(
-                        "source_integrity",
-                        "applied launch predecessor has an inconsistent linked-send child",
-                    ));
-                }
-                if let Some(linked_send) = linked_send {
+            if matches!(predecessor.command.verb.as_str(), "launch" | "resume") {
+                let retained = retained_action_admission(tx, predecessor.command)?;
+                if let Some(linked_send) = retained.linked_command {
                     match linked_send.state {
                         CommandState::Applied => {}
                         CommandState::Rejected | CommandState::Failed | CommandState::Cancelled => {
@@ -3187,6 +3250,59 @@ pub(super) fn gate_rule_action_dispatch_tx(
         if !matches!(sibling_state, CommandState::Accepted | CommandState::Queued) {
             continue;
         }
+        let sibling = load_command_record(tx, &row.0)?
+            .ok_or_else(|| Error::new("source_integrity", "rule-action sibling disappeared"))?;
+        if sibling.command.verb != "resume" {
+            continue;
+        }
+        let target = row.4.ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "undispatched rule-action child has no target",
+            )
+        })?;
+        let generation = row.5.or(row.6).ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "undispatched rule-action child has no generation",
+            )
+        })?;
+        if resume_workspace_stop_pending_tx(tx, &row.0, target, generation)? {
+            let current = load_command_record(tx, command_id)?
+                .ok_or_else(|| Error::new("source_integrity", "rule-action child disappeared"))?;
+            if current.state == CommandState::Accepted {
+                let current_target = current.target.ok_or_else(|| {
+                    Error::new("source_integrity", "rule-action child has no target")
+                })?;
+                let current_generation = current
+                    .command
+                    .generation
+                    .or(current.command.expected_generation)
+                    .ok_or_else(|| {
+                        Error::new("source_integrity", "rule-action child has no generation")
+                    })?;
+                update_command_state(tx, command_id, CommandState::Queued, None, None, now)?;
+                events.push(insert_daemon_command_event(
+                    tx,
+                    now,
+                    "command.queued",
+                    Some(current_target),
+                    Some(current_generation),
+                    command_id,
+                    json!({
+                        "command_id": command_id,
+                        "reason": "workspace_stop_pending",
+                    }),
+                )?);
+            }
+            return Ok(RuleActionDispatchGate::Held);
+        }
+    }
+    for row in sibling_rows.iter().skip(failed_index + 1) {
+        let sibling_state: CommandState = parse_enum(&row.3, "command state")?;
+        if !matches!(sibling_state, CommandState::Accepted | CommandState::Queued) {
+            continue;
+        }
         let target = row.4.ok_or_else(|| {
             Error::new(
                 "source_integrity",
@@ -3213,6 +3329,16 @@ pub(super) fn gate_rule_action_dispatch_tx(
         if sibling.command.verb == "launch" {
             super::capacity::release_unstarted_tx(tx, target, 1, &row.0)?;
             super::fail_unstarted_launch_tx(tx, target, &row.0, now, events)?;
+        } else if sibling.command.verb == "resume" {
+            super::cancel_unstarted_resume_input_tx(
+                tx,
+                target,
+                &row.0,
+                "rule_action_predecessor_terminal",
+                now,
+                events,
+                false,
+            )?;
         }
     }
     Ok(RuleActionDispatchGate::Cancelled)
@@ -3226,7 +3352,7 @@ fn has_open_rule_actions_tx(tx: &Transaction<'_>, principal: &str, rule: &str) -
              WHERE child.link_kind = 'rule_action' AND child.ordinal IS NOT NULL
                AND (
                    child.state IN ('accepted','queued','dispatched','unknown')
-                   OR (child.verb = 'launch' AND EXISTS (
+                   OR (child.verb IN ('launch','resume') AND EXISTS (
                        SELECT 1 FROM commands input
                        WHERE input.parent_command = child.id
                          AND input.link_kind = 'send' AND input.ordinal = 0
@@ -3645,7 +3771,14 @@ fn should_suppress_own_event_send_or_run_tx(
     request: &SubmitCommand,
     trigger_cause: Option<&core::EventCause>,
 ) -> Result<bool> {
-    if !matches!(request.verb.as_str(), "send" | "run") {
+    let has_rule_input = matches!(request.verb.as_str(), "send" | "run")
+        || (request.verb == "resume"
+            && request
+                .args
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.trim().is_empty()));
+    if !has_rule_input {
         return Ok(false);
     }
     let definition: Value = serde_json::from_str(canonical_definition)
@@ -3698,6 +3831,35 @@ fn should_suppress_own_event_send_or_run_tx(
                           AND root.principal = ?2
                           AND root.verb IN ('rule','timer.run','rule.catch_up')
                           AND json_extract(root.args, '$.rule') = ?3
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM commands action
+                        WHERE action.id = origin.parent_command
+                          AND origin.link_kind = 'send'
+                          AND action.principal = ?2
+                          AND action.link_kind = 'rule_action'
+                          AND action.ordinal IS NOT NULL
+                          AND (
+                              EXISTS (
+                                  SELECT 1 FROM commands root
+                                  WHERE root.id = action.parent_command
+                                    AND root.principal = ?2
+                                    AND root.verb IN ('rule','timer.run','rule.catch_up')
+                                    AND json_extract(root.args, '$.rule') = ?3
+                              )
+                              OR EXISTS (
+                                  SELECT 1 FROM commands run
+                                  JOIN commands root ON root.id = run.parent_command
+                                  WHERE run.id = action.parent_command
+                                    AND run.verb = 'run'
+                                    AND run.principal = ?2
+                                    AND run.link_kind = 'rule_action'
+                                    AND run.ordinal IS NOT NULL
+                                    AND root.principal = ?2
+                                    AND root.verb IN ('rule','timer.run','rule.catch_up')
+                                    AND json_extract(root.args, '$.rule') = ?3
+                              )
+                          )
                     )
                )
          )",
@@ -4032,29 +4194,122 @@ fn load_rule_child(
     Ok(Some(retained_action_admission(connection, command)?))
 }
 
-fn retained_action_admission(connection: &Connection, command: Command) -> Result<Admission> {
-    let linked_command = if command.verb == "launch" {
+pub(super) fn retained_action_admission(
+    connection: &Connection,
+    command: Command,
+) -> Result<Admission> {
+    let linked_command = if matches!(command.verb.as_str(), "launch" | "resume") {
         load_linked_command(connection, &command.id)?
     } else {
         None
     };
-    let expects_linked_send =
-        command.verb == "launch" && command.args.get("text").is_some_and(|text| !text.is_null());
-    match (expects_linked_send, linked_command.as_ref()) {
-        (true, Some(linked))
-            if linked.id == format!("{}/send", command.id)
-                && linked.principal == command.principal
-                && linked.verb == "send"
-                && linked.target == command.target
-                && linked.expected_generation == Some(1)
-                && linked.generation == Some(1)
-                && linked.args.get("text") == command.args.get("text") => {}
-        (false, None) => {}
-        _ => {
-            return Err(Error::new(
-                "source_integrity",
-                "rule launch linked-send row differs from its retained command",
-            ));
+    if command.verb == "launch" {
+        let expects_linked_send = command.args.get("text").is_some_and(|text| !text.is_null());
+        match (expects_linked_send, linked_command.as_ref()) {
+            (true, Some(linked))
+                if linked.id == format!("{}/send", command.id)
+                    && linked.principal == command.principal
+                    && linked.method == command.method
+                    && linked.verb == "send"
+                    && linked.target == command.target
+                    && linked.expected_generation == Some(1)
+                    && linked.generation == Some(1)
+                    && linked.args.get("text") == command.args.get("text") => {}
+            (false, None) => {}
+            _ => {
+                return Err(Error::new(
+                    "source_integrity",
+                    "rule launch linked-send row differs from its retained command",
+                ));
+            }
+        }
+    } else if command.verb == "resume" {
+        match linked_command.as_ref() {
+            Some(linked) => {
+                let old_generation = command
+                    .expected_generation
+                    .or(command.generation)
+                    .ok_or_else(|| {
+                        Error::new("source_integrity", "rule resume has no old generation")
+                    })?;
+                let next_generation = old_generation.checked_add(1).ok_or_else(|| {
+                    Error::new("source_integrity", "rule resume generation overflow")
+                })?;
+                let parent_target = command
+                    .target
+                    .as_deref()
+                    .map(parse_agent_id)
+                    .transpose()?
+                    .ok_or_else(|| {
+                        Error::new("source_integrity", "rule resume has no Agent target")
+                    })?;
+                let linked_record =
+                    load_command_record(connection, &linked.id)?.ok_or_else(|| {
+                        Error::new("source_integrity", "resume input row disappeared")
+                    })?;
+                let linked_turn_binding_matches = match (
+                    linked_record.state,
+                    linked_record.command.turn_id.as_deref(),
+                ) {
+                    (CommandState::Applied, Some(turn_id)) => {
+                        match (linked_record.target, linked_record.command.generation) {
+                            (Some(agent), Some(generation)) => {
+                                super::load_turn(connection, agent, generation, turn_id)?.is_some()
+                            }
+                            _ => false,
+                        }
+                    }
+                    (CommandState::Applied, None) => false,
+                    (_, None) => true,
+                    (_, Some(_)) => false,
+                };
+                let exact_input = linked.id == format!("{}/send", command.id)
+                    && linked.principal == command.principal
+                    && linked.method == command.method
+                    && linked.verb == "send"
+                    && linked.target == command.target
+                    && linked.expected_generation == Some(next_generation)
+                    && linked.generation == Some(next_generation)
+                    && linked.state == linked_record.state
+                    && linked.turn_id == linked_record.command.turn_id
+                    && linked.args == linked_record.command.args
+                    && linked_record.target == Some(parent_target)
+                    && linked_record.expected_turn_id.is_none()
+                    && linked_record.command.id == linked.id
+                    && linked_record.command.principal == linked.principal
+                    && linked_record.command.method == linked.method
+                    && linked_record.command.expected_generation == Some(next_generation)
+                    && linked_record.command.generation == Some(next_generation)
+                    && linked_record.command.request_id.is_none()
+                    && linked_turn_binding_matches
+                    && linked.request_id.is_none()
+                    && !linked.probe
+                    && linked.args.as_object().is_some_and(|args| {
+                        args.len() == 1 && args.get("text").is_some_and(Value::is_string)
+                    })
+                    && super::resume_parent_payload_matches(connection, &command, &linked.args)?;
+                if !exact_input {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "rule resume linked-send row differs from its retained request",
+                    ));
+                }
+            }
+            None => {
+                let no_input =
+                    super::resume_parent_payload_matches(connection, &command, &json!({}))?
+                        || super::resume_parent_payload_matches(
+                            connection,
+                            &command,
+                            &json!({"text": null}),
+                        )?;
+                if !no_input {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "rule resume is missing its retained linked input",
+                    ));
+                }
+            }
         }
     }
     Ok(Admission {
@@ -4263,6 +4518,76 @@ mod tests {
         let agent = tx.last_insert_rowid();
         tx.commit().unwrap();
         (agent, format_agent_id(agent))
+    }
+
+    fn ready_terminal_fake_agent(
+        store: &mut Store,
+        project: &str,
+        now: i64,
+    ) -> (String, String, String) {
+        let mut launch = SubmitCommand::new(Ulid::new().to_string(), "launch");
+        launch.args = json!({
+            "project": project,
+            "harness": "fake",
+            "profile": "fake",
+            "profile_snapshot": {},
+            "workspace": format!("synthetic-{project}"),
+        });
+        launch.expected_generation = Some(0);
+        let launch_id = launch.id.clone();
+        let agent = store
+            .submit("owner", launch, now)
+            .unwrap()
+            .command
+            .target
+            .expect("Fake launch Agent");
+        let native_scope = format!("{project}:{agent}:scope");
+        let native_ref = format!("{project}:{agent}:thread");
+        store.dispatch(&launch_id, now + 1).unwrap();
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: format!("{project}:ready"),
+                    agent_id: agent.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "session.ready".to_owned(),
+                        native_id: format!("{project}:ready"),
+                        data: json!({
+                            "command_id": launch_id.as_str(),
+                            "native_scope": native_scope.as_str(),
+                            "native_ref": native_ref.as_str(),
+                        }),
+                    }],
+                    cursor: None,
+                },
+                now + 2,
+            )
+            .unwrap();
+        store
+            .settle(&launch_id, CommandState::Applied, None, now + 3)
+            .unwrap();
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: format!("{project}:ended"),
+                    agent_id: agent.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "session.ended".to_owned(),
+                        native_id: format!("{project}:ended"),
+                        data: json!({}),
+                    }],
+                    cursor: None,
+                },
+                now + 4,
+            )
+            .unwrap();
+        (agent, native_scope, native_ref)
     }
 
     fn insert_test_rule_action(
@@ -6390,6 +6715,954 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(child_two_dispatches, 0);
+        }
+    }
+
+    #[test]
+    fn scheduled_and_manual_timer_store_paths_reject_resume_actions() {
+        let mut store = store();
+        let seed = Ulid::new();
+        let now = i64::try_from(seed.timestamp_ms()).unwrap() + 10;
+        let rule_id = "timer-resume-unsupported";
+        let rule = definition(rule_id, true);
+        let rule_state = store.ensure_rule_state("owner", &rule, now).unwrap();
+        let scheduled_at_ms = now + 1;
+        let timer = store
+            .ensure_timer_state(
+                "owner",
+                &TimerDefinitionInput {
+                    id: rule_id.to_owned(),
+                    schedule_revision: 1,
+                    schedule: core::api::TimerSchedule::Once {
+                        at: scheduled_at_ms,
+                    },
+                    enabled: true,
+                    initial_next_due_at: Some(scheduled_at_ms),
+                },
+                now,
+            )
+            .unwrap();
+        let mut scheduled_resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
+        scheduled_resume.target = Some("a1".to_owned());
+        scheduled_resume.expected_generation = Some(1);
+        let scheduled = store
+            .commit_timer_slot(
+                "owner",
+                &timer,
+                TimerSlotCommit {
+                    scheduled_at_ms,
+                    next_due_at_ms: None,
+                    action: Some(scheduled_resume),
+                    skip_code: None,
+                },
+                scheduled_at_ms,
+            )
+            .unwrap();
+        let scheduled_parent = scheduled.parent.unwrap();
+        assert_eq!(scheduled_parent.state, CommandState::Rejected);
+        assert_eq!(
+            scheduled_parent.outcome.as_ref().unwrap()["code"],
+            "rule_action_binding_invalid"
+        );
+        assert!(scheduled.child.is_none());
+
+        let manual = core::api::TimerRunRequest::new(Ulid::new().to_string(), rule_id);
+        let mut manual_resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
+        manual_resume.target = Some("a1".to_owned());
+        manual_resume.expected_generation = Some(1);
+        let command_count_before: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+            .unwrap();
+        let high_water_before = store.high_water().unwrap();
+        let error = store
+            .admit_manual_timer_run(
+                "owner",
+                &manual,
+                &scheduled.state,
+                rule_state.revision,
+                manual_resume,
+                scheduled_at_ms + 1,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "invalid");
+        let command_count_after: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(command_count_after, command_count_before);
+        assert_eq!(store.high_water().unwrap(), high_water_before);
+    }
+
+    #[test]
+    fn ordinary_fake_resume_preserves_optional_expected_generation() {
+        let mut store = store();
+        let seed = Ulid::new();
+        let now = i64::try_from(seed.timestamp_ms()).unwrap() + 20;
+        let (agent_id, native_scope, native_ref) =
+            ready_terminal_fake_agent(&mut store, "ordinary-fake-resume", now);
+        let mut request = SubmitCommand::new(Ulid::new().to_string(), "resume");
+        request.target = Some(agent_id.clone());
+        let resume_id = request.id.clone();
+        let admission = store.submit("owner", request, now + 5).unwrap();
+        assert_eq!(admission.command.expected_generation, None);
+        assert_eq!(admission.command.generation, Some(1));
+        assert_eq!(admission.command.state, CommandState::Accepted);
+        assert_eq!(
+            store
+                .dispatch(&resume_id, now + 6)
+                .unwrap()
+                .value
+                .generation,
+            Some(2)
+        );
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: "ordinary-fake-resume:ready".to_owned(),
+                    agent_id: agent_id.clone(),
+                    generation: 2,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "session.ready".to_owned(),
+                        native_id: "ordinary-fake-resume:ready".to_owned(),
+                        data: json!({
+                            "native_scope": native_scope.as_str(),
+                            "native_ref": native_ref.as_str(),
+                        }),
+                    }],
+                    cursor: None,
+                },
+                now + 7,
+            )
+            .unwrap();
+        store
+            .settle(&resume_id, CommandState::Applied, None, now + 8)
+            .unwrap();
+        let resumed = store.get_agent(&agent_id).unwrap().unwrap();
+        assert_eq!(resumed.generation, 2);
+        assert_eq!(resumed.native_scope.as_deref(), Some(native_scope.as_str()));
+        assert_eq!(resumed.native_ref.as_deref(), Some(native_ref.as_str()));
+    }
+
+    #[test]
+    fn live_fake_resume_reuses_subject_and_recovers_only_its_exact_linked_input() {
+        let mut store = store();
+        let seed = Ulid::new();
+        let now = i64::try_from(seed.timestamp_ms()).unwrap() + 20;
+        let (agent_id, native_scope, native_ref) =
+            ready_terminal_fake_agent(&mut store, "live-fake-resume", now);
+        let agent_num = parse_agent_id(&agent_id).unwrap();
+        let rule_id = "live-fake-resume";
+        let rule_value = json!({
+            "id": rule_id,
+            "enabled": true,
+            "on": {"event": "turn.completed"},
+            "do": [{
+                "action": "resume",
+                "target": "${event.agent}",
+                "expected_generation": "${event.generation}",
+                "text": "new resume input",
+            }],
+            "limit": {
+                "max": 1,
+                "per": "agent",
+                "window_ms": RULE_ACTION_WINDOW_MS,
+            },
+        });
+        let rule = RuleDefinitionInput {
+            id: rule_id.to_owned(),
+            canonical_definition: serde_json::to_string(&rule_value).unwrap(),
+            definition_digest: core::canonical_json_sha256(&rule_value).unwrap(),
+            enabled: true,
+        };
+        let state = store.ensure_rule_state("owner", &rule, now + 5).unwrap();
+        let event_seq = insert_test_turn_completed(&mut store, agent_num, now + 6);
+
+        let mut request = SubmitCommand::new(Ulid::new().to_string(), "resume");
+        request.target = Some(agent_id.clone());
+        request.expected_generation = Some(1);
+        request.args = json!({"text": "new resume input"});
+        let admission = store
+            .admit_rule_action("owner", &state, event_seq, request, now + 8)
+            .unwrap();
+        let resume = admission.child.as_ref().expect("resume rule child");
+        let resume_id = resume.command.id.clone();
+        assert_eq!(resume.command.verb, "resume");
+        assert_eq!(resume.command.target.as_deref(), Some(agent_id.as_str()));
+        assert_eq!(resume.command.expected_generation, Some(1));
+        assert_eq!(resume.command.generation, Some(1));
+        assert_eq!(resume.command.state, CommandState::Accepted);
+        let linked = resume
+            .linked_command
+            .as_ref()
+            .expect("resume text is stored as its linked SEND");
+        let send_id = linked.id.clone();
+        assert_eq!(send_id, format!("{resume_id}/send"));
+        assert_eq!(linked.expected_generation, Some(2));
+        assert_eq!(linked.generation, Some(2));
+        assert_eq!(linked.state, CommandState::Queued);
+        assert_eq!(linked.args["text"], "new resume input");
+        let parent_args: String = store
+            .connection
+            .query_row(
+                "SELECT args FROM commands WHERE id = ?1",
+                [&resume_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&parent_args).unwrap(),
+            json!({})
+        );
+        let link: (String, String, i64) = store
+            .connection
+            .query_row(
+                "SELECT parent_command, link_kind, ordinal FROM commands WHERE id = ?1",
+                [&send_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(link, (resume_id.clone(), "send".to_owned(), 0));
+
+        let limit = core::api::RuleLimit {
+            max: 1,
+            per: core::api::RuleLimitScope::Agent,
+            window_ms: RULE_ACTION_WINDOW_MS,
+        };
+        let tx = store
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let (scoped_count, global_count) =
+            rule_action_counts(&tx, "owner", rule_id, Some(&agent_id), &limit, now + 8).unwrap();
+        tx.commit().unwrap();
+        assert_eq!((scoped_count, global_count), (1, 1));
+
+        let mut ordinary_future_send = SubmitCommand::new(Ulid::new().to_string(), "send");
+        ordinary_future_send.target = Some(agent_id.clone());
+        ordinary_future_send.expected_generation = Some(2);
+        ordinary_future_send.args = json!({"text": "not a resume child"});
+        assert_eq!(
+            store
+                .submit("owner", ordinary_future_send, now + 9)
+                .unwrap_err()
+                .code,
+            "stale_generation"
+        );
+        let mut competing_resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
+        competing_resume.target = Some(agent_id.clone());
+        competing_resume.expected_generation = Some(1);
+        assert_eq!(
+            store
+                .submit("owner", competing_resume, now + 10)
+                .unwrap_err()
+                .code,
+            "bad_state",
+            "an unresolved resume holds this old generation",
+        );
+
+        assert_eq!(
+            store.dispatch(&resume_id, now + 11).unwrap().value.state,
+            CommandState::Dispatched
+        );
+        let starting = store.get_agent(&agent_id).unwrap().unwrap();
+        assert_eq!(starting.generation, 2);
+        assert_eq!(starting.state, AgentState::Starting);
+        assert_eq!(
+            starting.native_scope.as_deref(),
+            Some(native_scope.as_str())
+        );
+        assert_eq!(starting.native_ref.as_deref(), Some(native_ref.as_str()));
+
+        let high_water_before_mismatch = store.high_water().unwrap();
+        let wrong_command = store
+            .put_batch(
+                SourceBatch {
+                    batch_id: "live-fake-resume:wrong-command".to_owned(),
+                    agent_id: agent_id.clone(),
+                    generation: 2,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "session.ready".to_owned(),
+                        native_id: "live-fake-resume:wrong-command".to_owned(),
+                        data: json!({
+                            "command_id": "not-the-resume-command",
+                            "native_scope": native_scope.as_str(),
+                            "native_ref": native_ref.as_str(),
+                        }),
+                    }],
+                    cursor: None,
+                },
+                now + 12,
+            )
+            .unwrap_err();
+        assert_eq!(wrong_command.code, "source_integrity");
+        assert_eq!(store.high_water().unwrap(), high_water_before_mismatch);
+
+        let mismatched = store
+            .put_batch(
+                SourceBatch {
+                    batch_id: "live-fake-resume:mismatched-ready".to_owned(),
+                    agent_id: agent_id.clone(),
+                    generation: 2,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "session.ready".to_owned(),
+                        native_id: "live-fake-resume:mismatched-ready".to_owned(),
+                        data: json!({
+                            "native_scope": "forged-scope",
+                            "native_ref": native_ref.as_str(),
+                        }),
+                    }],
+                    cursor: None,
+                },
+                now + 12,
+            )
+            .unwrap_err();
+        assert_eq!(mismatched.code, "source_integrity");
+        assert_eq!(store.high_water().unwrap(), high_water_before_mismatch);
+        assert_eq!(
+            store.get_command(&send_id).unwrap().unwrap().state,
+            CommandState::Queued,
+            "mismatched readiness keeps the future input held",
+        );
+
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: "live-fake-resume:ready".to_owned(),
+                    agent_id: agent_id.clone(),
+                    generation: 2,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "session.ready".to_owned(),
+                        native_id: "live-fake-resume:ready".to_owned(),
+                        data: json!({
+                            "native_scope": native_scope.as_str(),
+                            "native_ref": native_ref.as_str(),
+                        }),
+                    }],
+                    cursor: None,
+                },
+                now + 13,
+            )
+            .unwrap();
+        store
+            .settle(&resume_id, CommandState::Applied, None, now + 14)
+            .unwrap();
+
+        let recovered = store.recover_rule_children(None, 100).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].command.id, resume_id);
+        assert_eq!(recovered[0].command.state, CommandState::Applied);
+        let recovered_input = recovered[0]
+            .linked_command
+            .as_ref()
+            .expect("recovery exposes the still-queued input");
+        assert_eq!(recovered_input.id, send_id);
+        assert_eq!(recovered_input.state, CommandState::Queued);
+        assert_eq!(
+            store
+                .recover_rule_children(Some(&resume_id), 100)
+                .unwrap()
+                .len(),
+            0,
+            "the resume ULID is the recovery page cursor",
+        );
+
+        let replay = store
+            .replay_rule_event_action("owner", &admission.state, state.revision, event_seq)
+            .unwrap()
+            .expect("retained live resume action");
+        let replayed_resume = replay.child.unwrap();
+        assert_eq!(replayed_resume.command.id, resume_id);
+        assert_eq!(replayed_resume.command.expected_generation, Some(1));
+        assert_eq!(replayed_resume.command.generation, Some(2));
+        assert_eq!(
+            replayed_resume.linked_command.unwrap().id,
+            send_id,
+            "replay remains bound after the Agent advances to N+1",
+        );
+
+        assert_eq!(
+            store.dispatch(&send_id, now + 15).unwrap().value.state,
+            CommandState::Dispatched
+        );
+        let turn_id = format!("resume-turn-{}", Ulid::new());
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: "live-fake-resume:turn".to_owned(),
+                    agent_id: agent_id.clone(),
+                    generation: 2,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "turn.started".to_owned(),
+                        native_id: "live-fake-resume:turn-started".to_owned(),
+                        data: json!({
+                            "command_id": send_id.as_str(),
+                            "turn_id": turn_id.as_str(),
+                        }),
+                    }],
+                    cursor: None,
+                },
+                now + 16,
+            )
+            .unwrap();
+        let applied_input = store.get_command(&send_id).unwrap().unwrap();
+        assert_eq!(applied_input.state, CommandState::Applied);
+        assert_eq!(applied_input.turn_id.as_deref(), Some(turn_id.as_str()));
+        assert_eq!(
+            store
+                .get_turn(&agent_id, 2, &turn_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            TurnState::Running
+        );
+
+        let (second_agent, _, _) =
+            ready_terminal_fake_agent(&mut store, "live-fake-resume-unknown", now + 30);
+        let second_event = insert_test_turn_completed(
+            &mut store,
+            parse_agent_id(&second_agent).unwrap(),
+            now + 35,
+        );
+        let mut unknown_request = SubmitCommand::new(Ulid::new().to_string(), "resume");
+        unknown_request.target = Some(second_agent.clone());
+        unknown_request.expected_generation = Some(1);
+        unknown_request.args = json!({"text": "uncertain resume input"});
+        let unknown_admission = store
+            .admit_rule_action(
+                "owner",
+                &admission.state,
+                second_event,
+                unknown_request,
+                now + 36,
+            )
+            .unwrap();
+        let unknown = unknown_admission.child.unwrap();
+        let unknown_id = unknown.command.id;
+        let unknown_send_id = unknown.linked_command.unwrap().id;
+        store.dispatch(&unknown_id, now + 37).unwrap();
+        store
+            .settle(
+                &unknown_id,
+                CommandState::Unknown,
+                Some(json!({"reason": "resume outcome is uncertain"})),
+                now + 38,
+            )
+            .unwrap();
+        let recoverable = store.recover_rule_children(None, 100).unwrap();
+        assert!(
+            recoverable
+                .iter()
+                .all(|action| action.command.id != unknown_id),
+            "an unknown resume is never replayed"
+        );
+        assert_eq!(
+            store.get_command(&unknown_send_id).unwrap().unwrap().state,
+            CommandState::Queued
+        );
+        assert_eq!(
+            store.dispatch(&unknown_id, now + 39).unwrap_err().code,
+            "bad_state"
+        );
+    }
+
+    #[test]
+    fn resume_linked_send_cause_suppresses_the_same_rule_without_trusting_cause_label() {
+        let mut store = store();
+        let seed = Ulid::new();
+        let now = i64::try_from(seed.timestamp_ms()).unwrap() + 20;
+        let (agent_id, _, _) = ready_terminal_fake_agent(&mut store, "resume-self-cause", now);
+        let agent_num = parse_agent_id(&agent_id).unwrap();
+        let rule_id = "resume-self-cause";
+        let rule_value = json!({
+            "id": rule_id,
+            "enabled": true,
+            "on": {"event": "turn.completed"},
+            "do": [{
+                "action": "resume",
+                "target": "${event.agent}",
+                "expected_generation": "${event.generation}",
+                "text": "same-rule resume input",
+            }],
+        });
+        let rule = RuleDefinitionInput {
+            id: rule_id.to_owned(),
+            canonical_definition: serde_json::to_string(&rule_value).unwrap(),
+            definition_digest: core::canonical_json_sha256(&rule_value).unwrap(),
+            enabled: true,
+        };
+        let state = store.ensure_rule_state("owner", &rule, now + 5).unwrap();
+        let first_event = insert_test_turn_completed(&mut store, agent_num, now + 6);
+        let mut first_request = SubmitCommand::new(Ulid::new().to_string(), "resume");
+        first_request.target = Some(agent_id.clone());
+        first_request.expected_generation = Some(1);
+        first_request.args = json!({"text": "same-rule resume input"});
+        let first = store
+            .admit_rule_action("owner", &state, first_event, first_request, now + 7)
+            .unwrap();
+        let first_child = first.child.as_ref().expect("admitted resume action");
+        let send_id = first_child.linked_command.as_ref().unwrap().id.clone();
+        let mut send_cause = command_cause_tx(&store.connection, &send_id)
+            .unwrap()
+            .expect("retained linked SEND cause");
+        assert_eq!(send_cause.command_id, send_id);
+        assert_eq!(send_cause.rule.as_deref(), Some(rule_id));
+        assert_eq!(send_cause.depth, 1);
+        send_cause.rule = Some("misleading-rule-label".to_owned());
+
+        let second_event =
+            insert_test_turn_completed_with_cause(&mut store, agent_num, now + 8, Some(send_cause));
+        let mut second_request = SubmitCommand::new(Ulid::new().to_string(), "resume");
+        second_request.target = Some(agent_id);
+        second_request.expected_generation = Some(1);
+        second_request.args = json!({"text": "same-rule resume input"});
+        let commands_before: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+            .unwrap();
+        let suppressed = store
+            .admit_rule_action("owner", &first.state, second_event, second_request, now + 9)
+            .unwrap();
+        assert!(suppressed.parent.is_none());
+        assert!(suppressed.child.is_none());
+        assert_eq!(suppressed.state.current_cursor, second_event);
+        let commands_after: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(commands_after, commands_before);
+    }
+
+    #[test]
+    fn catch_up_resume_siblings_wait_for_exact_linked_send_and_preserve_old_agent_on_cancel() {
+        let rule_id = "catch-up-resume-siblings";
+        let rule_value = json!({
+            "id": rule_id,
+            "enabled": true,
+            "on": {"event": "turn.completed"},
+            "do": [{
+                "action": "resume",
+                "target": "${event.agent}",
+                "expected_generation": "${event.generation}",
+                "text": "resume from captured result",
+            }],
+            "limit": {
+                "max": 2,
+                "per": "rule",
+                "window_ms": RULE_ACTION_WINDOW_MS,
+            },
+        });
+        let rule = RuleDefinitionInput {
+            id: rule_id.to_owned(),
+            canonical_definition: serde_json::to_string(&rule_value).unwrap(),
+            definition_digest: core::canonical_json_sha256(&rule_value).unwrap(),
+            enabled: true,
+        };
+        let resume_request = |agent: &str, text: &str| {
+            let mut request = SubmitCommand::new(Ulid::new().to_string(), "resume");
+            request.target = Some(agent.to_owned());
+            request.expected_generation = Some(1);
+            request.args = json!({"text": text});
+            request
+        };
+        let prepare_pair = || {
+            let mut store = store();
+            let seed = Ulid::new();
+            let now = i64::try_from(seed.timestamp_ms()).unwrap() + 25;
+            let (first_agent, first_scope, first_ref) =
+                ready_terminal_fake_agent(&mut store, "catch-up-resume-first", now);
+            let (second_agent, second_scope, second_ref) =
+                ready_terminal_fake_agent(&mut store, "catch-up-resume-second", now + 10);
+            let first_event = insert_test_turn_completed(
+                &mut store,
+                parse_agent_id(&first_agent).unwrap(),
+                now + 21,
+            );
+            let second_event = insert_test_turn_completed(
+                &mut store,
+                parse_agent_id(&second_agent).unwrap(),
+                now + 22,
+            );
+            let state = store.ensure_rule_state("owner", &rule, now + 23).unwrap();
+            let captured_through = state.current_cursor;
+            assert!(second_event <= captured_through);
+            let request = core::api::RuleCatchUpRequest::new(
+                Ulid::new().to_string(),
+                rule_id,
+                first_event - 1,
+                Some(captured_through),
+            );
+            let actions = [
+                RuleCatchUpAction::command(
+                    first_event,
+                    resume_request(&first_agent, "first input"),
+                ),
+                RuleCatchUpAction::command(
+                    second_event,
+                    resume_request(&second_agent, "second input"),
+                ),
+            ];
+            let admission = store
+                .admit_rule_catch_up(
+                    "owner",
+                    &request,
+                    &state,
+                    captured_through,
+                    &actions,
+                    now + 23,
+                )
+                .unwrap();
+            assert_eq!(admission.children.len(), 2);
+            let first = &admission.children[0];
+            let second = &admission.children[1];
+            assert_eq!(first.command.verb, "resume");
+            assert_eq!(second.command.verb, "resume");
+            let first_resume_id = first.command.id.clone();
+            let first_send_id = first.linked_command.as_ref().unwrap().id.clone();
+            let second_resume_id = second.command.id.clone();
+            let second_send_id = second.linked_command.as_ref().unwrap().id.clone();
+            assert_eq!(first_send_id, format!("{first_resume_id}/send"));
+            assert_eq!(second_send_id, format!("{second_resume_id}/send"));
+            assert_eq!(first.command.expected_generation, Some(1));
+            assert_eq!(first.command.generation, Some(1));
+            assert_eq!(first.linked_command.as_ref().unwrap().generation, Some(2));
+            assert_eq!(second.linked_command.as_ref().unwrap().generation, Some(2));
+            (
+                store,
+                now + 24,
+                first_resume_id,
+                first_send_id,
+                second_resume_id,
+                second_send_id,
+                first_agent,
+                second_agent,
+                first_scope,
+                first_ref,
+                second_scope,
+                second_ref,
+            )
+        };
+        let apply_first_resume = |store: &mut Store,
+                                  resume_id: &str,
+                                  agent: &str,
+                                  native_scope: &str,
+                                  native_ref: &str,
+                                  now: i64| {
+            store.dispatch(resume_id, now).unwrap();
+            store
+                .put_batch(
+                    SourceBatch {
+                        batch_id: format!("resume-ready-{resume_id}"),
+                        agent_id: agent.to_owned(),
+                        generation: 2,
+                        source: "stream".to_owned(),
+                        events: vec![NativeEvent {
+                            ts: None,
+                            kind: "session.ready".to_owned(),
+                            native_id: format!("resume-ready-{resume_id}"),
+                            data: json!({
+                                "native_scope": native_scope,
+                                "native_ref": native_ref,
+                            }),
+                        }],
+                        cursor: None,
+                    },
+                    now + 1,
+                )
+                .unwrap();
+            store
+                .settle(resume_id, CommandState::Applied, None, now + 2)
+                .unwrap();
+        };
+
+        for input_state in ["accepted", "queued", "dispatched", "unknown"] {
+            let (
+                mut store,
+                now,
+                first_resume_id,
+                first_send_id,
+                second_resume_id,
+                second_send_id,
+                first_agent,
+                second_agent,
+                first_scope,
+                first_ref,
+                _second_scope,
+                _second_ref,
+            ) = prepare_pair();
+            apply_first_resume(
+                &mut store,
+                &first_resume_id,
+                &first_agent,
+                &first_scope,
+                &first_ref,
+                now,
+            );
+            match input_state {
+                "accepted" | "queued" => {
+                    store
+                        .connection
+                        .execute(
+                            "UPDATE commands SET state = ?1 WHERE id = ?2",
+                            rusqlite::params![input_state, first_send_id],
+                        )
+                        .unwrap();
+                }
+                "dispatched" => {
+                    assert_eq!(
+                        store.dispatch(&first_send_id, now + 3).unwrap().value.state,
+                        CommandState::Dispatched
+                    );
+                }
+                "unknown" => {
+                    store.dispatch(&first_send_id, now + 3).unwrap();
+                    store
+                        .settle(
+                            &first_send_id,
+                            CommandState::Unknown,
+                            Some(json!({"reason": "input association is uncertain"})),
+                            now + 4,
+                        )
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let expected = match input_state {
+                "accepted" => CommandState::Accepted,
+                "queued" => CommandState::Queued,
+                "dispatched" => CommandState::Dispatched,
+                "unknown" => CommandState::Unknown,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                store.get_command(&first_send_id).unwrap().unwrap().state,
+                expected
+            );
+            let recoverable = store.recover_rule_children(None, 100).unwrap();
+            assert!(
+                recoverable
+                    .iter()
+                    .all(|action| action.command.id != second_resume_id),
+                "successor resume recovered while predecessor input was {input_state}"
+            );
+            let held = store.dispatch(&second_resume_id, now + 10).unwrap();
+            assert_eq!(held.value.state, CommandState::Queued);
+            assert!(
+                held.events
+                    .iter()
+                    .all(|event| event.kind != "command.dispatched")
+            );
+            let old_agent = store.get_agent(&second_agent).unwrap().unwrap();
+            assert_eq!(old_agent.generation, 1);
+            assert_eq!(old_agent.state, AgentState::Stopped);
+            let reservation: Option<i64> = store
+                .connection
+                .query_row(
+                    "SELECT capacity_generation FROM agents WHERE id = ?1",
+                    [parse_agent_id(&second_agent).unwrap()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(reservation, Some(2));
+            assert_eq!(
+                store.get_command(&second_send_id).unwrap().unwrap().state,
+                CommandState::Queued
+            );
+        }
+
+        {
+            let (
+                mut store,
+                now,
+                first_resume_id,
+                first_send_id,
+                second_resume_id,
+                _second_send_id,
+                first_agent,
+                second_agent,
+                first_scope,
+                first_ref,
+                _second_scope,
+                _second_ref,
+            ) = prepare_pair();
+            apply_first_resume(
+                &mut store,
+                &first_resume_id,
+                &first_agent,
+                &first_scope,
+                &first_ref,
+                now,
+            );
+            store.dispatch(&first_send_id, now + 3).unwrap();
+            let turn_id = Ulid::new().to_string();
+            store
+                .put_batch(
+                    SourceBatch {
+                        batch_id: format!("resume-turn-{first_send_id}"),
+                        agent_id: first_agent.clone(),
+                        generation: 2,
+                        source: "stream".to_owned(),
+                        events: vec![NativeEvent {
+                            ts: None,
+                            kind: "turn.started".to_owned(),
+                            native_id: format!("resume-turn-started-{first_send_id}"),
+                            data: json!({
+                                "command_id": first_send_id.as_str(),
+                                "turn_id": turn_id.as_str(),
+                            }),
+                        }],
+                        cursor: None,
+                    },
+                    now + 4,
+                )
+                .unwrap();
+            let first_send = store.get_command(&first_send_id).unwrap().unwrap();
+            assert_eq!(first_send.state, CommandState::Applied);
+            assert_eq!(first_send.turn_id.as_deref(), Some(turn_id.as_str()));
+            assert_eq!(
+                store
+                    .get_turn(&first_agent, 2, &turn_id)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                TurnState::Running
+            );
+            let recoverable = store.recover_rule_children(None, 100).unwrap();
+            assert!(
+                recoverable
+                    .iter()
+                    .any(|action| action.command.id == second_resume_id)
+            );
+            assert_eq!(
+                store
+                    .dispatch(&second_resume_id, now + 5)
+                    .unwrap()
+                    .value
+                    .state,
+                CommandState::Dispatched,
+                "exact input association releases the sibling before turn completion",
+            );
+            let next_agent = store.get_agent(&second_agent).unwrap().unwrap();
+            assert_eq!(next_agent.generation, 2);
+            assert_eq!(next_agent.state, AgentState::Starting);
+            assert_eq!(
+                store
+                    .get_turn(&first_agent, 2, &turn_id)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                TurnState::Running
+            );
+        }
+
+        for terminal_state in ["rejected", "failed", "cancelled"] {
+            let (
+                mut store,
+                now,
+                first_resume_id,
+                first_send_id,
+                second_resume_id,
+                second_send_id,
+                first_agent,
+                second_agent,
+                first_scope,
+                first_ref,
+                second_scope,
+                second_ref,
+            ) = prepare_pair();
+            apply_first_resume(
+                &mut store,
+                &first_resume_id,
+                &first_agent,
+                &first_scope,
+                &first_ref,
+                now,
+            );
+            match terminal_state {
+                "rejected" => {
+                    store
+                        .settle(
+                            &first_send_id,
+                            CommandState::Rejected,
+                            Some(json!({"reason": "resume input rejected"})),
+                            now + 3,
+                        )
+                        .unwrap();
+                }
+                "failed" => {
+                    store.dispatch(&first_send_id, now + 3).unwrap();
+                    store
+                        .settle(
+                            &first_send_id,
+                            CommandState::Failed,
+                            Some(json!({"reason": "resume input failed"})),
+                            now + 4,
+                        )
+                        .unwrap();
+                }
+                "cancelled" => {
+                    store
+                        .connection
+                        .execute(
+                            "UPDATE commands SET state = 'cancelled' WHERE id = ?1",
+                            [&first_send_id],
+                        )
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let cancelled = store.dispatch(&second_resume_id, now + 10).unwrap();
+            assert_eq!(cancelled.value.state, CommandState::Cancelled);
+            assert!(cancelled.events.iter().any(|event| {
+                event.kind == "command.cancelled" && event.data["command_id"] == second_resume_id
+            }));
+            assert!(cancelled.events.iter().any(|event| {
+                event.kind == "command.cancelled" && event.data["command_id"] == second_send_id
+            }));
+            assert!(
+                !cancelled
+                    .events
+                    .iter()
+                    .any(|event| event.kind == "agent.failed")
+            );
+            assert_eq!(
+                store.get_command(&second_send_id).unwrap().unwrap().state,
+                CommandState::Cancelled
+            );
+            let old_agent = store.get_agent(&second_agent).unwrap().unwrap();
+            assert_eq!(old_agent.generation, 1);
+            assert_eq!(old_agent.state, AgentState::Stopped);
+            assert_eq!(
+                old_agent.native_scope.as_deref(),
+                Some(second_scope.as_str())
+            );
+            assert_eq!(
+                old_agent.native_ref.as_deref(),
+                Some(second_ref.as_str()),
+                "cancelling an undispatched resume preserves the terminal native subject",
+            );
+            let reservation: Option<i64> = store
+                .connection
+                .query_row(
+                    "SELECT capacity_generation FROM agents WHERE id = ?1",
+                    [parse_agent_id(&second_agent).unwrap()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                reservation, None,
+                "resume cancellation releases N+1 capacity"
+            );
         }
     }
 

@@ -1112,10 +1112,10 @@ fn submit_tx(
             if let Some(path) = &agent.workspace {
                 require_managed_path_ready(tx, path)?;
             }
-            if agent.harness != "codex" {
+            if !matches!(agent.harness.as_str(), "codex" | "fake") {
                 return Err(Error::new(
                     "unsupported",
-                    "resume is only supported for a Codex Agent with a retained native subject",
+                    "resume is only supported for Codex or Fake Agents with a retained native subject",
                 ));
             }
             if let Some(expected) = request.expected_generation
@@ -1151,22 +1151,16 @@ fn submit_tx(
                     "resume requires a stopped, failed, or lost Agent with no active turn",
                 ));
             }
-            let pending_resume: bool = tx
-                .query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM commands
-                         WHERE target = ?1 AND generation = ?2 AND verb = 'resume'
-                           AND id <> ?3
-                           AND state IN ('accepted', 'queued', 'dispatched', 'unknown')
-                     )",
-                    params![agent_num, agent.generation, request.id],
-                    |row| row.get(0),
-                )
-                .map_err(sql_error)?;
-            if pending_resume {
+            if has_pending_resume_tx(tx, agent_num, agent.generation, &request.id)? {
                 return Err(Error::new(
                     "bad_state",
                     "a pending resume already targets this Agent generation",
+                ));
+            }
+            if has_in_flight_stop_tx(tx, agent_num, agent.generation)? {
+                return Err(Error::new(
+                    "bad_state",
+                    "a dispatched or unknown Stop still targets this Agent generation",
                 ));
             }
             if [&agent.native_scope, &agent.native_ref]
@@ -1194,6 +1188,14 @@ fn submit_tx(
                 check_input(text)?;
                 provider_holds::require_unheld_tx(tx, &agent)?;
             }
+            projects::validate_project_resume_action_tx(
+                tx,
+                principal,
+                &agent.id,
+                agent.generation,
+                request.expected_generation,
+                text.is_some(),
+            )?;
             let next_generation = agent
                 .generation
                 .checked_add(1)
@@ -1421,6 +1423,270 @@ fn submit_tx(
         linked_command,
         events,
         is_new: true,
+    })
+}
+
+fn has_pending_resume_tx(
+    tx: &Transaction<'_>,
+    agent: i64,
+    generation: i64,
+    except_id: &str,
+) -> Result<bool> {
+    tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM commands
+             WHERE target = ?1 AND generation = ?2 AND verb = 'resume'
+               AND id <> ?3
+               AND state IN ('accepted', 'queued', 'dispatched', 'unknown')
+         )",
+        params![agent, generation, except_id],
+        |row| row.get(0),
+    )
+    .map_err(sql_error)
+}
+
+fn has_in_flight_stop_tx(tx: &Transaction<'_>, agent: i64, generation: i64) -> Result<bool> {
+    for state in ["dispatched", "unknown"] {
+        for id in command_ids_in_state(tx, agent, generation, state)? {
+            let command = load_command(tx, &id)?
+                .ok_or_else(|| Error::new("source_integrity", "pending command disappeared"))?;
+            if command.verb == "stop" {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn restore_resume_workspace_marker_tx(
+    tx: &Transaction<'_>,
+    current: &WorkspacePreparation,
+    command_id: &str,
+    agent_num: i64,
+    old_generation: i64,
+    now: i64,
+    allow_workspace_cancel: bool,
+) -> Result<WorkspacePreparation> {
+    let next_generation = old_generation
+        .checked_add(1)
+        .ok_or_else(|| Error::new("source_integrity", "resume workspace generation overflow"))?;
+    let current_outcome = current.outcome.as_ref().ok_or_else(|| {
+        Error::new(
+            "source_integrity",
+            "resume workspace marker has no prior Ready state",
+        )
+    })?;
+    let current_previous = current_outcome
+        .get("resume_previous")
+        .ok_or_else(|| Error::new("source_integrity", "resume workspace lost its prior marker"))?;
+    let current_reuse = current_outcome.get("reuse").and_then(Value::as_bool) == Some(true);
+    if current.start_command_id != command_id
+        || current.target_generation != next_generation
+        || !matches!(
+            current.phase,
+            WorkspacePhase::Creating | WorkspacePhase::Ready
+        )
+        || current.setup_index != current.frozen_setup.len()
+        || !current_reuse
+        || workspace_cancel_requested(current) && !allow_workspace_cancel
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "resume withdrawal is not bound to its exact retained workspace marker",
+        ));
+    }
+    let previous_start_id = current_previous
+        .get("start_command_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::new("source_integrity", "resume prior marker has no start id"))?;
+    if current_previous
+        .get("target_generation")
+        .and_then(Value::as_i64)
+        != Some(old_generation)
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "resume prior marker belongs to another generation",
+        ));
+    }
+    let agent = load_agent_by_num(tx, agent_num)?
+        .ok_or_else(|| Error::new("not_found", "resume workspace Agent was not found"))?;
+    if parse_agent_id(&current.agent)? != agent_num
+        || agent.generation != old_generation
+        || !matches!(
+            agent.state,
+            AgentState::Stopped | AgentState::Failed | AgentState::Lost
+        )
+        || agent.active_turn.is_some()
+        || agent.workspace.as_deref() != Some(current.worktree_path.as_str())
+        || agent
+            .native_scope
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        || agent
+            .native_ref
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "resume withdrawal cannot restore a changed old Agent or workspace",
+        ));
+    }
+    let previous_start = load_command_record(tx, previous_start_id)?
+        .ok_or_else(|| Error::new("source_integrity", "resume prior start command is missing"))?;
+    if previous_start.target != Some(agent_num)
+        || !matches!(previous_start.command.verb.as_str(), "launch" | "resume")
+        || previous_start.command.generation != Some(old_generation)
+        || !matches!(
+            previous_start.state,
+            CommandState::Applied | CommandState::Dispatched | CommandState::Unknown
+        )
+        || previous_start
+            .command
+            .expected_generation
+            .is_some_and(|expected| expected.checked_add(1) != Some(old_generation))
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "resume prior start command does not own the retained workspace generation",
+        ));
+    }
+    let previous_outcome = current_previous
+        .get("outcome")
+        .cloned()
+        .filter(|outcome| !outcome.is_null());
+    let mut restored = current.clone();
+    restored.start_command_id = previous_start_id.to_owned();
+    restored.target_generation = old_generation;
+    restored.phase = WorkspacePhase::Ready;
+    restored.outcome = previous_outcome;
+    restored.updated_at = now;
+    Ok(restored)
+}
+
+pub(crate) fn cancel_unstarted_resume_input_tx(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    command_id: &str,
+    reason: &str,
+    now: i64,
+    events: &mut Vec<Event>,
+    allow_workspace_cancel: bool,
+) -> Result<Option<WorkspacePreparation>> {
+    let resume = load_command_record(tx, command_id)?
+        .ok_or_else(|| Error::new("source_integrity", "resume command row disappeared"))?;
+    let old_generation = resume
+        .command
+        .expected_generation
+        .or(resume.command.generation)
+        .ok_or_else(|| Error::new("source_integrity", "resume has no retained old generation"))?;
+    if resume.target != Some(agent_num)
+        || resume.command.verb != "resume"
+        || resume.command.generation != Some(old_generation)
+        || resume
+            .command
+            .expected_generation
+            .is_some_and(|expected| expected != old_generation)
+        || !matches!(
+            resume.state,
+            CommandState::Rejected | CommandState::Failed | CommandState::Cancelled
+        )
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "resume cleanup is not bound to its exact undispatched old generation",
+        ));
+    }
+    let agent = load_agent_by_num(tx, agent_num)?
+        .ok_or_else(|| Error::new("not_found", "resume target Agent was not found"))?;
+    if agent.generation != old_generation
+        || !matches!(
+            agent.state,
+            AgentState::Stopped | AgentState::Failed | AgentState::Lost
+        )
+        || agent.active_turn.is_some()
+        || agent
+            .native_scope
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        || agent
+            .native_ref
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "resume cleanup cannot alter a changed or nonterminal old Agent",
+        ));
+    }
+
+    let next_generation = old_generation
+        .checked_add(1)
+        .ok_or_else(|| Error::new("source_integrity", "resume capacity generation overflow"))?;
+    let workspace_restore = match load_workspace(tx, agent_num)? {
+        Some(current) => {
+            let restored = restore_resume_workspace_marker_tx(
+                tx,
+                &current,
+                command_id,
+                agent_num,
+                old_generation,
+                now,
+                allow_workspace_cancel,
+            )?;
+            Some((current, restored))
+        }
+        None => None,
+    };
+    let retained = rules::retained_action_admission(tx, resume.command)?;
+    if let Some(input) = retained.linked_command {
+        let input_target = input
+            .target
+            .as_deref()
+            .map(parse_agent_id)
+            .transpose()?
+            .ok_or_else(|| Error::new("source_integrity", "resume input has no Agent target"))?;
+        let input_generation = input
+            .generation
+            .or(input.expected_generation)
+            .ok_or_else(|| Error::new("source_integrity", "resume input has no next generation"))?;
+        if input_target != agent_num || input_generation != next_generation {
+            return Err(Error::new(
+                "source_integrity",
+                "resume input no longer targets its exact next generation",
+            ));
+        }
+        match input.state {
+            CommandState::Accepted | CommandState::Queued => cancel_pending_command_tx(
+                tx,
+                input_target,
+                input_generation,
+                &input.id,
+                reason,
+                now,
+                events,
+            )?,
+            CommandState::Rejected | CommandState::Cancelled => {}
+            CommandState::Dispatched
+            | CommandState::Unknown
+            | CommandState::Applied
+            | CommandState::Failed => {
+                return Err(Error::new(
+                    "bad_state",
+                    "resume input has an external outcome; its reservation remains held",
+                ));
+            }
+        }
+    }
+    capacity::release_unstarted_tx(tx, agent_num, next_generation, command_id).and_then(|()| {
+        if let Some((current, restored)) = workspace_restore {
+            persist_workspace(tx, &current, &restored)?;
+            events.push(workspace_event(tx, &restored, now)?);
+            Ok(Some(restored))
+        } else {
+            Ok(None)
+        }
     })
 }
 
@@ -1697,7 +1963,8 @@ impl Store {
                 )?);
             }
             "resume" => {
-                if command.state != CommandState::Accepted
+                let old_generation = command_generation;
+                if !matches!(command.state, CommandState::Accepted | CommandState::Queued)
                     || command_generation != agent.generation
                     || command
                         .command
@@ -1714,10 +1981,22 @@ impl Store {
                         "resume no longer targets the captured terminal Agent generation",
                     ));
                 }
-                if agent.harness != "codex" {
+                if !matches!(agent.harness.as_str(), "codex" | "fake") {
                     return Err(Error::new(
                         "unsupported",
-                        "resume is only supported for a Codex Agent",
+                        "resume is only supported for Codex or Fake Agents",
+                    ));
+                }
+                if has_pending_resume_tx(&tx, agent_num, old_generation, id)? {
+                    return Err(Error::new(
+                        "bad_state",
+                        "another pending resume targets this Agent generation",
+                    ));
+                }
+                if has_in_flight_stop_tx(&tx, agent_num, old_generation)? {
+                    return Err(Error::new(
+                        "bad_state",
+                        "a dispatched or unknown Stop still targets this Agent generation",
                     ));
                 }
                 let native_scope = agent
@@ -2292,6 +2571,9 @@ impl Store {
         } else {
             false
         };
+        let unstarted_resume_failure = record.command.verb == "resume"
+            && matches!(record.state, CommandState::Accepted | CommandState::Queued)
+            && matches!(state, CommandState::Rejected | CommandState::Failed);
         update_command_state(&tx, id, state, outcome.as_ref(), None, now)?;
         let mut events = Vec::new();
         let state_name = command_state_name(state);
@@ -2317,6 +2599,16 @@ impl Store {
                 target.ok_or_else(|| Error::new("internal", "launch has no Agent"))?,
                 1,
                 id,
+            )?;
+        } else if unstarted_resume_failure {
+            cancel_unstarted_resume_input_tx(
+                &tx,
+                target.ok_or_else(|| Error::new("internal", "resume has no Agent"))?,
+                id,
+                "resume_not_dispatched",
+                now,
+                &mut events,
+                false,
             )?;
         } else if state == CommandState::Rejected
             && matches!(record.command.verb.as_str(), "launch" | "resume")
@@ -4897,10 +5189,23 @@ fn admit_workspace_preparation(
             workspace.setup_index,
         )?;
         let old = workspace.clone();
+        let mut previous_outcome = old.outcome.clone().unwrap_or(Value::Null);
+        if let Some(outcome) = previous_outcome.as_object_mut() {
+            outcome.remove("resume_previous");
+        }
+        let resume_previous = json!({
+            "start_command_id": old.start_command_id.as_str(),
+            "target_generation": old.target_generation,
+            "outcome": previous_outcome,
+        });
         workspace.start_command_id = request.id.clone();
         workspace.target_generation = target;
         workspace.phase = WorkspacePhase::Creating;
-        workspace.outcome = Some(json!({"stage": "creation", "reuse": true}));
+        workspace.outcome = Some(json!({
+            "stage": "creation",
+            "reuse": true,
+            "resume_previous": resume_previous,
+        }));
         workspace.updated_at = now;
         persist_workspace(tx, &old, &workspace)?;
         events.push(workspace_event(tx, &workspace, now)?);
@@ -4980,7 +5285,7 @@ fn settle_preparation_command(
     state: CommandState,
     now: i64,
     events: &mut Vec<Event>,
-) -> Result<()> {
+) -> Result<Option<WorkspacePreparation>> {
     let (command, agent) = preparation_command(tx, workspace)?;
     if !matches!(
         command.state,
@@ -4996,26 +5301,50 @@ fn settle_preparation_command(
     // preparation_command plus the typed workspace caller prove the pre-native
     // marker/verb/generation exception; ordinary settlement cannot use it.
     write_command_state(tx, &command.command.id, state, Some(&outcome), None, now)?;
-    if matches!(state, CommandState::Failed | CommandState::Cancelled) {
-        capacity::release_unstarted_tx(
-            tx,
-            parse_agent_id(&agent.id)?,
-            workspace.target_generation,
-            &command.command.id,
-        )?;
-    }
-    if command.command.verb == "launch" {
-        let next = match state {
-            CommandState::Failed => AgentState::Failed,
-            CommandState::Cancelled => AgentState::Stopped,
-            _ => AgentState::Created,
-        };
-        db!(tx.execute("UPDATE agents SET state = ?1, updated_at = ?2 WHERE id = ?3 AND generation = 0 AND state = 'created'",
-            params![agent_state_name(next), now, parse_agent_id(&agent.id)?]));
-    }
-    if matches!(state, CommandState::Failed | CommandState::Cancelled) {
-        cancel_workspace_input(tx, &command.command.id, now, events)?;
-    }
+    let restored_workspace = if command.command.verb == "resume" && state == CommandState::Cancelled
+    {
+        // WorkspaceAction::Cancel reaches this branch only after validating the
+        // exact dispatched Stop and its confirmed Stopped result.
+        Some(
+            cancel_unstarted_resume_input_tx(
+                tx,
+                parse_agent_id(&agent.id)?,
+                &command.command.id,
+                "workspace_stop_confirmed",
+                now,
+                events,
+                true,
+            )?
+            .ok_or_else(|| {
+                Error::new(
+                    "source_integrity",
+                    "confirmed resume cancellation lost its retained workspace",
+                )
+            })?,
+        )
+    } else {
+        if matches!(state, CommandState::Failed | CommandState::Cancelled) {
+            capacity::release_unstarted_tx(
+                tx,
+                parse_agent_id(&agent.id)?,
+                workspace.target_generation,
+                &command.command.id,
+            )?;
+        }
+        if command.command.verb == "launch" {
+            let next = match state {
+                CommandState::Failed => AgentState::Failed,
+                CommandState::Cancelled => AgentState::Stopped,
+                _ => AgentState::Created,
+            };
+            db!(tx.execute("UPDATE agents SET state = ?1, updated_at = ?2 WHERE id = ?3 AND generation = 0 AND state = 'created'",
+                params![agent_state_name(next), now, parse_agent_id(&agent.id)?]));
+        }
+        if matches!(state, CommandState::Failed | CommandState::Cancelled) {
+            cancel_workspace_input(tx, &command.command.id, now, events)?;
+        }
+        None
+    };
     events.push(insert_daemon_command_event(
         tx,
         now,
@@ -5025,7 +5354,7 @@ fn settle_preparation_command(
         &command.command.id,
         json!({"command_id": command.command.id, "outcome": outcome}),
     )?);
-    Ok(())
+    Ok(restored_workspace)
 }
 
 enum WorkspaceAction {
@@ -5115,6 +5444,127 @@ impl Store {
             WorkspaceAction::Creation(outcome),
             now,
         )
+    }
+
+    /// Withdraw an exact managed resume before native dispatch. This remains
+    /// available after Project authority changes because it removes an effect
+    /// already admitted; it does not authorize a new effect.
+    pub fn reject_workspace_resume(
+        &mut self,
+        command_id: &str,
+        reason: &str,
+        now: i64,
+    ) -> Result<Change<Command>> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            require_nonempty(command_id, "command_id")?;
+            require_nonempty(reason, "reason")?;
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let record = load_command_record(&tx, command_id)?
+                .ok_or_else(|| Error::new("not_found", "workspace resume was not found"))?;
+            if record.command.verb != "resume"
+                || !matches!(record.state, CommandState::Accepted | CommandState::Queued)
+            {
+                return Err(Error::new(
+                    "bad_state",
+                    "only an accepted or queued workspace resume can be withdrawn",
+                ));
+            }
+            let agent_num = record
+                .target
+                .ok_or_else(|| Error::new("source_integrity", "workspace resume has no Agent"))?;
+            let old_generation = record.command.generation.ok_or_else(|| {
+                Error::new(
+                    "source_integrity",
+                    "workspace resume has no retained generation",
+                )
+            })?;
+            let next_generation = old_generation
+                .checked_add(1)
+                .ok_or_else(|| Error::new("stale_generation", "resume generation overflow"))?;
+            let workspace = load_workspace(&tx, agent_num)?.ok_or_else(|| {
+                Error::new("stale_generation", "resume workspace marker is absent")
+            })?;
+            if workspace.start_command_id != command_id
+                || workspace.target_generation != next_generation
+            {
+                return Err(Error::new(
+                    "stale_generation",
+                    "resume no longer owns the exact next-generation workspace marker",
+                ));
+            }
+            let (prepared, agent) = preparation_command(&tx, &workspace)?;
+            if prepared.command.id != command_id
+                || prepared.state != record.state
+                || agent.generation != old_generation
+                || !agent.is_terminal()
+                || agent.active_turn.is_some()
+                || has_pending_resume_tx(&tx, agent_num, old_generation, command_id)?
+                || has_in_flight_stop_tx(&tx, agent_num, old_generation)?
+            {
+                return Err(Error::new(
+                    "bad_state",
+                    "resume withdrawal requires its retained terminal generation without uncertain custody",
+                ));
+            }
+
+            let outcome = json!({
+                "stage": "workspace_resume_rejected",
+                "reason": reason,
+                "native_dispatched": false,
+                "target_generation": next_generation,
+            });
+            if encode_json(&outcome)?.len() > MAX_EVENT_BYTES {
+                return Err(Error::new(
+                    "frame_too_large",
+                    "workspace resume rejection exceeds 64 KiB",
+                ));
+            }
+            update_command_state(
+                &tx,
+                command_id,
+                CommandState::Rejected,
+                Some(&outcome),
+                None,
+                now,
+            )?;
+            let mut events = vec![insert_daemon_command_event(
+                &tx,
+                now,
+                "command.rejected",
+                Some(agent_num),
+                Some(old_generation),
+                command_id,
+                json!({"command_id": command_id, "outcome": outcome}),
+            )?];
+            let restored = cancel_unstarted_resume_input_tx(
+                &tx,
+                agent_num,
+                command_id,
+                reason,
+                now,
+                &mut events,
+                false,
+            )?;
+            if restored.is_none() {
+                return Err(Error::new(
+                    "source_integrity",
+                    "managed resume withdrawal lost its workspace marker",
+                ));
+            }
+            let command = load_command(&tx, command_id)?
+                .ok_or_else(|| Error::new("internal", "withdrawn resume disappeared"))?;
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(Change {
+                value: command,
+                events,
+            })
+        })();
+        self.fault_on_persistence_error(&result);
+        result
     }
 
     pub fn begin_workspace_setup(
@@ -5241,7 +5691,12 @@ impl Store {
             .and_then(|value| value.get("reuse"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let marker = match &action {
+        let resume_previous = workspace
+            .outcome
+            .as_ref()
+            .and_then(|value| value.get("resume_previous"))
+            .cloned();
+        let mut marker = match &action {
             WorkspaceAction::Creation(outcome) => {
                 json!({"stage": "creation", "reuse": reuse, "result": outcome})
             }
@@ -5253,13 +5708,22 @@ impl Store {
                 json!({"stage": "cancel", "stop_command_id": stop, "cancel_requested": true})
             }
             WorkspaceAction::Cancel(stop, outcome) => {
-                json!({"stage": "cancel", "stop_command_id": stop, "cancel_requested": true, "result": outcome})
+                json!({"stage": "cancel", "reuse": reuse, "stop_command_id": stop, "cancel_requested": true, "result": outcome})
             }
             WorkspaceAction::Removal(outcome) => {
                 json!({"stage": "removal", "command_id": command_id, "result": outcome,
                     "previous_phase": workspace.outcome.as_ref().and_then(|value| value.get("previous_phase"))})
             }
         };
+        if reuse
+            && matches!(
+                &action,
+                WorkspaceAction::Creation(_) | WorkspaceAction::Cancel(_, _)
+            )
+            && let Some(previous) = resume_previous
+        {
+            marker["resume_previous"] = previous;
+        }
         if encode_json(&marker)?.len() > MAX_EVENT_BYTES {
             return Err(Error::new(
                 "frame_too_large",
@@ -5344,15 +5808,22 @@ impl Store {
         }
         match action {
             WorkspaceAction::Creation(outcome) => {
-                if !matches!(
+                let ready_resume_unknown = workspace.phase == WorkspacePhase::Ready
+                    && command.command.verb == "resume"
+                    && reuse
+                    && workspace.setup_index == workspace.frozen_setup.len()
+                    && matches!(command.state, CommandState::Accepted | CommandState::Queued)
+                    && matches!(&outcome, WorkspaceCreationOutcome::Unknown { .. });
+                if !(matches!(
                     workspace.phase,
                     WorkspacePhase::Creating | WorkspacePhase::Unknown
-                ) || workspace
-                    .outcome
-                    .as_ref()
-                    .and_then(|value| value.get("stage"))
-                    .and_then(Value::as_str)
-                    != Some("creation")
+                ) || ready_resume_unknown)
+                    || workspace
+                        .outcome
+                        .as_ref()
+                        .and_then(|value| value.get("stage"))
+                        .and_then(Value::as_str)
+                        != Some("creation")
                     || workspace.setup_index
                         != if reuse {
                             workspace.frozen_setup.len()
@@ -5605,8 +6076,10 @@ impl Store {
         }
         workspace.outcome = Some(marker);
         workspace.updated_at = now;
+        let mut restored_workspace = None;
         if let Some(state) = result_state {
-            settle_preparation_command(&tx, &workspace, state, now, &mut events)?;
+            restored_workspace =
+                settle_preparation_command(&tx, &workspace, state, now, &mut events)?;
         }
         if let Some((stop_id, state)) = stop_result {
             let outcome = json!({"stage": "workspace_cancel", "start_command_id": workspace.start_command_id, "target_generation": target, "detail": workspace.outcome});
@@ -5621,8 +6094,12 @@ impl Store {
                 json!({"command_id": stop_id, "outcome": outcome}),
             )?);
         }
-        persist_workspace(&tx, &old, &workspace)?;
-        events.push(workspace_event(&tx, &workspace, now)?);
+        if let Some(restored) = restored_workspace {
+            workspace = restored;
+        } else {
+            persist_workspace(&tx, &old, &workspace)?;
+            events.push(workspace_event(&tx, &workspace, now)?);
+        }
         if removal && workspace.phase == WorkspacePhase::Removed {
             close_finished_workspace_process_source(&tx, agent_num, target, now, &mut events)?;
         }
@@ -5758,7 +6235,7 @@ fn recover_workspaces(tx: &Transaction<'_>, now: i64, events: &mut Vec<Event>) -
         outcome["reason"] = json!("daemon_restart");
         workspace.updated_at = now;
         if !removing {
-            settle_preparation_command(tx, &workspace, CommandState::Unknown, now, events)?;
+            let _ = settle_preparation_command(tx, &workspace, CommandState::Unknown, now, events)?;
         }
         persist_workspace(tx, &old, &workspace)?;
         events.push(workspace_event(tx, &workspace, now)?);
@@ -6394,6 +6871,34 @@ fn command_binding(connection: &Connection, id: &str) -> Result<Option<(String, 
         )
         .optional()
         .map_err(sql_error)
+}
+
+pub(crate) fn resume_parent_payload_matches(
+    connection: &Connection,
+    parent: &Command,
+    args: &Value,
+) -> Result<bool> {
+    if parent.verb != "resume"
+        || parent.request_id.is_some()
+        || parent.probe
+        || parent.turn_id.is_some()
+    {
+        return Ok(false);
+    }
+    let digest = canonical::digest(&json!({
+        "target": parent.target.as_deref(),
+        "verb": parent.verb.as_str(),
+        "args": args,
+        "expected_generation": parent.expected_generation,
+        "expected_turn_id": Value::Null,
+    }))?;
+    let Some((principal, method, stored_digest)) = command_binding(connection, &parent.id)? else {
+        return Err(Error::new(
+            "source_integrity",
+            "resume parent has no retained command binding",
+        ));
+    };
+    Ok(principal == parent.principal && method == parent.method && stored_digest == digest)
 }
 
 fn command_cause_tx(connection: &Connection, command_id: &str) -> Result<Option<core::EventCause>> {
@@ -7704,7 +8209,7 @@ fn verified_native_event_cause_tx(
         };
         let bound = command.target == Some(agent_num)
             && command.command.generation == Some(generation)
-            && command.command.verb == "launch"
+            && matches!(command.command.verb.as_str(), "launch" | "resume")
             && matches!(
                 command.state,
                 CommandState::Dispatched | CommandState::Unknown
@@ -7821,6 +8326,98 @@ fn verified_native_event_cause_tx(
         return command_cause_for_turn_tx(tx, agent_num, generation, turn_id);
     }
     Ok(None)
+}
+
+fn validate_resume_ready_subject_tx(
+    tx: &Transaction<'_>,
+    projection: &Agent,
+    agent_num: i64,
+    generation: i64,
+    native_event: &NativeEvent,
+) -> Result<()> {
+    if native_event.kind != "session.ready" {
+        return Ok(());
+    }
+    let (count, command_id): (i64, Option<String>) = tx
+        .query_row(
+            "SELECT COUNT(*), MIN(id) FROM commands
+             WHERE target = ?1 AND generation = ?2 AND verb = 'resume'
+               AND state IN ('dispatched','unknown','applied')",
+            params![agent_num, generation],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(sql_error)?;
+    if count == 0 {
+        return Ok(());
+    }
+    if count != 1 {
+        return Err(Error::new(
+            "source_integrity",
+            "resumed generation has multiple retained start commands",
+        ));
+    }
+    let command_id = command_id.ok_or_else(|| {
+        Error::new(
+            "source_integrity",
+            "resumed generation has no retained start command id",
+        )
+    })?;
+    let command = load_command_record(tx, &command_id)?
+        .ok_or_else(|| Error::new("source_integrity", "resume command row is missing"))?;
+    let old_generation = command
+        .command
+        .expected_generation
+        .or_else(|| {
+            command
+                .command
+                .generation
+                .and_then(|value| value.checked_sub(1))
+        })
+        .ok_or_else(|| Error::new("source_integrity", "resume command has no old generation"))?;
+    let command_id_matches = match native_event.data.get("command_id") {
+        None | Some(Value::Null) => true,
+        Some(Value::String(reported)) => reported == &command_id,
+        Some(_) => false,
+    };
+    if command.target != Some(agent_num)
+        || command.command.verb != "resume"
+        || command.command.generation != Some(generation)
+        || old_generation.checked_add(1) != Some(generation)
+        || !command_id_matches
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "session readiness does not match the exact resumed generation",
+        ));
+    }
+    let retained_scope = projection
+        .native_scope
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| Error::new("source_integrity", "resume lost its retained native scope"))?;
+    let retained_ref = projection
+        .native_ref
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "resume lost its retained native reference",
+            )
+        })?;
+    if native_event
+        .data
+        .get("native_scope")
+        .and_then(Value::as_str)
+        != Some(retained_scope)
+        || native_event.data.get("native_ref").and_then(Value::as_str) != Some(retained_ref)
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "resumed session readiness changed its retained native subject",
+        ));
+    }
+    Ok(())
 }
 
 fn verified_request_reply_cause_tx(
@@ -9208,6 +9805,15 @@ impl Store {
         let mut command_events = Vec::new();
         let mut provider_events = Vec::new();
         for (index, native_event) in batch.events.iter().enumerate() {
+            if expected_subject.is_none() {
+                validate_resume_ready_subject_tx(
+                    &tx,
+                    &projection,
+                    agent_num,
+                    batch.generation,
+                    native_event,
+                )?;
+            }
             let (next, effects) = if expected_subject.is_some() {
                 observer_live::persist_turn_fact(&tx, &projection, native_event)?;
                 (projection.clone(), Vec::new())

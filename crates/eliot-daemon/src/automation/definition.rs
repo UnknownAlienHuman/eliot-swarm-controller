@@ -113,6 +113,12 @@ enum AgentActionDefinition {
         request_id: Value,
         answers: BTreeMap<String, Value>,
     },
+    Resume {
+        target: Value,
+        expected_generation: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<Value>,
+    },
     Launch {
         profile: String,
         workspace: String,
@@ -223,7 +229,8 @@ impl AgentActionDefinition {
             | Self::Steer { target, .. }
             | Self::Approve { target, .. }
             | Self::Deny { target, .. }
-            | Self::Answer { target, .. } => Some(target),
+            | Self::Answer { target, .. }
+            | Self::Resume { target, .. } => Some(target),
             Self::Launch { .. } => None,
         }
     }
@@ -257,6 +264,10 @@ impl AgentActionDefinition {
             | Self::Answer {
                 expected_generation,
                 ..
+            }
+            | Self::Resume {
+                expected_generation,
+                ..
             } => Some(expected_generation),
             Self::Launch { .. } => None,
         }
@@ -267,6 +278,9 @@ impl AgentActionDefinition {
             Self::Send { text, .. } => Some((text, MAX_EVENT_BYTES, "64 KiB persisted-text bound")),
             Self::Steer { text, .. } => Some((text, MAX_TEXT_BYTES, "512 KiB text bound")),
             Self::Launch {
+                text: Some(text), ..
+            }
+            | Self::Resume {
                 text: Some(text), ..
             } => Some((text, MAX_EVENT_BYTES, "64 KiB persisted-text bound")),
             _ => None,
@@ -319,6 +333,7 @@ impl AgentActionDefinition {
             Self::Approve { .. } => "approve",
             Self::Deny { .. } => "deny",
             Self::Answer { .. } => "answer",
+            Self::Resume { .. } => "resume",
             Self::Launch { .. } => "launch",
         }
     }
@@ -719,6 +734,7 @@ fn reject_unimplemented_options(raw: &toml::Value) -> Result<(), Error> {
                                     | "deny"
                                     | "answer"
                                     | "launch"
+                                    | "resume"
                                     | "run"
                             )
                         })
@@ -1013,6 +1029,12 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
             return Err(Error::new(
                 "unsupported",
                 "interrupt actions require an event trigger",
+            ));
+        }
+        AgentActionDefinition::Resume { .. } => {
+            return Err(Error::new(
+                "unsupported",
+                "resume actions require an event trigger",
             ));
         }
         AgentActionDefinition::Steer { .. } => {
@@ -1524,6 +1546,13 @@ on = { event = 'turn.completed' }
 do = [{ action = 'launch', profile = 'fake', workspace = '/work/eliot', text = 'Review ${data.status}' }]
 "#;
 
+    const EVENT_RESUME_RULE: &str = r#"
+[[rule]]
+id = 'resume-after-known-stop'
+on = { event = 'command.applied', match = { 'event.data.command_id' = '01ARZ3NDEKTSV4RRFFQ69G5FAV' } }
+do = [{ action = 'resume', target = '${event.agent}', expected_generation = '${event.generation}', text = 'Recover ${event.kind}' }]
+"#;
+
     fn event() -> Event {
         Event {
             seq: 7,
@@ -1553,6 +1582,23 @@ do = [{ action = 'launch', profile = 'fake', workspace = '/work/eliot', text = '
             "turn_id": "turn-id",
             "kind": "question"
         });
+        event
+    }
+
+    fn known_stop_applied_event() -> Event {
+        let mut event = event();
+        event.kind = "command.applied".to_owned();
+        event.source = "daemon".to_owned();
+        event.native_id = None;
+        event.data = json!({
+            "command_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "state":"applied",
+            "outcome":null
+        });
+        if let Some(subject) = event.subject.as_mut() {
+            subject.harness = "codex".to_owned();
+            subject.profile = "codex".to_owned();
+        }
         event
     }
 
@@ -1753,6 +1799,118 @@ do = [{ action = 'launch', profile = 'fake', workspace = '/work/eliot', text = '
             evaluate(&without_text, &event()).unwrap().unwrap().args,
             json!({"profile":"fake", "workspace":"/work/eliot"})
         );
+    }
+
+    #[test]
+    fn event_resume_projects_exact_event_binding_and_optional_text() {
+        let event = known_stop_applied_event();
+        assert_eq!(
+            event.subject.as_ref().unwrap().state,
+            eliot_core::AgentState::Busy
+        );
+        assert_eq!(event.data.get("verb"), None);
+        let rule = load(Cursor::new(EVENT_RESUME_RULE)).unwrap().remove(0);
+        let mut unrelated_stop = event.clone();
+        unrelated_stop.data["command_id"] = json!("another-stop-id");
+        assert_eq!(evaluate(&rule, &unrelated_stop).unwrap(), None);
+        let command = evaluate(&rule, &event).unwrap().unwrap();
+
+        assert_eq!(command.id, "");
+        assert_eq!(command.verb, "resume");
+        assert_eq!(command.target.as_deref(), Some("a7"));
+        assert_eq!(command.expected_generation, Some(3));
+        assert_eq!(command.expected_turn_id, None);
+        assert_eq!(command.request_id, None);
+        assert!(!command.probe);
+        assert_eq!(command.args, json!({"text":"Recover command.applied"}));
+        command.validate().unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&rule).unwrap()["do"][0],
+            json!({
+                "action":"resume",
+                "target":"${event.agent}",
+                "expected_generation":"${event.generation}",
+                "text":"Recover ${event.kind}"
+            })
+        );
+        let saved = serde_json::to_string(&rule).unwrap();
+        let restored = RuleDefinition::deserialize_saved(&saved).unwrap();
+        assert_eq!(
+            restored.semantic_digest().unwrap(),
+            rule.semantic_digest().unwrap()
+        );
+
+        let without_text = EVENT_RESUME_RULE.replace(", text = 'Recover ${event.kind}'", "");
+        let without_text = load(Cursor::new(without_text)).unwrap().remove(0);
+        assert_eq!(
+            evaluate(&without_text, &event).unwrap().unwrap().args,
+            json!({})
+        );
+    }
+
+    #[test]
+    fn event_resume_rejects_binding_mismatches_and_overrides() {
+        let event = known_stop_applied_event();
+        for (old, replacement) in [
+            ("target = '${event.agent}'", "target = 'a8'"),
+            (
+                "expected_generation = '${event.generation}'",
+                "expected_generation = 4",
+            ),
+        ] {
+            let source = EVENT_RESUME_RULE.replace(old, replacement);
+            let rule = load(Cursor::new(source)).unwrap().remove(0);
+            assert_eq!(evaluate(&rule, &event).unwrap_err().code, "invalid");
+        }
+
+        for field in [
+            "profile = 'other'",
+            "profile_snapshot = {}",
+            "harness = 'fake'",
+            "workspace = '/other'",
+            "project = 'other'",
+            "worktree = 'branch'",
+            "base = 'HEAD'",
+            "setup = true",
+            "model = 'other'",
+            "effort = 'high'",
+            "permissions = 'other'",
+            "expected_turn_id = 'turn-id'",
+            "request_id = 'request-id'",
+        ] {
+            let source = EVENT_RESUME_RULE.replace(
+                "expected_generation = '${event.generation}'",
+                &format!("expected_generation = '${{event.generation}}', {field}"),
+            );
+            assert_eq!(load(Cursor::new(source)).unwrap_err().code, "invalid");
+        }
+
+        let partial_generation = EVENT_RESUME_RULE.replace(
+            "expected_generation = '${event.generation}'",
+            "expected_generation = '3${event.generation}'",
+        );
+        assert_eq!(
+            load(Cursor::new(partial_generation)).unwrap_err().code,
+            "invalid"
+        );
+
+        let unresolved_text =
+            EVENT_RESUME_RULE.replace("Recover ${event.kind}", "Recover ${data.missing}");
+        let unresolved_text = load(Cursor::new(unresolved_text)).unwrap().remove(0);
+        assert_eq!(
+            evaluate(&unresolved_text, &event).unwrap_err().code,
+            "invalid"
+        );
+    }
+
+    #[test]
+    fn timer_resume_is_explicitly_unsupported() {
+        let source = INTERVAL_TIMER.replace(
+            "action = 'stop', target = 'a7', expected_generation = 3",
+            "action = 'resume', target = 'a7', expected_generation = 3, text = 'new input'",
+        );
+        assert_eq!(load(Cursor::new(source)).unwrap_err().code, "unsupported");
     }
 
     #[test]

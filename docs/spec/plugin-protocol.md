@@ -175,6 +175,12 @@ Arm the reader/subscription before native create/resume/input. For a session-fir
 harness: create/resume without input → establish subject/effective settings → commit
 `session.ready` → return start success → host sends the linked input normally.
 
+For resumed `session.ready`, Store requires `data.native_scope` and `data.native_ref` to
+match the retained subject pair exactly before reducing the event. `data.command_id` may be
+absent or null; when supplied, it must match the unique Resume command for that target
+generation. The plugin need not add command correlation when its readiness observation does
+not carry it.
+
 For an input-created session, perform start+linked input once but report session,
 input-to-turn association and terminal result independently. Ready alone never proves
 input delivery. Buffer early facts within a bound; overflow records a gap rather than
