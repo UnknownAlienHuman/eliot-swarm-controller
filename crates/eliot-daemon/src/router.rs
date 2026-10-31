@@ -3453,7 +3453,7 @@ impl Router {
         if matches!(command.verb.as_str(), "launch" | "resume")
             && let Err(error) = self.inner.workspaces.prepare(&id).await
         {
-            self.settle_plugin_error(&id, &error).await;
+            self.settle_workspace_prepare_error(&id, &error).await;
             self.signal_progress();
             return;
         }
@@ -4274,6 +4274,48 @@ impl Router {
         }
         self.redact_native_value(&mut outcome);
         let _ = self.settle(id, state, Some(outcome)).await;
+    }
+
+    async fn settle_workspace_prepare_error(&self, id: &str, error: &Error) {
+        // WorkspaceManager persists its typed creation/setup outcomes. A Ready
+        // retained Resume readback is the remaining pre-native Unknown; Store
+        // rechecks that exact pending marker atomically before recording it.
+        if error.code == "unknown" {
+            let mut store = self.inner.store.lock().await;
+            if let Ok(Some(command)) = store.get_command(id)
+                && command.verb == "resume"
+                && matches!(command.state, CommandState::Accepted | CommandState::Queued)
+                && let Some(target_generation) = command
+                    .generation
+                    .and_then(|generation| generation.checked_add(1))
+                && let Ok(change) = store.settle_workspace_creation(
+                    id,
+                    target_generation,
+                    eliot_core::WorkspaceCreationOutcome::Unknown {
+                        code: "workspace_identity_unknown".to_owned(),
+                        message: "retained workspace identity could not be confirmed".to_owned(),
+                    },
+                    now_ms(),
+                )
+            {
+                self.publish_locked(&change.events);
+            }
+        }
+        let secrets = self
+            .inner
+            .secrets
+            .lock_recover()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let error = crate::redaction::redact_error(error.clone(), &secrets);
+        crate::logging::record(
+            &SecretPolicy::new(&secrets),
+            &error.code,
+            &[("command", id)],
+            Some(&error),
+        );
+        self.signal_progress();
     }
 
     pub(crate) async fn settle(
@@ -9544,6 +9586,256 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
 
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn losing_managed_workspace_prepare_cannot_overwrite_dispatched_resume() {
+        let router = router();
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "eliot-losing-workspace-prepare-{}",
+            ulid::Ulid::new()
+        ));
+        let checkout = root.join("checkout").to_string_lossy().into_owned();
+        let worktree = root.join("worktree").to_string_lossy().into_owned();
+        let repo_common_dir = root.join("checkout/.git").to_string_lossy().into_owned();
+        let branch = format!("codex/losing-prepare-{}", ulid::Ulid::new());
+        let base_oid = "e".repeat(40);
+        let input = WorkspacePreparationInput {
+            project: checkout.clone(),
+            repo_path: checkout.clone(),
+            repo_common_dir: repo_common_dir.clone(),
+            requested_branch: branch.clone(),
+            base_ref: Some("HEAD".to_owned()),
+            base_oid: base_oid.clone(),
+            worktree_path: worktree.clone(),
+            frozen_setup: Vec::new(),
+        };
+        let (agent, resume_id) = {
+            let mut store = router.inner.store.lock().await;
+            let launch_id = ulid::Ulid::new().to_string();
+            let mut launch = SubmitCommand::new(launch_id.clone(), "launch");
+            launch.expected_generation = Some(0);
+            launch.args = json!({
+                "project":checkout,
+                "workspace":worktree,
+                "worktree":branch,
+                "harness":"fake",
+                "profile":"fake",
+                "profile_snapshot":{"harness":"fake"},
+            });
+            let accepted = store
+                .submit_with_workspace("owner", launch, input.clone(), now_ms())
+                .unwrap();
+            let agent = accepted.command.target.unwrap();
+            store
+                .settle_workspace_creation(
+                    &launch_id,
+                    1,
+                    eliot_core::WorkspaceCreationOutcome::Verified {
+                        repo_path: input.repo_path.clone(),
+                        repo_common_dir: input.repo_common_dir.clone(),
+                        worktree_path: input.worktree_path.clone(),
+                        branch: input.requested_branch.clone(),
+                        head: base_oid.clone(),
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            store.dispatch(&launch_id, now_ms()).unwrap();
+            read_fixture_event(
+                &mut store,
+                &agent,
+                "session.ready",
+                json!({
+                    "command_id":launch_id,
+                    "native_scope":format!("fake:synthetic:scope:{agent}"),
+                    "native_ref":format!("fake:synthetic:session:{agent}"),
+                }),
+            );
+            store
+                .settle(&launch_id, CommandState::Applied, None, now_ms())
+                .unwrap();
+            read_fixture_event(&mut store, &agent, "session.ended", json!({}));
+
+            let resume_id = ulid::Ulid::new().to_string();
+            let mut resume = SubmitCommand::new(resume_id.clone(), "resume");
+            resume.target = Some(agent.clone());
+            resume.expected_generation = Some(1);
+            store.submit("owner", resume, now_ms()).unwrap();
+            store
+                .settle_workspace_creation(
+                    &resume_id,
+                    2,
+                    eliot_core::WorkspaceCreationOutcome::Verified {
+                        repo_path: input.repo_path.clone(),
+                        repo_common_dir: input.repo_common_dir.clone(),
+                        worktree_path: input.worktree_path.clone(),
+                        branch: input.requested_branch.clone(),
+                        head: base_oid.clone(),
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            let winner = store.dispatch(&resume_id, now_ms()).unwrap();
+            assert_eq!(winner.value.state, CommandState::Dispatched);
+            (agent, resume_id)
+        };
+
+        // This is the loser's real preparation entry after the winner committed
+        // N+1. start() must reject the now-dispatched command before Git I/O.
+        let losing_error = router
+            .inner
+            .workspaces
+            .prepare(&resume_id)
+            .await
+            .expect_err("an obsolete preparation cannot proceed after dispatch");
+        assert_eq!(losing_error.code, "stale_generation");
+        router
+            .settle_workspace_prepare_error(&resume_id, &losing_error)
+            .await;
+        {
+            let store = router.inner.store.lock().await;
+            let current = store.get_command(&resume_id).unwrap().unwrap();
+            assert_eq!(current.state, CommandState::Dispatched);
+            assert_eq!(current.outcome, None);
+            assert_eq!(store.get_agent(&agent).unwrap().unwrap().generation, 2);
+            assert!(
+                !store
+                    .read_events(0, 1_000, None)
+                    .unwrap()
+                    .iter()
+                    .any(|event| {
+                        matches!(event.kind.as_str(), "command.unknown" | "command.rejected")
+                            && event.data.get("command_id").and_then(Value::as_str)
+                                == Some(resume_id.as_str())
+                    })
+            );
+        }
+
+        {
+            let mut store = router.inner.store.lock().await;
+            store
+                .put_batch(
+                    eliot_core::SourceBatch {
+                        batch_id: ulid::Ulid::new().to_string(),
+                        agent_id: agent.clone(),
+                        generation: 2,
+                        source: "stream".to_owned(),
+                        events: vec![eliot_core::NativeEvent {
+                            ts: None,
+                            kind: "session.ready".to_owned(),
+                            native_id: format!("fake:{agent}:2:session.ready"),
+                            data: json!({
+                                "native_scope":format!("fake:synthetic:scope:{agent}"),
+                                "native_ref":format!("fake:synthetic:session:{agent}"),
+                            }),
+                        }],
+                        cursor: None,
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+        }
+        router
+            .settle(
+                &resume_id,
+                CommandState::Applied,
+                Some(json!({"state":"ready"})),
+            )
+            .await
+            .expect("the winning start settles after readiness");
+        {
+            let store = router.inner.store.lock().await;
+            assert_eq!(
+                store.get_command(&resume_id).unwrap().unwrap().state,
+                CommandState::Applied
+            );
+            let events = store.read_events(0, 1_000, None).unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| {
+                        event.kind == "command.applied"
+                            && event.data.get("command_id").and_then(Value::as_str)
+                                == Some(resume_id.as_str())
+                    })
+                    .count(),
+                1
+            );
+            assert!(!events.iter().any(|event| {
+                event.kind == "command.unknown"
+                    && event.data.get("command_id").and_then(Value::as_str)
+                        == Some(resume_id.as_str())
+            }));
+        }
+
+        let unknown_resume_id = ulid::Ulid::new().to_string();
+        {
+            let mut store = router.inner.store.lock().await;
+            store
+                .put_batch(
+                    eliot_core::SourceBatch {
+                        batch_id: ulid::Ulid::new().to_string(),
+                        agent_id: agent.clone(),
+                        generation: 2,
+                        source: "stream".to_owned(),
+                        events: vec![eliot_core::NativeEvent {
+                            ts: None,
+                            kind: "session.ended".to_owned(),
+                            native_id: format!("fake:{agent}:2:session.ended"),
+                            data: json!({}),
+                        }],
+                        cursor: None,
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            let mut resume = SubmitCommand::new(unknown_resume_id.clone(), "resume");
+            resume.target = Some(agent.clone());
+            resume.expected_generation = Some(2);
+            store.submit("owner", resume, now_ms()).unwrap();
+            store
+                .settle_workspace_creation(
+                    &unknown_resume_id,
+                    3,
+                    eliot_core::WorkspaceCreationOutcome::Verified {
+                        repo_path: input.repo_path.clone(),
+                        repo_common_dir: input.repo_common_dir.clone(),
+                        worktree_path: input.worktree_path.clone(),
+                        branch: input.requested_branch.clone(),
+                        head: base_oid.clone(),
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            assert_eq!(
+                store.get_workspace(&agent).unwrap().unwrap().phase,
+                WorkspacePhase::Ready
+            );
+        }
+        let readback_error = router
+            .inner
+            .workspaces
+            .prepare(&unknown_resume_id)
+            .await
+            .expect_err("retained Ready identity readback is uncertain");
+        assert_eq!(readback_error.code, "unknown");
+        router
+            .settle_workspace_prepare_error(&unknown_resume_id, &readback_error)
+            .await;
+        let store = router.inner.store.lock().await;
+        assert_eq!(
+            store
+                .get_command(&unknown_resume_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            CommandState::Unknown
+        );
+        let unknown_workspace = store.get_workspace(&agent).unwrap().unwrap();
+        assert_eq!(unknown_workspace.phase, WorkspacePhase::Unknown);
+        assert_eq!(unknown_workspace.target_generation, 3);
+        assert_eq!(store.get_agent(&agent).unwrap().unwrap().generation, 2);
     }
 
     #[tokio::test]

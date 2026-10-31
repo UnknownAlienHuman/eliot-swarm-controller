@@ -5808,15 +5808,22 @@ impl Store {
         }
         match action {
             WorkspaceAction::Creation(outcome) => {
-                if !matches!(
+                let ready_resume_unknown = workspace.phase == WorkspacePhase::Ready
+                    && command.command.verb == "resume"
+                    && reuse
+                    && workspace.setup_index == workspace.frozen_setup.len()
+                    && matches!(command.state, CommandState::Accepted | CommandState::Queued)
+                    && matches!(&outcome, WorkspaceCreationOutcome::Unknown { .. });
+                if !(matches!(
                     workspace.phase,
                     WorkspacePhase::Creating | WorkspacePhase::Unknown
-                ) || workspace
-                    .outcome
-                    .as_ref()
-                    .and_then(|value| value.get("stage"))
-                    .and_then(Value::as_str)
-                    != Some("creation")
+                ) || ready_resume_unknown)
+                    || workspace
+                        .outcome
+                        .as_ref()
+                        .and_then(|value| value.get("stage"))
+                        .and_then(Value::as_str)
+                        != Some("creation")
                     || workspace.setup_index
                         != if reuse {
                             workspace.frozen_setup.len()

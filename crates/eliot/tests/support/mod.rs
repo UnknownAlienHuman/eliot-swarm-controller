@@ -267,11 +267,72 @@ impl Fixture {
             if state == Some(expected) || any_outcome {
                 return command;
             }
-            assert!(
-                matches!(state, Some("accepted" | "queued" | "dispatched")),
-                "unexpected command state {}; private outcome deliberately omitted",
-                command["state"]
-            );
+            if !matches!(state, Some("accepted" | "queued" | "dispatched")) {
+                let outcome = command.get("outcome").and_then(Value::as_object);
+                let workspace_pre_dispatch = outcome.is_some_and(|outcome| {
+                    matches!(
+                        outcome.get("stage").and_then(Value::as_str),
+                        Some("workspace" | "workspace_resume_rejected")
+                    ) && outcome.get("native_dispatched").and_then(Value::as_bool) == Some(false)
+                });
+                let error_code_class = match outcome
+                    .and_then(|outcome| outcome.get("code"))
+                    .and_then(Value::as_str)
+                {
+                    Some("bad_state") => "bad_state",
+                    Some("native_not_dispatched") => "native_not_dispatched",
+                    Some("not_allowed") => "not_allowed",
+                    Some("process_custody_unknown") => "process_custody_unknown",
+                    Some("profile_error") => "profile_error",
+                    Some("source_generation_mismatch") => "source_generation_mismatch",
+                    Some("source_integrity") => "source_integrity",
+                    Some("stale_generation") => "stale_generation",
+                    Some("store_lock_deadline") => "store_lock_deadline",
+                    Some("timeout") => "timeout",
+                    Some("unknown") => "unknown",
+                    Some("unavailable") => "unavailable",
+                    Some("unsupported") => "unsupported",
+                    Some(_) => "other",
+                    None => "none",
+                };
+                let state_class = match state {
+                    Some("accepted") => "accepted",
+                    Some("queued") => "queued",
+                    Some("dispatched") => "dispatched",
+                    Some("applied") => "applied",
+                    Some("rejected") => "rejected",
+                    Some("failed") => "failed",
+                    Some("unknown") => "unknown",
+                    Some("cancelled") => "cancelled",
+                    Some(_) => "other",
+                    None => "missing",
+                };
+                let generation = command["generation"].as_i64();
+                let (event_snapshot_available, dispatch_seen, ready_seen_at_command_generation) =
+                    match self.events_if_available() {
+                        Some(events) => {
+                            let dispatch_seen = events.iter().any(|event| {
+                                event["kind"] == "command.dispatched"
+                                    && event["data"]["command_id"] == id
+                            });
+                            let ready_seen = command["target"]
+                                .as_str()
+                                .zip(generation)
+                                .is_some_and(|(agent, generation)| {
+                                    events.iter().any(|event| {
+                                        event["kind"] == "session.ready"
+                                            && event["agent"] == agent
+                                            && event["generation"] == generation
+                                    })
+                                });
+                            (true, dispatch_seen, ready_seen)
+                        }
+                        None => (false, false, false),
+                    };
+                panic!(
+                    "unexpected command state {state_class}; generation={generation:?}; workspace_pre_dispatch={workspace_pre_dispatch}; error_code_class={error_code_class}; event_snapshot_available={event_snapshot_available}; dispatch_seen={dispatch_seen}; ready_seen_at_command_generation={ready_seen_at_command_generation}; private outcome deliberately omitted"
+                );
+            }
             assert!(
                 Instant::now() < deadline,
                 "command readback deadline; private outcome deliberately omitted"
@@ -304,6 +365,39 @@ impl Fixture {
             after = next;
         }
         panic!("fixture events exceeded eight bounded pages");
+    }
+
+    fn events_if_available(&self) -> Option<Vec<Value>> {
+        let mut after = 0;
+        let mut events = Vec::new();
+        let mut end = None;
+        for _ in 0..8 {
+            let after_arg = after.to_string();
+            let reply = cli(
+                &self.data,
+                &["events", "--since", &after_arg, "--limit", "1000"],
+            );
+            if !reply.status.success() {
+                return None;
+            }
+            let page: Value = serde_json::from_str(&reply.stdout).ok()?;
+            let page_high_water = page["high_water"].as_i64()?;
+            let high_water = *end.get_or_insert(page_high_water);
+            for event in page["events"].as_array()? {
+                if event["seq"].as_i64()? <= high_water {
+                    events.push(event.clone());
+                }
+            }
+            let next = page["next"].as_i64()?;
+            if next >= high_water {
+                return Some(events);
+            }
+            if next <= after {
+                return None;
+            }
+            after = next;
+        }
+        None
     }
 
     pub fn stop(&mut self, force: bool) {

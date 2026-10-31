@@ -8373,6 +8373,10 @@ fn cli_event_resume_preserves_exact_subject_for_live_and_history_owner_project()
         let resume_id = children[0].clone();
         assert_eq!(firing["data"]["child_command"], resume_id);
 
+        eprintln!(
+            "waiting for event-resume rule {} from old generation {}",
+            case.rule, expected_old_generation
+        );
         let resume: CoreCommand =
             serde_json::from_value(fixture.wait_command(&resume_id, "applied"))
                 .expect("applied event-bound resume child");
