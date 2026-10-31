@@ -5285,7 +5285,7 @@ fn settle_preparation_command(
     state: CommandState,
     now: i64,
     events: &mut Vec<Event>,
-) -> Result<()> {
+) -> Result<Option<WorkspacePreparation>> {
     let (command, agent) = preparation_command(tx, workspace)?;
     if !matches!(
         command.state,
@@ -5301,26 +5301,50 @@ fn settle_preparation_command(
     // preparation_command plus the typed workspace caller prove the pre-native
     // marker/verb/generation exception; ordinary settlement cannot use it.
     write_command_state(tx, &command.command.id, state, Some(&outcome), None, now)?;
-    if matches!(state, CommandState::Failed | CommandState::Cancelled) {
-        capacity::release_unstarted_tx(
-            tx,
-            parse_agent_id(&agent.id)?,
-            workspace.target_generation,
-            &command.command.id,
-        )?;
-    }
-    if command.command.verb == "launch" {
-        let next = match state {
-            CommandState::Failed => AgentState::Failed,
-            CommandState::Cancelled => AgentState::Stopped,
-            _ => AgentState::Created,
-        };
-        db!(tx.execute("UPDATE agents SET state = ?1, updated_at = ?2 WHERE id = ?3 AND generation = 0 AND state = 'created'",
-            params![agent_state_name(next), now, parse_agent_id(&agent.id)?]));
-    }
-    if matches!(state, CommandState::Failed | CommandState::Cancelled) {
-        cancel_workspace_input(tx, &command.command.id, now, events)?;
-    }
+    let restored_workspace = if command.command.verb == "resume" && state == CommandState::Cancelled
+    {
+        // WorkspaceAction::Cancel reaches this branch only after validating the
+        // exact dispatched Stop and its confirmed Stopped result.
+        Some(
+            cancel_unstarted_resume_input_tx(
+                tx,
+                parse_agent_id(&agent.id)?,
+                &command.command.id,
+                "workspace_stop_confirmed",
+                now,
+                events,
+                true,
+            )?
+            .ok_or_else(|| {
+                Error::new(
+                    "source_integrity",
+                    "confirmed resume cancellation lost its retained workspace",
+                )
+            })?,
+        )
+    } else {
+        if matches!(state, CommandState::Failed | CommandState::Cancelled) {
+            capacity::release_unstarted_tx(
+                tx,
+                parse_agent_id(&agent.id)?,
+                workspace.target_generation,
+                &command.command.id,
+            )?;
+        }
+        if command.command.verb == "launch" {
+            let next = match state {
+                CommandState::Failed => AgentState::Failed,
+                CommandState::Cancelled => AgentState::Stopped,
+                _ => AgentState::Created,
+            };
+            db!(tx.execute("UPDATE agents SET state = ?1, updated_at = ?2 WHERE id = ?3 AND generation = 0 AND state = 'created'",
+                params![agent_state_name(next), now, parse_agent_id(&agent.id)?]));
+        }
+        if matches!(state, CommandState::Failed | CommandState::Cancelled) {
+            cancel_workspace_input(tx, &command.command.id, now, events)?;
+        }
+        None
+    };
     events.push(insert_daemon_command_event(
         tx,
         now,
@@ -5330,7 +5354,7 @@ fn settle_preparation_command(
         &command.command.id,
         json!({"command_id": command.command.id, "outcome": outcome}),
     )?);
-    Ok(())
+    Ok(restored_workspace)
 }
 
 enum WorkspaceAction {
@@ -6045,8 +6069,10 @@ impl Store {
         }
         workspace.outcome = Some(marker);
         workspace.updated_at = now;
+        let mut restored_workspace = None;
         if let Some(state) = result_state {
-            settle_preparation_command(&tx, &workspace, state, now, &mut events)?;
+            restored_workspace =
+                settle_preparation_command(&tx, &workspace, state, now, &mut events)?;
         }
         if let Some((stop_id, state)) = stop_result {
             let outcome = json!({"stage": "workspace_cancel", "start_command_id": workspace.start_command_id, "target_generation": target, "detail": workspace.outcome});
@@ -6061,8 +6087,12 @@ impl Store {
                 json!({"command_id": stop_id, "outcome": outcome}),
             )?);
         }
-        persist_workspace(&tx, &old, &workspace)?;
-        events.push(workspace_event(&tx, &workspace, now)?);
+        if let Some(restored) = restored_workspace {
+            workspace = restored;
+        } else {
+            persist_workspace(&tx, &old, &workspace)?;
+            events.push(workspace_event(&tx, &workspace, now)?);
+        }
         if removal && workspace.phase == WorkspacePhase::Removed {
             close_finished_workspace_process_source(&tx, agent_num, target, now, &mut events)?;
         }
@@ -6198,7 +6228,7 @@ fn recover_workspaces(tx: &Transaction<'_>, now: i64, events: &mut Vec<Event>) -
         outcome["reason"] = json!("daemon_restart");
         workspace.updated_at = now;
         if !removing {
-            settle_preparation_command(tx, &workspace, CommandState::Unknown, now, events)?;
+            let _ = settle_preparation_command(tx, &workspace, CommandState::Unknown, now, events)?;
         }
         persist_workspace(tx, &old, &workspace)?;
         events.push(workspace_event(tx, &workspace, now)?);

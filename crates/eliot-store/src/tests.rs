@@ -6400,6 +6400,476 @@ fn managed_catch_up_resume_sibling_cancellation_restores_for_retry() {
 }
 
 #[test]
+fn confirmed_managed_resume_stop_restores_ready_and_allows_retry() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let (agent, workspace_input) = ready_managed_codex_agent(
+        &mut store,
+        "/synthetic-resume-stop-confirmed",
+        "resume-stop-confirmed-profile",
+        now,
+    );
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "resume-stop-confirmed:ended".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ended".to_owned(),
+                    native_id: "resume-stop-confirmed:ended".to_owned(),
+                    data: json!({}),
+                }],
+                cursor: None,
+            },
+            now + 5,
+        )
+        .expect("commit retained terminal fact");
+    let old_agent = store.get_agent(&agent).unwrap().unwrap();
+    let prior_workspace = store.get_workspace(&agent).unwrap().unwrap();
+
+    let mut stop = SubmitCommand::new(Ulid::new().to_string(), "stop");
+    stop.target = Some(agent.clone());
+    stop.expected_generation = Some(1);
+    let stop_id = stop.id.clone();
+    store
+        .submit("owner", stop, now + 6)
+        .expect("admit old-generation Stop before Resume");
+    let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
+    resume.target = Some(agent.clone());
+    resume.expected_generation = Some(1);
+    resume.args = json!({"text": "retry after confirmed Stop"});
+    let resume_id = resume.id.clone();
+    let admission = store
+        .submit_with_workspace("owner", resume.clone(), workspace_input.clone(), now + 7)
+        .expect("admit managed Resume with linked SEND");
+    let send_id = admission.linked_command.unwrap().id;
+    assert_eq!(capacity_generation(&store, &agent), Some(2));
+
+    store
+        .request_workspace_cancel(&stop_id, &resume_id, 2, now + 8)
+        .expect("latch the exact old-generation Stop against the Resume marker");
+    let pending_workspace = store.get_workspace(&agent).unwrap().unwrap();
+    assert_eq!(
+        pending_workspace.outcome.as_ref().unwrap()["cancel_requested"],
+        true
+    );
+    assert_eq!(
+        pending_workspace.outcome.as_ref().unwrap()["stop_command_id"],
+        stop_id
+    );
+    assert_eq!(
+        store.get_command(&stop_id).unwrap().unwrap().state,
+        CommandState::Dispatched
+    );
+
+    let settled = store
+        .settle_workspace_cancel(
+            &stop_id,
+            &resume_id,
+            2,
+            WorkspaceCancelOutcome::Stopped,
+            now + 9,
+        )
+        .expect("confirmed Stop settles and restores the retained Ready marker");
+    assert_eq!(settled.value.phase, WorkspacePhase::Ready);
+    assert_eq!(settled.value.target_generation, 1);
+    assert_eq!(
+        settled.value.start_command_id,
+        prior_workspace.start_command_id
+    );
+    assert_eq!(settled.value.outcome, prior_workspace.outcome);
+    assert_eq!(settled.value.project, prior_workspace.project);
+    assert_eq!(settled.value.repo_path, prior_workspace.repo_path);
+    assert_eq!(
+        settled.value.repo_common_dir,
+        prior_workspace.repo_common_dir
+    );
+    assert_eq!(
+        settled.value.requested_branch,
+        prior_workspace.requested_branch
+    );
+    assert_eq!(settled.value.base_ref, prior_workspace.base_ref);
+    assert_eq!(settled.value.base_oid, prior_workspace.base_oid);
+    assert_eq!(settled.value.worktree_path, prior_workspace.worktree_path);
+    assert_eq!(settled.value.setup_index, prior_workspace.setup_index);
+    assert_eq!(settled.value.frozen_setup, prior_workspace.frozen_setup);
+    assert_eq!(store.get_agent(&agent).unwrap().unwrap(), old_agent);
+    assert_eq!(
+        store.get_command(&resume_id).unwrap().unwrap().state,
+        CommandState::Cancelled
+    );
+    assert_eq!(
+        store.get_command(&send_id).unwrap().unwrap().state,
+        CommandState::Cancelled
+    );
+    assert_eq!(
+        store.get_command(&stop_id).unwrap().unwrap().state,
+        CommandState::Applied
+    );
+    assert_eq!(capacity_generation(&store, &agent), None);
+
+    resume.id = Ulid::new().to_string();
+    let retry_id = resume.id.clone();
+    let retry = store
+        .submit_with_workspace("owner", resume, workspace_input, now + 10)
+        .expect("restored Ready generation admits a fresh Resume");
+    assert!(retry.is_new);
+    assert_eq!(retry.command.state, CommandState::Accepted);
+    assert_eq!(capacity_generation(&store, &agent), Some(2));
+    let retry_workspace = store.get_workspace(&agent).unwrap().unwrap();
+    assert_eq!(retry_workspace.phase, WorkspacePhase::Creating);
+    assert_eq!(retry_workspace.target_generation, 2);
+    assert_eq!(retry_workspace.start_command_id, retry_id);
+}
+
+#[test]
+fn managed_resume_sibling_waits_for_exact_workspace_stop_settlement() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let rule_id = "managed-resume-stop-sibling";
+    let rule_value = json!({
+        "id": rule_id,
+        "enabled": true,
+        "on": {"event": "session.ended"},
+        "do": [{
+            "action": "resume",
+            "target": "${event.agent}",
+            "expected_generation": "${event.generation}",
+            "text": "resume from captured terminal event",
+        }],
+        "limit": {"max": 2, "per": "rule", "window_ms": 60_000},
+    });
+    let rule = RuleDefinitionInput {
+        id: rule_id.to_owned(),
+        canonical_definition: serde_json::to_string(&rule_value).unwrap(),
+        definition_digest: eliot_core::canonical_json_sha256(&rule_value).unwrap(),
+        enabled: true,
+    };
+    let checkout = "/synthetic-resume-stop-sibling";
+    let (first_agent, _) =
+        ready_managed_codex_agent(&mut store, checkout, "resume-stop-first", now);
+    let (second_agent, second_workspace_input) =
+        ready_managed_codex_agent(&mut store, checkout, "resume-stop-second", now + 10);
+    let first_end = store
+        .put_batch(
+            SourceBatch {
+                batch_id: "resume-stop-sibling:first:ended".to_owned(),
+                agent_id: first_agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ended".to_owned(),
+                    native_id: "resume-stop-sibling:first:ended".to_owned(),
+                    data: json!({}),
+                }],
+                cursor: None,
+            },
+            now + 20,
+        )
+        .expect("commit first terminal event");
+    let first_event = first_end
+        .events
+        .iter()
+        .find(|event| event.kind == "session.ended")
+        .unwrap()
+        .seq;
+    let second_end = store
+        .put_batch(
+            SourceBatch {
+                batch_id: "resume-stop-sibling:second:ended".to_owned(),
+                agent_id: second_agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ended".to_owned(),
+                    native_id: "resume-stop-sibling:second:ended".to_owned(),
+                    data: json!({}),
+                }],
+                cursor: None,
+            },
+            now + 20,
+        )
+        .expect("commit second terminal event");
+    let second_event = second_end
+        .events
+        .iter()
+        .find(|event| event.kind == "session.ended")
+        .unwrap()
+        .seq;
+    let second_old_agent = store.get_agent(&second_agent).unwrap().unwrap();
+    let second_prior_workspace = store.get_workspace(&second_agent).unwrap().unwrap();
+    let state = store
+        .ensure_rule_state("owner", &rule, now + 21)
+        .expect("capture sibling event history");
+    let captured_through = state.current_cursor;
+    let mut stop = SubmitCommand::new(Ulid::new().to_string(), "stop");
+    stop.target = Some(second_agent.clone());
+    stop.expected_generation = Some(1);
+    let stop_id = stop.id.clone();
+    store
+        .submit("owner", stop, now + 22)
+        .expect("admit the exact old-generation Stop");
+    let request = RuleCatchUpRequest::new(
+        Ulid::new().to_string(),
+        rule_id,
+        first_event - 1,
+        Some(captured_through),
+    );
+    let resume_request = |agent: &str| {
+        let mut request = SubmitCommand::new(Ulid::new().to_string(), "resume");
+        request.target = Some(agent.to_owned());
+        request.expected_generation = Some(1);
+        request.args = json!({"text": "resume from captured terminal event"});
+        request
+    };
+    let admission = store
+        .admit_rule_catch_up(
+            "owner",
+            &request,
+            &state,
+            captured_through,
+            &[
+                RuleCatchUpAction::command(first_event, resume_request(&first_agent)),
+                RuleCatchUpAction::command(second_event, resume_request(&second_agent)),
+            ],
+            now + 23,
+        )
+        .expect("admit ordered Resume siblings");
+    let first_resume_id = admission.children[0].command.id.clone();
+    let second_resume_id = admission.children[1].command.id.clone();
+    let second_send_id = admission.children[1]
+        .linked_command
+        .as_ref()
+        .unwrap()
+        .id
+        .clone();
+    store
+        .request_workspace_cancel(&stop_id, &second_resume_id, 2, now + 24)
+        .expect("latch exact Stop ownership on the second Resume");
+    store
+        .reject_workspace_resume(&first_resume_id, "fixture_pre_dispatch_rejection", now + 25)
+        .expect("make the first Resume sibling terminal");
+
+    let held = store
+        .dispatch(&second_resume_id, now + 26)
+        .expect("pending exact Stop holds sibling withdrawal");
+    assert_eq!(held.value.state, CommandState::Queued);
+    assert!(held.events.iter().any(|event| {
+        event.kind == "command.queued" && event.data["reason"] == "workspace_stop_pending"
+    }));
+    assert_eq!(
+        store.get_command(&second_send_id).unwrap().unwrap().state,
+        CommandState::Queued
+    );
+    assert_eq!(
+        store.get_command(&stop_id).unwrap().unwrap().state,
+        CommandState::Dispatched
+    );
+    assert_eq!(capacity_generation(&store, &second_agent), Some(2));
+    let pending_workspace = store.get_workspace(&second_agent).unwrap().unwrap();
+    assert_eq!(pending_workspace.start_command_id, second_resume_id);
+    assert_eq!(
+        pending_workspace.outcome.as_ref().unwrap()["cancel_requested"],
+        true
+    );
+    assert_eq!(
+        pending_workspace.outcome.as_ref().unwrap()["stop_command_id"],
+        stop_id
+    );
+
+    let settled = store
+        .settle_workspace_cancel(
+            &stop_id,
+            &second_resume_id,
+            2,
+            WorkspaceCancelOutcome::Stopped,
+            now + 27,
+        )
+        .expect("exact Stop settlement owns restoration and Resume withdrawal");
+    assert_eq!(settled.value.phase, WorkspacePhase::Ready);
+    assert_eq!(settled.value.target_generation, 1);
+    assert_eq!(
+        settled.value.start_command_id,
+        second_prior_workspace.start_command_id
+    );
+    assert_eq!(settled.value.outcome, second_prior_workspace.outcome);
+    assert_eq!(
+        store.get_agent(&second_agent).unwrap().unwrap(),
+        second_old_agent
+    );
+    assert_eq!(
+        store.get_command(&second_resume_id).unwrap().unwrap().state,
+        CommandState::Cancelled
+    );
+    assert_eq!(
+        store.get_command(&second_send_id).unwrap().unwrap().state,
+        CommandState::Cancelled
+    );
+    assert_eq!(
+        store.get_command(&stop_id).unwrap().unwrap().state,
+        CommandState::Applied
+    );
+    assert_eq!(capacity_generation(&store, &second_agent), None);
+    let retry = store
+        .submit_with_workspace(
+            "owner",
+            resume_request(&second_agent),
+            second_workspace_input,
+            now + 28,
+        )
+        .expect("confirmed Stop restoration permits a fresh Resume");
+    assert_eq!(retry.command.state, CommandState::Accepted);
+    assert_eq!(capacity_generation(&store, &second_agent), Some(2));
+}
+
+#[test]
+fn unknown_managed_resume_stop_preserves_marker_input_and_reservation() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let (agent, workspace_input) = ready_managed_codex_agent(
+        &mut store,
+        "/synthetic-resume-stop-unknown",
+        "resume-stop-unknown-profile",
+        now,
+    );
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "resume-stop-unknown:ended".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ended".to_owned(),
+                    native_id: "resume-stop-unknown:ended".to_owned(),
+                    data: json!({}),
+                }],
+                cursor: None,
+            },
+            now + 5,
+        )
+        .expect("commit retained terminal fact");
+    let old_agent = store.get_agent(&agent).unwrap().unwrap();
+    let prior_workspace = store.get_workspace(&agent).unwrap().unwrap();
+    let mut stop = SubmitCommand::new(Ulid::new().to_string(), "stop");
+    stop.target = Some(agent.clone());
+    stop.expected_generation = Some(1);
+    let stop_id = stop.id.clone();
+    store.submit("owner", stop, now + 6).expect("admit Stop");
+    let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
+    resume.target = Some(agent.clone());
+    resume.expected_generation = Some(1);
+    resume.args = json!({"text": "keep uncertain input"});
+    let resume_id = resume.id.clone();
+    let admission = store
+        .submit_with_workspace("owner", resume, workspace_input, now + 7)
+        .expect("admit managed Resume");
+    let send_id = admission.linked_command.unwrap().id;
+    store
+        .request_workspace_cancel(&stop_id, &resume_id, 2, now + 8)
+        .expect("latch exact Stop ownership");
+    let unknown = store
+        .settle_workspace_cancel(
+            &stop_id,
+            &resume_id,
+            2,
+            WorkspaceCancelOutcome::Unknown {
+                code: "cleanup_unconfirmed".to_owned(),
+                message: "Stop custody is unresolved".to_owned(),
+            },
+            now + 9,
+        )
+        .expect("retain unconfirmed Stop custody");
+    assert_eq!(unknown.value.phase, WorkspacePhase::Unknown);
+    assert_eq!(unknown.value.start_command_id, resume_id);
+    assert_eq!(unknown.value.target_generation, 2);
+    assert_eq!(
+        unknown.value.outcome.as_ref().unwrap()["cancel_requested"],
+        true
+    );
+    assert_eq!(
+        unknown.value.outcome.as_ref().unwrap()["stop_command_id"],
+        stop_id
+    );
+    let unknown_agent = store.get_agent(&agent).unwrap().unwrap();
+    let mut expected_unknown_agent = old_agent.clone();
+    expected_unknown_agent.workspace_phase = Some(WorkspacePhase::Unknown);
+    assert_eq!(unknown_agent, expected_unknown_agent);
+    assert_eq!(unknown.value.project, prior_workspace.project);
+    assert_eq!(unknown.value.repo_path, prior_workspace.repo_path);
+    assert_eq!(
+        unknown.value.repo_common_dir,
+        prior_workspace.repo_common_dir
+    );
+    assert_eq!(
+        unknown.value.requested_branch,
+        prior_workspace.requested_branch
+    );
+    assert_eq!(unknown.value.base_ref, prior_workspace.base_ref);
+    assert_eq!(unknown.value.base_oid, prior_workspace.base_oid);
+    assert_eq!(unknown.value.worktree_path, prior_workspace.worktree_path);
+    assert_eq!(unknown.value.setup_index, prior_workspace.setup_index);
+    assert_eq!(unknown.value.frozen_setup, prior_workspace.frozen_setup);
+    assert_eq!(
+        store.get_command(&resume_id).unwrap().unwrap().state,
+        CommandState::Unknown
+    );
+    assert_eq!(
+        store.get_command(&send_id).unwrap().unwrap().state,
+        CommandState::Queued
+    );
+    assert_eq!(
+        store.get_command(&stop_id).unwrap().unwrap().state,
+        CommandState::Unknown
+    );
+    assert_eq!(capacity_generation(&store, &agent), Some(2));
+
+    let high_water = store.high_water().unwrap();
+    let event_count: i64 = store
+        .connection
+        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        store
+            .reject_workspace_resume(&resume_id, "must_not_override_unknown_stop", now + 10)
+            .unwrap_err()
+            .code,
+        "bad_state"
+    );
+    assert_eq!(store.get_workspace(&agent).unwrap().unwrap(), unknown.value);
+    assert_eq!(store.get_agent(&agent).unwrap().unwrap(), unknown_agent);
+    assert_eq!(
+        store.get_command(&resume_id).unwrap().unwrap().state,
+        CommandState::Unknown
+    );
+    assert_eq!(
+        store.get_command(&send_id).unwrap().unwrap().state,
+        CommandState::Queued
+    );
+    assert_eq!(
+        store.get_command(&stop_id).unwrap().unwrap().state,
+        CommandState::Unknown
+    );
+    assert_eq!(capacity_generation(&store, &agent), Some(2));
+    assert_eq!(store.high_water().unwrap(), high_water);
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        event_count
+    );
+    assert_eq!(prior_workspace.phase, WorkspacePhase::Ready);
+}
+
+#[test]
 fn managed_resume_withdrawal_refuses_uncertain_inputs_and_foreign_markers() {
     for fence in [
         "dispatched_input",

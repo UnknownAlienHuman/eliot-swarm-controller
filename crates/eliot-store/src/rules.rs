@@ -3005,6 +3005,48 @@ pub(super) fn rule_run_action_binding_error(
     }
 }
 
+fn resume_workspace_stop_pending_tx(
+    tx: &Transaction<'_>,
+    resume_id: &str,
+    target: i64,
+    old_generation: i64,
+) -> Result<bool> {
+    let Some(workspace) = super::load_workspace(tx, target)? else {
+        return Ok(false);
+    };
+    if workspace.start_command_id != resume_id || !super::workspace_cancel_requested(&workspace) {
+        return Ok(false);
+    }
+    let next_generation = old_generation
+        .checked_add(1)
+        .ok_or_else(|| Error::new("source_integrity", "resume generation overflow"))?;
+    let stop_id = workspace
+        .outcome
+        .as_ref()
+        .and_then(|outcome| outcome.get("stop_command_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::new("source_integrity", "workspace cancel marker has no Stop"))?;
+    let stop = load_command_record(tx, stop_id)?
+        .ok_or_else(|| Error::new("source_integrity", "workspace cancel Stop disappeared"))?;
+    if workspace.target_generation != next_generation
+        || !matches!(
+            workspace.phase,
+            WorkspacePhase::Creating | WorkspacePhase::Ready
+        )
+        || stop.command.verb != "stop"
+        || stop.target != Some(target)
+        || stop.command.generation != Some(old_generation)
+        || stop.expected_turn_id.is_some()
+        || !matches!(stop.state, CommandState::Dispatched | CommandState::Unknown)
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "workspace cancel marker does not retain its exact pending Stop",
+        ));
+    }
+    Ok(true)
+}
+
 /// Gate a rule-action child at the Store dispatch boundary. A held successor is
 /// durably queued; a failed predecessor cancels every later undispatched sibling.
 pub(super) fn gate_rule_action_dispatch_tx(
@@ -3208,6 +3250,59 @@ pub(super) fn gate_rule_action_dispatch_tx(
         if !matches!(sibling_state, CommandState::Accepted | CommandState::Queued) {
             continue;
         }
+        let sibling = load_command_record(tx, &row.0)?
+            .ok_or_else(|| Error::new("source_integrity", "rule-action sibling disappeared"))?;
+        if sibling.command.verb != "resume" {
+            continue;
+        }
+        let target = row.4.ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "undispatched rule-action child has no target",
+            )
+        })?;
+        let generation = row.5.or(row.6).ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "undispatched rule-action child has no generation",
+            )
+        })?;
+        if resume_workspace_stop_pending_tx(tx, &row.0, target, generation)? {
+            let current = load_command_record(tx, command_id)?
+                .ok_or_else(|| Error::new("source_integrity", "rule-action child disappeared"))?;
+            if current.state == CommandState::Accepted {
+                let current_target = current.target.ok_or_else(|| {
+                    Error::new("source_integrity", "rule-action child has no target")
+                })?;
+                let current_generation = current
+                    .command
+                    .generation
+                    .or(current.command.expected_generation)
+                    .ok_or_else(|| {
+                        Error::new("source_integrity", "rule-action child has no generation")
+                    })?;
+                update_command_state(tx, command_id, CommandState::Queued, None, None, now)?;
+                events.push(insert_daemon_command_event(
+                    tx,
+                    now,
+                    "command.queued",
+                    Some(current_target),
+                    Some(current_generation),
+                    command_id,
+                    json!({
+                        "command_id": command_id,
+                        "reason": "workspace_stop_pending",
+                    }),
+                )?);
+            }
+            return Ok(RuleActionDispatchGate::Held);
+        }
+    }
+    for row in sibling_rows.iter().skip(failed_index + 1) {
+        let sibling_state: CommandState = parse_enum(&row.3, "command state")?;
+        if !matches!(sibling_state, CommandState::Accepted | CommandState::Queued) {
+            continue;
+        }
         let target = row.4.ok_or_else(|| {
             Error::new(
                 "source_integrity",
@@ -3242,7 +3337,7 @@ pub(super) fn gate_rule_action_dispatch_tx(
                 "rule_action_predecessor_terminal",
                 now,
                 events,
-                true,
+                false,
             )?;
         }
     }
