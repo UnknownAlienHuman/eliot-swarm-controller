@@ -9850,11 +9850,14 @@ fn cli_fake_launch_actions_cover_owner_project_event_scheduled_manual_and_replay
             }
             Trigger::Scheduled => {
                 let timer_before_fire = read_timer(&fixture, case.rule, case.project);
-                let scheduled_at = timer_before_fire
-                    .last_key
-                    .or(timer_before_fire.next_due_at)
-                    .expect("scheduled timer exposes its actual slot");
-                let firing = wait_firing(&fixture, case.rule, None, Some(scheduled_at), None);
+                let firing = wait_firing(&fixture, case.rule, None, None, None);
+                let scheduled_at = firing["data"]["scheduled_at_ms"]
+                    .as_i64()
+                    .expect("successful scheduled firing UTC slot");
+                assert_eq!(
+                    firing["data"]["schedule_revision"],
+                    timer_before_fire.schedule_revision
+                );
                 let parent_id = firing["data"]["parent_command"]
                     .as_str()
                     .expect("scheduled launch timer parent")
