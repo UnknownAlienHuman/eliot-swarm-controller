@@ -1601,49 +1601,112 @@ impl Router {
                 .map_err(|_| Error::new("internal", "timer.run result could not be encoded"));
         }
         if contains_known_secret_including_keys(params, &self.inner.secrets) {
-            return Err(Error::new(
-                "secret_in_payload",
-                "timer.run request contains a known credential",
-            ));
+            return self
+                .timer_run_error_after_replay(
+                    &rule_principal,
+                    &request,
+                    Error::new(
+                        "secret_in_payload",
+                        "timer.run request contains a known credential",
+                    ),
+                )
+                .await;
         }
 
         if !self.rule_firings_open() {
-            return Err(Error::new("unavailable", "automation is draining"));
+            return self
+                .timer_run_error_after_replay(
+                    &rule_principal,
+                    &request,
+                    Error::new("unavailable", "automation is draining"),
+                )
+                .await;
         }
         let project_view = match request.project.as_deref() {
-            Some(project) => Some(
-                self.inner
+            Some(project) => {
+                let registration = self
+                    .inner
                     .store
                     .lock()
                     .await
-                    .get_project_registration("owner", project)?
-                    .ok_or_else(|| {
-                        Error::new("not_allowed", "project registration is not active")
-                    })?,
-            ),
+                    .get_project_registration("owner", project)?;
+                match registration {
+                    Some(registration) => Some(registration),
+                    None => {
+                        return self
+                            .timer_run_error_after_replay(
+                                &rule_principal,
+                                &request,
+                                Error::new("not_allowed", "project registration is not active"),
+                            )
+                            .await;
+                    }
+                }
+            }
             None => None,
         };
-        let (expected_rule_revision, definition) = self
-            .rule_definition(&rule_principal, &request.rule)
-            .ok_or_else(|| Error::new("not_found", "timer rule was not found"))?;
+        let Some((expected_rule_revision, definition)) =
+            self.rule_definition(&rule_principal, &request.rule)
+        else {
+            return self
+                .timer_run_error_after_replay(
+                    &rule_principal,
+                    &request,
+                    Error::new("not_found", "timer rule was not found"),
+                )
+                .await;
+        };
         if definition.schedule().is_none() {
-            return Err(Error::new("unsupported", "rule is not a timer"));
+            return self
+                .timer_run_error_after_replay(
+                    &rule_principal,
+                    &request,
+                    Error::new("unsupported", "rule is not a timer"),
+                )
+                .await;
         }
         let timer = self
             .inner
             .store
             .lock()
             .await
-            .get_timer_state(&rule_principal, &request.rule)?
-            .ok_or_else(|| Error::new("not_found", "timer was not found"))?;
+            .get_timer_state(&rule_principal, &request.rule)?;
+        let Some(timer) = timer else {
+            return self
+                .timer_run_error_after_replay(
+                    &rule_principal,
+                    &request,
+                    Error::new("not_found", "timer was not found"),
+                )
+                .await;
+        };
         if !timer.enabled {
-            return Err(Error::new("bad_state", "timer is disabled or paused"));
+            return self
+                .timer_run_error_after_replay(
+                    &rule_principal,
+                    &request,
+                    Error::new("bad_state", "timer is disabled or paused"),
+                )
+                .await;
         }
         if !self.rule_firings_open() {
-            return Err(Error::new("unavailable", "automation is draining"));
+            return self
+                .timer_run_error_after_replay(
+                    &rule_principal,
+                    &request,
+                    Error::new("unavailable", "automation is draining"),
+                )
+                .await;
         }
 
-        let command = definition.evaluate_timer()?;
+        let command = match definition.evaluate_timer() {
+            Ok(command) => command,
+            Err(error) => {
+                return self
+                    .timer_run_error_after_replay(&rule_principal, &request, error)
+                    .await;
+            }
+        };
         let prepared_result = if command.verb == "run" {
             self.prepare_timer_rule_run_submission(
                 command,
@@ -1667,13 +1730,9 @@ impl Router {
         let prepared = match prepared_result {
             Ok(prepared) => prepared,
             Err(error) => {
-                if let Some(parent) = self.replay_timer_run(&rule_principal, &request).await? {
-                    request.validate_response(&parent)?;
-                    return serde_json::to_value(parent).map_err(|_| {
-                        Error::new("internal", "timer.run result could not be encoded")
-                    });
-                }
-                return Err(error);
+                return self
+                    .timer_run_error_after_replay(&rule_principal, &request, error)
+                    .await;
             }
         };
         let Some(admission) = self
@@ -1687,12 +1746,13 @@ impl Router {
             )
             .await?
         else {
-            if let Some(parent) = self.replay_timer_run(&rule_principal, &request).await? {
-                request.validate_response(&parent)?;
-                return serde_json::to_value(parent)
-                    .map_err(|_| Error::new("internal", "timer.run result could not be encoded"));
-            }
-            return Err(Error::new("unavailable", "automation is draining"));
+            return self
+                .timer_run_error_after_replay(
+                    &rule_principal,
+                    &request,
+                    Error::new("unavailable", "automation is draining"),
+                )
+                .await;
         };
         if admission.blocked {
             return Err(Error::new(
@@ -1720,6 +1780,20 @@ impl Router {
             .replay_timer_run(principal, request)
     }
 
+    async fn timer_run_error_after_replay(
+        &self,
+        principal: &str,
+        request: &TimerRunRequest,
+        error: Error,
+    ) -> Result<Value> {
+        let Some(parent) = self.replay_timer_run(principal, request).await? else {
+            return Err(error);
+        };
+        request.validate_response(&parent)?;
+        serde_json::to_value(parent)
+            .map_err(|_| Error::new("internal", "timer.run result could not be encoded"))
+    }
+
     async fn admit_manual_timer_run(
         &self,
         principal: &str,
@@ -1730,16 +1804,19 @@ impl Router {
         prepared: PreparedSubmission,
     ) -> Result<Option<TimerSlotAdmission>> {
         validate_rule_launch_preparation(&prepared)?;
+        validate_rule_resume_preparation(&prepared, project)?;
         let PreparedSubmission {
             request: action,
             workspace,
         } = prepared;
-        if !matches!(action.verb.as_str(), "stop" | "send" | "launch" | "run")
-            || workspace.is_some()
+        if !matches!(
+            action.verb.as_str(),
+            "stop" | "send" | "launch" | "resume" | "run"
+        ) || workspace.is_some()
         {
             return Err(Error::new(
                 "invalid",
-                "timer firing must contain one prepared stop, send, launch, or Run command",
+                "timer firing must contain one prepared stop, send, launch, resume, or Run command",
             ));
         }
         if action.verb == "run" {
@@ -2011,6 +2088,7 @@ impl Router {
             } else {
                 if let Some(action) = slot.action.as_ref() {
                     validate_prepared_rule_launch_command(action)?;
+                    validate_rule_resume_action(action, project)?;
                 }
                 if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
                     return Ok(None);
@@ -12527,6 +12605,220 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         assert_eq!(response["lagged"], json!(false));
         assert_eq!(response["truncated"], json!(false));
     }
+
+    #[tokio::test]
+    async fn manual_timer_run_replays_parent_after_initial_miss_and_timer_disable() {
+        const RULE_ID: &str = "manual-resume-replay";
+        let router = router();
+        let now = now_ms();
+        let agent = {
+            let mut store = router.inner.store.lock().await;
+            stopped_fake_agent(&mut store, "manual-timer-resume-replay")
+        };
+        let rule_value = json!({
+            "id":RULE_ID,
+            "enabled":true,
+            "on":{"every":"1h"},
+            "do":[{"action":"resume", "target":agent.clone(), "expected_generation":1,
+                "text":"new timer input"}],
+        });
+        let rule_input = eliot_store::RuleDefinitionInput {
+            id: RULE_ID.to_owned(),
+            canonical_definition: serde_json::to_string(&rule_value).unwrap(),
+            definition_digest: eliot_core::canonical_json_sha256(&rule_value).unwrap(),
+            enabled: true,
+        };
+        let period_ms = 60 * 60 * 1_000;
+        let timer_input = TimerDefinitionInput {
+            id: RULE_ID.to_owned(),
+            schedule_revision: 1,
+            schedule: eliot_core::api::TimerSchedule::Interval {
+                period_ms,
+                anchor: Some(now),
+            },
+            enabled: true,
+            initial_next_due_at: Some(now + period_ms),
+        };
+        let rule_revision = router
+            .initialize_rules(
+                "owner",
+                std::slice::from_ref(&rule_input),
+                std::slice::from_ref(&timer_input),
+                now,
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .view
+            .revision;
+        let timer_state = router
+            .get_rule_timer("owner", RULE_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        let request = TimerRunRequest::new(ulid::Ulid::new().to_string(), RULE_ID);
+        assert!(
+            router
+                .replay_timer_run("owner", &request)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let mut action = SubmitCommand::new("", "resume");
+        action.target = Some(agent.clone());
+        action.expected_generation = Some(1);
+        action.args = json!({"text":"new timer input"});
+        let parent = router
+            .inner
+            .store
+            .lock()
+            .await
+            .admit_manual_timer_run("owner", &request, &timer_state, rule_revision, action, now)
+            .unwrap()
+            .parent
+            .unwrap();
+        let disabled_value = json!({
+            "id":RULE_ID,
+            "enabled":false,
+            "on":{"every":"1h"},
+            "do":[{"action":"resume", "target":agent, "expected_generation":1,
+                "text":"new timer input"}],
+        });
+        let disabled_rule_input = eliot_store::RuleDefinitionInput {
+            id: RULE_ID.to_owned(),
+            canonical_definition: serde_json::to_string(&disabled_value).unwrap(),
+            definition_digest: eliot_core::canonical_json_sha256(&disabled_value).unwrap(),
+            enabled: false,
+        };
+        let disabled_timer_input = TimerDefinitionInput {
+            id: RULE_ID.to_owned(),
+            schedule_revision: 1,
+            schedule: eliot_core::api::TimerSchedule::Interval {
+                period_ms,
+                anchor: Some(now),
+            },
+            enabled: false,
+            initial_next_due_at: Some(now + period_ms),
+        };
+        router
+            .initialize_rules(
+                "owner",
+                std::slice::from_ref(&disabled_rule_input),
+                std::slice::from_ref(&disabled_timer_input),
+                now + 1,
+            )
+            .await
+            .unwrap();
+        let disabled_timer = router
+            .get_rule_timer("owner", RULE_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!disabled_timer.enabled);
+        let high_water = router.inner.store.lock().await.high_water().unwrap();
+
+        // The duplicate missed its first lookup; the winner committed a parent
+        // before the current disabled-timer gate was rechecked.
+        let replay = router
+            .timer_run_error_after_replay(
+                "owner",
+                &request,
+                Error::new("bad_state", "timer is disabled or paused"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(replay, serde_json::to_value(parent).unwrap());
+        let conflicting_request = TimerRunRequest::new(request.id.clone(), "different-rule");
+        assert_eq!(
+            router
+                .timer_run_error_after_replay(
+                    "owner",
+                    &conflicting_request,
+                    Error::new("bad_state", "timer is disabled or paused"),
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "id_conflict"
+        );
+        assert_eq!(
+            router.inner.store.lock().await.high_water().unwrap(),
+            high_water
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_timer_resume_rechecks_current_project_registration() {
+        const PROJECT_ID: &str = "timer-resume-authority";
+        let router = router();
+        let checkout = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let input = ProjectRegistrationInput {
+            id: PROJECT_ID.to_owned(),
+            checkout: checkout.clone(),
+            repo_common_dir: checkout,
+            profiles: vec!["fake".to_owned()],
+            actions: vec!["resume".to_owned(), "send".to_owned()],
+            interpreters: Default::default(),
+            run_env: Vec::new(),
+        };
+        let registration = router
+            .reconcile_project_registrations(std::slice::from_ref(&input))
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let principal = format!("project:{PROJECT_ID}");
+        let request = TimerRunRequest::new(ulid::Ulid::new().to_string(), "project-timer")
+            .in_project(PROJECT_ID);
+        let timer_state = TimerStateView {
+            id: "project-timer".to_owned(),
+            project: Some(PROJECT_ID.to_owned()),
+            schedule_revision: 1,
+            schedule: eliot_core::api::TimerSchedule::Interval {
+                period_ms: 60_000,
+                anchor: None,
+            },
+            anchor: 0,
+            last_key: None,
+            next_due_at: Some(60_000),
+            enabled: true,
+        };
+        let mut action = SubmitCommand::new("", "resume");
+        action.target = Some("a1".to_owned());
+        action.expected_generation = Some(1);
+        action.args = json!({"text":"new timer input"});
+        let prepared = PreparedSubmission {
+            request: action,
+            workspace: None,
+        };
+
+        let mut stale_registration = registration;
+        stale_registration.revision += 1;
+        let error = router
+            .admit_manual_timer_run(
+                &principal,
+                Some(&stale_registration),
+                &request,
+                &timer_state,
+                1,
+                prepared,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "not_allowed");
+        assert_eq!(
+            error.message,
+            "project registration changed before timer admission"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -12607,6 +12899,7 @@ mod run_authorization_tests {
         let mut run_request = SubmitCommand::new("", "send");
         assert!(authorize_command(&run_principal(), &mut run_request).is_err());
     }
+
     #[tokio::test]
     async fn force_joins_active_run_worker_and_rejects_post_force_output() {
         let store = Arc::new(AsyncMutex::new(

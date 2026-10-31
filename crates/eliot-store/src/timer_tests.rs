@@ -176,6 +176,34 @@ fn project_registration(id: &str, actions: Vec<String>) -> ProjectRegistrationIn
     }
 }
 
+fn timer_resume_rule_input(
+    id: &str,
+    agent: &str,
+    expected_generation: i64,
+    text: Option<&str>,
+) -> RuleDefinitionInput {
+    let mut action = json!({
+        "action": "resume",
+        "target": agent,
+        "expected_generation": expected_generation,
+    });
+    if let Some(text) = text {
+        action["text"] = json!(text);
+    }
+    let value = json!({
+        "id": id,
+        "enabled": true,
+        "do": [action],
+        "limit": {"max": 4, "per": "rule", "window_ms": 60_000},
+    });
+    RuleDefinitionInput {
+        id: id.to_owned(),
+        canonical_definition: serde_json::to_string(&value).unwrap(),
+        definition_digest: canonical_json_sha256(&value).unwrap(),
+        enabled: true,
+    }
+}
+
 fn ensure_interval(
     store: &mut Store,
     id: &str,
@@ -262,24 +290,47 @@ fn rule_revision(store: &Store, id: &str) -> i64 {
 }
 
 fn ready_agent(store: &mut Store, project: &str, now: i64) -> String {
+    let workspace = format!("timer-{project}");
+    ready_agent_with_workspace(store, project, &workspace, "fake", now)
+}
+
+fn ready_agent_with_workspace(
+    store: &mut Store,
+    project: &str,
+    workspace: &str,
+    profile: &str,
+    now: i64,
+) -> String {
     let launch_id = Ulid::new().to_string();
     let mut launch = SubmitCommand::new(launch_id.clone(), "launch");
-    launch.args = json!({"project": project, "workspace": format!("timer-{project}")});
+    launch.args = json!({
+        "project": project,
+        "harness": "fake",
+        "profile": profile,
+        "workspace": workspace,
+    });
     launch.expected_generation = Some(0);
     let admission = store.submit("owner", launch, now).unwrap();
     let agent = admission.command.target.unwrap();
+    let native_scope = format!("timer-resume-{agent}-scope");
+    let native_ref = format!("timer-resume-{agent}-subject");
+    let ready_id = format!("{project}:{agent}:ready");
     store.dispatch(&launch_id, now).unwrap();
     store
         .put_batch(
             SourceBatch {
-                batch_id: format!("{project}:ready"),
+                batch_id: ready_id.clone(),
                 agent_id: agent.clone(),
                 generation: 1,
                 source: "stream".to_owned(),
                 events: vec![NativeEvent {
                     kind: "session.ready".to_owned(),
-                    native_id: format!("{project}:ready"),
-                    data: json!({"command_id": launch_id}),
+                    native_id: ready_id,
+                    data: json!({
+                        "command_id": launch_id,
+                        "native_scope": native_scope,
+                        "native_ref": native_ref,
+                    }),
                     ts: None,
                 }],
                 cursor: None,
@@ -291,6 +342,73 @@ fn ready_agent(store: &mut Store, project: &str, now: i64) -> String {
         .settle(&launch_id, CommandState::Applied, None, now)
         .unwrap();
     agent
+}
+
+fn end_timer_agent(store: &mut Store, agent: &str, now: i64) {
+    let generation = store.get_agent(agent).unwrap().unwrap().generation;
+    let native_id = format!("timer-resume-ended-{agent}");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: native_id.clone(),
+                agent_id: agent.to_owned(),
+                generation,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ended".to_owned(),
+                    native_id,
+                    data: json!({}),
+                }],
+                cursor: None,
+            },
+            now,
+        )
+        .unwrap();
+}
+
+fn apply_timer_resume(
+    store: &mut Store,
+    agent: &str,
+    resume_id: &str,
+    old_generation: i64,
+    now: i64,
+) {
+    let retained = store.get_agent(agent).unwrap().unwrap();
+    assert_eq!(retained.generation, old_generation);
+    let native_scope = retained
+        .native_scope
+        .expect("retained timer Agent has a native scope");
+    let native_ref = retained
+        .native_ref
+        .expect("retained timer Agent has a native subject");
+    let generation = old_generation + 1;
+    store.dispatch(resume_id, now).unwrap();
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("timer-resume-ready-{resume_id}"),
+                agent_id: agent.to_owned(),
+                generation,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ready".to_owned(),
+                    native_id: format!("timer-resume-ready-{resume_id}"),
+                    data: json!({
+                        "command_id": resume_id,
+                        "native_scope": native_scope,
+                        "native_ref": native_ref,
+                    }),
+                }],
+                cursor: None,
+            },
+            now + 1,
+        )
+        .unwrap();
+    store
+        .settle(resume_id, CommandState::Applied, None, now + 2)
+        .unwrap();
 }
 
 fn timer_launch_action(project: &str, text: Option<&str>) -> SubmitCommand {
@@ -396,6 +514,20 @@ fn stop_request(agent: &str) -> SubmitCommand {
     let mut request = SubmitCommand::new(Ulid::new().to_string(), "stop");
     request.target = Some(agent.to_owned());
     request.expected_generation = Some(1);
+    request
+}
+
+fn timer_resume_request(
+    agent: &str,
+    expected_generation: i64,
+    text: Option<&str>,
+) -> SubmitCommand {
+    let mut request = SubmitCommand::new(String::new(), "resume");
+    request.target = Some(agent.to_owned());
+    request.expected_generation = Some(expected_generation);
+    if let Some(text) = text {
+        request.args = json!({"text": text});
+    }
     request
 }
 
@@ -584,45 +716,289 @@ fn scheduled_cursor_is_monotonic_and_pending_children_block_next_slots() {
 }
 
 #[test]
-fn manual_replay_precedes_current_gates_and_keeps_schedule_cursor() {
+fn scheduled_owner_resume_uses_exact_generation_and_never_replays_uncertain_input() {
     let mut store = store();
     let registration_ms = now_ms();
-    let agent = ready_agent(&mut store, "timer-manual", registration_ms);
-    let before = ensure_interval(&mut store, "manual-stop", registration_ms, 60_000);
-    let expected_rule_revision = rule_revision(&store, "manual-stop");
-    let request = TimerRunRequest::new(Ulid::new().to_string(), "manual-stop");
-    let action = stop_request(&agent);
+    let project = "timer-owner-resume";
+    let workspace = "synthetic-timer-owner-resume";
+    let agent = ready_agent_with_workspace(&mut store, project, workspace, "fake", registration_ms);
+    end_timer_agent(&mut store, &agent, registration_ms + 4);
+    let retained = store.get_agent(&agent).unwrap().unwrap();
+    let agent_count_before: i64 = store
+        .connection
+        .query_row("SELECT COUNT(*) FROM agents", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap();
+    let period_ms = 1_000;
+    let initial = ensure_interval(
+        &mut store,
+        "scheduled-owner-resume",
+        registration_ms + 5,
+        period_ms,
+    );
+    let first_due = initial.next_due_at.unwrap();
+    let stale = store
+        .commit_timer_slot(
+            "owner",
+            &initial,
+            TimerSlotCommit {
+                scheduled_at_ms: first_due,
+                next_due_at_ms: Some(first_due + period_ms),
+                action: Some(timer_resume_request(&agent, 2, None)),
+                skip_code: None,
+            },
+            first_due,
+        )
+        .unwrap();
+    assert!(stale.is_new);
+    assert!(stale.child.is_none());
+    assert_eq!(
+        stale.parent.as_ref().unwrap().outcome.as_ref().unwrap()["code"],
+        "stale_generation"
+    );
+    assert_eq!(store.get_agent(&agent).unwrap().unwrap().generation, 1);
+
+    let resume_at = stale.state.next_due_at.unwrap();
+    let admitted = store
+        .commit_timer_slot(
+            "owner",
+            &stale.state,
+            TimerSlotCommit {
+                scheduled_at_ms: resume_at,
+                next_due_at_ms: Some(resume_at + period_ms),
+                action: Some(timer_resume_request(
+                    &agent,
+                    1,
+                    Some("new literal timer input"),
+                )),
+                skip_code: None,
+            },
+            resume_at,
+        )
+        .unwrap();
+    let child = admitted.child.as_ref().expect("targeted Resume action");
+    let resume_id = child.command.id.clone();
+    let linked = child.linked_command.as_ref().expect("new linked SEND");
+    let send_id = linked.id.clone();
+    assert_eq!(child.command.verb, "resume");
+    assert_eq!(child.command.target.as_deref(), Some(agent.as_str()));
+    assert_eq!(child.command.expected_generation, Some(1));
+    assert_eq!(child.command.generation, Some(1));
+    assert_eq!(child.command.args, json!({}));
+    assert_eq!(send_id, format!("{resume_id}/send"));
+    assert_eq!(linked.target.as_deref(), Some(agent.as_str()));
+    assert_eq!(linked.expected_generation, Some(2));
+    assert_eq!(linked.generation, Some(2));
+    assert_eq!(linked.state, CommandState::Queued);
+    assert_eq!(linked.args["text"], "new literal timer input");
+    assert_eq!(store.get_agent(&agent).unwrap().unwrap().generation, 1);
+    let blocked = store
+        .commit_timer_slot(
+            "owner",
+            &admitted.state,
+            scheduled_stop(
+                resume_at + period_ms,
+                Some(resume_at + 2 * period_ms),
+                &agent,
+            ),
+            resume_at + period_ms,
+        )
+        .unwrap();
+    assert!(
+        blocked.blocked,
+        "queued Resume input orders the next timer action"
+    );
+    assert_eq!(blocked.state.last_key, Some(resume_at));
+    assert_eq!(blocked.state.next_due_at, Some(resume_at + period_ms));
+
+    let dispatch_at = resume_at + period_ms + 1;
+    store.dispatch(&resume_id, dispatch_at).unwrap();
+    store
+        .connection
+        .execute(
+            "UPDATE rule_state SET enabled = 0 WHERE principal = ?1 AND rule = ?2",
+            rusqlite::params!["owner", "scheduled-owner-resume"],
+        )
+        .unwrap();
+    let dispatched = store
+        .commit_timer_slot(
+            "owner",
+            &admitted.state,
+            TimerSlotCommit {
+                scheduled_at_ms: resume_at,
+                next_due_at_ms: Some(resume_at + period_ms),
+                action: Some(timer_resume_request(&agent, 0, Some("replacement input"))),
+                skip_code: None,
+            },
+            dispatch_at + 1,
+        )
+        .unwrap();
+    assert!(!dispatched.is_new);
+    assert_eq!(dispatched.child.as_ref().unwrap().command.id, resume_id);
+    assert_eq!(
+        dispatched.child.as_ref().unwrap().command.state,
+        CommandState::Dispatched
+    );
+    store
+        .settle(&resume_id, CommandState::Unknown, None, dispatch_at + 2)
+        .unwrap();
+    let replay = store
+        .commit_timer_slot(
+            "owner",
+            &admitted.state,
+            TimerSlotCommit {
+                scheduled_at_ms: resume_at,
+                next_due_at_ms: Some(resume_at + period_ms),
+                action: Some(timer_resume_request(&agent, 0, Some("replacement input"))),
+                skip_code: None,
+            },
+            dispatch_at + 3,
+        )
+        .unwrap();
+    assert!(!replay.is_new);
+    let replayed = replay.child.as_ref().unwrap();
+    assert_eq!(replayed.command.id, resume_id);
+    assert_eq!(replayed.command.state, CommandState::Unknown);
+    assert_eq!(replayed.linked_command.as_ref().unwrap().id, send_id);
+    assert_eq!(
+        replayed.linked_command.as_ref().unwrap().state,
+        CommandState::Queued
+    );
+    assert_eq!(
+        replayed.linked_command.as_ref().unwrap().args["text"],
+        "new literal timer input"
+    );
+    let dispatched_resume_events: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE kind = 'command.dispatched'
+             AND json_extract(data, '$.command_id') = ?1",
+            [&resume_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    let dispatched_send_events: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE kind = 'command.dispatched'
+             AND json_extract(data, '$.command_id') = ?1",
+            [&send_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(dispatched_resume_events, 1);
+    assert_eq!(dispatched_send_events, 0);
+    let after = store.get_agent(&agent).unwrap().unwrap();
+    assert_eq!(after.generation, 2);
+    assert_eq!(after.profile, retained.profile);
+    assert_eq!(after.profile_snapshot, retained.profile_snapshot);
+    assert_eq!(after.project, retained.project);
+    assert_eq!(after.workspace, retained.workspace);
+    assert_eq!(after.native_scope, retained.native_scope);
+    assert_eq!(after.native_ref, retained.native_ref);
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM agents", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        agent_count_before
+    );
+}
+
+#[test]
+fn manual_owner_resume_replays_before_rule_gate_and_advances_the_retained_agent() {
+    let mut store = store();
+    let registration_ms = now_ms();
+    let project = "timer-manual-resume";
+    let workspace = "synthetic-timer-manual-resume";
+    let agent = ready_agent_with_workspace(&mut store, project, workspace, "fake", registration_ms);
+    end_timer_agent(&mut store, &agent, registration_ms + 4);
+    let retained = store.get_agent(&agent).unwrap().unwrap();
+    let agent_count_before: i64 = store
+        .connection
+        .query_row("SELECT COUNT(*) FROM agents", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap();
+    let before = ensure_interval(&mut store, "manual-resume", registration_ms + 5, 60_000);
+    let expected_rule_revision = rule_revision(&store, "manual-resume");
+    let request = TimerRunRequest::new(Ulid::new().to_string(), "manual-resume");
     let first = store
         .admit_manual_timer_run(
             "owner",
             &request,
             &before,
             expected_rule_revision,
-            action,
-            registration_ms,
+            timer_resume_request(&agent, 1, None),
+            registration_ms + 6,
         )
         .unwrap();
     assert!(first.is_new);
     assert_eq!(first.parent.as_ref().unwrap().id, request.id);
-    assert!(first.child.is_some());
+    let child = first.child.as_ref().expect("manual Resume action");
+    let resume_id = child.command.id.clone();
+    assert_eq!(child.command.target.as_deref(), Some(agent.as_str()));
+    assert_eq!(child.command.expected_generation, Some(1));
+    assert_eq!(child.command.generation, Some(1));
+    assert_eq!(child.command.args, json!({}));
+    assert!(child.linked_command.is_none());
+    assert_eq!(store.get_agent(&agent).unwrap().unwrap().generation, 1);
 
-    // A same-ID retry returns its retained parent even after the rule is
-    // disabled, and manual execution leaves scheduled cursor state untouched.
     store
         .connection
         .execute(
             "UPDATE rule_state SET enabled = 0 WHERE principal = ?1 AND rule = ?2",
-            rusqlite::params!["owner", "manual-stop"],
+            rusqlite::params!["owner", "manual-resume"],
         )
         .unwrap();
-    let replay = store.replay_timer_run("owner", &request).unwrap().unwrap();
-    assert_eq!(replay.id, request.id);
-    let after = store
-        .get_timer_state("owner", "manual-stop")
+    let high_water_before_replay = store.high_water().unwrap();
+    let replay = store
+        .admit_manual_timer_run(
+            "owner",
+            &request,
+            &before,
+            expected_rule_revision,
+            timer_resume_request(&agent, 0, None),
+            registration_ms + 7,
+        )
+        .unwrap();
+    assert!(!replay.is_new);
+    assert_eq!(replay.parent.as_ref().unwrap().id, request.id);
+    let replayed = replay.child.as_ref().expect("retained manual Resume");
+    assert_eq!(replayed.command.id, resume_id);
+    assert_eq!(replayed.command.expected_generation, Some(1));
+    assert_eq!(replayed.command.args, json!({}));
+    assert_eq!(store.high_water().unwrap(), high_water_before_replay);
+    let after_replay = store
+        .get_timer_state("owner", "manual-resume")
         .unwrap()
         .unwrap();
-    assert_eq!(after.last_key, before.last_key);
-    assert_eq!(after.next_due_at, before.next_due_at);
+    assert_eq!(after_replay.last_key, before.last_key);
+    assert_eq!(after_replay.next_due_at, before.next_due_at);
+
+    apply_timer_resume(&mut store, &agent, &resume_id, 1, registration_ms + 8);
+    let resumed = store.get_agent(&agent).unwrap().unwrap();
+    assert_eq!(resumed.generation, 2);
+    assert_eq!(resumed.profile, retained.profile);
+    assert_eq!(resumed.profile_snapshot, retained.profile_snapshot);
+    assert_eq!(resumed.project, retained.project);
+    assert_eq!(resumed.workspace, retained.workspace);
+    assert_eq!(resumed.native_scope, retained.native_scope);
+    assert_eq!(resumed.native_ref, retained.native_ref);
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM agents", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        agent_count_before
+    );
+    assert_eq!(
+        store.get_command(&resume_id).unwrap().unwrap().state,
+        CommandState::Applied
+    );
 }
 
 #[test]
@@ -2113,5 +2489,333 @@ fn project_timer_run_reuses_registration_authority_at_dispatch() {
     assert_eq!(
         store.get_command(&run.id).unwrap().unwrap().state,
         CommandState::Accepted
+    );
+}
+
+#[test]
+fn project_scheduled_and_manual_timer_resume_keep_bindings_and_gate_new_input() {
+    let mut store = store();
+    let registration_ms = now_ms();
+    let project = "timer-project-resume";
+    let mut registration = project_registration(project, vec!["resume".to_owned()]);
+    registration.profiles = vec!["fake".to_owned()];
+    let checkout = registration.checkout.clone();
+    store
+        .upsert_project_registration("owner", &registration, registration_ms)
+        .unwrap();
+    let principal = format!("project:{project}");
+
+    let scheduled_agent =
+        ready_agent_with_workspace(&mut store, project, &checkout, "fake", registration_ms + 1);
+    end_timer_agent(&mut store, &scheduled_agent, registration_ms + 5);
+    let scheduled_retained = store.get_agent(&scheduled_agent).unwrap().unwrap();
+    let manual_agent =
+        ready_agent_with_workspace(&mut store, project, &checkout, "fake", registration_ms + 10);
+    end_timer_agent(&mut store, &manual_agent, registration_ms + 14);
+    let manual_retained = store.get_agent(&manual_agent).unwrap().unwrap();
+    let agent_count_before: i64 = store
+        .connection
+        .query_row("SELECT COUNT(*) FROM agents", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap();
+
+    let scheduled_rule_id = "project-scheduled-resume";
+    let manual_rule_id = "project-manual-resume";
+    let scheduled_rule = timer_resume_rule_input(scheduled_rule_id, &scheduled_agent, 1, None);
+    let manual_text = "new literal Project timer input";
+    let manual_rule = timer_resume_rule_input(manual_rule_id, &manual_agent, 1, Some(manual_text));
+    assert!(
+        store
+            .ensure_rule_state(&principal, &scheduled_rule, registration_ms + 20)
+            .unwrap()
+            .enabled
+    );
+    let manual_rule_state = store
+        .ensure_rule_state(&principal, &manual_rule, registration_ms + 21)
+        .unwrap();
+    let period_ms = 1_000;
+    let scheduled_timer = store
+        .ensure_timer_state(
+            &principal,
+            &TimerDefinitionInput {
+                id: scheduled_rule_id.to_owned(),
+                schedule_revision: 1,
+                schedule: TimerSchedule::Interval {
+                    period_ms,
+                    anchor: Some(registration_ms + 20),
+                },
+                enabled: true,
+                initial_next_due_at: Some(registration_ms + 20 + period_ms),
+            },
+            registration_ms + 20,
+        )
+        .unwrap();
+    let manual_timer = store
+        .ensure_timer_state(
+            &principal,
+            &TimerDefinitionInput {
+                id: manual_rule_id.to_owned(),
+                schedule_revision: 1,
+                schedule: TimerSchedule::Interval {
+                    period_ms,
+                    anchor: Some(registration_ms + 21),
+                },
+                enabled: true,
+                initial_next_due_at: Some(registration_ms + 21 + period_ms),
+            },
+            registration_ms + 21,
+        )
+        .unwrap();
+
+    let scheduled_at_ms = scheduled_timer.next_due_at.unwrap();
+    let scheduled = store
+        .commit_timer_slot(
+            &principal,
+            &scheduled_timer,
+            TimerSlotCommit {
+                scheduled_at_ms,
+                next_due_at_ms: Some(scheduled_at_ms + period_ms),
+                action: Some(timer_resume_request(&scheduled_agent, 1, None)),
+                skip_code: None,
+            },
+            scheduled_at_ms,
+        )
+        .unwrap();
+    let scheduled_child = scheduled.child.as_ref().expect("Project timer Resume");
+    let scheduled_resume_id = scheduled_child.command.id.clone();
+    assert_eq!(scheduled_child.command.principal, principal);
+    assert_eq!(
+        scheduled_child.command.target.as_deref(),
+        Some(scheduled_agent.as_str())
+    );
+    assert_eq!(scheduled_child.command.expected_generation, Some(1));
+    assert_eq!(scheduled_child.command.generation, Some(1));
+    assert_eq!(scheduled_child.command.args, json!({}));
+    assert!(scheduled_child.linked_command.is_none());
+    let scheduled_before_resume = store.get_agent(&scheduled_agent).unwrap().unwrap();
+    assert_eq!(scheduled_before_resume.generation, 1);
+    assert_eq!(scheduled_before_resume.profile, scheduled_retained.profile);
+    assert_eq!(
+        scheduled_before_resume.workspace.as_deref(),
+        Some(checkout.as_str())
+    );
+    assert_eq!(
+        scheduled_before_resume.native_scope,
+        scheduled_retained.native_scope
+    );
+    assert_eq!(
+        scheduled_before_resume.native_ref,
+        scheduled_retained.native_ref
+    );
+    apply_timer_resume(
+        &mut store,
+        &scheduled_agent,
+        &scheduled_resume_id,
+        1,
+        scheduled_at_ms + 1,
+    );
+    let scheduled_resumed = store.get_agent(&scheduled_agent).unwrap().unwrap();
+    assert_eq!(scheduled_resumed.generation, 2);
+    assert_eq!(scheduled_resumed.profile, scheduled_retained.profile);
+    assert_eq!(
+        scheduled_resumed.profile_snapshot,
+        scheduled_retained.profile_snapshot
+    );
+    assert_eq!(scheduled_resumed.project, scheduled_retained.project);
+    assert_eq!(scheduled_resumed.workspace, scheduled_retained.workspace);
+    assert_eq!(
+        scheduled_resumed.native_scope,
+        scheduled_retained.native_scope
+    );
+    assert_eq!(scheduled_resumed.native_ref, scheduled_retained.native_ref);
+
+    let manual_request =
+        TimerRunRequest::new(Ulid::new().to_string(), manual_rule_id).in_project(project);
+    let manual_action = timer_resume_request(&manual_agent, 1, Some(manual_text));
+    let missing_send_grant = store
+        .admit_manual_timer_run(
+            &principal,
+            &manual_request,
+            &manual_timer,
+            manual_rule_state.revision,
+            manual_action.clone(),
+            scheduled_at_ms + 4,
+        )
+        .unwrap_err();
+    assert_eq!(missing_send_grant.code, "not_allowed");
+    let failed_rows: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM commands WHERE id = ?1 OR parent_command = ?1",
+            [&manual_request.id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(failed_rows, 0, "missing SEND grant leaves no retained run");
+
+    registration.actions.push("send".to_owned());
+    store
+        .upsert_project_registration("owner", &registration, scheduled_at_ms + 5)
+        .unwrap();
+    let manual = store
+        .admit_manual_timer_run(
+            &principal,
+            &manual_request,
+            &manual_timer,
+            manual_rule_state.revision,
+            manual_action,
+            scheduled_at_ms + 6,
+        )
+        .unwrap();
+    assert!(manual.is_new);
+    let manual_child = manual.child.as_ref().expect("manual Project Resume");
+    let manual_resume_id = manual_child.command.id.clone();
+    let linked = manual_child
+        .linked_command
+        .as_ref()
+        .expect("Project Resume text is a separate SEND");
+    let manual_send_id = linked.id.clone();
+    assert_eq!(manual_child.command.principal, principal);
+    assert_eq!(
+        manual_child.command.target.as_deref(),
+        Some(manual_agent.as_str())
+    );
+    assert_eq!(manual_child.command.expected_generation, Some(1));
+    assert_eq!(manual_child.command.generation, Some(1));
+    assert_eq!(manual_child.command.args, json!({}));
+    assert_eq!(manual_send_id, format!("{manual_resume_id}/send"));
+    assert_eq!(linked.target.as_deref(), Some(manual_agent.as_str()));
+    assert_eq!(linked.expected_generation, Some(2));
+    assert_eq!(linked.generation, Some(2));
+    assert_eq!(linked.state, CommandState::Queued);
+    assert_eq!(linked.args["text"], manual_text);
+    let manual_after_admission = store.get_agent(&manual_agent).unwrap().unwrap();
+    assert_eq!(
+        manual_after_admission.generation,
+        manual_retained.generation
+    );
+    assert_eq!(manual_after_admission.profile, manual_retained.profile);
+    assert_eq!(
+        manual_after_admission.profile_snapshot,
+        manual_retained.profile_snapshot
+    );
+    assert_eq!(manual_after_admission.project, manual_retained.project);
+    assert_eq!(manual_after_admission.workspace, manual_retained.workspace);
+    assert_eq!(
+        manual_after_admission.native_scope,
+        manual_retained.native_scope
+    );
+    assert_eq!(
+        manual_after_admission.native_ref,
+        manual_retained.native_ref
+    );
+
+    let dispatch_at = scheduled_at_ms + 7;
+    store.dispatch(&manual_resume_id, dispatch_at).unwrap();
+    store
+        .settle(
+            &manual_resume_id,
+            CommandState::Unknown,
+            None,
+            dispatch_at + 1,
+        )
+        .unwrap();
+    registration.actions.clear();
+    store
+        .upsert_project_registration("owner", &registration, dispatch_at + 2)
+        .unwrap();
+    store
+        .connection
+        .execute(
+            "UPDATE rule_state SET enabled = 0 WHERE principal = ?1 AND rule IN (?2, ?3)",
+            rusqlite::params![&principal, scheduled_rule_id, manual_rule_id],
+        )
+        .unwrap();
+
+    let command_count_before_replay: i64 = store
+        .connection
+        .query_row("SELECT COUNT(*) FROM commands", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap();
+    let high_water_before_replay = store.high_water().unwrap();
+    let scheduled_replay = store
+        .commit_timer_slot(
+            &principal,
+            &scheduled.state,
+            TimerSlotCommit {
+                scheduled_at_ms,
+                next_due_at_ms: Some(scheduled_at_ms + period_ms),
+                action: Some(timer_resume_request(&manual_agent, 9, Some("replacement"))),
+                skip_code: None,
+            },
+            dispatch_at + 3,
+        )
+        .unwrap();
+    assert!(!scheduled_replay.is_new);
+    assert_eq!(
+        scheduled_replay.child.as_ref().unwrap().command.id,
+        scheduled_resume_id
+    );
+    assert_eq!(
+        scheduled_replay.child.as_ref().unwrap().command.state,
+        CommandState::Applied
+    );
+    let manual_replay = store
+        .admit_manual_timer_run(
+            &principal,
+            &manual_request,
+            &manual_timer,
+            manual_rule_state.revision,
+            timer_resume_request(&scheduled_agent, 9, Some("replacement")),
+            dispatch_at + 4,
+        )
+        .unwrap();
+    assert!(!manual_replay.is_new);
+    let replayed_manual = manual_replay.child.as_ref().unwrap();
+    assert_eq!(replayed_manual.command.id, manual_resume_id);
+    assert_eq!(replayed_manual.command.state, CommandState::Unknown);
+    assert_eq!(replayed_manual.command.expected_generation, Some(1));
+    let replayed_send = replayed_manual.linked_command.as_ref().unwrap();
+    assert_eq!(replayed_send.id, manual_send_id);
+    assert_eq!(replayed_send.state, CommandState::Queued);
+    assert_eq!(replayed_send.args["text"], manual_text);
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        command_count_before_replay
+    );
+    assert_eq!(store.high_water().unwrap(), high_water_before_replay);
+    let resume_dispatches: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE kind = 'command.dispatched'
+             AND json_extract(data, '$.command_id') = ?1",
+            [&manual_resume_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    let send_dispatches: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE kind = 'command.dispatched'
+             AND json_extract(data, '$.command_id') = ?1",
+            [&manual_send_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(resume_dispatches, 1);
+    assert_eq!(send_dispatches, 0);
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM agents", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        agent_count_before
     );
 }

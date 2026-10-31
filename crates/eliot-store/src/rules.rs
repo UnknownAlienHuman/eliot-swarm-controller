@@ -2919,9 +2919,6 @@ fn valid_targetless_rule_launch_request(request: &SubmitCommand) -> bool {
 fn valid_timer_action_request(request: &SubmitCommand) -> bool {
     match request.verb.as_str() {
         "launch" => valid_targetless_rule_launch_request(request),
-        // Timer definitions and their action renderer do not expose resume.
-        // Keep the Store boundary aligned with that owning grammar.
-        "resume" => false,
         _ => valid_rule_action_request(request, false),
     }
 }
@@ -6719,11 +6716,11 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_and_manual_timer_store_paths_reject_resume_actions() {
+    fn scheduled_and_manual_timer_store_paths_reject_resume_without_old_generation() {
         let mut store = store();
         let seed = Ulid::new();
         let now = i64::try_from(seed.timestamp_ms()).unwrap() + 10;
-        let rule_id = "timer-resume-unsupported";
+        let rule_id = "timer-resume-missing-generation";
         let rule = definition(rule_id, true);
         let rule_state = store.ensure_rule_state("owner", &rule, now).unwrap();
         let scheduled_at_ms = now + 1;
@@ -6744,7 +6741,6 @@ mod tests {
             .unwrap();
         let mut scheduled_resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
         scheduled_resume.target = Some("a1".to_owned());
-        scheduled_resume.expected_generation = Some(1);
         let scheduled = store
             .commit_timer_slot(
                 "owner",
@@ -6769,7 +6765,6 @@ mod tests {
         let manual = core::api::TimerRunRequest::new(Ulid::new().to_string(), rule_id);
         let mut manual_resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
         manual_resume.target = Some("a1".to_owned());
-        manual_resume.expected_generation = Some(1);
         let command_count_before: i64 = store
             .connection
             .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
