@@ -151,6 +151,7 @@ pub fn fake_manifest() -> PluginManifest {
         mode: "per_agent".to_owned(),
         verbs: vec![
             "launch".to_owned(),
+            "resume".to_owned(),
             "send".to_owned(),
             "stop".to_owned(),
             "interrupt".to_owned(),
