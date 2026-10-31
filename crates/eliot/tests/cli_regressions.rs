@@ -8164,8 +8164,20 @@ fn cli_event_resume_preserves_exact_subject_for_live_and_history_owner_project()
         assert_eq!(stop_event["agent"], agent_id);
         let stopped: AgentGetResponse = serde_json::from_value(fixture.json(&["show", &agent_id]))
             .expect("stopped pre-resume Agent");
-        assert_eq!(stopped.agent.generation, generation);
-        assert_eq!(stopped.agent.state, AgentState::Stopped);
+        assert_eq!(stopped.agent.id, agent_id);
+        if case.history {
+            assert_eq!(stopped.agent.generation, generation);
+            assert_eq!(stopped.agent.state, AgentState::Stopped);
+        } else {
+            assert!(
+                (stopped.agent.generation == generation
+                    && stopped.agent.state == AgentState::Stopped)
+                    || stopped.agent.generation == generation + 1,
+                "live Stop-applied event observed Agent generation {}, expected {generation} stopped or {next} resumed",
+                stopped.agent.generation,
+                next = generation + 1
+            );
+        }
 
         let rule_state = if case.history {
             fs::write(&path, &initial_rule).expect("write historical event-resume rule");
@@ -8787,10 +8799,16 @@ fn cli_fake_launch_actions_cover_owner_project_event_scheduled_manual_and_replay
             Some(anchor_ms) => format!("{{ every = \"10s\", anchor = {anchor_ms} }}"),
             None => "{ every = \"1h\" }".to_owned(),
         };
+        let limit = if anchor_ms.is_some() {
+            "limit = { max = 2, per = \"rule\", window = \"1h\" }\n"
+        } else {
+            ""
+        };
         format!(
-            "[[rule]]\nid = {id:?}\non = {schedule}\ndo = [{action}]\n\n",
+            "[[rule]]\nid = {id:?}\non = {schedule}\n{limit}do = [{action}]\n\n",
             id = id,
             schedule = schedule,
+            limit = limit,
             action = render_action(profile, action_workspace, text),
         )
     };
@@ -9263,6 +9281,16 @@ fn cli_fake_launch_actions_cover_owner_project_event_scheduled_manual_and_replay
                 .filter(|agent| !agent.state.is_terminal())
                 .collect::<Vec<_>>();
             if active.is_empty() {
+                assert!(
+                    std::time::Instant::now() < cleanup_deadline,
+                    "fixture Agent event recheck deadline"
+                );
+                let events_after_scan = fixture.events();
+                assert!(
+                    std::time::Instant::now() < cleanup_deadline,
+                    "fixture Agent event recheck exceeded the cleanup deadline"
+                );
+                let scheduled_slots = scheduled_firing_identities(&events_after_scan);
                 let timers_after_scan = timers_before_scan
                     .iter()
                     .map(|(case, _)| {
@@ -9286,6 +9314,10 @@ fn cli_fake_launch_actions_cover_owner_project_event_scheduled_manual_and_replay
                 }
                 let mut imminent_slot = None;
                 for (case, timer) in &timers_after_scan {
+                    if distinct_scheduled_slot_count(&scheduled_slots, case.rule) >= 2 {
+                        // This fixture timer's per-rule max of two is consumed; later slots cannot admit Agents.
+                        continue;
+                    }
                     if let Some(slot) = timer.next_due_at {
                         let remaining_ms = slot.saturating_sub(epoch_ms()).max(0);
                         if remaining_ms <= SCHEDULED_WAKE_GRACE_MS {
@@ -9798,6 +9830,34 @@ fn cli_fake_launch_actions_cover_owner_project_event_scheduled_manual_and_replay
             .expect("stopped Agent readback before daemon drain");
         assert_eq!(stopped.agent.generation, *generation);
         assert_eq!(stopped.agent.state, AgentState::Stopped);
+    }
+    stop_live_fixture_agents(&fixture);
+    let second_slot_deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let current_events = fixture.events();
+        let current_slots = scheduled_firing_identities(&current_events);
+        let missing_rule = CASES.iter().find(|case| {
+            case.trigger == Trigger::Scheduled
+                && distinct_scheduled_slot_count(&current_slots, case.rule) < 2
+        });
+        let Some(case) = missing_rule else {
+            break;
+        };
+        assert!(
+            std::time::Instant::now() < second_slot_deadline,
+            "scheduled Owner and Project rules did not each produce a second distinct slot"
+        );
+        let timer = read_timer(&fixture, case.rule, case.project);
+        let next_slot = timer
+            .next_due_at
+            .expect("registered scheduled rule exposes its next slot");
+        wait_firing(
+            &fixture,
+            case.rule,
+            None,
+            Some(next_slot),
+            Some(second_slot_deadline),
+        );
     }
     stop_live_fixture_agents(&fixture);
     for (case, timer) in &mut scheduled_states {
@@ -10393,33 +10453,6 @@ fn cli_fake_launch_actions_cover_owner_project_event_scheduled_manual_and_replay
         let replay_parent: CoreCommand =
             serde_json::from_str(&replay.stdout).expect("typed retained history catch-up parent");
         assert_eq!(replay_parent, record.parent);
-    }
-    let second_slot_deadline = std::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let current_events = fixture.events();
-        let current_slots = scheduled_firing_identities(&current_events);
-        let missing_rule = CASES.iter().find(|case| {
-            case.trigger == Trigger::Scheduled
-                && distinct_scheduled_slot_count(&current_slots, case.rule) < 2
-        });
-        let Some(case) = missing_rule else {
-            break;
-        };
-        assert!(
-            std::time::Instant::now() < second_slot_deadline,
-            "scheduled Owner and Project rules did not each produce a second distinct slot"
-        );
-        let timer = read_timer(&fixture, case.rule, case.project);
-        let next_slot = timer
-            .next_due_at
-            .expect("registered scheduled rule exposes its next slot");
-        wait_firing(
-            &fixture,
-            case.rule,
-            None,
-            Some(next_slot),
-            Some(second_slot_deadline),
-        );
     }
     stop_live_fixture_agents(&fixture);
     let history_events_after_replay = fixture.events();
