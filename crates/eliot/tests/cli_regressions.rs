@@ -7010,9 +7010,11 @@ fn cli_fake_timer_resume_uses_literal_generation_in_owner_project_scopes() {
     let base_oid = base_reply.stdout.trim().to_owned();
     assert!(!base_oid.is_empty());
 
-    fs::create_dir_all(&fixture.data).expect("create private timer fixture data root");
     fs::create_dir_all(fixture.workspace.join(".eliot").join("rules"))
         .expect("create Project timer rule directory");
+    fixture.start();
+    fixture.stop(false);
+
     fs::write(
         fixture.data.join("config.toml"),
         format!(
