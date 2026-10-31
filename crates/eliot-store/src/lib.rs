@@ -1112,10 +1112,10 @@ fn submit_tx(
             if let Some(path) = &agent.workspace {
                 require_managed_path_ready(tx, path)?;
             }
-            if agent.harness != "codex" {
+            if !matches!(agent.harness.as_str(), "codex" | "fake") {
                 return Err(Error::new(
                     "unsupported",
-                    "resume is only supported for a Codex Agent with a retained native subject",
+                    "resume is only supported for Codex or Fake Agents with a retained native subject",
                 ));
             }
             if let Some(expected) = request.expected_generation
@@ -1151,22 +1151,16 @@ fn submit_tx(
                     "resume requires a stopped, failed, or lost Agent with no active turn",
                 ));
             }
-            let pending_resume: bool = tx
-                .query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM commands
-                         WHERE target = ?1 AND generation = ?2 AND verb = 'resume'
-                           AND id <> ?3
-                           AND state IN ('accepted', 'queued', 'dispatched', 'unknown')
-                     )",
-                    params![agent_num, agent.generation, request.id],
-                    |row| row.get(0),
-                )
-                .map_err(sql_error)?;
-            if pending_resume {
+            if has_pending_resume_tx(tx, agent_num, agent.generation, &request.id)? {
                 return Err(Error::new(
                     "bad_state",
                     "a pending resume already targets this Agent generation",
+                ));
+            }
+            if has_in_flight_stop_tx(tx, agent_num, agent.generation)? {
+                return Err(Error::new(
+                    "bad_state",
+                    "a dispatched or unknown Stop still targets this Agent generation",
                 ));
             }
             if [&agent.native_scope, &agent.native_ref]
@@ -1194,6 +1188,14 @@ fn submit_tx(
                 check_input(text)?;
                 provider_holds::require_unheld_tx(tx, &agent)?;
             }
+            projects::validate_project_resume_action_tx(
+                tx,
+                principal,
+                &agent.id,
+                agent.generation,
+                request.expected_generation,
+                text.is_some(),
+            )?;
             let next_generation = agent
                 .generation
                 .checked_add(1)
@@ -1422,6 +1424,38 @@ fn submit_tx(
         events,
         is_new: true,
     })
+}
+
+fn has_pending_resume_tx(
+    tx: &Transaction<'_>,
+    agent: i64,
+    generation: i64,
+    except_id: &str,
+) -> Result<bool> {
+    tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM commands
+             WHERE target = ?1 AND generation = ?2 AND verb = 'resume'
+               AND id <> ?3
+               AND state IN ('accepted', 'queued', 'dispatched', 'unknown')
+         )",
+        params![agent, generation, except_id],
+        |row| row.get(0),
+    )
+    .map_err(sql_error)
+}
+
+fn has_in_flight_stop_tx(tx: &Transaction<'_>, agent: i64, generation: i64) -> Result<bool> {
+    for state in ["dispatched", "unknown"] {
+        for id in command_ids_in_state(tx, agent, generation, state)? {
+            let command = load_command(tx, &id)?
+                .ok_or_else(|| Error::new("source_integrity", "pending command disappeared"))?;
+            if command.verb == "stop" {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 impl Store {
@@ -1697,7 +1731,8 @@ impl Store {
                 )?);
             }
             "resume" => {
-                if command.state != CommandState::Accepted
+                let old_generation = command_generation;
+                if !matches!(command.state, CommandState::Accepted | CommandState::Queued)
                     || command_generation != agent.generation
                     || command
                         .command
@@ -1714,10 +1749,22 @@ impl Store {
                         "resume no longer targets the captured terminal Agent generation",
                     ));
                 }
-                if agent.harness != "codex" {
+                if !matches!(agent.harness.as_str(), "codex" | "fake") {
                     return Err(Error::new(
                         "unsupported",
-                        "resume is only supported for a Codex Agent",
+                        "resume is only supported for Codex or Fake Agents",
+                    ));
+                }
+                if has_pending_resume_tx(&tx, agent_num, old_generation, id)? {
+                    return Err(Error::new(
+                        "bad_state",
+                        "another pending resume targets this Agent generation",
+                    ));
+                }
+                if has_in_flight_stop_tx(&tx, agent_num, old_generation)? {
+                    return Err(Error::new(
+                        "bad_state",
+                        "a dispatched or unknown Stop still targets this Agent generation",
                     ));
                 }
                 let native_scope = agent
@@ -6396,6 +6443,34 @@ fn command_binding(connection: &Connection, id: &str) -> Result<Option<(String, 
         .map_err(sql_error)
 }
 
+pub(crate) fn resume_parent_payload_matches(
+    connection: &Connection,
+    parent: &Command,
+    args: &Value,
+) -> Result<bool> {
+    if parent.verb != "resume"
+        || parent.request_id.is_some()
+        || parent.probe
+        || parent.turn_id.is_some()
+    {
+        return Ok(false);
+    }
+    let digest = canonical::digest(&json!({
+        "target": parent.target.as_deref(),
+        "verb": parent.verb.as_str(),
+        "args": args,
+        "expected_generation": parent.expected_generation,
+        "expected_turn_id": Value::Null,
+    }))?;
+    let Some((principal, method, stored_digest)) = command_binding(connection, &parent.id)? else {
+        return Err(Error::new(
+            "source_integrity",
+            "resume parent has no retained command binding",
+        ));
+    };
+    Ok(principal == parent.principal && method == parent.method && stored_digest == digest)
+}
+
 fn command_cause_tx(connection: &Connection, command_id: &str) -> Result<Option<core::EventCause>> {
     let encoded: Option<String> = connection
         .query_row(
@@ -7704,7 +7779,7 @@ fn verified_native_event_cause_tx(
         };
         let bound = command.target == Some(agent_num)
             && command.command.generation == Some(generation)
-            && command.command.verb == "launch"
+            && matches!(command.command.verb.as_str(), "launch" | "resume")
             && matches!(
                 command.state,
                 CommandState::Dispatched | CommandState::Unknown
@@ -7821,6 +7896,98 @@ fn verified_native_event_cause_tx(
         return command_cause_for_turn_tx(tx, agent_num, generation, turn_id);
     }
     Ok(None)
+}
+
+fn validate_resume_ready_subject_tx(
+    tx: &Transaction<'_>,
+    projection: &Agent,
+    agent_num: i64,
+    generation: i64,
+    native_event: &NativeEvent,
+) -> Result<()> {
+    if native_event.kind != "session.ready" {
+        return Ok(());
+    }
+    let (count, command_id): (i64, Option<String>) = tx
+        .query_row(
+            "SELECT COUNT(*), MIN(id) FROM commands
+             WHERE target = ?1 AND generation = ?2 AND verb = 'resume'
+               AND state IN ('dispatched','unknown','applied')",
+            params![agent_num, generation],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(sql_error)?;
+    if count == 0 {
+        return Ok(());
+    }
+    if count != 1 {
+        return Err(Error::new(
+            "source_integrity",
+            "resumed generation has multiple retained start commands",
+        ));
+    }
+    let command_id = command_id.ok_or_else(|| {
+        Error::new(
+            "source_integrity",
+            "resumed generation has no retained start command id",
+        )
+    })?;
+    let command = load_command_record(tx, &command_id)?
+        .ok_or_else(|| Error::new("source_integrity", "resume command row is missing"))?;
+    let old_generation = command
+        .command
+        .expected_generation
+        .or_else(|| {
+            command
+                .command
+                .generation
+                .and_then(|value| value.checked_sub(1))
+        })
+        .ok_or_else(|| Error::new("source_integrity", "resume command has no old generation"))?;
+    let command_id_matches = match native_event.data.get("command_id") {
+        None | Some(Value::Null) => true,
+        Some(Value::String(reported)) => reported == &command_id,
+        Some(_) => false,
+    };
+    if command.target != Some(agent_num)
+        || command.command.verb != "resume"
+        || command.command.generation != Some(generation)
+        || old_generation.checked_add(1) != Some(generation)
+        || !command_id_matches
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "session readiness does not match the exact resumed generation",
+        ));
+    }
+    let retained_scope = projection
+        .native_scope
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| Error::new("source_integrity", "resume lost its retained native scope"))?;
+    let retained_ref = projection
+        .native_ref
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "resume lost its retained native reference",
+            )
+        })?;
+    if native_event
+        .data
+        .get("native_scope")
+        .and_then(Value::as_str)
+        != Some(retained_scope)
+        || native_event.data.get("native_ref").and_then(Value::as_str) != Some(retained_ref)
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "resumed session readiness changed its retained native subject",
+        ));
+    }
+    Ok(())
 }
 
 fn verified_request_reply_cause_tx(
@@ -9208,6 +9375,15 @@ impl Store {
         let mut command_events = Vec::new();
         let mut provider_events = Vec::new();
         for (index, native_event) in batch.events.iter().enumerate() {
+            if expected_subject.is_none() {
+                validate_resume_ready_subject_tx(
+                    &tx,
+                    &projection,
+                    agent_num,
+                    batch.generation,
+                    native_event,
+                )?;
+            }
             let (next, effects) = if expected_subject.is_some() {
                 observer_live::persist_turn_fact(&tx, &projection, native_event)?;
                 (projection.clone(), Vec::new())

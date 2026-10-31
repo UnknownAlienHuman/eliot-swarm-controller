@@ -7786,6 +7786,794 @@ fn cli_event_rules_reply_to_exact_fake_requests_in_global_and_project_scopes() {
 }
 
 #[test]
+fn cli_event_resume_preserves_exact_subject_for_live_and_history_owner_project() {
+    const PROJECT_ID: &str = "resume-event-project";
+
+    #[derive(Clone, Copy)]
+    struct ResumeCase {
+        rule: &'static str,
+        project: Option<&'static str>,
+        history: bool,
+        text: Option<&'static str>,
+    }
+
+    const CASES: [ResumeCase; 4] = [
+        ResumeCase {
+            rule: "owner-live-resume",
+            project: None,
+            history: false,
+            text: None,
+        },
+        ResumeCase {
+            rule: "project-live-resume",
+            project: Some(PROJECT_ID),
+            history: false,
+            text: Some("project live resumed input"),
+        },
+        ResumeCase {
+            rule: "owner-history-resume",
+            project: None,
+            history: true,
+            text: Some("owner history resumed input"),
+        },
+        ResumeCase {
+            rule: "project-history-resume",
+            project: Some(PROJECT_ID),
+            history: true,
+            text: None,
+        },
+    ];
+
+    let mut fixture = Fixture::new("event resume exact subject");
+    assert!(
+        fixture
+            .git(&["init", "--initial-branch=main"])
+            .status
+            .success()
+    );
+    fs::write(fixture.workspace.join("seed.txt"), "event resume fixture\n")
+        .expect("write resume checkout seed");
+    assert!(fixture.git(&["add", "--", "seed.txt"]).status.success());
+    assert!(
+        fixture
+            .git(&["commit", "-m", "Event resume fixture"])
+            .status
+            .success()
+    );
+    fixture.start();
+    fixture.stop(false);
+
+    fs::write(
+        fixture.data.join("config.toml"),
+        format!(
+            concat!(
+                "[projects.{project_id}]\n",
+                "path = {workspace:?}\n",
+                "profiles = [\"fake\"]\n",
+                "actions = [\"resume\", \"send\"]\n",
+            ),
+            project_id = PROJECT_ID,
+            workspace = fixture.workspace.to_string_lossy(),
+        ),
+    )
+    .expect("grant the built-in Fake profile and Project resume/send authority");
+    let owner_rules = fixture.data.join("rules");
+    fs::create_dir_all(&owner_rules).expect("create Owner rule directory");
+
+    fixture.start();
+    let registration_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let registration: ProjectRegistrationView = loop {
+        let reply = cli(&fixture.data, &["project", "show", PROJECT_ID]);
+        if reply.status.success() {
+            break serde_json::from_str(&reply.stdout)
+                .expect("typed event-resume Project registration");
+        }
+        let status = reply.status.code();
+        let stdout = reply.stdout.chars().take(1024).collect::<String>();
+        let stderr = reply.stderr.chars().take(1024).collect::<String>();
+        if std::time::Instant::now() >= registration_deadline {
+            let log_path = fixture.data.join("logs").join("daemon.log");
+            let log_tail = fs::read_to_string(log_path)
+                .map(|log| {
+                    let mut lines = log.lines().rev().take(12).collect::<Vec<_>>();
+                    lines.reverse();
+                    lines.join("\n").chars().take(2048).collect::<String>()
+                })
+                .unwrap_or_else(|_| "unavailable".to_owned());
+            panic!(
+                "event-resume Project registration deadline; last project show exit={status:?}, stdout={stdout:?}, stderr={stderr:?}; daemon.log tail={log_tail:?}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    registration
+        .validate()
+        .expect("valid event-resume Project registration");
+    assert_eq!(
+        registration.checkout,
+        fs::canonicalize(&fixture.workspace)
+            .expect("canonical resume checkout")
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert!(
+        registration
+            .profiles
+            .iter()
+            .any(|profile| profile == "fake")
+    );
+    assert!(registration.actions.iter().any(|action| action == "resume"));
+    assert!(registration.actions.iter().any(|action| action == "send"));
+    let project_rules = Path::new(&registration.checkout)
+        .join(".eliot")
+        .join("rules");
+    fs::create_dir_all(&project_rules).expect("create canonical Project rule directory");
+
+    let rule_path = |case: ResumeCase| match case.project {
+        Some(_) => project_rules.join(format!("{}.toml", case.rule)),
+        None => owner_rules.join(format!("{}.toml", case.rule)),
+    };
+    let render_rule = |case: ResumeCase, stop_id: &str, text: Option<&str>| {
+        let text_field = text.map_or_else(String::new, |text| format!(", text = {text:?}"));
+        format!(
+            concat!(
+                "[[rule]]\n",
+                "id = {rule:?}\n",
+                "on = {{ event = \"command.applied\", match = {{ ",
+                "\"event.data.command_id\" = {stop_id:?}, ",
+                "\"event.data.state\" = \"applied\" }} }}\n",
+                "do = [{{ action = \"resume\", target = \"${{event.agent}}\", ",
+                "expected_generation = \"${{event.generation}}\"{text_field} }}]\n",
+            ),
+            rule = case.rule,
+            stop_id = stop_id,
+            text_field = text_field,
+        )
+    };
+    let read_rule = |fixture: &Fixture,
+                     case: ResumeCase,
+                     minimum_revision: i64,
+                     minimum_cursor: i64|
+     -> RuleStateView {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let args = match case.project {
+                Some(project) => vec!["rule", "show", case.rule, "--project", project],
+                None => vec!["rule", "show", case.rule],
+            };
+            let reply = cli(&fixture.data, &args);
+            if reply.status.success() {
+                let state: RuleStateView =
+                    serde_json::from_str(&reply.stdout).expect("typed event-resume rule state");
+                if state.project.as_deref() == case.project
+                    && state.revision >= minimum_revision
+                    && state.current_cursor >= minimum_cursor
+                {
+                    return state;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "event-resume rule {} state deadline",
+                case.rule
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    };
+    let wait_ready = |fixture: &Fixture, agent: &str, generation: i64| -> AgentGetResponse {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let ready = fixture.events().iter().any(|event| {
+                event["kind"] == "session.ready"
+                    && event["agent"] == agent
+                    && event["generation"] == generation
+            });
+            let view: AgentGetResponse = serde_json::from_value(fixture.json(&["show", agent]))
+                .expect("typed event-resume Agent readback");
+            if ready
+                && view.agent.generation == generation
+                && matches!(
+                    view.agent.state,
+                    AgentState::Idle | AgentState::Busy | AgentState::Waiting
+                )
+            {
+                return view;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "event-resume Agent {agent} generation {generation} readiness deadline"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    };
+    let wait_stop_applied_event = |fixture: &Fixture,
+                                   agent: &str,
+                                   generation: i64,
+                                   command_id: &str|
+     -> Value {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(event) = fixture.events().into_iter().find(|event| {
+                event["kind"] == "command.applied"
+                    && event["agent"] == agent
+                    && event["generation"] == generation
+                    && event["data"]["command_id"] == command_id
+                    && event["data"]["state"] == "applied"
+            }) {
+                return event;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "command.applied for stop {command_id} on {agent} generation {generation} deadline"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    };
+    let wait_firing =
+        |fixture: &Fixture, case: ResumeCase, event_seq: i64, parent: Option<&str>| -> Value {
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                if let Some(event) = fixture.events().into_iter().find(|event| {
+                    event["kind"] == "rule.fired"
+                        && event["data"]["rule"] == case.rule
+                        && event["data"]["event_seq"] == event_seq
+                        && parent.is_none_or(|id| event["data"]["parent_command"] == id)
+                }) {
+                    return event;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "event-resume rule {} firing deadline",
+                    case.rule
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        };
+    let fixture_agent_ids = |fixture: &Fixture| -> Vec<String> {
+        let mut after: Option<String> = None;
+        let mut ids = Vec::new();
+        loop {
+            let request = AgentListRequest {
+                after: after.clone(),
+                limit: 1000,
+                ..AgentListRequest::default()
+            };
+            let mut args = vec!["ls", "--limit", "1000"];
+            if let Some(cursor) = after.as_deref() {
+                args.extend(["--after", cursor]);
+            }
+            let page: AgentListResponse =
+                serde_json::from_value(fixture.json(&args)).expect("typed fixture Agent page");
+            request
+                .validate_response(&page)
+                .expect("valid fixture Agent page");
+            ids.extend(page.agents.into_iter().map(|row| row.agent.id));
+            let Some(next) = page.next else {
+                break;
+            };
+            assert_ne!(
+                after.as_deref(),
+                Some(next.as_str()),
+                "fixture Agent cursor did not advance"
+            );
+            after = Some(next);
+        }
+        ids
+    };
+
+    for case in CASES {
+        let launch: CoreCommand = serde_json::from_value(fixture.json(&[
+            "launch",
+            "--profile",
+            "fake",
+            "--workspace",
+            &registration.checkout,
+        ]))
+        .expect("typed event-resume Fake launch");
+        let launch: CoreCommand =
+            serde_json::from_value(fixture.wait_command(&launch.id, "applied"))
+                .expect("applied event-resume Fake launch");
+        let agent_id = launch.target.clone().expect("launch has its Agent row");
+        let generation = launch.generation.expect("launch dispatched generation");
+        assert_eq!(generation, 1);
+        let ready = wait_ready(&fixture, &agent_id, generation);
+        let initial_agent = ready.agent;
+        assert_eq!(initial_agent.profile, "fake");
+        assert_eq!(initial_agent.project, registration.checkout);
+        assert_eq!(
+            initial_agent.workspace.as_deref(),
+            Some(registration.checkout.as_str())
+        );
+        let native_scope = initial_agent
+            .native_scope
+            .clone()
+            .filter(|scope| !scope.trim().is_empty())
+            .expect("Fake start retained its synthetic native scope");
+        let native_ref = initial_agent
+            .native_ref
+            .clone()
+            .filter(|native_ref| !native_ref.trim().is_empty())
+            .expect("Fake start retained its synthetic native reference");
+
+        let old_text = format!("old generation seed for {}", case.rule);
+        let old_send_id = ulid::Ulid::new().to_string();
+        let generation_arg = generation.to_string();
+        let old_send_reply = cli(
+            &fixture.data,
+            &[
+                "--id",
+                &old_send_id,
+                "send",
+                &agent_id,
+                "--generation",
+                &generation_arg,
+                "--",
+                &old_text,
+            ],
+        );
+        assert!(old_send_reply.status.success(), "Fake seed SEND failed");
+        let old_send_submit: CommandSubmitResponse =
+            serde_json::from_str(&old_send_reply.stdout).expect("typed old-generation SEND");
+        assert_eq!(old_send_submit.command_id, old_send_id);
+        let old_send: CoreCommand =
+            serde_json::from_value(fixture.wait_command(&old_send_id, "applied"))
+                .expect("applied old-generation SEND");
+        let old_turn =
+            wait_fake_send_turn_result(&fixture, &agent_id, generation, &old_send, &old_text);
+        assert_eq!(old_turn.state, TurnState::Completed);
+        assert_eq!(old_turn.final_text.as_deref(), Some(old_text.as_str()));
+
+        let path = rule_path(case);
+        let stop_id = ulid::Ulid::new().to_string();
+        let initial_rule = render_rule(case, &stop_id, case.text);
+        let loaded_before_stop_applied = if case.history {
+            None
+        } else {
+            fs::write(&path, &initial_rule).expect("write live event-resume rule");
+            let state = read_rule(&fixture, case, 1, 0);
+            assert!(state.enabled);
+            assert!(state.paused_reason.is_none());
+            Some(state)
+        };
+        let mut ids_before_resume = (!case.history).then(|| fixture_agent_ids(&fixture));
+
+        let stop: CommandSubmitResponse = serde_json::from_value(fixture.json(&[
+            "--id",
+            &stop_id,
+            "stop",
+            &agent_id,
+            "--generation",
+            &generation_arg,
+        ]))
+        .expect("exact-generation pre-resume stop");
+        assert_eq!(stop.command_id, stop_id);
+        assert_eq!(stop.agent.as_deref(), Some(agent_id.as_str()));
+        assert_eq!(stop.generation, Some(generation));
+        fixture.wait_command(&stop_id, "applied");
+        let stop_event = wait_stop_applied_event(&fixture, &agent_id, generation, &stop_id);
+        let stop_event_seq = stop_event["seq"]
+            .as_i64()
+            .expect("committed exact Stop applied event sequence");
+        let expected_old_generation = stop_event["generation"]
+            .as_i64()
+            .expect("Stop applied event generation");
+        assert!(stop_event_seq > 0);
+        assert_eq!(expected_old_generation, generation);
+        assert_eq!(stop_event["data"]["command_id"], stop_id);
+        assert_eq!(stop_event["data"]["state"], "applied");
+        assert_eq!(stop_event["agent"], agent_id);
+        let stopped: AgentGetResponse = serde_json::from_value(fixture.json(&["show", &agent_id]))
+            .expect("stopped pre-resume Agent");
+        assert_eq!(stopped.agent.generation, generation);
+        assert_eq!(stopped.agent.state, AgentState::Stopped);
+
+        let rule_state = if case.history {
+            fs::write(&path, &initial_rule).expect("write historical event-resume rule");
+            let state = read_rule(&fixture, case, 1, stop_event_seq);
+            assert!(state.enabled);
+            assert!(state.paused_reason.is_none());
+            assert!(
+                !fixture.events().iter().any(|event| {
+                    event["kind"] == "rule.fired"
+                        && event["data"]["rule"] == case.rule
+                        && event["data"]["event_seq"] == stop_event_seq
+                }),
+                "historical Stop-applied event fired before explicit catch-up"
+            );
+            state
+        } else {
+            let state =
+                loaded_before_stop_applied.expect("live rule was loaded before Stop-applied event");
+            assert!(
+                state.current_cursor < stop_event_seq,
+                "live rule cursor had already passed its future Stop-applied event"
+            );
+            state
+        };
+        if ids_before_resume.is_none() {
+            ids_before_resume = Some(fixture_agent_ids(&fixture));
+        }
+        let ids_before_resume = ids_before_resume.expect("Agent IDs captured before resume");
+        assert!(
+            ids_before_resume.iter().any(|id| id == &agent_id),
+            "pre-resume Agent page omitted the existing subject"
+        );
+
+        let mut catchup_args = None;
+        let retained_catchup_parent = if case.history {
+            let catchup_id = ulid::Ulid::new().to_string();
+            let after_arg = (stop_event_seq - 1).to_string();
+            let through_arg = stop_event_seq.to_string();
+            let mut args = vec![
+                "--id".to_owned(),
+                catchup_id.clone(),
+                "rule".to_owned(),
+                "catch-up".to_owned(),
+                case.rule.to_owned(),
+                "--after".to_owned(),
+                after_arg.clone(),
+                "--through".to_owned(),
+                through_arg.clone(),
+            ];
+            if let Some(project) = case.project {
+                args.push("--project".to_owned());
+                args.push(project.to_owned());
+            }
+            let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+            let reply = cli(&fixture.data, &arg_refs);
+            assert!(
+                reply.status.success(),
+                "finite {} event-resume catch-up failed: stdout={:?}, stderr={:?}",
+                case.rule,
+                reply.stdout,
+                reply.stderr
+            );
+            let parent: CoreCommand =
+                serde_json::from_str(&reply.stdout).expect("typed finite resume catch-up parent");
+            assert_eq!(parent.id, catchup_id);
+            assert_eq!(parent.args["after_seq"], stop_event_seq - 1);
+            assert_eq!(parent.args["through_seq"], stop_event_seq);
+            catchup_args = Some(args);
+            Some(parent)
+        } else {
+            None
+        };
+
+        let firing = wait_firing(
+            &fixture,
+            case,
+            stop_event_seq,
+            retained_catchup_parent
+                .as_ref()
+                .map(|parent| parent.id.as_str()),
+        );
+        assert_eq!(firing["data"]["revision"], rule_state.revision);
+        assert_eq!(firing["data"]["event_seq"], stop_event_seq);
+        let parent_id = retained_catchup_parent
+            .as_ref()
+            .map(|parent| parent.id.clone())
+            .unwrap_or_else(|| {
+                firing["data"]["parent_command"]
+                    .as_str()
+                    .expect("live rule parent command id")
+                    .to_owned()
+            });
+        assert_eq!(firing["data"]["parent_command"], parent_id);
+        let parent: CoreCommand =
+            serde_json::from_value(fixture.wait_command(&parent_id, "applied"))
+                .expect("applied event-resume parent");
+        if let Some(retained) = retained_catchup_parent {
+            assert_eq!(parent, retained);
+            assert_eq!(parent.verb, "rule.catch_up");
+            assert_eq!(parent.args["rule"], case.rule);
+            if let Some(project) = case.project {
+                assert_eq!(parent.args["project"], project);
+            }
+        } else {
+            assert_eq!(parent.verb, "rule");
+            assert_eq!(parent.args["rule"], case.rule);
+            assert_eq!(parent.args["event_seq"], stop_event_seq);
+        }
+        let principal = case.project.map_or_else(
+            || "owner".to_owned(),
+            |project| format!("project:{project}"),
+        );
+        assert_eq!(parent.principal, principal);
+        let children: Vec<String> = serde_json::from_value(
+            parent
+                .outcome
+                .as_ref()
+                .expect("fixed resume action child set")["children"]
+                .clone(),
+        )
+        .expect("typed resume action child ids");
+        assert_eq!(children.len(), 1);
+        let resume_id = children[0].clone();
+        assert_eq!(firing["data"]["child_command"], resume_id);
+
+        let resume: CoreCommand =
+            serde_json::from_value(fixture.wait_command(&resume_id, "applied"))
+                .expect("applied event-bound resume child");
+        assert_eq!(resume.id, resume_id);
+        assert_eq!(resume.verb, "resume");
+        assert_eq!(resume.principal, principal);
+        assert_eq!(resume.target.as_deref(), Some(agent_id.as_str()));
+        assert_eq!(resume.expected_generation, Some(expected_old_generation));
+        assert_eq!(resume.generation, Some(generation + 1));
+        assert_eq!(resume.args, json!({}));
+
+        let resumed = wait_ready(&fixture, &agent_id, generation + 1);
+        assert_eq!(resumed.agent.id, initial_agent.id);
+        assert_eq!(resumed.agent.generation, generation + 1);
+        assert_eq!(
+            resumed.agent.native_scope.as_deref(),
+            Some(native_scope.as_str())
+        );
+        assert_eq!(
+            resumed.agent.native_ref.as_deref(),
+            Some(native_ref.as_str())
+        );
+        assert_eq!(resumed.agent.profile, initial_agent.profile);
+        assert_eq!(resumed.agent.workspace, initial_agent.workspace);
+        assert_eq!(resumed.agent.project, registration.checkout);
+        assert_eq!(resumed.agent.harness, initial_agent.harness);
+        assert_eq!(fixture_agent_ids(&fixture), ids_before_resume);
+
+        let linked_send_id = format!("{resume_id}/send");
+        let resumed_turn = if let Some(text) = case.text {
+            let send: CoreCommand =
+                serde_json::from_value(fixture.wait_command(&linked_send_id, "applied"))
+                    .expect("applied exact linked resume SEND");
+            assert_eq!(send.id, linked_send_id);
+            assert_eq!(send.principal, resume.principal);
+            assert_eq!(send.verb, "send");
+            assert_eq!(send.target.as_deref(), Some(agent_id.as_str()));
+            assert_eq!(send.expected_generation, Some(generation + 1));
+            assert_eq!(send.generation, Some(generation + 1));
+            assert_eq!(send.args, json!({"text": text}));
+            let turn = wait_fake_send_turn_result(&fixture, &agent_id, generation + 1, &send, text);
+            assert_eq!(turn.state, TurnState::Completed);
+            assert_eq!(turn.final_text.as_deref(), Some(text));
+            Some((send, turn))
+        } else {
+            let missing = cli(&fixture.data, &["cmd", "show", &linked_send_id]);
+            assert_eq!(missing.status.code(), Some(1));
+            assert!(missing.stderr.contains("not_found"));
+            None
+        };
+        let current_generation_arg = (generation + 1).to_string();
+        let current_result: AgentResultResponse = serde_json::from_value(fixture.json(&[
+            "result",
+            &agent_id,
+            "--generation",
+            &current_generation_arg,
+        ]))
+        .expect("typed resumed-generation result history");
+        if let Some((send, turn)) = &resumed_turn {
+            assert_eq!(current_result.turns, vec![turn.clone()]);
+            assert_ne!(turn.turn_id, old_turn.turn_id);
+            assert_eq!(fault_dispatches(&fixture.events(), &send.id), 1);
+        } else {
+            assert!(
+                current_result.turns.is_empty(),
+                "resume replayed the prior generation's input"
+            );
+        }
+        let events_after_resume = fixture.events();
+        assert_eq!(fault_dispatches(&events_after_resume, &old_send.id), 1);
+        assert_eq!(
+            events_after_resume
+                .iter()
+                .filter(|event| {
+                    event["kind"] == "turn.completed"
+                        && event["agent"] == agent_id
+                        && event["generation"] == generation + 1
+                        && event["data"]["command_id"] == old_send.id
+                })
+                .count(),
+            0,
+            "old-generation input was replayed into the resumed generation"
+        );
+        assert_eq!(fault_dispatches(&events_after_resume, &resume.id), 1);
+        let resume_dispatch = events_after_resume
+            .iter()
+            .find(|event| {
+                event["kind"] == "command.dispatched" && event["data"]["command_id"] == resume.id
+            })
+            .expect("public resume dispatch event");
+        assert_eq!(resume_dispatch["agent"], agent_id);
+        assert_eq!(resume_dispatch["generation"], generation + 1);
+        assert_eq!(resume_dispatch["cause"]["command_id"], resume.id);
+        assert_eq!(resume_dispatch["cause"]["rule"], case.rule);
+        let resume_cause = &resume_dispatch["cause"];
+        assert!(resume_cause["depth"].as_u64().is_some());
+        if let Some((send, _)) = &resumed_turn {
+            let send_dispatch = events_after_resume
+                .iter()
+                .find(|event| {
+                    event["kind"] == "command.dispatched" && event["data"]["command_id"] == send.id
+                })
+                .expect("public linked resume SEND dispatch event");
+            assert_eq!(send_dispatch["agent"], agent_id);
+            assert_eq!(send_dispatch["generation"], generation + 1);
+            assert_eq!(send_dispatch["cause"]["command_id"], send.id);
+            assert_eq!(send_dispatch["cause"]["rule"], resume_cause["rule"]);
+            assert_eq!(send_dispatch["cause"]["depth"], resume_cause["depth"]);
+        }
+        assert_eq!(
+            events_after_resume
+                .iter()
+                .filter(|event| {
+                    event["kind"] == "session.ready"
+                        && event["agent"] == agent_id
+                        && event["generation"] == generation + 1
+                })
+                .count(),
+            1,
+            "resume must ready the existing Agent exactly once"
+        );
+        assert_eq!(
+            events_after_resume
+                .iter()
+                .filter(|event| {
+                    event["kind"] == "rule.fired"
+                        && event["data"]["rule"] == case.rule
+                        && event["data"]["event_seq"] == stop_event_seq
+                        && event["data"]["parent_command"] == parent_id
+                })
+                .count(),
+            1,
+            "one resume firing for the exact terminal event"
+        );
+
+        let mut current_rule_revision = rule_state.revision;
+        if case.history {
+            let changed_text = if case.text.is_some() {
+                "${event.kind}"
+            } else {
+                "changed current resume definition"
+            };
+            fs::write(&path, render_rule(case, &stop_id, Some(changed_text)))
+                .expect("change the current event-resume definition after catch-up");
+            let current_rule = read_rule(&fixture, case, rule_state.revision + 1, stop_event_seq);
+            assert!(current_rule.enabled);
+            assert!(current_rule.paused_reason.is_none());
+            current_rule_revision = current_rule.revision;
+            if case.project.is_some() {
+                let current_registration: ProjectRegistrationView =
+                    serde_json::from_value(fixture.json(&["project", "show", PROJECT_ID]))
+                        .expect("current Project authority after rule edit");
+                current_registration
+                    .validate()
+                    .expect("valid current Project authority");
+                assert_eq!(current_registration.checkout, registration.checkout);
+                assert!(
+                    current_registration
+                        .profiles
+                        .iter()
+                        .any(|profile| profile == "fake")
+                );
+                assert!(
+                    current_registration
+                        .actions
+                        .iter()
+                        .any(|action| action == "resume")
+                );
+                assert!(
+                    current_registration
+                        .actions
+                        .iter()
+                        .any(|action| action == "send")
+                );
+            }
+
+            let args = catchup_args
+                .as_ref()
+                .expect("history case retained its exact catch-up request");
+            let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+            let replay = cli(&fixture.data, &arg_refs);
+            assert!(
+                replay.status.success(),
+                "same-ID resume catch-up replay failed"
+            );
+            let replay_parent: CoreCommand = serde_json::from_str(&replay.stdout)
+                .expect("typed retained resume catch-up parent");
+            assert_eq!(replay_parent, parent);
+            let parent_after: CoreCommand =
+                serde_json::from_value(fixture.json(&["cmd", "show", &parent.id]))
+                    .expect("retained resume catch-up parent");
+            let resume_after: CoreCommand =
+                serde_json::from_value(fixture.json(&["cmd", "show", &resume.id]))
+                    .expect("retained exact resume action");
+            assert_eq!(parent_after, parent);
+            assert_eq!(resume_after, resume);
+            if let Some((send, turn)) = &resumed_turn {
+                let send_after: CoreCommand =
+                    serde_json::from_value(fixture.json(&["cmd", "show", &send.id]))
+                        .expect("retained linked resume input");
+                assert_eq!(send_after, *send);
+                assert_eq!(turn.final_text.as_deref(), case.text);
+            } else {
+                let missing = cli(&fixture.data, &["cmd", "show", &linked_send_id]);
+                assert_eq!(missing.status.code(), Some(1));
+                assert!(missing.stderr.contains("not_found"));
+            }
+            let events_after_replay = fixture.events();
+            assert_eq!(fault_dispatches(&events_after_replay, &resume.id), 1);
+            if let Some((send, _)) = &resumed_turn {
+                assert_eq!(fault_dispatches(&events_after_replay, &send.id), 1);
+            }
+            assert_eq!(
+                events_after_replay
+                    .iter()
+                    .filter(|event| {
+                        event["kind"] == "session.ready"
+                            && event["agent"] == agent_id
+                            && event["generation"] == generation + 1
+                    })
+                    .count(),
+                1,
+                "same-ID catch-up replay duplicated the resumed Agent"
+            );
+            assert_eq!(fixture_agent_ids(&fixture), ids_before_resume);
+        }
+
+        let resumed_generation_arg = (generation + 1).to_string();
+        let stop_resumed_id = ulid::Ulid::new().to_string();
+        let stop_resumed: CommandSubmitResponse = serde_json::from_value(fixture.json(&[
+            "--id",
+            &stop_resumed_id,
+            "stop",
+            &agent_id,
+            "--generation",
+            &resumed_generation_arg,
+        ]))
+        .expect("exact-generation resumed Agent stop");
+        assert_eq!(stop_resumed.command_id, stop_resumed_id);
+        fixture.wait_command(&stop_resumed_id, "applied");
+        let stop_resumed_event =
+            wait_stop_applied_event(&fixture, &agent_id, generation + 1, &stop_resumed_id);
+        let stop_resumed_seq = stop_resumed_event["seq"]
+            .as_i64()
+            .expect("resumed generation Stop-applied event sequence");
+        assert_eq!(stop_resumed_event["data"]["command_id"], stop_resumed_id);
+        assert_eq!(stop_resumed_event["generation"], generation + 1);
+        let after_resumed_stop = read_rule(&fixture, case, current_rule_revision, stop_resumed_seq);
+        assert!(after_resumed_stop.enabled);
+        assert!(after_resumed_stop.paused_reason.is_none());
+        let events_after_resumed_stop = fixture.events();
+        assert!(
+            !events_after_resumed_stop.iter().any(|event| {
+                event["kind"] == "rule.fired"
+                    && event["data"]["rule"] == case.rule
+                    && event["data"]["event_seq"] == stop_resumed_seq
+            }),
+            "generation-N+1 Stop-applied event resumed a different turn"
+        );
+        assert_eq!(
+            events_after_resumed_stop
+                .iter()
+                .filter(|event| {
+                    event["kind"] == "session.ready"
+                        && event["agent"] == agent_id
+                        && event["generation"] == generation + 2
+                })
+                .count(),
+            0,
+            "stale-generation rule event allocated another session generation"
+        );
+        let stopped_after_resume: AgentGetResponse =
+            serde_json::from_value(fixture.json(&["show", &agent_id]))
+                .expect("stopped resumed Agent");
+        assert_eq!(stopped_after_resume.agent.id, initial_agent.id);
+        assert_eq!(stopped_after_resume.agent.generation, generation + 1);
+        assert_eq!(stopped_after_resume.agent.state, AgentState::Stopped);
+    }
+
+    fixture.stop(false);
+}
+
+#[test]
 fn cli_fake_launch_actions_cover_owner_project_event_scheduled_manual_and_replay() {
     const PROJECT_ID: &str = "launch-acceptance";
     const OWNER_EVENT: &str = "owner-event-launch";

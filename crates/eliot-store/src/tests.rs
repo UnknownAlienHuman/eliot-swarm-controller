@@ -1185,8 +1185,8 @@ fn history_project_rule_send_rejects_rebinding_old_event_to_current_generation()
                     native_id: "history-generation-binding:ready".to_owned(),
                     data: json!({
                         "command_id": resume_id,
-                        "native_scope": "history-generation-binding:scope-2",
-                        "native_ref": "history-generation-binding:thread-2"
+                        "native_scope": format!("{checkout}:{agent}:scope"),
+                        "native_ref": format!("{checkout}:{agent}:thread")
                     }),
                 }],
                 cursor: None,
@@ -1242,6 +1242,326 @@ fn history_project_rule_send_rejects_rebinding_old_event_to_current_generation()
             .current_cursor,
         event_seq,
         "history rejection does not rewind or move the live cursor",
+    );
+}
+
+#[test]
+fn project_resume_rules_use_retained_binding_for_live_and_history_and_require_send_for_text() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let project = "project-resume-rules";
+    let principal = format!("project:{project}");
+    let checkout = "/synthetic-project-resume-rules";
+    let profile = "project-resume-profile";
+    let (live_agent, live_workspace) =
+        ready_managed_codex_agent(&mut store, checkout, profile, now);
+    let (history_agent, history_workspace) =
+        ready_managed_codex_agent(&mut store, checkout, profile, now + 10);
+    let registration = |actions: Vec<String>| ProjectRegistrationInput {
+        id: project.to_owned(),
+        checkout: checkout.to_owned(),
+        repo_common_dir: format!("{checkout}/.git"),
+        profiles: vec![profile.to_owned()],
+        actions,
+        interpreters: BTreeMap::new(),
+        run_env: Vec::new(),
+    };
+    store
+        .upsert_project_registration(
+            "owner",
+            &registration(vec!["resume".to_owned(), "send".to_owned()]),
+            now + 20,
+        )
+        .expect("register Project resume and linked SEND");
+
+    let make_rule = |id: &str| {
+        let value = json!({
+            "id": id,
+            "enabled": true,
+            "on": {"event": "session.ended"},
+            "do": [{
+                "action": "resume",
+                "target": "${event.agent}",
+                "expected_generation": "${event.generation}",
+                "text": "continue retained Project session",
+            }],
+            "limit": {"max": 1, "per": "agent", "window_ms": 60_000},
+        });
+        RuleDefinitionInput {
+            id: id.to_owned(),
+            canonical_definition: serde_json::to_string(&value)
+                .expect("encode Project resume rule"),
+            definition_digest: eliot_core::canonical_json_sha256(&value)
+                .expect("digest Project resume rule"),
+            enabled: true,
+        }
+    };
+    let live_rule = make_rule("project-live-resume");
+    let history_rule = make_rule("project-history-resume");
+    let no_send_rule = make_rule("project-resume-no-send");
+    let live_state = store
+        .ensure_rule_state(&principal, &live_rule, now + 21)
+        .expect("seed live Project rule before its event");
+    let no_send_state = store
+        .ensure_rule_state(&principal, &no_send_rule, now + 23)
+        .expect("seed send-grant Project rule before its event");
+
+    let live_ended = store
+        .put_batch(
+            SourceBatch {
+                batch_id: "project-live-resume:ended".to_owned(),
+                agent_id: live_agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ended".to_owned(),
+                    native_id: "project-live-resume:ended".to_owned(),
+                    data: json!({}),
+                }],
+                cursor: None,
+            },
+            now + 24,
+        )
+        .expect("commit live Project terminal fact");
+    let live_event = live_ended
+        .events
+        .iter()
+        .find(|event| event.kind == "session.ended")
+        .expect("persist live Project event")
+        .seq;
+    let history_ended = store
+        .put_batch(
+            SourceBatch {
+                batch_id: "project-history-resume:ended".to_owned(),
+                agent_id: history_agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ended".to_owned(),
+                    native_id: "project-history-resume:ended".to_owned(),
+                    data: json!({}),
+                }],
+                cursor: None,
+            },
+            now + 25,
+        )
+        .expect("commit history Project terminal fact");
+    let history_event = history_ended
+        .events
+        .iter()
+        .find(|event| event.kind == "session.ended")
+        .expect("persist history Project event")
+        .seq;
+    let history_state = store
+        .ensure_rule_state(&principal, &history_rule, now + 26)
+        .expect("seed history Project cursor after its captured events");
+    let captured_through = history_state.current_cursor;
+    assert!(history_event <= captured_through);
+
+    let resume_request = |agent: &str, text: &str| {
+        let mut request = SubmitCommand::new(Ulid::new().to_string(), "resume");
+        request.target = Some(agent.to_owned());
+        request.expected_generation = Some(1);
+        request.args = json!({"text": text});
+        request
+    };
+    let live = store
+        .admit_rule_action(
+            &principal,
+            &live_state,
+            live_event,
+            resume_request(&live_agent, "live Project input"),
+            now + 26,
+        )
+        .expect("admit live Project resume through ordinary Store path");
+    let live_child = live.child.as_ref().expect("live Project resume child");
+    let live_resume_id = live_child.command.id.clone();
+    let live_send_id = live_child
+        .linked_command
+        .as_ref()
+        .expect("live Project resume has linked input")
+        .id
+        .clone();
+    assert_eq!(
+        live_child.command.target.as_deref(),
+        Some(live_agent.as_str())
+    );
+    assert_eq!(live_child.command.expected_generation, Some(1));
+    assert_eq!(live_child.command.generation, Some(1));
+    assert_eq!(
+        live_child
+            .linked_command
+            .as_ref()
+            .unwrap()
+            .expected_generation,
+        Some(2)
+    );
+    store
+        .settle_workspace_creation(
+            &live_resume_id,
+            2,
+            WorkspaceCreationOutcome::Verified {
+                repo_path: live_workspace.repo_path.clone(),
+                repo_common_dir: live_workspace.repo_common_dir.clone(),
+                worktree_path: live_workspace.worktree_path.clone(),
+                branch: live_workspace.requested_branch.clone(),
+                head: live_workspace.base_oid.clone(),
+            },
+            now + 27,
+        )
+        .expect("verify retained Project workspace for resume");
+    store
+        .dispatch(&live_resume_id, now + 28)
+        .expect("dispatch live Project resume");
+    let live_scope = format!("{checkout}:{live_agent}:scope");
+    let live_ref = format!("{checkout}:{live_agent}:thread");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "project-live-resume:ready".to_owned(),
+                agent_id: live_agent.clone(),
+                generation: 2,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ready".to_owned(),
+                    native_id: "project-live-resume:ready".to_owned(),
+                    data: json!({
+                        "command_id": live_resume_id.as_str(),
+                        "native_scope": live_scope.as_str(),
+                        "native_ref": live_ref.as_str(),
+                    }),
+                }],
+                cursor: None,
+            },
+            now + 29,
+        )
+        .expect("retain exact live Project native subject");
+    store
+        .settle(&live_resume_id, CommandState::Applied, None, now + 30)
+        .expect("settle live Project resume readiness");
+    store
+        .dispatch(&live_send_id, now + 31)
+        .expect("dispatch linked Project input against next-generation binding");
+    let live_turn = Ulid::new().to_string();
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "project-live-resume:turn".to_owned(),
+                agent_id: live_agent.clone(),
+                generation: 2,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "turn.started".to_owned(),
+                    native_id: "project-live-resume:turn-started".to_owned(),
+                    data: json!({
+                        "command_id": live_send_id.as_str(),
+                        "turn_id": live_turn.as_str(),
+                    }),
+                }],
+                cursor: None,
+            },
+            now + 32,
+        )
+        .expect("associate the exact Project input");
+    assert_eq!(
+        store.get_command(&live_send_id).unwrap().unwrap().state,
+        CommandState::Applied
+    );
+
+    let history_request = RuleCatchUpRequest::new(
+        Ulid::new().to_string(),
+        history_rule.id.as_str(),
+        history_event - 1,
+        Some(captured_through),
+    )
+    .in_project(project);
+    let history = store
+        .admit_rule_catch_up(
+            &principal,
+            &history_request,
+            &history_state,
+            captured_through,
+            &[RuleCatchUpAction::command(
+                history_event,
+                resume_request(&history_agent, "history Project input"),
+            )],
+            now + 33,
+        )
+        .expect("admit Project history resume through the same ordinary path");
+    assert_eq!(history.children.len(), 1);
+    assert_eq!(history.children[0].command.verb, "resume");
+    assert_eq!(
+        history.children[0].command.target.as_deref(),
+        Some(history_agent.as_str())
+    );
+    assert_eq!(history.children[0].command.expected_generation, Some(1));
+    let history_resume_id = history.children[0].command.id.clone();
+    let history_send_id = history.children[0]
+        .linked_command
+        .as_ref()
+        .expect("history Project resume has linked input")
+        .id
+        .clone();
+    assert_eq!(history_send_id, format!("{history_resume_id}/send"));
+    assert_eq!(
+        history.children[0]
+            .linked_command
+            .as_ref()
+            .unwrap()
+            .generation,
+        Some(2)
+    );
+    let history_workspace_row: (String, i64, String, String) = store
+        .connection
+        .query_row(
+            "SELECT phase, target_generation, start_command_id, worktree_path
+             FROM workspaces WHERE agent = ?1",
+            [eliot_core::parse_agent_id(&history_agent).unwrap()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("read retained Project workspace after catch-up resume admission");
+    assert_eq!(history_workspace_row.0, "creating");
+    assert_eq!(history_workspace_row.1, 2);
+    assert_eq!(history_workspace_row.2, history_resume_id);
+    assert_eq!(history_workspace_row.3, history_workspace.worktree_path);
+
+    store
+        .upsert_project_registration("owner", &registration(vec!["resume".to_owned()]), now + 34)
+        .expect("remove the Project SEND grant");
+    let denied = store
+        .admit_rule_action(
+            &principal,
+            &no_send_state,
+            history_event,
+            resume_request(&history_agent, "send grant is required"),
+            now + 35,
+        )
+        .expect("missing Project SEND grant is a deterministic rejection");
+    let denied_parent = denied.parent.unwrap();
+    assert_eq!(denied_parent.state, CommandState::Rejected);
+    assert_eq!(
+        denied_parent.outcome.as_ref().unwrap()["children"],
+        json!([])
+    );
+    assert!(denied.child.is_none());
+    let denied_children: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM commands
+             WHERE parent_command = ?1 AND link_kind = 'rule_action' AND ordinal IS NOT NULL",
+            [&denied_parent.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(denied_children, 0);
+    assert_eq!(
+        store.get_command(&history_send_id).unwrap().unwrap().state,
+        CommandState::Queued,
+        "a failed SEND grant cannot change the separately retained history input",
     );
 }
 
@@ -1604,7 +1924,7 @@ fn project_send_requires_the_approved_action_and_rejects_unknown_registration_ac
                 checkout: checkout.to_owned(),
                 repo_common_dir: common.clone(),
                 profiles: vec![profile.to_owned()],
-                actions: vec!["resume".to_owned()],
+                actions: vec!["unexpected".to_owned()],
                 interpreters: BTreeMap::new(),
                 run_env: Vec::new(),
             },
@@ -2340,6 +2660,18 @@ fn session_end_keeps_dispatched_stop_pending_until_exact_reply() {
     let mut store = Store::open(Path::new(":memory:")).expect("open Store");
     let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
     let agent = ready_agent(&mut store, "stop-session-ended", now);
+    let agent_num = eliot_core::parse_agent_id(&agent).expect("Agent id");
+    store
+        .connection
+        .execute(
+            "UPDATE agents SET native_scope = ?1, native_ref = ?2 WHERE id = ?3",
+            rusqlite::params![
+                "stop-session-ended:scope",
+                "stop-session-ended:thread",
+                agent_num
+            ],
+        )
+        .expect("retain a native subject for resume");
     let stop_id = Ulid::new().to_string();
     store
         .submit(
@@ -2396,12 +2728,48 @@ fn session_end_keeps_dispatched_stop_pending_until_exact_reply() {
         "session end alone does not acknowledge the stop RPC"
     );
 
+    let mut blocked_resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
+    blocked_resume.target = Some(agent.clone());
+    blocked_resume.expected_generation = Some(1);
+    let blocked_resume_id = blocked_resume.id.clone();
+    assert_eq!(
+        store
+            .submit("owner", blocked_resume, now + 3)
+            .unwrap_err()
+            .code,
+        "bad_state",
+        "a dispatched old-generation Stop still owns the host lifecycle",
+    );
+    assert!(store.get_command(&blocked_resume_id).unwrap().is_none());
+
+    store
+        .settle(
+            &stop_id,
+            CommandState::Unknown,
+            Some(json!({"reason":"stop reply was lost"})),
+            now + 4,
+        )
+        .expect("retain uncertain old-generation stop");
+    let mut unknown_blocked_resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
+    unknown_blocked_resume.target = Some(agent.clone());
+    unknown_blocked_resume.expected_generation = Some(1);
+    let unknown_blocked_id = unknown_blocked_resume.id.clone();
+    assert_eq!(
+        store
+            .submit("owner", unknown_blocked_resume, now + 5)
+            .unwrap_err()
+            .code,
+        "bad_state",
+        "an unknown Stop remains a generation-transition fence",
+    );
+    assert!(store.get_command(&unknown_blocked_id).unwrap().is_none());
+
     let settled = store
         .settle(
             &stop_id,
             CommandState::Applied,
             Some(json!({"state":"applied"})),
-            now + 4,
+            now + 6,
         )
         .expect("the exact stop RPC reply settles its command");
     assert_eq!(settled.value.state, CommandState::Applied);
@@ -2412,6 +2780,108 @@ fn session_end_keeps_dispatched_stop_pending_until_exact_reply() {
             .expect("owner")
             .state,
         AgentState::Stopped
+    );
+
+    let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
+    resume.target = Some(agent.clone());
+    resume.expected_generation = Some(1);
+    let resume_id = resume.id.clone();
+    store
+        .submit("owner", resume, now + 7)
+        .expect("exact Stop reply reopens the retained Agent for resume");
+    assert_eq!(
+        store
+            .dispatch(&resume_id, now + 8)
+            .unwrap()
+            .value
+            .generation,
+        Some(2)
+    );
+}
+
+#[test]
+fn resume_dispatch_rechecks_a_stop_that_becomes_dispatched_after_admission() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let agent = ready_agent(&mut store, "resume-stop-dispatch-race", now);
+    let agent_num = eliot_core::parse_agent_id(&agent).expect("Agent id");
+    store
+        .connection
+        .execute(
+            "UPDATE agents SET native_scope = ?1, native_ref = ?2 WHERE id = ?3",
+            rusqlite::params![
+                "resume-stop-dispatch-race:scope",
+                "resume-stop-dispatch-race:thread",
+                agent_num
+            ],
+        )
+        .expect("retain a native subject for resume");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "resume-stop-dispatch-race:ended".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ended".to_owned(),
+                    native_id: "resume-stop-dispatch-race:ended".to_owned(),
+                    data: json!({}),
+                }],
+                cursor: None,
+            },
+            now + 1,
+        )
+        .expect("commit terminal session fact");
+
+    let mut stop = SubmitCommand::new(Ulid::new().to_string(), "stop");
+    stop.target = Some(agent.clone());
+    stop.expected_generation = Some(1);
+    let stop_id = stop.id.clone();
+    store
+        .submit("owner", stop, now + 2)
+        .expect("admit old-generation Stop");
+    let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
+    resume.target = Some(agent.clone());
+    resume.expected_generation = Some(1);
+    let resume_id = resume.id.clone();
+    store
+        .submit("owner", resume, now + 3)
+        .expect("admit resume while the old Stop remains undispatched");
+    assert_eq!(capacity_generation(&store, &agent), Some(2));
+
+    assert_eq!(
+        store.dispatch(&stop_id, now + 4).unwrap().value.state,
+        CommandState::Dispatched
+    );
+    assert_eq!(
+        store.dispatch(&resume_id, now + 5).unwrap_err().code,
+        "bad_state",
+        "a Stop dispatched after resume admission still holds the generation fence",
+    );
+    assert_eq!(store.get_agent(&agent).unwrap().unwrap().generation, 1);
+    assert_eq!(
+        store.get_command(&resume_id).unwrap().unwrap().state,
+        CommandState::Accepted
+    );
+    assert_eq!(capacity_generation(&store, &agent), Some(2));
+
+    store
+        .settle(
+            &stop_id,
+            CommandState::Applied,
+            Some(json!({"state":"applied"})),
+            now + 6,
+        )
+        .expect("exact Stop reply clears the old-generation gate");
+    assert_eq!(
+        store
+            .dispatch(&resume_id, now + 7)
+            .unwrap()
+            .value
+            .generation,
+        Some(2)
     );
 }
 

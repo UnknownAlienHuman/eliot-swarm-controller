@@ -1363,6 +1363,7 @@ async fn process_rule_cursor(
                     &rule.principal,
                     rule.project.as_ref(),
                     &rule.state,
+                    revision,
                     event.seq,
                     prepared,
                 )
