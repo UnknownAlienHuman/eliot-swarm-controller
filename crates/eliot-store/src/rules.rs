@@ -44,7 +44,7 @@ impl RuleCatchUpAction {
 #[derive(Clone, Debug, PartialEq)]
 pub struct RuleCatchUpAdmission {
     pub parent: Command,
-    pub children: Vec<Command>,
+    pub children: Vec<Admission>,
     pub events: Vec<Event>,
     pub is_new: bool,
 }
@@ -114,7 +114,7 @@ pub struct RuleEventAdmission {
     /// Absent only for a cause-depth-suppressed event, which advances the
     /// cursor without creating a parent or action command.
     pub parent: Option<Command>,
-    pub child: Option<Command>,
+    pub child: Option<Admission>,
     pub events: Vec<Event>,
     pub is_new: bool,
 }
@@ -342,7 +342,7 @@ pub struct TimerSlotCommit {
 pub struct TimerSlotAdmission {
     pub state: core::api::TimerStateView,
     pub parent: Option<Command>,
-    pub child: Option<Command>,
+    pub child: Option<Admission>,
     pub events: Vec<Event>,
     pub is_new: bool,
     pub blocked: bool,
@@ -757,6 +757,28 @@ impl Store {
         result
     }
 
+    /// Resolve an already committed event firing before the caller prepares or
+    /// freezes the action. The captured definition revision is part of its key.
+    pub fn replay_rule_event_action(
+        &self,
+        principal: &str,
+        state: &core::api::RuleStateView,
+        revision: i64,
+        event_seq: i64,
+    ) -> Result<Option<RuleEventAdmission>> {
+        require_nonempty(principal, "principal")?;
+        require_nonempty(&state.id, "rule id")?;
+        if revision <= 0 || event_seq <= 0 {
+            return Err(Error::new(
+                "invalid",
+                "rule replay revision and event sequence must be positive",
+            ));
+        }
+        let stored = load_rule_state(&self.connection, principal, &state.id)?
+            .ok_or_else(|| Error::new("not_found", "rule state was not found"))?;
+        load_retained_rule_event_action(&self.connection, principal, &stored, revision, event_seq)
+    }
+
     fn admit_rule_action_inner(
         &mut self,
         principal: &str,
@@ -777,7 +799,6 @@ impl Store {
             .map_err(sql_error)?;
         let stored = load_rule_state(&tx, principal, &state.id)?
             .ok_or_else(|| Error::new("not_found", "rule state was not found"))?;
-        let trigger = load_rule_trigger(&tx, event_seq)?;
         let retiring = rule_cursor_is_retiring(&stored.view, event_seq);
         let cursor = if retiring {
             stored
@@ -795,6 +816,13 @@ impl Store {
         } else {
             stored.view.revision
         };
+        if let Some(replay) =
+            load_retained_rule_event_action(&tx, principal, &stored, revision, event_seq)?
+        {
+            commit_transaction(tx, &self.write_faulted)?;
+            return Ok(replay);
+        }
+        let trigger = load_rule_trigger(&tx, event_seq)?;
         let key = RuleFiringKey::event(
             principal,
             &stored.view,
@@ -803,29 +831,6 @@ impl Store {
             trigger.cause.clone(),
         )?;
 
-        if let Some(parent) = load_command(&tx, &key.parent_id)? {
-            if !key.matches_parent(&parent, principal) {
-                return Err(Error::new(
-                    "source_integrity",
-                    "derived rule parent id is bound to another action",
-                ));
-            }
-            if cursor < event_seq {
-                return Err(Error::new(
-                    "source_integrity",
-                    "rule parent exists before its event cursor commit",
-                ));
-            }
-            let child = load_rule_child(&tx, &key.parent_id, &key.child_id)?;
-            commit_transaction(tx, &self.write_faulted)?;
-            return Ok(RuleEventAdmission {
-                state: stored.view,
-                parent: Some(parent),
-                child,
-                events: Vec::new(),
-                is_new: false,
-            });
-        }
         if cursor >= event_seq {
             return Err(Error::new(
                 "bad_state",
@@ -855,6 +860,7 @@ impl Store {
                 is_new: true,
             });
         }
+
         let binding_error = if request.verb == "run" {
             rule_run_action_binding_error(&tx, principal, &state.id, revision, event_seq, &request)?
         } else {
@@ -915,7 +921,8 @@ impl Store {
         // submit_tx validates and admits the ordinary rule action. Its verb path
         // performs the normal deterministic checks before inserting the child;
         // the surrounding transaction rolls every write back on persistence failure.
-        let (parent, child, events) = match admit_rule_action_tx(&tx, &key, request, now) {
+        let (parent, child_admission, events) = match admit_rule_action_tx(&tx, &key, request, now)
+        {
             Ok(admission) => admission,
             Err(error) if core::is_deterministic_pre_admission_rejection(&error.code) => {
                 return reject_rule_event(tx, &self.write_faulted, &key, &error.code, now);
@@ -928,13 +935,17 @@ impl Store {
         Ok(RuleEventAdmission {
             state: view,
             parent: Some(parent),
-            child: Some(child),
+            child: Some(child_admission),
             events,
             is_new: true,
         })
     }
 
-    pub fn recover_rule_children(&self, after: Option<&str>, limit: usize) -> Result<Vec<Command>> {
+    pub fn recover_rule_children(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Admission>> {
         validate_limit(limit)?;
         if let Some(after) = after {
             validate_ulid(after)?;
@@ -950,13 +961,31 @@ impl Store {
                         created_at, updated_at, probe
                  FROM commands
                  WHERE link_kind = 'rule_action' AND ordinal IS NOT NULL
-                   AND state IN ('accepted','queued')
+                   AND (
+                       state IN ('accepted','queued')
+                       OR (verb = 'launch' AND state = 'applied'
+                           AND EXISTS (
+                               SELECT 1 FROM commands input
+                               WHERE input.parent_command = commands.id
+                                 AND input.link_kind = 'send' AND input.ordinal = 0
+                                 AND input.state IN ('accepted','queued')
+                           ))
+                   )
                    AND NOT EXISTS (
                        SELECT 1 FROM commands earlier
                        WHERE earlier.parent_command = commands.parent_command
                          AND earlier.link_kind = 'rule_action'
                          AND earlier.ordinal < commands.ordinal
-                         AND earlier.state IN ('accepted','queued','dispatched','unknown')
+                         AND (
+                             earlier.state IN ('accepted','queued','dispatched','unknown')
+                             OR (earlier.verb = 'launch' AND earlier.state = 'applied'
+                                 AND EXISTS (
+                                     SELECT 1 FROM commands input
+                                     WHERE input.parent_command = earlier.id
+                                       AND input.link_kind = 'send' AND input.ordinal = 0
+                                       AND input.state IN ('accepted','queued','dispatched','unknown')
+                                 ))
+                         )
                    )
                    AND (?1 IS NULL OR id > ?1)
                  ORDER BY id LIMIT ?2",
@@ -965,12 +994,13 @@ impl Store {
         let rows = statement
             .query_map(params![after, limit as i64], command_record_from_row)
             .map_err(sql_error)?;
-        let mut commands = Vec::new();
+        let mut admissions = Vec::new();
         for row in rows {
-            commands.push(command_from_raw(row.map_err(sql_error)?)?.command);
+            let command = command_from_raw(row.map_err(sql_error)?)?.command;
+            admissions.push(retained_action_admission(&self.connection, command)?);
         }
-        enforce_page_bytes(&mut commands)?;
-        Ok(commands)
+        trim_recovery_admission_page(&mut admissions)?;
+        Ok(admissions)
     }
 
     /// Persist a timer's immutable schedule beside its owning rule state. The
@@ -1287,7 +1317,7 @@ impl Store {
                     }
                     Err(error) => return Err(error),
                 }
-            } else if !valid_rule_action_request(&action, false) {
+            } else if !valid_timer_action_request(&action) {
                 Some("rule_action_binding_invalid".to_owned())
             } else {
                 None
@@ -1471,7 +1501,7 @@ impl Store {
                     "timer Run must be targetless and have no Agent bindings",
                 ));
             }
-        } else if !valid_rule_action_request(&action, false) {
+        } else if !valid_timer_action_request(&action) {
             return Err(Error::new(
                 "invalid",
                 "timer action is not a valid rule action",
@@ -1774,6 +1804,13 @@ fn validate_project_rule_action_tx(
     principal: &str,
     request: &SubmitCommand,
 ) -> Result<Option<core::api::ProjectRegistrationView>> {
+    if request.verb == "launch" {
+        return super::projects::validate_project_rule_launch_action_tx(
+            tx,
+            principal,
+            &request.args,
+        );
+    }
     if request.verb == "run" {
         if rule_project_id(principal)?.is_none() {
             return Ok(None);
@@ -2146,7 +2183,7 @@ fn replay_timer_run_tx(
     connection: &Connection,
     principal: &str,
     request: &core::api::TimerRunRequest,
-) -> Result<Option<(Command, Option<Command>)>> {
+) -> Result<Option<(Command, Option<Admission>)>> {
     let digest = timer_run_digest(request)?;
     let Some((old_principal, old_method, old_digest)) = command_binding(connection, &request.id)?
     else {
@@ -2166,7 +2203,8 @@ fn replay_timer_run_tx(
             "timer command binding does not match its retained parent",
         ));
     }
-    let child = load_linked_command(connection, &request.id)?;
+    let child_id = derived_manual_timer_id(principal, &request.rule, &request.id)?;
+    let child = load_rule_child(connection, &request.id, &child_id)?;
     Ok(Some((parent, child)))
 }
 
@@ -2790,6 +2828,9 @@ pub(super) fn valid_rule_action_request(request: &SubmitCommand, allow_interrupt
 }
 
 fn valid_event_rule_action_request(request: &SubmitCommand) -> bool {
+    if request.verb == "launch" {
+        return valid_targetless_rule_launch_request(request);
+    }
     let reply = matches!(request.verb.as_str(), "approve" | "deny" | "answer");
     if request.verb != "steer" && !reply {
         return valid_rule_action_request(request, true);
@@ -2832,6 +2873,25 @@ fn valid_targetless_rule_run_request(request: &SubmitCommand) -> bool {
         && request.request_id.is_none()
         && !request.probe
         && request.args.is_object()
+}
+
+fn valid_targetless_rule_launch_request(request: &SubmitCommand) -> bool {
+    request.validate().is_ok()
+        && request.verb == "launch"
+        && request.target.is_none()
+        && request.expected_generation == Some(0)
+        && request.expected_turn_id.is_none()
+        && request.request_id.is_none()
+        && !request.probe
+        && request.args.is_object()
+}
+
+fn valid_timer_action_request(request: &SubmitCommand) -> bool {
+    if request.verb == "launch" {
+        valid_targetless_rule_launch_request(request)
+    } else {
+        valid_rule_action_request(request, false)
+    }
 }
 
 fn expected_timer_script_context(
@@ -3041,46 +3101,82 @@ pub(super) fn gate_rule_action_dispatch_tx(
 
     let mut failed_predecessor = None;
     for (index, row) in sibling_rows.iter().take(current_index).enumerate() {
-        match parse_enum::<CommandState>(&row.3, "command state")? {
-            CommandState::Applied => {}
-            CommandState::Rejected | CommandState::Failed | CommandState::Cancelled => {
-                failed_predecessor = Some(index);
-                break;
-            }
+        let predecessor_state = parse_enum::<CommandState>(&row.3, "command state")?;
+        let mut predecessor_pending = matches!(
+            predecessor_state,
             CommandState::Accepted
-            | CommandState::Queued
-            | CommandState::Dispatched
-            | CommandState::Unknown => {
-                let current = load_command_record(tx, command_id)?.ok_or_else(|| {
-                    Error::new("source_integrity", "rule-action child disappeared")
-                })?;
-                if current.state == CommandState::Accepted {
-                    let target = current.target.ok_or_else(|| {
-                        Error::new("source_integrity", "rule-action child has no target")
-                    })?;
-                    let generation = current
-                        .command
-                        .generation
-                        .or(current.command.expected_generation)
-                        .ok_or_else(|| {
-                            Error::new("source_integrity", "rule-action child has no generation")
-                        })?;
-                    update_command_state(tx, command_id, CommandState::Queued, None, None, now)?;
-                    events.push(insert_daemon_command_event(
-                        tx,
-                        now,
-                        "command.queued",
-                        Some(target),
-                        Some(generation),
-                        command_id,
-                        json!({
-                            "command_id": command_id,
-                            "reason": "rule_action_predecessor_pending",
-                        }),
-                    )?);
+                | CommandState::Queued
+                | CommandState::Dispatched
+                | CommandState::Unknown
+        );
+        let mut predecessor_failed = matches!(
+            predecessor_state,
+            CommandState::Rejected | CommandState::Failed | CommandState::Cancelled
+        );
+        if predecessor_state == CommandState::Applied {
+            let predecessor = load_command_record(tx, &row.0)?.ok_or_else(|| {
+                Error::new("source_integrity", "rule-action predecessor disappeared")
+            })?;
+            if predecessor.command.verb == "launch" {
+                let expects_linked_send = predecessor
+                    .command
+                    .args
+                    .get("text")
+                    .is_some_and(|text| !text.is_null());
+                let linked_send = load_linked_command(tx, &row.0)?;
+                if expects_linked_send != linked_send.is_some() {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "applied launch predecessor has an inconsistent linked-send child",
+                    ));
                 }
-                return Ok(RuleActionDispatchGate::Held);
+                if let Some(linked_send) = linked_send {
+                    match linked_send.state {
+                        CommandState::Applied => {}
+                        CommandState::Rejected | CommandState::Failed | CommandState::Cancelled => {
+                            predecessor_failed = true
+                        }
+                        CommandState::Accepted
+                        | CommandState::Queued
+                        | CommandState::Dispatched
+                        | CommandState::Unknown => predecessor_pending = true,
+                    }
+                }
             }
+        }
+        if predecessor_failed {
+            failed_predecessor = Some(index);
+            break;
+        }
+        if predecessor_pending {
+            let current = load_command_record(tx, command_id)?
+                .ok_or_else(|| Error::new("source_integrity", "rule-action child disappeared"))?;
+            if current.state == CommandState::Accepted {
+                let target = current.target.ok_or_else(|| {
+                    Error::new("source_integrity", "rule-action child has no target")
+                })?;
+                let generation = current
+                    .command
+                    .generation
+                    .or(current.command.expected_generation)
+                    .ok_or_else(|| {
+                        Error::new("source_integrity", "rule-action child has no generation")
+                    })?;
+                update_command_state(tx, command_id, CommandState::Queued, None, None, now)?;
+                events.push(insert_daemon_command_event(
+                    tx,
+                    now,
+                    "command.queued",
+                    Some(target),
+                    Some(generation),
+                    command_id,
+                    json!({
+                        "command_id": command_id,
+                        "reason": "rule_action_predecessor_pending",
+                    }),
+                )?);
+            }
+            return Ok(RuleActionDispatchGate::Held);
         }
     }
     let Some(failed_index) = failed_predecessor else {
@@ -3103,6 +3199,8 @@ pub(super) fn gate_rule_action_dispatch_tx(
                 "undispatched rule-action child has no generation",
             )
         })?;
+        let sibling = load_command_record(tx, &row.0)?
+            .ok_or_else(|| Error::new("source_integrity", "rule-action sibling disappeared"))?;
         cancel_pending_command_tx(
             tx,
             target,
@@ -3112,6 +3210,10 @@ pub(super) fn gate_rule_action_dispatch_tx(
             now,
             events,
         )?;
+        if sibling.command.verb == "launch" {
+            super::capacity::release_unstarted_tx(tx, target, 1, &row.0)?;
+            super::fail_unstarted_launch_tx(tx, target, &row.0, now, events)?;
+        }
     }
     Ok(RuleActionDispatchGate::Cancelled)
 }
@@ -3122,7 +3224,15 @@ fn has_open_rule_actions_tx(tx: &Transaction<'_>, principal: &str, rule: &str) -
              SELECT 1 FROM commands child
              JOIN commands parent ON parent.id = child.parent_command
              WHERE child.link_kind = 'rule_action' AND child.ordinal IS NOT NULL
-               AND child.state IN ('accepted','queued','dispatched','unknown')
+               AND (
+                   child.state IN ('accepted','queued','dispatched','unknown')
+                   OR (child.verb = 'launch' AND EXISTS (
+                       SELECT 1 FROM commands input
+                       WHERE input.parent_command = child.id
+                         AND input.link_kind = 'send' AND input.ordinal = 0
+                         AND input.state IN ('accepted','queued','dispatched','unknown')
+                   ))
+               )
                 AND (
                     (parent.principal = ?1
                      AND json_extract(parent.args, '$.rule') = ?2)
@@ -3509,6 +3619,9 @@ fn rule_action_binding_error(event: &StoredRuleTrigger, request: &SubmitCommand)
     if !valid_event_rule_action_request(request) {
         return Some("rule_action_binding_invalid".to_owned());
     }
+    if request.verb == "launch" {
+        return None;
+    }
     if request.target != event.agent.map(format_agent_id)
         || request.expected_generation != event.generation
         || (matches!(
@@ -3776,7 +3889,7 @@ fn admit_rule_action_tx(
     key: &RuleFiringKey<'_>,
     mut request: SubmitCommand,
     now: i64,
-) -> Result<(Command, Command, Vec<Event>)> {
+) -> Result<(Command, Admission, Vec<Event>)> {
     let parent_cause = key.command_cause(&key.parent_id)?;
     let child_cause = key.command_cause(&key.child_id)?;
     request.id = key.child_id.clone();
@@ -3788,8 +3901,25 @@ fn admit_rule_action_tx(
         ));
     }
 
-    let child = child_admission.command;
-    annotate_rule_command_event(tx, &child.id, &mut child_admission.events, child_cause)?;
+    let child_id = child_admission.command.id.clone();
+    annotate_rule_command_event(
+        tx,
+        &child_id,
+        &mut child_admission.events,
+        child_cause.clone(),
+    )?;
+    if let Some(linked_command) = &child_admission.linked_command {
+        annotate_rule_command_event(
+            tx,
+            &linked_command.id,
+            &mut child_admission.events,
+            core::EventCause {
+                command_id: linked_command.id.clone(),
+                rule: child_cause.rule.clone(),
+                depth: child_cause.depth,
+            },
+        )?;
+    }
     let (parent, mut parent_event) = insert_rule_parent(tx, key, RuleParentOutcome::Admitted, now)?;
     annotate_new_command_cause_tx(tx, &parent.id, &mut parent_event, parent_cause.clone())?;
     let linked = tx
@@ -3798,7 +3928,7 @@ fn admit_rule_action_tx(
              SET parent_command = ?1, link_kind = 'rule_action', ordinal = 0
              WHERE id = ?2 AND parent_command IS NULL
                AND link_kind IS NULL AND ordinal IS NULL",
-            params![key.parent_id, child.id],
+            params![key.parent_id, child_id],
         )
         .map_err(sql_error)?;
     if linked != 1 {
@@ -3808,16 +3938,16 @@ fn admit_rule_action_tx(
         ));
     }
 
-    let mut events = child_admission.events;
+    let mut events = std::mem::take(&mut child_admission.events);
     events.push(parent_event);
     events.push(insert_rule_event_with_cause(
         tx,
         now,
         "rule.fired",
-        key.fired_data(&child.id),
+        key.fired_data(&child_id),
         Some(parent_cause),
     )?);
-    Ok((parent, child, events))
+    Ok((parent, child_admission, events))
 }
 
 pub(super) fn annotate_rule_command_event(
@@ -3878,7 +4008,7 @@ fn load_rule_child(
     connection: &Connection,
     parent_id: &str,
     expected_child_id: &str,
-) -> Result<Option<Command>> {
+) -> Result<Option<Admission>> {
     let child_id: Option<String> = connection
         .query_row(
             "SELECT id FROM commands
@@ -3897,7 +4027,196 @@ fn load_rule_child(
             "rule parent child id does not match its deterministic action id",
         ));
     }
-    load_command(connection, &child_id)
+    let command = load_command(connection, &child_id)?
+        .ok_or_else(|| Error::new("source_integrity", "rule parent child command is missing"))?;
+    Ok(Some(retained_action_admission(connection, command)?))
+}
+
+fn retained_action_admission(connection: &Connection, command: Command) -> Result<Admission> {
+    let linked_command = if command.verb == "launch" {
+        load_linked_command(connection, &command.id)?
+    } else {
+        None
+    };
+    let expects_linked_send =
+        command.verb == "launch" && command.args.get("text").is_some_and(|text| !text.is_null());
+    match (expects_linked_send, linked_command.as_ref()) {
+        (true, Some(linked))
+            if linked.id == format!("{}/send", command.id)
+                && linked.principal == command.principal
+                && linked.verb == "send"
+                && linked.target == command.target
+                && linked.expected_generation == Some(1)
+                && linked.generation == Some(1)
+                && linked.args.get("text") == command.args.get("text") => {}
+        (false, None) => {}
+        _ => {
+            return Err(Error::new(
+                "source_integrity",
+                "rule launch linked-send row differs from its retained command",
+            ));
+        }
+    }
+    Ok(Admission {
+        command,
+        linked_command,
+        events: Vec::new(),
+        is_new: false,
+    })
+}
+
+fn trim_recovery_admission_page(admissions: &mut Vec<Admission>) -> Result<()> {
+    let mut command_bytes = 2_usize;
+    let mut linked_bytes = 2_usize;
+    let mut has_linked_command = false;
+    let mut keep = 0_usize;
+
+    for (index, admission) in admissions.iter().enumerate() {
+        if index == MAX_PAGE_ENTRIES {
+            break;
+        }
+        let command_len = serde_json::to_vec(&admission.command)
+            .map_err(|_| Error::new("internal", "recovered command cannot be encoded"))?
+            .len();
+        let next_command_bytes = command_bytes
+            .saturating_add(command_len)
+            .saturating_add(if index == 0 { 0 } else { 1 });
+        let mut next_linked_bytes = linked_bytes;
+        let mut next_has_linked_command = has_linked_command;
+        if let Some(linked) = &admission.linked_command {
+            let linked_len = serde_json::to_vec(linked)
+                .map_err(|_| Error::new("internal", "recovered linked command cannot be encoded"))?
+                .len();
+            next_linked_bytes = next_linked_bytes
+                .saturating_add(linked_len)
+                .saturating_add(if has_linked_command { 1 } else { 0 });
+            next_has_linked_command = true;
+        }
+        if next_command_bytes.saturating_add(next_linked_bytes) > MAX_PAGE_BYTES {
+            // Preserve one already-admitted launch and its linked input as a singleton.
+            if keep == 0 {
+                keep = index + 1;
+            }
+            break;
+        }
+        command_bytes = next_command_bytes;
+        linked_bytes = next_linked_bytes;
+        has_linked_command = next_has_linked_command;
+        keep = index + 1;
+    }
+
+    admissions.truncate(keep);
+    Ok(())
+}
+fn ensure_admission_page(admissions: &[Admission]) -> Result<()> {
+    if admissions.len() > MAX_PAGE_ENTRIES {
+        return Err(Error::new(
+            "frame_too_large",
+            "admission page exceeds the bounded entry count",
+        ));
+    }
+    let commands = admissions
+        .iter()
+        .map(|admission| &admission.command)
+        .collect::<Vec<_>>();
+    let linked = admissions
+        .iter()
+        .filter_map(|admission| admission.linked_command.as_ref())
+        .collect::<Vec<_>>();
+    let command_bytes = serde_json::to_vec(&commands)
+        .map_err(|_| Error::new("internal", "recovered commands cannot be encoded"))?;
+    let linked_bytes = serde_json::to_vec(&linked)
+        .map_err(|_| Error::new("internal", "recovered linked commands cannot be encoded"))?;
+    if command_bytes.len().saturating_add(linked_bytes.len()) > MAX_PAGE_BYTES {
+        return Err(Error::new(
+            "frame_too_large",
+            "recovered rule admissions exceed the page byte bound",
+        ));
+    }
+    Ok(())
+}
+
+fn load_retained_rule_event_action(
+    connection: &Connection,
+    principal: &str,
+    stored: &StoredRuleState,
+    revision: i64,
+    event_seq: i64,
+) -> Result<Option<RuleEventAdmission>> {
+    let key = RuleFiringKey::event(principal, &stored.view, revision, event_seq, None)?;
+    let Some(parent) = load_command(connection, &key.parent_id)? else {
+        return Ok(None);
+    };
+    if !key.matches_parent(&parent, principal) {
+        return Err(Error::new(
+            "source_integrity",
+            "derived rule parent id is bound to another action",
+        ));
+    }
+    if stored.view.current_cursor < event_seq
+        && stored
+            .view
+            .retiring_cursor
+            .is_none_or(|cursor| cursor < event_seq)
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "rule parent exists before its event cursor commit",
+        ));
+    }
+    let expected_children = match &parent.state {
+        CommandState::Applied => vec![key.child_id.clone()],
+        CommandState::Rejected => Vec::new(),
+        _ => {
+            return Err(Error::new(
+                "source_integrity",
+                "retained rule parent has a nonterminal admission state",
+            ));
+        }
+    };
+    let recorded_children = parent
+        .outcome
+        .as_ref()
+        .and_then(|outcome| outcome.get("children"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "retained rule parent has no fixed child set",
+            )
+        })?
+        .iter()
+        .map(|child| {
+            child
+                .as_str()
+                .ok_or_else(|| Error::new("source_integrity", "retained rule child ID is invalid"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if recorded_children
+        .iter()
+        .map(|child| (*child).to_owned())
+        .collect::<Vec<_>>()
+        != expected_children
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "retained rule parent child set differs from its deterministic action",
+        ));
+    }
+    let child = load_rule_child(connection, &key.parent_id, &key.child_id)?;
+    if child.is_some() != (parent.state == CommandState::Applied) {
+        return Err(Error::new(
+            "source_integrity",
+            "retained rule child rows differ from the parent outcome",
+        ));
+    }
+    Ok(Some(RuleEventAdmission {
+        state: stored.view.clone(),
+        parent: Some(parent),
+        child,
+        events: Vec::new(),
+        is_new: false,
+    }))
 }
 
 #[cfg(test)]
@@ -4186,7 +4505,11 @@ mod tests {
             .unwrap();
         assert!(first.is_new);
         let parent_id = first.parent.as_ref().expect("admitted parent").id.clone();
-        let child = first.child.as_ref().expect("admitted interrupt child");
+        let child = &first
+            .child
+            .as_ref()
+            .expect("admitted interrupt child")
+            .command;
         assert_eq!(child.verb, "interrupt");
         assert_eq!(child.target.as_deref(), Some(agent_id.as_str()));
         assert_eq!(child.expected_generation, Some(1));
@@ -4208,7 +4531,7 @@ mod tests {
             .unwrap();
         assert!(!replay.is_new);
         assert_eq!(replay.parent.as_ref().unwrap().id, parent_id);
-        assert_eq!(replay.child.as_ref().unwrap().id, child_id);
+        assert_eq!(replay.child.as_ref().unwrap().command.id, child_id);
         assert!(replay.events.is_empty());
         assert!(store.get_command(&child_id).unwrap().is_some());
     }
@@ -4286,7 +4609,7 @@ mod tests {
             .unwrap();
         assert!(first.is_new);
         let parent_id = first.parent.as_ref().unwrap().id.clone();
-        let child = first.child.as_ref().expect("admitted STEER child");
+        let child = &first.child.as_ref().expect("admitted STEER child").command;
         assert_eq!(child.verb, "steer");
         assert_eq!(child.target.as_deref(), Some(agent_id.as_str()));
         assert_eq!(child.expected_generation, Some(1));
@@ -4316,7 +4639,7 @@ mod tests {
             .unwrap();
         assert!(!replay.is_new);
         assert_eq!(replay.parent.as_ref().unwrap().id, parent_id);
-        assert_eq!(replay.child.as_ref().unwrap().id, child_id);
+        assert_eq!(replay.child.as_ref().unwrap().command.id, child_id);
         assert!(replay.events.is_empty());
         assert_eq!(store.high_water().unwrap(), high_water_before_replay);
 
@@ -4547,7 +4870,7 @@ mod tests {
         assert!(admission.is_new);
         assert_eq!(admission.parent.state, CommandState::Applied);
         assert_eq!(admission.children.len(), 1);
-        let admitted_child = &admission.children[0];
+        let admitted_child = &admission.children[0].command;
         assert_eq!(admitted_child.verb, "interrupt");
         assert_eq!(admitted_child.turn_id.as_deref(), Some("turn-current"));
         assert_eq!(
@@ -4626,7 +4949,7 @@ mod tests {
             .unwrap();
         assert!(!replay.is_new);
         assert_eq!(replay.parent.id, admission.parent.id);
-        assert_eq!(replay.children[0].id, admitted_child.id);
+        assert_eq!(replay.children[0].command.id, admitted_child.id);
         assert!(replay.events.is_empty());
         assert_eq!(store.high_water().unwrap(), high_water);
     }
@@ -5121,7 +5444,7 @@ mod tests {
         assert_eq!(first.parent.verb, "rule.catch_up");
         assert_eq!(first.parent.args["revision"].as_i64(), Some(state.revision));
         assert_eq!(first.children.len(), 1);
-        let child = &first.children[0];
+        let child = &first.children[0].command;
         assert_eq!(child.target.as_deref(), Some(agent_id.as_str()));
         assert_eq!(child.expected_generation, Some(1));
         assert_eq!(child.generation, Some(1));
@@ -5153,7 +5476,7 @@ mod tests {
             Some(state.revision)
         );
         assert_eq!(replay.children.len(), 1);
-        assert_eq!(replay.children[0].id, child_id);
+        assert_eq!(replay.children[0].command.id, child_id);
         assert!(replay.events.is_empty());
         assert_eq!(store.high_water().unwrap(), high_water_after_edit);
 
@@ -5466,6 +5789,160 @@ mod tests {
     }
 
     #[test]
+    fn finite_history_catch_up_launch_page_overflow_rolls_back() {
+        const ACTION_COUNT: usize = 8;
+
+        let mut store = store();
+        let request_id = Ulid::new();
+        let now = i64::try_from(request_id.timestamp_ms()).unwrap() + 10;
+        let workspace = std::env::temp_dir()
+            .join("eliot-owner-catch-up-launch")
+            .display()
+            .to_string();
+        let rule_id = "owner-catch-up-launch-page";
+        let rule_value = json!({
+            "id": rule_id,
+            "enabled": true,
+            "on": {"event": "command.accepted"},
+            "do": [{"action": "launch", "profile": "fake", "workspace": workspace}],
+            "limit": {
+                "max": RULE_ACTION_LIMIT as u64,
+                "per": "rule",
+                "window_ms": RULE_ACTION_WINDOW_MS,
+            },
+        });
+        let rule = RuleDefinitionInput {
+            id: rule_id.to_owned(),
+            canonical_definition: serde_json::to_string(&rule_value).unwrap(),
+            definition_digest: core::canonical_json_sha256(&rule_value).unwrap(),
+            enabled: true,
+        };
+        let launch_text = "x".repeat(MAX_EVENT_BYTES - 4 * 1024);
+        assert_eq!(launch_text.len(), 60 * 1024);
+        assert!(launch_text.len() < MAX_INPUT_BYTES);
+        assert!(ACTION_COUNT < RULE_ACTION_LIMIT as usize);
+        assert!(ACTION_COUNT < GLOBAL_RULE_ACTION_LIMIT as usize);
+        let pair_text_bytes = launch_text.len() * 2;
+        assert!(
+            pair_text_bytes + 16 * 1024 < MAX_PAGE_BYTES,
+            "one Launch plus its linked SEND remains below the page bound"
+        );
+        assert!(
+            pair_text_bytes * ACTION_COUNT > MAX_PAGE_BYTES,
+            "all eight Launch+SEND pairs exceed the full admission-page bound"
+        );
+
+        let mut event_seqs = Vec::with_capacity(ACTION_COUNT);
+        for _ in 0..ACTION_COUNT {
+            event_seqs.push(insert_test_event(&mut store, "command.accepted", now - 1));
+        }
+        let state = store.ensure_rule_state("owner", &rule, now).unwrap();
+        let captured_through = state.current_cursor;
+        assert!(
+            event_seqs
+                .last()
+                .is_some_and(|seq| *seq <= captured_through)
+        );
+
+        let actions = event_seqs
+            .iter()
+            .map(|event_seq| {
+                let mut launch = SubmitCommand::new(Ulid::new().to_string(), "launch");
+                launch.args = json!({
+                    "project": workspace,
+                    "harness": "fake",
+                    "profile": "fake",
+                    "profile_snapshot": {},
+                    "workspace": workspace,
+                    "text": launch_text,
+                });
+                launch.expected_generation = Some(0);
+                assert!(valid_targetless_rule_launch_request(&launch));
+                assert!(
+                    serde_json::to_vec(&launch).unwrap().len() <= MAX_FRAME_BYTES,
+                    "each targetless launch request remains inside its frame bound"
+                );
+                RuleCatchUpAction::command(*event_seq, launch)
+            })
+            .collect::<Vec<_>>();
+        let encoded_actions = serde_json::to_vec(&actions).unwrap();
+        assert!(
+            encoded_actions.len() <= MAX_PAGE_BYTES,
+            "the complete catch-up request remains inside its 900 KiB bound"
+        );
+
+        let request = core::api::RuleCatchUpRequest::new(
+            request_id.to_string(),
+            rule_id,
+            event_seqs[0] - 1,
+            Some(captured_through),
+        );
+        let commands_before: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+            .unwrap();
+        let agents_before = store.agent_count().unwrap();
+        let events_before: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        let high_water_before = store.high_water().unwrap();
+        let cursor_before = state.current_cursor;
+
+        let error = store
+            .admit_rule_catch_up("owner", &request, &state, captured_through, &actions, now)
+            .expect_err("oversized whole launch admission set must roll back");
+        assert_eq!(error.code, "frame_too_large");
+        assert!(
+            error
+                .message
+                .contains("recovered rule admissions exceed the page byte bound"),
+            "failure must come from the full catch-up admission-page check: {}",
+            error.message
+        );
+
+        assert!(store.get_command(&request.id).unwrap().is_none());
+        for event_seq in &event_seqs {
+            let launch_id =
+                derived_rule_id("action-0", "owner", rule_id, state.revision, *event_seq).unwrap();
+            assert!(store.get_command(&launch_id).unwrap().is_none());
+            assert!(
+                store
+                    .get_command(&format!("{launch_id}/send"))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM commands", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            commands_before
+        );
+        assert_eq!(store.agent_count().unwrap(), agents_before);
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM events", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            events_before
+        );
+        assert_eq!(store.high_water().unwrap(), high_water_before);
+        assert_eq!(
+            store
+                .get_rule_state("owner", rule_id)
+                .unwrap()
+                .unwrap()
+                .current_cursor,
+            cursor_before
+        );
+        assert!(!store.is_write_faulted());
+    }
+
+    #[test]
     fn finite_history_catch_up_allows_cursor_only_progress() {
         let mut store = store();
         let request_id = Ulid::new();
@@ -5519,10 +5996,10 @@ mod tests {
         assert_eq!(admission.parent.id, request.id);
         assert_eq!(admission.children.len(), 1);
         assert_eq!(
-            admission.children[0].target.as_deref(),
+            admission.children[0].command.target.as_deref(),
             Some(agent_id.as_str())
         );
-        assert_eq!(admission.children[0].expected_generation, Some(1));
+        assert_eq!(admission.children[0].command.expected_generation, Some(1));
 
         let current_state = store
             .get_rule_state("owner", "history-rule")
@@ -5631,10 +6108,13 @@ mod tests {
             .unwrap();
         assert!(admission.is_new);
         assert_eq!(admission.children.len(), 2);
-        assert_ne!(admission.children[0].target, admission.children[1].target);
+        assert_ne!(
+            admission.children[0].command.target,
+            admission.children[1].command.target
+        );
 
-        let first_child_id = admission.children[0].id.clone();
-        let second_child_id = admission.children[1].id.clone();
+        let first_child_id = admission.children[0].command.id.clone();
+        let second_child_id = admission.children[1].command.id.clone();
         let first_link: (String, i64) = store
             .connection
             .query_row(
@@ -5716,7 +6196,7 @@ mod tests {
             assert!(
                 !recoverable
                     .iter()
-                    .any(|command| command.id == second_child_id),
+                    .any(|command| command.command.id == second_child_id),
                 "child 2 became recoverable while child 1 was {predecessor_state}"
             );
             let held = store
@@ -5777,7 +6257,7 @@ mod tests {
         assert!(
             recoverable
                 .iter()
-                .any(|command| command.id == second_child_id)
+                .any(|command| command.command.id == second_child_id)
         );
         assert_eq!(
             store
@@ -5832,8 +6312,8 @@ mod tests {
                 .admit_rule_catch_up("owner", &request, &state, captured_through, &actions, now)
                 .unwrap();
             assert_eq!(admission.children.len(), 2);
-            let first_child_id = admission.children[0].id.clone();
-            let second_child_id = admission.children[1].id.clone();
+            let first_child_id = admission.children[0].command.id.clone();
+            let second_child_id = admission.children[1].command.id.clone();
 
             let expected_predecessor_state = match terminal_predecessor {
                 "failed" => {
@@ -5874,7 +6354,7 @@ mod tests {
             assert!(
                 recoverable
                     .iter()
-                    .any(|command| command.id == second_child_id),
+                    .any(|command| command.command.id == second_child_id),
                 "Store recovery must surface the terminal follower for cancellation"
             );
             let cancelled = store.dispatch(&second_child_id, now + 3).unwrap();
@@ -5892,7 +6372,7 @@ mod tests {
             assert!(
                 !recoverable_after_cancel
                     .iter()
-                    .any(|command| command.id == second_child_id)
+                    .any(|command| command.command.id == second_child_id)
             );
             assert_eq!(
                 store.get_command(&second_child_id).unwrap().unwrap().state,
@@ -5910,6 +6390,406 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(child_two_dispatches, 0);
+        }
+    }
+
+    #[test]
+    fn catch_up_launch_sibling_gate_tracks_linked_send_and_cleans_terminal_successors() {
+        let rule_id = "catch-up-launch-sibling";
+        let workspace = "synthetic-catch-up-launch-sibling";
+        let rule_value = json!({
+            "id": rule_id,
+            "enabled": true,
+            "on": {"event": "command.accepted"},
+            "do": [{"action": "launch", "profile": "fake", "workspace": workspace}],
+            "limit": {
+                "max": 2,
+                "per": "rule",
+                "window_ms": RULE_ACTION_WINDOW_MS,
+            },
+        });
+        let rule = RuleDefinitionInput {
+            id: rule_id.to_owned(),
+            canonical_definition: serde_json::to_string(&rule_value).unwrap(),
+            definition_digest: core::canonical_json_sha256(&rule_value).unwrap(),
+            enabled: true,
+        };
+        let launch_request = |text: &str| {
+            let mut request = SubmitCommand::new(Ulid::new().to_string(), "launch");
+            request.args = json!({
+                "project": workspace,
+                "harness": "fake",
+                "profile": "fake",
+                "profile_snapshot": {},
+                "workspace": workspace,
+                "text": text,
+            });
+            request.expected_generation = Some(0);
+            request
+        };
+        let prepare_pair = || {
+            let mut store = store();
+            let request_id = Ulid::new();
+            let now = i64::try_from(request_id.timestamp_ms()).unwrap() + 10;
+            let first_event = insert_test_event(&mut store, "command.accepted", now - 1);
+            let second_event = insert_test_event(&mut store, "command.accepted", now - 1);
+            let state = store.ensure_rule_state("owner", &rule, now).unwrap();
+            let captured_through = state.current_cursor;
+            assert!(second_event <= captured_through);
+            let request = core::api::RuleCatchUpRequest::new(
+                request_id.to_string(),
+                rule_id,
+                first_event - 1,
+                Some(captured_through),
+            );
+            let actions = [
+                RuleCatchUpAction::command(
+                    first_event,
+                    launch_request("first linked launch input"),
+                ),
+                RuleCatchUpAction::command(
+                    second_event,
+                    launch_request("successor linked launch input"),
+                ),
+            ];
+            let admitted = store
+                .admit_rule_catch_up("owner", &request, &state, captured_through, &actions, now)
+                .unwrap();
+            assert_eq!(admitted.children.len(), 2);
+            let first = &admitted.children[0];
+            let second = &admitted.children[1];
+            assert_eq!(first.command.verb, "launch");
+            assert_eq!(second.command.verb, "launch");
+            let first_launch_id = first.command.id.clone();
+            let first_send_id = first
+                .linked_command
+                .as_ref()
+                .expect("first launch has its linked SEND")
+                .id
+                .clone();
+            let second_launch_id = second.command.id.clone();
+            let second_send_id = second
+                .linked_command
+                .as_ref()
+                .expect("successor launch has its linked SEND")
+                .id
+                .clone();
+            assert_eq!(first_send_id, format!("{first_launch_id}/send"));
+            assert_eq!(second_send_id, format!("{second_launch_id}/send"));
+            let first_agent = first.command.target.clone().expect("first launch Agent");
+            let second_agent = second
+                .command
+                .target
+                .clone()
+                .expect("successor launch Agent");
+
+            store.dispatch(&first_launch_id, now + 1).unwrap();
+            store
+                .put_batch(
+                    SourceBatch {
+                        batch_id: format!("catch-up-first-launch-ready-{request_id}"),
+                        agent_id: first_agent.clone(),
+                        generation: 1,
+                        source: "stream".to_owned(),
+                        events: vec![NativeEvent {
+                            ts: None,
+                            kind: "session.ready".to_owned(),
+                            native_id: format!("catch-up-first-launch-ready-{request_id}"),
+                            data: json!({"command_id": first_launch_id}),
+                        }],
+                        cursor: None,
+                    },
+                    now + 2,
+                )
+                .unwrap();
+            store
+                .settle(&first_launch_id, CommandState::Applied, None, now + 3)
+                .unwrap();
+            assert_eq!(
+                store.get_command(&first_launch_id).unwrap().unwrap().state,
+                CommandState::Applied
+            );
+            (
+                store,
+                now + 4,
+                first_launch_id,
+                first_send_id,
+                second_launch_id,
+                second_send_id,
+                first_agent,
+                second_agent,
+            )
+        };
+
+        for input_state in ["accepted", "queued", "dispatched", "unknown"] {
+            let (
+                mut store,
+                now,
+                _first_launch_id,
+                first_send_id,
+                second_launch_id,
+                second_send_id,
+                _first_agent,
+                second_agent,
+            ) = prepare_pair();
+            match input_state {
+                "accepted" | "queued" => {
+                    store
+                        .connection
+                        .execute(
+                            "UPDATE commands SET state = ?1 WHERE id = ?2",
+                            rusqlite::params![input_state, first_send_id],
+                        )
+                        .unwrap();
+                }
+                "dispatched" => {
+                    assert_eq!(
+                        store.dispatch(&first_send_id, now).unwrap().value.state,
+                        CommandState::Dispatched
+                    );
+                }
+                "unknown" => {
+                    store.dispatch(&first_send_id, now).unwrap();
+                    store
+                        .settle(
+                            &first_send_id,
+                            CommandState::Unknown,
+                            Some(json!({"reason": "fixture uncertainty"})),
+                            now + 1,
+                        )
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let expected_input_state = match input_state {
+                "accepted" => CommandState::Accepted,
+                "queued" => CommandState::Queued,
+                "dispatched" => CommandState::Dispatched,
+                "unknown" => CommandState::Unknown,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                store.get_command(&first_send_id).unwrap().unwrap().state,
+                expected_input_state
+            );
+            let recoverable = store.recover_rule_children(None, 100).unwrap();
+            assert!(
+                recoverable
+                    .iter()
+                    .all(|action| action.command.id != second_launch_id),
+                "successor recovered while first Launch input was {input_state}"
+            );
+            let held = store.dispatch(&second_launch_id, now + 10).unwrap();
+            assert_eq!(held.value.state, CommandState::Queued);
+            assert!(
+                !held
+                    .events
+                    .iter()
+                    .any(|event| event.kind == "command.dispatched")
+            );
+            assert_eq!(held.value.generation, Some(0));
+            let second_agent = store.get_agent(&second_agent).unwrap().unwrap();
+            assert_eq!(second_agent.generation, 0);
+            assert_eq!(second_agent.state, AgentState::Created);
+            let reservation: Option<i64> = store
+                .connection
+                .query_row(
+                    "SELECT capacity_generation FROM agents WHERE id = ?1",
+                    [eliot_core::parse_agent_id(&second_agent.id).unwrap()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(reservation, Some(1));
+            assert_eq!(
+                store.get_command(&second_send_id).unwrap().unwrap().state,
+                CommandState::Queued
+            );
+            let recoverable_after_hold = store.recover_rule_children(None, 100).unwrap();
+            assert!(
+                recoverable_after_hold
+                    .iter()
+                    .all(|action| action.command.id != second_launch_id)
+            );
+        }
+
+        {
+            let (
+                mut store,
+                now,
+                _first_launch_id,
+                first_send_id,
+                second_launch_id,
+                _second_send_id,
+                first_agent,
+                second_agent,
+            ) = prepare_pair();
+            let turn_id = Ulid::new().to_string();
+            store.dispatch(&first_send_id, now).unwrap();
+            store
+                .put_batch(
+                    SourceBatch {
+                        batch_id: Ulid::new().to_string(),
+                        agent_id: first_agent.clone(),
+                        generation: 1,
+                        source: "stream".to_owned(),
+                        events: vec![NativeEvent {
+                            ts: None,
+                            kind: "turn.started".to_owned(),
+                            native_id: Ulid::new().to_string(),
+                            data: json!({
+                                "command_id": first_send_id,
+                                "turn_id": turn_id,
+                            }),
+                        }],
+                        cursor: None,
+                    },
+                    now + 1,
+                )
+                .unwrap();
+            let first_send = store.get_command(&first_send_id).unwrap().unwrap();
+            assert_eq!(first_send.state, CommandState::Applied);
+            assert_eq!(first_send.turn_id.as_deref(), Some(turn_id.as_str()));
+            assert_eq!(
+                store
+                    .get_turn(&first_agent, 1, &turn_id)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                TurnState::Running
+            );
+            let recoverable = store.recover_rule_children(None, 100).unwrap();
+            assert!(
+                recoverable
+                    .iter()
+                    .any(|action| action.command.id == second_launch_id)
+            );
+            assert_eq!(
+                store
+                    .dispatch(&second_launch_id, now + 2)
+                    .unwrap()
+                    .value
+                    .state,
+                CommandState::Dispatched
+            );
+            let second_agent = store.get_agent(&second_agent).unwrap().unwrap();
+            assert_eq!(second_agent.generation, 1);
+            assert_eq!(second_agent.state, AgentState::Starting);
+            assert_eq!(
+                store
+                    .get_turn(&first_agent, 1, &turn_id)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                TurnState::Running
+            );
+        }
+
+        for terminal_input_state in ["rejected", "failed", "cancelled"] {
+            let (
+                mut store,
+                now,
+                _first_launch_id,
+                first_send_id,
+                second_launch_id,
+                second_send_id,
+                _first_agent,
+                second_agent,
+            ) = prepare_pair();
+            match terminal_input_state {
+                "rejected" => {
+                    store
+                        .settle(
+                            &first_send_id,
+                            CommandState::Rejected,
+                            Some(json!({"reason": "fixture rejection"})),
+                            now,
+                        )
+                        .unwrap();
+                }
+                "failed" => {
+                    store.dispatch(&first_send_id, now).unwrap();
+                    store
+                        .settle(
+                            &first_send_id,
+                            CommandState::Failed,
+                            Some(json!({"reason": "fixture failure"})),
+                            now + 1,
+                        )
+                        .unwrap();
+                }
+                "cancelled" => {
+                    assert_eq!(
+                        store
+                            .connection
+                            .execute(
+                                "UPDATE commands SET state = 'cancelled' WHERE id = ?1",
+                                [&first_send_id],
+                            )
+                            .unwrap(),
+                        1
+                    );
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                store.get_command(&first_send_id).unwrap().unwrap().state,
+                match terminal_input_state {
+                    "rejected" => CommandState::Rejected,
+                    "failed" => CommandState::Failed,
+                    "cancelled" => CommandState::Cancelled,
+                    _ => unreachable!(),
+                }
+            );
+            let recoverable = store.recover_rule_children(None, 100).unwrap();
+            assert!(
+                recoverable
+                    .iter()
+                    .any(|action| action.command.id == second_launch_id),
+                "terminal first input makes the undispatched successor recoverable"
+            );
+            let cancelled = store.dispatch(&second_launch_id, now + 10).unwrap();
+            assert_eq!(cancelled.value.state, CommandState::Cancelled);
+            assert!(cancelled.events.iter().any(|event| {
+                event.kind == "command.cancelled" && event.data["command_id"] == second_launch_id
+            }));
+            assert!(cancelled.events.iter().any(|event| {
+                event.kind == "command.cancelled" && event.data["command_id"] == second_send_id
+            }));
+            assert!(cancelled.events.iter().any(|event| {
+                event.kind == "agent.failed"
+                    && event.data["command_id"] == second_launch_id
+                    && event.data["reason"] == "launch_not_dispatched"
+            }));
+            assert_eq!(
+                store.get_command(&second_send_id).unwrap().unwrap().state,
+                CommandState::Cancelled
+            );
+            let second_agent = store.get_agent(&second_agent).unwrap().unwrap();
+            assert_eq!(second_agent.generation, 0);
+            assert_eq!(second_agent.state, AgentState::Failed);
+            assert!(second_agent.is_terminal());
+            let reservation: Option<i64> = store
+                .connection
+                .query_row(
+                    "SELECT capacity_generation FROM agents WHERE id = ?1",
+                    [eliot_core::parse_agent_id(&second_agent.id).unwrap()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(reservation, None);
+            assert_eq!(
+                store
+                    .connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM events
+                         WHERE kind = 'command.dispatched'
+                           AND json_extract(data, '$.command_id') = ?1",
+                        [&second_launch_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0
+            );
         }
     }
 
@@ -5956,7 +6836,11 @@ mod tests {
                 now + 2,
             )
             .unwrap();
-        let project_child = project_source.child.as_ref().expect("project rule child");
+        let project_child = &project_source
+            .child
+            .as_ref()
+            .expect("project rule child")
+            .command;
         let project_cause = command_cause_tx(&store.connection, &project_child.id)
             .unwrap()
             .expect("Store-verified project rule cause");
@@ -6000,10 +6884,11 @@ mod tests {
                 now + 5,
             )
             .unwrap();
-        let foreign_send = cross_namespace
+        let foreign_send = &cross_namespace
             .child
             .as_ref()
-            .expect("different principal is not a self send");
+            .expect("different principal is not a self send")
+            .command;
         assert_eq!(foreign_send.verb, "send");
         assert_eq!(
             foreign_send.args["text"],
@@ -6028,7 +6913,11 @@ mod tests {
                 now + 8,
             )
             .unwrap();
-        let owner_child = owner_source.child.as_ref().expect("owner rule child");
+        let owner_child = &owner_source
+            .child
+            .as_ref()
+            .expect("owner rule child")
+            .command;
         let owner_cause = command_cause_tx(&store.connection, &owner_child.id)
             .unwrap()
             .expect("Store-verified owner rule cause");
@@ -6109,7 +6998,7 @@ mod tests {
             let admission = store
                 .admit_rule_action("owner", &state, event_seq, stop_request(&agent_id), now + 1)
                 .unwrap();
-            let child = admission.child.expect("caused stop child");
+            let child = admission.child.expect("caused stop child").command;
             let child_cause = command_cause_tx(&store.connection, &child.id)
                 .unwrap()
                 .expect("verified Store cause");
@@ -6136,10 +7025,11 @@ mod tests {
         let admission = store
             .admit_rule_action("owner", &state, send_event, send, now + 1)
             .unwrap();
-        let send_child = admission
+        let send_child = &admission
             .child
             .as_ref()
-            .expect("allow_self sends at depth five");
+            .expect("allow_self sends at depth five")
+            .command;
         assert_eq!(send_child.verb, "send");
         assert_eq!(send_child.args["text"], "bounded self send");
         let send_cause = command_cause_tx(&store.connection, &send_child.id)
@@ -6213,7 +7103,11 @@ mod tests {
         let live_admission = store
             .admit_rule_action("owner", &live_state, live_event, live_send.clone(), now + 2)
             .unwrap();
-        let live_child = live_admission.child.as_ref().expect("live send child");
+        let live_child = &live_admission
+            .child
+            .as_ref()
+            .expect("live send child")
+            .command;
         let live_child_id = live_child.id.clone();
         assert_eq!(live_child.verb, "send");
         store.dispatch(&live_child_id, now + 3).unwrap();
@@ -6233,7 +7127,7 @@ mod tests {
         assert!(
             !live_recovery
                 .iter()
-                .any(|command| command.id == live_child_id)
+                .any(|command| command.command.id == live_child_id)
         );
 
         let commands_before_live_replay: i64 = store
@@ -6249,7 +7143,7 @@ mod tests {
             live_replay.parent.unwrap().id,
             live_admission.parent.unwrap().id
         );
-        assert_eq!(live_replay.child.unwrap().id, live_child_id);
+        assert_eq!(live_replay.child.unwrap().command.id, live_child_id);
         assert!(live_replay.events.is_empty());
         assert_eq!(
             store
@@ -6289,7 +7183,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(history_admission.children.len(), 1);
-        let history_child_id = history_admission.children[0].id.clone();
+        let history_child_id = history_admission.children[0].command.id.clone();
         store.dispatch(&history_child_id, history_now + 1).unwrap();
         store
             .settle(
@@ -6311,16 +7205,17 @@ mod tests {
         assert!(!history_replay.is_new);
         assert_eq!(history_replay.parent.id, history_request.id);
         assert_eq!(history_replay.children.len(), 1);
-        assert_eq!(history_replay.children[0].id, history_child_id);
-        assert_eq!(history_replay.children[0].state, CommandState::Unknown);
+        assert_eq!(history_replay.children[0].command.id, history_child_id);
+        assert_eq!(
+            history_replay.children[0].command.state,
+            CommandState::Unknown
+        );
         assert!(history_replay.events.is_empty());
 
         let recovered = store.recover_rule_children(None, 100).unwrap();
-        assert!(
-            !recovered
-                .iter()
-                .any(|command| { command.id == live_child_id || command.id == history_child_id })
-        );
+        assert!(!recovered.iter().any(|command| {
+            command.command.id == live_child_id || command.command.id == history_child_id
+        }));
         assert_eq!(
             store
                 .connection
@@ -6442,7 +7337,7 @@ mod tests {
         let admission = store
             .admit_rule_action("owner", &state, event_seq, stop_request(&agent_id), 3)
             .unwrap();
-        let child = admission.child.unwrap();
+        let child = admission.child.unwrap().command;
         store
             .connection
             .execute(
@@ -6485,7 +7380,11 @@ mod tests {
                 .admit_rule_action("owner", &state, event_seq, stop_request(&agent_id), now)
                 .unwrap();
             assert!(admission.is_new);
-            let child = admission.child.as_ref().expect("admitted stop child");
+            let child = &admission
+                .child
+                .as_ref()
+                .expect("admitted stop child")
+                .command;
             assert_eq!(child.verb, "stop");
             let parent = admission.parent.as_ref().expect("admitted rule parent");
             assert_eq!(parent.state, CommandState::Applied);
@@ -6592,10 +7491,10 @@ mod tests {
 
         let first_page = store.recover_rule_children(None, 4).unwrap();
         assert_eq!(first_page.len(), 4);
-        let after = first_page.last().unwrap().id.clone();
+        let after = first_page.last().unwrap().command.id.clone();
         let second_page = store.recover_rule_children(Some(&after), 100).unwrap();
         assert_eq!(second_page.len(), RULE_ACTION_LIMIT as usize - 4);
-        assert!(second_page.first().unwrap().id > after);
+        assert!(second_page.first().unwrap().command.id > after);
         let pending_after_pages = first_page
             .into_iter()
             .chain(second_page)
@@ -6604,20 +7503,23 @@ mod tests {
         assert!(
             pending_after_pages
                 .iter()
-                .all(|command| command.state == CommandState::Accepted)
+                .all(|command| command.command.state == CommandState::Accepted)
         );
 
         store
             .connection
             .execute(
                 "UPDATE commands SET state = 'dispatched' WHERE id = ?1",
-                [&pending_after_pages[0].id],
+                [&pending_after_pages[0].command.id],
             )
             .unwrap();
         let pending_after_dispatch = store.recover_rule_children(None, 100).unwrap();
         assert_eq!(pending_after_dispatch.len(), RULE_ACTION_LIMIT as usize - 1);
         assert!(pending_after_dispatch.iter().all(|command| {
-            matches!(command.state, CommandState::Accepted | CommandState::Queued)
+            matches!(
+                command.command.state,
+                CommandState::Accepted | CommandState::Queued
+            )
         }));
     }
 
@@ -6633,14 +7535,14 @@ mod tests {
         assert!(
             seeded
                 .iter()
-                .all(|command| command.state == CommandState::Accepted)
+                .all(|command| command.command.state == CommandState::Accepted)
         );
         store
             .connection
             .execute(
                 // Seed both states accepted by recovery without building a predecessor chain.
                 "UPDATE commands SET state = 'queued' WHERE id = ?1",
-                [&seeded[0].id],
+                [&seeded[0].command.id],
             )
             .unwrap();
 
@@ -6649,12 +7551,12 @@ mod tests {
         assert!(
             healthy
                 .iter()
-                .any(|command| command.state == CommandState::Accepted)
+                .any(|command| command.command.state == CommandState::Accepted)
         );
         assert!(
             healthy
                 .iter()
-                .any(|command| command.state == CommandState::Queued)
+                .any(|command| command.command.state == CommandState::Queued)
         );
 
         store.write_faulted.set(true);
@@ -6663,13 +7565,13 @@ mod tests {
 
         let accepted = healthy
             .iter()
-            .find(|command| command.state == CommandState::Accepted)
+            .find(|command| command.command.state == CommandState::Accepted)
             .unwrap();
-        let error = store.dispatch(&accepted.id, 102).unwrap_err();
+        let error = store.dispatch(&accepted.command.id, 102).unwrap_err();
         assert_eq!(error.code, "unavailable");
         for command in &healthy {
-            let retained = store.get_command(&command.id).unwrap().unwrap();
-            assert_eq!(retained.state, command.state);
+            let retained = store.get_command(&command.command.id).unwrap().unwrap();
+            assert_eq!(retained.state, command.command.state);
         }
         let dispatched: i64 = store
             .connection

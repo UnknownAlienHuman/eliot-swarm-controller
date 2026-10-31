@@ -172,6 +172,21 @@ pub(super) fn validate_project_rule_admission_tx(
     Ok(Some(registration))
 }
 
+pub(super) fn validate_project_rule_launch_action_tx(
+    tx: &Transaction<'_>,
+    principal: &str,
+    args: &Value,
+) -> Result<Option<core::api::ProjectRegistrationView>> {
+    let Some(project_id) = project_id_from_principal(principal)? else {
+        return Ok(None);
+    };
+    let registration = load_project_registration(tx, &project_id)?
+        .ok_or_else(|| Error::new("not_allowed", "project registration is absent"))?
+        .view;
+    validate_project_launch_args(&registration, args)?;
+    Ok(Some(registration))
+}
+
 pub(super) fn capture_project_command_binding_tx(
     tx: &Transaction<'_>,
     command: &CommandInsert<'_>,
@@ -183,16 +198,23 @@ pub(super) fn capture_project_command_binding_tx(
         .ok_or_else(|| Error::new("not_allowed", "project registration is absent"))?
         .view;
     let binding = if let Some(target) = command.target {
-        let generation = command
-            .generation
-            .ok_or_else(|| Error::new("not_allowed", "project command has no frozen generation"))?;
-        project_binding_for_agent_tx(
-            tx,
-            &registration,
-            &format_agent_id(target),
-            generation,
-            command.verb,
-        )?
+        if command.verb == "launch" {
+            validate_project_launch_args(&registration, command.args)?;
+        }
+        if command.verb == "send" && command.link_kind == Some("send") {
+            project_launch_input_binding_tx(tx, &registration, command, target)?
+        } else {
+            let generation = command.generation.ok_or_else(|| {
+                Error::new("not_allowed", "project command has no frozen generation")
+            })?;
+            project_binding_for_agent_tx(
+                tx,
+                &registration,
+                &format_agent_id(target),
+                generation,
+                command.verb,
+            )?
+        }
     } else if command.verb == "run" {
         require_project_registration_action(&registration, "run")?;
         targetless_project_run_binding(registration.revision)
@@ -242,6 +264,9 @@ pub(super) fn validate_project_command_dispatch_tx(
     let registration = load_project_registration(tx, &project_id)?
         .ok_or_else(|| Error::new("not_allowed", "project registration was removed"))?
         .view;
+    if command.command.verb == "launch" {
+        validate_project_launch_args(&registration, &command.command.args)?;
+    }
     if command.target.is_none() && command.command.verb == "run" {
         require_project_registration_action(&registration, "run")?;
         if binding != targetless_project_run_binding(registration.revision) {
@@ -308,6 +333,121 @@ fn require_project_registration_action(
         ));
     }
     Ok(())
+}
+
+fn validate_project_launch_args(
+    registration: &core::api::ProjectRegistrationView,
+    args: &Value,
+) -> Result<()> {
+    require_project_registration_action(registration, "launch")?;
+    let profile = required_string(args, "profile")?;
+    if !registration
+        .profiles
+        .iter()
+        .any(|approved| approved == &profile)
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "project registration does not approve the launch profile",
+        ));
+    }
+    let workspace = required_string(args, "workspace")?;
+    if workspace != registration.checkout {
+        return Err(Error::new(
+            "not_allowed",
+            "project launch workspace is not the registered checkout",
+        ));
+    }
+    if args
+        .get("worktree")
+        .is_some_and(|worktree| !worktree.is_null())
+    {
+        return Err(Error::new(
+            "unsupported",
+            "project rule launch does not admit managed workspace preparation",
+        ));
+    }
+    if args.get("text").is_some_and(|text| !text.is_null()) {
+        require_project_registration_action(registration, "send")?;
+    }
+    Ok(())
+}
+
+fn project_launch_input_binding_tx(
+    tx: &Transaction<'_>,
+    registration: &core::api::ProjectRegistrationView,
+    command: &CommandInsert<'_>,
+    target: i64,
+) -> Result<ProjectCommandBinding> {
+    let parent_id = command.parent_command.ok_or_else(|| {
+        Error::new(
+            "not_allowed",
+            "project launch input must be linked to its admitted launch",
+        )
+    })?;
+    let parent = load_command_record(tx, parent_id)?
+        .ok_or_else(|| Error::new("source_integrity", "project launch input parent is missing"))?;
+    let launch_text = parent.command.args.get("text").and_then(Value::as_str);
+    if command.link_kind != Some("send")
+        || command.ordinal != Some(0)
+        || command.id != format!("{parent_id}/send")
+        || command.target != Some(target)
+        || command.expected_generation != Some(1)
+        || command.generation != Some(1)
+        || command.expected_turn_id.is_some()
+        || command.request_id.is_some()
+        || command.probe
+        || command.state != CommandState::Queued
+        || launch_text.is_none()
+        || command.args.get("text").and_then(Value::as_str) != launch_text
+        || parent.command.method != command.method
+        || parent.command.principal != command.principal
+        || parent.command.verb != "launch"
+        || parent.state != CommandState::Accepted
+        || parent.target != Some(target)
+        || parent.command.generation != Some(0)
+        || parent
+            .command
+            .expected_generation
+            .is_some_and(|generation| generation != 0)
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "project linked input does not match its exact queued launch and next generation",
+        ));
+    }
+    validate_project_launch_args(registration, &parent.command.args)?;
+    require_project_registration_action(registration, "send")?;
+    let agent = load_agent_by_num(tx, target)?
+        .ok_or_else(|| Error::new("not_found", "project launch Agent was not found"))?;
+    if agent.generation != 0 || agent.state != AgentState::Created {
+        return Err(Error::new(
+            "not_allowed",
+            "project launch input is not bound to the next generation of a created Agent",
+        ));
+    }
+    let binding =
+        project_binding_for_agent_tx(tx, registration, &format_agent_id(target), 0, "launch")?;
+    let encoded: Option<String> = tx
+        .query_row(
+            "SELECT project_binding FROM commands WHERE id = ?1",
+            [parent_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?
+        .flatten();
+    let saved = encoded
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<ProjectCommandBinding>(value).ok())
+        .ok_or_else(|| Error::new("source_integrity", "project launch has no saved binding"))?;
+    if saved != binding {
+        return Err(Error::new(
+            "source_integrity",
+            "project linked input differs from its launch registration binding",
+        ));
+    }
+    Ok(binding)
 }
 
 fn project_binding_for_agent_tx(
@@ -478,7 +618,7 @@ fn normalize_registration(input: &ProjectRegistrationInput) -> Result<ProjectReg
 fn is_supported_project_action(action: &str) -> bool {
     matches!(
         action,
-        "stop" | "send" | "interrupt" | "steer" | "approve" | "deny" | "answer"
+        "launch" | "stop" | "send" | "interrupt" | "steer" | "approve" | "deny" | "answer"
     )
 }
 

@@ -553,7 +553,7 @@ mod tests {
                 now + 2,
             )
             .expect("admit targetless Run child");
-        let run = admission.child.expect("Run child");
+        let run = admission.child.expect("Run child").command;
         (admission.state, event, run)
     }
 
@@ -652,7 +652,11 @@ mod tests {
             )
             .expect("admit initial rule Run");
         let state = first.state;
-        let run = dispatch_run(store, &first.child.expect("initial Run child"), now + 7);
+        let run = dispatch_run(
+            store,
+            &first.child.expect("initial Run child").command,
+            now + 7,
+        );
         let output = store
             .admit_script_output(
                 &run.id,
@@ -996,7 +1000,7 @@ mod tests {
             .expect("admit first Run");
         let run = dispatch_run(
             &mut store,
-            &run_admission.child.expect("first Run child"),
+            &run_admission.child.expect("first Run child").command,
             14,
         );
         let output = store
@@ -1101,7 +1105,7 @@ mod tests {
 
         if allow_self {
             let parent = admission.parent.expect("allow_self Run parent");
-            let run = admission.child.expect("allow_self Run child");
+            let run = admission.child.expect("allow_self Run child").command;
             assert_eq!(parent.verb, "rule");
             assert_eq!(run.verb, "run");
             let cause = command_cause_tx(&store.connection, &run.id)
@@ -1180,7 +1184,7 @@ mod tests {
 
         if allow_self {
             assert_eq!(admission.children.len(), 1);
-            let run = &admission.children[0];
+            let run = &admission.children[0].command;
             assert_eq!(run.verb, "run");
             let cause = command_cause_tx(&store.connection, &run.id)
                 .expect("read admitted history Run cause")
@@ -1375,7 +1379,8 @@ mod tests {
             )
             .expect("admit cause source child")
             .child
-            .expect("cause source child");
+            .expect("cause source child")
+            .command;
         let trigger_cause = command_cause_tx(&store.connection, &prior_child.id)
             .expect("read source cause")
             .expect("source command has cause");
@@ -1412,7 +1417,7 @@ mod tests {
             .expect("admit event-bound catch-up Run");
         assert_eq!(admitted.parent.verb, "rule.catch_up");
         assert_eq!(admitted.children.len(), 1);
-        let run = admitted.children[0].clone();
+        let run = admitted.children[0].command.clone();
         assert!(run.target.is_none());
         let run_cause = command_cause_tx(&store.connection, &run.id)
             .expect("read catch-up Run cause")
@@ -1444,9 +1449,9 @@ mod tests {
             .expect("replay retained catch-up parent and Run child");
         assert!(!replay.is_new);
         assert!(replay.events.is_empty());
-        assert_eq!(replay.children[0].id, run.id);
+        assert_eq!(replay.children[0].command.id, run.id);
         assert_eq!(
-            replay.children[0].outcome.as_ref().unwrap()["process"]["custody"],
+            replay.children[0].command.outcome.as_ref().unwrap()["process"]["custody"],
             "exact"
         );
 
@@ -1566,7 +1571,7 @@ mod tests {
                 now + 1,
             )
             .expect("admit valid in-range catch-up Run");
-        let run = valid.children[0].clone();
+        let run = valid.children[0].command.clone();
         let mut tampered_args = run.args.clone();
         tampered_args["context"]["event"]["seq"] = json!(through_seq + 1);
         let encoded = serde_json::to_string(&tampered_args).expect("encode modified test row");

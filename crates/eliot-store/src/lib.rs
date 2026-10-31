@@ -6456,7 +6456,8 @@ fn write_exists(connection: &Connection, id: &str) -> Result<bool> {
 fn load_linked_command(connection: &Connection, parent: &str) -> Result<Option<Command>> {
     let child_id: Option<String> = connection
         .query_row(
-            "SELECT id FROM commands WHERE parent_command = ?1 ORDER BY ordinal LIMIT 1",
+            "SELECT id FROM commands
+             WHERE parent_command = ?1 AND link_kind = 'send' AND ordinal = 0",
             [parent],
             |row| row.get(0),
         )
@@ -8217,7 +8218,10 @@ fn fail_unstarted_launch_tx(
     if command.target != Some(agent_num)
         || command.command.verb != "launch"
         || command.command.generation != Some(0)
-        || !matches!(command.state, CommandState::Rejected | CommandState::Failed)
+        || !matches!(
+            command.state,
+            CommandState::Rejected | CommandState::Failed | CommandState::Cancelled
+        )
     {
         return Err(Error::new(
             "stale_generation",

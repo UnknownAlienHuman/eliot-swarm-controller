@@ -2160,6 +2160,24 @@ fn wait_fake_send_turn_result(
     command: &CoreCommand,
     expected_text: &str,
 ) -> CoreTurn {
+    wait_fake_send_turn_result_until(
+        fixture,
+        agent,
+        generation,
+        command,
+        expected_text,
+        std::time::Instant::now() + Duration::from_secs(20),
+    )
+}
+
+fn wait_fake_send_turn_result_until(
+    fixture: &Fixture,
+    agent: &str,
+    generation: i64,
+    command: &CoreCommand,
+    expected_text: &str,
+    deadline: std::time::Instant,
+) -> CoreTurn {
     assert_eq!(command.verb, "send");
     assert_eq!(command.target.as_deref(), Some(agent));
     assert_eq!(command.expected_generation, Some(generation));
@@ -2174,9 +2192,18 @@ fn wait_fake_send_turn_result(
         turn_id: Some(turn_id.to_owned()),
         limit: 1,
     };
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "SEND command {} did not produce its exact terminal turn before the shared deadline",
+            command.id
+        );
         let events = fixture.events();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "SEND command {} event read exceeded the shared deadline",
+            command.id
+        );
         let terminal = events.iter().find(|event| {
             event["kind"] == "turn.completed"
                 && event["agent"] == agent
@@ -2185,7 +2212,12 @@ fn wait_fake_send_turn_result(
                 && event["data"]["turn_id"] == turn_id
         });
         if terminal.is_some() {
-            let response: AgentResultResponse = serde_json::from_value(fixture.json(&[
+            assert!(
+                std::time::Instant::now() < deadline,
+                "SEND command {} result read deadline",
+                command.id
+            );
+            let result_reply = fixture.json(&[
                 "result",
                 agent,
                 "--generation",
@@ -2194,8 +2226,14 @@ fn wait_fake_send_turn_result(
                 turn_id,
                 "--limit",
                 "1",
-            ]))
-            .expect("typed exact SEND result");
+            ]);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "SEND command {} result read exceeded the shared deadline",
+                command.id
+            );
+            let response: AgentResultResponse =
+                serde_json::from_value(result_reply).expect("typed exact SEND result");
             request
                 .validate_response(&response)
                 .expect("SEND result remains bound to its command turn");
@@ -2211,7 +2249,10 @@ fn wait_fake_send_turn_result(
             "SEND command {} did not produce its exact terminal turn",
             command.id
         );
-        std::thread::sleep(Duration::from_millis(25));
+        std::thread::sleep(
+            Duration::from_millis(25)
+                .min(deadline.saturating_duration_since(std::time::Instant::now())),
+        );
     }
 }
 
@@ -7740,6 +7781,1929 @@ fn cli_event_rules_reply_to_exact_fake_requests_in_global_and_project_scopes() {
         assert_eq!(fault_dispatches(&events_after_restart, &send.id), 1);
         assert_eq!(fault_dispatches(&events_after_restart, &reply.id), 1);
         assert_eq!(fault_dispatches(&events_after_restart, &interrupt.id), 1);
+    }
+    fixture.stop(false);
+}
+
+#[test]
+fn cli_fake_launch_actions_cover_owner_project_event_scheduled_manual_and_replay() {
+    const PROJECT_ID: &str = "launch-acceptance";
+    const OWNER_EVENT: &str = "owner-event-launch";
+    const PROJECT_EVENT: &str = "project-event-launch";
+    const OWNER_SCHEDULED: &str = "owner-scheduled-launch";
+    const PROJECT_SCHEDULED: &str = "project-scheduled-launch";
+    const OWNER_MANUAL: &str = "owner-manual-launch";
+    const PROJECT_MANUAL: &str = "project-manual-launch";
+    const OWNER_HISTORY_RULE: &str = "owner-history-launch-catchup";
+    const PROJECT_HISTORY_RULE: &str = "project-history-launch-catchup";
+    const OWNER_EVENT_TEXT: &str = "owner-event-completed";
+    const PROJECT_SCHEDULED_TEXT: &str = "project-scheduled-echo";
+    const PROJECT_MANUAL_TEXT: &str = "project-manual-echo";
+    const OWNER_HISTORY_TEXT: &str = "owner-history-completed";
+    const PROJECT_HISTORY_TEXT: &str = "project-history-completed";
+    const PERIOD_MS: i64 = 10_000;
+    const FIRST_SLOT_DELAY_MS: i64 = 3_000;
+    const SCHEDULED_WAKE_GRACE_MS: i64 = 5_000;
+    const MAX_SCHEDULED_REMAINING_MS: i64 = PERIOD_MS;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Trigger {
+        Event,
+        Scheduled,
+        Manual,
+    }
+
+    #[derive(Clone, Copy)]
+    struct Case {
+        rule: &'static str,
+        project: Option<&'static str>,
+        trigger: Trigger,
+        input: Option<&'static str>,
+    }
+
+    #[derive(Clone, Copy)]
+    struct HistoryCase {
+        rule: &'static str,
+        project: Option<&'static str>,
+        text_template: &'static str,
+        expected_text: &'static str,
+    }
+
+    struct HistoryRecord {
+        case: HistoryCase,
+        id: String,
+        args: Vec<String>,
+        parent: CoreCommand,
+        launch: CoreCommand,
+        send: CoreCommand,
+        agent: String,
+        revision: i64,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct ScheduledFiringIdentity {
+        rule: String,
+        project: Option<String>,
+        schedule_revision: i64,
+        scheduled_at_ms: i64,
+        parent_command: String,
+        child_command: String,
+    }
+
+    const CASES: [Case; 6] = [
+        Case {
+            rule: OWNER_EVENT,
+            project: None,
+            trigger: Trigger::Event,
+            input: Some(OWNER_EVENT_TEXT),
+        },
+        Case {
+            rule: PROJECT_EVENT,
+            project: Some(PROJECT_ID),
+            trigger: Trigger::Event,
+            input: None,
+        },
+        Case {
+            rule: OWNER_SCHEDULED,
+            project: None,
+            trigger: Trigger::Scheduled,
+            input: None,
+        },
+        Case {
+            rule: PROJECT_SCHEDULED,
+            project: Some(PROJECT_ID),
+            trigger: Trigger::Scheduled,
+            input: Some(PROJECT_SCHEDULED_TEXT),
+        },
+        Case {
+            rule: OWNER_MANUAL,
+            project: None,
+            trigger: Trigger::Manual,
+            input: None,
+        },
+        Case {
+            rule: PROJECT_MANUAL,
+            project: Some(PROJECT_ID),
+            trigger: Trigger::Manual,
+            input: Some(PROJECT_MANUAL_TEXT),
+        },
+    ];
+
+    const HISTORY_CASES: [HistoryCase; 2] = [
+        HistoryCase {
+            rule: OWNER_HISTORY_RULE,
+            project: None,
+            text_template: "owner-history-${data.status}",
+            expected_text: OWNER_HISTORY_TEXT,
+        },
+        HistoryCase {
+            rule: PROJECT_HISTORY_RULE,
+            project: Some(PROJECT_ID),
+            text_template: "project-history-${data.status}",
+            expected_text: PROJECT_HISTORY_TEXT,
+        },
+    ];
+
+    let mut fixture = Fixture::new("automation targetless launch");
+    assert!(
+        fixture
+            .git(&["init", "--initial-branch=main"])
+            .status
+            .success()
+    );
+    fs::write(
+        fixture.workspace.join("seed.txt"),
+        "targetless launch acceptance\n",
+    )
+    .expect("write project checkout seed");
+    assert!(fixture.git(&["add", "--", "seed.txt"]).status.success());
+    assert!(
+        fixture
+            .git(&["commit", "-m", "Targetless launch fixture"])
+            .status
+            .success()
+    );
+    fixture.start();
+    fixture.stop(false);
+
+    let workspace = fixture.workspace.to_string_lossy().into_owned();
+    let alternate_workspace = fixture.workspace.join("alternate launch workspace");
+    fs::create_dir(&alternate_workspace).expect("create changed replay workspace path");
+    let alternate_workspace = alternate_workspace.to_string_lossy().into_owned();
+    fs::write(
+        fixture.data.join("config.toml"),
+        format!(
+            "[projects.{project_id}]\npath = {workspace:?}\nprofiles = [\"fake\"]\nactions = [\"launch\", \"send\"]\n",
+            project_id = PROJECT_ID,
+        ),
+    )
+    .expect("register project launch and linked-send authority");
+
+    fixture.start();
+    let registration_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let registration: ProjectRegistrationView = loop {
+        let reply = cli(&fixture.data, &["project", "show", PROJECT_ID]);
+        if reply.status.success() {
+            break serde_json::from_str(&reply.stdout).expect("typed launch project registration");
+        }
+        assert!(
+            std::time::Instant::now() < registration_deadline,
+            "launch project registration readback deadline"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    registration
+        .validate()
+        .expect("valid registered launch project");
+    assert_eq!(registration.id, PROJECT_ID);
+    assert!(
+        registration
+            .profiles
+            .iter()
+            .any(|profile| profile == "fake")
+    );
+    assert!(registration.actions.iter().any(|action| action == "launch"));
+    assert!(registration.actions.iter().any(|action| action == "send"));
+
+    let seed_send_id = ulid::Ulid::new().to_string();
+    let render_action = |profile: &str, action_workspace: &str, text: Option<&str>| match text {
+        Some(text) => format!(
+            "{{ action = \"launch\", profile = {profile:?}, workspace = {action_workspace:?}, text = {text:?} }}"
+        ),
+        None => format!(
+            "{{ action = \"launch\", profile = {profile:?}, workspace = {action_workspace:?} }}"
+        ),
+    };
+    let render_event_rule =
+        |id: &str, profile: &str, action_workspace: &str, text: Option<&str>| {
+            format!(
+                concat!(
+                    "[[rule]]\n",
+                    "id = {id:?}\n",
+                    "on = {{ event = \"turn.completed\", match = {{ ",
+                    "\"subject.harness\" = \"fake\", ",
+                    "\"event.data.command_id\" = {seed_send_id:?} }} }}\n",
+                    "do = [{action}]\n\n",
+                ),
+                id = id,
+                seed_send_id = seed_send_id,
+                action = render_action(profile, action_workspace, text),
+            )
+        };
+    let render_timer_rule = |id: &str,
+                             profile: &str,
+                             action_workspace: &str,
+                             text: Option<&str>,
+                             anchor_ms: Option<i64>| {
+        let schedule = match anchor_ms {
+            Some(anchor_ms) => format!("{{ every = \"10s\", anchor = {anchor_ms} }}"),
+            None => "{ every = \"1h\" }".to_owned(),
+        };
+        format!(
+            "[[rule]]\nid = {id:?}\non = {schedule}\ndo = [{action}]\n\n",
+            id = id,
+            schedule = schedule,
+            action = render_action(profile, action_workspace, text),
+        )
+    };
+    let render_rule_files = |profile: &str, action_workspace: &str, anchor_ms: i64| {
+        let owner = format!(
+            "{}{}{}",
+            render_event_rule(
+                OWNER_EVENT,
+                profile,
+                action_workspace,
+                Some("owner-event-${data.status}"),
+            ),
+            render_timer_rule(
+                OWNER_SCHEDULED,
+                profile,
+                action_workspace,
+                None,
+                Some(anchor_ms)
+            ),
+            render_timer_rule(OWNER_MANUAL, profile, action_workspace, None, None),
+        );
+        let project = format!(
+            "{}{}{}",
+            render_event_rule(PROJECT_EVENT, profile, action_workspace, None),
+            render_timer_rule(
+                PROJECT_SCHEDULED,
+                profile,
+                action_workspace,
+                Some(PROJECT_SCHEDULED_TEXT),
+                Some(anchor_ms),
+            ),
+            render_timer_rule(
+                PROJECT_MANUAL,
+                profile,
+                action_workspace,
+                Some(PROJECT_MANUAL_TEXT),
+                None,
+            ),
+        );
+        (owner, project)
+    };
+
+    let epoch_ms = || {
+        i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock is after the Unix epoch")
+                .as_millis(),
+        )
+        .expect("epoch milliseconds fit signed range")
+    };
+    let now_ms = epoch_ms();
+    let scheduled_anchor = now_ms - PERIOD_MS + FIRST_SLOT_DELAY_MS;
+    let (owner_rules, project_rules) =
+        render_rule_files("fake", &registration.checkout, scheduled_anchor);
+    let global_rule_dir = fixture.data.join("rules");
+    let project_rule_dir = fixture.workspace.join(".eliot").join("rules");
+    fs::create_dir_all(&global_rule_dir).expect("create global launch rule directory");
+    fs::create_dir_all(&project_rule_dir).expect("create registered project rule directory");
+    fs::write(global_rule_dir.join("launches.toml"), owner_rules)
+        .expect("write three Owner launch rules");
+    fs::write(project_rule_dir.join("launches.toml"), project_rules)
+        .expect("write three Project launch rules");
+
+    let wait_rule = |fixture: &Fixture, rule_id: &str, project: Option<&str>| -> RuleStateView {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let reply = match project {
+                Some(project) => cli(
+                    &fixture.data,
+                    &["rule", "show", rule_id, "--project", project],
+                ),
+                None => cli(&fixture.data, &["rule", "show", rule_id]),
+            };
+            if reply.status.success() {
+                let state: RuleStateView =
+                    serde_json::from_str(&reply.stdout).expect("typed launch rule state");
+                if state.project.as_deref() == project {
+                    return state;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "launch rule {rule_id} load deadline"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    };
+    let sleep_before_deadline = |deadline: std::time::Instant| {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if !remaining.is_zero() {
+            std::thread::sleep(Duration::from_millis(25).min(remaining));
+        }
+    };
+    let read_timer_until = |fixture: &Fixture,
+                            rule_id: &str,
+                            project: Option<&str>,
+                            deadline: std::time::Instant|
+     -> TimerStateView {
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "launch timer {rule_id} load deadline"
+            );
+            let args = match project {
+                Some(project) => vec!["timer", "show", rule_id, "--project", project],
+                None => vec!["timer", "show", rule_id],
+            };
+            let reply = cli(&fixture.data, &args);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "launch timer {rule_id} read exceeded its deadline"
+            );
+            if reply.status.success() {
+                return serde_json::from_str(&reply.stdout).expect("typed launch timer state");
+            }
+            sleep_before_deadline(deadline);
+        }
+    };
+    let read_timer = |fixture: &Fixture, rule_id: &str, project: Option<&str>| {
+        read_timer_until(
+            fixture,
+            rule_id,
+            project,
+            std::time::Instant::now() + Duration::from_secs(20),
+        )
+    };
+    let assert_scheduled_timer_progress =
+        |fixture: &Fixture, baseline: &[(Case, TimerStateView)]| {
+            for (case, before) in baseline {
+                let after = read_timer(fixture, case.rule, case.project);
+                assert_eq!(after.schedule_revision, before.schedule_revision);
+                assert_eq!(after.schedule, before.schedule);
+                let before_last = before.last_key.expect("observed scheduled slot");
+                let after_last = after.last_key.expect("retained scheduled slot");
+                assert!(
+                    after_last >= before_last,
+                    "scheduled last_key moved backward"
+                );
+                let before_next = before.next_due_at.expect("next scheduled slot");
+                let after_next = after.next_due_at.expect("next scheduled slot after replay");
+                assert!(
+                    after_next >= before_next,
+                    "scheduled next_due_at moved backward"
+                );
+                let TimerSchedule::Interval {
+                    period_ms,
+                    anchor: Some(anchor),
+                } = &after.schedule
+                else {
+                    panic!("launch test timer lost its explicit interval phase");
+                };
+                assert!(*period_ms > 0);
+                assert_eq!((after_last - *anchor) % *period_ms, 0);
+                assert_eq!((after_next - *anchor) % *period_ms, 0);
+                assert!(after_next > after_last);
+            }
+        };
+    let mut initial_rule_revisions = Vec::new();
+    for case in CASES {
+        let state = wait_rule(&fixture, case.rule, case.project);
+        assert!(state.enabled, "launch rule {} is disabled", case.rule);
+        assert!(
+            state.paused_reason.is_none(),
+            "launch rule {} is paused",
+            case.rule
+        );
+        initial_rule_revisions.push((case, state.revision));
+        if case.trigger == Trigger::Scheduled {
+            let timer = read_timer(&fixture, case.rule, case.project);
+            assert_eq!(timer.id, case.rule);
+            assert_eq!(
+                timer.schedule,
+                TimerSchedule::Interval {
+                    period_ms: PERIOD_MS,
+                    anchor: Some(scheduled_anchor),
+                }
+            );
+            assert_eq!(timer.project.as_deref(), case.project);
+            let registered_slot = timer
+                .last_key
+                .or(timer.next_due_at)
+                .expect("registered interval has a fired or pending slot");
+            assert!(registered_slot > scheduled_anchor);
+            assert_eq!((registered_slot - scheduled_anchor) % PERIOD_MS, 0);
+        }
+    }
+
+    let wait_ready_until = |fixture: &Fixture,
+                            agent_id: &str,
+                            generation: i64,
+                            deadline: std::time::Instant|
+     -> AgentGetResponse {
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Fake Agent {agent_id} generation {generation} readiness deadline"
+            );
+            let ready = fixture.events().iter().any(|event| {
+                event["kind"] == "session.ready"
+                    && event["agent"] == agent_id
+                    && event["generation"] == generation
+            });
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Fake Agent {agent_id} generation {generation} ready-event read exceeded its deadline"
+            );
+            let view: AgentGetResponse = serde_json::from_value(fixture.json(&["show", agent_id]))
+                .expect("typed launched Agent readback");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Fake Agent {agent_id} generation {generation} view read exceeded its deadline"
+            );
+            if ready
+                && view.agent.generation == generation
+                && matches!(
+                    view.agent.state,
+                    AgentState::Idle | AgentState::Busy | AgentState::Waiting
+                )
+            {
+                return view;
+            }
+            sleep_before_deadline(deadline);
+        }
+    };
+    let wait_ready = |fixture: &Fixture, agent_id: &str, generation: i64| {
+        wait_ready_until(
+            fixture,
+            agent_id,
+            generation,
+            std::time::Instant::now() + Duration::from_secs(20),
+        )
+    };
+    let wait_applied_command_until =
+        |fixture: &Fixture, command_id: &str, deadline: std::time::Instant| -> Value {
+            loop {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "command {command_id} applied readback deadline"
+                );
+                let command = fixture.json(&["cmd", "show", command_id]);
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "command {command_id} read exceeded the shared deadline"
+                );
+                let state = command["state"].as_str();
+                if state == Some("applied") {
+                    return command;
+                }
+                assert!(
+                    matches!(state, Some("accepted" | "queued" | "dispatched")),
+                    "fixture command {command_id} reached unexpected state {:?}",
+                    command["state"]
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "command {command_id} applied readback deadline"
+                );
+                sleep_before_deadline(deadline);
+            }
+        };
+    let wait_firing = |fixture: &Fixture,
+                       rule_id: &str,
+                       event_seq: Option<i64>,
+                       scheduled_at: Option<i64>,
+                       deadline_cap: Option<std::time::Instant>|
+     -> Value {
+        let scheduled_deadline = if let Some(scheduled_at) = scheduled_at {
+            let remaining_ms = scheduled_at.saturating_sub(epoch_ms()).max(0);
+            assert!(
+                remaining_ms <= MAX_SCHEDULED_REMAINING_MS,
+                "registered timer slot {scheduled_at} is {remaining_ms}ms away; expected a phase-aligned interval slot"
+            );
+            std::time::Instant::now()
+                + Duration::from_millis(
+                    u64::try_from(remaining_ms + SCHEDULED_WAKE_GRACE_MS)
+                        .expect("bounded scheduled wait fits u64"),
+                )
+        } else {
+            std::time::Instant::now() + Duration::from_secs(30)
+        };
+        let deadline = deadline_cap.map_or(scheduled_deadline, |cap| cap.min(scheduled_deadline));
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "launch rule {rule_id} firing deadline"
+            );
+            let events = fixture.events();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "launch rule {rule_id} event read exceeded its deadline"
+            );
+            if let Some(firing) = events.iter().find(|event| {
+                event["kind"] == "rule.fired"
+                    && event["data"]["rule"] == rule_id
+                    && event_seq.is_none_or(|seq| event["data"]["event_seq"].as_i64() == Some(seq))
+                    && scheduled_at
+                        .is_none_or(|slot| event["data"]["scheduled_at_ms"].as_i64() == Some(slot))
+            }) {
+                return firing.clone();
+            }
+            sleep_before_deadline(deadline);
+        }
+    };
+    let scheduled_firing_identity = |event: &Value| -> Option<ScheduledFiringIdentity> {
+        if event["kind"] != "rule.fired" {
+            return None;
+        }
+        let rule = event["data"]["rule"].as_str()?;
+        if rule != OWNER_SCHEDULED && rule != PROJECT_SCHEDULED {
+            return None;
+        }
+        let event_project = event["data"]
+            .get("project")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let expected_project = (rule == PROJECT_SCHEDULED).then_some(PROJECT_ID);
+        if let Some(event_project) = event_project.as_deref() {
+            assert_eq!(Some(event_project), expected_project);
+        }
+        let project = expected_project.map(str::to_owned);
+        Some(ScheduledFiringIdentity {
+            rule: rule.to_owned(),
+            project,
+            schedule_revision: event["data"]["schedule_revision"]
+                .as_i64()
+                .expect("scheduled rule revision"),
+            scheduled_at_ms: event["data"]["scheduled_at_ms"]
+                .as_i64()
+                .expect("scheduled UTC slot"),
+            parent_command: event["data"]["parent_command"]
+                .as_str()
+                .expect("scheduled parent command")
+                .to_owned(),
+            child_command: event["data"]["child_command"]
+                .as_str()
+                .expect("scheduled launch child")
+                .to_owned(),
+        })
+    };
+    let scheduled_firing_identities = |events: &[Value]| {
+        events
+            .iter()
+            .filter_map(&scheduled_firing_identity)
+            .collect::<Vec<_>>()
+    };
+    let same_scheduled_slot = |left: &ScheduledFiringIdentity, right: &ScheduledFiringIdentity| {
+        left.rule == right.rule
+            && left.project == right.project
+            && left.schedule_revision == right.schedule_revision
+            && left.scheduled_at_ms == right.scheduled_at_ms
+    };
+    let distinct_scheduled_slot_count = |slots: &[ScheduledFiringIdentity], rule: &str| -> usize {
+        let mut unique: Vec<ScheduledFiringIdentity> = Vec::new();
+        for slot in slots.iter().filter(|slot| slot.rule == rule) {
+            if !unique.iter().any(|seen| same_scheduled_slot(seen, slot)) {
+                unique.push(slot.clone());
+            }
+        }
+        unique.len()
+    };
+    let verify_scheduled_slot_action =
+        |fixture: &Fixture, slot: &ScheduledFiringIdentity, events: &[Value]| {
+            let case = CASES
+                .iter()
+                .find(|case| case.rule == slot.rule)
+                .expect("scheduled firing belongs to one launch case");
+            let principal = case.project.map_or_else(
+                || "owner".to_owned(),
+                |project| format!("project:{project}"),
+            );
+            let parent: CoreCommand =
+                serde_json::from_value(fixture.wait_command(&slot.parent_command, "applied"))
+                    .expect("applied scheduled launch parent");
+            assert_eq!(parent.principal, principal);
+            assert_eq!(
+                parent.outcome.as_ref().expect("scheduled fixed child set")["children"],
+                json!([slot.child_command])
+            );
+            let launch: CoreCommand =
+                serde_json::from_value(fixture.wait_command(&slot.child_command, "applied"))
+                    .expect("applied scheduled launch child");
+            let agent = launch.target.clone().expect("resolved scheduled Agent");
+            assert_eq!(launch.principal, principal);
+            assert_eq!(launch.verb, "launch");
+            assert_eq!(launch.expected_generation, Some(0));
+            assert_eq!(launch.generation, Some(1));
+            assert_eq!(fault_dispatches(events, &launch.id), 1);
+
+            let send_id = format!("{}/send", launch.id);
+            match case.input {
+                Some(text) => {
+                    let send: CoreCommand =
+                        serde_json::from_value(fixture.wait_command(&send_id, "applied"))
+                            .expect("applied scheduled linked SEND");
+                    assert_eq!(send.principal, principal);
+                    assert_eq!(send.target.as_deref(), Some(agent.as_str()));
+                    assert_eq!(send.expected_generation, Some(1));
+                    assert_eq!(send.generation, Some(1));
+                    wait_fake_send_turn_result(fixture, &agent, 1, &send, text);
+                    assert_eq!(fault_dispatches(events, &send.id), 1);
+                }
+                None => {
+                    let missing = cli(&fixture.data, &["cmd", "show", &send_id]);
+                    assert_eq!(missing.status.code(), Some(1));
+                    assert!(missing.stderr.contains("not_found"));
+                }
+            }
+        };
+    let stop_live_fixture_agents = |fixture: &Fixture| {
+        let cleanup_deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            assert!(
+                std::time::Instant::now() < cleanup_deadline,
+                "fixture Fake Agent cleanup deadline"
+            );
+            let timers_before_scan = CASES
+                .iter()
+                .filter(|case| case.trigger == Trigger::Scheduled)
+                .map(|case| {
+                    (
+                        *case,
+                        read_timer_until(fixture, case.rule, case.project, cleanup_deadline),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut after = None;
+            let mut listed_agents = Vec::new();
+            loop {
+                let request = AgentListRequest {
+                    after: after.clone(),
+                    limit: 1000,
+                    ..AgentListRequest::default()
+                };
+                let mut args = vec!["ls", "--limit", "1000"];
+                if let Some(cursor) = after.as_deref() {
+                    args.extend(["--after", cursor]);
+                }
+                assert!(
+                    std::time::Instant::now() < cleanup_deadline,
+                    "fixture Agent list pagination deadline"
+                );
+                let reply = fixture.json(&args);
+                assert!(
+                    std::time::Instant::now() < cleanup_deadline,
+                    "fixture Agent list page read exceeded the cleanup deadline"
+                );
+                let listing: AgentListResponse =
+                    serde_json::from_value(reply).expect("typed fixture-local Agent list");
+                request
+                    .validate_response(&listing)
+                    .expect("valid fixture-local Agent list page");
+                listed_agents.extend(listing.agents.into_iter().map(|row| row.agent));
+                let Some(next) = listing.next else {
+                    break;
+                };
+                assert_ne!(
+                    after.as_deref(),
+                    Some(next.as_str()),
+                    "fixture Agent list cursor did not advance"
+                );
+                after = Some(next);
+                assert!(
+                    std::time::Instant::now() < cleanup_deadline,
+                    "fixture Agent list pagination deadline"
+                );
+            }
+            let active = listed_agents
+                .into_iter()
+                .filter(|agent| !agent.state.is_terminal())
+                .collect::<Vec<_>>();
+            if active.is_empty() {
+                let timers_after_scan = timers_before_scan
+                    .iter()
+                    .map(|(case, _)| {
+                        (
+                            *case,
+                            read_timer_until(fixture, case.rule, case.project, cleanup_deadline),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let cursor_advanced = timers_before_scan.iter().zip(&timers_after_scan).any(
+                    |((before_case, before), (after_case, after))| {
+                        assert_eq!(before_case.rule, after_case.rule);
+                        assert_eq!(before_case.project, after_case.project);
+                        before.schedule_revision != after.schedule_revision
+                            || before.last_key != after.last_key
+                            || before.next_due_at != after.next_due_at
+                    },
+                );
+                if cursor_advanced {
+                    continue;
+                }
+                let mut imminent_slot = None;
+                for (case, timer) in &timers_after_scan {
+                    if let Some(slot) = timer.next_due_at {
+                        let remaining_ms = slot.saturating_sub(epoch_ms()).max(0);
+                        if remaining_ms <= SCHEDULED_WAKE_GRACE_MS {
+                            imminent_slot = Some((case.rule, slot));
+                            break;
+                        }
+                    }
+                }
+                if let Some((rule, slot)) = imminent_slot {
+                    wait_firing(fixture, rule, None, Some(slot), Some(cleanup_deadline));
+                    assert!(std::time::Instant::now() < cleanup_deadline);
+                    continue;
+                }
+                assert!(
+                    std::time::Instant::now() < cleanup_deadline,
+                    "fixture Fake Agent cleanup deadline"
+                );
+                return;
+            }
+
+            for agent in active {
+                assert_eq!(
+                    agent.harness, "fake",
+                    "fixture cleanup found a non-Fake Agent"
+                );
+                assert!(
+                    std::time::Instant::now() < cleanup_deadline,
+                    "fixture Fake Agent launch lookup deadline"
+                );
+                let accepted_events = fixture.events();
+                assert!(
+                    std::time::Instant::now() < cleanup_deadline,
+                    "fixture Fake Agent acceptance-event read exceeded the cleanup deadline"
+                );
+                let mut launch_id = None;
+                for event in accepted_events.iter().filter(|event| {
+                    event["kind"] == "command.accepted" && event["agent"] == agent.id
+                }) {
+                    let Some(command_id) = event["data"]["command_id"].as_str() else {
+                        continue;
+                    };
+                    assert!(
+                        std::time::Instant::now() < cleanup_deadline,
+                        "fixture Fake Agent command lookup deadline"
+                    );
+                    let command: CoreCommand =
+                        serde_json::from_value(fixture.json(&["cmd", "show", command_id]))
+                            .expect("typed command accepted for fixture Fake Agent");
+                    assert!(
+                        std::time::Instant::now() < cleanup_deadline,
+                        "fixture Fake Agent command read exceeded the cleanup deadline"
+                    );
+                    if command.verb == "launch"
+                        && command.target.as_deref() == Some(agent.id.as_str())
+                    {
+                        launch_id = Some(command_id.to_owned());
+                        break;
+                    }
+                }
+                let launch_id =
+                    launch_id.expect("fixture Fake Agent has a committed launch acceptance");
+                let launch: CoreCommand = serde_json::from_value(wait_applied_command_until(
+                    fixture,
+                    &launch_id,
+                    cleanup_deadline,
+                ))
+                .expect("applied fixture Fake launch");
+                assert_eq!(launch.verb, "launch");
+                assert_eq!(launch.target.as_deref(), Some(agent.id.as_str()));
+                assert_eq!(launch.expected_generation, Some(0));
+                let generation = launch
+                    .generation
+                    .expect("applied launch exposes its dispatched generation");
+                assert!(generation > 0);
+                assert!(
+                    agent.generation == 0 || agent.generation == generation,
+                    "listed Agent generation {} disagrees with applied launch generation {generation}",
+                    agent.generation
+                );
+                let ready = wait_ready_until(fixture, &agent.id, generation, cleanup_deadline);
+                assert_eq!(ready.agent.generation, generation);
+                let send_id = format!("{launch_id}/send");
+                assert!(
+                    std::time::Instant::now() < cleanup_deadline,
+                    "fixture Fake linked SEND lookup deadline"
+                );
+                let send_reply = cli(fixture.data.as_path(), &["cmd", "show", &send_id]);
+                assert!(
+                    std::time::Instant::now() < cleanup_deadline,
+                    "fixture Fake linked SEND read exceeded the cleanup deadline"
+                );
+                if send_reply.status.success() {
+                    let _: CoreCommand = serde_json::from_str(&send_reply.stdout)
+                        .expect("typed fixture launch linked SEND");
+                    let send: CoreCommand = serde_json::from_value(wait_applied_command_until(
+                        fixture,
+                        &send_id,
+                        cleanup_deadline,
+                    ))
+                    .expect("applied fixture launch linked SEND");
+                    let text = send.args["text"]
+                        .as_str()
+                        .expect("linked SEND has frozen text");
+                    wait_fake_send_turn_result_until(
+                        fixture,
+                        &agent.id,
+                        generation,
+                        &send,
+                        text,
+                        cleanup_deadline,
+                    );
+                } else {
+                    assert_eq!(send_reply.status.code(), Some(1));
+                    assert!(send_reply.stderr.contains("not_found"));
+                }
+
+                let generation_arg = generation.to_string();
+                assert!(
+                    std::time::Instant::now() < cleanup_deadline,
+                    "fixture Fake stop admission deadline"
+                );
+                let stop: CommandSubmitResponse = serde_json::from_value(fixture.json(&[
+                    "stop",
+                    &agent.id,
+                    "--generation",
+                    &generation_arg,
+                ]))
+                .expect("exact-generation fixture Fake stop");
+                assert!(
+                    std::time::Instant::now() < cleanup_deadline,
+                    "fixture Fake stop admission exceeded the cleanup deadline"
+                );
+                wait_applied_command_until(fixture, &stop.command_id, cleanup_deadline);
+                assert!(
+                    std::time::Instant::now() < cleanup_deadline,
+                    "fixture Fake stopped Agent readback deadline"
+                );
+                let stopped_reply = fixture.json(&["show", &agent.id]);
+                assert!(
+                    std::time::Instant::now() < cleanup_deadline,
+                    "fixture Fake stopped Agent read exceeded the cleanup deadline"
+                );
+                let stopped: AgentGetResponse =
+                    serde_json::from_value(stopped_reply).expect("stopped fixture Fake Agent");
+                assert_eq!(stopped.agent.generation, generation);
+                assert_eq!(stopped.agent.state, AgentState::Stopped);
+            }
+            assert!(
+                std::time::Instant::now() < cleanup_deadline,
+                "fixture Fake Agent cleanup deadline"
+            );
+        }
+    };
+    let assert_scheduled_slot_history = |fixture: &Fixture,
+                                         before: &[ScheduledFiringIdentity],
+                                         after: &[ScheduledFiringIdentity],
+                                         timer_baseline: &[(Case, TimerStateView)],
+                                         events: &[Value]| {
+        for slot in after {
+            assert_eq!(
+                after
+                    .iter()
+                    .filter(|candidate| same_scheduled_slot(candidate, slot))
+                    .count(),
+                1,
+                "scheduled slot identity was duplicated: {} at {}",
+                slot.rule,
+                slot.scheduled_at_ms
+            );
+            let case = CASES
+                .iter()
+                .find(|case| case.rule == slot.rule)
+                .expect("scheduled identity maps to a launch case");
+            assert_eq!(slot.project.as_deref(), case.project);
+            let (_, timer) = timer_baseline
+                .iter()
+                .find(|(baseline_case, _)| baseline_case.rule == slot.rule)
+                .expect("scheduled case has registered timer state");
+            assert_eq!(slot.schedule_revision, timer.schedule_revision);
+            let TimerSchedule::Interval {
+                period_ms,
+                anchor: Some(anchor),
+            } = &timer.schedule
+            else {
+                panic!("scheduled identity has no registered interval phase");
+            };
+            assert!(slot.scheduled_at_ms > *anchor);
+            assert_eq!((slot.scheduled_at_ms - *anchor) % *period_ms, 0);
+            if let Some(previous_slot) = before
+                .iter()
+                .filter(|candidate| {
+                    candidate.rule == slot.rule
+                        && candidate.project == slot.project
+                        && candidate.schedule_revision == slot.schedule_revision
+                })
+                .map(|candidate| candidate.scheduled_at_ms)
+                .max()
+                && !before
+                    .iter()
+                    .any(|candidate| same_scheduled_slot(candidate, slot))
+            {
+                assert!(
+                    slot.scheduled_at_ms > previous_slot,
+                    "later scheduled slot did not advance its phase"
+                );
+            }
+            verify_scheduled_slot_action(fixture, slot, events);
+        }
+        for slot in before {
+            let retained: Vec<_> = after
+                .iter()
+                .filter(|candidate| same_scheduled_slot(candidate, slot))
+                .collect();
+            assert_eq!(retained.len(), 1, "retained scheduled slot disappeared");
+            assert_eq!(retained[0].parent_command, slot.parent_command);
+            assert_eq!(retained[0].child_command, slot.child_command);
+        }
+        assert_scheduled_timer_progress(fixture, timer_baseline);
+    };
+
+    let source_reply = cli(
+        &fixture.data,
+        &["launch", "--profile", "fake", "--workspace", &workspace],
+    );
+    assert!(source_reply.status.success(), "Fake trigger launch failed");
+    let source_launch: CoreCommand =
+        serde_json::from_str(&source_reply.stdout).expect("typed Fake trigger launch");
+    let source_launch: CoreCommand =
+        serde_json::from_value(fixture.wait_command(&source_launch.id, "applied"))
+            .expect("applied Fake trigger launch");
+    let source_agent = source_launch.target.clone().expect("Fake trigger Agent");
+    let source_generation = source_launch.generation.expect("Fake trigger generation");
+    assert_eq!(source_generation, 1);
+    let source_view = wait_ready(&fixture, &source_agent, source_generation);
+    assert_eq!(source_view.agent.project, registration.checkout);
+    let mut created_agents = vec![(source_agent.clone(), source_generation)];
+
+    let source_generation_arg = source_generation.to_string();
+    let seed_reply = cli(
+        &fixture.data,
+        &[
+            "--id",
+            &seed_send_id,
+            "send",
+            &source_agent,
+            "--generation",
+            &source_generation_arg,
+            "--",
+            "launch-trigger-echo",
+        ],
+    );
+    assert!(seed_reply.status.success(), "Fake trigger SEND failed");
+    let seed_command: CoreCommand =
+        serde_json::from_value(fixture.wait_command(&seed_send_id, "applied"))
+            .expect("applied Fake trigger SEND");
+    let seed_turn = wait_fake_send_turn_result(
+        &fixture,
+        &source_agent,
+        source_generation,
+        &seed_command,
+        "launch-trigger-echo",
+    );
+    let seed_event = fixture
+        .events()
+        .into_iter()
+        .find(|event| {
+            event["kind"] == "turn.completed"
+                && event["agent"] == source_agent
+                && event["generation"] == source_generation
+                && event["data"]["command_id"] == seed_send_id
+                && event["data"]["turn_id"] == seed_turn.turn_id
+        })
+        .expect("exact Fake trigger completion event");
+    let seed_event_seq = seed_event["seq"].as_i64().expect("trigger event sequence");
+
+    let mut records: Vec<(Case, CoreCommand, CoreCommand, Option<CoreCommand>)> = Vec::new();
+    let mut manual_replays: Vec<(Case, String, CoreCommand)> = Vec::new();
+    let mut scheduled_states: Vec<(Case, TimerStateView)> = Vec::new();
+    for case in CASES {
+        let (parent_id, launch_id, manual_parent) = match case.trigger {
+            Trigger::Event => {
+                let firing = wait_firing(&fixture, case.rule, Some(seed_event_seq), None, None);
+                let definition_revision = initial_rule_revisions
+                    .iter()
+                    .find(|(loaded_case, _)| loaded_case.rule == case.rule)
+                    .map(|(_, revision)| *revision)
+                    .expect("loaded event rule revision");
+                assert_eq!(firing["data"]["revision"], definition_revision);
+                let parent_id = firing["data"]["parent_command"]
+                    .as_str()
+                    .expect("event launch rule parent")
+                    .to_owned();
+                let launch_id = firing["data"]["child_command"]
+                    .as_str()
+                    .expect("event launch action child")
+                    .to_owned();
+                (parent_id, launch_id, None)
+            }
+            Trigger::Scheduled => {
+                let timer_before_fire = read_timer(&fixture, case.rule, case.project);
+                let scheduled_at = timer_before_fire
+                    .last_key
+                    .or(timer_before_fire.next_due_at)
+                    .expect("scheduled timer exposes its actual slot");
+                let firing = wait_firing(&fixture, case.rule, None, Some(scheduled_at), None);
+                let parent_id = firing["data"]["parent_command"]
+                    .as_str()
+                    .expect("scheduled launch timer parent")
+                    .to_owned();
+                let launch_id = firing["data"]["child_command"]
+                    .as_str()
+                    .expect("scheduled launch action child")
+                    .to_owned();
+                assert_eq!(firing["data"]["scheduled_at_ms"], scheduled_at);
+                let timer = read_timer(&fixture, case.rule, case.project);
+                let observed_last_key = timer
+                    .last_key
+                    .expect("scheduled timer retained its fired slot");
+                assert!(
+                    observed_last_key >= scheduled_at,
+                    "scheduled timer regressed behind observed slot {scheduled_at}: last_key={observed_last_key}"
+                );
+                assert_eq!(
+                    timer.schedule_revision,
+                    firing["data"]["schedule_revision"]
+                        .as_i64()
+                        .expect("scheduled firing revision")
+                );
+                scheduled_states.push((case, timer));
+                (parent_id, launch_id, None)
+            }
+            Trigger::Manual => {
+                let manual_id = ulid::Ulid::new().to_string();
+                let args = match case.project {
+                    Some(project) => vec![
+                        "--id",
+                        manual_id.as_str(),
+                        "timer",
+                        "run",
+                        case.rule,
+                        "--project",
+                        project,
+                    ],
+                    None => vec!["--id", manual_id.as_str(), "timer", "run", case.rule],
+                };
+                let reply = cli(&fixture.data, &args);
+                assert!(
+                    reply.status.success(),
+                    "manual launch timer {} failed",
+                    case.rule
+                );
+                let parent: CoreCommand =
+                    serde_json::from_str(&reply.stdout).expect("typed manual timer parent");
+                assert_eq!(parent.id, manual_id);
+                let children: Vec<String> = serde_json::from_value(
+                    parent.outcome.as_ref().expect("manual timer child set")["children"].clone(),
+                )
+                .expect("manual timer launch child IDs");
+                assert_eq!(children.len(), 1);
+                (manual_id, children[0].clone(), Some(parent))
+            }
+        };
+
+        let parent: CoreCommand =
+            serde_json::from_value(fixture.wait_command(&parent_id, "applied"))
+                .expect("applied launch action parent");
+        if let Some(manual_parent) = manual_parent {
+            assert_eq!(parent, manual_parent);
+            assert_eq!(parent.verb, "timer.run");
+            assert_eq!(parent.args["rule"], case.rule);
+            if let Some(project) = case.project {
+                assert_eq!(parent.args["project"], project);
+            }
+            manual_replays.push((case, parent_id.clone(), parent.clone()));
+        } else if case.trigger == Trigger::Event {
+            assert_eq!(parent.verb, "rule");
+            assert_eq!(parent.args["event_seq"], seed_event_seq);
+        }
+        let principal = case.project.map_or_else(
+            || "owner".to_owned(),
+            |project| format!("project:{project}"),
+        );
+        assert_eq!(parent.principal, principal);
+        assert_eq!(
+            parent
+                .outcome
+                .as_ref()
+                .expect("fixed launch action child set")["children"],
+            json!([launch_id]),
+            "the retained parent must name the admitted launch action"
+        );
+
+        let launch: CoreCommand =
+            serde_json::from_value(fixture.wait_command(&launch_id, "applied"))
+                .expect("applied targetless launch action");
+        let agent_id = launch.target.clone().expect("resolved launch Agent target");
+        assert_eq!(launch.id, launch_id);
+        assert_eq!(launch.principal, principal);
+        assert_eq!(launch.verb, "launch");
+        assert_eq!(launch.expected_generation, Some(0));
+        assert_eq!(launch.generation, Some(1));
+        assert_eq!(launch.args["profile"], "fake");
+        assert_eq!(launch.args["workspace"], registration.checkout);
+        assert_eq!(launch.args.get("text").and_then(Value::as_str), case.input);
+
+        let agent = wait_ready(&fixture, &agent_id, 1);
+        assert_eq!(agent.agent.id, agent_id);
+        assert_eq!(agent.agent.generation, 1);
+        assert_eq!(agent.agent.profile, "fake");
+        assert_eq!(agent.agent.project, registration.checkout);
+        assert_ne!(agent.agent.project, PROJECT_ID);
+        created_agents.push((agent_id.clone(), 1));
+
+        let linked_send_id = format!("{launch_id}/send");
+        let send = match case.input {
+            Some(text) => {
+                let send: CoreCommand =
+                    serde_json::from_value(fixture.wait_command(&linked_send_id, "applied"))
+                        .expect("applied deterministic launch linked SEND");
+                assert_eq!(send.id, linked_send_id);
+                assert_eq!(send.verb, "send");
+                assert_eq!(send.target.as_deref(), Some(agent_id.as_str()));
+                assert_eq!(send.expected_generation, Some(1));
+                assert_eq!(send.generation, Some(1));
+                wait_fake_send_turn_result(&fixture, &agent_id, 1, &send, text);
+                Some(send)
+            }
+            None => {
+                let missing = cli(&fixture.data, &["cmd", "show", &linked_send_id]);
+                assert_eq!(missing.status.code(), Some(1));
+                assert!(missing.stderr.contains("not_found"));
+                assert_eq!(fault_dispatches(&fixture.events(), &linked_send_id), 0);
+                None
+            }
+        };
+        let action_events = fixture.events();
+        let launch_dispatch = action_events
+            .iter()
+            .find(|event| {
+                event["kind"] == "command.dispatched" && event["data"]["command_id"] == launch.id
+            })
+            .expect("public launch dispatch event");
+        let launch_cause = &launch_dispatch["cause"];
+        assert_eq!(launch_cause["command_id"], launch.id);
+        assert_eq!(launch_cause["rule"], case.rule);
+        assert!(launch_cause["depth"].as_u64().is_some());
+        if let Some(send) = &send {
+            assert_eq!(send.principal, launch.principal);
+            let send_dispatch = action_events
+                .iter()
+                .find(|event| {
+                    event["kind"] == "command.dispatched" && event["data"]["command_id"] == send.id
+                })
+                .expect("public linked SEND dispatch event");
+            let send_cause = &send_dispatch["cause"];
+            assert_eq!(send_cause["command_id"], send.id);
+            assert_eq!(send_cause["rule"], launch_cause["rule"]);
+            assert_eq!(send_cause["depth"], launch_cause["depth"]);
+        }
+        records.push((case, parent, launch, send));
+    }
+
+    let relevant_firings = |events: &[Value]| {
+        events
+            .iter()
+            .filter(|event| {
+                event["kind"] == "rule.fired"
+                    && event["data"]["rule"].as_str().is_some_and(|rule| {
+                        CASES
+                            .iter()
+                            .any(|case| case.rule == rule && case.trigger != Trigger::Scheduled)
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let events_before_cleanup = fixture.events();
+    for (_, _, launch, send) in &records {
+        assert_eq!(fault_dispatches(&events_before_cleanup, &launch.id), 1);
+        if let Some(send) = send {
+            assert_eq!(fault_dispatches(&events_before_cleanup, &send.id), 1);
+        }
+    }
+    for (agent_id, generation) in &created_agents {
+        assert_eq!(
+            events_before_cleanup
+                .iter()
+                .filter(|event| {
+                    event["kind"] == "session.ready"
+                        && event["agent"] == agent_id.as_str()
+                        && event["generation"] == *generation
+                })
+                .count(),
+            1,
+            "one ready fact for {agent_id} generation {generation}"
+        );
+    }
+
+    for (agent_id, generation) in &created_agents {
+        let generation_arg = generation.to_string();
+        let stop: CommandSubmitResponse = serde_json::from_value(fixture.json(&[
+            "stop",
+            agent_id,
+            "--generation",
+            &generation_arg,
+        ]))
+        .expect("exact-generation Agent stop submission");
+        fixture.wait_command(&stop.command_id, "applied");
+        let stopped: AgentGetResponse = serde_json::from_value(fixture.json(&["show", agent_id]))
+            .expect("stopped Agent readback before daemon drain");
+        assert_eq!(stopped.agent.generation, *generation);
+        assert_eq!(stopped.agent.state, AgentState::Stopped);
+    }
+    stop_live_fixture_agents(&fixture);
+    for (case, timer) in &mut scheduled_states {
+        *timer = read_timer(&fixture, case.rule, case.project);
+    }
+    let events_before_restart = fixture.events();
+    let firings_before_restart = relevant_firings(&events_before_restart);
+    let scheduled_slots_before_restart = scheduled_firing_identities(&events_before_restart);
+    for case in CASES
+        .iter()
+        .filter(|case| case.trigger == Trigger::Scheduled)
+    {
+        assert!(
+            scheduled_slots_before_restart
+                .iter()
+                .any(|slot| slot.rule == case.rule),
+            "no persisted slot fired for {}",
+            case.rule
+        );
+    }
+    assert_scheduled_slot_history(
+        &fixture,
+        &scheduled_slots_before_restart,
+        &scheduled_slots_before_restart,
+        &scheduled_states,
+        &events_before_restart,
+    );
+    stop_live_fixture_agents(&fixture);
+    fixture.stop(false);
+
+    fs::write(
+        fixture.data.join("config.toml"),
+        format!(
+            "[profiles.fake-next]\nharness = \"fake\"\n\n[projects.{project_id}]\npath = {workspace:?}\nprofiles = [\"fake-next\"]\nactions = [\"launch\", \"send\"]\n",
+            project_id = PROJECT_ID,
+        ),
+    )
+    .expect("change approved profile after retained launches");
+    let (changed_owner_rules, _) =
+        render_rule_files("fake-next", &alternate_workspace, scheduled_anchor);
+    let (_, changed_project_rules) =
+        render_rule_files("fake-next", &registration.checkout, scheduled_anchor);
+    fs::write(global_rule_dir.join("launches.toml"), changed_owner_rules)
+        .expect("change Owner launch profile and workspace path");
+    fs::write(
+        project_rule_dir.join("launches.toml"),
+        changed_project_rules,
+    )
+    .expect("change Project launch profile and workspace path");
+
+    fixture.start();
+    let changed_registration_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let changed_registration: ProjectRegistrationView = loop {
+        let reply = cli(&fixture.data, &["project", "show", PROJECT_ID]);
+        if reply.status.success() {
+            break serde_json::from_str(&reply.stdout)
+                .expect("changed project registration readback");
+        }
+        assert!(
+            std::time::Instant::now() < changed_registration_deadline,
+            "changed project registration readback deadline"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(changed_registration.revision > registration.revision);
+    assert!(
+        changed_registration
+            .profiles
+            .iter()
+            .any(|profile| profile == "fake-next")
+    );
+    assert_eq!(changed_registration.profiles, vec!["fake-next".to_owned()]);
+    assert_eq!(changed_registration.checkout, registration.checkout);
+    for (case, previous_revision) in &initial_rule_revisions {
+        let current = wait_rule(&fixture, case.rule, case.project);
+        assert!(current.enabled, "reloaded rule {} is disabled", case.rule);
+        assert!(
+            current.paused_reason.is_none(),
+            "reloaded rule {} is paused",
+            case.rule
+        );
+        assert!(
+            current.revision > *previous_revision,
+            "profile/path edit was not loaded for {}",
+            case.rule
+        );
+    }
+
+    for (case, manual_id, original_parent) in &manual_replays {
+        let args = match case.project {
+            Some(project) => vec![
+                "--id",
+                manual_id.as_str(),
+                "timer",
+                "run",
+                case.rule,
+                "--project",
+                project,
+            ],
+            None => vec!["--id", manual_id.as_str(), "timer", "run", case.rule],
+        };
+        let replay = cli(&fixture.data, &args);
+        assert!(replay.status.success(), "retained timer replay failed");
+        let replayed: CoreCommand =
+            serde_json::from_str(&replay.stdout).expect("typed retained manual timer replay");
+        assert_eq!(&replayed, original_parent);
+    }
+
+    stop_live_fixture_agents(&fixture);
+    let events_after_restart = fixture.events();
+    let scheduled_slots_after_restart = scheduled_firing_identities(&events_after_restart);
+    assert_scheduled_slot_history(
+        &fixture,
+        &scheduled_slots_before_restart,
+        &scheduled_slots_after_restart,
+        &scheduled_states,
+        &events_after_restart,
+    );
+    stop_live_fixture_agents(&fixture);
+    assert_eq!(
+        relevant_firings(&events_after_restart),
+        firings_before_restart,
+        "restart and profile/workspace edits did not refire retained rules"
+    );
+    for (case, parent, launch, send) in &records {
+        let parent_after: CoreCommand =
+            serde_json::from_value(fixture.json(&["cmd", "show", &parent.id]))
+                .expect("retained launch action parent");
+        let launch_after: CoreCommand =
+            serde_json::from_value(fixture.json(&["cmd", "show", &launch.id]))
+                .expect("retained launch action command");
+        assert_eq!(&parent_after, parent);
+        assert_eq!(&launch_after, launch);
+        assert_eq!(fault_dispatches(&events_after_restart, &launch.id), 1);
+        if let Some(send) = send {
+            let send_after: CoreCommand =
+                serde_json::from_value(fixture.json(&["cmd", "show", &send.id]))
+                    .expect("retained exact linked SEND");
+            assert_eq!(&send_after, send);
+            assert_eq!(fault_dispatches(&events_after_restart, &send.id), 1);
+        } else {
+            let linked_send_id = format!("{}/send", launch.id);
+            let missing = cli(&fixture.data, &["cmd", "show", &linked_send_id]);
+            assert_eq!(missing.status.code(), Some(1));
+            assert!(missing.stderr.contains("not_found"));
+        }
+        assert_eq!(
+            case.project.is_some(),
+            launch.principal.starts_with("project:")
+        );
+    }
+    for (agent_id, generation) in &created_agents {
+        assert_eq!(
+            events_after_restart
+                .iter()
+                .filter(|event| {
+                    event["kind"] == "session.ready"
+                        && event["agent"] == agent_id.as_str()
+                        && event["generation"] == *generation
+                })
+                .count(),
+            1,
+            "retained replay did not duplicate Agent {agent_id}"
+        );
+        let stopped: AgentGetResponse = serde_json::from_value(fixture.json(&["show", agent_id]))
+            .expect("retained stopped Agent after replay");
+        assert_eq!(stopped.agent.generation, *generation);
+        assert_eq!(stopped.agent.state, AgentState::Stopped);
+    }
+    let owner_history_path = global_rule_dir.join("history-launch-owner.toml");
+    let project_history_path = project_rule_dir.join("history-launch-project.toml");
+    assert!(!owner_history_path.exists());
+    assert!(!project_history_path.exists());
+
+    let history_seed_launch: CoreCommand = serde_json::from_value(fixture.json(&[
+        "launch",
+        "--profile",
+        "fake-next",
+        "--workspace",
+        &changed_registration.checkout,
+    ]))
+    .expect("typed history-seed Fake launch");
+    let history_seed_launch: CoreCommand =
+        serde_json::from_value(fixture.wait_command(&history_seed_launch.id, "applied"))
+            .expect("applied history-seed Fake launch");
+    let history_seed_agent = history_seed_launch
+        .target
+        .clone()
+        .expect("history-seed Agent target");
+    let history_seed_generation = history_seed_launch
+        .generation
+        .expect("history-seed Agent generation");
+    assert_eq!(history_seed_generation, 1);
+    let history_seed_view = wait_ready(&fixture, &history_seed_agent, history_seed_generation);
+    assert_eq!(history_seed_view.agent.profile, "fake-next");
+    assert_eq!(
+        history_seed_view.agent.project,
+        changed_registration.checkout
+    );
+    let mut history_agents = vec![(history_seed_agent.clone(), history_seed_generation)];
+
+    let history_seed_send_id = ulid::Ulid::new().to_string();
+    let history_seed_generation_arg = history_seed_generation.to_string();
+    let history_seed_reply = cli(
+        &fixture.data,
+        &[
+            "--id",
+            &history_seed_send_id,
+            "send",
+            &history_seed_agent,
+            "--generation",
+            &history_seed_generation_arg,
+            "--wait",
+            "--timeout-seconds",
+            "10",
+            "--",
+            "launch-history-catchup-seed",
+        ],
+    );
+    assert!(
+        history_seed_reply.status.success(),
+        "Fake history seed SEND failed"
+    );
+    let history_seed_turn: CoreTurn =
+        serde_json::from_str(&history_seed_reply.stdout).expect("typed history-seed Fake turn");
+    assert_eq!(history_seed_turn.state, TurnState::Completed);
+    let history_seed_event = fixture
+        .events()
+        .into_iter()
+        .find(|event| {
+            event["kind"] == "turn.completed"
+                && event["agent"] == history_seed_agent
+                && event["generation"] == history_seed_generation
+                && event["data"]["command_id"] == history_seed_send_id
+                && event["data"]["turn_id"] == history_seed_turn.turn_id
+        })
+        .expect("committed exact history-seed turn event");
+    assert_eq!(history_seed_event["data"]["status"], "completed");
+    let history_event_seq = history_seed_event["seq"]
+        .as_i64()
+        .expect("history-seed event sequence");
+    assert!(history_event_seq > 0);
+
+    let render_history_rule = |case: HistoryCase,
+                               trigger_send_id: &str,
+                               profile: &str,
+                               action_workspace: &str,
+                               text_template: &str| {
+        format!(
+            concat!(
+                "[[rule]]\n",
+                "id = {rule_id:?}\n",
+                "on = {{ event = \"turn.completed\", match = {{ ",
+                "\"subject.harness\" = \"fake\", ",
+                "\"event.data.command_id\" = {trigger_send_id:?} }} }}\n",
+                "do = [{{ action = \"launch\", profile = {profile:?}, ",
+                "workspace = {workspace:?}, text = {text:?} }}]\n",
+            ),
+            rule_id = case.rule,
+            trigger_send_id = trigger_send_id,
+            profile = profile,
+            workspace = action_workspace,
+            text = text_template,
+        )
+    };
+    let history_rule_owner = render_history_rule(
+        HISTORY_CASES[0],
+        &history_seed_send_id,
+        "fake-next",
+        &changed_registration.checkout,
+        HISTORY_CASES[0].text_template,
+    );
+    let history_rule_project = render_history_rule(
+        HISTORY_CASES[1],
+        &history_seed_send_id,
+        "fake-next",
+        &changed_registration.checkout,
+        HISTORY_CASES[1].text_template,
+    );
+    fs::write(&owner_history_path, history_rule_owner)
+        .expect("write Owner catch-up-only launch rule after its event");
+    fs::write(&project_history_path, history_rule_project)
+        .expect("write Project catch-up-only launch rule after its event");
+
+    let mut history_revisions = Vec::new();
+    for case in HISTORY_CASES {
+        let state = wait_rule(&fixture, case.rule, case.project);
+        assert!(state.enabled, "history rule {} is disabled", case.rule);
+        assert!(
+            state.paused_reason.is_none(),
+            "history rule {} is paused",
+            case.rule
+        );
+        assert!(
+            state.current_cursor >= history_event_seq,
+            "history rule {} did not seed beyond the already-committed event",
+            case.rule
+        );
+        history_revisions.push((case, state.revision));
+    }
+    assert!(
+        !fixture.events().iter().any(|event| {
+            event["kind"] == "rule.fired"
+                && HISTORY_CASES
+                    .iter()
+                    .any(|case| event["data"]["rule"] == case.rule)
+        }),
+        "the historical seed event fired live before explicit catch-up"
+    );
+
+    let after_seq = history_event_seq - 1;
+    let after_arg = after_seq.to_string();
+    let through_arg = history_event_seq.to_string();
+    let mut history_records = Vec::new();
+    for case in HISTORY_CASES {
+        let revision = history_revisions
+            .iter()
+            .find(|(loaded_case, _)| loaded_case.rule == case.rule)
+            .map(|(_, revision)| *revision)
+            .expect("loaded history rule revision");
+        let catchup_id = ulid::Ulid::new().to_string();
+        let mut args = vec![
+            "--id".to_owned(),
+            catchup_id.clone(),
+            "rule".to_owned(),
+            "catch-up".to_owned(),
+            case.rule.to_owned(),
+            "--after".to_owned(),
+            after_arg.clone(),
+            "--through".to_owned(),
+            through_arg.clone(),
+        ];
+        if let Some(project) = case.project {
+            args.push("--project".to_owned());
+            args.push(project.to_owned());
+        }
+        let reply = {
+            let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+            cli(&fixture.data, &arg_refs)
+        };
+        assert!(
+            reply.status.success(),
+            "history catch-up {} failed; bounded stdout={:?}; bounded stderr={:?}",
+            case.rule,
+            reply.stdout.chars().take(2048).collect::<String>(),
+            reply.stderr.chars().take(2048).collect::<String>()
+        );
+        let parent: CoreCommand =
+            serde_json::from_str(&reply.stdout).expect("typed launch history catch-up parent");
+        let principal = case.project.map_or_else(
+            || "owner".to_owned(),
+            |project| format!("project:{project}"),
+        );
+        assert_eq!(parent.id, catchup_id);
+        assert_eq!(parent.verb, "rule.catch_up");
+        assert_eq!(parent.state, CommandState::Applied);
+        assert_eq!(parent.principal, principal);
+        assert_eq!(parent.args["rule"], case.rule);
+        assert_eq!(parent.args["after_seq"], after_seq);
+        assert_eq!(parent.args["through_seq"], history_event_seq);
+        assert_eq!(parent.args["revision"], revision);
+        if let Some(project) = case.project {
+            assert_eq!(parent.args["project"], project);
+        }
+        let children: Vec<String> = serde_json::from_value(
+            parent.outcome.as_ref().expect("catch-up fixed child set")["children"].clone(),
+        )
+        .expect("typed catch-up launch children");
+        assert_eq!(children.len(), 1);
+        let launch_id = children[0].clone();
+        let firing = wait_firing(&fixture, case.rule, Some(history_event_seq), None, None);
+        assert_eq!(firing["data"]["parent_command"], catchup_id);
+        assert_eq!(firing["data"]["event_seq"], history_event_seq);
+        assert_eq!(firing["data"]["revision"], revision);
+        assert_eq!(firing["data"]["child_command"], launch_id);
+        if let Some(project) = case.project {
+            assert_eq!(firing["data"]["project"], project);
+        } else {
+            assert!(firing["data"].get("project").is_none_or(Value::is_null));
+        }
+        assert_eq!(
+            parent.outcome.as_ref().unwrap()["children"],
+            json!([launch_id])
+        );
+
+        let launch: CoreCommand =
+            serde_json::from_value(fixture.wait_command(&launch_id, "applied"))
+                .expect("applied catch-up targetless launch");
+        let agent_id = launch
+            .target
+            .clone()
+            .expect("resolved catch-up launch target");
+        assert_eq!(launch.id, launch_id);
+        assert_eq!(launch.principal, principal);
+        assert_eq!(launch.verb, "launch");
+        assert_eq!(launch.expected_generation, Some(0));
+        assert_eq!(launch.generation, Some(1));
+        assert_eq!(launch.args["profile"], "fake-next");
+        assert_eq!(launch.args["workspace"], changed_registration.checkout);
+        assert_eq!(launch.args["text"], case.expected_text);
+        let agent = wait_ready(&fixture, &agent_id, 1);
+        assert_eq!(agent.agent.generation, 1);
+        assert_eq!(agent.agent.profile, "fake-next");
+        assert_eq!(agent.agent.project, changed_registration.checkout);
+        assert_ne!(agent.agent.project, PROJECT_ID);
+        history_agents.push((agent_id.clone(), 1));
+
+        let send_id = format!("{launch_id}/send");
+        let send: CoreCommand = serde_json::from_value(fixture.wait_command(&send_id, "applied"))
+            .expect("applied deterministic catch-up linked SEND");
+        assert_eq!(send.id, send_id);
+        assert_eq!(send.principal, launch.principal);
+        assert_eq!(send.verb, "send");
+        assert_eq!(send.target.as_deref(), Some(agent_id.as_str()));
+        assert_eq!(send.expected_generation, Some(1));
+        assert_eq!(send.generation, Some(1));
+        assert_eq!(send.args, json!({"text":case.expected_text}));
+        let result = wait_fake_send_turn_result(&fixture, &agent_id, 1, &send, case.expected_text);
+        assert_eq!(result.state, TurnState::Completed);
+        assert_eq!(result.final_text.as_deref(), Some(case.expected_text));
+
+        let action_events = fixture.events();
+        let launch_dispatch = action_events
+            .iter()
+            .find(|event| {
+                event["kind"] == "command.dispatched" && event["data"]["command_id"] == launch.id
+            })
+            .expect("public catch-up launch dispatch event");
+        let launch_cause = &launch_dispatch["cause"];
+        assert_eq!(launch_cause["command_id"], launch.id);
+        assert_eq!(launch_cause["rule"], case.rule);
+        assert!(launch_cause["depth"].as_u64().is_some());
+        let send_dispatch = action_events
+            .iter()
+            .find(|event| {
+                event["kind"] == "command.dispatched" && event["data"]["command_id"] == send.id
+            })
+            .expect("public catch-up SEND dispatch event");
+        let send_cause = &send_dispatch["cause"];
+        assert_eq!(send_cause["command_id"], send.id);
+        assert_eq!(send_cause["rule"], launch_cause["rule"]);
+        assert_eq!(send_cause["depth"], launch_cause["depth"]);
+
+        history_records.push(HistoryRecord {
+            case,
+            id: catchup_id,
+            args,
+            parent,
+            launch,
+            send,
+            agent: agent_id,
+            revision,
+        });
+    }
+
+    let history_events_before_restart = fixture.events();
+    for record in &history_records {
+        assert_eq!(
+            history_events_before_restart
+                .iter()
+                .filter(|event| {
+                    event["kind"] == "rule.fired"
+                        && event["data"]["rule"] == record.case.rule
+                        && event["data"]["parent_command"] == record.id
+                        && event["data"]["event_seq"] == history_event_seq
+                })
+                .count(),
+            1,
+            "one catch-up firing for {}",
+            record.case.rule
+        );
+        assert_eq!(
+            fault_dispatches(&history_events_before_restart, &record.launch.id),
+            1
+        );
+        assert_eq!(
+            fault_dispatches(&history_events_before_restart, &record.send.id),
+            1
+        );
+    }
+    for (agent_id, generation) in &history_agents {
+        let generation_arg = generation.to_string();
+        let stop: CommandSubmitResponse = serde_json::from_value(fixture.json(&[
+            "stop",
+            agent_id,
+            "--generation",
+            &generation_arg,
+        ]))
+        .expect("exact-generation history Agent stop");
+        fixture.wait_command(&stop.command_id, "applied");
+        let stopped: AgentGetResponse = serde_json::from_value(fixture.json(&["show", agent_id]))
+            .expect("stopped history Agent before daemon drain");
+        assert_eq!(stopped.agent.generation, *generation);
+        assert_eq!(stopped.agent.state, AgentState::Stopped);
+    }
+    stop_live_fixture_agents(&fixture);
+    fixture.stop(false);
+
+    fs::write(
+        fixture.data.join("config.toml"),
+        format!(
+            concat!(
+                "[profiles.fake-next]\n",
+                "harness = \"fake\"\n\n",
+                "[profiles.fake-replay]\n",
+                "harness = \"fake\"\n\n",
+                "[projects.{project_id}]\n",
+                "path = {workspace:?}\n",
+                "profiles = [\"fake-next\"]\n",
+                "actions = [\"launch\", \"send\"]\n",
+            ),
+            project_id = PROJECT_ID,
+            workspace = workspace,
+        ),
+    )
+    .expect("approve the replay profile in the existing project registration");
+    let owner_replay_workspace = fixture
+        .root
+        .join("owner-history-catchup-missing-replay-workspace")
+        .to_string_lossy()
+        .into_owned();
+    assert!(!Path::new(&owner_replay_workspace).exists());
+    let owner_replay_rule = render_history_rule(
+        HISTORY_CASES[0],
+        &history_seed_send_id,
+        "fake-replay",
+        &owner_replay_workspace,
+        HISTORY_CASES[0].text_template,
+    );
+    let project_replay_rule = render_history_rule(
+        HISTORY_CASES[1],
+        &history_seed_send_id,
+        "fake-next",
+        &changed_registration.checkout,
+        "${data.missing_replay_field}",
+    );
+    fs::write(&owner_history_path, owner_replay_rule)
+        .expect("change Owner catch-up profile to a missing workspace path");
+    fs::write(&project_history_path, project_replay_rule)
+        .expect("make Project catch-up text unresolved while retaining its approved path");
+
+    fixture.start();
+    let replay_registration_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let replay_registration: ProjectRegistrationView = loop {
+        let reply = cli(&fixture.data, &["project", "show", PROJECT_ID]);
+        if reply.status.success() {
+            break serde_json::from_str(&reply.stdout)
+                .expect("typed catch-up replay project registration");
+        }
+        assert!(
+            std::time::Instant::now() < replay_registration_deadline,
+            "catch-up replay project registration deadline"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(replay_registration.checkout, changed_registration.checkout);
+    assert!(
+        replay_registration
+            .profiles
+            .iter()
+            .any(|profile| profile == "fake-next")
+    );
+    assert_eq!(replay_registration.profiles, vec!["fake-next".to_owned()]);
+    assert!(
+        replay_registration
+            .actions
+            .iter()
+            .any(|action| action == "launch")
+    );
+    assert!(
+        replay_registration
+            .actions
+            .iter()
+            .any(|action| action == "send")
+    );
+    for record in &history_records {
+        let current = wait_rule(&fixture, record.case.rule, record.case.project);
+        assert!(current.enabled, "reloaded catch-up rule is disabled");
+        assert!(
+            current.paused_reason.is_none(),
+            "reloaded catch-up rule is paused"
+        );
+        assert!(current.revision > record.revision);
+    }
+
+    for record in &history_records {
+        let args = record.args.iter().map(String::as_str).collect::<Vec<_>>();
+        let replay = cli(&fixture.data, &args);
+        assert!(
+            replay.status.success(),
+            "same-ID history catch-up replay failed"
+        );
+        let replay_parent: CoreCommand =
+            serde_json::from_str(&replay.stdout).expect("typed retained history catch-up parent");
+        assert_eq!(replay_parent, record.parent);
+    }
+    let second_slot_deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let current_events = fixture.events();
+        let current_slots = scheduled_firing_identities(&current_events);
+        let missing_rule = CASES.iter().find(|case| {
+            case.trigger == Trigger::Scheduled
+                && distinct_scheduled_slot_count(&current_slots, case.rule) < 2
+        });
+        let Some(case) = missing_rule else {
+            break;
+        };
+        assert!(
+            std::time::Instant::now() < second_slot_deadline,
+            "scheduled Owner and Project rules did not each produce a second distinct slot"
+        );
+        let timer = read_timer(&fixture, case.rule, case.project);
+        let next_slot = timer
+            .next_due_at
+            .expect("registered scheduled rule exposes its next slot");
+        wait_firing(
+            &fixture,
+            case.rule,
+            None,
+            Some(next_slot),
+            Some(second_slot_deadline),
+        );
+    }
+    stop_live_fixture_agents(&fixture);
+    let history_events_after_replay = fixture.events();
+    for record in &history_records {
+        assert_eq!(
+            history_events_after_replay
+                .iter()
+                .filter(|event| {
+                    event["kind"] == "rule.fired"
+                        && event["data"]["rule"] == record.case.rule
+                        && event["data"]["parent_command"] == record.id
+                        && event["data"]["event_seq"] == history_event_seq
+                })
+                .count(),
+            1,
+            "same-ID replay did not repeat the catch-up firing"
+        );
+        assert_eq!(
+            fault_dispatches(&history_events_after_replay, &record.launch.id),
+            1
+        );
+        assert_eq!(
+            fault_dispatches(&history_events_after_replay, &record.send.id),
+            1
+        );
+        assert_eq!(
+            history_events_after_replay
+                .iter()
+                .filter(|event| {
+                    event["kind"] == "session.ready"
+                        && event["agent"] == record.agent.as_str()
+                        && event["generation"] == 1
+                })
+                .count(),
+            1,
+            "same-ID catch-up replay did not duplicate the Agent"
+        );
+        let parent_after: CoreCommand =
+            serde_json::from_value(fixture.json(&["cmd", "show", &record.parent.id]))
+                .expect("retained catch-up parent readback");
+        let launch_after: CoreCommand =
+            serde_json::from_value(fixture.json(&["cmd", "show", &record.launch.id]))
+                .expect("retained catch-up launch readback");
+        let send_after: CoreCommand =
+            serde_json::from_value(fixture.json(&["cmd", "show", &record.send.id]))
+                .expect("retained catch-up linked SEND readback");
+        assert_eq!(parent_after, record.parent);
+        assert_eq!(launch_after, record.launch);
+        assert_eq!(send_after, record.send);
+        let stopped: AgentGetResponse =
+            serde_json::from_value(fixture.json(&["show", &record.agent]))
+                .expect("retained stopped catch-up Agent");
+        assert_eq!(stopped.agent.generation, 1);
+        assert_eq!(stopped.agent.state, AgentState::Stopped);
+    }
+    let scheduled_slots_after_history = scheduled_firing_identities(&history_events_after_replay);
+    assert_scheduled_slot_history(
+        &fixture,
+        &scheduled_slots_before_restart,
+        &scheduled_slots_after_history,
+        &scheduled_states,
+        &history_events_after_replay,
+    );
+    for case in CASES
+        .iter()
+        .filter(|case| case.trigger == Trigger::Scheduled)
+    {
+        assert!(
+            distinct_scheduled_slot_count(&scheduled_slots_after_history, case.rule) >= 2,
+            "scheduled rule {} did not retain two distinct phase-valid slots",
+            case.rule
+        );
     }
     fixture.stop(false);
 }
