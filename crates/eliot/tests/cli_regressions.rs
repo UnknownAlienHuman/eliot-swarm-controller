@@ -7020,7 +7020,7 @@ fn cli_fake_timer_resume_uses_literal_generation_in_owner_project_scopes() {
                 "[projects.{project_id}]\n",
                 "path = {workspace:?}\n",
                 "profiles = [\"fake\"]\n",
-                "actions = [\"resume\"]\n",
+                "actions = [\"resume\", \"send\"]\n",
             ),
             project_id = PROJECT_ID,
             workspace = fixture.workspace.to_string_lossy(),
@@ -7043,6 +7043,7 @@ fn cli_fake_timer_resume_uses_literal_generation_in_owner_project_scopes() {
         std::thread::sleep(Duration::from_millis(25));
     };
     assert!(registration.actions.iter().any(|action| action == "resume"));
+    assert!(registration.actions.iter().any(|action| action == "send"));
     assert!(
         registration
             .profiles
