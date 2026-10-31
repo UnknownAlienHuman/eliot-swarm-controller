@@ -386,8 +386,10 @@ never substitutes for Codex. Subject grammar remains plugin-owned. Resume keeps 
 subject, profile and workspace, replays no old input, and accepts no profile, workspace,
 worktree, base, setup, model, effort or permission override.
 
-`text` is optional. Event text is rendered once and frozen under the ordinary persisted-text
-bound; timer text is literal. Nonblank text creates the normal linked `<resume-id>/send` for
+`text` is optional, but a supplied value must be nonblank. Event text is rendered once and
+frozen under the ordinary persisted-text bound; ordinary command validation rejects blank
+rendered text. Timer text is literal, and supplied blank or whitespace-only text is rejected;
+omission remains valid. Nonblank text creates the normal linked `<resume-id>/send` for
 generation `N+1`; it is one configured `resume` action, and the linked SEND keeps its own
 command ID and verified cause ancestry. Apply the linked-input ordering gate above: accepted,
 queued, dispatched or unknown input holds later timer/action work; applied confirms

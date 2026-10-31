@@ -1039,7 +1039,14 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
             let args = match action.text() {
                 Some((text, max_bytes, limit_label)) => {
                     validate_text_template(text, false, max_bytes, action.verb(), limit_label)?;
-                    json!({"text": text.as_str().expect("validated resume text")})
+                    let text = text.as_str().expect("validated resume text");
+                    if text.trim().is_empty() {
+                        return Err(Error::new(
+                            "invalid",
+                            "rule resume text must be a nonempty string when supplied",
+                        ));
+                    }
+                    json!({"text": text})
                 }
                 None => json!({}),
             };
@@ -1948,6 +1955,20 @@ do = [{ action = 'resume', target = '${event.agent}', expected_generation = '${e
         );
         let without_text = load(Cursor::new(without_text)).unwrap().remove(0);
         assert_eq!(without_text.evaluate_timer().unwrap().args, json!({}));
+    }
+
+    #[test]
+    fn timer_resume_rejects_empty_and_whitespace_supplied_text() {
+        for text in ["", " \t\r\n "] {
+            let action = format!(
+                "action = 'resume', target = 'a7', expected_generation = 3, text = {text:?}"
+            );
+            let source = INTERVAL_TIMER.replace(
+                "action = 'stop', target = 'a7', expected_generation = 3",
+                &action,
+            );
+            assert_eq!(load(Cursor::new(source)).unwrap_err().code, "invalid");
+        }
     }
 
     #[test]
