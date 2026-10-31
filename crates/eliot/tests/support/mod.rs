@@ -252,6 +252,7 @@ impl Fixture {
         cli(&self.data, args).json()
     }
 
+    #[track_caller]
     pub fn wait_command(&self, id: &str, expected: &str) -> Value {
         let deadline = Instant::now() + WAIT;
         loop {
