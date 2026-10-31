@@ -489,9 +489,10 @@ exists, with no ambient SSH configuration fallback.
 
 The raw arguments are Core [`GitFetchDefinitionArgs`](../../crates/eliot-core/src/api/git.rs);
 all supplied values are literal and do not accept event or subject templates. Optional
-`timeout` uses the existing humantime grammar, positive whole-millisecond validation and
-10-minute default. This registered-project timer example uses the `app` owner configuration
-in [configuration](configuration.md#project-registration-and-rule-authority).
+`timeout` uses humantime, must be positive with whole-millisecond precision and fit a
+checked platform `Instant` deadline (unrepresentable values are `invalid`, never panic),
+and defaults to 10 minutes when omitted. This registered-project timer example uses the
+`app` owner configuration in [configuration](configuration.md#project-registration-and-rule-authority).
 
 ```toml
 [[rule]]

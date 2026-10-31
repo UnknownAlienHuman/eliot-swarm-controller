@@ -187,7 +187,7 @@ fn private_security_descriptor(directory: bool) -> Result<LocalSecurityDescripto
     Ok(LocalSecurityDescriptor(descriptor))
 }
 
-fn create_private_directory(path: &Path) -> Result<bool> {
+pub(crate) fn create_private_directory(path: &Path) -> Result<bool> {
     let descriptor = private_security_descriptor(true)?;
     let attributes = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,

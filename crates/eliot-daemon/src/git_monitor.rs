@@ -552,6 +552,27 @@ impl GitProbe {
         self.run(root, args, &overrides, &[], deadline).await
     }
 
+    /// Read from the captured Git repository binding, even if the checkout's
+    /// `.git` pointer changes after identity was established.
+    pub(crate) async fn workspace_command_bound(
+        &self,
+        root: &Path,
+        args: &[&str],
+        binding: GitBinding<'_>,
+        deadline: Instant,
+    ) -> Result<Captured> {
+        let overrides = self
+            .safe_overrides_for(root, deadline, Some(binding))
+            .await?;
+        if Instant::now() >= deadline {
+            return Err(unavailable(
+                "bound workspace command preparation deadline elapsed",
+            ));
+        }
+        self.run_scoped(root, args, &overrides, &[], deadline, Some(binding))
+            .await
+    }
+
     /// Build, but never execute, an explicitly authorized workspace mutation.
     pub(crate) async fn prepare_workspace_command(
         &self,

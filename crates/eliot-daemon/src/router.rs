@@ -3939,7 +3939,9 @@ impl Router {
                                             | "command.failed"
                                             | "command.rejected"
                                             | "command.cancelled"
+                                            | "command.unknown"
                                     )
+                                    || event.kind.starts_with("workspace.")
                                     || (event.agent == target
                                         && event.generation == generation
                                         && (event.kind.starts_with("turn.")
@@ -6880,6 +6882,193 @@ mod tests {
                 .unwrap_err()
                 .code,
             "unsupported"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_git_fetch_wakes_on_workspace_unknown_and_rechecks_store_before_effect() {
+        let router = router();
+        let now = now_ms();
+        let project_id = format!("git-fetch-wake-{}", ulid::Ulid::new());
+        let root = std::env::temp_dir().join(&project_id);
+        let checkout = root.join("checkout").display().to_string();
+        let repo_common_dir = std::path::Path::new(&checkout)
+            .join(".git")
+            .display()
+            .to_string();
+        let registration_input = ProjectRegistrationInput {
+            id: project_id.clone(),
+            checkout: checkout.clone(),
+            repo_common_dir: repo_common_dir.clone(),
+            git: Some(eliot_core::api::ProjectGitView {
+                fetch_remotes: std::collections::BTreeMap::from([(
+                    "origin".to_owned(),
+                    "https://example.invalid/repository.git".to_owned(),
+                )]),
+                credential_helper: None,
+            }),
+            profiles: Vec::new(),
+            actions: vec!["git.fetch".to_owned()],
+            interpreters: std::collections::BTreeMap::new(),
+            run_env: Vec::new(),
+        };
+        let registration = {
+            let mut store = router.inner.store.lock().await;
+            let change = store
+                .upsert_project_registration("owner", &registration_input, now)
+                .expect("register Owner fetch repository");
+            router.publish_locked(&change.events);
+            change.value
+        };
+
+        let workspace_input = eliot_core::WorkspacePreparationInput {
+            project: checkout.clone(),
+            repo_path: checkout.clone(),
+            repo_common_dir: repo_common_dir.clone(),
+            requested_branch: "codex/fetch-wake".to_owned(),
+            base_ref: Some("HEAD".to_owned()),
+            base_oid: "d".repeat(40),
+            worktree_path: root.join("worktree").display().to_string(),
+            frozen_setup: Vec::new(),
+        };
+        let start_id = ulid::Ulid::new().to_string();
+        let mut launch = SubmitCommand::new(start_id.clone(), "launch");
+        launch.expected_generation = Some(0);
+        launch.args = json!({
+            "project":checkout,
+            "workspace":checkout,
+            "worktree":workspace_input.requested_branch,
+            "harness":"fake",
+            "profile":"fake",
+            "profile_snapshot":{},
+        });
+        {
+            let mut store = router.inner.store.lock().await;
+            let admission = store
+                .submit_with_workspace("owner", launch, workspace_input.clone(), now + 1)
+                .expect("admit pre-native workspace creation");
+            router.publish_locked(&admission.events);
+        }
+
+        let frozen = FrozenGitFetch {
+            repository: project_id.clone(),
+            registration_revision: registration.revision,
+            canonical_checkout: registration.checkout.clone(),
+            common_dir: registration.repo_common_dir.clone(),
+            remote: "origin".to_owned(),
+            endpoint: "https://example.invalid/repository.git".to_owned(),
+            source_ref: "refs/heads/main".to_owned(),
+            advertised_oid: "a".repeat(40),
+            tracking_ref: "refs/remotes/origin/main".to_owned(),
+            expected_old_oid: None,
+            timeout_ms: eliot_core::api::DEFAULT_GIT_FETCH_TIMEOUT_MS,
+            credential_helper: None,
+        };
+        let fetch_id = ulid::Ulid::new().to_string();
+        let mut fetch = CommandSubmitRequest::new(fetch_id.clone(), "git.fetch");
+        fetch.args = serde_json::to_value(&frozen).unwrap();
+        {
+            let mut store = router.inner.store.lock().await;
+            let admission = store
+                .submit("owner", fetch, now + 2)
+                .expect("admit frozen targetless Git fetch");
+            router.publish_locked(&admission.events);
+        }
+
+        let mut events = router.inner.bus.subscribe();
+        router.schedule_command(fetch_id.clone(), None);
+        let queued = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let event = events.recv().await.expect("Router event bus remains open");
+                if event.kind == "command.queued"
+                    && event.data.get("command_id").and_then(Value::as_str)
+                        == Some(fetch_id.as_str())
+                {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("queued Git fetch reaches its dispatch waiter");
+        assert_eq!(queued.data["command_id"], fetch_id);
+
+        let mut changed_registration = registration_input;
+        changed_registration
+            .git
+            .as_mut()
+            .expect("registered Git view")
+            .fetch_remotes
+            .insert(
+                "origin".to_owned(),
+                "https://changed.invalid/repository.git".to_owned(),
+            );
+        {
+            let mut store = router.inner.store.lock().await;
+            let changed = store
+                .upsert_project_registration("owner", &changed_registration, now + 3)
+                .expect("advance saved registration revision");
+            assert!(changed.value.revision > registration.revision);
+            let unknown = store
+                .settle_workspace_creation(
+                    &start_id,
+                    1,
+                    eliot_core::WorkspaceCreationOutcome::Unknown {
+                        code: "preflight_inspection_unknown".to_owned(),
+                        message: "read-only workspace inspection did not complete".to_owned(),
+                    },
+                    now + 4,
+                )
+                .expect("settle pre-native inspection Unknown");
+            assert!(unknown.events.iter().any(|event| {
+                event.kind == "command.unknown"
+                    && event.data.get("command_id").and_then(Value::as_str)
+                        == Some(start_id.as_str())
+            }));
+            assert!(
+                unknown
+                    .events
+                    .iter()
+                    .any(|event| event.kind == "workspace.unknown")
+            );
+            router.publish_locked(&unknown.events);
+        }
+
+        let rejected = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let event = events.recv().await.expect("Router event bus remains open");
+                if event.kind == "command.rejected"
+                    && event.data.get("command_id").and_then(Value::as_str)
+                        == Some(fetch_id.as_str())
+                {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("workspace Unknown wakes the queued fetch to recheck Store authority");
+        assert_eq!(rejected.data["command_id"], fetch_id);
+
+        let store = router.inner.store.lock().await;
+        let rejected = store.get_command(&fetch_id).unwrap().unwrap();
+        assert_eq!(rejected.state, CommandState::Rejected);
+        assert_eq!(
+            rejected
+                .outcome
+                .as_ref()
+                .and_then(|outcome| outcome["reason"].as_str()),
+            Some("not_allowed")
+        );
+        assert!(
+            !store
+                .read_events(0, 1_000, None)
+                .unwrap()
+                .iter()
+                .any(|event| {
+                    event.kind == "command.dispatched"
+                        && event.data.get("command_id").and_then(Value::as_str)
+                            == Some(fetch_id.as_str())
+                }),
+            "registration recheck rejects before native dispatch"
         );
     }
 

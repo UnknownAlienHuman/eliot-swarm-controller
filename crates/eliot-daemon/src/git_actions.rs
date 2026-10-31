@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use std::{
     env,
     ffi::OsString,
-    fs::{self, OpenOptions},
+    fs,
     io::Write,
     path::{Path, PathBuf},
     process::Stdio,
@@ -93,6 +93,13 @@ struct GitProcessContext {
     environment: TransportEnvironment,
     helper: Option<FrozenSetupFile>,
     protocol: String,
+    binding: Option<GitProcessBinding>,
+}
+
+struct GitProcessBinding {
+    git_dir: PathBuf,
+    common_dir: PathBuf,
+    work_tree: Option<PathBuf>,
     object_directory: Option<PathBuf>,
 }
 
@@ -125,8 +132,9 @@ pub(crate) async fn prepare_fetch(
         .get(&definition.remote)
         .ok_or_else(|| Error::new("not_allowed", "remote is not approved for Git fetch"))?
         .clone();
-    endpoint_protocol(&endpoint)?;
     let timeout_ms = automation::git_fetch_timeout_ms(definition.timeout.as_deref())?;
+    let advertisement_deadline = operation_deadline(timeout_ms)?;
+    endpoint_protocol(&endpoint)?;
 
     automation::verify_project_registration(data_root, registration).await?;
     let binding = repository_binding(&registration.checkout, &registration.repo_common_dir).await?;
@@ -143,7 +151,7 @@ pub(crate) async fn prepare_fetch(
         &endpoint,
         definition,
         helper.as_ref(),
-        timeout_ms,
+        advertisement_deadline,
     )
     .await?;
     automation::verify_project_registration(data_root, registration).await?;
@@ -190,23 +198,27 @@ pub(crate) async fn execute(
     registration: &ProjectRegistrationView,
     cancellation: watch::Receiver<bool>,
 ) -> GitFetchExecution {
+    if let Err(error) = validate_frozen_registration(registration, frozen) {
+        return execution(CommandState::Rejected, &error.code, None);
+    }
+    if frozen.validate().is_err() {
+        return execution(CommandState::Rejected, "native_not_dispatched", None);
+    }
+    if validate_refs(&frozen.remote, &frozen.source_ref, &frozen.tracking_ref).is_err() {
+        return execution(CommandState::Rejected, "native_not_dispatched", None);
+    }
+    let effect_deadline = match operation_deadline(frozen.timeout_ms) {
+        Ok(deadline) => deadline,
+        Err(error) => return execution(CommandState::Rejected, &error.code, None),
+    };
     let view = match private_view_path(data_root, command_id) {
         Ok(view) => view,
         Err(_) => return execution(CommandState::Rejected, "native_not_dispatched", None),
     };
-    if let Err(error) = validate_frozen_registration(registration, frozen) {
-        return execution(CommandState::Rejected, &error.code, Some(view));
-    }
     if automation::verify_project_registration(data_root, registration)
         .await
         .is_err()
     {
-        return execution(CommandState::Rejected, "native_not_dispatched", Some(view));
-    }
-    if frozen.validate().is_err() {
-        return execution(CommandState::Rejected, "native_not_dispatched", Some(view));
-    }
-    if validate_refs(&frozen.remote, &frozen.source_ref, &frozen.tracking_ref).is_err() {
         return execution(CommandState::Rejected, "native_not_dispatched", Some(view));
     }
     let protocol = match endpoint_protocol(&frozen.endpoint) {
@@ -252,6 +264,7 @@ pub(crate) async fn execute(
         &git,
         &repo,
         frozen,
+        effect_deadline,
         cancellation.clone(),
     )
     .await
@@ -273,13 +286,36 @@ pub(crate) async fn execute(
         Ok(path) => path,
         Err(_) => return execution(CommandState::Rejected, "native_not_dispatched", Some(view)),
     };
-    let process = match git_process_context(
+    let transport_process = match git_process_context(
         &git,
         &repo,
         &environment,
         frozen.credential_helper.as_ref(),
         protocol,
-        Some(object_directory),
+        Some(GitProcessBinding {
+            git_dir: view.clone(),
+            common_dir: view.clone(),
+            work_tree: None,
+            object_directory: Some(object_directory.clone()),
+        }),
+    )
+    .await
+    {
+        Ok(process) => process,
+        Err(_) => return execution(CommandState::Rejected, "native_not_dispatched", Some(view)),
+    };
+    let registered_process = match git_process_context(
+        &git,
+        &repo,
+        &environment,
+        frozen.credential_helper.as_ref(),
+        protocol,
+        Some(GitProcessBinding {
+            git_dir: repo.git_dir.clone(),
+            common_dir: repo.common_dir.clone(),
+            work_tree: Some(repo.checkout.clone()),
+            object_directory: Some(object_directory),
+        }),
     )
     .await
     {
@@ -287,7 +323,6 @@ pub(crate) async fn execute(
         Err(_) => return execution(CommandState::Rejected, "native_not_dispatched", Some(view)),
     };
     let private_ref = private_fetch_ref(command_id);
-    let effect_deadline = operation_deadline(frozen.timeout_ms);
     let fetch_args = vec![
         OsString::from("fetch"),
         OsString::from("--quiet"),
@@ -298,7 +333,7 @@ pub(crate) async fn execute(
         OsString::from(format!("{}:{private_ref}", frozen.source_ref)),
     ];
     let fetch = run_transport_command(
-        &process,
+        &transport_process,
         &view,
         &fetch_args,
         effect_deadline,
@@ -363,7 +398,7 @@ pub(crate) async fn execute(
         };
     }
     let object_check = match verify_registered_object_graph(
-        &process,
+        &registered_process,
         &repo,
         &frozen.advertised_oid,
         effect_deadline,
@@ -496,7 +531,7 @@ pub(crate) async fn execute(
         OsString::from("--stdin"),
     ];
     let update = run_repository_command(
-        &process,
+        &registered_process,
         &repo.checkout,
         &update_args,
         update_input.as_bytes(),
@@ -792,12 +827,18 @@ fn one_line(bytes: &[u8]) -> Result<String> {
 
 async fn read_config_values(
     git: &GitProbe,
-    root: &Path,
+    repo: &RepositoryBinding,
     key: &str,
     deadline: Instant,
 ) -> Result<Vec<String>> {
     let args = ["config", "--local", "--null", "--get-all", key];
-    let output = git.workspace_command(root, &args, deadline).await?;
+    let binding = GitBinding {
+        git_dir: &repo.git_dir,
+        common_dir: &repo.common_dir,
+    };
+    let output = git
+        .workspace_command_bound(&repo.checkout, &args, binding, deadline)
+        .await?;
     if output.code == 1 && output.stdout.is_empty() {
         return Ok(Vec::new());
     }
@@ -842,19 +883,24 @@ async fn verify_remote_configuration(
     let fetch_key = format!("remote.{remote}.url");
     let push_key = format!("remote.{remote}.pushurl");
     let deadline = Instant::now() + GIT_READ_TIME;
-    let fetch_urls = read_config_values(git, &repo.checkout, &fetch_key, deadline).await?;
+    let fetch_urls = read_config_values(git, repo, &fetch_key, deadline).await?;
     // Read pushurls independently; a push endpoint is never a fetch fallback.
-    let _push_urls = read_config_values(git, &repo.checkout, &push_key, deadline).await?;
+    let _push_urls = read_config_values(git, repo, &push_key, deadline).await?;
     if fetch_urls.len() != 1 || fetch_urls[0] != approved_endpoint {
         return Err(Error::new(
             "not_allowed",
             "raw fetch URL differs from its owner-approved direct endpoint",
         ));
     }
+    let binding = GitBinding {
+        git_dir: &repo.git_dir,
+        common_dir: &repo.common_dir,
+    };
     let effective = git
-        .workspace_command(
+        .workspace_command_bound(
             &repo.checkout,
             &["remote", "get-url", "--all", remote],
+            binding,
             deadline,
         )
         .await?;
@@ -903,10 +949,15 @@ async fn read_tracking_ref(
     tracking_ref: &str,
 ) -> Result<Option<String>> {
     let deadline = Instant::now() + GIT_READ_TIME;
+    let binding = GitBinding {
+        git_dir: &repo.git_dir,
+        common_dir: &repo.common_dir,
+    };
     let symbolic = git
-        .workspace_command(
+        .workspace_command_bound(
             &repo.checkout,
             &["symbolic-ref", "--quiet", tracking_ref],
+            binding,
             deadline,
         )
         .await?;
@@ -923,9 +974,10 @@ async fn read_tracking_ref(
         ));
     }
     let output = git
-        .workspace_command(
+        .workspace_command_bound(
             &repo.checkout,
             &["rev-parse", "--verify", "--quiet", tracking_ref],
+            binding,
             deadline,
         )
         .await?;
@@ -1046,9 +1098,15 @@ fn update_ref_input(frozen: &FrozenGitFetch, new_oid: &str) -> String {
     }
 }
 
-fn operation_deadline(timeout_ms: i64) -> Instant {
-    let millis = u64::try_from(timeout_ms).unwrap_or(1);
-    Instant::now() + Duration::from_millis(millis.max(1))
+fn operation_deadline(timeout_ms: i64) -> Result<Instant> {
+    let millis = u64::try_from(timeout_ms)
+        .ok()
+        .filter(|millis| *millis > 0)
+        .ok_or_else(|| Error::new("invalid", "git.fetch timeout_ms must be positive"))?;
+    let deadline = std::time::Instant::now()
+        .checked_add(Duration::from_millis(millis))
+        .ok_or_else(|| Error::new("invalid", "git.fetch timeout deadline is out of range"))?;
+    Ok(Instant::from_std(deadline))
 }
 
 async fn advertise_ref(
@@ -1058,7 +1116,7 @@ async fn advertise_ref(
     endpoint: &str,
     definition: &GitFetchDefinitionArgs,
     helper: Option<&FrozenSetupFile>,
-    timeout_ms: i64,
+    deadline: Instant,
 ) -> Result<String> {
     let id = Ulid::new().to_string();
     let root = private_view_path(data_root, &id)?;
@@ -1073,15 +1131,7 @@ async fn advertise_ref(
         OsString::from(native_endpoint_argument(endpoint)?),
         OsString::from(&definition.source_ref),
     ];
-    let result = run_owned_git(
-        &process,
-        &root,
-        &args,
-        &[],
-        operation_deadline(timeout_ms),
-        None,
-    )
-    .await?;
+    let result = run_owned_git(&process, &root, &args, &[], deadline, None).await?;
     if !result.quiescent {
         return Err(Error::new(
             "unknown",
@@ -1136,8 +1186,46 @@ fn create_private_environment_root(root: &Path) -> Result<()> {
             "Git private view already exists and will not be reused",
         ));
     }
-    fs::create_dir(root).map_err(|_| unavailable("Git private view could not be created"))?;
-    ensure_private_root(root)
+    create_private_directory_new(root)
+}
+
+#[cfg(windows)]
+fn create_private_directory_new(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::new("invalid", "private Git directory has no parent"))?;
+    validate_private_root(parent)?;
+    if !crate::platform::windows::create_private_directory(path)? {
+        return Err(Error::new(
+            "bad_state",
+            "private Git directory already exists and will not be reused",
+        ));
+    }
+    validate_private_root(path)
+}
+
+#[cfg(unix)]
+fn create_private_directory_new(path: &Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::new("invalid", "private Git directory has no parent"))?;
+    validate_private_root(parent)?;
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder
+        .create(path)
+        .map_err(|_| unavailable("private Git directory could not be created"))?;
+    validate_private_root(path)
+}
+
+#[cfg(not(any(windows, unix)))]
+fn create_private_directory_new(path: &Path) -> Result<()> {
+    let _ = path;
+    Err(Error::new(
+        "unsupported",
+        "private Git directories are unsupported on this platform",
+    ))
 }
 
 fn create_transport_environment(root: &Path) -> Result<TransportEnvironment> {
@@ -1155,9 +1243,7 @@ fn create_transport_environment(root: &Path) -> Result<TransportEnvironment> {
         &environment.hooks,
         &environment.template,
     ] {
-        fs::create_dir(directory)
-            .map_err(|_| unavailable("Git private transport directory could not be created"))?;
-        ensure_private_root(directory)?;
+        create_private_directory_new(directory)?;
     }
     Ok(environment)
 }
@@ -1178,6 +1264,7 @@ async fn ensure_transport_view(
     git: &GitProbe,
     repo: &RepositoryBinding,
     frozen: &FrozenGitFetch,
+    deadline: Instant,
     cancellation: watch::Receiver<bool>,
 ) -> Result<()> {
     let view = private_view_path(data_root, command_id)?;
@@ -1205,15 +1292,8 @@ async fn ensure_transport_view(
         args.push(OsString::from("--object-format=sha256"));
     }
     args.push(view.as_os_str().to_owned());
-    let initialized = run_owned_git(
-        &process,
-        &view,
-        &args,
-        &[],
-        Instant::now() + GIT_READ_TIME,
-        Some(cancellation),
-    )
-    .await?;
+    let initialized =
+        run_owned_git(&process, &view, &args, &[], deadline, Some(cancellation)).await?;
     if !initialized.quiescent {
         return Err(Error::new(
             "unknown",
@@ -1227,7 +1307,7 @@ async fn ensure_transport_view(
     }
 
     let config = render_transport_config(&environment, frozen)?;
-    write_private_file_replace(&view.join("config"), config.as_bytes())?;
+    write_private_file_replace(&view, &view.join("config"), config.as_bytes())?;
     shared_object_directory(&repo.common_dir)?;
     verify_transport_view(data_root, command_id, frozen)
 }
@@ -1373,17 +1453,24 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
     validate_private_root(path)
 }
 
+#[cfg(any(windows, unix))]
 fn write_private_file_new(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(path)
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::new("invalid", "private Git file has no parent"))?;
+    validate_private_root(parent)?;
+    #[cfg(windows)]
+    let mut file = crate::platform::windows::create_private_file_new(path)
         .map_err(|_| unavailable("private Git file could not be created"))?;
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        options
+            .open(path)
+            .map_err(|_| unavailable("private Git file could not be created"))?
+    };
     file.write_all(bytes)
         .map_err(|_| unavailable("private Git file could not be written"))?;
     file.sync_all()
@@ -1391,7 +1478,24 @@ fn write_private_file_new(path: &Path, bytes: &[u8]) -> Result<()> {
     ensure_private_file(path)
 }
 
-fn write_private_file_replace(path: &Path, bytes: &[u8]) -> Result<()> {
+#[cfg(not(any(windows, unix)))]
+fn write_private_file_new(path: &Path, bytes: &[u8]) -> Result<()> {
+    let _ = (path, bytes);
+    Err(Error::new(
+        "unsupported",
+        "private Git files are unsupported on this platform",
+    ))
+}
+
+fn write_private_file_replace(view: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
+    validate_private_root(view)?;
+    ensure_no_reparse_path(view)?;
+    if path.parent() != Some(view) {
+        return Err(Error::new(
+            "source_integrity",
+            "Git-generated config is outside its owned private view",
+        ));
+    }
     let metadata = fs::symlink_metadata(path)
         .map_err(|_| unavailable("Git-generated private config is unavailable"))?;
     if !metadata.is_file()
@@ -1451,15 +1555,18 @@ async fn git_toolchain(git: &GitProbe, repo: &RepositoryBinding) -> Result<GitTo
     }
     let program = fs::canonicalize(program)
         .map_err(|_| unavailable("selected Git executable cannot be resolved"))?;
-    let exec_path = canonical_root(
-        &read_git_line(
-            git,
+    let exec_path = git
+        .workspace_command_bound(
             &repo.checkout,
             &["--exec-path"],
+            binding,
             Instant::now() + GIT_READ_TIME,
         )
-        .await?,
-    )?;
+        .await?;
+    if exec_path.code != 0 {
+        return Err(unavailable("selected Git exec path cannot be read"));
+    }
+    let exec_path = canonical_root(&one_line(&exec_path.stdout)?)?;
     Ok(GitToolchain { program, exec_path })
 }
 
@@ -1469,14 +1576,14 @@ async fn git_process_context(
     environment: &TransportEnvironment,
     helper: Option<&FrozenSetupFile>,
     protocol: &str,
-    object_directory: Option<PathBuf>,
+    binding: Option<GitProcessBinding>,
 ) -> Result<GitProcessContext> {
     Ok(GitProcessContext {
         toolchain: git_toolchain(git, repo).await?,
         environment: environment.clone(),
         helper: helper.cloned(),
         protocol: protocol.to_owned(),
-        object_directory,
+        binding,
     })
 }
 
@@ -1513,7 +1620,7 @@ async fn run_owned_git(
     let environment = &context.environment;
     let helper = context.helper.as_ref();
     let protocol = context.protocol.as_str();
-    let object_directory = context.object_directory.as_deref();
+    let binding = context.binding.as_ref();
     if Instant::now() >= deadline {
         return Err(unavailable("Git operation deadline elapsed before spawn"));
     }
@@ -1628,8 +1735,16 @@ async fn run_owned_git(
         .env("GIT_PROTOCOL_FROM_USER", "0")
         .env("LC_ALL", "C")
         .env("GCM_INTERACTIVE", "Never");
-    if let Some(object_directory) = object_directory {
-        command.env("GIT_OBJECT_DIRECTORY", git_path_argument(object_directory)?);
+    if let Some(binding) = binding {
+        command
+            .env("GIT_DIR", git_path_argument(&binding.git_dir)?)
+            .env("GIT_COMMON_DIR", git_path_argument(&binding.common_dir)?);
+        if let Some(work_tree) = &binding.work_tree {
+            command.env("GIT_WORK_TREE", git_path_argument(work_tree)?);
+        }
+        if let Some(object_directory) = &binding.object_directory {
+            command.env("GIT_OBJECT_DIRECTORY", git_path_argument(object_directory)?);
+        }
     }
     let mut overrides = vec![
         ("core.hooksPath", git_path_argument(&environment.hooks)?),
@@ -2431,6 +2546,174 @@ mod tests {
         assert_eq!(fixture.checkout_head(), head_before);
         if let Some(view) = execution.cleanup_view.take() {
             cleanup_after_settlement(&fixture.data_root, &view);
+        }
+    }
+
+    #[tokio::test]
+    async fn captured_git_binding_pins_refs_after_worktree_pointer_changes() {
+        let fixture = LocalFetchFixture::new().await;
+        let original_oid = fixture.checkout_head();
+        fs::write(
+            fixture.checkout.join("second.txt"),
+            b"second local commit\n",
+        )
+        .expect("write second local commit");
+        fixture
+            .git
+            .success(&fixture.checkout, &git_args(&["add", "--", "second.txt"]));
+        fixture.git.success(
+            &fixture.checkout,
+            &git_args(&["commit", "--quiet", "-m", "second local commit"]),
+        );
+        let new_oid = fixture.checkout_head();
+        fixture.git.success(
+            &fixture.checkout,
+            &git_args(&["reset", "--hard", "--quiet", &original_oid]),
+        );
+
+        let target = "refs/remotes/origin/pointer-race";
+        let foreign_oid = fixture
+            .git
+            .text(&fixture.seed, &git_args(&["rev-parse", "HEAD"]));
+        fixture.git.success(
+            &fixture.checkout,
+            &git_args(&["update-ref", target, &original_oid]),
+        );
+        fixture.git.success(
+            &fixture.seed,
+            &git_args(&["update-ref", target, &foreign_oid]),
+        );
+
+        let worktree = fixture.root.path.join("captured-worktree");
+        let mut worktree_args = git_args(&["worktree", "add", "--detach"]);
+        worktree_args.push(worktree.as_os_str().to_owned());
+        worktree_args.push(OsString::from(&original_oid));
+        fixture.git.success(&fixture.checkout, &worktree_args);
+        let worktree_text = fs::canonicalize(&worktree)
+            .expect("canonical linked worktree")
+            .to_str()
+            .expect("worktree path is UTF-8")
+            .to_owned();
+        let (canonical_checkout, common_dir) = WorkspaceGit::new()
+            .unwrap()
+            .repository_identity(&worktree_text)
+            .await
+            .unwrap();
+        let repo = repository_binding(&canonical_checkout, &common_dir)
+            .await
+            .unwrap();
+        assert_ne!(repo.git_dir, repo.common_dir);
+        let git = GitProbe::new().unwrap();
+        assert_eq!(
+            read_tracking_ref(&git, &repo, target).await.unwrap(),
+            Some(original_oid.clone())
+        );
+
+        let foreign_git_dir = fs::canonicalize(fixture.seed.join(".git")).unwrap();
+        let pointer = format!("gitdir: {}\n", git_path_argument(&foreign_git_dir).unwrap());
+        fs::write(worktree.join(".git"), pointer).expect("replace linked worktree pointer");
+        assert_eq!(
+            fixture.git.text(
+                &worktree,
+                &git_args(&["show-ref", "--verify", "--hash", target])
+            ),
+            foreign_oid
+        );
+
+        let command_id = Ulid::new().to_string();
+        let view = private_view_path(&fixture.data_root, &command_id).unwrap();
+        create_private_environment_root(&view).unwrap();
+        let environment = create_transport_environment(&view).unwrap();
+        let object_directory = shared_object_directory(&repo.common_dir).unwrap();
+        let process = git_process_context(
+            &git,
+            &repo,
+            &environment,
+            None,
+            "file",
+            Some(GitProcessBinding {
+                git_dir: repo.git_dir.clone(),
+                common_dir: repo.common_dir.clone(),
+                work_tree: Some(repo.checkout.clone()),
+                object_directory: Some(object_directory),
+            }),
+        )
+        .await
+        .unwrap();
+        let update = format!("update {target} {new_oid} {original_oid}\n");
+        let update_args = git_args(&["update-ref", "--no-deref", "--stdin"]);
+        let result = run_owned_git(
+            &process,
+            &worktree,
+            &update_args,
+            update.as_bytes(),
+            Instant::now() + GIT_READ_TIME,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(result.quiescent);
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(
+            read_tracking_ref(&git, &repo, target).await.unwrap(),
+            Some(new_oid)
+        );
+        assert_eq!(
+            fixture.git.text(
+                &worktree,
+                &git_args(&["show-ref", "--verify", "--hash", target])
+            ),
+            foreign_oid
+        );
+        cleanup_after_settlement(&fixture.data_root, &view);
+        assert!(!view.exists());
+    }
+
+    #[tokio::test]
+    async fn large_parsed_timeout_is_checked_without_native_io_or_panic() {
+        let timeout_seconds = 9_223_372_036_854_775_i64;
+        let timeout = format!("{timeout_seconds}s");
+        let timeout_ms = automation::git_fetch_timeout_ms(Some(&timeout)).unwrap();
+        assert_eq!(timeout_ms, timeout_seconds.checked_mul(1_000).unwrap());
+        let checked = std::panic::catch_unwind(|| operation_deadline(timeout_ms));
+        assert!(checked.is_ok(), "maximum parsed timeout must not panic");
+        let deadline = checked.unwrap();
+        if let Err(error) = deadline {
+            assert_eq!(error.code, "invalid");
+            let checkout = env::current_dir().unwrap().to_string_lossy().into_owned();
+            let registration = ProjectRegistrationView {
+                id: "timeout-check-project".to_owned(),
+                checkout: checkout.clone(),
+                repo_common_dir: checkout,
+                profiles: vec!["fake".to_owned()],
+                actions: vec!["git.fetch".to_owned()],
+                interpreters: Default::default(),
+                run_env: Vec::new(),
+                git: Some(eliot_core::api::ProjectGitView {
+                    fetch_remotes: std::collections::BTreeMap::from([(
+                        "origin".to_owned(),
+                        "https://example.invalid/repository.git".to_owned(),
+                    )]),
+                    credential_helper: None,
+                }),
+                revision: 1,
+            };
+            let data_root = env::temp_dir().join(format!("missing-git-fetch-data-{}", Ulid::new()));
+            let error = prepare_fetch(
+                &data_root,
+                &registration,
+                &GitFetchDefinitionArgs {
+                    repository: registration.id.clone(),
+                    remote: "origin".to_owned(),
+                    source_ref: "refs/heads/main".to_owned(),
+                    tracking_ref: "refs/remotes/origin/timeout".to_owned(),
+                    timeout: Some(timeout),
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code, "invalid");
+            assert!(!data_root.exists());
         }
     }
 
