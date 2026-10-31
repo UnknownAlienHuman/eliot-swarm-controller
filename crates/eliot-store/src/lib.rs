@@ -1458,6 +1458,107 @@ fn has_in_flight_stop_tx(tx: &Transaction<'_>, agent: i64, generation: i64) -> R
     Ok(false)
 }
 
+pub(crate) fn cancel_unstarted_resume_input_tx(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    command_id: &str,
+    reason: &str,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    let resume = load_command_record(tx, command_id)?
+        .ok_or_else(|| Error::new("source_integrity", "resume command row disappeared"))?;
+    let old_generation = resume
+        .command
+        .expected_generation
+        .or(resume.command.generation)
+        .ok_or_else(|| Error::new("source_integrity", "resume has no retained old generation"))?;
+    if resume.target != Some(agent_num)
+        || resume.command.verb != "resume"
+        || resume.command.generation != Some(old_generation)
+        || resume
+            .command
+            .expected_generation
+            .is_some_and(|expected| expected != old_generation)
+        || !matches!(
+            resume.state,
+            CommandState::Rejected | CommandState::Failed | CommandState::Cancelled
+        )
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "resume cleanup is not bound to its exact undispatched old generation",
+        ));
+    }
+    let agent = load_agent_by_num(tx, agent_num)?
+        .ok_or_else(|| Error::new("not_found", "resume target Agent was not found"))?;
+    if agent.generation != old_generation
+        || !matches!(
+            agent.state,
+            AgentState::Stopped | AgentState::Failed | AgentState::Lost
+        )
+        || agent.active_turn.is_some()
+        || agent
+            .native_scope
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        || agent
+            .native_ref
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "resume cleanup cannot alter a changed or nonterminal old Agent",
+        ));
+    }
+
+    let next_generation = old_generation
+        .checked_add(1)
+        .ok_or_else(|| Error::new("source_integrity", "resume capacity generation overflow"))?;
+    let retained = rules::retained_action_admission(tx, resume.command)?;
+    if let Some(input) = retained.linked_command {
+        let input_target = input
+            .target
+            .as_deref()
+            .map(parse_agent_id)
+            .transpose()?
+            .ok_or_else(|| Error::new("source_integrity", "resume input has no Agent target"))?;
+        let input_generation = input
+            .generation
+            .or(input.expected_generation)
+            .ok_or_else(|| Error::new("source_integrity", "resume input has no next generation"))?;
+        if input_target != agent_num || input_generation != next_generation {
+            return Err(Error::new(
+                "source_integrity",
+                "resume input no longer targets its exact next generation",
+            ));
+        }
+        match input.state {
+            CommandState::Accepted | CommandState::Queued => cancel_pending_command_tx(
+                tx,
+                input_target,
+                input_generation,
+                &input.id,
+                reason,
+                now,
+                events,
+            )?,
+            CommandState::Rejected | CommandState::Cancelled => {}
+            CommandState::Dispatched
+            | CommandState::Unknown
+            | CommandState::Applied
+            | CommandState::Failed => {
+                return Err(Error::new(
+                    "bad_state",
+                    "resume input has an external outcome; its reservation remains held",
+                ));
+            }
+        }
+    }
+    capacity::release_unstarted_tx(tx, agent_num, next_generation, command_id)
+}
+
 impl Store {
     /// Persist an idempotent non-command write. L1 uses this for daemon shutdown;
     /// command admission remains in the commands table.
@@ -2339,6 +2440,9 @@ impl Store {
         } else {
             false
         };
+        let unstarted_resume_failure = record.command.verb == "resume"
+            && matches!(record.state, CommandState::Accepted | CommandState::Queued)
+            && matches!(state, CommandState::Rejected | CommandState::Failed);
         update_command_state(&tx, id, state, outcome.as_ref(), None, now)?;
         let mut events = Vec::new();
         let state_name = command_state_name(state);
@@ -2364,6 +2468,15 @@ impl Store {
                 target.ok_or_else(|| Error::new("internal", "launch has no Agent"))?,
                 1,
                 id,
+            )?;
+        } else if unstarted_resume_failure {
+            cancel_unstarted_resume_input_tx(
+                &tx,
+                target.ok_or_else(|| Error::new("internal", "resume has no Agent"))?,
+                id,
+                "resume_not_dispatched",
+                now,
+                &mut events,
             )?;
         } else if state == CommandState::Rejected
             && matches!(record.command.verb.as_str(), "launch" | "resume")

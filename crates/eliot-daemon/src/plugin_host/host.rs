@@ -174,6 +174,31 @@ pub(crate) struct PluginHost {
     state: Arc<HostState>,
 }
 
+fn resume_source_generation(command: &Command) -> Result<i64> {
+    let dispatched_generation = command
+        .generation
+        .ok_or_else(|| Error::new("stale_generation", "resume has no dispatched generation"))?;
+    if dispatched_generation <= 1 {
+        return Err(Error::new(
+            "stale_generation",
+            "resume requires a positive retained generation",
+        ));
+    }
+    let previous_generation = dispatched_generation
+        .checked_sub(1)
+        .ok_or_else(|| Error::new("stale_generation", "resume has no previous generation"))?;
+    if command
+        .expected_generation
+        .is_some_and(|expected| expected != previous_generation)
+    {
+        return Err(Error::new(
+            "stale_generation",
+            "resume expected generation differs from the dispatched target",
+        ));
+    }
+    Ok(command.expected_generation.unwrap_or(previous_generation))
+}
+
 impl PluginHost {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -258,7 +283,8 @@ impl PluginHost {
                 .as_ref()
                 .and_then(|state| state.get("retained_generation"))
                 .and_then(Value::as_i64);
-            if retained_generation != command.expected_generation {
+            let resume_generation = resume_source_generation(&command)?;
+            if retained_generation != Some(resume_generation) {
                 return Err(Error::new(
                     "stale_generation",
                     "resume readback does not match the retained Agent generation",
@@ -2495,7 +2521,71 @@ pub(crate) fn forget_revoked_agent_token(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eliot_core::{NativeEvent, SubmitCommand};
+    use eliot_core::{CommandState, NativeEvent, SubmitCommand};
+
+    #[test]
+    fn resume_source_generation_uses_the_checked_dispatched_predecessor() {
+        let command = Command {
+            id: "resume-generation".to_owned(),
+            principal: "owner".to_owned(),
+            method: "command.submit".to_owned(),
+            verb: "resume".to_owned(),
+            target: Some("a7".to_owned()),
+            expected_generation: None,
+            generation: Some(3),
+            args: json!({}),
+            state: CommandState::Dispatched,
+            turn_id: None,
+            request_id: None,
+            outcome: None,
+            created_at: 0,
+            updated_at: 0,
+            probe: false,
+        };
+        assert_eq!(resume_source_generation(&command).unwrap(), 2);
+
+        let explicit = Command {
+            expected_generation: Some(2),
+            ..command.clone()
+        };
+        assert_eq!(resume_source_generation(&explicit).unwrap(), 2);
+
+        let mismatched = Command {
+            expected_generation: Some(1),
+            ..command.clone()
+        };
+        assert_eq!(
+            resume_source_generation(&mismatched).unwrap_err().code,
+            "stale_generation"
+        );
+
+        let zero_target = Command {
+            generation: Some(0),
+            ..command.clone()
+        };
+        assert_eq!(
+            resume_source_generation(&zero_target).unwrap_err().code,
+            "stale_generation"
+        );
+        let first_generation_target = Command {
+            generation: Some(1),
+            ..command.clone()
+        };
+        assert_eq!(
+            resume_source_generation(&first_generation_target)
+                .unwrap_err()
+                .code,
+            "stale_generation"
+        );
+        let negative_target = Command {
+            generation: Some(-1),
+            ..command
+        };
+        assert_eq!(
+            resume_source_generation(&negative_target).unwrap_err().code,
+            "stale_generation"
+        );
+    }
 
     #[test]
     fn route_binding_requires_the_existing_responses_manifest_capability() {

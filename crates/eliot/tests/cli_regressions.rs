@@ -8582,6 +8582,238 @@ fn cli_event_resume_preserves_exact_subject_for_live_and_history_owner_project()
         assert_eq!(stopped_after_resume.agent.state, AgentState::Stopped);
     }
 
+    // Ordinary CLI resume hydrates the stopped Agent generation without a rule firing.
+    let cli_launch: CoreCommand = serde_json::from_value(fixture.json(&[
+        "launch",
+        "--profile",
+        "fake",
+        "--workspace",
+        &registration.checkout,
+    ]))
+    .expect("typed ordinary-resume Fake launch");
+    let cli_launch: CoreCommand =
+        serde_json::from_value(fixture.wait_command(&cli_launch.id, "applied"))
+            .expect("applied ordinary-resume Fake launch");
+    let cli_agent_id = cli_launch
+        .target
+        .clone()
+        .expect("ordinary-resume Fake Agent");
+    let cli_generation = cli_launch
+        .generation
+        .expect("ordinary-resume launch generation");
+    assert_eq!(cli_generation, 1);
+    let cli_initial = wait_ready(&fixture, &cli_agent_id, cli_generation);
+    let cli_native_scope = cli_initial
+        .agent
+        .native_scope
+        .clone()
+        .filter(|scope| !scope.trim().is_empty())
+        .expect("ordinary-resume Fake native scope");
+    let cli_native_ref = cli_initial
+        .agent
+        .native_ref
+        .clone()
+        .filter(|native_ref| !native_ref.trim().is_empty())
+        .expect("ordinary-resume Fake native reference");
+
+    let cli_old_text = "ordinary resume old-generation seed";
+    let cli_old_send_id = ulid::Ulid::new().to_string();
+    let cli_generation_arg = cli_generation.to_string();
+    let cli_old_send_reply = cli(
+        &fixture.data,
+        &[
+            "--id",
+            &cli_old_send_id,
+            "send",
+            &cli_agent_id,
+            "--generation",
+            &cli_generation_arg,
+            "--",
+            cli_old_text,
+        ],
+    );
+    assert!(
+        cli_old_send_reply.status.success(),
+        "ordinary Fake seed SEND failed"
+    );
+    let cli_old_send_submit: CommandSubmitResponse =
+        serde_json::from_str(&cli_old_send_reply.stdout).expect("typed ordinary old SEND");
+    assert_eq!(cli_old_send_submit.command_id, cli_old_send_id);
+    let cli_old_send: CoreCommand =
+        serde_json::from_value(fixture.wait_command(&cli_old_send_id, "applied"))
+            .expect("applied ordinary old-generation SEND");
+    let cli_old_turn = wait_fake_send_turn_result(
+        &fixture,
+        &cli_agent_id,
+        cli_generation,
+        &cli_old_send,
+        cli_old_text,
+    );
+    let cli_stop_id = ulid::Ulid::new().to_string();
+    let cli_stop: CommandSubmitResponse = serde_json::from_value(fixture.json(&[
+        "--id",
+        &cli_stop_id,
+        "stop",
+        &cli_agent_id,
+        "--generation",
+        &cli_generation_arg,
+    ]))
+    .expect("ordinary-resume exact-generation stop");
+    assert_eq!(cli_stop.command_id, cli_stop_id);
+    fixture.wait_command(&cli_stop_id, "applied");
+    let cli_stop_event =
+        wait_stop_applied_event(&fixture, &cli_agent_id, cli_generation, &cli_stop_id);
+    let cli_stop_seq = cli_stop_event["seq"]
+        .as_i64()
+        .expect("ordinary stop applied seq");
+    assert!(
+        !fixture.events().iter().any(|event| {
+            event["kind"] == "rule.fired" && event["data"]["event_seq"] == cli_stop_seq
+        }),
+        "ordinary CLI resume fixture unexpectedly used an event rule"
+    );
+    let cli_ids_before_resume = fixture_agent_ids(&fixture);
+    assert!(cli_ids_before_resume.iter().any(|id| id == &cli_agent_id));
+
+    let cli_resume_id = ulid::Ulid::new().to_string();
+    let cli_new_text = "ordinary CLI resumed-generation input";
+    let cli_resume_reply = cli(
+        &fixture.data,
+        &[
+            "--id",
+            &cli_resume_id,
+            "resume",
+            &cli_agent_id,
+            cli_new_text,
+        ],
+    );
+    assert!(
+        cli_resume_reply.status.success(),
+        "ordinary Fake CLI resume without --generation failed"
+    );
+    let cli_resume_submit: CommandSubmitResponse =
+        serde_json::from_str(&cli_resume_reply.stdout).expect("typed generationless CLI resume");
+    let cli_linked_send_id = format!("{cli_resume_id}/send");
+    assert_eq!(cli_resume_submit.command_id, cli_resume_id);
+    assert_eq!(
+        cli_resume_submit.agent.as_deref(),
+        Some(cli_agent_id.as_str())
+    );
+    assert_eq!(
+        cli_resume_submit.linked_command.as_deref(),
+        Some(cli_linked_send_id.as_str())
+    );
+    let cli_resume: CoreCommand =
+        serde_json::from_value(fixture.wait_command(&cli_resume_id, "applied"))
+            .expect("applied ordinary generationless resume");
+    assert_eq!(cli_resume.verb, "resume");
+    assert_eq!(cli_resume.principal, "owner");
+    assert_eq!(cli_resume.target.as_deref(), Some(cli_agent_id.as_str()));
+    assert_eq!(cli_resume.expected_generation, None);
+    assert_eq!(cli_resume.generation, Some(cli_generation + 1));
+    assert_eq!(cli_resume.args, json!({}));
+    let cli_resumed = wait_ready(&fixture, &cli_agent_id, cli_generation + 1);
+    assert_eq!(cli_resumed.agent.id, cli_initial.agent.id);
+    assert_eq!(cli_resumed.agent.generation, cli_generation + 1);
+    assert_eq!(cli_resumed.agent.native_scope, Some(cli_native_scope));
+    assert_eq!(cli_resumed.agent.native_ref, Some(cli_native_ref));
+    assert_eq!(cli_resumed.agent.profile, cli_initial.agent.profile);
+    assert_eq!(cli_resumed.agent.workspace, cli_initial.agent.workspace);
+    assert_eq!(fixture_agent_ids(&fixture), cli_ids_before_resume);
+
+    let cli_send: CoreCommand =
+        serde_json::from_value(fixture.wait_command(&cli_linked_send_id, "applied"))
+            .expect("applied ordinary resume linked SEND");
+    assert_eq!(cli_send.verb, "send");
+    assert_eq!(cli_send.principal, "owner");
+    assert_eq!(cli_send.target.as_deref(), Some(cli_agent_id.as_str()));
+    assert_eq!(cli_send.expected_generation, Some(cli_generation + 1));
+    assert_eq!(cli_send.generation, Some(cli_generation + 1));
+    assert_eq!(cli_send.args, json!({"text": cli_new_text}));
+    let cli_new_turn = wait_fake_send_turn_result(
+        &fixture,
+        &cli_agent_id,
+        cli_generation + 1,
+        &cli_send,
+        cli_new_text,
+    );
+    assert_eq!(cli_new_turn.state, TurnState::Completed);
+    assert_eq!(cli_new_turn.final_text.as_deref(), Some(cli_new_text));
+    assert_ne!(cli_new_turn.turn_id, cli_old_turn.turn_id);
+    let cli_resume_dispatch = fixture
+        .events()
+        .into_iter()
+        .find(|event| {
+            event["kind"] == "command.dispatched" && event["data"]["command_id"] == cli_resume_id
+        })
+        .expect("ordinary CLI resume dispatch");
+    assert_eq!(cli_resume_dispatch["generation"], cli_generation + 1);
+    assert_eq!(cli_resume_dispatch["cause"]["command_id"], cli_resume_id);
+    assert!(cli_resume_dispatch["cause"]["rule"].is_null());
+    let cli_result_generation = (cli_generation + 1).to_string();
+    let cli_new_result: AgentResultResponse = serde_json::from_value(fixture.json(&[
+        "result",
+        &cli_agent_id,
+        "--generation",
+        &cli_result_generation,
+    ]))
+    .expect("ordinary resumed-generation result history");
+    assert_eq!(cli_new_result.turns, vec![cli_new_turn]);
+    let cli_events_after_resume = fixture.events();
+    assert_eq!(
+        fault_dispatches(&cli_events_after_resume, &cli_old_send.id),
+        1
+    );
+    assert_eq!(
+        fault_dispatches(&cli_events_after_resume, &cli_resume.id),
+        1
+    );
+    assert_eq!(fault_dispatches(&cli_events_after_resume, &cli_send.id), 1);
+    assert_eq!(
+        cli_events_after_resume
+            .iter()
+            .filter(|event| {
+                event["kind"] == "turn.completed"
+                    && event["agent"] == cli_agent_id
+                    && event["generation"] == cli_generation + 1
+                    && event["data"]["command_id"] == cli_old_send.id
+            })
+            .count(),
+        0,
+        "ordinary resume replayed old-generation input"
+    );
+    assert_eq!(fixture_agent_ids(&fixture), cli_ids_before_resume);
+
+    let cli_stop_resumed_id = ulid::Ulid::new().to_string();
+    let cli_resumed_generation_arg = (cli_generation + 1).to_string();
+    let cli_stop_resumed: CommandSubmitResponse = serde_json::from_value(fixture.json(&[
+        "--id",
+        &cli_stop_resumed_id,
+        "stop",
+        &cli_agent_id,
+        "--generation",
+        &cli_resumed_generation_arg,
+    ]))
+    .expect("ordinary-resume cleanup stop");
+    assert_eq!(cli_stop_resumed.command_id, cli_stop_resumed_id);
+    fixture.wait_command(&cli_stop_resumed_id, "applied");
+    let cli_stop_resumed_event = wait_stop_applied_event(
+        &fixture,
+        &cli_agent_id,
+        cli_generation + 1,
+        &cli_stop_resumed_id,
+    );
+    let cli_stop_resumed_seq = cli_stop_resumed_event["seq"]
+        .as_i64()
+        .expect("ordinary resumed-generation stop applied seq");
+    assert!(
+        !fixture.events().iter().any(|event| {
+            event["kind"] == "rule.fired" && event["data"]["event_seq"] == cli_stop_resumed_seq
+        }),
+        "ordinary generationless resume used an event rule"
+    );
+    assert_eq!(fixture_agent_ids(&fixture), cli_ids_before_resume);
+
     fixture.stop(false);
 }
 
@@ -9834,7 +10066,15 @@ fn cli_fake_launch_actions_cover_owner_project_event_scheduled_manual_and_replay
     stop_live_fixture_agents(&fixture);
     let second_slot_deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
+        assert!(
+            std::time::Instant::now() < second_slot_deadline,
+            "scheduled Owner and Project rules did not each produce a second distinct slot"
+        );
         let current_events = fixture.events();
+        assert!(
+            std::time::Instant::now() < second_slot_deadline,
+            "scheduled slot scan exceeded its deadline"
+        );
         let current_slots = scheduled_firing_identities(&current_events);
         let missing_rule = CASES.iter().find(|case| {
             case.trigger == Trigger::Scheduled
@@ -9847,7 +10087,27 @@ fn cli_fake_launch_actions_cover_owner_project_event_scheduled_manual_and_replay
             std::time::Instant::now() < second_slot_deadline,
             "scheduled Owner and Project rules did not each produce a second distinct slot"
         );
-        let timer = read_timer(&fixture, case.rule, case.project);
+        let timer = read_timer_until(&fixture, case.rule, case.project, second_slot_deadline);
+        assert!(
+            std::time::Instant::now() < second_slot_deadline,
+            "scheduled post-timer slot recheck deadline"
+        );
+        let events_after_timer = fixture.events();
+        assert!(
+            std::time::Instant::now() < second_slot_deadline,
+            "scheduled post-timer slot scan exceeded its deadline"
+        );
+        let slots_after_timer = scheduled_firing_identities(&events_after_timer);
+        if CASES
+            .iter()
+            .filter(|scheduled| scheduled.trigger == Trigger::Scheduled)
+            .all(|scheduled| distinct_scheduled_slot_count(&slots_after_timer, scheduled.rule) >= 2)
+        {
+            break;
+        }
+        if distinct_scheduled_slot_count(&slots_after_timer, case.rule) >= 2 {
+            continue;
+        }
         let next_slot = timer
             .next_due_at
             .expect("registered scheduled rule exposes its next slot");
@@ -10521,8 +10781,8 @@ fn cli_fake_launch_actions_cover_owner_project_event_scheduled_manual_and_replay
         .filter(|case| case.trigger == Trigger::Scheduled)
     {
         assert!(
-            distinct_scheduled_slot_count(&scheduled_slots_after_history, case.rule) >= 2,
-            "scheduled rule {} did not retain two distinct phase-valid slots",
+            distinct_scheduled_slot_count(&scheduled_slots_after_history, case.rule) == 2,
+            "scheduled rule {} did not retain exactly two distinct phase-valid success slots",
             case.rule
         );
     }

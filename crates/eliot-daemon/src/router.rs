@@ -4938,7 +4938,7 @@ fn validate_retained_resume_agent(agent: &Agent, command: &Command) -> Result<i6
     if command.verb != "resume" {
         return Err(Error::new("bad_state", "command is not a resume"));
     }
-    if command.state != CommandState::Accepted {
+    if !matches!(command.state, CommandState::Accepted | CommandState::Queued) {
         return Err(Error::new(
             "bad_state",
             "resume source state must be captured before dispatch",
@@ -4961,12 +4961,15 @@ fn validate_retained_resume_agent(agent: &Agent, command: &Command) -> Result<i6
             "observe-only or unknown Agents cannot resume",
         ));
     }
-    let generation = command.expected_generation.ok_or_else(|| {
-        Error::new(
-            "stale_generation",
-            "resume did not capture its old generation",
-        )
-    })?;
+    let generation = command
+        .expected_generation
+        .or(command.generation)
+        .ok_or_else(|| {
+            Error::new(
+                "stale_generation",
+                "resume did not capture its old generation",
+            )
+        })?;
     if agent.generation != generation || command.generation != Some(generation) {
         return Err(Error::new(
             "stale_generation",
@@ -6058,6 +6061,22 @@ mod tests {
             ))
         );
 
+        let queued_resume = rule_admission(
+            command_with_state("resume-queued", "resume", CommandState::Queued),
+            Some(command_with_state(
+                "resume-send-held",
+                "send",
+                CommandState::Queued,
+            )),
+        );
+        assert_eq!(
+            rule_admission_dispatch_plan(&queued_resume),
+            Some((
+                "resume-queued".to_owned(),
+                Some("resume-send-held".to_owned())
+            ))
+        );
+
         let applied_resume = rule_admission(
             command_with_state("resume-applied", "resume", CommandState::Applied),
             Some(command_with_state(
@@ -6114,6 +6133,21 @@ mod tests {
         resume.expected_generation = Some(2);
         resume.generation = Some(2);
         assert_eq!(validate_retained_resume_agent(&fake, &resume).unwrap(), 2);
+
+        let mut ordinary = resume.clone();
+        ordinary.expected_generation = None;
+        assert_eq!(validate_retained_resume_agent(&fake, &ordinary).unwrap(), 2);
+        let mut queued = ordinary.clone();
+        queued.state = CommandState::Queued;
+        assert_eq!(validate_retained_resume_agent(&fake, &queued).unwrap(), 2);
+        let mut missing_stored_generation = resume.clone();
+        missing_stored_generation.generation = None;
+        assert_eq!(
+            validate_retained_resume_agent(&fake, &missing_stored_generation)
+                .unwrap_err()
+                .code,
+            "stale_generation"
+        );
 
         let mut observed = fake.clone();
         observed.observe_only = true;
@@ -8926,6 +8960,72 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
     }
 
     #[tokio::test]
+    async fn resume_stop_dispatch_race_settlement_cancels_linked_send() {
+        let router = router();
+        let (agent, stop_id, resume_id, linked_id, dispatch_error) = {
+            let mut store = router.inner.store.lock().await;
+            let agent = stopped_fake_agent(&mut store, "resume-stop-dispatch-race");
+
+            let stop_id = ulid::Ulid::new().to_string();
+            let mut stop = SubmitCommand::new(stop_id.clone(), "stop");
+            stop.target = Some(agent.clone());
+            stop.expected_generation = Some(1);
+            store.submit("owner", stop, now_ms()).unwrap();
+
+            let resume_id = ulid::Ulid::new().to_string();
+            let mut resume = SubmitCommand::new(resume_id.clone(), "resume");
+            resume.target = Some(agent.clone());
+            resume.expected_generation = Some(1);
+            resume.args = json!({"text":"resume after the stop gate"});
+            let admission = store.submit("owner", resume, now_ms()).unwrap();
+            let linked = admission
+                .linked_command
+                .expect("Resume text is persisted as linked SEND");
+            let linked_id = linked.id;
+            assert_eq!(admission.command.state, CommandState::Accepted);
+            assert_eq!(linked.state, CommandState::Queued);
+
+            assert_eq!(
+                store.dispatch(&stop_id, now_ms()).unwrap().value.state,
+                CommandState::Dispatched
+            );
+            let dispatch_error = store.dispatch(&resume_id, now_ms()).unwrap_err();
+            assert_eq!(dispatch_error.code, "bad_state");
+            (agent, stop_id, resume_id, linked_id, dispatch_error)
+        };
+
+        router
+            .settle_dispatch_error(&resume_id, &dispatch_error, false, false, false)
+            .await;
+
+        let store = router.inner.store.lock().await;
+        assert_eq!(
+            store.get_command(&resume_id).unwrap().unwrap().state,
+            CommandState::Rejected
+        );
+        assert_eq!(
+            store.get_command(&linked_id).unwrap().unwrap().state,
+            CommandState::Cancelled
+        );
+        assert!(
+            store
+                .read_events(0, 1_000, None)
+                .unwrap()
+                .iter()
+                .any(|event| {
+                    event.kind == "command.cancelled"
+                        && event.data.get("command_id").and_then(Value::as_str)
+                            == Some(linked_id.as_str())
+                })
+        );
+        assert_eq!(store.get_agent(&agent).unwrap().unwrap().generation, 1);
+        assert_eq!(
+            store.get_command(&stop_id).unwrap().unwrap().state,
+            CommandState::Dispatched
+        );
+    }
+
+    #[tokio::test]
     async fn store_write_fault_overlays_unknown_only_for_uncertain_dispatch() {
         let router = router();
         let accepted_id = ulid::Ulid::new().to_string();
@@ -9878,6 +9978,16 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             &mut authorized,
         )
         .expect("Project resume and its linked SEND are explicitly approved");
+
+        let mut without_captured_generation = request.clone();
+        without_captured_generation.expected_generation = None;
+        assert_eq!(
+            validate_rule_resume_action(&without_captured_generation, Some(&registration))
+                .unwrap_err()
+                .code,
+            "invalid",
+            "EventRule Resume must keep its captured generation",
+        );
 
         let mut without_send = registration.clone();
         without_send.actions = vec!["resume".to_owned()];
@@ -11034,6 +11144,46 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 now_ms(),
             )
             .unwrap();
+    }
+
+    fn stopped_fake_agent(store: &mut eliot_store::Store, project: &str) -> String {
+        let workspace = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let launch_id = ulid::Ulid::new().to_string();
+        let mut launch = SubmitCommand::new(launch_id.clone(), "launch");
+        launch.expected_generation = Some(0);
+        launch.args = json!({
+            "project":project,
+            "workspace":workspace,
+            "harness":"fake",
+            "profile":"fake",
+            "profile_snapshot":{"harness":"fake"},
+        });
+        let agent = store
+            .submit("owner", launch, now_ms())
+            .unwrap()
+            .command
+            .target
+            .unwrap();
+        store.dispatch(&launch_id, now_ms()).unwrap();
+        read_fixture_event(
+            store,
+            &agent,
+            "session.ready",
+            json!({
+                "command_id":launch_id,
+                "native_scope":format!("fake:synthetic:scope:{agent}"),
+                "native_ref":format!("fake:synthetic:session:{agent}"),
+            }),
+        );
+        store
+            .settle(&launch_id, CommandState::Applied, None, now_ms())
+            .unwrap();
+        read_fixture_event(store, &agent, "session.ended", json!({}));
+        agent
     }
 
     fn result_fixture(store: &mut eliot_store::Store) -> (String, String) {

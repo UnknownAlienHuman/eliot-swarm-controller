@@ -6083,10 +6083,29 @@ fn exact_undispatched_resume_rejection_releases_only_its_next_generation_slot() 
     let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
     resume.target = Some(agent.clone());
     resume.expected_generation = Some(1);
+    resume.args = json!({"text": "newly admitted resume input"});
     let resume_id = resume.id.clone();
-    store.submit("owner", resume, now + 2).unwrap();
+    let retained_request = resume.clone();
+    let admission = store.submit("owner", resume, now + 2).unwrap();
+    assert_eq!(admission.command.args, json!({}));
+    let linked = admission
+        .linked_command
+        .expect("resume text is a linked SEND");
+    let linked_id = linked.id.clone();
+    assert_eq!(linked_id, format!("{resume_id}/send"));
+    assert_eq!(linked.expected_generation, Some(2));
+    assert_eq!(linked.generation, Some(2));
+    assert_eq!(linked.state, CommandState::Queued);
+    assert_eq!(linked.args["text"], "newly admitted resume input");
+    let linked_cause = super::command_cause_tx(&store.connection, &linked_id)
+        .unwrap()
+        .expect("ordinary linked SEND cause");
+    assert_eq!(linked_cause.command_id, linked_id);
+    assert!(linked_cause.rule.is_none());
+    assert_eq!(linked_cause.depth, 0);
+    let old_agent = store.get_agent(&agent).unwrap().unwrap();
     assert_eq!(capacity_generation(&store, &agent), Some(2));
-    store
+    let settled = store
         .settle(
             &resume_id,
             CommandState::Rejected,
@@ -6094,13 +6113,44 @@ fn exact_undispatched_resume_rejection_releases_only_its_next_generation_slot() 
             now + 3,
         )
         .expect("exact no-session rejection withdraws this resume");
+    assert!(settled.events.iter().any(|event| {
+        event.kind == "command.cancelled" && event.data["command_id"] == linked_id
+    }));
+    assert_eq!(
+        store.get_command(&linked_id).unwrap().unwrap().state,
+        CommandState::Cancelled
+    );
+    assert_eq!(store.get_agent(&agent).unwrap().unwrap(), old_agent);
+    let pending_children: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM commands
+             WHERE parent_command = ?1 AND link_kind = 'send' AND ordinal = 0
+               AND state IN ('accepted','queued','dispatched','unknown')",
+            [&resume_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        pending_children, 0,
+        "pre-dispatch failure leaves no open input"
+    );
     assert_eq!(capacity_generation(&store, &agent), None);
+    let replay = store
+        .submit("owner", retained_request, now + 4)
+        .expect("the original rejected resume retains its cancellation");
+    assert!(!replay.is_new);
+    assert_eq!(replay.command.state, CommandState::Rejected);
+    assert_eq!(
+        replay.linked_command.unwrap().state,
+        CommandState::Cancelled
+    );
 
     let mut next = SubmitCommand::new(Ulid::new().to_string(), "resume");
     next.target = Some(agent.clone());
     next.expected_generation = Some(1);
     store
-        .submit("owner", next, now + 4)
+        .submit("owner", next, now + 5)
         .expect("a withdrawn resume no longer blocks a new exact resume");
     assert_eq!(capacity_generation(&store, &agent), Some(2));
 }

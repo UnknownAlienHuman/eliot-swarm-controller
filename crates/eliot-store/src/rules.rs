@@ -3235,58 +3235,14 @@ pub(super) fn gate_rule_action_dispatch_tx(
             super::capacity::release_unstarted_tx(tx, target, 1, &row.0)?;
             super::fail_unstarted_launch_tx(tx, target, &row.0, now, events)?;
         } else if sibling.command.verb == "resume" {
-            let old_generation = sibling.command.expected_generation.ok_or_else(|| {
-                Error::new(
-                    "source_integrity",
-                    "undispatched resume has no old generation",
-                )
-            })?;
-            if sibling.target != Some(target) || sibling.command.generation != Some(old_generation)
-            {
-                return Err(Error::new(
-                    "source_integrity",
-                    "undispatched resume no longer has its exact terminal generation",
-                ));
-            }
-            let next_generation = old_generation.checked_add(1).ok_or_else(|| {
-                Error::new("source_integrity", "resume capacity generation overflow")
-            })?;
-            let retained = retained_action_admission(tx, sibling.command.clone())?;
-            if let Some(input) = retained.linked_command
-                && matches!(input.state, CommandState::Accepted | CommandState::Queued)
-            {
-                let input_target = input
-                    .target
-                    .as_deref()
-                    .map(parse_agent_id)
-                    .transpose()?
-                    .ok_or_else(|| {
-                        Error::new("source_integrity", "resume input has no Agent target")
-                    })?;
-                let input_generation =
-                    input
-                        .generation
-                        .or(input.expected_generation)
-                        .ok_or_else(|| {
-                            Error::new("source_integrity", "resume input has no next generation")
-                        })?;
-                if input_target != target || input_generation != next_generation {
-                    return Err(Error::new(
-                        "source_integrity",
-                        "resume input no longer targets its exact next generation",
-                    ));
-                }
-                cancel_pending_command_tx(
-                    tx,
-                    input_target,
-                    input_generation,
-                    &input.id,
-                    "rule_action_predecessor_terminal",
-                    now,
-                    events,
-                )?;
-            }
-            super::capacity::release_unstarted_tx(tx, target, next_generation, &row.0)?;
+            super::cancel_unstarted_resume_input_tx(
+                tx,
+                target,
+                &row.0,
+                "rule_action_predecessor_terminal",
+                now,
+                events,
+            )?;
         }
     }
     Ok(RuleActionDispatchGate::Cancelled)
@@ -4142,7 +4098,10 @@ fn load_rule_child(
     Ok(Some(retained_action_admission(connection, command)?))
 }
 
-fn retained_action_admission(connection: &Connection, command: Command) -> Result<Admission> {
+pub(super) fn retained_action_admission(
+    connection: &Connection,
+    command: Command,
+) -> Result<Admission> {
     let linked_command = if matches!(command.verb.as_str(), "launch" | "resume") {
         load_linked_command(connection, &command.id)?
     } else {
@@ -4171,9 +4130,12 @@ fn retained_action_admission(connection: &Connection, command: Command) -> Resul
     } else if command.verb == "resume" {
         match linked_command.as_ref() {
             Some(linked) => {
-                let old_generation = command.expected_generation.ok_or_else(|| {
-                    Error::new("source_integrity", "rule resume has no old generation")
-                })?;
+                let old_generation = command
+                    .expected_generation
+                    .or(command.generation)
+                    .ok_or_else(|| {
+                        Error::new("source_integrity", "rule resume has no old generation")
+                    })?;
                 let next_generation = old_generation.checked_add(1).ok_or_else(|| {
                     Error::new("source_integrity", "rule resume generation overflow")
                 })?;

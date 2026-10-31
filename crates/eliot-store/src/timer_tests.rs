@@ -1786,6 +1786,246 @@ fn timer_launch_and_linked_input_count_as_one_rule_action() {
 }
 
 #[test]
+fn scheduled_project_timer_launch_replay_precedes_current_profile_gate() {
+    let mut store = store();
+    let registration_ms = now_ms();
+    let project = "timer-project-launch-replay";
+    let rule_id = "timer-project-launch-replay";
+    let mut registration =
+        project_registration(project, vec!["launch".to_owned(), "send".to_owned()]);
+    registration.profiles = vec!["fake".to_owned()];
+    let checkout = registration.checkout.clone();
+    store
+        .upsert_project_registration("owner", &registration, registration_ms)
+        .expect("register Project timer Launch and SEND");
+
+    let principal = format!("project:{project}");
+    let rule_value = json!({
+        "id": rule_id,
+        "enabled": true,
+        "on": {"event": "turn.completed"},
+        "do": [{
+            "action": "launch",
+            "profile": "fake",
+            "workspace": checkout,
+            "text": "initial Project timer input",
+        }],
+        "limit": {"max": 2, "per": "rule", "window_ms": 60_000},
+    });
+    let rule = RuleDefinitionInput {
+        id: rule_id.to_owned(),
+        canonical_definition: serde_json::to_string(&rule_value).unwrap(),
+        definition_digest: canonical_json_sha256(&rule_value).unwrap(),
+        enabled: true,
+    };
+    let rule_state = store
+        .ensure_rule_state(&principal, &rule, registration_ms + 1)
+        .expect("ensure two-action Project timer rule");
+    assert!(rule_state.enabled);
+    let period_ms = 1_000;
+    let timer = store
+        .ensure_timer_state(
+            &principal,
+            &TimerDefinitionInput {
+                id: rule_id.to_owned(),
+                schedule_revision: 1,
+                schedule: TimerSchedule::Interval {
+                    period_ms,
+                    anchor: Some(registration_ms),
+                },
+                enabled: true,
+                initial_next_due_at: Some(registration_ms + period_ms),
+            },
+            registration_ms + 1,
+        )
+        .expect("ensure Project timer schedule");
+    let launch_action = |text: Option<&str>| {
+        let mut action = SubmitCommand::new(Ulid::new().to_string(), "launch");
+        action.args = json!({
+            "project": project,
+            "harness": "fake",
+            "profile": "fake",
+            "profile_snapshot": {},
+            "workspace": checkout.as_str(),
+        });
+        if let Some(text) = text {
+            action.args["text"] = json!(text);
+        }
+        action.expected_generation = Some(0);
+        action
+    };
+    let first_due = timer.next_due_at.expect("first scheduled slot");
+    let first = store
+        .commit_timer_slot(
+            &principal,
+            &timer,
+            TimerSlotCommit {
+                scheduled_at_ms: first_due,
+                next_due_at_ms: Some(first_due + period_ms),
+                action: Some(launch_action(Some("initial Project timer input"))),
+                skip_code: None,
+            },
+            first_due,
+        )
+        .expect("admit first Project timer Launch");
+    assert!(!first.blocked);
+    let first_parent_id = first.parent.as_ref().unwrap().id.clone();
+    let first_child = first.child.as_ref().expect("first Project Launch action");
+    let first_launch_id = first_child.command.id.clone();
+    let first_send_id = first_child
+        .linked_command
+        .as_ref()
+        .expect("Project Launch has linked SEND")
+        .id
+        .clone();
+    let first_agent = first_child.command.target.as_deref().unwrap().to_owned();
+    assert_eq!(first_send_id, format!("{first_launch_id}/send"));
+    ready_timer_launch(&mut store, &first_launch_id, &first_agent, first_due + 1);
+    apply_timer_launch_input_in_running_turn(
+        &mut store,
+        &first_agent,
+        &first_send_id,
+        first_due + 4,
+    );
+
+    let second_due = first.state.next_due_at.expect("second scheduled slot");
+    let second = store
+        .commit_timer_slot(
+            &principal,
+            &first.state,
+            TimerSlotCommit {
+                scheduled_at_ms: second_due,
+                next_due_at_ms: Some(second_due + period_ms),
+                action: Some(launch_action(None)),
+                skip_code: None,
+            },
+            second_due,
+        )
+        .expect("admit second Project timer Launch under max=2");
+    assert!(!second.blocked);
+    let second_child = second.child.as_ref().expect("second Project Launch action");
+    let second_launch_id = second_child.command.id.clone();
+    let second_agent = second_child.command.target.as_deref().unwrap().to_owned();
+    assert!(second_child.linked_command.is_none());
+    ready_timer_launch(&mut store, &second_launch_id, &second_agent, second_due + 1);
+    let action_count: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM commands
+             WHERE principal = ?1 AND link_kind = 'rule_action' AND ordinal IS NOT NULL",
+            [&principal],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(action_count, 2);
+
+    registration.profiles.clear();
+    store
+        .upsert_project_registration("owner", &registration, second_due + 4)
+        .expect("revoke the current Project profile grant");
+    let third_due = second.state.next_due_at.expect("third scheduled slot");
+    let denied = store
+        .commit_timer_slot(
+            &principal,
+            &second.state,
+            TimerSlotCommit {
+                scheduled_at_ms: third_due,
+                next_due_at_ms: Some(third_due + period_ms),
+                action: Some(launch_action(None)),
+                skip_code: None,
+            },
+            third_due,
+        )
+        .expect("record rejection under the changed current profile gate");
+    assert!(!denied.blocked);
+    assert!(denied.child.is_none());
+    assert_eq!(
+        denied.parent.as_ref().unwrap().state,
+        CommandState::Rejected
+    );
+    assert_eq!(
+        denied.parent.as_ref().unwrap().outcome.as_ref().unwrap()["code"],
+        "not_allowed"
+    );
+    let commands_before_replay: i64 = store
+        .connection
+        .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+        .unwrap();
+    let high_water_before_replay = store.high_water().unwrap();
+    let first_launch_dispatches: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE kind = 'command.dispatched'
+             AND json_extract(data, '$.command_id') = ?1",
+            [&first_launch_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    let first_send_dispatches: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE kind = 'command.dispatched'
+             AND json_extract(data, '$.command_id') = ?1",
+            [&first_send_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(first_launch_dispatches, 1);
+    assert_eq!(first_send_dispatches, 1);
+
+    let replay = store
+        .replay_timer_slot(&principal, &timer, first_due)
+        .unwrap()
+        .expect("same scheduled Launch slot replays before changed current gates");
+    assert!(!replay.is_new);
+    assert!(replay.events.is_empty());
+    assert_eq!(replay.parent.as_ref().unwrap().id, first_parent_id);
+    let replay_launch = replay.child.as_ref().expect("retained Launch action");
+    assert_eq!(replay_launch.command.id, first_launch_id);
+    assert_eq!(replay_launch.command.state, CommandState::Applied);
+    let replay_send = replay_launch
+        .linked_command
+        .as_ref()
+        .expect("retained linked Project input");
+    assert_eq!(replay_send.id, first_send_id);
+    assert_eq!(replay_send.args["text"], "initial Project timer input");
+    assert_eq!(replay_send.state, CommandState::Applied);
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        commands_before_replay
+    );
+    assert_eq!(store.high_water().unwrap(), high_water_before_replay);
+    assert_eq!(
+        store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind = 'command.dispatched'
+                 AND json_extract(data, '$.command_id') = ?1",
+                [&first_launch_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        first_launch_dispatches
+    );
+    assert_eq!(
+        store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind = 'command.dispatched'
+                 AND json_extract(data, '$.command_id') = ?1",
+                [&first_send_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        first_send_dispatches
+    );
+}
+
+#[test]
 fn project_timer_run_reuses_registration_authority_at_dispatch() {
     let mut store = store();
     let registration_ms = now_ms();

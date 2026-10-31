@@ -2,6 +2,11 @@ use super::*;
 
 const SCRIPT_ACTION_ID_DOMAIN: &str = "eliot.script.action.command.v1";
 
+fn valid_script_output_action_request(request: &SubmitCommand) -> bool {
+    matches!(request.verb.as_str(), "stop" | "send" | "interrupt")
+        && rules::valid_rule_action_request(request, true)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScriptRunAdmission {
     pub command: Command,
@@ -93,7 +98,7 @@ impl Store {
         let mut events = Vec::new();
         let mut child_ids = Vec::with_capacity(actions.len());
         for (index, mut action) in actions.into_iter().enumerate() {
-            if !action.id.is_empty() || !rules::valid_rule_action_request(&action, true) {
+            if !action.id.is_empty() || !valid_script_output_action_request(&action) {
                 return Err(Error::new(
                     "invalid",
                     "script output must contain an id-free stop, send or interrupt command",
@@ -728,7 +733,9 @@ mod tests {
     fn stored_command_count(store: &Store) -> i64 {
         store
             .connection
-            .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| {
+                row.get::<_, i64>(0)
+            })
             .expect("count stored commands")
     }
 
@@ -797,6 +804,54 @@ mod tests {
                 == "bad_state"
         );
         assert!(child_ids(&store, &run.id).is_empty());
+    }
+
+    #[test]
+    fn script_output_rejects_constructed_resume_without_writes() {
+        let mut store = store();
+        let (_, agent) = insert_agent(&mut store, "script-resume-rejected", 10);
+        let (_, _, run) = admit_run(
+            &mut store,
+            "owner",
+            "script-resume-rejected",
+            11,
+            None,
+            None,
+        );
+        let run = dispatch_run(&mut store, &run, 14);
+        let mut resume = SubmitCommand::new(String::new(), "resume");
+        resume.target = Some(agent);
+        resume.expected_generation = Some(1);
+        resume.args = json!({});
+
+        let commands_before: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+            .expect("count commands before rejected output");
+        let high_water_before = store.high_water().expect("read event high-water");
+        let error = store
+            .admit_script_output(
+                &run.id,
+                vec![resume],
+                process_result(core::ScriptCustody::Exact),
+                15,
+            )
+            .expect_err("script output grammar excludes Resume");
+        assert_eq!(error.code, "invalid");
+        assert!(child_ids(&store, &run.id).is_empty());
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM commands", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("count commands after rejected output"),
+            commands_before
+        );
+        assert_eq!(store.high_water().unwrap(), high_water_before);
+        assert_eq!(
+            store.get_command(&run.id).unwrap().unwrap().state,
+            CommandState::Dispatched
+        );
     }
 
     #[test]
