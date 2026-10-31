@@ -8218,7 +8218,10 @@ fn fail_unstarted_launch_tx(
     if command.target != Some(agent_num)
         || command.command.verb != "launch"
         || command.command.generation != Some(0)
-        || !matches!(command.state, CommandState::Rejected | CommandState::Failed)
+        || !matches!(
+            command.state,
+            CommandState::Rejected | CommandState::Failed | CommandState::Cancelled
+        )
     {
         return Err(Error::new(
             "stale_generation",

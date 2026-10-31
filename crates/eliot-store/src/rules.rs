@@ -3199,6 +3199,8 @@ pub(super) fn gate_rule_action_dispatch_tx(
                 "undispatched rule-action child has no generation",
             )
         })?;
+        let sibling = load_command_record(tx, &row.0)?
+            .ok_or_else(|| Error::new("source_integrity", "rule-action sibling disappeared"))?;
         cancel_pending_command_tx(
             tx,
             target,
@@ -3208,6 +3210,10 @@ pub(super) fn gate_rule_action_dispatch_tx(
             now,
             events,
         )?;
+        if sibling.command.verb == "launch" {
+            super::capacity::release_unstarted_tx(tx, target, 1, &row.0)?;
+            super::fail_unstarted_launch_tx(tx, target, &row.0, now, events)?;
+        }
     }
     Ok(RuleActionDispatchGate::Cancelled)
 }
@@ -6384,6 +6390,406 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(child_two_dispatches, 0);
+        }
+    }
+
+    #[test]
+    fn catch_up_launch_sibling_gate_tracks_linked_send_and_cleans_terminal_successors() {
+        let rule_id = "catch-up-launch-sibling";
+        let workspace = "synthetic-catch-up-launch-sibling";
+        let rule_value = json!({
+            "id": rule_id,
+            "enabled": true,
+            "on": {"event": "command.accepted"},
+            "do": [{"action": "launch", "profile": "fake", "workspace": workspace}],
+            "limit": {
+                "max": 2,
+                "per": "rule",
+                "window_ms": RULE_ACTION_WINDOW_MS,
+            },
+        });
+        let rule = RuleDefinitionInput {
+            id: rule_id.to_owned(),
+            canonical_definition: serde_json::to_string(&rule_value).unwrap(),
+            definition_digest: core::canonical_json_sha256(&rule_value).unwrap(),
+            enabled: true,
+        };
+        let launch_request = |text: &str| {
+            let mut request = SubmitCommand::new(Ulid::new().to_string(), "launch");
+            request.args = json!({
+                "project": workspace,
+                "harness": "fake",
+                "profile": "fake",
+                "profile_snapshot": {},
+                "workspace": workspace,
+                "text": text,
+            });
+            request.expected_generation = Some(0);
+            request
+        };
+        let prepare_pair = || {
+            let mut store = store();
+            let request_id = Ulid::new();
+            let now = i64::try_from(request_id.timestamp_ms()).unwrap() + 10;
+            let first_event = insert_test_event(&mut store, "command.accepted", now - 1);
+            let second_event = insert_test_event(&mut store, "command.accepted", now - 1);
+            let state = store.ensure_rule_state("owner", &rule, now).unwrap();
+            let captured_through = state.current_cursor;
+            assert!(second_event <= captured_through);
+            let request = core::api::RuleCatchUpRequest::new(
+                request_id.to_string(),
+                rule_id,
+                first_event - 1,
+                Some(captured_through),
+            );
+            let actions = [
+                RuleCatchUpAction::command(
+                    first_event,
+                    launch_request("first linked launch input"),
+                ),
+                RuleCatchUpAction::command(
+                    second_event,
+                    launch_request("successor linked launch input"),
+                ),
+            ];
+            let admitted = store
+                .admit_rule_catch_up("owner", &request, &state, captured_through, &actions, now)
+                .unwrap();
+            assert_eq!(admitted.children.len(), 2);
+            let first = &admitted.children[0];
+            let second = &admitted.children[1];
+            assert_eq!(first.command.verb, "launch");
+            assert_eq!(second.command.verb, "launch");
+            let first_launch_id = first.command.id.clone();
+            let first_send_id = first
+                .linked_command
+                .as_ref()
+                .expect("first launch has its linked SEND")
+                .id
+                .clone();
+            let second_launch_id = second.command.id.clone();
+            let second_send_id = second
+                .linked_command
+                .as_ref()
+                .expect("successor launch has its linked SEND")
+                .id
+                .clone();
+            assert_eq!(first_send_id, format!("{first_launch_id}/send"));
+            assert_eq!(second_send_id, format!("{second_launch_id}/send"));
+            let first_agent = first.command.target.clone().expect("first launch Agent");
+            let second_agent = second
+                .command
+                .target
+                .clone()
+                .expect("successor launch Agent");
+
+            store.dispatch(&first_launch_id, now + 1).unwrap();
+            store
+                .put_batch(
+                    SourceBatch {
+                        batch_id: format!("catch-up-first-launch-ready-{request_id}"),
+                        agent_id: first_agent.clone(),
+                        generation: 1,
+                        source: "stream".to_owned(),
+                        events: vec![NativeEvent {
+                            ts: None,
+                            kind: "session.ready".to_owned(),
+                            native_id: format!("catch-up-first-launch-ready-{request_id}"),
+                            data: json!({"command_id": first_launch_id}),
+                        }],
+                        cursor: None,
+                    },
+                    now + 2,
+                )
+                .unwrap();
+            store
+                .settle(&first_launch_id, CommandState::Applied, None, now + 3)
+                .unwrap();
+            assert_eq!(
+                store.get_command(&first_launch_id).unwrap().unwrap().state,
+                CommandState::Applied
+            );
+            (
+                store,
+                now + 4,
+                first_launch_id,
+                first_send_id,
+                second_launch_id,
+                second_send_id,
+                first_agent,
+                second_agent,
+            )
+        };
+
+        for input_state in ["accepted", "queued", "dispatched", "unknown"] {
+            let (
+                mut store,
+                now,
+                _first_launch_id,
+                first_send_id,
+                second_launch_id,
+                second_send_id,
+                _first_agent,
+                second_agent,
+            ) = prepare_pair();
+            match input_state {
+                "accepted" | "queued" => {
+                    store
+                        .connection
+                        .execute(
+                            "UPDATE commands SET state = ?1 WHERE id = ?2",
+                            rusqlite::params![input_state, first_send_id],
+                        )
+                        .unwrap();
+                }
+                "dispatched" => {
+                    assert_eq!(
+                        store.dispatch(&first_send_id, now).unwrap().value.state,
+                        CommandState::Dispatched
+                    );
+                }
+                "unknown" => {
+                    store.dispatch(&first_send_id, now).unwrap();
+                    store
+                        .settle(
+                            &first_send_id,
+                            CommandState::Unknown,
+                            Some(json!({"reason": "fixture uncertainty"})),
+                            now + 1,
+                        )
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let expected_input_state = match input_state {
+                "accepted" => CommandState::Accepted,
+                "queued" => CommandState::Queued,
+                "dispatched" => CommandState::Dispatched,
+                "unknown" => CommandState::Unknown,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                store.get_command(&first_send_id).unwrap().unwrap().state,
+                expected_input_state
+            );
+            let recoverable = store.recover_rule_children(None, 100).unwrap();
+            assert!(
+                recoverable
+                    .iter()
+                    .all(|action| action.command.id != second_launch_id),
+                "successor recovered while first Launch input was {input_state}"
+            );
+            let held = store.dispatch(&second_launch_id, now + 10).unwrap();
+            assert_eq!(held.value.state, CommandState::Queued);
+            assert!(
+                !held
+                    .events
+                    .iter()
+                    .any(|event| event.kind == "command.dispatched")
+            );
+            assert_eq!(held.value.generation, Some(0));
+            let second_agent = store.get_agent(&second_agent).unwrap().unwrap();
+            assert_eq!(second_agent.generation, 0);
+            assert_eq!(second_agent.state, AgentState::Created);
+            let reservation: Option<i64> = store
+                .connection
+                .query_row(
+                    "SELECT capacity_generation FROM agents WHERE id = ?1",
+                    [eliot_core::parse_agent_id(&second_agent.id).unwrap()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(reservation, Some(1));
+            assert_eq!(
+                store.get_command(&second_send_id).unwrap().unwrap().state,
+                CommandState::Queued
+            );
+            let recoverable_after_hold = store.recover_rule_children(None, 100).unwrap();
+            assert!(
+                recoverable_after_hold
+                    .iter()
+                    .all(|action| action.command.id != second_launch_id)
+            );
+        }
+
+        {
+            let (
+                mut store,
+                now,
+                _first_launch_id,
+                first_send_id,
+                second_launch_id,
+                _second_send_id,
+                first_agent,
+                second_agent,
+            ) = prepare_pair();
+            let turn_id = Ulid::new().to_string();
+            store.dispatch(&first_send_id, now).unwrap();
+            store
+                .put_batch(
+                    SourceBatch {
+                        batch_id: Ulid::new().to_string(),
+                        agent_id: first_agent.clone(),
+                        generation: 1,
+                        source: "stream".to_owned(),
+                        events: vec![NativeEvent {
+                            ts: None,
+                            kind: "turn.started".to_owned(),
+                            native_id: Ulid::new().to_string(),
+                            data: json!({
+                                "command_id": first_send_id,
+                                "turn_id": turn_id,
+                            }),
+                        }],
+                        cursor: None,
+                    },
+                    now + 1,
+                )
+                .unwrap();
+            let first_send = store.get_command(&first_send_id).unwrap().unwrap();
+            assert_eq!(first_send.state, CommandState::Applied);
+            assert_eq!(first_send.turn_id.as_deref(), Some(turn_id.as_str()));
+            assert_eq!(
+                store
+                    .get_turn(&first_agent, 1, &turn_id)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                TurnState::Running
+            );
+            let recoverable = store.recover_rule_children(None, 100).unwrap();
+            assert!(
+                recoverable
+                    .iter()
+                    .any(|action| action.command.id == second_launch_id)
+            );
+            assert_eq!(
+                store
+                    .dispatch(&second_launch_id, now + 2)
+                    .unwrap()
+                    .value
+                    .state,
+                CommandState::Dispatched
+            );
+            let second_agent = store.get_agent(&second_agent).unwrap().unwrap();
+            assert_eq!(second_agent.generation, 1);
+            assert_eq!(second_agent.state, AgentState::Starting);
+            assert_eq!(
+                store
+                    .get_turn(&first_agent, 1, &turn_id)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                TurnState::Running
+            );
+        }
+
+        for terminal_input_state in ["rejected", "failed", "cancelled"] {
+            let (
+                mut store,
+                now,
+                _first_launch_id,
+                first_send_id,
+                second_launch_id,
+                second_send_id,
+                _first_agent,
+                second_agent,
+            ) = prepare_pair();
+            match terminal_input_state {
+                "rejected" => {
+                    store
+                        .settle(
+                            &first_send_id,
+                            CommandState::Rejected,
+                            Some(json!({"reason": "fixture rejection"})),
+                            now,
+                        )
+                        .unwrap();
+                }
+                "failed" => {
+                    store.dispatch(&first_send_id, now).unwrap();
+                    store
+                        .settle(
+                            &first_send_id,
+                            CommandState::Failed,
+                            Some(json!({"reason": "fixture failure"})),
+                            now + 1,
+                        )
+                        .unwrap();
+                }
+                "cancelled" => {
+                    assert_eq!(
+                        store
+                            .connection
+                            .execute(
+                                "UPDATE commands SET state = 'cancelled' WHERE id = ?1",
+                                [&first_send_id],
+                            )
+                            .unwrap(),
+                        1
+                    );
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                store.get_command(&first_send_id).unwrap().unwrap().state,
+                match terminal_input_state {
+                    "rejected" => CommandState::Rejected,
+                    "failed" => CommandState::Failed,
+                    "cancelled" => CommandState::Cancelled,
+                    _ => unreachable!(),
+                }
+            );
+            let recoverable = store.recover_rule_children(None, 100).unwrap();
+            assert!(
+                recoverable
+                    .iter()
+                    .any(|action| action.command.id == second_launch_id),
+                "terminal first input makes the undispatched successor recoverable"
+            );
+            let cancelled = store.dispatch(&second_launch_id, now + 10).unwrap();
+            assert_eq!(cancelled.value.state, CommandState::Cancelled);
+            assert!(cancelled.events.iter().any(|event| {
+                event.kind == "command.cancelled" && event.data["command_id"] == second_launch_id
+            }));
+            assert!(cancelled.events.iter().any(|event| {
+                event.kind == "command.cancelled" && event.data["command_id"] == second_send_id
+            }));
+            assert!(cancelled.events.iter().any(|event| {
+                event.kind == "agent.failed"
+                    && event.data["command_id"] == second_launch_id
+                    && event.data["reason"] == "launch_not_dispatched"
+            }));
+            assert_eq!(
+                store.get_command(&second_send_id).unwrap().unwrap().state,
+                CommandState::Cancelled
+            );
+            let second_agent = store.get_agent(&second_agent).unwrap().unwrap();
+            assert_eq!(second_agent.generation, 0);
+            assert_eq!(second_agent.state, AgentState::Failed);
+            assert!(second_agent.is_terminal());
+            let reservation: Option<i64> = store
+                .connection
+                .query_row(
+                    "SELECT capacity_generation FROM agents WHERE id = ?1",
+                    [eliot_core::parse_agent_id(&second_agent.id).unwrap()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(reservation, None);
+            assert_eq!(
+                store
+                    .connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM events
+                         WHERE kind = 'command.dispatched'
+                           AND json_extract(data, '$.command_id') = ?1",
+                        [&second_launch_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0
+            );
         }
     }
 
