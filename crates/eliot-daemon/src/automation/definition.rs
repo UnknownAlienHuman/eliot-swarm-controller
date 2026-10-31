@@ -1031,11 +1031,19 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
                 "interrupt actions require an event trigger",
             ));
         }
-        AgentActionDefinition::Resume { .. } => {
-            return Err(Error::new(
-                "unsupported",
-                "resume actions require an event trigger",
-            ));
+        AgentActionDefinition::Resume {
+            target,
+            expected_generation,
+            ..
+        } => {
+            let args = match action.text() {
+                Some((text, max_bytes, limit_label)) => {
+                    validate_text_template(text, false, max_bytes, action.verb(), limit_label)?;
+                    json!({"text": text.as_str().expect("validated resume text")})
+                }
+                None => json!({}),
+            };
+            (target, expected_generation, args)
         }
         AgentActionDefinition::Steer { .. } => {
             return Err(Error::new(
@@ -1075,13 +1083,24 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
     ensure_agent_id_capacity(target.len())?;
     parse_agent_id(target)
         .map_err(|_| Error::new("invalid", "timer action target is not a canonical Agent id"))?;
+    let is_resume = matches!(action, AgentActionDefinition::Resume { .. });
     let expected_generation = generation_value
         .as_i64()
-        .filter(|generation| *generation >= 0)
+        .filter(|generation| {
+            if is_resume {
+                *generation > 0
+            } else {
+                *generation >= 0
+            }
+        })
         .ok_or_else(|| {
             Error::new(
                 "invalid",
-                "timer action generation must be a nonnegative integer without templates",
+                if is_resume {
+                    "timer resume generation must be a positive integer without templates"
+                } else {
+                    "timer action generation must be a nonnegative integer without templates"
+                },
             )
         })?;
     Ok(submit_command(
@@ -1905,12 +1924,83 @@ do = [{ action = 'resume', target = '${event.agent}', expected_generation = '${e
     }
 
     #[test]
-    fn timer_resume_is_explicitly_unsupported() {
+    fn timer_resume_projects_literal_target_generation_and_optional_text() {
         let source = INTERVAL_TIMER.replace(
             "action = 'stop', target = 'a7', expected_generation = 3",
             "action = 'resume', target = 'a7', expected_generation = 3, text = 'new input'",
         );
-        assert_eq!(load(Cursor::new(source)).unwrap_err().code, "unsupported");
+        let rule = load(Cursor::new(source)).unwrap().remove(0);
+        let command = rule.evaluate_timer().unwrap();
+
+        assert_eq!(command.id, "");
+        assert_eq!(command.verb, "resume");
+        assert_eq!(command.target.as_deref(), Some("a7"));
+        assert_eq!(command.expected_generation, Some(3));
+        assert_eq!(command.expected_turn_id, None);
+        assert_eq!(command.request_id, None);
+        assert!(!command.probe);
+        assert_eq!(command.args, json!({"text":"new input"}));
+        command.validate().unwrap();
+
+        let without_text = INTERVAL_TIMER.replace(
+            "action = 'stop', target = 'a7', expected_generation = 3",
+            "action = 'resume', target = 'a7', expected_generation = 3",
+        );
+        let without_text = load(Cursor::new(without_text)).unwrap().remove(0);
+        assert_eq!(without_text.evaluate_timer().unwrap().args, json!({}));
+    }
+
+    #[test]
+    fn timer_resume_rejects_templates_invalid_generation_and_overrides() {
+        let timer = INTERVAL_TIMER.replace(
+            "action = 'stop', target = 'a7', expected_generation = 3",
+            "action = 'resume', target = 'a7', expected_generation = 3, text = 'new input'",
+        );
+
+        for (old, replacement) in [
+            ("target = 'a7'", "target = '${event.agent}'"),
+            (
+                "expected_generation = 3",
+                "expected_generation = '${event.generation}'",
+            ),
+            (
+                "expected_generation = 3",
+                "expected_generation = '3${event.generation}'",
+            ),
+            ("expected_generation = 3", "expected_generation = 0"),
+            ("expected_generation = 3", "expected_generation = -1"),
+            ("expected_generation = 3", "expected_generation = '3'"),
+            ("text = 'new input'", "text = '${data.status}'"),
+            ("text = 'new input'", "text = '${subject.profile}'"),
+        ] {
+            let source = timer.replace(old, replacement);
+            assert_eq!(load(Cursor::new(source)).unwrap_err().code, "invalid");
+        }
+
+        let missing_generation = timer.replace("expected_generation = 3, ", "");
+        assert_eq!(
+            load(Cursor::new(missing_generation)).unwrap_err().code,
+            "invalid"
+        );
+
+        for field in [
+            "profile = 'other'",
+            "workspace = '/other'",
+            "worktree = 'branch'",
+            "base = 'HEAD'",
+            "setup = true",
+            "model = 'other'",
+            "effort = 'high'",
+            "permissions = 'other'",
+            "expected_turn_id = 'turn-id'",
+            "request_id = 'request-id'",
+        ] {
+            let source = timer.replace(
+                "expected_generation = 3",
+                &format!("expected_generation = 3, {field}"),
+            );
+            assert_eq!(load(Cursor::new(source)).unwrap_err().code, "invalid");
+        }
     }
 
     #[test]

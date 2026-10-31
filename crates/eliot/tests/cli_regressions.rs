@@ -2256,6 +2256,71 @@ fn wait_fake_send_turn_result_until(
     }
 }
 
+fn wait_agent_ready(
+    fixture: &Fixture,
+    agent: &str,
+    generation: i64,
+    deadline_label: &str,
+    readback_label: &str,
+) -> AgentGetResponse {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let ready = fixture.events().iter().any(|event| {
+            event["kind"] == "session.ready"
+                && event["agent"] == agent
+                && event["generation"] == generation
+        });
+        let view: AgentGetResponse = serde_json::from_value(fixture.json(&["show", agent]))
+            .unwrap_or_else(|error| panic!("typed {readback_label} Agent readback: {error:?}"));
+        if ready
+            && view.agent.generation == generation
+            && matches!(
+                view.agent.state,
+                AgentState::Idle | AgentState::Busy | AgentState::Waiting
+            )
+        {
+            return view;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{deadline_label} Agent {agent} generation {generation} readiness deadline"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn fixture_agent_ids(fixture: &Fixture, context: &str) -> Vec<String> {
+    let mut after: Option<String> = None;
+    let mut ids = Vec::new();
+    loop {
+        let request = AgentListRequest {
+            after: after.clone(),
+            limit: 1000,
+            ..AgentListRequest::default()
+        };
+        let mut args = vec!["ls", "--limit", "1000"];
+        if let Some(cursor) = after.as_deref() {
+            args.extend(["--after", cursor]);
+        }
+        let page: AgentListResponse = serde_json::from_value(fixture.json(&args))
+            .unwrap_or_else(|error| panic!("typed {context} Agent page: {error:?}"));
+        request
+            .validate_response(&page)
+            .unwrap_or_else(|error| panic!("valid {context} Agent page: {error}"));
+        ids.extend(page.agents.into_iter().map(|row| row.agent.id));
+        let Some(next) = page.next else {
+            break;
+        };
+        assert_ne!(
+            after.as_deref(),
+            Some(next.as_str()),
+            "{context} Agent cursor did not advance"
+        );
+        after = Some(next);
+    }
+    ids
+}
+
 fn send_fake_handoff(fixture: &Fixture, agent: &str, generation: i64, id: &str) -> CoreTurn {
     let turn: CoreTurn = serde_json::from_value(fixture.json(&[
         "--id",
@@ -6847,6 +6912,896 @@ fn cli_fake_timer_send_scheduled_and_manual_replay_keep_exact_turns() {
 }
 
 #[test]
+fn cli_fake_timer_resume_uses_literal_generation_in_owner_project_scopes() {
+    const PROJECT_ID: &str = "timer-resume-project";
+    const MANAGED_BRANCH: &str = "codex/project-timer-resume";
+    const PERIOD_MS: i64 = 3_600_000;
+    const FIRST_SLOT_DELAY_MS: i64 = 30_000;
+    const OWNER_SCHEDULED: &str = "owner-scheduled-resume";
+    const PROJECT_SCHEDULED: &str = "project-scheduled-resume";
+    const OWNER_MANUAL: &str = "owner-manual-resume";
+    const PROJECT_MANUAL: &str = "project-manual-resume";
+    const STALE_MANUAL: &str = "owner-stale-resume";
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Invocation {
+        Scheduled,
+        Manual,
+    }
+
+    #[derive(Clone, Copy)]
+    struct ResumeCase {
+        rule: &'static str,
+        project: Option<&'static str>,
+        invocation: Invocation,
+        text: Option<&'static str>,
+        managed_worktree: bool,
+    }
+
+    const CASES: [ResumeCase; 4] = [
+        ResumeCase {
+            rule: OWNER_SCHEDULED,
+            project: None,
+            invocation: Invocation::Scheduled,
+            text: Some("owner scheduled timer resume input"),
+            managed_worktree: false,
+        },
+        ResumeCase {
+            rule: PROJECT_SCHEDULED,
+            project: Some(PROJECT_ID),
+            invocation: Invocation::Scheduled,
+            text: None,
+            managed_worktree: true,
+        },
+        ResumeCase {
+            rule: OWNER_MANUAL,
+            project: None,
+            invocation: Invocation::Manual,
+            text: None,
+            managed_worktree: false,
+        },
+        ResumeCase {
+            rule: PROJECT_MANUAL,
+            project: Some(PROJECT_ID),
+            invocation: Invocation::Manual,
+            text: Some("project manual timer resume input"),
+            managed_worktree: false,
+        },
+    ];
+
+    const STALE_CASE: ResumeCase = ResumeCase {
+        rule: STALE_MANUAL,
+        project: None,
+        invocation: Invocation::Manual,
+        text: None,
+        managed_worktree: false,
+    };
+
+    struct RetainedAgent {
+        case: ResumeCase,
+        agent_id: String,
+        initial: AgentGetResponse,
+        old_send_id: String,
+        old_turn_id: String,
+        old_text: String,
+        managed_worktrees: Option<String>,
+        managed_seed: Option<Vec<u8>>,
+    }
+
+    let mut fixture = Fixture::new("timer resume literal generation");
+    assert!(
+        fixture
+            .git(&["init", "--initial-branch=main"])
+            .status
+            .success(),
+        "initialize timer Resume Project checkout"
+    );
+    fs::write(fixture.workspace.join("seed.txt"), "timer resume fixture\n")
+        .expect("write timer Resume Project seed");
+    assert!(fixture.git(&["add", "--", "seed.txt"]).status.success());
+    assert!(
+        fixture
+            .git(&["commit", "-m", "Timer Resume fixture"])
+            .status
+            .success()
+    );
+    let base_reply = fixture.git(&["rev-parse", "--verify", "HEAD"]);
+    assert!(base_reply.status.success(), "read Project base commit");
+    let base_oid = base_reply.stdout.trim().to_owned();
+    assert!(!base_oid.is_empty());
+
+    fs::create_dir_all(&fixture.data).expect("create private timer fixture data root");
+    fs::create_dir_all(fixture.workspace.join(".eliot").join("rules"))
+        .expect("create Project timer rule directory");
+    fs::write(
+        fixture.data.join("config.toml"),
+        format!(
+            concat!(
+                "[projects.{project_id}]\n",
+                "path = {workspace:?}\n",
+                "profiles = [\"fake\"]\n",
+                "actions = [\"resume\"]\n",
+            ),
+            project_id = PROJECT_ID,
+            workspace = fixture.workspace.to_string_lossy(),
+        ),
+    )
+    .expect("approve Fake Project Resume actions");
+
+    fixture.start();
+    let registration_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let registration: ProjectRegistrationView = loop {
+        let reply = cli(&fixture.data, &["project", "show", PROJECT_ID]);
+        if reply.status.success() {
+            break serde_json::from_str(&reply.stdout)
+                .expect("typed timer Resume Project registration");
+        }
+        assert!(
+            std::time::Instant::now() < registration_deadline,
+            "timer Resume Project registration deadline"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(registration.actions.iter().any(|action| action == "resume"));
+    assert!(
+        registration
+            .profiles
+            .iter()
+            .any(|profile| profile == "fake")
+    );
+
+    let mut retained = Vec::new();
+    for case in CASES {
+        let mut launch_args = vec![
+            "launch".to_owned(),
+            "--profile".to_owned(),
+            "fake".to_owned(),
+            "--workspace".to_owned(),
+            registration.checkout.clone(),
+        ];
+        if case.managed_worktree {
+            launch_args.extend([
+                "--worktree".to_owned(),
+                MANAGED_BRANCH.to_owned(),
+                "--base".to_owned(),
+                base_oid.clone(),
+            ]);
+        }
+        let launch_args = launch_args.iter().map(String::as_str).collect::<Vec<_>>();
+        let launch: CoreCommand = serde_json::from_value(fixture.json(&launch_args))
+            .expect("typed timer Resume Fake launch");
+        let launch: CoreCommand =
+            serde_json::from_value(fixture.wait_command(&launch.id, "applied"))
+                .expect("applied timer Resume Fake launch");
+        let agent_id = launch.target.clone().expect("launched Agent identity");
+        assert_eq!(launch.generation, Some(1));
+        let ready = wait_agent_ready(&fixture, &agent_id, 1, "Fake", "timer Resume");
+        assert_eq!(ready.agent.profile, "fake");
+        assert_eq!(ready.agent.project, registration.checkout);
+        assert!(ready.agent.native_scope.is_some());
+        assert!(ready.agent.native_ref.is_some());
+        if case.managed_worktree {
+            assert_eq!(
+                ready.agent.workspace_phase,
+                Some(eliot_core::WorkspacePhase::Ready)
+            );
+            assert_eq!(ready.agent.branch.as_deref(), Some(MANAGED_BRANCH));
+            assert_eq!(ready.agent.base_oid.as_deref(), Some(base_oid.as_str()));
+        } else {
+            assert_eq!(
+                ready.agent.workspace.as_deref(),
+                Some(registration.checkout.as_str())
+            );
+        }
+
+        let old_text = format!("timer-resume-old-input-{}", case.rule);
+        let old_send_id = ulid::Ulid::new().to_string();
+        let old_send_reply = cli(
+            &fixture.data,
+            &[
+                "--id",
+                &old_send_id,
+                "send",
+                &agent_id,
+                "--generation",
+                "1",
+                "--",
+                &old_text,
+            ],
+        );
+        assert!(
+            old_send_reply.status.success(),
+            "seed Fake input for {}: {}",
+            case.rule,
+            old_send_reply.stderr
+        );
+        let old_send: CoreCommand =
+            serde_json::from_value(fixture.wait_command(&old_send_id, "applied"))
+                .expect("applied prior-generation Fake input");
+        let old_turn = wait_fake_send_turn_result(&fixture, &agent_id, 1, &old_send, &old_text);
+
+        let stop_id = ulid::Ulid::new().to_string();
+        let stop: CommandSubmitResponse = serde_json::from_value(fixture.json(&[
+            "--id",
+            &stop_id,
+            "stop",
+            &agent_id,
+            "--generation",
+            "1",
+        ]))
+        .expect("exact generation-1 Agent stop");
+        assert_eq!(stop.command_id, stop_id);
+        fixture.wait_command(&stop_id, "applied");
+        let initial: AgentGetResponse = serde_json::from_value(fixture.json(&["show", &agent_id]))
+            .expect("retained stopped timer Resume Agent");
+        assert_eq!(initial.agent.generation, 1);
+        assert_eq!(initial.agent.state, AgentState::Stopped);
+
+        let (managed_worktrees, managed_seed) = if case.managed_worktree {
+            let workspace = Path::new(
+                initial
+                    .agent
+                    .workspace
+                    .as_deref()
+                    .expect("Project scheduled Agent managed workspace"),
+            )
+            .canonicalize()
+            .expect("canonical timer Resume managed worktree");
+            let worktrees_root = fixture
+                .data
+                .canonicalize()
+                .expect("canonical timer Resume data root")
+                .join("worktrees");
+            assert!(workspace.starts_with(&worktrees_root));
+            let worktrees = fixture.git(&["worktree", "list", "--porcelain"]);
+            assert!(
+                worktrees.status.success(),
+                "read managed worktree inventory"
+            );
+            let seed = fs::read(workspace.join("seed.txt"))
+                .expect("read managed timer Resume worktree seed");
+            (Some(worktrees.stdout), Some(seed))
+        } else {
+            (None, None)
+        };
+        retained.push(RetainedAgent {
+            case,
+            agent_id,
+            initial,
+            old_send_id,
+            old_turn_id: old_turn.turn_id,
+            old_text,
+            managed_worktrees,
+            managed_seed,
+        });
+    }
+
+    let agent_ids_before_timers = fixture_agent_ids(&fixture, "timer fixture");
+    assert_eq!(agent_ids_before_timers.len(), CASES.len());
+    fixture.stop(false);
+
+    let owner_rules = fixture.data.join("rules");
+    let project_rules = fixture.workspace.join(".eliot").join("rules");
+    fs::create_dir_all(&owner_rules).expect("create Owner timer rule directory");
+    fs::create_dir_all(&project_rules).expect("retain Project timer rule directory");
+    let epoch_ms = || {
+        i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock is after the Unix epoch")
+                .as_millis(),
+        )
+        .expect("timer Resume epoch milliseconds fit signed range")
+    };
+    let schedule_now = epoch_ms();
+    let scheduled_anchor = schedule_now + FIRST_SLOT_DELAY_MS - PERIOD_MS;
+    let render_rule = |rule: &str, agent: &str, anchor: i64, text: Option<&str>| {
+        let text_field = text.map_or_else(String::new, |text| format!(", text = {text:?}"));
+        format!(
+            concat!(
+                "[[rule]]\n",
+                "id = {rule:?}\n",
+                "on = {{ every = \"1h\", anchor = {anchor} }}\n",
+                "catch_up = \"none\"\n",
+                "do = [{{ action = \"resume\", target = {agent:?}, ",
+                "expected_generation = 1{text_field} }}]\n",
+            ),
+            rule = rule,
+            anchor = anchor,
+            agent = agent,
+            text_field = text_field,
+        )
+    };
+    for record in &retained {
+        let anchor = if record.case.invocation == Invocation::Scheduled {
+            scheduled_anchor
+        } else {
+            schedule_now
+        };
+        let rule_path = if record.case.project.is_some() {
+            project_rules.join(format!("{}.toml", record.case.rule))
+        } else {
+            owner_rules.join(format!("{}.toml", record.case.rule))
+        };
+        fs::write(
+            rule_path,
+            render_rule(record.case.rule, &record.agent_id, anchor, record.case.text),
+        )
+        .expect("write literal timer Resume action");
+    }
+    let stale_target = retained
+        .iter()
+        .find(|record| record.case.rule == OWNER_SCHEDULED)
+        .expect("Owner scheduled Resume Agent");
+    fs::write(
+        owner_rules.join(format!("{STALE_MANUAL}.toml")),
+        render_rule(STALE_MANUAL, &stale_target.agent_id, schedule_now, None),
+    )
+    .expect("write stale literal-generation timer Resume action");
+
+    fixture.start();
+    let read_timer = |fixture: &Fixture, case: ResumeCase| -> TimerStateView {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut args = vec!["timer".to_owned(), "show".to_owned(), case.rule.to_owned()];
+        if let Some(project) = case.project {
+            args.extend(["--project".to_owned(), project.to_owned()]);
+        }
+        let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        loop {
+            let reply = cli(&fixture.data, &arg_refs);
+            if reply.status.success() {
+                return serde_json::from_str(&reply.stdout).expect("typed registered timer state");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timer {} registration deadline: {}",
+                case.rule,
+                reply.stderr
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    };
+    let wait_firing = |fixture: &Fixture,
+                       case: ResumeCase,
+                       scheduled_identity: Option<(i64, i64)>,
+                       manual_identity: Option<(&str, &str)>|
+     -> Value {
+        let deadline = match (case.invocation, scheduled_identity, manual_identity) {
+            (Invocation::Scheduled, Some((_, slot)), None) => {
+                let remaining_ms = slot.saturating_sub(epoch_ms()).max(0);
+                std::time::Instant::now()
+                    + Duration::from_millis(
+                        u64::try_from(remaining_ms).expect("bounded timer slot delay") + 30_000,
+                    )
+            }
+            (Invocation::Manual, None, Some(_)) => {
+                std::time::Instant::now() + Duration::from_secs(20)
+            }
+            _ => panic!("timer firing identity does not match its invocation"),
+        };
+        loop {
+            if let Some(event) = fixture.events().into_iter().find(|event| {
+                if event["kind"] != "rule.fired" || event["data"]["rule"] != case.rule {
+                    return false;
+                }
+                match case.invocation {
+                    Invocation::Scheduled => scheduled_identity.is_some_and(|(revision, slot)| {
+                        event["data"]["schedule_revision"].as_i64() == Some(revision)
+                            && event["data"]["scheduled_at_ms"].as_i64() == Some(slot)
+                    }),
+                    Invocation::Manual => manual_identity.is_some_and(|(parent, child)| {
+                        event["data"]["parent_command"] == parent
+                            && event["data"]["child_command"] == child
+                    }),
+                }
+            }) {
+                return event;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timer Resume rule {} firing deadline",
+                case.rule
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    };
+
+    let mut registered_timers = Vec::new();
+    for case in CASES.into_iter().chain([STALE_CASE]) {
+        let timer = read_timer(&fixture, case);
+        assert_eq!(timer.id, case.rule);
+        assert_eq!(timer.project.as_deref(), case.project);
+        assert!(timer.enabled);
+        assert_eq!(timer.last_key, None);
+        let expected_anchor = if case.invocation == Invocation::Scheduled {
+            scheduled_anchor
+        } else {
+            schedule_now
+        };
+        assert_eq!(
+            timer.schedule,
+            TimerSchedule::Interval {
+                period_ms: PERIOD_MS,
+                anchor: Some(expected_anchor),
+            }
+        );
+        let next_due_at = timer.next_due_at.expect("registered finite timer due time");
+        assert!(next_due_at > epoch_ms());
+        if case.invocation == Invocation::Scheduled {
+            assert_eq!(next_due_at, scheduled_anchor + PERIOD_MS);
+        }
+        registered_timers.push((case, timer));
+    }
+
+    for record in &retained {
+        let case = record.case;
+        let timer_before = registered_timers
+            .iter()
+            .find(|(registered_case, _)| registered_case.rule == case.rule)
+            .map(|(_, timer)| timer.clone())
+            .expect("registered Owner or Project Resume timer");
+
+        let (firing, parent_id, manual_args, manual_parent_before) = match case.invocation {
+            Invocation::Scheduled => {
+                let due = timer_before
+                    .next_due_at
+                    .expect("registered scheduled Resume slot");
+                let firing = wait_firing(
+                    &fixture,
+                    case,
+                    Some((timer_before.schedule_revision, due)),
+                    None,
+                );
+                let parent_id = firing["data"]["parent_command"]
+                    .as_str()
+                    .expect("successful scheduled Resume parent identity")
+                    .to_owned();
+                (firing, parent_id, None, None)
+            }
+            Invocation::Manual => {
+                let id = ulid::Ulid::new().to_string();
+                let mut args = vec![
+                    "--id".to_owned(),
+                    id.clone(),
+                    "timer".to_owned(),
+                    "run".to_owned(),
+                    case.rule.to_owned(),
+                ];
+                if let Some(project) = case.project {
+                    args.extend(["--project".to_owned(), project.to_owned()]);
+                }
+                let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+                let reply = cli(&fixture.data, &arg_refs);
+                assert!(
+                    reply.status.success(),
+                    "manual timer Resume {} failed: {}",
+                    case.rule,
+                    reply.stderr
+                );
+                let manual_parent: CoreCommand =
+                    serde_json::from_str(&reply.stdout).expect("typed manual timer Resume parent");
+                assert_eq!(manual_parent.id, id);
+                let children: Vec<String> = serde_json::from_value(
+                    manual_parent
+                        .outcome
+                        .as_ref()
+                        .expect("manual timer Resume child set")["children"]
+                        .clone(),
+                )
+                .expect("manual timer Resume child IDs");
+                assert_eq!(children.len(), 1);
+                let child_id = children[0].clone();
+                let firing =
+                    wait_firing(&fixture, case, None, Some((&manual_parent.id, &child_id)));
+                (firing, id, Some(args), Some(manual_parent))
+            }
+        };
+
+        let resume_id = firing["data"]["child_command"]
+            .as_str()
+            .expect("successful timer Resume child identity")
+            .to_owned();
+        assert_eq!(firing["data"]["rule"], case.rule);
+        assert_eq!(firing["data"]["parent_command"], parent_id);
+        assert_eq!(firing["data"]["child_command"], resume_id);
+        match case.invocation {
+            Invocation::Scheduled => {
+                let due = timer_before.next_due_at.expect("scheduled Resume slot");
+                assert_eq!(
+                    firing["data"]["schedule_revision"],
+                    timer_before.schedule_revision
+                );
+                assert_eq!(firing["data"]["scheduled_at_ms"], due);
+            }
+            Invocation::Manual => {
+                assert!(firing["data"].get("schedule_revision").is_none());
+                assert!(firing["data"].get("scheduled_at_ms").is_none());
+            }
+        }
+
+        let parent: CoreCommand =
+            serde_json::from_value(fixture.wait_command(&parent_id, "applied"))
+                .expect("applied timer Resume parent");
+        if let Some(manual_parent) = manual_parent_before.as_ref() {
+            assert_eq!(&parent, manual_parent);
+            assert_eq!(parent.verb, "timer.run");
+            assert_eq!(parent.args["rule"], case.rule);
+            if let Some(project) = case.project {
+                assert_eq!(parent.args["project"], project);
+            }
+        }
+        let principal = case.project.map_or_else(
+            || "owner".to_owned(),
+            |project| format!("project:{project}"),
+        );
+        assert_eq!(parent.principal, principal);
+        let children: Vec<String> = serde_json::from_value(
+            parent
+                .outcome
+                .as_ref()
+                .expect("timer Resume fixed child set")["children"]
+                .clone(),
+        )
+        .expect("typed timer Resume child identities");
+        assert_eq!(children, vec![resume_id.clone()]);
+        let resume: CoreCommand =
+            serde_json::from_value(fixture.wait_command(&resume_id, "applied"))
+                .expect("applied literal timer Resume child");
+        assert_eq!(resume.id, resume_id);
+        assert_eq!(resume.verb, "resume");
+        assert_eq!(resume.principal, principal);
+        assert_eq!(resume.target.as_deref(), Some(record.agent_id.as_str()));
+        assert_eq!(resume.expected_generation, Some(1));
+        assert_eq!(resume.generation, Some(2));
+        assert_eq!(resume.args, json!({}));
+
+        let resumed = wait_agent_ready(&fixture, &record.agent_id, 2, "Fake", "timer Resume");
+        assert_eq!(resumed.agent.id, record.initial.agent.id);
+        assert_eq!(resumed.agent.generation, 2);
+        assert!(matches!(
+            resumed.agent.state,
+            AgentState::Idle | AgentState::Busy | AgentState::Waiting
+        ));
+        assert_eq!(
+            resumed.agent.native_scope,
+            record.initial.agent.native_scope
+        );
+        assert_eq!(resumed.agent.native_ref, record.initial.agent.native_ref);
+        assert_eq!(resumed.agent.profile, record.initial.agent.profile);
+        assert_eq!(resumed.agent.workspace, record.initial.agent.workspace);
+        assert_eq!(resumed.agent.project, record.initial.agent.project);
+        assert_eq!(resumed.agent.harness, record.initial.agent.harness);
+        assert_eq!(
+            fixture_agent_ids(&fixture, "timer fixture"),
+            agent_ids_before_timers
+        );
+
+        let linked_send_id = format!("{resume_id}/send");
+        let resumed_turn = if let Some(text) = case.text {
+            let send: CoreCommand =
+                serde_json::from_value(fixture.wait_command(&linked_send_id, "applied"))
+                    .expect("applied linked timer Resume input");
+            assert_eq!(send.id, linked_send_id);
+            assert_eq!(send.verb, "send");
+            assert_eq!(send.principal, principal);
+            assert_eq!(send.target.as_deref(), Some(record.agent_id.as_str()));
+            assert_eq!(send.expected_generation, Some(2));
+            assert_eq!(send.generation, Some(2));
+            assert_eq!(send.args, json!({"text": text}));
+            let turn = wait_fake_send_turn_result(&fixture, &record.agent_id, 2, &send, text);
+            assert_eq!(turn.state, TurnState::Completed);
+            assert_eq!(turn.final_text.as_deref(), Some(text));
+            assert_ne!(turn.turn_id, record.old_turn_id);
+            Some((send, turn))
+        } else {
+            let missing = cli(&fixture.data, &["cmd", "show", &linked_send_id]);
+            assert_eq!(missing.status.code(), Some(1));
+            assert!(missing.stderr.contains("not_found"));
+            assert_eq!(fault_dispatches(&fixture.events(), &linked_send_id), 0);
+            None
+        };
+
+        let generation_arg = "2";
+        let result: AgentResultResponse = serde_json::from_value(fixture.json(&[
+            "result",
+            &record.agent_id,
+            "--generation",
+            generation_arg,
+        ]))
+        .expect("typed resumed-generation Fake history");
+        if let Some((_, turn)) = &resumed_turn {
+            assert_eq!(result.turns, vec![turn.clone()]);
+            assert_eq!(result.turns[0].final_text.as_deref(), case.text);
+            assert!(
+                result
+                    .turns
+                    .iter()
+                    .all(|turn| { turn.final_text.as_deref() != Some(record.old_text.as_str()) })
+            );
+        } else {
+            assert!(
+                result.turns.is_empty(),
+                "timer Resume replayed old input without new text"
+            );
+        }
+        let events_after_resume = fixture.events();
+        assert_eq!(
+            events_after_resume
+                .iter()
+                .filter(|event| {
+                    event["kind"] == "rule.fired"
+                        && event["data"]["rule"] == case.rule
+                        && event["data"]["parent_command"] == parent_id
+                        && event["data"]["child_command"] == resume.id
+                })
+                .count(),
+            1,
+            "one successful timer Resume firing identity"
+        );
+        assert_eq!(
+            fault_dispatches(&events_after_resume, &record.old_send_id),
+            1
+        );
+        assert_eq!(fault_dispatches(&events_after_resume, &resume.id), 1);
+        assert_eq!(
+            events_after_resume
+                .iter()
+                .filter(|event| {
+                    event["kind"] == "turn.completed"
+                        && event["agent"] == record.agent_id
+                        && event["generation"] == 2
+                        && event["data"]["command_id"] == record.old_send_id
+                })
+                .count(),
+            0,
+            "timer Resume replayed the old-generation command"
+        );
+        assert_eq!(
+            events_after_resume
+                .iter()
+                .filter(|event| {
+                    event["kind"] == "session.ready"
+                        && event["agent"] == record.agent_id
+                        && event["generation"] == 2
+                })
+                .count(),
+            1,
+            "timer Resume must ready the retained Agent exactly once"
+        );
+        if let Some((send, _)) = &resumed_turn {
+            assert_eq!(fault_dispatches(&events_after_resume, &send.id), 1);
+        }
+
+        if case.managed_worktree {
+            assert_eq!(
+                resumed.agent.workspace_phase,
+                Some(eliot_core::WorkspacePhase::Ready)
+            );
+            assert_eq!(resumed.agent.branch.as_deref(), Some(MANAGED_BRANCH));
+            assert_eq!(resumed.agent.base_oid, record.initial.agent.base_oid);
+            let resumed_workspace = Path::new(
+                resumed
+                    .agent
+                    .workspace
+                    .as_deref()
+                    .expect("resumed Project managed workspace"),
+            )
+            .canonicalize()
+            .expect("canonical resumed timer Resume worktree");
+            let initial_workspace = Path::new(
+                record
+                    .initial
+                    .agent
+                    .workspace
+                    .as_deref()
+                    .expect("initial Project managed workspace"),
+            )
+            .canonicalize()
+            .expect("canonical initial timer Resume worktree");
+            assert_eq!(resumed_workspace, initial_workspace);
+            assert_eq!(
+                fs::read(resumed_workspace.join("seed.txt"))
+                    .expect("read resumed managed worktree seed"),
+                record.managed_seed.clone().expect("captured managed seed")
+            );
+            let worktrees_after = fixture.git(&["worktree", "list", "--porcelain"]);
+            assert!(worktrees_after.status.success());
+            assert_eq!(
+                worktrees_after.stdout,
+                record
+                    .managed_worktrees
+                    .as_deref()
+                    .expect("captured worktree inventory")
+            );
+        }
+
+        if let Some(manual_args) = manual_args.as_ref() {
+            let arg_refs = manual_args.iter().map(String::as_str).collect::<Vec<_>>();
+            let replay_reply = cli(&fixture.data, &arg_refs);
+            assert!(
+                replay_reply.status.success(),
+                "same-ID manual timer Resume replay failed: {}",
+                replay_reply.stderr
+            );
+            let replay: CoreCommand = serde_json::from_str(&replay_reply.stdout)
+                .expect("typed retained manual Resume parent");
+            assert_eq!(replay, parent);
+            let events_after_replay = fixture.events();
+            assert_eq!(
+                events_after_replay
+                    .iter()
+                    .filter(|event| {
+                        event["kind"] == "rule.fired"
+                            && event["data"]["rule"] == case.rule
+                            && event["data"]["parent_command"] == parent_id
+                            && event["data"]["child_command"] == resume.id
+                    })
+                    .count(),
+                1,
+                "same-ID manual replay duplicated its firing"
+            );
+            assert_eq!(fault_dispatches(&events_after_replay, &resume.id), 1);
+            if let Some((send, _)) = &resumed_turn {
+                assert_eq!(fault_dispatches(&events_after_replay, &send.id), 1);
+            }
+            let timer_after_replay = read_timer(&fixture, case);
+            assert_eq!(timer_after_replay.last_key, timer_before.last_key);
+            assert_eq!(timer_after_replay.next_due_at, timer_before.next_due_at);
+            assert_eq!(
+                timer_after_replay.schedule_revision,
+                timer_before.schedule_revision
+            );
+        }
+
+        if case.invocation == Invocation::Scheduled {
+            let due = timer_before.next_due_at.expect("scheduled Resume slot");
+            let timer_after = read_timer(&fixture, case);
+            assert_eq!(timer_after.last_key, Some(due));
+            assert!(timer_after.next_due_at.is_some_and(|next| next > due));
+        }
+    }
+
+    let stale_agent = retained
+        .iter()
+        .find(|record| record.case.rule == OWNER_SCHEDULED)
+        .expect("resumed Owner scheduled Agent for stale-generation refusal");
+    let stop_id = ulid::Ulid::new().to_string();
+    let stop: CommandSubmitResponse = serde_json::from_value(fixture.json(&[
+        "--id",
+        &stop_id,
+        "stop",
+        &stale_agent.agent_id,
+        "--generation",
+        "2",
+    ]))
+    .expect("stop generation-2 Agent before stale timer Resume");
+    assert_eq!(stop.command_id, stop_id);
+    fixture.wait_command(&stop.command_id, "applied");
+    let stopped: AgentGetResponse =
+        serde_json::from_value(fixture.json(&["show", &stale_agent.agent_id]))
+            .expect("stopped generation-2 stale-target Agent");
+    assert_eq!(stopped.agent.generation, 2);
+    assert_eq!(stopped.agent.state, AgentState::Stopped);
+
+    let stale_timer_before = registered_timers
+        .iter()
+        .find(|(case, _)| case.rule == STALE_MANUAL)
+        .map(|(_, timer)| timer.clone())
+        .expect("registered stale-generation timer");
+    let stale_id = ulid::Ulid::new().to_string();
+    let stale_args = ["--id", stale_id.as_str(), "timer", "run", STALE_MANUAL];
+    let stale_reply = cli(&fixture.data, &stale_args);
+    assert!(
+        stale_reply.status.code() == Some(3),
+        "stale literal-generation timer should return a definite rejected parent: stdout={:?}, stderr={:?}",
+        stale_reply.stdout,
+        stale_reply.stderr,
+    );
+    let stale_parent: CoreCommand =
+        serde_json::from_str(&stale_reply.stdout).expect("typed stale timer Resume parent");
+    assert_eq!(stale_parent.id, stale_id);
+    assert_eq!(stale_parent.verb, "timer.run");
+    assert_eq!(stale_parent.args["rule"], STALE_CASE.rule);
+    assert_eq!(stale_parent.state, CommandState::Rejected);
+    let stale_outcome = stale_parent
+        .outcome
+        .as_ref()
+        .expect("rejected stale timer parent outcome");
+    assert_eq!(
+        stale_outcome["children"],
+        json!([]),
+        "pre-admission stale generation must not create a child command"
+    );
+    assert_eq!(stale_outcome["code"], "stale_generation");
+    let stale_events = fixture.events();
+    assert_eq!(
+        stale_events
+            .iter()
+            .filter(|event| {
+                event["kind"] == "rule.rejected"
+                    && event["data"]["rule"] == STALE_CASE.rule
+                    && event["data"]["parent_command"] == stale_id
+                    && event["data"]["code"] == "stale_generation"
+            })
+            .count(),
+        1,
+        "stale literal generation must be a retained timer rejection"
+    );
+    assert_eq!(
+        stale_events
+            .iter()
+            .filter(|event| {
+                event["kind"] == "rule.fired"
+                    && event["data"]["rule"] == STALE_CASE.rule
+                    && event["data"]["parent_command"] == stale_id
+            })
+            .count(),
+        0,
+        "rejected stale generation must not report a firing"
+    );
+    assert_eq!(
+        stale_events
+            .iter()
+            .filter(|event| {
+                event["kind"] == "command.dispatched" && event["cause"]["rule"] == STALE_CASE.rule
+            })
+            .count(),
+        0,
+        "rejected stale generation must not dispatch an action child"
+    );
+    assert_eq!(
+        stale_events
+            .iter()
+            .filter(|event| {
+                event["kind"] == "session.ready"
+                    && event["agent"] == stale_agent.agent_id
+                    && event["generation"] == 3
+            })
+            .count(),
+        0,
+        "stale literal generation was automatically retargeted"
+    );
+    let still_stopped: AgentGetResponse =
+        serde_json::from_value(fixture.json(&["show", &stale_agent.agent_id]))
+            .expect("stale timer target remains retained");
+    assert_eq!(still_stopped.agent.id, stale_agent.initial.agent.id);
+    assert_eq!(still_stopped.agent.generation, 2);
+    assert_eq!(still_stopped.agent.state, AgentState::Stopped);
+    assert_eq!(
+        fixture_agent_ids(&fixture, "timer fixture"),
+        agent_ids_before_timers
+    );
+    let stale_timer_after = read_timer(&fixture, STALE_CASE);
+    assert_eq!(stale_timer_after.last_key, stale_timer_before.last_key);
+    assert_eq!(
+        stale_timer_after.next_due_at,
+        stale_timer_before.next_due_at
+    );
+    assert_eq!(
+        stale_timer_after.schedule_revision,
+        stale_timer_before.schedule_revision
+    );
+
+    for record in &retained {
+        if record.case.rule == OWNER_SCHEDULED {
+            continue;
+        }
+        let stop_id = ulid::Ulid::new().to_string();
+        let stop: CommandSubmitResponse = serde_json::from_value(fixture.json(&[
+            "--id",
+            &stop_id,
+            "stop",
+            &record.agent_id,
+            "--generation",
+            "2",
+        ]))
+        .expect("stop resumed timer fixture Agent");
+        fixture.wait_command(&stop.command_id, "applied");
+    }
+    fixture.stop(false);
+}
+
+#[test]
 fn cli_event_rule_steers_exact_held_turn_in_global_and_project_scopes() {
     const PROJECT_ID: &str = "steer-fixture";
     const GLOBAL_RULE_ID: &str = "global-event-steer";
@@ -7968,32 +8923,6 @@ fn cli_event_resume_preserves_exact_subject_for_live_and_history_owner_project()
             std::thread::sleep(Duration::from_millis(25));
         }
     };
-    let wait_ready = |fixture: &Fixture, agent: &str, generation: i64| -> AgentGetResponse {
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            let ready = fixture.events().iter().any(|event| {
-                event["kind"] == "session.ready"
-                    && event["agent"] == agent
-                    && event["generation"] == generation
-            });
-            let view: AgentGetResponse = serde_json::from_value(fixture.json(&["show", agent]))
-                .expect("typed event-resume Agent readback");
-            if ready
-                && view.agent.generation == generation
-                && matches!(
-                    view.agent.state,
-                    AgentState::Idle | AgentState::Busy | AgentState::Waiting
-                )
-            {
-                return view;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "event-resume Agent {agent} generation {generation} readiness deadline"
-            );
-            std::thread::sleep(Duration::from_millis(25));
-        }
-    };
     let wait_stop_applied_event = |fixture: &Fixture,
                                    agent: &str,
                                    generation: i64,
@@ -8037,38 +8966,6 @@ fn cli_event_resume_preserves_exact_subject_for_live_and_history_owner_project()
                 std::thread::sleep(Duration::from_millis(25));
             }
         };
-    let fixture_agent_ids = |fixture: &Fixture| -> Vec<String> {
-        let mut after: Option<String> = None;
-        let mut ids = Vec::new();
-        loop {
-            let request = AgentListRequest {
-                after: after.clone(),
-                limit: 1000,
-                ..AgentListRequest::default()
-            };
-            let mut args = vec!["ls", "--limit", "1000"];
-            if let Some(cursor) = after.as_deref() {
-                args.extend(["--after", cursor]);
-            }
-            let page: AgentListResponse =
-                serde_json::from_value(fixture.json(&args)).expect("typed fixture Agent page");
-            request
-                .validate_response(&page)
-                .expect("valid fixture Agent page");
-            ids.extend(page.agents.into_iter().map(|row| row.agent.id));
-            let Some(next) = page.next else {
-                break;
-            };
-            assert_ne!(
-                after.as_deref(),
-                Some(next.as_str()),
-                "fixture Agent cursor did not advance"
-            );
-            after = Some(next);
-        }
-        ids
-    };
-
     for case in CASES {
         let managed_project_live = case.project == Some(PROJECT_ID) && !case.history;
         let mut launch_args = vec![
@@ -8101,7 +8998,13 @@ fn cli_event_resume_preserves_exact_subject_for_live_and_history_owner_project()
             assert_eq!(launch.args["worktree"], PROJECT_LIVE_BRANCH);
             assert_eq!(launch.args["base"], managed_base_oid);
         }
-        let ready = wait_ready(&fixture, &agent_id, generation);
+        let ready = wait_agent_ready(
+            &fixture,
+            &agent_id,
+            generation,
+            "event-resume",
+            "event-resume",
+        );
         let initial_agent = ready.agent;
         assert_eq!(initial_agent.profile, "fake");
         assert_eq!(initial_agent.project, registration.checkout);
@@ -8205,7 +9108,7 @@ fn cli_event_resume_preserves_exact_subject_for_live_and_history_owner_project()
             assert!(state.paused_reason.is_none());
             Some(state)
         };
-        let mut ids_before_resume = (!case.history).then(|| fixture_agent_ids(&fixture));
+        let mut ids_before_resume = (!case.history).then(|| fixture_agent_ids(&fixture, "fixture"));
 
         let stop: CommandSubmitResponse = serde_json::from_value(fixture.json(&[
             "--id",
@@ -8273,7 +9176,7 @@ fn cli_event_resume_preserves_exact_subject_for_live_and_history_owner_project()
             state
         };
         if ids_before_resume.is_none() {
-            ids_before_resume = Some(fixture_agent_ids(&fixture));
+            ids_before_resume = Some(fixture_agent_ids(&fixture, "fixture"));
         }
         let ids_before_resume = ids_before_resume.expect("Agent IDs captured before resume");
         assert!(
@@ -8388,7 +9291,13 @@ fn cli_event_resume_preserves_exact_subject_for_live_and_history_owner_project()
         assert_eq!(resume.generation, Some(generation + 1));
         assert_eq!(resume.args, json!({}));
 
-        let resumed = wait_ready(&fixture, &agent_id, generation + 1);
+        let resumed = wait_agent_ready(
+            &fixture,
+            &agent_id,
+            generation + 1,
+            "event-resume",
+            "event-resume",
+        );
         assert_eq!(resumed.agent.id, initial_agent.id);
         assert_eq!(resumed.agent.generation, generation + 1);
         assert_eq!(
@@ -8443,7 +9352,7 @@ fn cli_event_resume_preserves_exact_subject_for_live_and_history_owner_project()
                     .expect("managed worktree inventory before resume")
             );
         }
-        assert_eq!(fixture_agent_ids(&fixture), ids_before_resume);
+        assert_eq!(fixture_agent_ids(&fixture, "fixture"), ids_before_resume);
 
         let linked_send_id = format!("{resume_id}/send");
         let resumed_turn = if let Some(text) = case.text {
@@ -8641,7 +9550,7 @@ fn cli_event_resume_preserves_exact_subject_for_live_and_history_owner_project()
                 1,
                 "same-ID catch-up replay duplicated the resumed Agent"
             );
-            assert_eq!(fixture_agent_ids(&fixture), ids_before_resume);
+            assert_eq!(fixture_agent_ids(&fixture, "fixture"), ids_before_resume);
         }
 
         let resumed_generation_arg = (generation + 1).to_string();
@@ -8716,7 +9625,13 @@ fn cli_event_resume_preserves_exact_subject_for_live_and_history_owner_project()
         .generation
         .expect("ordinary-resume launch generation");
     assert_eq!(cli_generation, 1);
-    let cli_initial = wait_ready(&fixture, &cli_agent_id, cli_generation);
+    let cli_initial = wait_agent_ready(
+        &fixture,
+        &cli_agent_id,
+        cli_generation,
+        "event-resume",
+        "event-resume",
+    );
     let cli_native_scope = cli_initial
         .agent
         .native_scope
@@ -8786,7 +9701,7 @@ fn cli_event_resume_preserves_exact_subject_for_live_and_history_owner_project()
         }),
         "ordinary CLI resume fixture unexpectedly used an event rule"
     );
-    let cli_ids_before_resume = fixture_agent_ids(&fixture);
+    let cli_ids_before_resume = fixture_agent_ids(&fixture, "fixture");
     assert!(cli_ids_before_resume.iter().any(|id| id == &cli_agent_id));
 
     let cli_resume_id = ulid::Ulid::new().to_string();
@@ -8826,14 +9741,23 @@ fn cli_event_resume_preserves_exact_subject_for_live_and_history_owner_project()
     assert_eq!(cli_resume.expected_generation, None);
     assert_eq!(cli_resume.generation, Some(cli_generation + 1));
     assert_eq!(cli_resume.args, json!({}));
-    let cli_resumed = wait_ready(&fixture, &cli_agent_id, cli_generation + 1);
+    let cli_resumed = wait_agent_ready(
+        &fixture,
+        &cli_agent_id,
+        cli_generation + 1,
+        "event-resume",
+        "event-resume",
+    );
     assert_eq!(cli_resumed.agent.id, cli_initial.agent.id);
     assert_eq!(cli_resumed.agent.generation, cli_generation + 1);
     assert_eq!(cli_resumed.agent.native_scope, Some(cli_native_scope));
     assert_eq!(cli_resumed.agent.native_ref, Some(cli_native_ref));
     assert_eq!(cli_resumed.agent.profile, cli_initial.agent.profile);
     assert_eq!(cli_resumed.agent.workspace, cli_initial.agent.workspace);
-    assert_eq!(fixture_agent_ids(&fixture), cli_ids_before_resume);
+    assert_eq!(
+        fixture_agent_ids(&fixture, "fixture"),
+        cli_ids_before_resume
+    );
 
     let cli_send: CoreCommand =
         serde_json::from_value(fixture.wait_command(&cli_linked_send_id, "applied"))
@@ -8896,7 +9820,10 @@ fn cli_event_resume_preserves_exact_subject_for_live_and_history_owner_project()
         0,
         "ordinary resume replayed old-generation input"
     );
-    assert_eq!(fixture_agent_ids(&fixture), cli_ids_before_resume);
+    assert_eq!(
+        fixture_agent_ids(&fixture, "fixture"),
+        cli_ids_before_resume
+    );
 
     let cli_stop_resumed_id = ulid::Ulid::new().to_string();
     let cli_resumed_generation_arg = (cli_generation + 1).to_string();
@@ -8926,7 +9853,10 @@ fn cli_event_resume_preserves_exact_subject_for_live_and_history_owner_project()
         }),
         "ordinary generationless resume used an event rule"
     );
-    assert_eq!(fixture_agent_ids(&fixture), cli_ids_before_resume);
+    assert_eq!(
+        fixture_agent_ids(&fixture, "fixture"),
+        cli_ids_before_resume
+    );
 
     fixture.stop(false);
 }

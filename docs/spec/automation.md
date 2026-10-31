@@ -121,12 +121,12 @@ only edits preserve the schedule. Reconcile timers from stored state on restart.
 ## First connected timer slice
 
 Global and registered-project timers use their namespace's startup-loaded rule files and
-the existing command router. The connected timer slice admits ordinary `stop`, `send`,
-targetless `launch` and `run` children for global and
+the existing command router. The connected timer slice admits ordinary `stop`, `send` and
+`resume` Agent actions, plus targetless `launch` and `run` children for global and
 registered-project interval, cron and once firings, including manual `timer.run`. See
 [Timer Run invocation context](#timer-run-invocation-context).
-The event-rule `interrupt`, `steer`, `resume` and request-reply actions remain unsupported
-for scheduled or manual timer runs.
+Timer `interrupt`, `steer` and request-reply actions remain unsupported for scheduled or
+manual timer runs.
 Other action verbs remain future work.
 
 ```toml
@@ -139,9 +139,14 @@ do = [{ action = "send", target = "a1", expected_generation = 1, text = "schedul
 
 `eliot timer run periodic-send` manually invokes the same SEND action with a generated
 external ULID; `eliot --id ULID timer run periodic-send` supplies one explicitly.
-Scheduled and manual timer actions have no event or subject context, so target, generation
-and SEND text are literal values. A timer `launch` also requires literal profile and
-workspace values; its optional text is literal and cannot use event or subject templates.
+Scheduled and manual timer actions have no event or subject context, so Agent-action
+`target` and `expected_generation` values are literal. For example, a timer rule may use
+`do = [{ action = "resume", target = "a1", expected_generation = 4, text = "Continue" }]`;
+`target` names the retained Agent and `expected_generation` is its literal old generation
+`N`. Timer `send` requires literal `text`; timer `resume` text is optional and literal.
+Neither text value can use event or subject templates.
+A timer `launch` also requires literal profile and workspace values; its optional text is
+literal and cannot use event or subject templates.
 
 An interval `every` value uses the humantime duration grammar and must be positive with
 whole-millisecond precision; it is normalized to signed `period_ms`. An explicit interval
@@ -173,8 +178,10 @@ the most recent due instant. A normally delayed wake for a timer that remained a
 the live daemon still fires its due slot under either policy. Do not burst missed slots or
 stack another firing while the previous action children are open or unknown.
 
-Timer `stop` and `send` actions freeze their literal `target` and `expected_generation`; they
-do not look up an Agent row to fill either value. A timer `launch` is targetless and fixes
+Timer `stop`, `send` and `resume` actions freeze their literal `target` and
+`expected_generation`; they do not look up an Agent row to fill either value or refresh the
+generation. Resume's literal is the old generation `N`, which ordinary command admission
+must match before advancing the retained Agent. A timer `launch` is targetless and fixes
 `expected_generation` at 0. Timer invocations have no event or subject, so a template that
 requires `${event...}` or `${subject...}` fails admission. `timer.get` is
 an owner-only read of the canonical Core timer view. `timer.run ID` is an owner-only
@@ -348,7 +355,8 @@ effect or silently choose another profile or workspace.
 
 ### Resume a retained Agent
 
-The `resume` action submits the existing ordinary `resume` command:
+The `resume` action submits the existing ordinary `resume` command through the Router/Store
+path:
 
 ```toml
 [[rule]]
@@ -363,32 +371,39 @@ a post-stop `subject.state`, and does not depend on `agent.stopped` being emitte
 post-stop trigger example, not a restriction on event kinds; other committed events can trigger
 resume when their captured Agent/generation and current Store admission are valid.
 
-`target` and `expected_generation` must resolve exactly to the captured event-time Agent and
-old generation `N`. The ordinary command has no turn/request binding. Store advances that
-same Agent to `N+1` only if it is stopped, failed or lost, has no active turn, and has a
-retained subject resumable by its harness. Native Codex resume keeps its pinned native binding
-and uses normal native readback. The tinyFake verifier uses only a synthetic retained subject
-for deterministic transport exercise; it makes no native L2 qualification claim and never
-substitutes for Codex. Subject grammar remains plugin-owned. A stale event is rejected without
-retargeting. Resume keeps the retained subject, profile and workspace, replays no old input,
-and accepts no profile, workspace, worktree, base, setup, model, effort or permission override.
+The ordinary command DTO is [Core `CommandSubmitRequest`](../../crates/eliot-core/src/api/mutations.rs).
+For event rules, `target` and `expected_generation` resolve exactly to the captured
+event-time Agent and old generation `N`. For scheduled and manual timer rules, both are
+configured literal values: the target names the retained Agent and the generation is its
+literal old `N`. Timer Resume has no event or subject binding and never refreshes `N` from
+live state; ordinary command admission rejects a stale value. In either context, the
+ordinary command has no turn/request binding. Store advances that same Agent to `N+1` only
+if it is stopped, failed or lost, has no active turn, and has a retained subject resumable by
+its harness. No replacement Agent is created. Native Codex resume keeps its pinned native
+binding and uses normal native readback. The tinyFake verifier uses only a synthetic retained
+subject for deterministic transport exercise; it makes no native L2 qualification claim and
+never substitutes for Codex. Subject grammar remains plugin-owned. Resume keeps the retained
+subject, profile and workspace, replays no old input, and accepts no profile, workspace,
+worktree, base, setup, model, effort or permission override.
 
 `text` is optional. Event text is rendered once and frozen under the ordinary persisted-text
-bound. Nonblank text creates the normal linked `<resume-id>/send` for generation `N+1`; it is
-one configured `resume` action, and the linked SEND keeps its own command ID and verified
-cause ancestry. Apply the linked-input ordering gate above: accepted, queued, dispatched or
-unknown input holds later timer/action work; applied confirms input-to-turn association, while
-the turn's terminal result remains separate. An unknown resume or SEND is never replayed.
+bound; timer text is literal. Nonblank text creates the normal linked `<resume-id>/send` for
+generation `N+1`; it is one configured `resume` action, and the linked SEND keeps its own
+command ID and verified cause ancestry. Apply the linked-input ordering gate above: accepted,
+queued, dispatched or unknown input holds later timer/action work; applied confirms
+input-to-turn association, while the turn's terminal result remains separate. An unknown
+resume or SEND is never replayed.
 
-Owner rules use Owner authority. Project rules require an explicit `resume` action grant and
-the current canonical registration, checkout and approval for the retained profile. Nonblank
-text also requires an explicit `send` grant. `Agent.project` remains descriptive and never
-establishes project authority.
+Owner rules use Owner authority. Project event and timer rules require an explicit `resume`
+action grant and the current canonical registration, checkout and approval for the retained
+profile. Nonblank text also requires an explicit `send` grant. `Agent.project` remains
+descriptive and never establishes project authority.
 
 Rate accounting uses the configured `RuleLimit` scope. With `per = "agent"`, targetless `run`
 and `launch` have no target Agent and contribute no Agent-scope count; never borrow the
-triggering event's Agent. Targeted `resume` uses its exact captured Agent. With `per = "rule"`,
-each configured launch or resume counts once; a linked initial SEND is not counted again.
+triggering event's Agent. Event `resume` uses its exact captured Agent; timer `resume` uses
+its configured literal target. With `per = "rule"`, each configured launch or resume counts
+once; a linked initial SEND is not counted again.
 The existing global action guard also counts each configured action once. Only the selected
 `RuleLimit` scope applies, so `per = "agent"` does not additionally
 impose a per-rule count. The `RuleLimit` configuration is unchanged, and this introduces no
