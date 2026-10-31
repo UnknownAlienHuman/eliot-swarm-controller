@@ -892,6 +892,51 @@ impl Router {
         validate_project_rule_resume_profile(registration, &agent)
     }
 
+    async fn verify_project_rule_resume_after_admission(
+        &self,
+        registration: &ProjectRegistrationView,
+        command: &Command,
+    ) -> Result<()> {
+        registration.validate()?;
+        let target = command
+            .target
+            .as_deref()
+            .ok_or_else(|| Error::new("invalid", "project resume has no Agent target"))?;
+        let retained_generation = command
+            .generation
+            .ok_or_else(|| Error::new("invalid", "project resume has no retained generation"))?;
+        let Some((agent, workspace)) = self
+            .project_rule_target_snapshot(target, retained_generation)
+            .await?
+        else {
+            return Err(Error::new(
+                "stale_generation",
+                "project resume no longer targets its retained Agent generation",
+            ));
+        };
+        validate_project_rule_resume_profile(registration, &agent)?;
+        match workspace {
+            Some(workspace) => {
+                crate::automation::verify_managed_project_resume_workspace(
+                    registration,
+                    &workspace,
+                    &agent,
+                    command,
+                )
+                .await
+            }
+            None => {
+                self.verify_project_rule_target_workspace(
+                    registration,
+                    &agent,
+                    None,
+                    retained_generation,
+                )
+                .await
+            }
+        }
+    }
+
     pub(crate) async fn verify_project_rule_target_scope(
         &self,
         registration: &ProjectRegistrationView,
@@ -3379,14 +3424,8 @@ impl Router {
                     self.reject_undispatched(&id, &error.code).await;
                     return;
                 }
-                let (Some(target), Some(generation)) =
-                    (command.target.as_deref(), command.generation)
-                else {
-                    self.reject_undispatched(&id, "invalid").await;
-                    return;
-                };
                 if let Err(error) = self
-                    .verify_project_rule_resume_target(&registration, target, generation)
+                    .verify_project_rule_resume_after_admission(&registration, &command)
                     .await
                 {
                     self.reject_undispatched(&id, &error.code).await;
@@ -3963,7 +4002,33 @@ impl Router {
                 Ok(Some(command))
                     if matches!(command.state, CommandState::Accepted | CommandState::Queued) =>
                 {
-                    store.settle(id, CommandState::Rejected, Some(outcome), now_ms())
+                    let workspace_resume = if command.verb == "resume" {
+                        match (
+                            command.target.as_deref(),
+                            command
+                                .generation
+                                .and_then(|generation| generation.checked_add(1)),
+                        ) {
+                            (Some(target), Some(next_generation)) => {
+                                store.get_workspace(target).map(|workspace| {
+                                    workspace.is_some_and(|workspace| {
+                                        workspace.start_command_id == id
+                                            && workspace.target_generation == next_generation
+                                    })
+                                })
+                            }
+                            _ => Ok(false),
+                        }
+                    } else {
+                        Ok(false)
+                    };
+                    match workspace_resume {
+                        Ok(true) => store.reject_workspace_resume(id, reason, now_ms()),
+                        Ok(false) => {
+                            store.settle(id, CommandState::Rejected, Some(outcome), now_ms())
+                        }
+                        Err(error) => Err(error),
+                    }
                 }
                 Ok(_) => return,
                 Err(error) => Err(error),
@@ -9022,6 +9087,149 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         assert_eq!(
             store.get_command(&stop_id).unwrap().unwrap().state,
             CommandState::Dispatched
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_resume_rejection_restores_ready_workspace_and_cancels_linked_send() {
+        let router = router();
+        let (agent, launch_id, resume_id, linked_id, previous_workspace) = {
+            let mut store = router.inner.store.lock().await;
+            let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
+                "eliot-managed-resume-rejection-{}",
+                ulid::Ulid::new()
+            ));
+            let checkout = root.join("checkout").to_string_lossy().into_owned();
+            let worktree = root.join("worktree").to_string_lossy().into_owned();
+            let branch = format!("codex/resume-rejection-{}", ulid::Ulid::new());
+            let base_oid = "d".repeat(40);
+            let input = WorkspacePreparationInput {
+                project: checkout.clone(),
+                repo_path: checkout.clone(),
+                repo_common_dir: root.join("checkout/.git").to_string_lossy().into_owned(),
+                requested_branch: branch.clone(),
+                base_ref: Some("HEAD".to_owned()),
+                base_oid: base_oid.clone(),
+                worktree_path: worktree.clone(),
+                frozen_setup: Vec::new(),
+            };
+
+            let launch_id = ulid::Ulid::new().to_string();
+            let mut launch = SubmitCommand::new(launch_id.clone(), "launch");
+            launch.expected_generation = Some(0);
+            launch.args = json!({
+                "project":checkout,
+                "workspace":worktree,
+                "worktree":branch,
+                "harness":"fake",
+                "profile":"fake",
+                "profile_snapshot":{"harness":"fake"},
+            });
+            let accepted = store
+                .submit_with_workspace("owner", launch, input.clone(), now_ms())
+                .unwrap();
+            let agent = accepted.command.target.unwrap();
+            store
+                .settle_workspace_creation(
+                    &launch_id,
+                    1,
+                    eliot_core::WorkspaceCreationOutcome::Verified {
+                        repo_path: input.repo_path.clone(),
+                        repo_common_dir: input.repo_common_dir.clone(),
+                        worktree_path: input.worktree_path.clone(),
+                        branch: input.requested_branch.clone(),
+                        head: base_oid.clone(),
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            store.dispatch(&launch_id, now_ms()).unwrap();
+            read_fixture_event(
+                &mut store,
+                &agent,
+                "session.ready",
+                json!({
+                    "command_id":launch_id,
+                    "native_scope":format!("fake:synthetic:scope:{agent}"),
+                    "native_ref":format!("fake:synthetic:session:{agent}"),
+                }),
+            );
+            store
+                .settle(&launch_id, CommandState::Applied, None, now_ms())
+                .unwrap();
+            read_fixture_event(&mut store, &agent, "session.ended", json!({}));
+            let previous_workspace = store
+                .get_workspace(&agent)
+                .unwrap()
+                .expect("retained managed workspace");
+
+            let resume_id = ulid::Ulid::new().to_string();
+            let mut resume = SubmitCommand::new(resume_id.clone(), "resume");
+            resume.target = Some(agent.clone());
+            resume.expected_generation = Some(1);
+            resume.args = json!({"text":"new input only"});
+            let admission = store.submit("owner", resume, now_ms()).unwrap();
+            let linked_id = admission
+                .linked_command
+                .expect("Resume text is a linked SEND")
+                .id;
+
+            // Exercise the already-prepared marker boundary: routing must use its
+            // exact command and generation ownership even after it reaches Ready.
+            store
+                .settle_workspace_creation(
+                    &resume_id,
+                    2,
+                    eliot_core::WorkspaceCreationOutcome::Verified {
+                        repo_path: input.repo_path.clone(),
+                        repo_common_dir: input.repo_common_dir.clone(),
+                        worktree_path: input.worktree_path.clone(),
+                        branch: input.requested_branch.clone(),
+                        head: base_oid,
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+            let ready = store
+                .get_workspace(&agent)
+                .unwrap()
+                .expect("prepared next-generation marker");
+            assert_eq!(ready.phase, WorkspacePhase::Ready);
+            assert_eq!(ready.start_command_id, resume_id);
+            assert_eq!(ready.target_generation, 2);
+            (agent, launch_id, resume_id, linked_id, previous_workspace)
+        };
+
+        router.reject_undispatched(&resume_id, "not_allowed").await;
+
+        let store = router.inner.store.lock().await;
+        assert_eq!(
+            store.get_command(&resume_id).unwrap().unwrap().state,
+            CommandState::Rejected
+        );
+        assert_eq!(
+            store.get_command(&linked_id).unwrap().unwrap().state,
+            CommandState::Cancelled
+        );
+        let restored = store
+            .get_workspace(&agent)
+            .unwrap()
+            .expect("prior managed workspace restored");
+        assert_eq!(restored.start_command_id, launch_id);
+        assert_eq!(restored.target_generation, 1);
+        assert_eq!(restored.phase, WorkspacePhase::Ready);
+        assert_eq!(restored.setup_index, previous_workspace.setup_index);
+        assert_eq!(restored.outcome, previous_workspace.outcome);
+        assert!(
+            store
+                .read_events(0, 1_000, None)
+                .unwrap()
+                .iter()
+                .any(|event| {
+                    event.kind == "command.cancelled"
+                        && event.data.get("command_id").and_then(Value::as_str)
+                            == Some(linked_id.as_str())
+                })
         );
     }
 

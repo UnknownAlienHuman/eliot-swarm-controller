@@ -289,7 +289,16 @@ workspace marker permits `accepted|queued -> failed|unknown` without advancing t
 Agent generation or creating a native token/source. The general settlement API does
 not acquire this permission. For first launch, preparation failure is `failed` at
 generation 0; uncertainty retains `created` at generation 0 with an unknown command.
-Pre-native resume failure/uncertainty preserves the prior terminal Agent projection.
+Pre-native resume failure/uncertainty preserves the prior terminal Agent projection. For a
+retained managed worktree, a known no-native-effect rejection, failure, cancellation or
+withdrawal restores the exact prior `ready` marker at generation `N`, including its completed
+setup index and retained identity, only after Store proves this exact undispatched Resume owns
+the `N+1` marker and the retained workspace/preparation binding is unchanged. This restores
+Ready metadata only; Store does not assert filesystem contents are unchanged. A later Resume
+still requires ordinary exact Git/worktree identity readback before native dispatch. Do not
+remove or recreate the worktree or replay setup. A dispatched/unknown Resume or unconfirmed
+custody/cleanup remains unresolved and fenced until exact readback; do not restore readiness or
+replay Resume.
 After Store proves the exact preparation marker, generation and verb, it uses the
 separate pure `workspace_preparation_transition_allowed(from,to) -> bool` predicate for
 those existing transitions. This does not widen ordinary command settlement.

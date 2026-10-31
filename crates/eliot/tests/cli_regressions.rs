@@ -7788,6 +7788,7 @@ fn cli_event_rules_reply_to_exact_fake_requests_in_global_and_project_scopes() {
 #[test]
 fn cli_event_resume_preserves_exact_subject_for_live_and_history_owner_project() {
     const PROJECT_ID: &str = "resume-event-project";
+    const PROJECT_LIVE_BRANCH: &str = "codex/project-live-resume";
 
     #[derive(Clone, Copy)]
     struct ResumeCase {
@@ -7840,6 +7841,13 @@ fn cli_event_resume_preserves_exact_subject_for_live_and_history_owner_project()
             .status
             .success()
     );
+    let base_reply = fixture.git(&["rev-parse", "--verify", "HEAD"]);
+    assert!(
+        base_reply.status.success(),
+        "read committed resume fixture base"
+    );
+    let managed_base_oid = base_reply.stdout.trim().to_owned();
+    assert!(!managed_base_oid.is_empty());
     fixture.start();
     fixture.stop(false);
 
@@ -8062,28 +8070,90 @@ fn cli_event_resume_preserves_exact_subject_for_live_and_history_owner_project()
     };
 
     for case in CASES {
-        let launch: CoreCommand = serde_json::from_value(fixture.json(&[
-            "launch",
-            "--profile",
-            "fake",
-            "--workspace",
-            &registration.checkout,
-        ]))
-        .expect("typed event-resume Fake launch");
+        let managed_project_live = case.project == Some(PROJECT_ID) && !case.history;
+        let mut launch_args = vec![
+            "launch".to_owned(),
+            "--profile".to_owned(),
+            "fake".to_owned(),
+            "--workspace".to_owned(),
+            registration.checkout.clone(),
+        ];
+        if managed_project_live {
+            launch_args.extend([
+                "--worktree".to_owned(),
+                PROJECT_LIVE_BRANCH.to_owned(),
+                "--base".to_owned(),
+                managed_base_oid.clone(),
+            ]);
+        }
+        let launch_arg_refs = launch_args.iter().map(String::as_str).collect::<Vec<_>>();
+        let launch: CoreCommand = serde_json::from_value(fixture.json(&launch_arg_refs))
+            .expect("typed event-resume Fake launch");
         let launch: CoreCommand =
             serde_json::from_value(fixture.wait_command(&launch.id, "applied"))
                 .expect("applied event-resume Fake launch");
         let agent_id = launch.target.clone().expect("launch has its Agent row");
         let generation = launch.generation.expect("launch dispatched generation");
         assert_eq!(generation, 1);
+        if managed_project_live {
+            assert_eq!(launch.args["profile"], "fake");
+            assert_eq!(launch.args["workspace"], registration.checkout);
+            assert_eq!(launch.args["worktree"], PROJECT_LIVE_BRANCH);
+            assert_eq!(launch.args["base"], managed_base_oid);
+        }
         let ready = wait_ready(&fixture, &agent_id, generation);
         let initial_agent = ready.agent;
         assert_eq!(initial_agent.profile, "fake");
         assert_eq!(initial_agent.project, registration.checkout);
-        assert_eq!(
-            initial_agent.workspace.as_deref(),
-            Some(registration.checkout.as_str())
-        );
+        let (initial_managed_workspace, managed_seed_bytes) = if managed_project_live {
+            assert_eq!(
+                initial_agent.workspace_phase,
+                Some(eliot_core::WorkspacePhase::Ready)
+            );
+            assert_eq!(initial_agent.branch.as_deref(), Some(PROJECT_LIVE_BRANCH));
+            assert_eq!(
+                initial_agent.base_oid.as_deref(),
+                Some(managed_base_oid.as_str())
+            );
+            assert!(initial_agent.base_ref.is_some());
+            let workspace = Path::new(
+                initial_agent
+                    .workspace
+                    .as_deref()
+                    .expect("Project live resume has a managed workspace"),
+            )
+            .canonicalize()
+            .expect("canonical Project live managed worktree");
+            let worktrees_root = fixture
+                .data
+                .canonicalize()
+                .expect("canonical private fixture data root")
+                .join("worktrees");
+            assert!(workspace.starts_with(&worktrees_root));
+            assert!(workspace.is_dir());
+            let seed_bytes = fs::read(workspace.join("seed.txt"))
+                .expect("read checked-out managed worktree seed bytes");
+            assert!(
+                seed_bytes.as_slice() == "event resume fixture\n".as_bytes()
+                    || seed_bytes.as_slice() == "event resume fixture\r\n".as_bytes(),
+                "managed worktree seed has unexpected logical contents: {:?}",
+                String::from_utf8_lossy(&seed_bytes)
+            );
+            (Some(workspace), Some(seed_bytes))
+        } else {
+            assert_eq!(
+                initial_agent.workspace.as_deref(),
+                Some(registration.checkout.as_str())
+            );
+            (None, None)
+        };
+        let managed_worktrees_before_resume = if initial_managed_workspace.is_some() {
+            let readback = fixture.git(&["worktree", "list", "--porcelain"]);
+            assert!(readback.status.success(), "read managed worktree inventory");
+            Some(readback.stdout)
+        } else {
+            None
+        };
         let native_scope = initial_agent
             .native_scope
             .clone()
@@ -8329,6 +8399,46 @@ fn cli_event_resume_preserves_exact_subject_for_live_and_history_owner_project()
         assert_eq!(resumed.agent.workspace, initial_agent.workspace);
         assert_eq!(resumed.agent.project, registration.checkout);
         assert_eq!(resumed.agent.harness, initial_agent.harness);
+        if let Some(initial_workspace) = &initial_managed_workspace {
+            assert_eq!(
+                resumed.agent.workspace_phase,
+                Some(eliot_core::WorkspacePhase::Ready)
+            );
+            assert_eq!(resumed.agent.branch, initial_agent.branch);
+            assert_eq!(resumed.agent.base_ref, initial_agent.base_ref);
+            assert_eq!(resumed.agent.base_oid, initial_agent.base_oid);
+            let resumed_workspace = Path::new(
+                resumed
+                    .agent
+                    .workspace
+                    .as_deref()
+                    .expect("resumed managed workspace path"),
+            )
+            .canonicalize()
+            .expect("canonical resumed Project worktree");
+            assert_eq!(resumed_workspace.as_path(), initial_workspace.as_path());
+            assert!(resumed_workspace.is_dir());
+            let resumed_seed_bytes = fs::read(resumed_workspace.join("seed.txt"))
+                .expect("read managed worktree seed bytes after resume");
+            assert_eq!(
+                resumed_seed_bytes.as_slice(),
+                managed_seed_bytes
+                    .as_ref()
+                    .expect("captured managed worktree seed bytes before resume")
+                    .as_slice()
+            );
+            let worktrees_after_resume = fixture.git(&["worktree", "list", "--porcelain"]);
+            assert!(
+                worktrees_after_resume.status.success(),
+                "read managed worktree inventory after resume"
+            );
+            assert_eq!(
+                worktrees_after_resume.stdout.as_str(),
+                managed_worktrees_before_resume
+                    .as_deref()
+                    .expect("managed worktree inventory before resume")
+            );
+        }
         assert_eq!(fixture_agent_ids(&fixture), ids_before_resume);
 
         let linked_send_id = format!("{resume_id}/send");

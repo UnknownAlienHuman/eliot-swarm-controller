@@ -6058,6 +6058,524 @@ fn pending_plain_workspace_resume_reserves_next_generation_and_stale_exit_cannot
 }
 
 #[test]
+fn managed_workspace_resume_rejection_restores_ready_after_project_revocation() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let project = "resume-withdrawal-project";
+    let checkout = "/synthetic-resume-withdrawal";
+    let profile = "resume-withdrawal-profile";
+    let (agent, workspace_input) = ready_managed_codex_agent(&mut store, checkout, profile, now);
+    let registration = ProjectRegistrationInput {
+        id: project.to_owned(),
+        checkout: checkout.to_owned(),
+        repo_common_dir: format!("{checkout}/.git"),
+        profiles: vec![profile.to_owned()],
+        actions: vec!["resume".to_owned(), "send".to_owned()],
+        interpreters: BTreeMap::new(),
+        run_env: Vec::new(),
+    };
+    store
+        .upsert_project_registration("owner", &registration, now + 5)
+        .expect("grant Project resume and linked input");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "resume-withdrawal-project:ended".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ended".to_owned(),
+                    native_id: "resume-withdrawal-project:ended".to_owned(),
+                    data: json!({}),
+                }],
+                cursor: None,
+            },
+            now + 6,
+        )
+        .expect("commit retained terminal session fact");
+    let old_agent = store.get_agent(&agent).unwrap().unwrap();
+    assert_eq!(old_agent.generation, 1);
+    assert_eq!(old_agent.state, AgentState::Stopped);
+    let ready_workspace = store.get_workspace(&agent).unwrap().unwrap();
+
+    let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
+    resume.target = Some(agent.clone());
+    resume.expected_generation = Some(1);
+    resume.args = json!({"text": "continue after revoked Project grant"});
+    let resume_id = resume.id.clone();
+    let principal = format!("project:{project}");
+    let admission = store
+        .submit_with_workspace(&principal, resume.clone(), workspace_input.clone(), now + 7)
+        .expect("admit Project resume with linked input");
+    assert_eq!(admission.command.state, CommandState::Accepted);
+    assert_eq!(admission.command.args, json!({}));
+    let linked = admission
+        .linked_command
+        .expect("resume text is its linked SEND");
+    let linked_id = linked.id.clone();
+    assert_eq!(linked.state, CommandState::Queued);
+    assert_eq!(linked.generation, Some(2));
+    assert_eq!(linked.args["text"], "continue after revoked Project grant");
+    assert_eq!(capacity_generation(&store, &agent), Some(2));
+    let pending_workspace = store.get_workspace(&agent).unwrap().unwrap();
+    assert_eq!(pending_workspace.phase, WorkspacePhase::Creating);
+    assert_eq!(pending_workspace.target_generation, 2);
+    assert_eq!(pending_workspace.start_command_id, resume_id);
+
+    store
+        .reconcile_project_registrations("owner", &[], now + 8)
+        .expect("revoke current Project registration");
+    assert!(
+        store
+            .get_project_registration("owner", project)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .settle(
+                &resume_id,
+                CommandState::Rejected,
+                Some(json!({"reason": "project_registration_revoked"})),
+                now + 9,
+            )
+            .unwrap_err()
+            .code,
+        "bad_state",
+        "generic settlement remains closed for a managed workspace resume"
+    );
+    let rejected = store
+        .reject_workspace_resume(&resume.id, "project_registration_revoked", now + 10)
+        .expect("withdraw admitted resume without renewed Project authority");
+    assert_eq!(rejected.value.state, CommandState::Rejected);
+    assert_eq!(
+        rejected.value.outcome.as_ref().unwrap()["native_dispatched"],
+        false
+    );
+    assert!(rejected.events.iter().any(|event| {
+        event.kind == "command.cancelled" && event.data["command_id"] == linked_id
+    }));
+    assert_eq!(
+        store.get_command(&linked_id).unwrap().unwrap().state,
+        CommandState::Cancelled
+    );
+    assert_eq!(store.get_agent(&agent).unwrap().unwrap(), old_agent);
+    assert_eq!(capacity_generation(&store, &agent), None);
+    let restored = store.get_workspace(&agent).unwrap().unwrap();
+    assert_eq!(restored.phase, WorkspacePhase::Ready);
+    assert_eq!(restored.target_generation, 1);
+    assert_eq!(restored.start_command_id, ready_workspace.start_command_id);
+    assert_eq!(restored.outcome, ready_workspace.outcome);
+    assert_eq!(restored.setup_index, ready_workspace.setup_index);
+    assert_eq!(restored.project, ready_workspace.project);
+    assert_eq!(restored.repo_path, ready_workspace.repo_path);
+    assert_eq!(restored.repo_common_dir, ready_workspace.repo_common_dir);
+    assert_eq!(restored.requested_branch, ready_workspace.requested_branch);
+    assert_eq!(restored.base_ref, ready_workspace.base_ref);
+    assert_eq!(restored.base_oid, ready_workspace.base_oid);
+    assert_eq!(restored.worktree_path, ready_workspace.worktree_path);
+    assert_eq!(restored.frozen_setup, ready_workspace.frozen_setup);
+
+    store
+        .upsert_project_registration("owner", &registration, now + 11)
+        .expect("restore the Project grant for a new explicit resume");
+    resume.id = Ulid::new().to_string();
+    let retry_id = resume.id.clone();
+    let retry = store
+        .submit_with_workspace(&principal, resume, workspace_input, now + 12)
+        .expect("restored Ready generation admits a fresh resume");
+    assert!(retry.is_new);
+    assert_eq!(retry.command.state, CommandState::Accepted);
+    assert_eq!(capacity_generation(&store, &agent), Some(2));
+    let retry_workspace = store.get_workspace(&agent).unwrap().unwrap();
+    assert_eq!(retry_workspace.phase, WorkspacePhase::Creating);
+    assert_eq!(retry_workspace.target_generation, 2);
+    assert_eq!(retry_workspace.start_command_id, retry_id);
+}
+
+#[test]
+fn managed_catch_up_resume_sibling_cancellation_restores_for_retry() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let rule_id = "managed-resume-sibling-cancel";
+    let rule_value = json!({
+        "id": rule_id,
+        "enabled": true,
+        "on": {"event": "session.ended"},
+        "do": [{
+            "action": "resume",
+            "target": "${event.agent}",
+            "expected_generation": "${event.generation}",
+            "text": "resume from captured terminal event",
+        }],
+        "limit": {"max": 2, "per": "rule", "window_ms": 60_000},
+    });
+    let rule = RuleDefinitionInput {
+        id: rule_id.to_owned(),
+        canonical_definition: serde_json::to_string(&rule_value).unwrap(),
+        definition_digest: eliot_core::canonical_json_sha256(&rule_value).unwrap(),
+        enabled: true,
+    };
+    let checkout = "/synthetic-resume-sibling";
+    let (first_agent, _) =
+        ready_managed_codex_agent(&mut store, checkout, "resume-sibling-first", now);
+    let (second_agent, second_workspace) =
+        ready_managed_codex_agent(&mut store, checkout, "resume-sibling-second", now + 10);
+    let first_prior_workspace = store.get_workspace(&first_agent).unwrap().unwrap();
+    let second_prior_workspace = store.get_workspace(&second_agent).unwrap().unwrap();
+    let first_end = store
+        .put_batch(
+            SourceBatch {
+                batch_id: "managed-resume-sibling:first:ended".to_owned(),
+                agent_id: first_agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ended".to_owned(),
+                    native_id: "managed-resume-sibling:first:ended".to_owned(),
+                    data: json!({}),
+                }],
+                cursor: None,
+            },
+            now + 20,
+        )
+        .expect("commit first captured terminal event");
+    let first_event = first_end
+        .events
+        .iter()
+        .find(|event| event.kind == "session.ended")
+        .expect("first terminal event")
+        .seq;
+    let second_end = store
+        .put_batch(
+            SourceBatch {
+                batch_id: "managed-resume-sibling:second:ended".to_owned(),
+                agent_id: second_agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ended".to_owned(),
+                    native_id: "managed-resume-sibling:second:ended".to_owned(),
+                    data: json!({}),
+                }],
+                cursor: None,
+            },
+            now + 20,
+        )
+        .expect("commit second captured terminal event");
+    let second_event = second_end
+        .events
+        .iter()
+        .find(|event| event.kind == "session.ended")
+        .expect("second terminal event")
+        .seq;
+    let state = store
+        .ensure_rule_state("owner", &rule, now + 21)
+        .expect("capture both history events");
+    let captured_through = state.current_cursor;
+    let request = RuleCatchUpRequest::new(
+        Ulid::new().to_string(),
+        rule_id,
+        first_event - 1,
+        Some(captured_through),
+    );
+    let first_old_agent = store.get_agent(&first_agent).unwrap().unwrap();
+    let second_old_agent = store.get_agent(&second_agent).unwrap().unwrap();
+    let resume_request = |agent: &str| {
+        let mut request = SubmitCommand::new(Ulid::new().to_string(), "resume");
+        request.target = Some(agent.to_owned());
+        request.expected_generation = Some(1);
+        request.args = json!({"text": "resume from captured terminal event"});
+        request
+    };
+    let admission = store
+        .admit_rule_catch_up(
+            "owner",
+            &request,
+            &state,
+            captured_through,
+            &[
+                RuleCatchUpAction::command(first_event, resume_request(&first_agent)),
+                RuleCatchUpAction::command(second_event, resume_request(&second_agent)),
+            ],
+            now + 22,
+        )
+        .expect("admit ordered managed resume siblings");
+    assert_eq!(admission.children.len(), 2);
+    let first_resume_id = admission.children[0].command.id.clone();
+    let first_send_id = admission.children[0]
+        .linked_command
+        .as_ref()
+        .unwrap()
+        .id
+        .clone();
+    let second_resume_id = admission.children[1].command.id.clone();
+    let second_send_id = admission.children[1]
+        .linked_command
+        .as_ref()
+        .unwrap()
+        .id
+        .clone();
+    assert_eq!(
+        admission.children[1]
+            .linked_command
+            .as_ref()
+            .unwrap()
+            .generation,
+        Some(2)
+    );
+    store
+        .reject_workspace_resume(&first_resume_id, "fixture_pre_dispatch_rejection", now + 23)
+        .expect("withdraw the known no-effect predecessor");
+    assert_eq!(
+        store.get_command(&first_send_id).unwrap().unwrap().state,
+        CommandState::Cancelled
+    );
+    let cancelled = store
+        .dispatch(&second_resume_id, now + 24)
+        .expect("terminal predecessor cancels its undispatched sibling");
+    assert_eq!(cancelled.value.state, CommandState::Cancelled);
+    assert!(cancelled.events.iter().any(|event| {
+        event.kind == "command.cancelled" && event.data["command_id"] == second_send_id
+    }));
+    assert_eq!(
+        store.get_command(&second_send_id).unwrap().unwrap().state,
+        CommandState::Cancelled
+    );
+    assert_eq!(
+        store.get_agent(&first_agent).unwrap().unwrap(),
+        first_old_agent
+    );
+    assert_eq!(
+        store.get_agent(&second_agent).unwrap().unwrap(),
+        second_old_agent
+    );
+    assert_eq!(capacity_generation(&store, &first_agent), None);
+    assert_eq!(capacity_generation(&store, &second_agent), None);
+    for (agent, original) in [
+        (&first_agent, &first_prior_workspace),
+        (&second_agent, &second_prior_workspace),
+    ] {
+        let restored = store.get_workspace(agent).unwrap().unwrap();
+        assert_eq!(restored.phase, WorkspacePhase::Ready);
+        assert_eq!(restored.target_generation, 1);
+        assert_eq!(restored.start_command_id, original.start_command_id);
+        assert_eq!(restored.outcome, original.outcome);
+        assert_eq!(restored.project, original.project);
+        assert_eq!(restored.repo_path, original.repo_path);
+        assert_eq!(restored.repo_common_dir, original.repo_common_dir);
+        assert_eq!(restored.requested_branch, original.requested_branch);
+        assert_eq!(restored.base_ref, original.base_ref);
+        assert_eq!(restored.base_oid, original.base_oid);
+        assert_eq!(restored.worktree_path, original.worktree_path);
+        assert_eq!(restored.frozen_setup, original.frozen_setup);
+    }
+    assert!(
+        store
+            .recover_rule_children(None, 100)
+            .unwrap()
+            .iter()
+            .all(|child| child.command.id != second_resume_id)
+    );
+
+    let mut retry_request = SubmitCommand::new(Ulid::new().to_string(), "resume");
+    retry_request.target = Some(second_agent.clone());
+    retry_request.expected_generation = Some(1);
+    retry_request.args = json!({"text": "resume from captured terminal event"});
+    let retry_id = retry_request.id.clone();
+    let retry = store
+        .submit_with_workspace("owner", retry_request, second_workspace, now + 25)
+        .expect("restored Ready workspace admits a fresh resume");
+    assert!(retry.is_new);
+    assert_eq!(retry.command.state, CommandState::Accepted);
+    assert_eq!(capacity_generation(&store, &second_agent), Some(2));
+    let retry_workspace = store.get_workspace(&second_agent).unwrap().unwrap();
+    assert_eq!(retry_workspace.phase, WorkspacePhase::Creating);
+    assert_eq!(retry_workspace.target_generation, 2);
+    assert_eq!(retry_workspace.start_command_id, retry_id);
+}
+
+#[test]
+fn managed_resume_withdrawal_refuses_uncertain_inputs_and_foreign_markers() {
+    for fence in [
+        "dispatched_input",
+        "unknown_input",
+        "dispatched_resume",
+        "unknown_resume",
+        "unknown_stop",
+        "foreign_marker",
+    ] {
+        let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+        let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+        let (agent, workspace_input) = ready_managed_codex_agent(
+            &mut store,
+            "/synthetic-resume-withdrawal-fence",
+            "resume-withdrawal-fence-profile",
+            now,
+        );
+        let foreign_start_id = store
+            .get_workspace(&agent)
+            .unwrap()
+            .unwrap()
+            .start_command_id;
+        let stop_id = if fence == "unknown_stop" {
+            let mut stop = SubmitCommand::new(Ulid::new().to_string(), "stop");
+            stop.target = Some(agent.clone());
+            stop.expected_generation = Some(1);
+            let id = stop.id.clone();
+            store
+                .submit("owner", stop, now + 5)
+                .expect("admit old-generation stop before resume");
+            Some(id)
+        } else {
+            None
+        };
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: format!("resume-withdrawal-fence:{fence}:ended"),
+                    agent_id: agent.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "session.ended".to_owned(),
+                        native_id: format!("resume-withdrawal-fence:{fence}:ended"),
+                        data: json!({}),
+                    }],
+                    cursor: None,
+                },
+                now + 6,
+            )
+            .expect("commit terminal fact");
+        let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
+        resume.target = Some(agent.clone());
+        resume.expected_generation = Some(1);
+        resume.args = json!({"text": "fenced retained input"});
+        let resume_id = resume.id.clone();
+        let admission = store
+            .submit_with_workspace("owner", resume, workspace_input.clone(), now + 7)
+            .expect("admit exact managed resume");
+        let linked_id = admission.linked_command.unwrap().id;
+        let mut reject_now = now + 8;
+
+        match fence {
+            "dispatched_input" | "unknown_input" => {
+                store
+                    .connection
+                    .execute(
+                        "UPDATE commands SET state = ?1 WHERE id = ?2",
+                        rusqlite::params![fence.strip_suffix("_input").unwrap(), linked_id],
+                    )
+                    .unwrap();
+            }
+            "dispatched_resume" | "unknown_resume" => {
+                store
+                    .settle_workspace_creation(
+                        &resume_id,
+                        2,
+                        WorkspaceCreationOutcome::Verified {
+                            repo_path: workspace_input.repo_path.clone(),
+                            repo_common_dir: workspace_input.repo_common_dir.clone(),
+                            worktree_path: workspace_input.worktree_path.clone(),
+                            branch: workspace_input.requested_branch.clone(),
+                            head: workspace_input.base_oid.clone(),
+                        },
+                        now + 8,
+                    )
+                    .expect("verify the retained worktree before native dispatch");
+                store
+                    .dispatch(&resume_id, now + 9)
+                    .expect("dispatch the native resume");
+                if fence == "unknown_resume" {
+                    store
+                        .settle(
+                            &resume_id,
+                            CommandState::Unknown,
+                            Some(json!({"reason": "fixture_unknown_resume"})),
+                            now + 10,
+                        )
+                        .expect("retain the unknown native resume result");
+                    reject_now = now + 11;
+                } else {
+                    reject_now = now + 10;
+                }
+            }
+            "unknown_stop" => {
+                store
+                    .connection
+                    .execute(
+                        "UPDATE commands SET state = 'unknown' WHERE id = ?1",
+                        [stop_id.as_deref().unwrap()],
+                    )
+                    .unwrap();
+            }
+            "foreign_marker" => {
+                store
+                    .connection
+                    .execute(
+                        "UPDATE workspaces SET start_command_id = ?1 WHERE agent = ?2",
+                        rusqlite::params![
+                            foreign_start_id,
+                            eliot_core::parse_agent_id(&agent).unwrap()
+                        ],
+                    )
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let command_before = store.get_command(&resume_id).unwrap().unwrap();
+        let linked_before = store.get_command(&linked_id).unwrap().unwrap();
+        let agent_before = store.get_agent(&agent).unwrap().unwrap();
+        let workspace_before = store.get_workspace(&agent).unwrap().unwrap();
+        let capacity_before = capacity_generation(&store, &agent);
+        let high_water_before = store.high_water().unwrap();
+        let event_count_before: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+
+        let error = store
+            .reject_workspace_resume(&resume_id, "fixture_rejection", reject_now)
+            .expect_err("uncertain or foreign custody must remain fenced");
+        assert_eq!(
+            error.code,
+            if fence == "foreign_marker" {
+                "stale_generation"
+            } else {
+                "bad_state"
+            },
+            "{fence}"
+        );
+        assert_eq!(
+            store.get_command(&resume_id).unwrap().unwrap(),
+            command_before
+        );
+        assert_eq!(
+            store.get_command(&linked_id).unwrap().unwrap(),
+            linked_before
+        );
+        assert_eq!(store.get_agent(&agent).unwrap().unwrap(), agent_before);
+        assert_eq!(
+            store.get_workspace(&agent).unwrap().unwrap(),
+            workspace_before
+        );
+        assert_eq!(capacity_generation(&store, &agent), capacity_before);
+        assert_eq!(store.high_water().unwrap(), high_water_before);
+        let event_count_after: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(event_count_after, event_count_before);
+        assert!(!store.is_write_faulted());
+    }
+}
+
+#[test]
 fn exact_undispatched_resume_rejection_releases_only_its_next_generation_slot() {
     let mut store = Store::open(Path::new(":memory:")).expect("open Store");
     let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");

@@ -3242,6 +3242,7 @@ pub(super) fn gate_rule_action_dispatch_tx(
                 "rule_action_predecessor_terminal",
                 now,
                 events,
+                true,
             )?;
         }
     }
