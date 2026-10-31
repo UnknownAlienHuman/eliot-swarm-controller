@@ -16,6 +16,7 @@ use eliot_core::{
     WorkspacePreparationInput, WorkspaceRemovalOutcome, WorkspaceSetupOutcome,
 };
 use eliot_plugin::sync::LockExt;
+use eliot_store::WorkspaceGitReservation;
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
@@ -83,6 +84,8 @@ struct State {
     progress: watch::Sender<u64>,
     monitoring: Monitoring,
     slots: Mutex<HashMap<Key, Arc<Slot>>>,
+    #[cfg(test)]
+    deferred_git_effect: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 #[derive(Clone)]
@@ -124,7 +127,16 @@ impl WorkspaceManager {
                 progress,
                 monitoring,
                 slots: Mutex::new(HashMap::new()),
+                #[cfg(test)]
+                deferred_git_effect: Mutex::new(None),
             }),
+        }
+    }
+
+    #[cfg(test)]
+    fn signal_deferred_git_effect(&self) {
+        if let Some(sender) = self.inner.deferred_git_effect.lock_recover().take() {
+            let _ = sender.send(());
         }
     }
 
@@ -211,24 +223,57 @@ impl WorkspaceManager {
                                 let gate = slot.gate.clone().lock_owned().await;
                                 self.require_current(&current, WorkspacePhase::Creating)
                                     .await?;
-                                let result = self
-                                    .run_owned(
-                                        &slot,
-                                        command,
-                                        Instant::now() + GIT_TIME,
-                                        gate,
-                                        WorkspaceProcessContext::new(
-                                            &current,
-                                            command_id,
-                                            "workspace_create",
-                                            None,
-                                        ),
-                                    )
-                                    .await;
-                                if !result.quiescent {
-                                    creation_unknown(result.code)
-                                } else {
-                                    git.inspect(&current).await
+                                let mut progress = self.inner.progress.subscribe();
+                                let observed_progress = *progress.borrow_and_update();
+                                let reservation = {
+                                    let mut store = self.inner.store.lock().await;
+                                    store.begin_workspace_git_effect(
+                                        command_id,
+                                        &current,
+                                        now_ms(),
+                                    )?
+                                };
+                                match reservation {
+                                    WorkspaceGitReservation::Reserved => {
+                                        let result = self
+                                            .run_owned(
+                                                &slot,
+                                                command,
+                                                Instant::now() + GIT_TIME,
+                                                gate,
+                                                WorkspaceProcessContext::new(
+                                                    &current,
+                                                    command_id,
+                                                    "workspace_create",
+                                                    None,
+                                                ),
+                                            )
+                                            .await;
+                                        if !result.quiescent {
+                                            creation_unknown(result.code)
+                                        } else {
+                                            git.inspect(&current).await
+                                        }
+                                    }
+                                    WorkspaceGitReservation::Deferred => {
+                                        drop(gate);
+                                        #[cfg(test)]
+                                        self.signal_deferred_git_effect();
+                                        wait_for_git_write_progress(
+                                            &mut progress,
+                                            observed_progress,
+                                        )
+                                        .await;
+                                        continue;
+                                    }
+                                    WorkspaceGitReservation::MayHaveBegun => {
+                                        drop(gate);
+                                        if workspace_git_effect_quiescent(&slot) {
+                                            git.inspect(&current).await
+                                        } else {
+                                            creation_unknown("workspace_git_custody_unknown")
+                                        }
+                                    }
                                 }
                             }
                             Err(_) => git.inspect(&current).await,
@@ -438,107 +483,142 @@ impl WorkspaceManager {
         slot: &Arc<Slot>,
         git: &WorkspaceGit,
     ) -> WorkspaceRemovalOutcome {
-        let deadline = Instant::now() + GIT_TIME;
-        if self
-            .wait_git_sources_closed(preparation, command, slot, deadline)
-            .await
-            .is_err()
-        {
-            return removal_unknown("workspace_git_drain_unknown");
-        }
-        let scratch = {
-            let _gate = slot.gate.clone().lock_owned().await;
+        loop {
+            let deadline = Instant::now() + GIT_TIME;
+            if self
+                .wait_git_sources_closed(preparation, command, slot, deadline)
+                .await
+                .is_err()
+            {
+                return removal_unknown("workspace_git_drain_unknown");
+            }
+            let scratch = {
+                let _gate = slot.gate.clone().lock_owned().await;
+                if self.require_removing(preparation, command).await.is_err() {
+                    return removal_unknown("workspace_removal_marker_changed");
+                }
+                let store = self.inner.store.lock().await;
+                let profile = match store.get_agent(&preparation.agent) {
+                    Ok(Some(agent)) => agent.profile_snapshot,
+                    _ => return removal_refused(),
+                };
+                match frozen_scratch(&profile) {
+                    Ok(scratch) => scratch,
+                    Err(_) => return removal_refused(),
+                }
+            };
+            // Complete Git classification belongs to the low-level reader. It rejects
+            // tracked dirt and returns only ordinary untracked/ignored file candidates.
+            let candidates =
+                match timeout_at(deadline, git.scratch_candidates(preparation, &scratch)).await {
+                    Ok(Ok(candidates)) => candidates,
+                    Ok(Err(error)) => return removal_preflight_error(&error),
+                    Err(_) => return removal_unknown("workspace_scratch_deadline"),
+                };
+            let mut files = Vec::with_capacity(candidates.len());
+            let mut seen = HashSet::new();
+            for candidate in candidates {
+                if Instant::now() >= deadline {
+                    return removal_unknown("workspace_scratch_deadline");
+                }
+                let file = match self.checked_scratch_file(preparation, &scratch, &candidate) {
+                    Ok(file) => file,
+                    Err(error) => return removal_preflight_error(&error),
+                };
+                if !seen.insert(file.clone()) {
+                    return removal_refused();
+                }
+                files.push(file);
+            }
+            let mut deleted = false;
+            for file in files {
+                let _gate = slot.gate.clone().lock_owned().await;
+                if self.require_removing(preparation, command).await.is_err() {
+                    return removal_unknown("workspace_removal_marker_changed");
+                }
+                if Instant::now() >= deadline {
+                    return removal_unknown("workspace_scratch_deadline");
+                }
+                // Recheck immediately before each individual unlink, under the same
+                // gate as forced shutdown. Never hold Store while doing filesystem I/O.
+                let file = match self.checked_scratch_file(preparation, &scratch, &file) {
+                    Ok(file) => file,
+                    Err(_) => return removal_unknown("workspace_scratch_path_changed"),
+                };
+                if fs::remove_file(&file).is_err() {
+                    return removal_unknown("workspace_scratch_delete_unknown");
+                }
+                deleted = true;
+                if Instant::now() >= deadline {
+                    return removal_unknown("workspace_scratch_deadline");
+                }
+            }
+            // Empty directories are left to ordinary Git removal; never recurse over
+            // a scratch root that might also contain clean tracked files.
+            let mutator = match timeout_at(deadline, git.prepare_remove(preparation)).await {
+                Ok(Ok(command)) => command,
+                Ok(Err(error)) if !deleted => return removal_preflight_error(&error),
+                Ok(Err(_)) => return removal_unknown("workspace_remove_after_scratch"),
+                Err(_) => return removal_unknown("workspace_remove_deadline"),
+            };
+            let gate = slot.gate.clone().lock_owned().await;
             if self.require_removing(preparation, command).await.is_err() {
                 return removal_unknown("workspace_removal_marker_changed");
             }
-            let store = self.inner.store.lock().await;
-            let profile = match store.get_agent(&preparation.agent) {
-                Ok(Some(agent)) => agent.profile_snapshot,
-                _ => return removal_refused(),
-            };
-            match frozen_scratch(&profile) {
-                Ok(scratch) => scratch,
-                Err(_) => return removal_refused(),
-            }
-        };
-        // Complete Git classification belongs to the low-level reader. It rejects
-        // tracked dirt and returns only ordinary untracked/ignored file candidates.
-        let candidates =
-            match timeout_at(deadline, git.scratch_candidates(preparation, &scratch)).await {
-                Ok(Ok(candidates)) => candidates,
-                Ok(Err(error)) => return removal_preflight_error(&error),
-                Err(_) => return removal_unknown("workspace_scratch_deadline"),
-            };
-        let mut files = Vec::with_capacity(candidates.len());
-        let mut seen = HashSet::new();
-        for candidate in candidates {
             if Instant::now() >= deadline {
-                return removal_unknown("workspace_scratch_deadline");
+                return removal_unknown("workspace_remove_deadline");
             }
-            let file = match self.checked_scratch_file(preparation, &scratch, &candidate) {
-                Ok(file) => file,
+            let mut progress = self.inner.progress.subscribe();
+            let observed_progress = *progress.borrow_and_update();
+            let reservation = {
+                let mut store = self.inner.store.lock().await;
+                store.begin_workspace_git_effect(&command.id, preparation, now_ms())
+            };
+            match reservation {
                 Err(error) => return removal_preflight_error(&error),
-            };
-            if !seen.insert(file.clone()) {
-                return removal_refused();
+                Ok(WorkspaceGitReservation::Deferred) => {
+                    drop(gate);
+                    #[cfg(test)]
+                    self.signal_deferred_git_effect();
+                    wait_for_git_write_progress(&mut progress, observed_progress).await;
+                    continue;
+                }
+                Ok(WorkspaceGitReservation::MayHaveBegun) => {
+                    drop(gate);
+                    if !workspace_git_effect_quiescent(slot) {
+                        return removal_unknown("workspace_git_custody_unknown");
+                    }
+                    return match timeout_at(deadline, git.inspect_removal(preparation)).await {
+                        Ok(removed @ WorkspaceRemovalOutcome::Removed { .. }) => removed,
+                        _ => removal_unknown("workspace_removal_unconfirmed"),
+                    };
+                }
+                Ok(WorkspaceGitReservation::Reserved) => {
+                    let result = self
+                        .run_owned(
+                            slot,
+                            mutator,
+                            deadline,
+                            gate,
+                            WorkspaceProcessContext::new(
+                                preparation,
+                                &command.id,
+                                "workspace_remove",
+                                None,
+                            ),
+                        )
+                        .await;
+                    if !result.quiescent {
+                        return removal_unknown(result.code);
+                    }
+                    // A nonzero Git exit never proves no destructive effect. Only exact
+                    // absence and retained-branch readback can establish successful removal.
+                    return match timeout_at(deadline, git.inspect_removal(preparation)).await {
+                        Ok(removed @ WorkspaceRemovalOutcome::Removed { .. }) => removed,
+                        _ => removal_unknown("workspace_removal_unconfirmed"),
+                    };
+                }
             }
-            files.push(file);
-        }
-        let mut deleted = false;
-        for file in files {
-            let _gate = slot.gate.clone().lock_owned().await;
-            if self.require_removing(preparation, command).await.is_err() {
-                return removal_unknown("workspace_removal_marker_changed");
-            }
-            if Instant::now() >= deadline {
-                return removal_unknown("workspace_scratch_deadline");
-            }
-            // Recheck immediately before each individual unlink, under the same
-            // gate as forced shutdown. Never hold Store while doing filesystem I/O.
-            let file = match self.checked_scratch_file(preparation, &scratch, &file) {
-                Ok(file) => file,
-                Err(_) => return removal_unknown("workspace_scratch_path_changed"),
-            };
-            if fs::remove_file(&file).is_err() {
-                return removal_unknown("workspace_scratch_delete_unknown");
-            }
-            deleted = true;
-            if Instant::now() >= deadline {
-                return removal_unknown("workspace_scratch_deadline");
-            }
-        }
-        // Empty directories are left to ordinary Git removal; never recurse over
-        // a scratch root that might also contain clean tracked files.
-        let mutator = match timeout_at(deadline, git.prepare_remove(preparation)).await {
-            Ok(Ok(command)) => command,
-            Ok(Err(error)) if !deleted => return removal_preflight_error(&error),
-            Ok(Err(_)) => return removal_unknown("workspace_remove_after_scratch"),
-            Err(_) => return removal_unknown("workspace_remove_deadline"),
-        };
-        let gate = slot.gate.clone().lock_owned().await;
-        if self.require_removing(preparation, command).await.is_err() {
-            return removal_unknown("workspace_removal_marker_changed");
-        }
-        if Instant::now() >= deadline {
-            return removal_unknown("workspace_remove_deadline");
-        }
-        let result = self
-            .run_owned(
-                slot,
-                mutator,
-                deadline,
-                gate,
-                WorkspaceProcessContext::new(preparation, &command.id, "workspace_remove", None),
-            )
-            .await;
-        if !result.quiescent {
-            return removal_unknown(result.code);
-        }
-        // A nonzero Git exit never proves no destructive effect. Only exact
-        // absence and retained-branch readback can establish successful removal.
-        match timeout_at(deadline, git.inspect_removal(preparation)).await {
-            Ok(removed @ WorkspaceRemovalOutcome::Removed { .. }) => removed,
-            _ => removal_unknown("workspace_removal_unconfirmed"),
         }
     }
 
@@ -682,21 +762,15 @@ impl WorkspaceManager {
         for preparation in preparations {
             let slot = self.slot(&preparation);
             let _operation = slot.operation.lock().await;
-            if slot.active.lock_recover().is_some() {
+            if !workspace_git_effect_quiescent(&slot) {
                 continue;
             }
-            let quiescent = match *slot.last.lock_recover() {
-                Some(result) => result.quiescent,
-                // recover runs after exclusive daemon acquisition; prior Windows
-                // kill-on-close Jobs cannot outlive their owning daemon.
-                None => cfg!(windows),
-            };
             let stage = preparation
                 .outcome
                 .as_ref()
                 .and_then(|value| value.get("stage"))
                 .and_then(Value::as_str);
-            if preparation.phase == WorkspacePhase::Unknown && quiescent {
+            if preparation.phase == WorkspacePhase::Unknown {
                 match stage {
                     Some("creation") if !cancelled(&preparation) => {
                         let reuse = preparation
@@ -1242,6 +1316,25 @@ impl WorkspaceManager {
     }
 }
 
+async fn wait_for_git_write_progress(progress: &mut watch::Receiver<u64>, observed: u64) {
+    if *progress.borrow_and_update() == observed {
+        let _ = progress.changed().await;
+    }
+}
+
+fn workspace_git_effect_quiescent(slot: &Slot) -> bool {
+    if slot.active.lock_recover().is_some() {
+        return false;
+    }
+    // `last` records the owned process-family result. After exclusive daemon
+    // acquisition, Windows Job close proves a prior child family empty; Unix
+    // cannot infer quiescence when no birth-checked result was retained.
+    match *slot.last.lock_recover() {
+        Some(result) => result.quiescent,
+        None => cfg!(windows),
+    }
+}
+
 async fn drain_bounded<R: AsyncRead + Unpin>(mut stream: R) -> Result<()> {
     let mut buffer = [0_u8; 4096];
     let mut total = 0_usize;
@@ -1440,5 +1533,284 @@ fn safe_removal(outcome: WorkspaceRemovalOutcome) -> WorkspaceRemovalOutcome {
             message: "workspace removal was refused before mutation spawn".to_owned(),
         },
         WorkspaceRemovalOutcome::Unknown { .. } => removal_unknown("workspace_removal_unknown"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command as GitCommand;
+
+    struct TestRoot(PathBuf);
+
+    impl TestRoot {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "eliot-workspace-git-fence-{}",
+                Ulid::new().to_string().to_ascii_lowercase()
+            ));
+            fs::create_dir_all(&path).expect("create workspace Git fixture root");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn git(checkout: &Path, args: &[&str]) -> String {
+        let output = GitCommand::new("git")
+            .arg("-C")
+            .arg(checkout)
+            .args(args)
+            .output()
+            .expect("run local Git fixture command");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("Git fixture output is UTF-8")
+            .trim()
+            .to_owned()
+    }
+
+    async fn admit_workspace(
+        store: &StoreHandle,
+        repo_path: &str,
+        worktrees: &Path,
+        label: &str,
+    ) -> (String, String, String, String, WorkspacePreparation) {
+        let id = Ulid::new().to_string();
+        let suffix = Ulid::new().to_string().to_ascii_lowercase();
+        let branch = format!("codex/{label}-{suffix}");
+        let requested_worktree_path = worktrees
+            .join(format!("{label}-{suffix}"))
+            .to_string_lossy()
+            .into_owned();
+        let frozen = WorkspaceGit::new()
+            .expect("resolve installed Git")
+            .freeze(repo_path, &branch, Some("HEAD"), &requested_worktree_path)
+            .await
+            .expect("freeze canonical workspace identity");
+        let input = WorkspacePreparationInput {
+            project: frozen.repo_path.clone(),
+            repo_path: frozen.repo_path.clone(),
+            repo_common_dir: frozen.repo_common_dir.clone(),
+            requested_branch: frozen.requested_branch.clone(),
+            base_ref: Some("HEAD".to_owned()),
+            base_oid: frozen.base_oid.clone(),
+            worktree_path: frozen.worktree_path.clone(),
+            frozen_setup: Vec::new(),
+        };
+        let request = SubmitCommand {
+            id: id.clone(),
+            target: None,
+            verb: "launch".to_owned(),
+            args: json!({
+                "project": frozen.repo_path.clone(),
+                "workspace": frozen.repo_path.clone(),
+                "worktree": frozen.requested_branch.clone(),
+                "base": "HEAD",
+                "harness": "fake",
+                "profile": "fake",
+                "profile_snapshot": {},
+            }),
+            expected_generation: Some(0),
+            expected_turn_id: None,
+            request_id: None,
+            probe: false,
+        };
+        let mut store = store.lock().await;
+        let admission = store
+            .submit_with_workspace("owner", request, input, now_ms())
+            .expect("admit managed workspace launch");
+        let agent = admission.command.target.expect("launch Agent target");
+        let preparation = store
+            .get_workspace(&agent)
+            .expect("read prepared workspace")
+            .expect("workspace row");
+        (
+            id,
+            agent,
+            frozen.worktree_path,
+            frozen.requested_branch,
+            preparation,
+        )
+    }
+
+    #[tokio::test]
+    async fn workspace_git_fence_defers_before_spawn_and_never_replays_may_have_begun() {
+        let root = TestRoot::new();
+        let checkout = root.0.join("checkout");
+        fs::create_dir_all(&checkout).expect("create local Git checkout");
+        git(&checkout, &["init", "--quiet", "--initial-branch=main"]);
+        git(&checkout, &["config", "user.name", "Workspace Fence Test"]);
+        git(
+            &checkout,
+            &["config", "user.email", "workspace-fence@example.invalid"],
+        );
+        git(
+            &checkout,
+            &["commit", "--quiet", "--allow-empty", "-m", "base"],
+        );
+        let checkout_input = checkout.to_string_lossy().into_owned();
+        let (repo_path, _) = WorkspaceGit::new()
+            .expect("resolve installed Git")
+            .repository_identity(&checkout_input)
+            .await
+            .expect("read repository identity");
+        let worktrees = root.0.join("worktrees");
+        fs::create_dir_all(&worktrees).expect("create worktree parent");
+
+        let store = Arc::new(AsyncMutex::new(
+            eliot_store::Store::open(Path::new(":memory:")).expect("open test Store"),
+        ));
+        let bus = Bus::new(32);
+        let secrets: SecretSet = Arc::new(Mutex::new(HashSet::new()));
+        let (progress, _progress_rx) = watch::channel(0_u64);
+        let monitoring = Monitoring::new(store.clone(), bus.clone(), secrets.clone());
+        let manager = WorkspaceManager::new(
+            root.0.join("data"),
+            store.clone(),
+            bus,
+            secrets,
+            progress,
+            monitoring,
+        );
+
+        let (blocker_id, _, _, _, blocker) =
+            admit_workspace(&store, &repo_path, &worktrees, "blocker").await;
+        let (deferred_id, deferred_agent, deferred_path, deferred_branch, _) =
+            admit_workspace(&store, &repo_path, &worktrees, "deferred").await;
+        let blocker_reservation = store
+            .lock()
+            .await
+            .begin_workspace_git_effect(&blocker_id, &blocker, now_ms())
+            .expect("reserve first repository writer");
+        assert_eq!(blocker_reservation, WorkspaceGitReservation::Reserved);
+
+        let (deferred_tx, deferred_rx) = tokio::sync::oneshot::channel();
+        *manager.inner.deferred_git_effect.lock_recover() = Some(deferred_tx);
+        let worker_manager = manager.clone();
+        let worker_id = deferred_id.clone();
+        let mut worker = tokio::spawn(async move { worker_manager.prepare(&worker_id).await });
+        let deferred_signal = tokio::time::timeout(Duration::from_secs(15), deferred_rx).await;
+        let observed_deferred = matches!(deferred_signal, Ok(Ok(())));
+        let deferred_was_pending = !worker.is_finished();
+        let deferred_worktree_absent = !Path::new(&deferred_path).exists();
+        let deferred_branch_absent =
+            git(&checkout, &["branch", "--list", &deferred_branch]).is_empty();
+        let deferred_marker_false = {
+            let store = store.lock().await;
+            let command = store
+                .get_command(&deferred_id)
+                .expect("read deferred launch")
+                .expect("deferred command");
+            let workspace = store
+                .get_workspace(&deferred_agent)
+                .expect("read deferred workspace")
+                .expect("deferred workspace row");
+            command.state == CommandState::Accepted
+                && workspace
+                    .outcome
+                    .as_ref()
+                    .and_then(|outcome| outcome["native_git_write_dispatched"].as_bool())
+                    == Some(false)
+        };
+
+        let release = {
+            let mut store = store.lock().await;
+            store
+                .settle_workspace_creation(
+                    &blocker_id,
+                    blocker.target_generation,
+                    WorkspaceCreationOutcome::Failed {
+                        code: "fixture_no_git_effect".to_owned(),
+                        message: "fixture released its reservation before spawn".to_owned(),
+                    },
+                    now_ms(),
+                )
+                .expect("release reserved repository writer")
+        };
+        manager.publish(&release.events);
+        let deferred_result = tokio::time::timeout(Duration::from_secs(60), &mut worker)
+            .await
+            .expect("deferred workspace resumes after repository release")
+            .expect("workspace manager task");
+
+        assert!(
+            observed_deferred,
+            "manager did not take the Deferred branch"
+        );
+        assert!(
+            deferred_was_pending,
+            "Deferred settled or returned to Router"
+        );
+        assert!(
+            deferred_worktree_absent,
+            "Deferred spawned a Git worktree mutation"
+        );
+        assert!(deferred_branch_absent, "Deferred created a local branch");
+        assert!(
+            deferred_marker_false,
+            "Deferred marked a possible Git write"
+        );
+        deferred_result.expect("workspace create after fence release");
+        assert!(Path::new(&deferred_path).exists());
+        assert!(
+            git(&checkout, &["branch", "--list", &deferred_branch]).ends_with(&deferred_branch),
+            "the branch is created after the fence releases"
+        );
+        let ready = store
+            .lock()
+            .await
+            .get_workspace(&deferred_agent)
+            .expect("read created workspace")
+            .expect("created workspace row");
+        assert_eq!(ready.phase, WorkspacePhase::Ready);
+
+        let (
+            may_have_begun_id,
+            may_have_begun_agent,
+            may_have_begun_path,
+            may_have_begun_branch,
+            may_have_begun,
+        ) = admit_workspace(&store, &repo_path, &worktrees, "may-have-begun").await;
+        let reservation = store
+            .lock()
+            .await
+            .begin_workspace_git_effect(&may_have_begun_id, &may_have_begun, now_ms())
+            .expect("reserve workspace mutator before simulated restart");
+        assert_eq!(reservation, WorkspaceGitReservation::Reserved);
+        assert!(manager.prepare(&may_have_begun_id).await.is_err());
+        assert!(
+            !Path::new(&may_have_begun_path).exists(),
+            "MayHaveBegun must not rerun git worktree add"
+        );
+        assert!(
+            git(&checkout, &["branch", "--list", &may_have_begun_branch]).is_empty(),
+            "MayHaveBegun must not create a local branch"
+        );
+        let uncertain = store
+            .lock()
+            .await
+            .get_workspace(&may_have_begun_agent)
+            .expect("read MayHaveBegun workspace")
+            .expect("MayHaveBegun workspace row");
+        assert_eq!(
+            uncertain
+                .outcome
+                .as_ref()
+                .and_then(|outcome| outcome["native_git_write_dispatched"].as_bool()),
+            Some(true)
+        );
+        assert!(matches!(
+            uncertain.phase,
+            WorkspacePhase::Unknown | WorkspacePhase::Failed
+        ));
     }
 }

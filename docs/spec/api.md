@@ -139,9 +139,10 @@ unknown commands remain unknown. Agent list observations appear only when reques
 Absent source cursors and sequence/acknowledgement values remain null.
 
 `project.list` and `project.get` are owner-only readbacks of the owner-registered
-canonical checkout, repository common directory, and explicit profile/action allowlists.
-They do not create or modify registrations. Their project values use the Core
-`ProjectRegistrationView` linked above.
+canonical checkout, repository common directory, explicit profile/action allowlists and
+optional Git fetch approval. They do not create or modify registrations. Their project
+values use Core [`ProjectRegistrationView`](../../crates/eliot-core/src/api/agent_views.rs),
+whose optional `git` value uses [`ProjectGitView` and `GitCredentialHelper`](../../crates/eliot-core/src/api/agent_views.rs).
 
 `rule.get` uses `RuleGetRequest`/`RuleStateView`, is owner-only, and reads the selected
 global or project rule's current cursor and any retiring definition's cursor/boundary. An
@@ -245,6 +246,16 @@ verb's native effect. A generation-changing verb can establish or update its com
 generation at dispatch, so the response generation is not universally equal to
 `expected_generation`. Interactive calls may omit expectations; delayed automation
 supplies its captured expectations.
+
+For `git.fetch`, mutation-ID binding uses Core
+[`GitFetchDefinitionArgs::binding_args(timeout_ms)`](../../crates/eliot-core/src/api/git.rs#L43)
+or [`FrozenGitFetch::binding_args()`](../../crates/eliot-core/src/api/git.rs#L114): timeout
+is normalized to positive milliseconds, so omission and equivalent spellings bind the same
+caller intent. The first-admission Core `FrozenGitFetch` snapshot is retained and never
+rebinds that caller ID. Store's read-only
+[`replay_git_fetch_submission`](../../crates/eliot-store/src/lib.rs#L679) runs before current
+gates or native I/O; same-ID concurrent winner/error replay returns the retained command
+result without refreezing or fetching again.
 
 The current request does not accept `selector`; unknown request fields are `invalid`.
 The optional `probe` intent defaults to false; false is omitted on the wire, and true is

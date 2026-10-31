@@ -40,6 +40,7 @@ const MAX_EVENT_BYTES: usize = 64 * 1024;
 const MAX_INPUT_BYTES: usize = 512 * 1024;
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const RETRY_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
+const CURRENT_SCHEMA_VERSION: i64 = 16;
 const COMMAND_METHOD: &str = "command.submit";
 const INITIAL_SOURCE: &str = "stream";
 const PROCESS_SOURCE: &str = "os";
@@ -82,6 +83,13 @@ pub struct Admission {
 pub struct Change<T> {
     pub value: T,
     pub events: Vec<Event>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceGitReservation {
+    Reserved,
+    Deferred,
+    MayHaveBegun,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -141,7 +149,7 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(sql_error)?;
-        if current > 15 {
+        if current > CURRENT_SCHEMA_VERSION {
             return Err(Error::new(
                 "unsupported",
                 format!("Store schema version {current} is newer than this binary"),
@@ -574,6 +582,23 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
+        if current < CURRENT_SCHEMA_VERSION {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE INDEX commands_git_fetch_open_repo ON commands(
+                     json_extract(args, '$.common_dir')
+                 ) WHERE verb = 'git.fetch'
+                     AND state IN ('accepted','queued','dispatched','unknown');
+                 ALTER TABLE project_registrations ADD COLUMN git TEXT;
+                 CREATE INDEX workspaces_git_repo ON workspaces(repo_common_dir);
+                 INSERT INTO schema_migrations(version) VALUES (16);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
         Ok(())
     }
 
@@ -627,6 +652,81 @@ impl Store {
         result
     }
 
+    /// Resolve a targetless Git fetch retry using only its caller-authored
+    /// selectors and normalized timeout. Frozen remote/OID snapshots are not
+    /// consulted until a genuinely new command is prepared.
+    pub fn replay_git_fetch_submission(
+        &self,
+        principal: &str,
+        request: &SubmitCommand,
+        timeout_ms: i64,
+    ) -> Result<Option<Admission>> {
+        require_nonempty(principal, "principal")?;
+        request.validate()?;
+        validate_ulid(&request.id)?;
+        if request.verb != "git.fetch"
+            || request.target.is_some()
+            || request.expected_generation.is_some()
+            || request.expected_turn_id.is_some()
+            || request.request_id.is_some()
+            || request.probe
+        {
+            return Err(Error::new(
+                "invalid",
+                "Git fetch replay lookup requires the exact targetless command shape",
+            ));
+        }
+        let definition =
+            serde_json::from_value::<core::api::GitFetchDefinitionArgs>(request.args.clone())
+                .map_err(|_| Error::new("invalid", "git.fetch definition args are malformed"))?;
+        definition.validate()?;
+        if encode_json(request)?.len() > MAX_FRAME_BYTES {
+            return Err(Error::new(
+                "frame_too_large",
+                "command request exceeds 1 MiB",
+            ));
+        }
+        let semantic_args = definition.binding_args(timeout_ms)?;
+        let semantic_payload = command_semantic_payload(request, semantic_args)?;
+        let payload_digest = canonical::digest(&semantic_payload)?;
+        if let Some((old_principal, old_method, old_digest)) =
+            command_binding(&self.connection, &request.id)?
+        {
+            if old_principal != principal
+                || old_method != COMMAND_METHOD
+                || old_digest != payload_digest
+            {
+                return Err(Error::new(
+                    "id_conflict",
+                    "command id is already bound to another principal, method, or payload",
+                ));
+            }
+            let command = load_command(&self.connection, &request.id)?.ok_or_else(|| {
+                Error::new("internal", "command binding exists without its command row")
+            })?;
+            if command.verb != "git.fetch" || command.target.is_some() {
+                return Err(Error::new(
+                    "source_integrity",
+                    "retained Git fetch binding has another command shape",
+                ));
+            }
+            let linked_command = load_linked_command(&self.connection, &request.id)?;
+            return Ok(Some(Admission {
+                command,
+                linked_command,
+                events: Vec::new(),
+                is_new: false,
+            }));
+        }
+        if write_exists(&self.connection, &request.id)? {
+            return Err(Error::new(
+                "id_conflict",
+                "command id is already bound to another write",
+            ));
+        }
+        Ok(None)
+    }
+
     fn submit_inner(
         &mut self,
         principal: &str,
@@ -642,6 +742,29 @@ impl Store {
         commit_transaction(tx, &self.write_faulted)?;
         Ok(admission)
     }
+}
+
+fn command_semantic_payload(request: &SubmitCommand, args: Value) -> Result<Value> {
+    let mut payload = json!({
+        "target": request.target,
+        "verb": request.verb,
+        "args": args,
+        "expected_generation": request.expected_generation,
+        "expected_turn_id": request.expected_turn_id,
+    });
+    if request.probe {
+        payload["probe"] = Value::Bool(true);
+    }
+    if let Some(request_id) = request.request_id.as_deref() {
+        payload["request_id"] = Value::String(request_id.to_owned());
+    }
+    if encode_json(&payload)?.len() > MAX_FRAME_BYTES {
+        return Err(Error::new(
+            "frame_too_large",
+            "command semantic request exceeds its bound",
+        ));
+    }
+    Ok(payload)
 }
 
 fn submit_tx(
@@ -677,38 +800,20 @@ fn submit_tx(
         ));
     }
     validate_ulid(&request.id)?;
-    let mut semantic_args = request.args.clone();
+    let mut semantic_args = if request.verb == "git.fetch" {
+        serde_json::from_value::<core::api::FrozenGitFetch>(request.args.clone())
+            .map_err(|_| Error::new("invalid", "git.fetch args must be a frozen intent"))?
+            .binding_args()?
+    } else {
+        request.args.clone()
+    };
     if request.verb == "attach" {
         semantic_args
             .as_object_mut()
             .ok_or_else(|| Error::new("invalid", "attach args must be an object"))?
             .remove("profile_snapshot");
     }
-    let mut semantic_payload = json!({
-        "target": request.target,
-        "verb": request.verb,
-        "args": semantic_args,
-        "expected_generation": request.expected_generation,
-        "expected_turn_id": request.expected_turn_id,
-    });
-    if request.probe {
-        semantic_payload["probe"] = Value::Bool(true);
-    }
-    if let Some(request_id) = request.request_id.as_deref() {
-        let object = semantic_payload
-            .as_object_mut()
-            .ok_or_else(|| Error::new("internal", "command semantic payload is not an object"))?;
-        object.insert(
-            "request_id".to_owned(),
-            Value::String(request_id.to_owned()),
-        );
-    }
-    if encode_json(&semantic_payload)?.len() > MAX_FRAME_BYTES {
-        return Err(Error::new(
-            "frame_too_large",
-            "command semantic request exceeds its bound",
-        ));
-    }
+    let semantic_payload = command_semantic_payload(&request, semantic_args)?;
     let payload_digest = canonical::digest(&semantic_payload)?;
     if let Some((old_principal, old_method, old_digest)) = command_binding(tx, &request.id)? {
         if old_principal != principal
@@ -801,6 +906,28 @@ fn submit_tx(
                 tx,
                 &CommandInsert::targetless_admitted(principal, &request, &payload_digest, now),
                 json!({"command_id": request.id, "verb": "run"}),
+            )?);
+            None
+        }
+        "git.fetch" => {
+            if request.target.is_some()
+                || request.expected_generation.is_some()
+                || request.expected_turn_id.is_some()
+                || request.request_id.is_some()
+                || request.probe
+                || preparation.is_some()
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "git.fetch is a targetless command without Agent bindings",
+                ));
+            }
+            let frozen = projects::decode_frozen_git_fetch(&request.args)?;
+            projects::validate_git_fetch_intent_tx(tx, principal, &frozen)?;
+            events.push(admit_command(
+                tx,
+                &CommandInsert::targetless_admitted(principal, &request, &payload_digest, now),
+                json!({"command_id": request.id, "verb": "git.fetch"}),
             )?);
             None
         }
@@ -1878,6 +2005,78 @@ impl Store {
                 events,
             });
         }
+        if command.command.verb == "git.fetch" {
+            if command.target.is_some()
+                || command.command.generation.is_some()
+                || command.command.expected_generation.is_some()
+                || command.command.turn_id.is_some()
+                || command.expected_turn_id.is_some()
+                || command.command.request_id.is_some()
+                || command.command.probe
+            {
+                return Err(Error::new(
+                    "source_integrity",
+                    "stored git.fetch command has an Agent binding",
+                ));
+            }
+            let frozen = projects::decode_frozen_git_fetch(&command.command.args)?;
+            projects::validate_git_fetch_intent_tx(&tx, &command.command.principal, &frozen)?;
+            projects::validate_project_command_dispatch_tx(&tx, &command)?;
+            match rules::gate_rule_action_dispatch_tx(&tx, id, now, &mut events)? {
+                rules::RuleActionDispatchGate::Ready => {}
+                rules::RuleActionDispatchGate::Held | rules::RuleActionDispatchGate::Cancelled => {
+                    let command = load_command(&tx, id)?
+                        .ok_or_else(|| Error::new("internal", "gated command disappeared"))?;
+                    commit_transaction(tx, &self.write_faulted)?;
+                    return Ok(Change {
+                        value: command,
+                        events,
+                    });
+                }
+            }
+            if repo_git_write_blocked_tx(&tx, id, &frozen.common_dir)? {
+                if command.state == CommandState::Accepted {
+                    update_command_state(&tx, id, CommandState::Queued, None, None, now)?;
+                    events.push(insert_daemon_command_event(
+                        &tx,
+                        now,
+                        "command.queued",
+                        None,
+                        None,
+                        id,
+                        json!({
+                            "command_id": id,
+                            "verb": "git.fetch",
+                            "reason": "same_repository_write_pending",
+                        }),
+                    )?);
+                }
+                let command = load_command(&tx, id)?
+                    .ok_or_else(|| Error::new("internal", "queued git.fetch disappeared"))?;
+                commit_transaction(tx, &self.write_faulted)?;
+                return Ok(Change {
+                    value: command,
+                    events,
+                });
+            }
+            update_command_state(&tx, id, CommandState::Dispatched, None, None, now)?;
+            events.push(insert_daemon_command_event(
+                &tx,
+                now,
+                "command.dispatched",
+                None,
+                None,
+                id,
+                json!({"command_id": id, "verb": "git.fetch"}),
+            )?);
+            let command = load_command(&tx, id)?
+                .ok_or_else(|| Error::new("internal", "dispatched git.fetch disappeared"))?;
+            commit_transaction(tx, &self.write_faulted)?;
+            return Ok(Change {
+                value: command,
+                events,
+            });
+        }
         let agent_num = command.target.ok_or_else(|| {
             Error::new("bad_state", "L1 dispatch requires a concrete Agent target")
         })?;
@@ -2130,10 +2329,36 @@ impl Store {
                         "worktree removal binding changed",
                     ));
                 }
+                if repo_git_write_blocked_tx(&tx, id, &workspace.repo_common_dir)? {
+                    if command.state == CommandState::Accepted {
+                        update_command_state(&tx, id, CommandState::Queued, None, None, now)?;
+                        events.push(insert_daemon_command_event(
+                            &tx,
+                            now,
+                            "command.queued",
+                            Some(agent_num),
+                            Some(agent.generation),
+                            id,
+                            json!({
+                                "command_id": id,
+                                "verb": "worktree.remove",
+                                "reason": "same_repository_write_pending",
+                            }),
+                        )?);
+                    }
+                    let queued = load_command(&tx, id)?
+                        .ok_or_else(|| Error::new("internal", "queued removal disappeared"))?;
+                    commit_transaction(tx, &self.write_faulted)?;
+                    return Ok(Change {
+                        value: queued,
+                        events,
+                    });
+                }
                 let old = workspace.clone();
                 workspace.phase = WorkspacePhase::Removing;
                 workspace.outcome = Some(
-                    json!({"stage": "removal", "command_id": id, "previous_phase": old.phase}),
+                    json!({"stage": "removal", "command_id": id, "previous_phase": old.phase,
+                        "native_git_write_dispatched": false}),
                 );
                 workspace.updated_at = now;
                 persist_workspace(&tx, &old, &workspace)?;
@@ -2442,6 +2667,18 @@ impl Store {
             .map_err(sql_error)?;
         let mut record = load_command_record(&tx, id)?
             .ok_or_else(|| Error::new("not_found", format!("command {id} was not found")))?;
+        if record.command.verb == "git.fetch" && state == CommandState::Applied {
+            let frozen = projects::decode_frozen_git_fetch(&record.command.args)?;
+            let value = outcome.as_ref().ok_or_else(|| {
+                Error::new(
+                    "invalid",
+                    "applied git.fetch requires verified ref readback",
+                )
+            })?;
+            let outcome = serde_json::from_value::<core::api::GitFetchOutcome>(value.clone())
+                .map_err(|_| Error::new("invalid", "applied git.fetch readback is malformed"))?;
+            outcome.validate_for(&frozen)?;
+        }
         if matches!(record.command.verb.as_str(), "attach" | "detach")
             && state == CommandState::Applied
         {
@@ -5107,6 +5344,12 @@ fn workspace_event(
     )
 }
 
+fn preserve_native_git_write_marker(previous: Option<&Value>, outcome: &mut Value) {
+    if let Some(marker) = previous.and_then(|value| value.get("native_git_write_dispatched")) {
+        outcome["native_git_write_dispatched"] = marker.clone();
+    }
+}
+
 fn admit_workspace_preparation(
     tx: &Transaction<'_>,
     request: &SubmitCommand,
@@ -5144,7 +5387,11 @@ fn admit_workspace_preparation(
             frozen_setup: input.frozen_setup.clone(),
             phase: WorkspacePhase::Creating,
             setup_index: 0,
-            outcome: Some(json!({"stage": "creation", "reuse": false})),
+            outcome: Some(json!({
+                "stage": "creation",
+                "reuse": false,
+                "native_git_write_dispatched": false,
+            })),
             updated_at: now,
         };
         if encode_json(&workspace)?.len() > MAX_PAGE_BYTES {
@@ -5204,6 +5451,7 @@ fn admit_workspace_preparation(
         workspace.outcome = Some(json!({
             "stage": "creation",
             "reuse": true,
+            "native_git_write_dispatched": false,
             "resume_previous": resume_previous,
         }));
         workspace.updated_at = now;
@@ -5429,6 +5677,165 @@ impl Store {
             .map_err(sql_error)?;
         enforce_page_bytes(&mut workspaces)?;
         Ok(workspaces)
+    }
+
+    /// Reserve one native managed-worktree Git mutator after read-only preflight.
+    /// The durable outcome marker is committed before the caller may spawn Git.
+    pub fn begin_workspace_git_effect(
+        &mut self,
+        command_id: &str,
+        expected: &WorkspacePreparation,
+        now: i64,
+    ) -> Result<WorkspaceGitReservation> {
+        self.ensure_writer_healthy()?;
+        let result = self.begin_workspace_git_effect_inner(command_id, expected, now);
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    fn begin_workspace_git_effect_inner(
+        &mut self,
+        command_id: &str,
+        expected: &WorkspacePreparation,
+        now: i64,
+    ) -> Result<WorkspaceGitReservation> {
+        require_nonempty(command_id, "command_id")?;
+        validate_ulid(command_id)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let agent_num = parse_agent_id(&expected.agent)?;
+        let workspace = load_workspace(&tx, agent_num)?
+            .ok_or_else(|| Error::new("not_found", "workspace preparation was not found"))?;
+        if workspace != *expected {
+            return Err(Error::new(
+                "bad_state",
+                "workspace preparation changed before native Git reservation",
+            ));
+        }
+        let command = load_command_record(&tx, command_id)?
+            .ok_or_else(|| Error::new("not_found", "workspace Git command was not found"))?;
+        if command.target != Some(agent_num) {
+            return Err(Error::new(
+                "source_integrity",
+                "workspace Git command targets another Agent",
+            ));
+        }
+        let outcome = workspace.outcome.as_ref();
+        let stage = outcome
+            .and_then(|value| value.get("stage"))
+            .and_then(Value::as_str);
+        let reuse = outcome
+            .and_then(|value| value.get("reuse"))
+            .and_then(Value::as_bool)
+            == Some(true);
+        let resume_previous = outcome
+            .and_then(|value| value.get("resume_previous"))
+            .is_some();
+        if reuse && resume_previous {
+            return Err(Error::new(
+                "bad_state",
+                "retained Resume readback does not start a native Git mutation",
+            ));
+        }
+        let creation_identity = stage == Some("creation")
+            && workspace.start_command_id == command_id
+            && command.command.verb == "launch"
+            && !reuse;
+        let removal_identity = stage == Some("removal")
+            && outcome
+                .and_then(|value| value.get("command_id"))
+                .and_then(Value::as_str)
+                == Some(command_id)
+            && command.command.verb == "worktree.remove";
+        if !creation_identity && !removal_identity {
+            return Err(Error::new(
+                "bad_state",
+                "native Git reservation requires its exact workspace create or remove",
+            ));
+        }
+
+        if removal_identity {
+            let agent = load_agent_by_num(&tx, agent_num)?
+                .ok_or_else(|| Error::new("not_found", "workspace owner was not found"))?;
+            if command.command.generation != Some(agent.generation)
+                || workspace.target_generation != agent.generation
+                || !agent.is_terminal()
+                || agent.active_turn.is_some()
+                || command.expected_turn_id.is_some()
+                || command.command.request_id.is_some()
+            {
+                return Err(Error::new(
+                    "stale_generation",
+                    "worktree removal no longer targets its terminal workspace generation",
+                ));
+            }
+        } else {
+            if preparation_command(&tx, &workspace)?.0.command.id != command_id {
+                return Err(Error::new(
+                    "source_integrity",
+                    "workspace start command changed before native Git reservation",
+                ));
+            }
+        }
+
+        let native_phase = matches!(
+            workspace.phase,
+            WorkspacePhase::Creating | WorkspacePhase::Removing | WorkspacePhase::Unknown
+        );
+        match outcome
+            .and_then(|value| value.get("native_git_write_dispatched"))
+            .and_then(Value::as_bool)
+        {
+            Some(true) if native_phase => {
+                commit_transaction(tx, &self.write_faulted)?;
+                return Ok(WorkspaceGitReservation::MayHaveBegun);
+            }
+            None if native_phase => {
+                // Old in-flight rows have no explicit no-dispatch proof.
+                commit_transaction(tx, &self.write_faulted)?;
+                return Ok(WorkspaceGitReservation::MayHaveBegun);
+            }
+            Some(false) => {}
+            Some(true) | None => {
+                return Err(Error::new(
+                    "bad_state",
+                    "workspace Git marker is outside a native creation/removal phase",
+                ));
+            }
+        }
+
+        let eligible = if creation_identity {
+            workspace.phase == WorkspacePhase::Creating
+                && matches!(command.state, CommandState::Accepted | CommandState::Queued)
+        } else {
+            workspace.phase == WorkspacePhase::Removing && command.state == CommandState::Dispatched
+        };
+        if !eligible {
+            return Err(Error::new(
+                "bad_state",
+                "workspace Git command is not at its native mutation boundary",
+            ));
+        }
+        projects::validate_project_command_dispatch_tx(&tx, &command)?;
+        if repo_git_write_blocked_tx(&tx, command_id, &workspace.repo_common_dir)? {
+            commit_transaction(tx, &self.write_faulted)?;
+            return Ok(WorkspaceGitReservation::Deferred);
+        }
+
+        let old = workspace.clone();
+        let mut workspace = workspace;
+        let marker = workspace
+            .outcome
+            .as_mut()
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| Error::new("source_integrity", "workspace outcome is not an object"))?;
+        marker.insert("native_git_write_dispatched".to_owned(), Value::Bool(true));
+        workspace.updated_at = now;
+        persist_workspace(&tx, &old, &workspace)?;
+        commit_transaction(tx, &self.write_faulted)?;
+        Ok(WorkspaceGitReservation::Reserved)
     }
 
     pub fn settle_workspace_creation(
@@ -5715,6 +6122,7 @@ impl Store {
                     "previous_phase": workspace.outcome.as_ref().and_then(|value| value.get("previous_phase"))})
             }
         };
+        preserve_native_git_write_marker(old.outcome.as_ref(), &mut marker);
         if reuse
             && matches!(
                 &action,
@@ -6871,6 +7279,91 @@ fn command_binding(connection: &Connection, id: &str) -> Result<Option<(String, 
         )
         .optional()
         .map_err(sql_error)
+}
+
+fn repo_git_write_blocked_tx(
+    tx: &Transaction<'_>,
+    command_id: &str,
+    common_dir: &str,
+) -> Result<bool> {
+    let current_rowid: i64 = tx
+        .query_row(
+            "SELECT rowid FROM commands WHERE id = ?1",
+            [command_id],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    let fetch_pending = tx
+        .query_row(
+            "SELECT EXISTS(
+             SELECT 1
+             FROM commands prior
+             WHERE prior.verb = 'git.fetch'
+               AND prior.id <> ?1
+               AND prior.state IN ('accepted','queued','dispatched','unknown')
+               AND json_extract(prior.args, '$.common_dir') = ?2
+               AND (prior.state IN ('dispatched','unknown') OR prior.rowid < ?3)
+         )",
+            params![command_id, common_dir, current_rowid],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if fetch_pending {
+        return Ok(true);
+    }
+    tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM workspaces workspace
+             JOIN commands prior ON (
+                 (prior.verb = 'launch' AND prior.id = workspace.start_command_id)
+                 OR (prior.verb = 'worktree.remove' AND prior.target = workspace.agent)
+             )
+             WHERE prior.id <> ?1
+               AND workspace.repo_common_dir = ?2
+               AND (prior.verb <> 'worktree.remove'
+                    OR json_extract(prior.args, '$.target_generation') = workspace.target_generation)
+               AND (
+                   (json_extract(workspace.outcome, '$.native_git_write_dispatched') = 1
+                    AND workspace.phase IN ('creating','removing','unknown')
+                    AND ((prior.verb = 'launch'
+                          AND json_extract(workspace.outcome, '$.stage') = 'creation'
+                          AND NOT (COALESCE(json_extract(workspace.outcome, '$.reuse'), 0) = 1
+                                   AND json_type(workspace.outcome, '$.resume_previous') IS NOT NULL))
+                         OR (prior.verb = 'worktree.remove'
+                             AND json_extract(workspace.outcome, '$.stage') = 'removal'
+                             AND json_extract(workspace.outcome, '$.command_id') = prior.id)))
+                   OR (json_type(workspace.outcome, '$.native_git_write_dispatched') IS NULL
+                       AND workspace.phase IN ('creating','removing','unknown')
+                       AND ((prior.verb = 'launch'
+                             AND json_extract(workspace.outcome, '$.stage') = 'creation'
+                             AND NOT (COALESCE(json_extract(workspace.outcome, '$.reuse'), 0) = 1
+                                      AND json_type(workspace.outcome, '$.resume_previous') IS NOT NULL))
+                            OR (prior.verb = 'worktree.remove'
+                                AND workspace.phase IN ('removing','unknown')
+                                AND json_extract(workspace.outcome, '$.stage') = 'removal'
+                                AND json_extract(workspace.outcome, '$.command_id') = prior.id)))
+                   OR (prior.rowid < ?3
+                       AND prior.state IN ('accepted','queued','dispatched')
+                       AND ((prior.verb = 'launch'
+                             AND json_extract(workspace.outcome, '$.native_git_write_dispatched') = 0
+                             AND workspace.phase = 'creating'
+                             AND json_extract(workspace.outcome, '$.stage') = 'creation'
+                             AND json_extract(workspace.outcome, '$.reuse') IS NOT 1)
+                            OR (prior.verb = 'worktree.remove'
+                                AND ((prior.state IN ('accepted','queued')
+                                      AND workspace.phase IN ('ready','failed'))
+                                     OR (prior.state = 'dispatched'
+                                         AND json_extract(workspace.outcome, '$.native_git_write_dispatched') = 0
+                                         AND workspace.phase = 'removing'
+                                         AND json_extract(workspace.outcome, '$.stage') = 'removal'
+                                         AND json_extract(workspace.outcome, '$.command_id') = prior.id)))))
+               )
+         )",
+        params![command_id, common_dir, current_rowid],
+        |row| row.get(0),
+    )
+    .map_err(sql_error)
 }
 
 pub(crate) fn resume_parent_payload_matches(
@@ -9962,3 +10455,9 @@ mod tests;
 
 #[cfg(test)]
 mod timer_tests;
+
+#[cfg(test)]
+mod git_fetch_tests;
+
+#[cfg(test)]
+mod git_workspace_fence_tests;

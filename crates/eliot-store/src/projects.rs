@@ -11,6 +11,7 @@ pub struct ProjectRegistrationInput {
     pub id: String,
     pub checkout: String,
     pub repo_common_dir: String,
+    pub git: Option<core::api::ProjectGitView>,
     pub profiles: Vec<String>,
     pub actions: Vec<String>,
     pub interpreters: BTreeMap<String, core::api::ScriptInterpreter>,
@@ -214,6 +215,75 @@ pub(super) fn validate_project_resume_action_tx(
     Ok(Some(registration))
 }
 
+pub(super) fn decode_frozen_git_fetch(args: &Value) -> Result<core::api::FrozenGitFetch> {
+    let frozen = serde_json::from_value::<core::api::FrozenGitFetch>(args.clone())
+        .map_err(|_| Error::new("invalid", "git.fetch args must be a frozen intent"))?;
+    frozen.validate()?;
+    Ok(frozen)
+}
+
+pub(super) fn validate_git_fetch_intent_tx(
+    tx: &Transaction<'_>,
+    principal: &str,
+    frozen: &core::api::FrozenGitFetch,
+) -> Result<core::api::ProjectRegistrationView> {
+    frozen.validate()?;
+    let project_id = if principal == "owner" {
+        None
+    } else {
+        Some(
+            project_id_from_principal(principal)?
+                .ok_or_else(|| Error::new("not_allowed", "git.fetch principal is unauthorized"))?,
+        )
+    };
+    if project_id
+        .as_deref()
+        .is_some_and(|project_id| project_id != frozen.repository)
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "Project git.fetch repository must match its saved principal",
+        ));
+    }
+    let registration = load_project_registration(tx, &frozen.repository)?
+        .ok_or_else(|| Error::new("not_allowed", "git.fetch repository is not registered"))?
+        .view;
+    registration
+        .validate()
+        .map_err(|_| Error::new("source_integrity", "stored project registration is invalid"))?;
+    if registration.id != frozen.repository
+        || registration.revision != frozen.registration_revision
+        || registration.checkout != frozen.canonical_checkout
+        || registration.repo_common_dir != frozen.common_dir
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "git.fetch frozen registration binding is stale",
+        ));
+    }
+    let git = registration
+        .git
+        .as_ref()
+        .ok_or_else(|| Error::new("not_allowed", "repository has no Git fetch approval"))?;
+    if git.fetch_remotes.get(&frozen.remote) != Some(&frozen.endpoint) {
+        return Err(Error::new(
+            "not_allowed",
+            "git.fetch endpoint does not match the approved direct remote",
+        ));
+    }
+    let helper_approved = git.credential_helper == Some(core::api::GitCredentialHelper::Manager);
+    if helper_approved != frozen.credential_helper.is_some() {
+        return Err(Error::new(
+            "not_allowed",
+            "git.fetch helper receipt does not match the registered helper policy",
+        ));
+    }
+    if project_id.is_some() {
+        require_project_registration_action(&registration, "git.fetch")?;
+    }
+    Ok(registration)
+}
+
 pub(super) fn capture_project_command_binding_tx(
     tx: &Transaction<'_>,
     command: &CommandInsert<'_>,
@@ -242,9 +312,13 @@ pub(super) fn capture_project_command_binding_tx(
                 command.verb,
             )?
         }
+    } else if command.verb == "git.fetch" {
+        let frozen = decode_frozen_git_fetch(command.args)?;
+        validate_git_fetch_intent_tx(tx, command.principal, &frozen)?;
+        targetless_project_command_binding(registration.revision)
     } else if command.verb == "run" {
         require_project_registration_action(&registration, "run")?;
-        targetless_project_run_binding(registration.revision)
+        targetless_project_command_binding(registration.revision)
     } else {
         if !matches!(command.verb, "rule" | "timer.run" | "rule.catch_up") {
             return Err(Error::new(
@@ -252,7 +326,7 @@ pub(super) fn capture_project_command_binding_tx(
                 "project principals may only create rule and catch-up parents",
             ));
         }
-        targetless_project_run_binding(registration.revision)
+        targetless_project_command_binding(registration.revision)
     };
     encode_json(&binding).map(Some)
 }
@@ -322,9 +396,21 @@ pub(super) fn validate_project_command_dispatch_tx(
         }
         return Ok(());
     }
+    if command.target.is_none() && command.command.verb == "git.fetch" {
+        let frozen = decode_frozen_git_fetch(&command.command.args)?;
+        validate_git_fetch_intent_tx(tx, &command.command.principal, &frozen)?;
+        require_project_registration_action(&registration, "git.fetch")?;
+        if binding != targetless_project_command_binding(registration.revision) {
+            return Err(Error::new(
+                "not_allowed",
+                "Project git.fetch binding does not match its saved registration",
+            ));
+        }
+        return Ok(());
+    }
     if command.target.is_none() && command.command.verb == "run" {
         require_project_registration_action(&registration, "run")?;
-        if binding != targetless_project_run_binding(registration.revision) {
+        if binding != targetless_project_command_binding(registration.revision) {
             return Err(Error::new(
                 "not_allowed",
                 "project run binding does not match its saved registration",
@@ -435,7 +521,7 @@ fn project_resume_binding_for_dispatch_tx(
     })
 }
 
-fn targetless_project_run_binding(registration_revision: i64) -> ProjectCommandBinding {
+fn targetless_project_command_binding(registration_revision: i64) -> ProjectCommandBinding {
     ProjectCommandBinding {
         registration_revision,
         profile: None,
@@ -776,6 +862,7 @@ fn require_project_owner(principal: &str) -> Result<()> {
 fn normalize_registration(input: &ProjectRegistrationInput) -> Result<ProjectRegistrationInput> {
     let mut profiles = input.profiles.clone();
     let mut actions = input.actions.clone();
+    let git = input.git.clone();
     let interpreters = input.interpreters.clone();
     let mut run_env = input.run_env.clone();
     normalize_allowset(&mut profiles, "project profiles")?;
@@ -804,6 +891,7 @@ fn normalize_registration(input: &ProjectRegistrationInput) -> Result<ProjectReg
         id: input.id.clone(),
         checkout: input.checkout.clone(),
         repo_common_dir: input.repo_common_dir.clone(),
+        git: git.clone(),
         profiles: profiles.clone(),
         actions: actions.clone(),
         interpreters: interpreters.clone(),
@@ -815,6 +903,7 @@ fn normalize_registration(input: &ProjectRegistrationInput) -> Result<ProjectReg
         id: input.id.clone(),
         checkout: input.checkout.clone(),
         repo_common_dir: input.repo_common_dir.clone(),
+        git,
         profiles,
         actions,
         interpreters,
@@ -834,6 +923,7 @@ fn is_supported_project_action(action: &str) -> bool {
             | "approve"
             | "deny"
             | "answer"
+            | "git.fetch"
     )
 }
 
@@ -863,6 +953,7 @@ fn upsert_project_registration_tx(
     if let Some(existing) = load_project_registration(tx, &input.id)? {
         if existing.view.checkout == input.checkout
             && existing.view.repo_common_dir == input.repo_common_dir
+            && existing.view.git == input.git
             && existing.view.profiles == input.profiles
             && existing.view.actions == input.actions
             && existing.view.interpreters == input.interpreters
@@ -885,12 +976,13 @@ fn upsert_project_registration_tx(
     }
     let profiles = encode_json(&input.profiles)?;
     let actions = encode_json(&input.actions)?;
+    let git = input.git.as_ref().map(encode_json).transpose()?;
     let interpreters = encode_json(&input.interpreters)?;
     let run_env = encode_json(&input.run_env)?;
     tx.execute(
         "INSERT INTO project_registrations(
-             id, checkout, repo_common_dir, profiles, actions, interpreters, run_env
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             id, checkout, repo_common_dir, profiles, actions, interpreters, run_env, git
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             input.id,
             input.checkout,
@@ -899,6 +991,7 @@ fn upsert_project_registration_tx(
             actions,
             interpreters,
             run_env,
+            git,
         ],
     )
     .map_err(sql_error)?;
@@ -925,7 +1018,7 @@ fn list_project_registrations_tx(
 ) -> Result<Vec<core::api::ProjectRegistrationView>> {
     let mut statement = connection
         .prepare(
-            "SELECT revision, id, checkout, repo_common_dir, profiles, actions, interpreters, run_env
+            "SELECT revision, id, checkout, repo_common_dir, profiles, actions, interpreters, run_env, git
              FROM project_registrations
              WHERE ?1 IS NULL OR id > ?1
              ORDER BY id LIMIT ?2",
@@ -950,7 +1043,7 @@ fn load_project_registration(
 ) -> Result<Option<ProjectRegistrationRow>> {
     connection
         .query_row(
-            "SELECT revision, id, checkout, repo_common_dir, profiles, actions, interpreters, run_env
+            "SELECT revision, id, checkout, repo_common_dir, profiles, actions, interpreters, run_env, git
              FROM project_registrations WHERE id = ?1",
             [id],
             project_registration_from_row,
@@ -982,6 +1075,7 @@ fn project_registration_from_row(
     let actions_text: String = row.get(5)?;
     let interpreters_text: String = row.get(6)?;
     let run_env_text: String = row.get(7)?;
+    let git_text: Option<String> = row.get(8)?;
     let profiles = serde_json::from_str(&profiles_text).map_err(|_| {
         rusqlite::Error::FromSqlConversionFailure(
             4,
@@ -1022,11 +1116,26 @@ fn project_registration_from_row(
             )),
         )
     })?;
+    let git = git_text
+        .map(|text| {
+            serde_json::from_str::<core::api::ProjectGitView>(&text).map_err(|_| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    8,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "invalid project Git registration",
+                    )),
+                )
+            })
+        })
+        .transpose()?;
     Ok(ProjectRegistrationRow {
         view: core::api::ProjectRegistrationView {
             id,
             checkout,
             repo_common_dir,
+            git,
             profiles,
             actions,
             interpreters,

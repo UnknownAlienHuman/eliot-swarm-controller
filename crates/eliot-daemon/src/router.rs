@@ -19,11 +19,12 @@ use eliot_core::{
         CommandGetRequest, CommandSubmitRequest, CommandSubmitResponse, DaemonShutdownRequest,
         DaemonShutdownResponse, DaemonStatusRequest, DaemonStatusResponse, DiscoverPage,
         EventsFilter, EventsReadRequest, EventsReadResponse, EventsSubscribeRequest,
-        EventsSubscribeResponse, GitView, MAX_OBSERVATION_PAGE_BYTES, ObservationPage,
-        ObservationQuery, ObservationView, ProcessPageCursor, ProjectRegistrationView,
-        ProviderClearHoldRequest, ProviderHoldsRequest, RuleCatchUpRequest, RuleGetRequest,
-        RuleStateView, ShutdownMode, SourceState, StatusBlocker, TimerGetRequest, TimerRunRequest,
-        TimerStateView, TurnGetRequest, UnsettledCommandSummary, WorkspaceCustodyView,
+        EventsSubscribeResponse, FrozenGitFetch, GitFetchDefinitionArgs, GitView,
+        MAX_OBSERVATION_PAGE_BYTES, ObservationPage, ObservationQuery, ObservationView,
+        ProcessPageCursor, ProjectRegistrationView, ProviderClearHoldRequest, ProviderHoldsRequest,
+        RuleCatchUpRequest, RuleGetRequest, RuleStateView, ShutdownMode, SourceState,
+        StatusBlocker, TimerGetRequest, TimerRunRequest, TimerStateView, TurnGetRequest,
+        UnsettledCommandSummary, WorkspaceCustodyView,
     },
     classify_dispatched_error, is_deterministic_pre_admission_rejection,
 };
@@ -551,6 +552,9 @@ impl Router {
     async fn submit(&self, params: &Value, principal: &Principal) -> Result<Value> {
         let request: CommandSubmitRequest = serde_json::from_value(params.clone())
             .map_err(|_| Error::new("invalid", "command.submit params are malformed"))?;
+        if request.verb == "git.fetch" {
+            return self.submit_git_fetch(request, principal).await;
+        }
         let prepared = self.prepare_submission(request, principal).await?;
         let PreparedSubmission {
             mut request,
@@ -614,6 +618,116 @@ impl Router {
         .map_err(|_| Error::new("internal", "command admission result could not be encoded"))
     }
 
+    async fn submit_git_fetch(
+        &self,
+        request: CommandSubmitRequest,
+        principal: &Principal,
+    ) -> Result<Value> {
+        request.validate()?;
+        let definition = serde_json::from_value::<GitFetchDefinitionArgs>(request.args.clone())
+            .map_err(|_| Error::new("invalid", "git.fetch definition is malformed"))?;
+        definition.validate()?;
+        let timeout_ms = crate::automation::git_fetch_timeout_ms(definition.timeout.as_deref())?;
+
+        if let Some(response) = self
+            .retained_git_fetch_submit(principal, &request, timeout_ms)
+            .await?
+        {
+            return Ok(response);
+        }
+
+        let prepared = match self
+            .prepare_git_fetch_submission(request.clone(), principal, None)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if let Some(response) = self
+                    .retained_git_fetch_submit(principal, &request, timeout_ms)
+                    .await?
+                {
+                    return Ok(response);
+                }
+                return Err(error);
+            }
+        };
+        let principal_name = principal_name(principal);
+        let admission = {
+            let mut store = self.inner.store.lock().await;
+            let result = store.submit(&principal_name, prepared.request, now_ms());
+            match result {
+                Ok(admission) => {
+                    self.publish_locked(&admission.events);
+                    Ok(admission)
+                }
+                Err(error) => Err(error),
+            }
+        };
+        let admission = match admission {
+            Ok(admission) => admission,
+            Err(error) => {
+                if let Some(response) = self
+                    .retained_git_fetch_submit(principal, &request, timeout_ms)
+                    .await?
+                {
+                    return Ok(response);
+                }
+                return Err(error);
+            }
+        };
+        self.note_unknown(&admission.events);
+        if admission.command.state == CommandState::Unknown {
+            self.inner
+                .unknown_commands
+                .lock_recover()
+                .insert(admission.command.id.clone());
+        }
+        if admission.is_new {
+            self.schedule_command(admission.command.id.clone(), None);
+        }
+        self.signal_progress();
+        serde_json::to_value(submit_result(
+            &admission.command,
+            admission.linked_command.as_ref(),
+        ))
+        .map_err(|_| {
+            Error::new(
+                "internal",
+                "git.fetch admission result could not be encoded",
+            )
+        })
+    }
+
+    async fn retained_git_fetch_submit(
+        &self,
+        principal: &Principal,
+        request: &CommandSubmitRequest,
+        timeout_ms: i64,
+    ) -> Result<Option<Value>> {
+        let admission = self.inner.store.lock().await.replay_git_fetch_submission(
+            &principal_name(principal),
+            request,
+            timeout_ms,
+        )?;
+        let Some(admission) = admission else {
+            return Ok(None);
+        };
+        self.note_unknown(&admission.events);
+        if admission.command.state == CommandState::Unknown {
+            self.inner
+                .unknown_commands
+                .lock_recover()
+                .insert(admission.command.id.clone());
+        }
+        self.signal_progress();
+        serde_json::to_value(submit_result(
+            &admission.command,
+            admission.linked_command.as_ref(),
+        ))
+        .map(Some)
+        .map_err(|_| Error::new("internal", "retained git.fetch result could not be encoded"))
+    }
+
     pub(crate) async fn issue_run_credential(
         &self,
         command: &Command,
@@ -644,7 +758,9 @@ impl Router {
                 return Err(Error::new("source_integrity", "Run project scope changed"));
             }
             registration.validate()?;
-            SavedRunPrincipal::ProjectRule { registration }
+            SavedRunPrincipal::ProjectRule {
+                registration: Box::new(registration),
+            }
         } else if command.principal == "owner" {
             SavedRunPrincipal::Owner
         } else {
@@ -659,10 +775,110 @@ impl Router {
             .issue(command.id.clone(), saved_principal.clone())?;
         Ok((guard, saved_principal))
     }
+
+    async fn prepare_git_fetch_submission(
+        &self,
+        mut request: SubmitCommand,
+        principal: &Principal,
+        expected_registration: Option<&ProjectRegistrationView>,
+    ) -> Result<PreparedSubmission> {
+        if request.verb != "git.fetch"
+            || request.target.is_some()
+            || request.expected_generation.is_some()
+            || request.expected_turn_id.is_some()
+            || request.request_id.is_some()
+            || request.probe
+        {
+            return Err(Error::new(
+                "invalid",
+                "git.fetch must be targetless and have no Agent or request bindings",
+            ));
+        }
+        authorize_command(principal, &mut request)?;
+        if contains_known_secret(&request.args, &self.inner.secrets) {
+            return Err(Error::new(
+                "secret_in_payload",
+                "git.fetch request contains a known credential",
+            ));
+        }
+        let definition = serde_json::from_value::<GitFetchDefinitionArgs>(request.args.clone())
+            .map_err(|_| Error::new("invalid", "git.fetch definition is malformed"))?;
+        definition.validate()?;
+        let timeout_ms = crate::automation::git_fetch_timeout_ms(definition.timeout.as_deref())?;
+        let _binding_args = definition.binding_args(timeout_ms)?;
+        if self.inner.mode.load(Ordering::SeqCst) == MODE_FORCE {
+            return Err(Error::new("unavailable", "daemon is forcing shutdown"));
+        }
+
+        let registration = match principal {
+            Principal::Owner => self
+                .inner
+                .store
+                .lock()
+                .await
+                .get_project_registration("owner", &definition.repository)?
+                .ok_or_else(|| Error::new("not_found", "Git fetch repository is not registered"))?,
+            Principal::ProjectRule {
+                registration: saved,
+            } => {
+                if definition.repository != saved.id {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "project git.fetch repository differs from its saved principal",
+                    ));
+                }
+                if expected_registration.is_some_and(|expected| expected != saved) {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "project git.fetch registration differs from its saved principal",
+                    ));
+                }
+                let current = self
+                    .inner
+                    .store
+                    .lock()
+                    .await
+                    .get_project_registration("owner", &saved.id)?
+                    .ok_or_else(|| Error::new("not_allowed", "project registration was removed"))?;
+                if current != *saved {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "project registration changed before git.fetch preparation",
+                    ));
+                }
+                saved.clone()
+            }
+            _ => {
+                return Err(Error::new(
+                    "not_allowed",
+                    "git.fetch requires the Owner or saved project principal",
+                ));
+            }
+        };
+        if expected_registration.is_some_and(|expected| expected != &registration) {
+            return Err(Error::new(
+                "not_allowed",
+                "git.fetch registration changed before preparation",
+            ));
+        }
+        let frozen =
+            crate::git_actions::prepare_fetch(&self.inner.data_root, &registration, &definition)
+                .await?;
+        request.args = serde_json::to_value(frozen)
+            .map_err(|_| Error::new("internal", "frozen git.fetch intent could not be encoded"))?;
+        self.prepare_submission_after_authorization(request, principal, true)
+            .await
+    }
+
     pub(crate) async fn prepare_owner_submission(
         &self,
         request: SubmitCommand,
     ) -> Result<PreparedSubmission> {
+        if request.verb == "git.fetch" {
+            return self
+                .prepare_git_fetch_submission(request, &Principal::Owner, None)
+                .await;
+        }
         validate_rule_launch_action(&request, None)?;
         validate_rule_resume_action(&request, None)?;
         let prepared = self.prepare_submission(request, &Principal::Owner).await?;
@@ -777,7 +993,12 @@ impl Router {
         };
         let mut prepared = Vec::with_capacity(requests.len());
         for request in requests {
-            let prepared_request = self.prepare_submission(request, &principal).await?;
+            let prepared_request = if request.verb == "git.fetch" {
+                self.prepare_git_fetch_submission(request, &principal, Some(registration))
+                    .await?
+            } else {
+                self.prepare_submission(request, &principal).await?
+            };
             validate_rule_launch_preparation(&prepared_request)?;
             validate_rule_resume_preparation(&prepared_request, Some(registration))?;
             if let (Some(target), Some(generation)) = (
@@ -821,6 +1042,14 @@ impl Router {
         request: SubmitCommand,
         registration: &ProjectRegistrationView,
     ) -> Result<PreparedSubmission> {
+        if request.verb == "git.fetch" {
+            let principal = Principal::ProjectRule {
+                registration: registration.clone(),
+            };
+            return self
+                .prepare_git_fetch_submission(request, &principal, Some(registration))
+                .await;
+        }
         validate_rule_launch_action(&request, Some(registration))?;
         validate_rule_resume_action(&request, Some(registration))?;
         let principal = Principal::ProjectRule {
@@ -1811,7 +2040,7 @@ impl Router {
         } = prepared;
         if !matches!(
             action.verb.as_str(),
-            "stop" | "send" | "launch" | "resume" | "run"
+            "stop" | "send" | "launch" | "resume" | "run" | "git.fetch"
         ) || workspace.is_some()
         {
             return Err(Error::new(
@@ -1848,6 +2077,27 @@ impl Router {
                     "invalid",
                     "manual timer Run context does not match its admission",
                 ));
+            }
+        }
+        if action.verb == "git.fetch" {
+            let frozen: FrozenGitFetch = serde_json::from_value(action.args.clone())
+                .map_err(|_| Error::new("invalid", "manual timer Git fetch is not frozen"))?;
+            frozen.validate()?;
+            match project {
+                Some(registration) if registration.id == frozen.repository => {}
+                Some(_) => {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "manual project timer Git fetch differs from its saved registration",
+                    ));
+                }
+                None if principal == "owner" => {}
+                None => {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "global timer Git fetch requires the Owner principal",
+                    ));
+                }
             }
         }
         let admission = {
@@ -2196,7 +2446,7 @@ impl Router {
         event_seq: i64,
         prepared: PreparedSubmission,
     ) -> Result<Option<eliot_store::RuleEventAdmission>> {
-        if prepared.request.verb == "resume"
+        if matches!(prepared.request.verb.as_str(), "resume" | "git.fetch")
             && let Some(admission) = self
                 .replay_rule_event_action(principal, state, revision, event_seq)
                 .await?
@@ -2256,6 +2506,7 @@ impl Router {
             }
         } else if request.verb != "launch"
             && request.verb != "resume"
+            && request.verb != "git.fetch"
             && !matches!(
                 request.verb.as_str(),
                 "stop" | "send" | "steer" | "interrupt" | "approve" | "deny" | "answer"
@@ -2268,7 +2519,7 @@ impl Router {
         }
         let admission = {
             let mut store = self.inner.store.lock().await;
-            let retained_resume = if request.verb == "resume" {
+            let retained_resume = if matches!(request.verb.as_str(), "resume" | "git.fetch") {
                 store.replay_rule_event_action(principal, state, revision, event_seq)?
             } else {
                 None
@@ -2281,7 +2532,7 @@ impl Router {
                 }
                 let replay_first_action = matches!(
                     request.verb.as_str(),
-                    "launch" | "approve" | "deny" | "answer"
+                    "launch" | "approve" | "deny" | "answer" | "git.fetch"
                 );
                 // Store resolves retained launch/reply parents before current gates.
                 if !replay_first_action && let Some(expected) = project {
@@ -3465,8 +3716,48 @@ impl Router {
                 return;
             }
         }
-        if let Some(project_id) = command.principal.strip_prefix("project:") {
+        let git_fetch_registration = if command.verb == "git.fetch" {
+            let frozen = match serde_json::from_value::<FrozenGitFetch>(command.args.clone()) {
+                Ok(frozen) if frozen.validate().is_ok() => frozen,
+                _ => {
+                    self.reject_undispatched(&id, "invalid").await;
+                    return;
+                }
+            };
+            let project_principal = command.principal.strip_prefix("project:");
+            if command.principal != "owner" && project_principal != Some(frozen.repository.as_str())
+            {
+                self.reject_undispatched(&id, "not_allowed").await;
+                return;
+            }
             let registration = {
+                let store = self.inner.store.lock().await;
+                store.get_project_registration("owner", &frozen.repository)
+            };
+            match registration {
+                Ok(Some(registration)) => Some(registration),
+                Ok(None) => {
+                    self.reject_undispatched(&id, "not_allowed").await;
+                    return;
+                }
+                Err(error) => {
+                    self.reject_undispatched(&id, &error.code).await;
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(project_id) = command.principal.strip_prefix("project:") {
+            let registration = if command.verb == "git.fetch" {
+                match &git_fetch_registration {
+                    Some(registration) => Ok(Some(registration.clone())),
+                    None => Err(Error::new(
+                        "not_allowed",
+                        "Git fetch registration is unavailable",
+                    )),
+                }
+            } else {
                 let store = self.inner.store.lock().await;
                 store.get_project_registration("owner", project_id)
             };
@@ -3615,6 +3906,14 @@ impl Router {
                             "force shutdown prevents script dispatch",
                         ))
                     }
+                    None if command.verb == "git.fetch"
+                        && self.inner.mode.load(Ordering::SeqCst) == MODE_FORCE =>
+                    {
+                        Err(Error::new(
+                            "bad_state",
+                            "force shutdown prevents Git fetch dispatch",
+                        ))
+                    }
                     None => store.dispatch(&id, now_ms()),
                 };
                 let result = match dispatched {
@@ -3690,6 +3989,50 @@ impl Router {
                 RunWorkerStart::ForceRequested => {
                     self.settle_run_cancelled_before_start(&run_id).await;
                 }
+            }
+            self.signal_progress();
+            return;
+        }
+        if dispatched.verb == "git.fetch" {
+            let Some(registration) = git_fetch_registration else {
+                self.settle(
+                    &id,
+                    CommandState::Rejected,
+                    Some(json!({"code":"not_allowed"})),
+                )
+                .await;
+                return;
+            };
+            let frozen = match serde_json::from_value::<FrozenGitFetch>(dispatched.args.clone()) {
+                Ok(frozen) => frozen,
+                Err(_) => {
+                    self.settle(&id, CommandState::Rejected, Some(json!({"code":"invalid"})))
+                        .await;
+                    return;
+                }
+            };
+            let mut execution = crate::git_actions::execute(
+                &self.inner.data_root,
+                &id,
+                &frozen,
+                &registration,
+                self.inner.run_cancellation.subscribe(),
+            )
+            .await;
+            self.redact_native_value(&mut execution.outcome);
+            let state = execution.state;
+            let expected_outcome = execution.outcome.clone();
+            let cleanup_view = execution.cleanup_view.take();
+            let settled = self.settle(&id, state, Some(execution.outcome)).await;
+            let durable_match = settled.as_ref().is_some_and(|command| {
+                command.id == id
+                    && command.verb == "git.fetch"
+                    && command.state == state
+                    && state != CommandState::Unknown
+                    && command.outcome.as_ref() == Some(&expected_outcome)
+            });
+            if durable_match && let Some(view) = cleanup_view {
+                crate::git_actions::cleanup_after_settlement(&self.inner.data_root, &view);
             }
             self.signal_progress();
             return;
@@ -4263,7 +4606,7 @@ impl Router {
             .await
             .get_project_registration("owner", &registration.id)?
             .ok_or_else(|| Error::new("not_allowed", "Run project registration is absent"))?;
-        if &current != registration {
+        if &current != registration.as_ref() {
             return Err(Error::new(
                 "not_allowed",
                 "project registration changed during script execution",
@@ -5824,6 +6167,30 @@ fn auth_fields_are_exact(auth: &serde_json::Map<String, Value>, kind: &str) -> b
 
 fn authorize_command(principal: &Principal, request: &mut SubmitCommand) -> Result<()> {
     if let Principal::ProjectRule { registration } = principal {
+        if request.verb == "git.fetch" {
+            if !registration
+                .actions
+                .iter()
+                .any(|action| action == "git.fetch")
+            {
+                return Err(Error::new(
+                    "not_allowed",
+                    "project rule is not approved for git.fetch",
+                ));
+            }
+            if request.target.is_some()
+                || request.expected_generation.is_some()
+                || request.expected_turn_id.is_some()
+                || request.request_id.is_some()
+                || request.probe
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "git.fetch command must be targetless and unbound",
+                ));
+            }
+            return Ok(());
+        }
         if request.verb == "run" {
             if !registration.actions.iter().any(|action| action == "run") {
                 return Err(Error::new(
@@ -6158,6 +6525,137 @@ mod tests {
             Arc::new(AsyncMutex::new(store)),
             Bus::new(16),
         )
+    }
+
+    #[tokio::test]
+    async fn direct_git_fetch_replay_uses_literal_binding_after_registration_changes() {
+        let router = router();
+        let checkout = std::fs::canonicalize(std::env::current_dir().unwrap())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let project_id = "git-fetch-replay-project";
+        let input = ProjectRegistrationInput {
+            id: project_id.to_owned(),
+            checkout: checkout.clone(),
+            repo_common_dir: checkout.clone(),
+            git: Some(eliot_core::api::ProjectGitView {
+                fetch_remotes: std::collections::BTreeMap::from([(
+                    "origin".to_owned(),
+                    "https://example.invalid/repository.git".to_owned(),
+                )]),
+                credential_helper: None,
+            }),
+            profiles: Vec::new(),
+            actions: vec!["git.fetch".to_owned()],
+            interpreters: std::collections::BTreeMap::new(),
+            run_env: Vec::new(),
+        };
+        let registration = router
+            .reconcile_project_registrations(std::slice::from_ref(&input))
+            .await
+            .unwrap()
+            .remove(0);
+        let id = ulid::Ulid::new().to_string();
+        let definition = GitFetchDefinitionArgs {
+            repository: project_id.to_owned(),
+            remote: "origin".to_owned(),
+            source_ref: "refs/heads/main".to_owned(),
+            tracking_ref: "refs/remotes/origin/main".to_owned(),
+            timeout: None,
+        };
+        let mut raw = CommandSubmitRequest::new(id, "git.fetch");
+        raw.args = serde_json::to_value(&definition).unwrap();
+        let frozen = FrozenGitFetch {
+            repository: definition.repository.clone(),
+            registration_revision: registration.revision,
+            canonical_checkout: registration.checkout.clone(),
+            common_dir: registration.repo_common_dir.clone(),
+            remote: definition.remote.clone(),
+            endpoint: "https://example.invalid/repository.git".to_owned(),
+            source_ref: definition.source_ref.clone(),
+            advertised_oid: "a".repeat(40),
+            tracking_ref: definition.tracking_ref.clone(),
+            expected_old_oid: None,
+            timeout_ms: eliot_core::api::DEFAULT_GIT_FETCH_TIMEOUT_MS,
+            credential_helper: None,
+        };
+        frozen.validate().unwrap();
+        let mut retained_request = raw.clone();
+        retained_request.args = serde_json::to_value(&frozen).unwrap();
+        let retained = router
+            .inner
+            .store
+            .lock()
+            .await
+            .submit("owner", retained_request, now_ms())
+            .unwrap();
+        assert_ne!(raw.args, retained.command.args);
+
+        let mut changed_registration = input;
+        changed_registration
+            .git
+            .as_mut()
+            .unwrap()
+            .fetch_remotes
+            .insert(
+                "origin".to_owned(),
+                "https://changed.invalid/repository.git".to_owned(),
+            );
+        router
+            .reconcile_project_registrations(&[changed_registration])
+            .await
+            .unwrap();
+
+        let expected = serde_json::to_value(submit_result(
+            &retained.command,
+            retained.linked_command.as_ref(),
+        ))
+        .unwrap();
+        let response = router
+            .submit(&serde_json::to_value(&raw).unwrap(), &Principal::Owner)
+            .await
+            .unwrap();
+        assert_eq!(response, expected);
+
+        let mut equivalent_timeout = raw.clone();
+        equivalent_timeout.args["timeout"] = Value::String("600s".to_owned());
+        assert_eq!(
+            router
+                .submit(
+                    &serde_json::to_value(&equivalent_timeout).unwrap(),
+                    &Principal::Owner,
+                )
+                .await
+                .unwrap(),
+            expected
+        );
+
+        for (field, value) in [
+            ("repository", Value::String("other-project".to_owned())),
+            ("remote", Value::String("upstream".to_owned())),
+            ("source_ref", Value::String("refs/heads/other".to_owned())),
+            (
+                "tracking_ref",
+                Value::String("refs/remotes/upstream/main".to_owned()),
+            ),
+            ("timeout", Value::String("1m".to_owned())),
+        ] {
+            let mut changed_input = raw.clone();
+            changed_input.args[field] = value;
+            assert_eq!(
+                router
+                    .submit(
+                        &serde_json::to_value(&changed_input).unwrap(),
+                        &Principal::Owner
+                    )
+                    .await
+                    .unwrap_err()
+                    .code,
+                "id_conflict",
+                "changing {field} must conflict with the retained caller binding",
+            );
+        }
     }
 
     fn command_with_state(id: &str, verb: &str, state: CommandState) -> Command {
@@ -8640,6 +9138,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             id: PROJECT_ID.to_owned(),
             checkout: checkout.clone(),
             repo_common_dir,
+            git: None,
             profiles: Vec::new(),
             actions: vec!["run".to_owned()],
             interpreters: std::collections::BTreeMap::from([(
@@ -9426,6 +9925,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             id: PROJECT_ID.to_owned(),
             checkout: checkout.clone(),
             repo_common_dir: repo_common_dir.clone(),
+            git: None,
             profiles: vec!["fake".to_owned()],
             actions: vec!["resume".to_owned(), "send".to_owned()],
             interpreters: std::collections::BTreeMap::new(),
@@ -10855,6 +11355,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             actions: vec!["resume".to_owned(), "send".to_owned()],
             interpreters: std::collections::BTreeMap::new(),
             run_env: Vec::new(),
+            git: None,
             revision: 1,
         };
         let mut request = SubmitCommand::new(String::new(), "resume");
@@ -10979,6 +11480,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             actions: vec!["launch".to_owned(), "send".to_owned()],
             interpreters: std::collections::BTreeMap::new(),
             run_env: Vec::new(),
+            git: None,
             revision: 1,
         };
         let mut request = SubmitCommand::new(String::new(), "launch");
@@ -11042,6 +11544,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             actions: vec!["launch".to_owned(), "send".to_owned()],
             interpreters: std::collections::BTreeMap::new(),
             run_env: Vec::new(),
+            git: None,
             revision: 1,
         };
         let command = Command {
@@ -11146,6 +11649,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             actions: Vec::new(),
             interpreters: std::collections::BTreeMap::new(),
             run_env: Vec::new(),
+            git: None,
             revision: 1,
         };
         let verbs = ["approve", "deny", "answer"];
@@ -11196,6 +11700,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             actions: vec!["steer".to_owned()],
             interpreters: std::collections::BTreeMap::new(),
             run_env: Vec::new(),
+            git: None,
             revision: 1,
         };
         let mut request = SubmitCommand::new(String::new(), "steer");
@@ -11244,6 +11749,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                         id: project_id.to_owned(),
                         checkout: checkout.clone(),
                         repo_common_dir: checkout,
+                        git: None,
                         profiles: vec!["fake".to_owned()],
                         actions: vec!["send".to_owned()],
                         interpreters: std::collections::BTreeMap::new(),
@@ -11327,6 +11833,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             id: project_id.to_owned(),
             checkout: "synthetic-workspace".to_owned(),
             repo_common_dir: "synthetic-workspace/.git".to_owned(),
+            git: None,
             profiles: vec!["synthetic".to_owned()],
             actions: vec!["approve".to_owned()],
             interpreters: std::collections::BTreeMap::new(),
@@ -12763,6 +13270,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             id: PROJECT_ID.to_owned(),
             checkout: checkout.clone(),
             repo_common_dir: checkout,
+            git: None,
             profiles: vec!["fake".to_owned()],
             actions: vec!["resume".to_owned(), "send".to_owned()],
             interpreters: Default::default(),
@@ -12878,6 +13386,7 @@ mod run_authorization_tests {
             actions: vec!["run".to_owned()],
             interpreters: Default::default(),
             run_env: Vec::new(),
+            git: None,
             revision: 1,
         };
         let project = Principal::ProjectRule { registration };

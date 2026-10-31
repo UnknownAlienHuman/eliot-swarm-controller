@@ -1821,6 +1821,20 @@ fn validate_project_rule_action_tx(
         super::projects::capture_project_command_binding_tx(tx, &command)?;
         return Ok(None);
     }
+    if request.verb == "git.fetch" {
+        let Some(project_id) = rule_project_id(principal)? else {
+            return Ok(None);
+        };
+        let frozen = super::projects::decode_frozen_git_fetch(&request.args)?;
+        if frozen.repository != project_id {
+            return Err(Error::new(
+                "not_allowed",
+                "Project git.fetch repository must match its saved principal",
+            ));
+        }
+        let registration = super::projects::validate_git_fetch_intent_tx(tx, principal, &frozen)?;
+        return Ok(Some(registration));
+    }
     if request.verb == "resume" {
         let target = request
             .target
@@ -2861,6 +2875,9 @@ fn valid_event_rule_action_request(request: &SubmitCommand) -> bool {
     if request.verb == "launch" {
         return valid_targetless_rule_launch_request(request);
     }
+    if request.verb == "git.fetch" {
+        return valid_targetless_git_fetch_request(request);
+    }
     let reply = matches!(request.verb.as_str(), "approve" | "deny" | "answer");
     if request.verb != "steer" && !reply {
         return valid_rule_action_request(request, true);
@@ -2905,6 +2922,17 @@ fn valid_targetless_rule_run_request(request: &SubmitCommand) -> bool {
         && request.args.is_object()
 }
 
+fn valid_targetless_git_fetch_request(request: &SubmitCommand) -> bool {
+    request.validate().is_ok()
+        && request.verb == "git.fetch"
+        && request.target.is_none()
+        && request.expected_generation.is_none()
+        && request.expected_turn_id.is_none()
+        && request.request_id.is_none()
+        && !request.probe
+        && super::projects::decode_frozen_git_fetch(&request.args).is_ok()
+}
+
 fn valid_targetless_rule_launch_request(request: &SubmitCommand) -> bool {
     request.validate().is_ok()
         && request.verb == "launch"
@@ -2919,6 +2947,7 @@ fn valid_targetless_rule_launch_request(request: &SubmitCommand) -> bool {
 fn valid_timer_action_request(request: &SubmitCommand) -> bool {
     match request.verb.as_str() {
         "launch" => valid_targetless_rule_launch_request(request),
+        "git.fetch" => valid_targetless_git_fetch_request(request),
         _ => valid_rule_action_request(request, false),
     }
 }
@@ -3742,7 +3771,7 @@ fn rule_action_binding_error(event: &StoredRuleTrigger, request: &SubmitCommand)
     if !valid_event_rule_action_request(request) {
         return Some("rule_action_binding_invalid".to_owned());
     }
-    if request.verb == "launch" {
+    if matches!(request.verb.as_str(), "launch" | "git.fetch") {
         return None;
     }
     if request.target != event.agent.map(format_agent_id)
@@ -4680,6 +4709,7 @@ mod tests {
                     id: project.to_owned(),
                     checkout: checkout.clone(),
                     repo_common_dir: format!("synthetic-common-{project}"),
+                    git: None,
                     profiles: vec!["fake".to_owned()],
                     actions: vec!["stop".to_owned()],
                     interpreters: std::collections::BTreeMap::new(),

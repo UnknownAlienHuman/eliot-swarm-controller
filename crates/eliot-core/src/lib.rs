@@ -4,7 +4,8 @@ pub mod api;
 pub mod limits;
 
 pub use api::{
-    FrozenScriptContext, FrozenScriptInterpreter, FrozenScriptRun, RunDefinitionArgs,
+    DEFAULT_GIT_FETCH_TIMEOUT_MS, FrozenGitFetch, FrozenScriptContext, FrozenScriptInterpreter,
+    FrozenScriptRun, GitFetchDefinitionArgs, GitFetchOutcome, RunDefinitionArgs,
     ScriptActionRecord, ScriptCommandContext, ScriptCustody, ScriptDirectExit, ScriptInputContext,
     ScriptInterpreter, ScriptProcessResult, ScriptRuleContext, ScriptRunApplied,
     ScriptTimerContext, ScriptTimerInvocation, bound_script_outcome_stderr,

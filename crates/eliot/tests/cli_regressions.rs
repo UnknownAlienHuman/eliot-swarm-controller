@@ -7805,6 +7805,755 @@ fn cli_fake_timer_resume_uses_literal_generation_in_owner_project_scopes() {
 }
 
 #[test]
+fn cli_timer_git_fetch_uses_owner_and_project_authority_with_a_real_remote() {
+    const PROJECT_ID: &str = "git-fetch-project";
+    const OWNER_RULE: &str = "owner-fetch-main";
+    const PROJECT_RULE: &str = "project-fetch-copy";
+    const MISMATCH_RULE: &str = "project-fetch-wrong-repository";
+    const SOURCE_REF: &str = "refs/heads/main";
+    const OWNER_TRACKING_REF: &str = "refs/remotes/origin/main";
+    const PROJECT_TRACKING_REF: &str = "refs/remotes/origin/project-copy";
+    const MISMATCH_TRACKING_REF: &str = "refs/remotes/origin/blocked";
+
+    let mut fixture = Fixture::new("git fetch registered remote");
+    let git_output = |fixture: &Fixture, args: &[&str], context: &str| -> String {
+        let reply = fixture.git(args);
+        assert!(
+            reply.status.success(),
+            "{context}: stdout={:?}, stderr={:?}",
+            reply.stdout,
+            reply.stderr
+        );
+        reply.stdout.trim().to_owned()
+    };
+
+    git_output(
+        &fixture,
+        &["init", "--initial-branch=main"],
+        "initialize disposable Git fetch checkout",
+    );
+    fs::write(fixture.workspace.join("seed.txt"), "fetch base\n")
+        .expect("write disposable Git fetch seed");
+    git_output(
+        &fixture,
+        &["add", "--", "seed.txt"],
+        "stage initial Git fetch seed",
+    );
+    git_output(
+        &fixture,
+        &["commit", "-m", "Git fetch base"],
+        "commit initial Git fetch seed",
+    );
+    let base_oid = git_output(
+        &fixture,
+        &["rev-parse", "--verify", "HEAD"],
+        "read initial local HEAD",
+    );
+
+    let fetch_remote_path = fixture.root.join("approved fetch origin.git");
+    let fetch_remote_arg = fetch_remote_path.to_string_lossy().into_owned();
+    let push_remote_path = fixture.root.join("separate push destination.git");
+    let push_remote_arg = push_remote_path.to_string_lossy().into_owned();
+    git_output(
+        &fixture,
+        &["init", "--bare", &fetch_remote_arg],
+        "initialize disposable fetch origin",
+    );
+    git_output(
+        &fixture,
+        &["init", "--bare", &push_remote_arg],
+        "initialize separate push destination",
+    );
+    git_output(
+        &fixture,
+        &["remote", "add", "origin", &fetch_remote_arg],
+        "add disposable fetch origin",
+    );
+    git_output(
+        &fixture,
+        &["push", "origin", "main"],
+        "push base commit to disposable origin",
+    );
+    git_output(
+        &fixture,
+        &[
+            "fetch",
+            "origin",
+            "refs/heads/main:refs/remotes/origin/main",
+        ],
+        "seed local tracking ref from base commit",
+    );
+    assert_eq!(
+        git_output(
+            &fixture,
+            &["rev-parse", "--verify", OWNER_TRACKING_REF],
+            "read seeded tracking ref",
+        ),
+        base_oid
+    );
+
+    let writer_path = fixture.root.join("separate remote writer");
+    let writer_arg = writer_path.to_string_lossy().into_owned();
+    git_output(
+        &fixture,
+        &["clone", "--no-local", ".", &writer_arg],
+        "clone an independent remote writer object database",
+    );
+    git_output(
+        &fixture,
+        &[
+            "-C",
+            &writer_arg,
+            "remote",
+            "set-url",
+            "origin",
+            &fetch_remote_arg,
+        ],
+        "point independent writer at the bare fetch origin",
+    );
+    git_output(
+        &fixture,
+        &["-C", &writer_arg, "switch", "-c", "remote-advance"],
+        "create advancement branch in independent writer",
+    );
+    fs::write(writer_path.join("seed.txt"), "remote target\n")
+        .expect("write remote advancement in independent writer");
+    git_output(
+        &fixture,
+        &["-C", &writer_arg, "add", "--", "seed.txt"],
+        "stage remote advancement in independent writer",
+    );
+    git_output(
+        &fixture,
+        &["-C", &writer_arg, "commit", "-m", "Git fetch remote target"],
+        "commit remote advancement in independent writer",
+    );
+    let advertised_oid = git_output(
+        &fixture,
+        &["-C", &writer_arg, "rev-parse", "--verify", "HEAD"],
+        "read advertised remote target OID",
+    );
+    git_output(
+        &fixture,
+        &[
+            "-C",
+            &writer_arg,
+            "push",
+            "origin",
+            "remote-advance:refs/heads/main",
+        ],
+        "advance bare remote main from independent writer",
+    );
+    let remote_main_oid = git_output(
+        &fixture,
+        &[
+            "--git-dir",
+            &fetch_remote_arg,
+            "rev-parse",
+            "--verify",
+            SOURCE_REF,
+        ],
+        "verify advanced bare remote main",
+    );
+    assert_eq!(remote_main_oid, advertised_oid);
+    let advertised_commit_spec = format!("{advertised_oid}^{{commit}}");
+    let absent_before_fetch = fixture.git(&["cat-file", "-e", &advertised_commit_spec]);
+    assert!(
+        !absent_before_fetch.status.success(),
+        "new remote commit must not already exist in the registered repository object database"
+    );
+    assert_eq!(
+        git_output(
+            &fixture,
+            &["rev-parse", "--verify", "HEAD"],
+            "read local main",
+        ),
+        base_oid
+    );
+    assert_eq!(
+        git_output(
+            &fixture,
+            &["rev-parse", "--verify", OWNER_TRACKING_REF],
+            "confirm local tracking ref stayed at base before Eliot fetch",
+        ),
+        base_oid
+    );
+    assert_eq!(
+        git_output(
+            &fixture,
+            &["rev-parse", "--verify", "HEAD"],
+            "registered repository HEAD remains at base before Eliot fetch",
+        ),
+        base_oid
+    );
+    git_output(
+        &fixture,
+        &["remote", "set-url", "--push", "origin", &push_remote_arg],
+        "set a distinct push URL",
+    );
+    let approved_endpoint = git_output(
+        &fixture,
+        &["config", "--get-all", "remote.origin.url"],
+        "read raw origin fetch URL",
+    );
+    let push_endpoint = git_output(
+        &fixture,
+        &["config", "--get-all", "remote.origin.pushurl"],
+        "read separate origin push URL",
+    );
+    assert!(!approved_endpoint.is_empty());
+    assert!(!push_endpoint.is_empty());
+    assert!(Path::new(&approved_endpoint).is_absolute());
+    assert_ne!(approved_endpoint, push_endpoint);
+
+    let project_rules = fixture.workspace.join(".eliot").join("rules");
+    fs::create_dir_all(&project_rules).expect("create Project Git fetch rule directory");
+    // Let the daemon create and protect the Windows private data root before the
+    // fixture writes owner configuration, matching the existing project fixtures.
+    fixture.start();
+    fixture.stop(false);
+
+    let owner_rules = fixture.data.join("rules");
+    fs::create_dir_all(&owner_rules).expect("create Owner Git fetch rule directory");
+    fs::write(
+        fixture.data.join("config.toml"),
+        format!(
+            concat!(
+                "[projects.{project_id}]\n",
+                "path = {workspace:?}\n",
+                "profiles = [\"fake\"]\n",
+                "actions = [\"git.fetch\"]\n\n",
+                "[projects.{project_id}.git]\n",
+                "fetch_remotes = {{ origin = {endpoint:?} }}\n",
+            ),
+            project_id = PROJECT_ID,
+            workspace = fixture.workspace.to_string_lossy(),
+            endpoint = approved_endpoint,
+        ),
+    )
+    .expect("approve direct project fetch origin");
+
+    let epoch_ms = || {
+        i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock is after the Unix epoch")
+                .as_millis(),
+        )
+        .expect("Git fetch timer anchor fits signed milliseconds")
+    };
+    let anchor = epoch_ms();
+    let render_rule = |rule: &str, repository: &str, tracking_ref: &str| {
+        format!(
+            concat!(
+                "[[rule]]\n",
+                "id = {rule:?}\n",
+                "on = {{ every = \"1h\", anchor = {anchor} }}\n",
+                "catch_up = \"none\"\n",
+                "do = [{{ action = \"git.fetch\", repository = {repository:?}, ",
+                "remote = \"origin\", source_ref = \"refs/heads/main\", ",
+                "tracking_ref = {tracking_ref:?} }}]\n",
+            ),
+            rule = rule,
+            anchor = anchor,
+            repository = repository,
+            tracking_ref = tracking_ref,
+        )
+    };
+    fs::write(
+        owner_rules.join(format!("{OWNER_RULE}.toml")),
+        render_rule(OWNER_RULE, PROJECT_ID, OWNER_TRACKING_REF),
+    )
+    .expect("write Owner timer Git fetch rule");
+    let mut project_source = render_rule(PROJECT_RULE, PROJECT_ID, PROJECT_TRACKING_REF);
+    project_source.push_str(&render_rule(
+        MISMATCH_RULE,
+        "another-project",
+        MISMATCH_TRACKING_REF,
+    ));
+    fs::write(project_rules.join("git-fetch.toml"), project_source)
+        .expect("write Project timer Git fetch rules");
+
+    fixture.start();
+    let registration_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let registration: ProjectRegistrationView = loop {
+        let reply = cli(&fixture.data, &["project", "show", PROJECT_ID]);
+        if reply.status.success() {
+            break serde_json::from_str(&reply.stdout).expect("typed registered Git fetch Project");
+        }
+        assert!(
+            std::time::Instant::now() < registration_deadline,
+            "Git fetch Project registration deadline: {}",
+            reply.stderr
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    registration
+        .validate()
+        .expect("valid Git fetch Project view");
+    assert_eq!(
+        registration.checkout,
+        fixture
+            .workspace
+            .canonicalize()
+            .expect("canonical registered fetch checkout")
+            .to_string_lossy()
+            .into_owned()
+    );
+    assert!(
+        registration
+            .actions
+            .iter()
+            .any(|action| action == "git.fetch")
+    );
+    let git_approval = registration
+        .git
+        .as_ref()
+        .expect("owner-approved Project Git configuration");
+    assert_eq!(
+        git_approval.fetch_remotes.get("origin"),
+        Some(&approved_endpoint)
+    );
+    assert_eq!(git_approval.credential_helper, None);
+
+    let read_timer = |fixture: &Fixture, rule: &str, project: Option<&str>| -> TimerStateView {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut args = vec!["timer".to_owned(), "show".to_owned(), rule.to_owned()];
+        if let Some(project) = project {
+            args.extend(["--project".to_owned(), project.to_owned()]);
+        }
+        let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        loop {
+            let reply = cli(&fixture.data, &refs);
+            if reply.status.success() {
+                return serde_json::from_str(&reply.stdout).expect("typed Git fetch timer state");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Git fetch timer {rule} registration deadline: {}",
+                reply.stderr
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    };
+    let wait_manual_firing =
+        |fixture: &Fixture, rule: &str, parent_id: &str, child_id: &str| -> Value {
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                if let Some(event) = fixture.events().into_iter().find(|event| {
+                    event["kind"] == "rule.fired"
+                        && event["data"]["rule"] == rule
+                        && event["data"]["parent_command"] == parent_id
+                        && event["data"]["child_command"] == child_id
+                }) {
+                    assert!(event["data"].get("schedule_revision").is_none());
+                    assert!(event["data"].get("scheduled_at_ms").is_none());
+                    return event;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "manual Git fetch rule {rule} firing deadline"
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        };
+    let timer_run_args = |id: &str, rule: &str, project: Option<&str>| {
+        let mut args = vec![
+            "--id".to_owned(),
+            id.to_owned(),
+            "timer".to_owned(),
+            "run".to_owned(),
+            rule.to_owned(),
+        ];
+        if let Some(project) = project {
+            args.extend(["--project".to_owned(), project.to_owned()]);
+        }
+        args
+    };
+    let invoke_manual = |fixture: &Fixture,
+                         id: &str,
+                         rule: &str,
+                         project: Option<&str>|
+     -> (CoreCommand, CoreCommand) {
+        let args = timer_run_args(id, rule, project);
+        let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let reply = cli(&fixture.data, &refs);
+        assert!(
+            reply.status.success(),
+            "manual Git fetch timer {rule} failed: {}",
+            reply.stderr
+        );
+        let parent: CoreCommand =
+            serde_json::from_str(&reply.stdout).expect("typed manual Git fetch parent");
+        assert_eq!(parent.id, id);
+        assert_eq!(parent.verb, "timer.run");
+        assert_eq!(parent.args["rule"], rule);
+        if let Some(project) = project {
+            assert_eq!(parent.args["project"], project);
+            assert_eq!(parent.principal, format!("project:{project}"));
+        } else {
+            assert_eq!(parent.principal, "owner");
+        }
+        let children: Vec<String> = serde_json::from_value(
+            parent.outcome.as_ref().expect("manual Git fetch child set")["children"].clone(),
+        )
+        .expect("typed manual Git fetch child IDs");
+        assert_eq!(children.len(), 1);
+        let child_id = children[0].clone();
+        let _firing = wait_manual_firing(fixture, rule, &parent.id, &child_id);
+        let retained_parent: CoreCommand =
+            serde_json::from_value(fixture.wait_command(&parent.id, "applied"))
+                .expect("applied manual Git fetch parent");
+        assert_eq!(retained_parent, parent);
+        let action: CoreCommand =
+            serde_json::from_value(fixture.wait_command(&child_id, "applied"))
+                .expect("applied native Git fetch action");
+        assert_eq!(action.id, child_id);
+        assert_eq!(action.verb, "git.fetch");
+        assert_eq!(action.principal, parent.principal);
+        assert_eq!(action.target, None);
+        assert_eq!(action.generation, None);
+        assert_eq!(action.expected_generation, None);
+        assert_eq!(
+            parent.outcome.as_ref().unwrap()["children"],
+            json!([action.id.clone()])
+        );
+        (parent, action)
+    };
+    let verify_fetch = |action: &CoreCommand,
+                        principal: &str,
+                        tracking_ref: &str,
+                        expected_old_oid: Option<&str>|
+     -> eliot_core::api::GitFetchOutcome {
+        assert_eq!(action.principal, principal);
+        let frozen: eliot_core::api::FrozenGitFetch =
+            serde_json::from_value(action.args.clone()).expect("typed frozen Git fetch intent");
+        assert_eq!(frozen.repository, PROJECT_ID);
+        assert_eq!(frozen.registration_revision, registration.revision);
+        assert_eq!(frozen.canonical_checkout, registration.checkout);
+        assert_eq!(frozen.common_dir, registration.repo_common_dir);
+        assert_eq!(frozen.remote, "origin");
+        assert_eq!(frozen.endpoint, approved_endpoint);
+        assert_eq!(frozen.source_ref, SOURCE_REF);
+        assert_eq!(frozen.advertised_oid, advertised_oid);
+        assert_eq!(frozen.tracking_ref, tracking_ref);
+        assert_eq!(frozen.expected_old_oid.as_deref(), expected_old_oid);
+        assert_eq!(
+            frozen.timeout_ms,
+            eliot_core::api::DEFAULT_GIT_FETCH_TIMEOUT_MS
+        );
+        assert_eq!(frozen.credential_helper, None);
+        let outcome: eliot_core::api::GitFetchOutcome = serde_json::from_value(
+            action
+                .outcome
+                .as_ref()
+                .expect("applied Git fetch readback")
+                .clone(),
+        )
+        .expect("typed applied Git fetch outcome");
+        outcome
+            .validate_for(&frozen)
+            .expect("exact frozen ref readback");
+        assert_eq!(outcome.tracking_ref, tracking_ref);
+        assert_eq!(outcome.tracking_oid, advertised_oid);
+        outcome
+    };
+
+    let owner_timer_before = read_timer(&fixture, OWNER_RULE, None);
+    let project_timer_before = read_timer(&fixture, PROJECT_RULE, Some(PROJECT_ID));
+    let mismatch_timer_before = read_timer(&fixture, MISMATCH_RULE, Some(PROJECT_ID));
+    for timer in [
+        &owner_timer_before,
+        &project_timer_before,
+        &mismatch_timer_before,
+    ] {
+        assert_eq!(timer.last_key, None);
+        assert!(timer.next_due_at.is_some());
+    }
+
+    let workspace_bytes_before = fs::read(fixture.workspace.join("seed.txt"))
+        .expect("read local worktree file before native fetch");
+    let local_head_before = git_output(
+        &fixture,
+        &["rev-parse", "--verify", "HEAD"],
+        "read local HEAD",
+    );
+    let local_branch_before =
+        git_output(&fixture, &["branch", "--show-current"], "read local branch");
+    let local_branches_before = git_output(
+        &fixture,
+        &["branch", "--format=%(refname)"],
+        "read local branch refs",
+    );
+    let worktrees_before = git_output(
+        &fixture,
+        &["worktree", "list", "--porcelain"],
+        "read worktree inventory",
+    );
+    let status_before = git_output(
+        &fixture,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+        "read worktree status",
+    );
+    let blocked_ref_before =
+        fixture.git(&["show-ref", "--verify", "--quiet", MISMATCH_TRACKING_REF]);
+    assert!(!blocked_ref_before.status.success());
+
+    let owner_id = ulid::Ulid::new().to_string();
+    let (owner_parent, owner_fetch) = invoke_manual(&fixture, &owner_id, OWNER_RULE, None);
+    assert_eq!(owner_parent.principal, "owner");
+    verify_fetch(
+        &owner_fetch,
+        "owner",
+        OWNER_TRACKING_REF,
+        Some(base_oid.as_str()),
+    );
+    assert_eq!(fault_dispatches(&fixture.events(), &owner_fetch.id), 1);
+    let owner_timer_after = read_timer(&fixture, OWNER_RULE, None);
+    assert_eq!(owner_timer_after.last_key, owner_timer_before.last_key);
+    assert_eq!(
+        owner_timer_after.next_due_at,
+        owner_timer_before.next_due_at
+    );
+    assert_eq!(
+        owner_timer_after.schedule_revision,
+        owner_timer_before.schedule_revision
+    );
+
+    let project_id = ulid::Ulid::new().to_string();
+    let (project_parent, project_fetch) =
+        invoke_manual(&fixture, &project_id, PROJECT_RULE, Some(PROJECT_ID));
+    assert_eq!(project_parent.principal, format!("project:{PROJECT_ID}"));
+    verify_fetch(
+        &project_fetch,
+        &format!("project:{PROJECT_ID}"),
+        PROJECT_TRACKING_REF,
+        None,
+    );
+    assert_eq!(fault_dispatches(&fixture.events(), &project_fetch.id), 1);
+    let project_timer_after = read_timer(&fixture, PROJECT_RULE, Some(PROJECT_ID));
+    assert_eq!(project_timer_after.last_key, project_timer_before.last_key);
+    assert_eq!(
+        project_timer_after.next_due_at,
+        project_timer_before.next_due_at
+    );
+    assert_eq!(
+        project_timer_after.schedule_revision,
+        project_timer_before.schedule_revision
+    );
+
+    for (id, rule, project, parent, action, timer_before) in [
+        (
+            &owner_id,
+            OWNER_RULE,
+            None,
+            &owner_parent,
+            &owner_fetch,
+            &owner_timer_before,
+        ),
+        (
+            &project_id,
+            PROJECT_RULE,
+            Some(PROJECT_ID),
+            &project_parent,
+            &project_fetch,
+            &project_timer_before,
+        ),
+    ] {
+        let args = timer_run_args(id, rule, project);
+        let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let replay_reply = cli(&fixture.data, &refs);
+        assert!(
+            replay_reply.status.success(),
+            "same-ID {rule} timer replay failed"
+        );
+        let replay: CoreCommand =
+            serde_json::from_str(&replay_reply.stdout).expect("typed retained Git fetch parent");
+        assert_eq!(&replay, parent);
+        let events = fixture.events();
+        assert_eq!(fault_dispatches(&events, &action.id), 1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event["kind"] == "rule.fired"
+                        && event["data"]["rule"] == rule
+                        && event["data"]["parent_command"] == parent.id
+                        && event["data"]["child_command"] == action.id
+                })
+                .count(),
+            1,
+            "same-ID {rule} replay duplicated its firing"
+        );
+        let timer_after_replay = read_timer(&fixture, rule, project);
+        assert_eq!(timer_after_replay.last_key, timer_before.last_key);
+        assert_eq!(timer_after_replay.next_due_at, timer_before.next_due_at);
+        assert_eq!(
+            timer_after_replay.schedule_revision,
+            timer_before.schedule_revision
+        );
+    }
+
+    let mismatch_id = ulid::Ulid::new().to_string();
+    let mismatch_args = timer_run_args(&mismatch_id, MISMATCH_RULE, Some(PROJECT_ID));
+    let mismatch_refs = mismatch_args.iter().map(String::as_str).collect::<Vec<_>>();
+    let mismatch_reply = cli(&fixture.data, &mismatch_refs);
+    assert!(
+        !mismatch_reply.status.success(),
+        "Project principal must not fetch another registered repository"
+    );
+    if let Ok(parent) = serde_json::from_str::<CoreCommand>(&mismatch_reply.stdout) {
+        assert_eq!(parent.verb, "timer.run");
+        assert_eq!(parent.state, CommandState::Rejected);
+        assert_eq!(parent.args["rule"], MISMATCH_RULE);
+        let outcome = parent
+            .outcome
+            .as_ref()
+            .expect("rejected mismatch timer outcome");
+        assert_eq!(outcome["children"], json!([]));
+        assert_eq!(outcome["code"], "not_allowed");
+    } else {
+        assert!(
+            mismatch_reply.stderr.contains("not_allowed"),
+            "repository binding rejection must be explicit: {:?}",
+            mismatch_reply.stderr
+        );
+    }
+    let events_after_mismatch = fixture.events();
+    assert!(
+        !events_after_mismatch.iter().any(|event| {
+            event["kind"] == "rule.fired" && event["data"]["rule"] == MISMATCH_RULE
+        })
+    );
+    assert!(!events_after_mismatch.iter().any(|event| {
+        event["kind"] == "command.dispatched" && event["cause"]["rule"] == MISMATCH_RULE
+    }));
+    let mismatch_timer_after = read_timer(&fixture, MISMATCH_RULE, Some(PROJECT_ID));
+    assert_eq!(
+        mismatch_timer_after.last_key,
+        mismatch_timer_before.last_key
+    );
+    assert_eq!(
+        mismatch_timer_after.next_due_at,
+        mismatch_timer_before.next_due_at
+    );
+
+    assert_eq!(
+        git_output(
+            &fixture,
+            &["rev-parse", "--verify", OWNER_TRACKING_REF],
+            "read fetched owner tracking ref",
+        ),
+        advertised_oid
+    );
+    assert_eq!(
+        git_output(
+            &fixture,
+            &["rev-parse", "--verify", PROJECT_TRACKING_REF],
+            "read newly created Project tracking ref",
+        ),
+        advertised_oid
+    );
+    // Fixture.git clears inherited GIT_* variables and runs in the registered
+    // checkout, so these reads prove the fetched objects are in its normal ODB.
+    git_output(
+        &fixture,
+        &["cat-file", "-e", &advertised_commit_spec],
+        "read fetched commit from registered repository object database",
+    );
+    let advertised_tree_spec = format!("{advertised_oid}^{{tree}}");
+    git_output(
+        &fixture,
+        &["cat-file", "-e", &advertised_tree_spec],
+        "read fetched tree from registered repository object database",
+    );
+    let seed_blob_spec = format!("{advertised_oid}:seed.txt");
+    let seed_blob_oid = git_output(
+        &fixture,
+        &["rev-parse", "--verify", &seed_blob_spec],
+        "read fetched seed.txt blob OID",
+    );
+    git_output(
+        &fixture,
+        &["cat-file", "-e", &seed_blob_oid],
+        "read fetched seed.txt blob from registered repository object database",
+    );
+    assert_eq!(
+        git_output(
+            &fixture,
+            &["show", &seed_blob_spec],
+            "read fetched seed.txt blob"
+        ),
+        "remote target"
+    );
+    let blocked_ref_after =
+        fixture.git(&["show-ref", "--verify", "--quiet", MISMATCH_TRACKING_REF]);
+    assert!(!blocked_ref_after.status.success());
+    assert_eq!(
+        git_output(
+            &fixture,
+            &["rev-parse", "--verify", "HEAD"],
+            "read local HEAD after fetch"
+        ),
+        local_head_before
+    );
+    assert_eq!(
+        git_output(
+            &fixture,
+            &["branch", "--show-current"],
+            "read local branch after fetch",
+        ),
+        local_branch_before
+    );
+    assert_eq!(
+        git_output(
+            &fixture,
+            &["branch", "--format=%(refname)"],
+            "read local branch refs after fetch",
+        ),
+        local_branches_before
+    );
+    assert_eq!(
+        git_output(
+            &fixture,
+            &["worktree", "list", "--porcelain"],
+            "read worktree inventory after fetch",
+        ),
+        worktrees_before
+    );
+    assert_eq!(
+        git_output(
+            &fixture,
+            &["status", "--porcelain=v1", "--untracked-files=all"],
+            "read worktree status after fetch",
+        ),
+        status_before
+    );
+    assert_eq!(
+        fs::read(fixture.workspace.join("seed.txt")).expect("read local file after fetch"),
+        workspace_bytes_before
+    );
+    assert_eq!(
+        git_output(
+            &fixture,
+            &["config", "--get-all", "remote.origin.url"],
+            "verify fetch URL stayed unchanged",
+        ),
+        approved_endpoint
+    );
+    assert_eq!(
+        git_output(
+            &fixture,
+            &["config", "--get-all", "remote.origin.pushurl"],
+            "verify push URL stayed separate",
+        ),
+        push_endpoint
+    );
+
+    fixture.stop(false);
+}
+
+#[test]
 fn cli_event_rule_steers_exact_held_turn_in_global_and_project_scopes() {
     const PROJECT_ID: &str = "steer-fixture";
     const GLOBAL_RULE_ID: &str = "global-event-steer";

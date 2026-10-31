@@ -1,7 +1,8 @@
 use eliot_core::{
     Error, Event, SubmitCommand,
     api::{
-        CatchUp, CommandSubmitRequest, RuleLimit, RuleLimitScope, RunDefinitionArgs, TimerSchedule,
+        CatchUp, CommandSubmitRequest, GitFetchDefinitionArgs, RuleLimit, RuleLimitScope,
+        RunDefinitionArgs, TimerSchedule,
     },
     canonical_json_sha256,
     limits::{MAX_EVENT_BYTES, MAX_TEXT_BYTES},
@@ -131,6 +132,7 @@ enum AgentActionDefinition {
 enum ActionDefinition {
     Agent(AgentActionDefinition),
     Run { definition: RunDefinitionArgs },
+    GitFetch { definition: GitFetchDefinitionArgs },
 }
 
 impl<'de> Deserialize<'de> for ActionDefinition {
@@ -154,6 +156,13 @@ impl<'de> Deserialize<'de> for ActionDefinition {
                 serde_json::from_value(Value::Object(fields)).map_err(D::Error::custom)?;
             return Ok(Self::Run { definition });
         }
+        if action == "git.fetch" {
+            let mut fields = object.clone();
+            fields.remove("action");
+            let definition =
+                serde_json::from_value(Value::Object(fields)).map_err(D::Error::custom)?;
+            return Ok(Self::GitFetch { definition });
+        }
         serde_json::from_value::<AgentActionDefinition>(value)
             .map(Self::Agent)
             .map_err(D::Error::custom)
@@ -167,6 +176,19 @@ impl Serialize for ActionDefinition {
     {
         match self {
             Self::Agent(action) => action.serialize(serializer),
+            Self::GitFetch { definition } => {
+                let mut fields =
+                    match serde_json::to_value(definition).map_err(serde::ser::Error::custom)? {
+                        Value::Object(fields) => fields,
+                        _ => {
+                            return Err(serde::ser::Error::custom(
+                                "git.fetch definition must serialize as an object",
+                            ));
+                        }
+                    };
+                fields.insert("action".to_owned(), Value::String("git.fetch".to_owned()));
+                Value::Object(fields).serialize(serializer)
+            }
             Self::Run { definition } => {
                 let mut fields =
                     match serde_json::to_value(definition).map_err(serde::ser::Error::custom)? {
@@ -492,7 +514,7 @@ impl TriggerDefinition {
     }
 }
 
-/// Matches a committed event and renders its one bound Agent command.
+/// Matches a committed event and projects its one ordinary command action.
 /// `None` means disabled, a different event, or no exact match. The caller advances
 /// disabled/no-match cursors and settles rate-limit skips with the event transaction.
 pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<SubmitCommand>, Error> {
@@ -528,6 +550,9 @@ pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<SubmitCom
         .ok_or_else(|| Error::new("invalid", "rule has no action"))?;
     let action = match action {
         ActionDefinition::Run { definition } => return submit_run_command(definition).map(Some),
+        ActionDefinition::GitFetch { definition } => {
+            return submit_git_fetch_command(definition).map(Some);
+        }
         ActionDefinition::Agent(action) => action,
     };
     let roots = TemplateRoots {
@@ -647,6 +672,29 @@ fn submit_run_command(definition: &RunDefinitionArgs) -> Result<SubmitCommand, E
     Ok(command)
 }
 
+fn validate_git_fetch_definition(definition: &GitFetchDefinitionArgs) -> Result<(), Error> {
+    definition.validate()?;
+    if let Some(timeout) = &definition.timeout {
+        super::schedule::parse_positive_duration_ms(timeout).map_err(|_| {
+            Error::new(
+                "invalid",
+                "git.fetch timeout must be a positive whole-millisecond duration",
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn submit_git_fetch_command(definition: &GitFetchDefinitionArgs) -> Result<SubmitCommand, Error> {
+    validate_git_fetch_definition(definition)?;
+    let args = serde_json::to_value(definition)
+        .map_err(|_| Error::new("invalid", "git.fetch arguments cannot be encoded"))?;
+    let mut command = CommandSubmitRequest::new(String::new(), "git.fetch");
+    command.args = args;
+    command.validate()?;
+    Ok(command)
+}
+
 fn submit_launch_command(
     profile: &str,
     workspace: &str,
@@ -736,6 +784,7 @@ fn reject_unimplemented_options(raw: &toml::Value) -> Result<(), Error> {
                                     | "launch"
                                     | "resume"
                                     | "run"
+                                    | "git.fetch"
                             )
                         })
                 })
@@ -896,6 +945,9 @@ fn is_match_scalar(value: &Value) -> bool {
 fn validate_event_action(action: &ActionDefinition) -> Result<(), Error> {
     let action = match action {
         ActionDefinition::Run { definition } => return definition.validate(),
+        ActionDefinition::GitFetch { definition } => {
+            return validate_git_fetch_definition(definition);
+        }
         ActionDefinition::Agent(action) => action,
     };
     if let AgentActionDefinition::Launch {
@@ -1005,6 +1057,7 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
         .ok_or_else(|| Error::new("invalid", "rule has no action"))?;
     let action = match action {
         ActionDefinition::Run { definition } => return submit_run_command(definition),
+        ActionDefinition::GitFetch { definition } => return submit_git_fetch_command(definition),
         ActionDefinition::Agent(action) => action,
     };
     let (target_value, generation_value, args) = match action {
@@ -2021,6 +2074,93 @@ do = [{ action = 'resume', target = '${event.agent}', expected_generation = '${e
                 &format!("expected_generation = 3, {field}"),
             );
             assert_eq!(load(Cursor::new(source)).unwrap_err().code, "invalid");
+        }
+    }
+
+    #[test]
+    fn git_fetch_event_and_timer_project_literal_targetless_commands() {
+        const EVENT_RULE: &str = r#"
+[[rule]]
+id = 'event-git-fetch'
+on = { event = 'turn.completed' }
+do = [{ action = 'git.fetch', repository = 'project-one', remote = 'origin', source_ref = 'refs/heads/main', tracking_ref = 'refs/remotes/origin/main', timeout = '2m' }]
+"#;
+        let event_rule = load(Cursor::new(EVENT_RULE)).unwrap().remove(0);
+        let event_command = evaluate(&event_rule, &event()).unwrap().unwrap();
+        assert_eq!(event_command.id, "");
+        assert_eq!(event_command.verb, "git.fetch");
+        assert_eq!(event_command.target, None);
+        assert_eq!(event_command.expected_generation, None);
+        assert_eq!(event_command.expected_turn_id, None);
+        assert_eq!(event_command.request_id, None);
+        assert!(!event_command.probe);
+        assert_eq!(
+            event_command.args,
+            json!({
+                "repository":"project-one",
+                "remote":"origin",
+                "source_ref":"refs/heads/main",
+                "tracking_ref":"refs/remotes/origin/main",
+                "timeout":"2m"
+            })
+        );
+        event_command.validate().unwrap();
+        let serialized = serde_json::to_value(&event_rule).unwrap();
+        assert_eq!(serialized["do"][0]["action"], "git.fetch");
+        assert!(serialized["do"][0].get("definition").is_none());
+
+        let timer_source = INTERVAL_TIMER.replace(
+            "action = 'stop', target = 'a7', expected_generation = 3",
+            "action = 'git.fetch', repository = 'project-one', remote = 'origin', source_ref = 'refs/heads/main', tracking_ref = 'refs/remotes/origin/main'",
+        );
+        let timer_rule = load(Cursor::new(timer_source)).unwrap().remove(0);
+        let timer_command = timer_rule.evaluate_timer().unwrap();
+        assert_eq!(timer_command.verb, "git.fetch");
+        assert_eq!(timer_command.target, None);
+        assert_eq!(timer_command.expected_generation, None);
+        assert_eq!(timer_command.expected_turn_id, None);
+        assert_eq!(timer_command.request_id, None);
+        assert_eq!(
+            timer_command.args,
+            json!({
+                "repository":"project-one",
+                "remote":"origin",
+                "source_ref":"refs/heads/main",
+                "tracking_ref":"refs/remotes/origin/main"
+            })
+        );
+        timer_command.validate().unwrap();
+    }
+
+    #[test]
+    fn git_fetch_rejects_templates_invalid_refs_and_timeout() {
+        const RULE: &str = r#"
+[[rule]]
+id = 'event-git-fetch'
+on = { event = 'turn.completed' }
+do = [{ action = 'git.fetch', repository = 'project-one', remote = 'origin', source_ref = 'refs/heads/main', tracking_ref = 'refs/remotes/origin/main', timeout = '2m' }]
+"#;
+        for (old, replacement) in [
+            (
+                "repository = 'project-one'",
+                "repository = '${event.data.repository}'",
+            ),
+            ("remote = 'origin'", "remote = '${subject.remote}'"),
+            ("source_ref = 'refs/heads/main'", "source_ref = 'main'"),
+            (
+                "tracking_ref = 'refs/remotes/origin/main'",
+                "tracking_ref = 'refs/remotes/origin/../main'",
+            ),
+            ("timeout = '2m'", "timeout = '0ms'"),
+            ("timeout = '2m'", "timeout = '2m', force = true"),
+        ] {
+            let source = RULE.replace(old, replacement);
+            assert_eq!(load(Cursor::new(source)).unwrap_err().code, "invalid");
+        }
+
+        for action in ["git.push", "git.worktree"] {
+            let source = RULE.replace("action = 'git.fetch'", &format!("action = '{action}'"));
+            assert_eq!(load(Cursor::new(source)).unwrap_err().code, "unsupported");
         }
     }
 

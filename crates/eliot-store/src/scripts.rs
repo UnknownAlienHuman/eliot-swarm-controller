@@ -761,6 +761,7 @@ mod tests {
             id: id.to_owned(),
             checkout: checkout.display().to_string(),
             repo_common_dir: checkout.join(".git").display().to_string(),
+            git: None,
             profiles: Vec::new(),
             actions,
             interpreters: std::collections::BTreeMap::from([(

@@ -492,6 +492,7 @@ fn project_command_binding_is_captured_and_revalidated_before_dispatch() {
         id: project.to_owned(),
         checkout: "synthetic-workspace".to_owned(),
         repo_common_dir: "synthetic-repository".to_owned(),
+        git: None,
         profiles: vec!["fake".to_owned()],
         actions: vec!["stop".to_owned()],
         interpreters: BTreeMap::new(),
@@ -659,6 +660,7 @@ fn project_stop_rejects_setup_ready_next_generation() {
         id: project.to_owned(),
         checkout: checkout.to_owned(),
         repo_common_dir: repo_common_dir.to_owned(),
+        git: None,
         profiles: vec!["fake".to_owned()],
         actions: vec!["stop".to_owned()],
         interpreters: BTreeMap::new(),
@@ -824,6 +826,7 @@ fn project_stop_cannot_cancel_a_new_workspace_generation_after_dispatch_admissio
         id: project.to_owned(),
         checkout: checkout.to_owned(),
         repo_common_dir: repo_common_dir.to_owned(),
+        git: None,
         profiles: vec!["project-profile".to_owned()],
         actions: vec!["stop".to_owned()],
         interpreters: BTreeMap::new(),
@@ -949,6 +952,7 @@ fn project_approved_send_uses_existing_store_admission_and_dispatch() {
                 id: project.to_owned(),
                 checkout: checkout.to_owned(),
                 repo_common_dir: format!("{checkout}/.git"),
+                git: None,
                 profiles: vec![profile.to_owned()],
                 actions: vec!["send".to_owned()],
                 interpreters: BTreeMap::new(),
@@ -1003,6 +1007,7 @@ fn live_project_rule_send_rejects_other_valid_agent_at_same_generation() {
                 id: project.to_owned(),
                 checkout: checkout.to_owned(),
                 repo_common_dir: format!("{checkout}/.git"),
+                git: None,
                 profiles: vec![profile.to_owned()],
                 actions: vec!["send".to_owned()],
                 interpreters: BTreeMap::new(),
@@ -1081,6 +1086,7 @@ fn history_project_rule_send_rejects_rebinding_old_event_to_current_generation()
                 id: project.to_owned(),
                 checkout: checkout.to_owned(),
                 repo_common_dir: format!("{checkout}/.git"),
+                git: None,
                 profiles: vec![profile.to_owned()],
                 actions: vec!["send".to_owned()],
                 interpreters: BTreeMap::new(),
@@ -1261,6 +1267,7 @@ fn project_resume_rules_use_retained_binding_for_live_and_history_and_require_se
         id: project.to_owned(),
         checkout: checkout.to_owned(),
         repo_common_dir: format!("{checkout}/.git"),
+        git: None,
         profiles: vec![profile.to_owned()],
         actions,
         interpreters: BTreeMap::new(),
@@ -1599,6 +1606,7 @@ fn project_fake_interrupt_requires_explicit_action_approval() {
         id: project.to_owned(),
         checkout: "synthetic-workspace".to_owned(),
         repo_common_dir: "synthetic-workspace/.git".to_owned(),
+        git: None,
         profiles: vec!["fake".to_owned()],
         actions: vec!["send".to_owned()],
         interpreters: BTreeMap::new(),
@@ -1655,6 +1663,7 @@ fn project_fake_steer_requires_explicit_approval_and_keeps_exact_turn_binding() 
         id: project.to_owned(),
         checkout: checkout.to_owned(),
         repo_common_dir: format!("{checkout}/.git"),
+        git: None,
         profiles: vec!["fake".to_owned()],
         actions: vec!["send".to_owned()],
         interpreters: BTreeMap::new(),
@@ -1923,6 +1932,7 @@ fn project_send_requires_the_approved_action_and_rejects_unknown_registration_ac
                 id: "unsupported-project-action".to_owned(),
                 checkout: checkout.to_owned(),
                 repo_common_dir: common.clone(),
+                git: None,
                 profiles: vec![profile.to_owned()],
                 actions: vec!["unexpected".to_owned()],
                 interpreters: BTreeMap::new(),
@@ -1941,6 +1951,7 @@ fn project_send_requires_the_approved_action_and_rejects_unknown_registration_ac
                 id: project.to_owned(),
                 checkout: checkout.to_owned(),
                 repo_common_dir: common,
+                git: None,
                 profiles: vec![profile.to_owned()],
                 actions: vec!["stop".to_owned()],
                 interpreters: BTreeMap::new(),
@@ -1999,6 +2010,7 @@ fn project_event_launch_requires_both_grants_and_only_linked_send_uses_next_gene
         id: project.to_owned(),
         checkout: checkout.clone(),
         repo_common_dir: checkout_path.join(".git").display().to_string(),
+        git: None,
         profiles: vec!["fake".to_owned()],
         actions: vec!["launch".to_owned()],
         interpreters: BTreeMap::new(),
@@ -2438,6 +2450,7 @@ fn project_run_registration_roundtrips_and_rechecks_targetless_approval() {
         id: project.to_owned(),
         checkout: "/synthetic/project-run".to_owned(),
         repo_common_dir: "/synthetic/project-run/.git".to_owned(),
+        git: None,
         profiles: Vec::new(),
         actions: Vec::new(),
         interpreters: BTreeMap::from([("pwsh".to_owned(), interpreter.clone())]),
@@ -2594,6 +2607,93 @@ fn project_registration_migration_defaults_legacy_run_authority_to_deny() {
                 r#"CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY);
                    INSERT INTO schema_migrations(version) VALUES
                        (1),(2),(3),(4),(5),(6),(7),(8),(9),(10),(11),(12),(13),(14);
+                   CREATE TABLE agents (
+                       id INTEGER PRIMARY KEY AUTOINCREMENT,
+                       generation INTEGER NOT NULL DEFAULT 0,
+                       name TEXT UNIQUE,
+                       project TEXT NOT NULL,
+                       harness TEXT NOT NULL,
+                       profile TEXT NOT NULL,
+                       workspace TEXT,
+                       token TEXT UNIQUE,
+                       state TEXT NOT NULL,
+                       active_turn TEXT,
+                       created_at INTEGER NOT NULL,
+                       updated_at INTEGER NOT NULL,
+                       profile_snapshot TEXT NOT NULL DEFAULT '{}',
+                       native_scope TEXT,
+                       native_ref TEXT,
+                       effective TEXT,
+                       pending TEXT NOT NULL DEFAULT '[]',
+                       origin TEXT NOT NULL DEFAULT 'eliot'
+                           CHECK(origin IN ('eliot','native','external')),
+                       observe_only INTEGER NOT NULL DEFAULT 0
+                           CHECK(observe_only IN (0,1) AND (state <> 'unknown' OR observe_only = 1)
+                               AND (observe_only = 0 OR token IS NULL)),
+                       capacity_generation INTEGER
+                           CHECK(capacity_generation IS NULL OR capacity_generation > 0)
+                   );
+                   CREATE INDEX agents_state ON agents(state);
+                   CREATE UNIQUE INDEX agents_native
+                       ON agents(native_scope, native_ref)
+                       WHERE native_scope IS NOT NULL AND native_ref IS NOT NULL;
+                   CREATE INDEX agents_capacity_reserved ON agents(capacity_generation)
+                       WHERE capacity_generation IS NOT NULL;
+                   CREATE TABLE commands (
+                       id TEXT PRIMARY KEY,
+                       principal TEXT NOT NULL,
+                       method TEXT NOT NULL,
+                       payload_digest BLOB NOT NULL,
+                       target INTEGER REFERENCES agents(id),
+                       expected_generation INTEGER,
+                       generation INTEGER,
+                       expected_turn_id TEXT,
+                       parent_command TEXT REFERENCES commands(id),
+                       link_kind TEXT,
+                       ordinal INTEGER,
+                       turn_id TEXT,
+                       verb TEXT NOT NULL,
+                       args TEXT NOT NULL,
+                       state TEXT NOT NULL,
+                       outcome TEXT,
+                       created_at INTEGER NOT NULL,
+                       updated_at INTEGER NOT NULL,
+                       request_id TEXT,
+                       probe INTEGER NOT NULL DEFAULT 0 CHECK(probe IN (0,1)),
+                       cause TEXT,
+                       project_binding TEXT,
+                       CHECK((parent_command IS NULL AND link_kind IS NULL AND ordinal IS NULL)
+                          OR (parent_command IS NOT NULL AND link_kind IS NOT NULL
+                              AND ordinal IS NOT NULL AND ordinal >= 0))
+                   );
+                   CREATE INDEX commands_target ON commands(target, created_at);
+                   CREATE INDEX commands_open ON commands(state)
+                       WHERE state IN ('accepted','queued','dispatched','unknown');
+                   CREATE UNIQUE INDEX commands_children
+                       ON commands(parent_command, ordinal)
+                       WHERE parent_command IS NOT NULL;
+                   CREATE INDEX commands_request_open
+                       ON commands(target, generation, request_id, state)
+                       WHERE request_id IS NOT NULL;
+                   CREATE INDEX commands_rule_action_window ON commands(created_at)
+                       WHERE link_kind = 'rule_action';
+                   CREATE TABLE workspaces (
+                       agent INTEGER PRIMARY KEY REFERENCES agents(id),
+                       target_generation INTEGER NOT NULL CHECK(target_generation > 0),
+                       start_command_id TEXT NOT NULL REFERENCES commands(id),
+                       project TEXT NOT NULL,
+                       repo_path TEXT NOT NULL,
+                       repo_common_dir TEXT NOT NULL,
+                       requested_branch TEXT NOT NULL,
+                       base_ref TEXT,
+                       base_oid TEXT NOT NULL,
+                       worktree_path TEXT NOT NULL UNIQUE,
+                       frozen_setup TEXT NOT NULL,
+                       phase TEXT NOT NULL CHECK(phase IN ('creating','setup_ready','setup_running','ready','unknown','failed','removing','removed')),
+                       setup_index INTEGER NOT NULL DEFAULT 0 CHECK(setup_index >= 0),
+                       outcome TEXT,
+                       updated_at INTEGER NOT NULL
+                   );
                    CREATE TABLE project_registrations(
                        revision INTEGER PRIMARY KEY AUTOINCREMENT,
                        id TEXT NOT NULL UNIQUE,
@@ -2611,14 +2711,14 @@ fn project_registration_migration_defaults_legacy_run_authority_to_deny() {
             .expect("insert pre-migration project registration");
     }
 
-    let store = Store::open(&path).expect("apply registration migration 15");
+    let store = Store::open(&path).expect("apply registration and Git migration 16");
     let version: i64 = store
         .connection
         .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
             row.get(0)
         })
         .expect("read Store migration version");
-    assert_eq!(version, 15);
+    assert_eq!(version, 16);
     let legacy = store
         .get_project_registration("owner", "legacy-run")
         .expect("read migrated registration")
@@ -2639,6 +2739,7 @@ fn project_registration_list_rejects_oversized_whole_value_without_truncation() 
             id: id.to_owned(),
             checkout: format!("/synthetic/{id}"),
             repo_common_dir: format!("/synthetic/{id}/.git"),
+            git: None,
             profiles: vec![format!("{profile_body}-{id}")],
             actions: vec!["stop".to_owned()],
             interpreters: BTreeMap::new(),
@@ -4301,6 +4402,7 @@ fn project_event_reply_requires_the_explicit_per_verb_grant() {
         id: project.to_owned(),
         checkout: checkout.to_owned(),
         repo_common_dir: format!("{checkout}/.git"),
+        git: None,
         profiles: vec!["fake".to_owned()],
         actions: vec!["approve".to_owned()],
         interpreters: BTreeMap::new(),
@@ -6069,6 +6171,7 @@ fn managed_workspace_resume_rejection_restores_ready_after_project_revocation() 
         id: project.to_owned(),
         checkout: checkout.to_owned(),
         repo_common_dir: format!("{checkout}/.git"),
+        git: None,
         profiles: vec![profile.to_owned()],
         actions: vec!["resume".to_owned(), "send".to_owned()],
         interpreters: BTreeMap::new(),
@@ -7416,7 +7519,17 @@ fn capacity_migration_uses_commands_and_physical_facts_without_rewriting_snapsho
                  agent INTEGER, generation INTEGER, source TEXT, state TEXT
              );
              CREATE TABLE processes(owner TEXT, role TEXT, state TEXT);
-             CREATE TABLE workspaces(start_command_id TEXT, target_generation INTEGER);",
+             CREATE TABLE workspaces (
+                 agent INTEGER PRIMARY KEY REFERENCES agents(id),
+                 target_generation INTEGER NOT NULL CHECK(target_generation > 0),
+                 start_command_id TEXT NOT NULL REFERENCES commands(id),
+                 project TEXT NOT NULL, repo_path TEXT NOT NULL, repo_common_dir TEXT NOT NULL,
+                 requested_branch TEXT NOT NULL, base_ref TEXT, base_oid TEXT NOT NULL,
+                 worktree_path TEXT NOT NULL UNIQUE, frozen_setup TEXT NOT NULL,
+                 phase TEXT NOT NULL CHECK(phase IN ('creating','setup_ready','setup_running','ready','unknown','failed','removing','removed')),
+                 setup_index INTEGER NOT NULL DEFAULT 0 CHECK(setup_index >= 0),
+                 outcome TEXT, updated_at INTEGER NOT NULL
+             );",
         )
         .expect("create v8 tables");
         for (id, generation, profile, snapshot) in [

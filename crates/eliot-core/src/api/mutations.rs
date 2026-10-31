@@ -34,6 +34,18 @@ impl CommandSubmitRequest {
                 "provider probes are supported only for send",
             ));
         }
+        if self.verb == "git.fetch"
+            && (self.target.is_some()
+                || self.expected_generation.is_some()
+                || self.expected_turn_id.is_some()
+                || self.request_id.is_some()
+                || self.probe)
+        {
+            return Err(Error::new(
+                "invalid",
+                "git.fetch is targetless and has no Agent bindings",
+            ));
+        }
         Ok(())
     }
 }
@@ -317,6 +329,34 @@ mod tests {
             assert_eq!(error.code, "invalid");
             assert_eq!(error.message, "command args must be a JSON object");
         }
+    }
+
+    #[test]
+    fn git_fetch_submit_is_targetless_and_unbound() {
+        let mut request = CommandSubmitRequest::new("id", "git.fetch");
+        request.args = json!({
+            "repository":"project-one",
+            "remote":"origin",
+            "source_ref":"refs/heads/main",
+            "tracking_ref":"refs/remotes/origin/main"
+        });
+        request.validate().unwrap();
+
+        let mut bound = request.clone();
+        bound.target = Some("a1".to_owned());
+        assert_eq!(bound.validate().unwrap_err().code, "invalid");
+        let mut bound = request.clone();
+        bound.expected_generation = Some(1);
+        assert_eq!(bound.validate().unwrap_err().code, "invalid");
+        let mut bound = request.clone();
+        bound.expected_turn_id = Some("turn-1".to_owned());
+        assert_eq!(bound.validate().unwrap_err().code, "invalid");
+        let mut bound = request.clone();
+        bound.request_id = Some("request-1".to_owned());
+        assert_eq!(bound.validate().unwrap_err().code, "invalid");
+        let mut probe = request;
+        probe.probe = true;
+        assert_eq!(probe.validate().unwrap_err().code, "unsupported");
     }
 
     #[test]
