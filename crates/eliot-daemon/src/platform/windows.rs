@@ -737,8 +737,11 @@ impl Drop for Job {
     }
 }
 
-/// Whether a named custody Job no longer contains any process. A missing name
-/// means the kernel destroyed the Job, which needs every member to have exited.
+/// Whether a named kill-on-close custody Job has been closed. The name leaves
+/// the namespace when the last handle closes; for this Job that close has
+/// already told the kernel to terminate every member (no breakaway), but a
+/// member can still be exiting, so callers also check recorded identities.
+/// An open Job counts only when it has no member.
 pub(crate) fn named_job_closed(name: &str) -> Result<bool> {
     let wide: Vec<u16> = OsStr::new(name).encode_wide().chain(Some(0)).collect();
     // JOB_OBJECT_QUERY (0x0004); see Job::observer.
@@ -757,6 +760,27 @@ pub(crate) fn named_job_closed(name: &str) -> Result<bool> {
     unsafe { CloseHandle(handle) };
     let (pids, complete) = members?;
     Ok(complete && pids.is_empty())
+}
+
+#[cfg(test)]
+pub(crate) fn process_start_time(pid: u32) -> u64 {
+    read_job_process(None, pid, "", "", "", 0)
+        .expect("read test process identity")
+        .0
+        .record
+        .identity
+        .start_time
+}
+
+/// Whether a process recorded by an earlier daemon (exact creation FILETIME)
+/// is still running. A missing, exited or reused PID is not that process.
+pub(crate) fn recorded_process_alive(pid: u32, start_time: u64) -> Result<bool> {
+    match read_job_process(None, pid, "", "", "", 0) {
+        Ok((sample, _)) => Ok(sample.record.identity.start_time == start_time
+            && sample.record.state == ProcessState::Running),
+        Err(error) if error.code == "process_gone" => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 struct QueryHandle(HANDLE);

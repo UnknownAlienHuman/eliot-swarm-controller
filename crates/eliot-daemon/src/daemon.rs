@@ -76,10 +76,15 @@ async fn run_owned(
         events
     };
     router.note_events(&recovered);
-    let (custody_namespace, retained) = restart_capacity::retained(&store).await?;
-    let retained =
-        restart_capacity::reconcile(&store, &bus, &router, &custody_namespace, retained, true)
-            .await?;
+    let (namespace, retained) = restart_capacity::retained(&store).await?;
+    let capacity = restart_capacity::Reconcile {
+        store: Arc::clone(&store),
+        bus: bus.clone(),
+        router: router.clone(),
+        policy: Arc::clone(&policy),
+        namespace,
+    };
+    let retained = restart_capacity::reconcile(&capacity, retained, true).await;
     let automation_config = crate::config::load_automation_config(data_dir.path())?;
     // Parse global definitions and seed only new rules before publishing ready.
     let (global_rules, initial_deferred_notice) =
@@ -102,14 +107,7 @@ async fn run_owned(
     // Dropped with this function, which aborts a recheck still waiting.
     let mut capacity_recheck = JoinSet::new();
     if !retained.is_empty() {
-        capacity_recheck.spawn(restart_capacity::recheck(
-            Arc::clone(&store),
-            bus.clone(),
-            router.clone(),
-            custody_namespace,
-            retained,
-            Arc::clone(&policy),
-        ));
+        capacity_recheck.spawn(restart_capacity::recheck(capacity, retained));
     }
     let (automation_stop, automation_shutdown) = watch::channel(false);
     let mut automation_tasks = JoinSet::new();

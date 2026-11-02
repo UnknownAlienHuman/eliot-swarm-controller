@@ -9,7 +9,7 @@ use crate::{
     platform::{RestartCustody, restart_custody},
     router::Router,
 };
-use eliot_core::{Result, SecretPolicy};
+use eliot_core::{Error, Result, SecretPolicy};
 use eliot_store::{RetainedGeneration, Store};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Mutex;
@@ -35,80 +35,95 @@ pub(crate) async fn retained(store: &Mutex<Store>) -> Result<(String, Vec<Retain
     Ok((namespace, retained))
 }
 
-/// Release each generation whose custody is verified closed. The first pass
-/// records why each remaining reservation stays; returns those generations.
+/// Release each generation whose custody is verified closed and return the
+/// rest. A failure for one generation keeps it retained and is logged; it
+/// never stops startup or the other generations. The first pass also records
+/// why each remaining reservation stays.
 pub(crate) async fn reconcile(
-    store: &Mutex<Store>,
-    bus: &Bus,
-    router: &Router,
-    namespace: &str,
+    context: &Reconcile,
     pending: Vec<RetainedGeneration>,
     first_pass: bool,
-) -> Result<Vec<RetainedGeneration>> {
+) -> Vec<RetainedGeneration> {
     let mut remaining = Vec::new();
     for generation in pending {
-        let custody = restart_custody(namespace, &generation).unwrap_or(RestartCustody::Retained {
-            missing: "custody_probe_failed",
+        let custody = restart_custody(&context.namespace, &generation).unwrap_or_else(|error| {
+            context.log("daemon.restart_custody_probe_failed", &generation, &error);
+            RestartCustody::Retained {
+                missing: "custody_probe_failed",
+            }
         });
-        let events = match custody {
+        let now = now_ms();
+        let committed = match custody {
             RestartCustody::Closed {
                 evidence,
                 orphan_possible,
-            } => store.lock().await.release_restart_closed_generation(
-                &generation.agent,
-                generation.generation,
-                evidence,
-                orphan_possible,
-                now_ms(),
-            )?,
-            RestartCustody::Retained { missing } => {
-                let events = if first_pass {
-                    store.lock().await.record_restart_capacity_retained(
-                        &generation.agent,
-                        generation.generation,
-                        missing,
-                        now_ms(),
-                    )?
-                } else {
-                    Vec::new()
-                };
-                remaining.push(generation);
-                events
+            } => context
+                .store
+                .lock()
+                .await
+                .release_restart_closed_generation(
+                    &generation.agent,
+                    generation.generation,
+                    evidence,
+                    orphan_possible,
+                    now,
+                ),
+            RestartCustody::Retained { missing } if first_pass => {
+                context.store.lock().await.record_restart_capacity_retained(
+                    &generation.agent,
+                    generation.generation,
+                    missing,
+                    now,
+                )
             }
+            RestartCustody::Retained { .. } => Ok(Vec::new()),
         };
-        bus.publish(&events);
-        router.note_events(&events);
+        let released = matches!(custody, RestartCustody::Closed { .. });
+        match committed {
+            Ok(events) => {
+                context.bus.publish(&events);
+                context.router.note_events(&events);
+                if !released {
+                    remaining.push(generation);
+                }
+            }
+            Err(error) => {
+                context.log("daemon.restart_capacity_failed", &generation, &error);
+                remaining.push(generation);
+            }
+        }
     }
-    Ok(remaining)
+    remaining
 }
 
 /// Recheck retained generations until each one is released; Unix plugin
 /// groups do not die with the daemon and may exit after it restarts.
-pub(crate) async fn recheck(
-    store: Arc<Mutex<Store>>,
-    bus: Bus,
-    router: Router,
-    namespace: String,
-    mut pending: Vec<RetainedGeneration>,
-    policy: Arc<SecretPolicy>,
-) {
+pub(crate) async fn recheck(context: Reconcile, mut pending: Vec<RetainedGeneration>) {
     while !pending.is_empty() {
         tokio::time::sleep(RECHECK).await;
-        match reconcile(
-            &store,
-            &bus,
-            &router,
-            &namespace,
-            std::mem::take(&mut pending),
-            false,
-        )
-        .await
-        {
-            Ok(remaining) => pending = remaining,
-            Err(error) => {
-                logging::record(&policy, "daemon.restart_capacity_failed", &[], Some(&error));
-                return;
-            }
-        }
+        pending = reconcile(&context, pending, false).await;
+    }
+}
+
+pub(crate) struct Reconcile {
+    pub store: Arc<Mutex<Store>>,
+    pub bus: Bus,
+    pub router: Router,
+    pub policy: Arc<SecretPolicy>,
+    pub namespace: String,
+}
+
+impl Reconcile {
+    fn log(&self, event: &str, generation: &RetainedGeneration, error: &Error) {
+        let generation_text = generation.generation.to_string();
+        logging::record(
+            &self.policy,
+            event,
+            &[
+                ("agent", generation.agent.as_str()),
+                ("generation", generation_text.as_str()),
+            ],
+            Some(error),
+        );
     }
 }

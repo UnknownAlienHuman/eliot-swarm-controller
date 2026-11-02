@@ -386,15 +386,30 @@ pub fn restart_custody(
             });
         }
         let name = agent_custody_name(namespace, &generation.agent, generation.generation);
-        Ok(if super::windows::named_job_closed(&name)? {
-            RestartCustody::Closed {
-                evidence: "windows_job_closed",
-                orphan_possible: false,
-            }
-        } else {
-            RestartCustody::Retained {
+        if !super::windows::named_job_closed(&name)? {
+            return Ok(RestartCustody::Retained {
                 missing: "windows_job_live",
+            });
+        }
+        // Closing the Job only started member termination; the boot marker is an
+        // estimate, so match recorded identities by PID and exact creation time.
+        for process in generation
+            .processes
+            .iter()
+            .filter(|process| !process.exited)
+        {
+            if super::windows::recorded_process_alive(
+                process.identity.pid,
+                process.identity.start_time,
+            )? {
+                return Ok(RestartCustody::Retained {
+                    missing: "windows_process_live",
+                });
             }
+        }
+        Ok(RestartCustody::Closed {
+            evidence: "windows_job_closed",
+            orphan_possible: false,
         })
     }
     #[cfg(target_os = "linux")]
@@ -622,15 +637,27 @@ mod restart_custody_tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn named_agent_job_is_retained_while_live_and_closed_after_its_owner_drops_it() {
+        use eliot_core::ProcessIdentity;
+        use eliot_store::RecordedProcess;
+
+        let recorded = |pid: u32| RecordedProcess {
+            identity: ProcessIdentity {
+                host_boot_id: "windows-boot-filetime-estimate:earlier-daemon".to_owned(),
+                pid,
+                start_time: super::super::windows::process_start_time(pid),
+            },
+            role: "plugin".to_owned(),
+            exited: false,
+        };
         let namespace = ulid::Ulid::new().to_string();
+        let child = OwnedChild::spawn_agent(long_running(), &namespace, "a1", 3)
+            .expect("spawn named Agent custody");
         let generation = RetainedGeneration {
             agent: "a1".to_owned(),
             generation: 3,
             named_custody: true,
-            processes: Vec::new(),
+            processes: vec![recorded(child.child.id().expect("live plugin pid"))],
         };
-        let child = OwnedChild::spawn_agent(long_running(), &namespace, "a1", 3)
-            .expect("spawn named Agent custody");
         assert_eq!(
             restart_custody(&namespace, &generation).expect("probe live custody"),
             RestartCustody::Retained {
@@ -652,12 +679,35 @@ mod restart_custody_tests {
         );
         let unnamed = RetainedGeneration {
             named_custody: false,
-            ..generation
+            ..generation.clone()
         };
         assert_eq!(
             restart_custody(&namespace, &unnamed).expect("probe unnamed custody"),
             RestartCustody::Retained {
                 missing: "named_custody_unrecorded"
+            }
+        );
+
+        // A missing Job name alone is not enough: a recorded process that is
+        // still running keeps the reservation.
+        let mut outside = long_running();
+        let mut outside = outside.spawn().expect("spawn recorded process");
+        let still_running = RetainedGeneration {
+            processes: vec![recorded(outside.id().expect("live recorded pid"))],
+            ..generation
+        };
+        assert_eq!(
+            restart_custody(&namespace, &still_running).expect("probe recorded process"),
+            RestartCustody::Retained {
+                missing: "windows_process_live"
+            }
+        );
+        outside.kill().await.expect("stop recorded process");
+        assert_eq!(
+            restart_custody(&namespace, &still_running).expect("probe exited process"),
+            RestartCustody::Closed {
+                evidence: "windows_job_closed",
+                orphan_possible: false
             }
         );
     }

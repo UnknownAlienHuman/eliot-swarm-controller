@@ -6175,7 +6175,8 @@ fn verified_restart_closure_releases_only_the_retained_lost_generation() {
 
 #[test]
 fn generations_started_before_the_custody_namespace_are_not_named() {
-    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let path = capacity_store_path();
+    let mut store = Store::open(&path).expect("open persistent Store");
     let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
     let launch = capacity_launch_request(
         "restart-legacy",
@@ -6187,14 +6188,15 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
     store
         .dispatch(&launch_id, now + 1)
         .expect("dispatch launch");
-    // As if this generation started before migration 17 recorded `since_seq`.
+    // Return the file to schema 16, as an older binary left it, and upgrade.
     store
         .connection
-        .execute(
-            "UPDATE store_identity SET since_seq = (SELECT MAX(seq) FROM events)",
-            [],
+        .execute_batch(
+            "DROP TABLE store_identity; DELETE FROM schema_migrations WHERE version = 17;",
         )
-        .expect("move named-custody boundary");
+        .expect("roll back to schema 16");
+    drop(store);
+    let mut store = Store::open(&path).expect("migrate 16 to 17");
     store.recover_on_restart(now + 2).expect("recover");
     let retained = store
         .restart_retained_generations(None)
@@ -6202,6 +6204,8 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
     assert_eq!(retained.len(), 1);
     assert!(!retained[0].named_custody);
     assert!(!store.custody_namespace().expect("namespace").is_empty());
+    drop(store);
+    remove_capacity_store_files(&path);
 }
 
 #[test]
