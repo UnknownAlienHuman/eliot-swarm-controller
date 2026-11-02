@@ -53,6 +53,20 @@ small changes, without starting another rewrite or a new recovery framework.
       shared `max_live` scope. Completion means proven-closed generations can resume or
       free the shared slot, stale closure cannot free a newer reservation, and unresolved
       custody remains explicitly blocked without replaying an input.
+- [ ] **Git fetch failure settlement.** In `git_actions::execute`, after the interruption
+      and custody checks, handle `exit_code = Some(nonzero)` before requiring the private
+      fetched ref. A missing exit status is not a definite nonzero exit. If exact
+      tracking-ref readback still equals the frozen old state, settle `failed`; a missing
+      private ref on that path must not create an indefinite `unknown` repository fence.
+      Preserve unknown custody/readback/CAS outcomes and never retry an uncertain effect.
+      The [Git settlement contract](spec/automation.md#failed-transfer-and-unknown-readback)
+      owns the distinction. Completion means a failed transfer leaves the tracking ref
+      unchanged and permits the next same-repository fetch/worktree operation after
+      settlement; genuinely unknown work still blocks it.
+      Diagnose the separate Linux timer-fetch CI failure by exposing allowlisted Git
+      stage codes in the existing test helper. Its current `other` classification hides
+      the failing branch. Establish the cause before treating a rerun as a fix; keep raw
+      outcomes, native stderr and credentials out of CI logs.
 - [ ] **Unknown-outcome readback/resolution.** Finish the narrow caller-to-result path
       in the [API contract](spec/api.md#input-turn-and-unknown-gates): exact native readback first,
       then constrained owner `command.resolve` / `turn.resolve` and CLI forms where

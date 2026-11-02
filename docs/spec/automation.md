@@ -544,7 +544,19 @@ ref is absent. Freeze rejects a symbolic tracking target, and `--no-deref` preve
 later symbolic ref from redirecting the CAS. A moved remote or failed CAS leaves the real
 tracking ref unchanged; `HEAD`, local branches and the worktree are unchanged.
 
-### Unknown readback
+### Failed transfer and unknown readback
+
+The pending [Git fetch settlement repair](../roadmap.md#repairs-to-implemented-paths)
+must distinguish a definite failed transfer from an uncertain effect. After the existing
+interruption and custody checks, handle `exit_code = Some(nonzero)` before requiring the
+private fetched ref: when exact tracking-ref readback still equals the frozen old state, settle
+`failed`. A missing private ref is expected when the source ref disappears or transfer
+fails; it does not by itself imply that the later tracking-ref CAS may have run. Partial
+object downloads do not imply rollback, and do not require an `unknown` result for a
+known failed transfer. A missing exit status is not a definite nonzero exit. Preserve
+the existing private-ref/OID validation after success and the handling of interrupted
+transfers and unknown custody/readback/CAS outcomes. Keep private-view cleanup after
+durable settlement, using the existing Router/Store path.
 
 After proving the process stopped, read back the tracking ref through the same frozen
 configuration and canonical common directory. Unknown settlement is read-only: it never
