@@ -83,7 +83,7 @@ Use the existing Store/router and small internal modules. Keep evidence in the P
       Follow [sampling work](spec/monitoring.md#sampling-work): preserve identity checks,
       per-owner limits, incomplete samples and honest Unix custody. Measure enumeration
       count and sample age before claiming a latency improvement.
-- [ ] **Unstarted plugin cleanup.** Validate before creating an instance directory where
+- [x] **Unstarted plugin cleanup.** Validate before creating an instance directory where
       possible; clean the exact generated empty directory on pre-spawn errors in
       `PluginHost::start` and partial-create errors in `create_instance_dir`. Use empty-only
       removal as the reader path does. Post-spawn or nonempty plugin data needs its own
