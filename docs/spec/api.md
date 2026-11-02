@@ -85,11 +85,13 @@ rule actions have bounded derived ids. No general receipt/floor framework.
 | `agent.list/get/result` | scoped, paginated Agent state and exact results |
 | `agent.processes/stats` | scoped process records and ephemeral OS samples |
 | `agent.git/edits` | current Git snapshot and paginated native-attributed edits |
-| `command.submit/get/children/resolve` | immutable admission, linked commands, child readback and constrained resolution |
-| `turn.get/resolve` | running/completed/unknown turn; constrained owner assertion |
+| `command.submit/get` | implemented immutable admission and command readback |
+| `turn.get` | implemented running/completed/unknown turn read |
+| `command.children/resolve`, `turn.resolve` | later child readback and constrained owner resolution; no current handlers |
 | `project.list/get` | owner-only read of registered project authority |
 | `rule.get/catch_up` | owner-only rule read and finite committed-history catch-up |
 | `timer.get/run` | owner-only timer read and idempotent manual firing |
+| `provider.holds/clear_hold` | owner-only provider hold readback and constrained correction |
 | `events.read/subscribe` | persisted replay plus bounded live delivery |
 | `agent.discover` | owner-only native metadata discovery, without creating Agents |
 | `agent.history` | owner-only bounded history of an exact observed subject |
@@ -101,6 +103,12 @@ Canonical public wire types are re-exported by
 [`eliot_core::api`](../../crates/eliot-core/src/api.rs). These DTOs and their validators
 define field names, JSON shapes and grammar; this spec owns behavior and authority. Principal
 authentication precedes method parameter validation.
+
+The method inventory includes later-layer methods. `command.children`, `command.resolve`
+and `turn.resolve` are target APIs only and are not registered by the current Router;
+calling them now returns `unsupported`. Their semantics below preserve the intended
+future contract, but do not imply current availability. The same rule applies to later
+methods identified in the Purpose column or by the roadmap.
 
 | Surface | Canonical DTO definitions |
 | --- | --- |
@@ -119,8 +127,9 @@ Errors include
 `busy`, `unavailable`, `capacity_unavailable`, `provider_held`, `history_gap`, `source_integrity`,
 `secret_in_payload`, `frame_too_large`, `mailbox_full`, `internal`.
 
-`capacity_unavailable` is a pre-effect rejection from a configured Eliot `max_live`
-scope, not a vendor quota or entitlement result. A full-cap request is not admitted:
+`capacity_unavailable` is a pre-effect rejection from a retained prior-generation
+reservation or a configured Eliot `max_live` scope, not a vendor quota or entitlement
+result. A capacity-rejected request is not admitted:
 there is no command row to read back, and the same ID may be submitted again once the
 scope frees. Once a command is admitted, its same-ID readback returns the retained result
 and never retries the native effect. Provider-hold methods are defined below;
@@ -372,15 +381,18 @@ effective settings are read back or explicitly resolved. Timeout does not releas
 hold, even when the observed Agent state is idle. This is a predicate over existing
 command rows, not another queue/table. Stop/interrupt/request replies/readback still work.
 
-Owner turn resolution requires exact readback proving it inactive or the generation
-terminal. Future resolution metadata may record `resolution_source=owner`; the current
-`Turn` read object does not expose that field. Resolution remains an owner assertion,
-not a synthetic native completion. Future turn-result metadata retains the planned
-`command_ids` and `usage` fields.
-Owner command resolution is `command.resolve {id, command_id, as: applied|failed,
-reason}`; it records an owner assertion, never a native receipt, and releases only the
-relevant hold. `turn.resolve` likewise takes a mutation id, Agent/generation/turn,
+The target contract for future owner turn resolution requires exact readback proving it
+inactive or the generation terminal. Future resolution metadata may record
+`resolution_source=owner`; the current `Turn` read object does not expose that field.
+Resolution remains an owner assertion, not a synthetic native completion. Future
+turn-result metadata retains the planned `command_ids` and `usage` fields.
+The target contract for future owner command resolution is
+`command.resolve {id, command_id, as: applied|failed, reason}`; it records an owner
+assertion, never a native receipt, and releases only the relevant hold. Future
+`turn.resolve` likewise takes a mutation id, Agent/generation/turn,
 terminal status and reason; it cannot bypass the inactive/terminal precondition.
+Neither assertion establishes process closure or overrides a
+[capacity reservation](configuration.md#accounts-and-configured-capacity).
 Known failure can include partial effects; it never implies rollback or automatic retry.
 
 ## Provider holds
@@ -603,6 +615,7 @@ services. Degraded Unix reports possible orphans, not exact clean success.
 
 All commands accept `--json` and `--data-dir`; every mutation accepts `--id`.
 Generation/turn/request flags are optional for immediate calls, explicit for delayed ones.
+The synopsis is target grammar; later-layer forms are not an inventory of current help.
 
 ```text
 eliot daemon [--foreground]
@@ -641,6 +654,10 @@ eliot provider holds [--after SCOPE] [--limit N]
 eliot provider clear-hold SCOPE --corrective-evidence credentials_updated|configuration_updated|owner_verified [--expected-probe-command ID]
 eliot plugin NAME | plugin-test ... | hook ... | mcp
 ```
+
+In particular, `turn resolve` and `cmd children|cancel|resolve` are not implemented CLI
+forms. `turn show` and `cmd show` are available. The deferred resolution and child-read
+semantics above do not make those command forms callable today.
 
 Only current-layer commands appear in help and Agent guidance. Exit codes: 0 success/
 queued; 1 definite failure; 2 usage; 3 pre-effect rejection; 4 unknown; 5 wait timeout;

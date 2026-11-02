@@ -498,10 +498,30 @@ paired-null handoff columns, but not every semantic binding. This handoff readba
 available through the authenticated private `source.state` request only; public Agent
 `source_states` owner rows and their DTO do not expose the ACK or digest.
 
+## Retention
+
+The [physical retention increment](../roadmap.md#l7--qualification-repair-and-release)
+is pending. The following is its contract; bounded read pages alone do not bound stored
+history.
+
+Cleanup uses bounded batches through the existing Store writer. Delete only an expired,
+contiguous event prefix below every enabled current/retiring rule cursor. A lagging rule
+releases its pin only through the ordinary atomic backlog skip/pause transition. Advance
+`rule_history_coverage.pruned_through` in the same transaction as deletion, so replay and
+explicit catch-up return `history_gap` instead of silently omitting events. Never reset
+the event id allocator or reconstruct old subjects from current Agent state.
+
 Current projections and source recovery state outlive ordinary event retention. A new
 batch replaces only its last-batch acknowledgement. Retained event/native-id history is
 not an unlimited replay permit: cursor/no-cursor recovery obeys the protocol.
+Do not discard native deduplication bindings while an accepted replay/recovery path can
+still refer to them. Preserve each source's latest committed batch ACK/digest, cursor,
+gap and handoff ACK even when ordinary event rows expire.
 
 Retain parent/child command sets while required by open work or the supported history
 window; prune the set transactionally, children before parent, so callers never see a
-partly pruned expansion. Once gone, `command.children` returns `history_gap`.
+partly pruned expansion. Keep any set containing accepted, queued, dispatched or unknown
+work. Retain command bindings/results in `commands` and other mutation bindings/results
+in `writes` for at least the supported retry window. Cleanup must not make an accepted
+id look new or replay an external effect.
+Once a complete expansion is gone, the target `command.children` API returns `history_gap`.

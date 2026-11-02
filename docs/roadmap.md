@@ -38,6 +38,41 @@ an arbitrary line limit. The target architecture is a ceiling on concepts, not a
 to create every crate/table immediately. Keep test/check evidence in PRs and CI, not in
 per-task report packets or another status registry.
 
+## Repairs to implemented paths
+
+**Next:** the recovery repairs below, starting with capacity, then L4.2. Checked layers record
+delivered increments; they do not imply complete crash recovery or L7 qualification.
+Keep these repairs on the existing command/Store path. Refactor the affected owners in
+small changes, without starting another rewrite or a new recovery framework.
+
+- [ ] **Restart capacity recovery.** Connect daemon replacement to exact prior-generation
+      custody reconciliation and conditional reservation release/transfer, using the
+      [capacity contract](spec/configuration.md#accounts-and-configured-capacity).
+      `lost` currently retains the old reservation without a general recovery path:
+      it blocks that Agent's resume even without a configured cap, and can exhaust a
+      shared `max_live` scope. Completion means proven-closed generations can resume or
+      free the shared slot, stale closure cannot free a newer reservation, and unresolved
+      custody remains explicitly blocked without replaying an input.
+- [ ] **Unknown-outcome readback/resolution.** Finish the narrow caller-to-result path
+      in the [API contract](spec/api.md#input-turn-and-unknown-gates): exact native readback first,
+      then constrained owner `command.resolve` / `turn.resolve` and CLI forms where
+      readback permits them. Cover a send whose native reply lost its turn association;
+      do not invent a turn id, native receipt or successful result. Release only the
+      resolved command/turn gate; capacity still requires independent closure evidence.
+      Keep these methods advertised as deferred until their handlers exist.
+- [ ] **Separate existing responsibilities.** Extract Store admission/dispatch and Router
+      command execution before adding more branches to those owners. Separate timer
+      scheduling and event-rule traversal where they share only storage plumbing.
+      [Architecture](architecture.md#internal-module-boundaries) names the boundaries;
+      retain transaction/effect ordering and the one writer/router. No crate/trait/LOC
+      target or parallel executor.
+- [ ] **Reconcile historical issues.** Revalidate #200 against the current generation
+      model; its pre-reset binding allocator/validator design is not an implementation
+      dependency. Mark the v1 work in #1, #3, #4, #5, #11, #140, #153 and #159 historical
+      or superseded after preserving any still-relevant requirement in its owning spec
+      and current layer. Keep #199 a proposed Later extension. Open issue text must not
+      silently restore the archived runtime or override this build order.
+
 ## L0 — Archive and smallest workspace
 
 - [x] **L0.1 Archive/reset.** v1 is preserved on branch `archive/v1-final` at
@@ -49,8 +84,6 @@ per-task report packets or another status registry.
       free `eliot` binary with help/version. CI runs fmt, scoped Clippy and brief
       help/version smoke commands on Windows/Ubuntu. No empty framework crates or
       test platform.
-
-**Next:** L4.2 actions/scripts.
 
 ## L1 — Core, Store, bus and one fake command path
 
@@ -144,6 +177,10 @@ No second executor, workflow graph or acceptance engine.
       Frozen inputs, scoped principal, exit/output handling and unknown outcomes use
       normal commands. Add Git fetch/push wrappers only with their concrete recipe;
       direct harness Git remains harness work, not intercepted by Eliot.
+      Agent actions, bounded Run scripts and `git.fetch` are connected; the remaining
+      wrappers stay unsupported as specified in [automation](spec/automation.md).
+      Add bounded `command.children` readback for retained expansions through the same
+      Router/CLI before advertising that target API.
 - [ ] **L4.3 Goals/requests.** Native Goal where installed Codex supports it; Eliot
       continuation/checks with turn/cost/no-progress limits. No check runs under the
       Store lock. Neither a failed check nor a missing terminal fact authorizes replay.
@@ -192,9 +229,16 @@ or speculative remote/GUI/service feature.
 
 ## L7 — Qualification, repair and release
 
-Now build/run the complete campaign against the connected product. Keep results in the
-PR/CI, not a permanent audit/readiness hierarchy.
+Implement the bounded retention path first, then build/run the complete campaign against
+the connected product. Keep results in the PR/CI, not a permanent audit/readiness hierarchy.
 
+- [ ] **Physical retention.** Wire retention settings to bounded Store cleanup invoked
+      by daemon maintenance. Implement event-prefix pruning and atomic command/child
+      cleanup under the [Core retention contract](spec/core.md#retention), including the
+      rule history floor, replay/idempotency window and source recovery dependencies.
+      Current bounded queries and rule backlog handling do not delete event/command
+      history. Keep open/unknown work and current projections; no full rewrite, forced
+      unknown resolution or separate cleanup ledger.
 - [ ] Core/Store/API/reducer and event replay, including retention and non-reused ids.
 - [ ] CLI fake E2E, exact generations/turns/requests, queue ordering and unknown outcomes.
 - [ ] Crash at admission, native effect, event commit, reply and source-drain boundaries;

@@ -48,9 +48,13 @@ permissions = "workspace-write"
 pass_env = ["CODEX_HOME"]
 ```
 
-The profile author supplies an exact model string. Eliot does not call `model/list`,
-check provider entitlement, or issue an inference probe to resolve it. An unavailable
-model fails explicitly; it does not trigger route or account fallback.
+The profile author supplies an exact model string. On the direct ChatGPT Codex route,
+the Codex plugin uses native `model/list` to look up that exact model and its supported
+reasoning efforts; a missing catalog entry fails startup explicitly. On an explicitly
+configured Responses route, the plugin skips that lookup and uses the explicit effort;
+provider rejection is surfaced when the native operation reports it. Neither route
+issues a separate inference or entitlement probe, or selects another model, route or
+account automatically.
 [`Codex`](../harnesses/codex.md#first-useful-path) owns native bring-up steps. Existing
 workspace and owner login suffice; no proxy/account registry is mandatory.
 
@@ -299,8 +303,9 @@ database root or scope; native configuration can affect selection.
 For a new Codex launch, resolve the effective store only after the actual workspace is
 prepared, including setup. The owned read-only
 [`profile.store`](../../crates/eliot-plugin/src/protocol.rs) reader uses that workspace
-and the admitted inputs. Eliot itself issues no model/list, entitlement or inference
-probe. Native app-server startup may make a vendor-owned read-only model-catalog GET,
+and the admitted inputs. This metadata reader issues no `model/list`, entitlement or
+inference probe; direct ChatGPT control startup uses the catalog lookup described under
+[First profile](#first-profile). Native app-server startup may make a vendor-owned read-only model-catalog GET,
 normally to the selected provider base URL. A supported absolute `model_catalog_url`
 can redirect that request to another host, potentially with native client authentication;
 route admission must pin it to the selected provider or suppress it before process birth.
@@ -402,6 +407,30 @@ released only after the owned generation is proven closed. Uncertain starts reta
 reservation across daemon replacement. These limits describe Eliot's admitted workload,
 not vendor entitlements, account permissions or provider quotas. Fake profiles may use
 named profile/account caps; Fake does not acquire a proxy route.
+
+The pending [restart recovery repair](../roadmap.md#repairs-to-implemented-paths) must
+connect retained reservations to a supported reconciliation path. Capture the old
+Agent/generation and its recorded process/custody identity; recover exact closure facts
+outside the Store lock. Reuse existing process/source state and capacity helpers;
+persist only any missing custody identity needed by this path, before the native start
+it identifies. Do not introduce a separate proof ledger.
+
+Closure and source coverage are independent: drain recoverable data and commit native
+terminal facts first, or record an explicit gap for the lost tail. Only after this source
+reconciliation, commit the independently verified custody closure and release/transfer
+in one Store transaction conditional on `capacity_generation` still equaling that old
+generation. A gap, a stale/closed source, an Agent marked `lost`, a timeout or cleared
+provider hold never proves custody closed or a turn complete. Do not replay an uncertain
+launch/send or turn unknown work into a successful result to reclaim a slot.
+
+Use the [platform custody rules](monitoring.md#process-identity-and-custody). A PID being
+absent and the current estimated Windows boot marker are insufficient by themselves;
+Windows recovery needs verifiable Job/process closure. Degraded Unix may retain possible
+escaped descendants. If closure cannot be established, retain the reservation and show
+the blocking Agent/generation and missing evidence in existing owner readback. Later
+exact native terminal-session evidence accepted by existing settlement, or separately
+verified custody closure, may settle it. An owner command/turn assertion is not a capacity
+override. Do not count unknown reservations as free slots.
 
 Provider holds are durable Eliot state over the named local scope derived from the frozen
 route, account or profile. They do not infer vendor account identity, entitlement or
