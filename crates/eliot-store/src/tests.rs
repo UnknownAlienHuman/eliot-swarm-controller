@@ -2718,7 +2718,7 @@ fn project_registration_migration_defaults_legacy_run_authority_to_deny() {
             row.get(0)
         })
         .expect("read Store migration version");
-    assert_eq!(version, 16);
+    assert_eq!(version, super::CURRENT_SCHEMA_VERSION);
     let legacy = store
         .get_project_registration("owner", "legacy-run")
         .expect("read migrated registration")
@@ -6075,6 +6075,133 @@ fn unknown_start_capacity_survives_recovery_and_store_reopen() {
         );
     }
     remove_capacity_store_files(&path);
+}
+
+#[test]
+fn verified_restart_closure_releases_only_the_retained_lost_generation() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let scopes = |profile: &str| {
+        json!([
+            {"scope": format!("profile:{profile}"), "max_live": null},
+            {"scope": "account:restart-shared", "max_live": 1}
+        ])
+    };
+    let launch = capacity_launch_request("restart-first", "restart-first", scopes("restart-first"));
+    let launch_id = launch.id.clone();
+    let agent = store
+        .submit("owner", launch, now)
+        .expect("admit launch")
+        .command
+        .target
+        .expect("launch Agent");
+    store
+        .dispatch(&launch_id, now + 1)
+        .expect("dispatch launch");
+    store
+        .settle(
+            &launch_id,
+            CommandState::Unknown,
+            Some(json!({"reason":"start_readback_unknown"})),
+            now + 2,
+        )
+        .expect("retain uncertain native start");
+    store.recover_on_restart(now + 3).expect("recover");
+
+    let retained = store
+        .restart_retained_generations(None)
+        .expect("read retained generations");
+    assert_eq!(retained.len(), 1);
+    assert_eq!(
+        (retained[0].agent.as_str(), retained[0].generation),
+        (agent.as_str(), 1)
+    );
+    assert!(retained[0].named_custody);
+    assert!(retained[0].processes.is_empty());
+    assert!(
+        store
+            .restart_retained_generations(Some(&agent))
+            .expect("read next page")
+            .is_empty()
+    );
+
+    let notice = store
+        .record_restart_capacity_retained(&agent, 1, "windows_job_live", now + 5)
+        .expect("record retained reservation");
+    assert_eq!(notice.len(), 1);
+    assert_eq!(notice[0].kind, "capacity.retained");
+    assert_eq!(notice[0].data["missing"], "windows_job_live");
+
+    // Closure for any other generation cannot touch the retained slot.
+    assert!(
+        store
+            .release_restart_closed_generation(&agent, 2, "windows_job_closed", false, now + 6)
+            .expect("stale closure")
+            .is_empty()
+    );
+    assert_eq!(capacity_generation(&store, &agent), Some(1));
+    let other =
+        || capacity_launch_request("restart-other", "restart-other", scopes("restart-other"));
+    assert_eq!(
+        store.submit("owner", other(), now + 7).unwrap_err().code,
+        "capacity_unavailable"
+    );
+
+    let released = store
+        .release_restart_closed_generation(&agent, 1, "unix_group_empty", true, now + 8)
+        .expect("release verified closure");
+    assert_eq!(released.len(), 1);
+    assert_eq!(released[0].kind, "capacity.released");
+    assert_eq!(released[0].data["reason"], "restart_custody_closed");
+    assert_eq!(released[0].data["evidence"], "unix_group_empty");
+    assert_eq!(released[0].data["orphan_possible"], true);
+    assert_eq!(capacity_generation(&store, &agent), None);
+    assert!(
+        store
+            .restart_retained_generations(None)
+            .expect("nothing retained")
+            .is_empty()
+    );
+    assert!(
+        store
+            .release_restart_closed_generation(&agent, 1, "unix_group_empty", true, now + 9)
+            .expect("repeated closure")
+            .is_empty()
+    );
+    store
+        .submit("owner", other(), now + 10)
+        .expect("shared scope admits after verified closure");
+}
+
+#[test]
+fn generations_started_before_the_custody_namespace_are_not_named() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let launch = capacity_launch_request(
+        "restart-legacy",
+        "restart-legacy",
+        json!([{"scope":"profile:restart-legacy","max_live":null}]),
+    );
+    let launch_id = launch.id.clone();
+    store.submit("owner", launch, now).expect("admit launch");
+    store
+        .dispatch(&launch_id, now + 1)
+        .expect("dispatch launch");
+    // As if this generation started before migration 17 recorded `since_seq`.
+    store
+        .connection
+        .execute(
+            "UPDATE store_identity SET since_seq = (SELECT MAX(seq) FROM events)",
+            [],
+        )
+        .expect("move named-custody boundary");
+    store.recover_on_restart(now + 2).expect("recover");
+    let retained = store
+        .restart_retained_generations(None)
+        .expect("read retained generations");
+    assert_eq!(retained.len(), 1);
+    assert!(!retained[0].named_custody);
+    assert!(!store.custody_namespace().expect("namespace").is_empty());
 }
 
 #[test]

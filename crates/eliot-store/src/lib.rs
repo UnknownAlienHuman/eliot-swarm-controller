@@ -9,6 +9,7 @@ mod provider_holds;
 mod rules;
 mod scripts;
 
+pub use capacity::{RecordedProcess, RetainedGeneration};
 pub use projects::ProjectRegistrationInput;
 pub use rules::{
     RuleCatchUpAction, RuleCatchUpActionOutcome, RuleCatchUpAdmission, RuleCursorOutcome,
@@ -40,7 +41,7 @@ const MAX_EVENT_BYTES: usize = 64 * 1024;
 const MAX_INPUT_BYTES: usize = 512 * 1024;
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const RETRY_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
-const CURRENT_SCHEMA_VERSION: i64 = 16;
+const CURRENT_SCHEMA_VERSION: i64 = 17;
 const COMMAND_METHOD: &str = "command.submit";
 const INITIAL_SOURCE: &str = "stream";
 const PROCESS_SOURCE: &str = "os";
@@ -584,7 +585,7 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
-        if current < CURRENT_SCHEMA_VERSION {
+        if current < 16 {
             let tx = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -599,6 +600,15 @@ impl Store {
                  INSERT INTO schema_migrations(version) VALUES (16);",
             )
             .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < CURRENT_SCHEMA_VERSION {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            capacity::create_store_identity_tx(&tx)?;
+            db!(tx.execute("INSERT INTO schema_migrations(version) VALUES (17)", []));
             tx.commit().map_err(sql_error)?;
         }
         Ok(())

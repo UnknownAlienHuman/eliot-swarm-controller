@@ -12587,3 +12587,63 @@ fn cli_fake_launch_actions_cover_owner_project_event_scheduled_manual_and_replay
     }
     fixture.stop(false);
 }
+
+#[test]
+fn restart_releases_lost_generation_capacity_once_its_custody_closed() {
+    let mut fixture = Fixture::new("restart capacity");
+    fixture.start();
+    let launched = fixture.json(&[
+        "launch",
+        "--profile",
+        "fake",
+        "--workspace",
+        fixture.workspace.to_str().unwrap(),
+    ]);
+    assert_eq!(launched["state"], "applied");
+    let agent = launched["target"]
+        .as_str()
+        .expect("launched Agent")
+        .to_owned();
+
+    fixture.kill_daemon();
+    fixture.start();
+    // Windows proves closure at startup; a Unix plugin group may exit later.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let released = loop {
+        let events = fixture.events();
+        if let Some(event) = events.iter().find(|event| {
+            event["kind"] == "capacity.released"
+                && event["agent"] == agent.as_str()
+                && event["generation"] == 1
+        }) {
+            break event.clone();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "restart kept the lost generation's capacity: {:?}",
+            events
+                .iter()
+                .filter(|event| event["kind"] == "capacity.retained")
+                .collect::<Vec<_>>()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(released["data"]["reason"], "restart_custody_closed");
+    assert_eq!(
+        released["data"]["orphan_possible"],
+        !cfg!(windows),
+        "{released}"
+    );
+
+    let resume_id = ulid::Ulid::new().to_string();
+    let resume = cli(&fixture.data, &["--id", &resume_id, "resume", &agent]);
+    assert!(
+        resume.status.success(),
+        "resume after restart: {}",
+        resume.stderr
+    );
+    let resumed = fixture.wait_command(&resume_id, "applied");
+    assert_eq!(resumed["generation"], 2);
+    // Drain would wait for the live resumed generation.
+    fixture.stop(true);
+}

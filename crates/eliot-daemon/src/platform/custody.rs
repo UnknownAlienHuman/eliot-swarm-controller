@@ -173,44 +173,74 @@ impl OwnedChild {
         }
     }
 
-    fn spawn_with_policy(mut command: Command, leaf: bool) -> Result<Self> {
+    /// Start one Agent generation's plugin in custody that a later daemon can
+    /// check after replacement: a Job named from the Store custody namespace on
+    /// Windows, or a Unix group whose recorded leader identifies it.
+    pub fn spawn_agent(
+        command: Command,
+        namespace: &str,
+        agent: &str,
+        generation: i64,
+    ) -> Result<Self> {
         #[cfg(windows)]
         {
-            use std::os::windows::process::CommandExt;
-            use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
+            let name = agent_custody_name(namespace, agent, generation);
+            Self::spawn_in_job(
+                command,
+                super::windows::Job::new_named_kill_on_close(&name)?,
+            )
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (namespace, agent, generation);
+            Self::spawn(command)
+        }
+    }
 
+    #[cfg(windows)]
+    fn spawn_in_job(mut command: Command, job: super::windows::Job) -> Result<Self> {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
+
+        command
+            .as_std_mut()
+            .creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW);
+        let mut child = command
+            .spawn()
+            .map_err(|error| io_error("spawn suspended child", error))?;
+        let process = match child.raw_handle() {
+            Some(process) => process,
+            None => {
+                let _ = child.start_kill();
+                return Err(Error::new(
+                    "process_handle_unavailable",
+                    "Tokio did not expose the suspended child process handle",
+                ));
+            }
+        };
+        job.assign_then_resume(process)?;
+        Ok(Self {
+            job,
+            child,
+            observation: std::sync::Mutex::new(None),
+        })
+    }
+
+    fn spawn_with_policy(command: Command, leaf: bool) -> Result<Self> {
+        #[cfg(windows)]
+        {
             let job = if leaf {
                 super::windows::Job::new_leaf()?
             } else {
                 super::windows::Job::new_kill_on_close()?
             };
-            command
-                .as_std_mut()
-                .creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW);
-            let mut child = command
-                .spawn()
-                .map_err(|error| io_error("spawn suspended child", error))?;
-            let process = match child.raw_handle() {
-                Some(process) => process,
-                None => {
-                    let _ = child.start_kill();
-                    return Err(Error::new(
-                        "process_handle_unavailable",
-                        "Tokio did not expose the suspended child process handle",
-                    ));
-                }
-            };
-            job.assign_then_resume(process)?;
-            Ok(Self {
-                job,
-                child,
-                observation: std::sync::Mutex::new(None),
-            })
+            Self::spawn_in_job(command, job)
         }
 
         #[cfg(unix)]
         {
             let _ = leaf;
+            let mut command = command;
             command.process_group(0);
             let child = command
                 .spawn()
@@ -320,6 +350,111 @@ impl Drop for OwnedChild {
         if let Some(identity) = self.identity.as_ref() {
             let _ = super::unix::terminate_process_group(identity);
         }
+    }
+}
+
+/// What a replacement daemon can establish about an earlier daemon's Agent
+/// custody, read from the OS without holding the Store lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestartCustody {
+    /// No custody member can still run; Unix cannot exclude escaped descendants.
+    Closed {
+        evidence: &'static str,
+        orphan_possible: bool,
+    },
+    /// Closure is not proven, so the reservation stays; names the missing proof.
+    Retained { missing: &'static str },
+}
+
+#[cfg(windows)]
+fn agent_custody_name(namespace: &str, agent: &str, generation: i64) -> String {
+    // Global, not session-local: a daemon restarted in another logon session
+    // must not mistake a still-live Job for a missing one.
+    format!("Global\\eliot-{namespace}-{agent}-{generation}")
+}
+
+/// Check the custody of a generation that an earlier daemon started.
+pub fn restart_custody(
+    namespace: &str,
+    generation: &eliot_store::RetainedGeneration,
+) -> Result<RestartCustody> {
+    #[cfg(windows)]
+    {
+        if !generation.named_custody {
+            return Ok(RestartCustody::Retained {
+                missing: "named_custody_unrecorded",
+            });
+        }
+        let name = agent_custody_name(namespace, &generation.agent, generation.generation);
+        Ok(if super::windows::named_job_closed(&name)? {
+            RestartCustody::Closed {
+                evidence: "windows_job_closed",
+                orphan_possible: false,
+            }
+        } else {
+            RestartCustody::Retained {
+                missing: "windows_job_live",
+            }
+        })
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = namespace;
+        let boot = super::unix::host_boot_id()?;
+        let mut leader = None;
+        let mut current_boot = false;
+        for process in &generation.processes {
+            if process.identity.host_boot_id != boot {
+                continue;
+            }
+            current_boot = true;
+            if !process.exited
+                && super::unix::recorded_process_alive(
+                    process.identity.pid,
+                    process.identity.start_time,
+                )?
+            {
+                return Ok(RestartCustody::Retained {
+                    missing: "unix_process_live",
+                });
+            }
+            if process.role == "plugin" {
+                leader = Some(process.identity.pid);
+            }
+        }
+        if generation.processes.is_empty() {
+            return Ok(RestartCustody::Retained {
+                missing: "unix_process_identity_unrecorded",
+            });
+        }
+        if !current_boot {
+            return Ok(RestartCustody::Closed {
+                evidence: "host_rebooted",
+                orphan_possible: false,
+            });
+        }
+        let Some(leader) = leader else {
+            return Ok(RestartCustody::Retained {
+                missing: "unix_group_leader_unrecorded",
+            });
+        };
+        Ok(if super::unix::recorded_process_group_empty(leader)? {
+            RestartCustody::Closed {
+                evidence: "unix_group_empty",
+                orphan_possible: true,
+            }
+        } else {
+            RestartCustody::Retained {
+                missing: "unix_group_live",
+            }
+        })
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = (namespace, generation);
+        Ok(RestartCustody::Retained {
+            missing: "custody_unsupported",
+        })
     }
 }
 
@@ -441,4 +576,147 @@ mod leaf_tests {
 
 fn io_error(action: &str, error: std::io::Error) -> Error {
     Error::new("platform_io", format!("{action}: {error}"))
+}
+
+#[cfg(all(test, any(windows, target_os = "linux")))]
+mod restart_custody_tests {
+    use super::{OwnedChild, RestartCustody, restart_custody};
+    use eliot_store::RetainedGeneration;
+    use std::{process::Stdio, time::Duration};
+    use tokio::process::Command;
+
+    fn long_running() -> Command {
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("cmd.exe");
+            command.args(["/d", "/c", "ping -n 60 127.0.0.1 >NUL"]);
+            command
+        };
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = Command::new("sleep");
+            command.arg("60");
+            command
+        };
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        command
+    }
+
+    async fn eventually_closed(namespace: &str, generation: &RetainedGeneration) -> RestartCustody {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let custody = restart_custody(namespace, generation).expect("probe custody");
+            if matches!(custody, RestartCustody::Closed { .. })
+                || tokio::time::Instant::now() >= deadline
+            {
+                return custody;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn named_agent_job_is_retained_while_live_and_closed_after_its_owner_drops_it() {
+        let namespace = ulid::Ulid::new().to_string();
+        let generation = RetainedGeneration {
+            agent: "a1".to_owned(),
+            generation: 3,
+            named_custody: true,
+            processes: Vec::new(),
+        };
+        let child = OwnedChild::spawn_agent(long_running(), &namespace, "a1", 3)
+            .expect("spawn named Agent custody");
+        assert_eq!(
+            restart_custody(&namespace, &generation).expect("probe live custody"),
+            RestartCustody::Retained {
+                missing: "windows_job_live"
+            }
+        );
+        let duplicate = OwnedChild::spawn_agent(long_running(), &namespace, "a1", 3)
+            .err()
+            .expect("an existing custody name is never adopted");
+        assert_eq!(duplicate.code, "process_custody_conflict");
+
+        drop(child);
+        assert_eq!(
+            eventually_closed(&namespace, &generation).await,
+            RestartCustody::Closed {
+                evidence: "windows_job_closed",
+                orphan_possible: false
+            }
+        );
+        let unnamed = RetainedGeneration {
+            named_custody: false,
+            ..generation
+        };
+        assert_eq!(
+            restart_custody(&namespace, &unnamed).expect("probe unnamed custody"),
+            RestartCustody::Retained {
+                missing: "named_custody_unrecorded"
+            }
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn recorded_unix_leader_is_retained_while_live_and_closed_after_its_group_empties() {
+        use eliot_core::ProcessIdentity;
+        use eliot_store::RecordedProcess;
+
+        let mut child = OwnedChild::spawn_agent(long_running(), "unused", "a1", 3)
+            .expect("spawn Agent process group");
+        let pid = child.child.id().expect("live leader pid");
+        let leader = RecordedProcess {
+            identity: ProcessIdentity {
+                host_boot_id: super::super::unix::host_boot_id().expect("boot id"),
+                pid,
+                start_time: super::super::unix::linux_start_ticks(pid),
+            },
+            role: "plugin".to_owned(),
+            exited: false,
+        };
+        let generation = RetainedGeneration {
+            agent: "a1".to_owned(),
+            generation: 3,
+            named_custody: true,
+            processes: vec![leader.clone()],
+        };
+        assert_eq!(
+            restart_custody("unused", &generation).expect("probe live group"),
+            RestartCustody::Retained {
+                missing: "unix_process_live"
+            }
+        );
+
+        child.terminate().expect("terminate group");
+        child.wait().await.expect("reap leader");
+        assert_eq!(
+            eventually_closed("unused", &generation).await,
+            RestartCustody::Closed {
+                evidence: "unix_group_empty",
+                orphan_possible: true
+            }
+        );
+        let mut earlier_boot = leader;
+        earlier_boot.identity.host_boot_id = "earlier-boot".to_owned();
+        assert_eq!(
+            restart_custody(
+                "unused",
+                &RetainedGeneration {
+                    processes: vec![earlier_boot],
+                    ..generation
+                }
+            )
+            .expect("probe earlier boot"),
+            RestartCustody::Closed {
+                evidence: "host_rebooted",
+                orphan_possible: false
+            }
+        );
+    }
 }

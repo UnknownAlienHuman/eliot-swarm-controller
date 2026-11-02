@@ -12,7 +12,7 @@ pub(crate) mod unix;
 #[cfg(windows)]
 pub(crate) mod windows;
 
-pub use custody::{CustodyGuarantee, OwnedChild};
+pub use custody::{CustodyGuarantee, OwnedChild, RestartCustody, restart_custody};
 pub use data_dir::DataDir;
 pub use ipc::{IpcListener, IpcStream};
 pub use process_observation::CustodyObserver;

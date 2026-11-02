@@ -17,8 +17,9 @@ use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, FILETIME, HANDLE,
-    HLOCAL, INVALID_HANDLE_VALUE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, DuplicateHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND,
+    ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, FILETIME, GetLastError, HANDLE, HLOCAL,
+    INVALID_HANDLE_VALUE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -41,8 +42,8 @@ use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_PROCESS_ID_LIST,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicProcessIdList,
-    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
-    TerminateJobObject,
+    JobObjectExtendedLimitInformation, OpenJobObjectW, QueryInformationJobObject,
+    SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::Pipes::{
     CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
@@ -612,20 +613,43 @@ impl Job {
     /// Source: v1 donor dc6f70aa, process_group.rs. This uses only its Job
     /// Object lifetime/assignment mechanism; process schemas and wrappers stay local.
     pub(crate) fn new_kill_on_close() -> Result<Self> {
-        Self::new_with_leaf_limit(false)
+        Self::new_with_leaf_limit(false, None)
+    }
+
+    /// A kill-on-close Job whose name lets a later daemon prove it closed.
+    /// An existing object with that name is never adopted as custody.
+    pub(crate) fn new_named_kill_on_close(name: &str) -> Result<Self> {
+        Self::new_with_leaf_limit(false, Some(name))
     }
 
     pub(crate) fn new_leaf() -> Result<Self> {
-        Self::new_with_leaf_limit(true)
+        Self::new_with_leaf_limit(true, None)
     }
 
-    fn new_with_leaf_limit(leaf: bool) -> Result<Self> {
-        // SAFETY: null attributes/name request a private unnamed Job Object.
-        let handle = unsafe { CreateJobObjectW(null(), null()) };
+    fn new_with_leaf_limit(leaf: bool, name: Option<&str>) -> Result<Self> {
+        let name = name.map(|name| {
+            OsStr::new(name)
+                .encode_wide()
+                .chain(Some(0))
+                .collect::<Vec<u16>>()
+        });
+        // SAFETY: null attributes request default security; the name is either
+        // null (private Job) or a NUL-terminated buffer that outlives the call.
+        let handle =
+            unsafe { CreateJobObjectW(null(), name.as_ref().map_or(null(), |name| name.as_ptr())) };
         if handle.is_null() {
             return Err(io_error(
                 "create process Job Object",
                 std::io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: GetLastError reads this thread's error from the call above.
+        if name.is_some() && unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            // SAFETY: handle was opened above and is not shared.
+            unsafe { CloseHandle(handle) };
+            return Err(Error::new(
+                "process_custody_conflict",
+                "a Job Object with this custody name already exists",
             ));
         }
 
@@ -711,6 +735,28 @@ impl Drop for Job {
         // SAFETY: this object uniquely owns the handle.
         unsafe { CloseHandle(self.handle) };
     }
+}
+
+/// Whether a named custody Job no longer contains any process. A missing name
+/// means the kernel destroyed the Job, which needs every member to have exited.
+pub(crate) fn named_job_closed(name: &str) -> Result<bool> {
+    let wide: Vec<u16> = OsStr::new(name).encode_wide().chain(Some(0)).collect();
+    // JOB_OBJECT_QUERY (0x0004); see Job::observer.
+    // SAFETY: `wide` is a NUL-terminated name that outlives the call.
+    let handle = unsafe { OpenJobObjectW(0x0004, 0, wide.as_ptr()) };
+    if handle.is_null() {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) {
+            Ok(true)
+        } else {
+            Err(io_error("open recorded custody Job Object", error))
+        };
+    }
+    let members = job_members(handle);
+    // SAFETY: handle was opened above and is not shared.
+    unsafe { CloseHandle(handle) };
+    let (pids, complete) = members?;
+    Ok(complete && pids.is_empty())
 }
 
 struct QueryHandle(HANDLE);

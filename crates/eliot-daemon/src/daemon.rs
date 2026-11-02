@@ -4,6 +4,7 @@ use crate::{
     common::now_ms,
     logging,
     platform::{DataDir, IpcListener, IpcStream, data_dir::DaemonLock},
+    restart_capacity,
     router::Router,
 };
 use eliot_core::{
@@ -75,6 +76,10 @@ async fn run_owned(
         events
     };
     router.note_events(&recovered);
+    let (custody_namespace, retained) = restart_capacity::retained(&store).await?;
+    let retained =
+        restart_capacity::reconcile(&store, &bus, &router, &custody_namespace, retained, true)
+            .await?;
     let automation_config = crate::config::load_automation_config(data_dir.path())?;
     // Parse global definitions and seed only new rules before publishing ready.
     let (global_rules, initial_deferred_notice) =
@@ -94,6 +99,18 @@ async fn run_owned(
     let mut recovery = JoinSet::new();
     let recovery_router = router.clone();
     recovery.spawn(async move { recovery_router.recover_workspaces().await });
+    // Dropped with this function, which aborts a recheck still waiting.
+    let mut capacity_recheck = JoinSet::new();
+    if !retained.is_empty() {
+        capacity_recheck.spawn(restart_capacity::recheck(
+            Arc::clone(&store),
+            bus.clone(),
+            router.clone(),
+            custody_namespace,
+            retained,
+            Arc::clone(&policy),
+        ));
+    }
     let (automation_stop, automation_shutdown) = watch::channel(false);
     let mut automation_tasks = JoinSet::new();
     let rule_router = router.clone();

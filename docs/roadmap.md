@@ -40,11 +40,10 @@ per-task report packets or another status registry.
 
 ## Repairs to implemented paths
 
-**Next:** repair capacity and Git settlement, then the remaining current-path work below
-and L4.2. Checked layers record delivered increments, not full crash/load qualification.
+**Next:** the remaining current-path repairs below, then L4.2. Checked layers record delivered increments, not full crash/load qualification.
 Use the existing Store/router and small internal modules. Keep evidence in the PR/CI.
 
-- [ ] **Restart capacity recovery.** Reconcile exact prior-generation custody and release
+- [x] **Restart capacity recovery.** Reconcile exact prior-generation custody and release
       or transfer the reservation under the [capacity contract](spec/configuration.md#accounts-and-configured-capacity).
       A retained old slot currently blocks resume even without a cap and can exhaust a
       shared scope. Completion: proven closure frees/transfers that slot, stale closure

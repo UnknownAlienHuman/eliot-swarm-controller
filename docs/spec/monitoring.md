@@ -71,6 +71,8 @@ using that service.
 
 - create suspended, assign per-Agent/action Job without breakaway, then resume;
 - daemon-owned stdio Jobs use kill-on-close;
+- an Agent generation's Job has a name derived from the Store custody namespace, so a
+  replacement daemon can prove it closed ([restart recovery](configuration.md#accounts-and-configured-capacity));
 - services that must survive daemon restart use separate service custody;
 - force-stop waits for the Job to become empty and verifies recorded process identities.
 
