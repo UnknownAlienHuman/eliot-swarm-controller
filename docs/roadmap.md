@@ -38,6 +38,62 @@ an arbitrary line limit. The target architecture is a ceiling on concepts, not a
 to create every crate/table immediately. Keep test/check evidence in PRs and CI, not in
 per-task report packets or another status registry.
 
+## Repairs to implemented paths
+
+**Next:** repair capacity and Git settlement, then the remaining current-path work below
+and L4.2. Checked layers record delivered increments, not full crash/load qualification.
+Use the existing Store/router and small internal modules. Keep evidence in the PR/CI.
+
+- [ ] **Restart capacity recovery.** Reconcile exact prior-generation custody and release
+      or transfer the reservation under the [capacity contract](spec/configuration.md#accounts-and-configured-capacity).
+      A retained old slot currently blocks resume even without a cap and can exhaust a
+      shared scope. Completion: proven closure frees/transfers that slot, stale closure
+      cannot free a newer slot, and unresolved custody stays visibly blocked without replay.
+- [ ] **Git fetch failure settlement.** Implement the [Git settlement contract](spec/automation.md#failed-transfer-and-unknown-readback):
+      after interruption/custody checks, handle a definite nonzero exit before reading the
+      private ref. Exact unchanged tracking-ref readback permits `failed`; missing exit
+      status or uncertain custody/readback/CAS must not be treated as definite failure.
+      Completion: the next same-repository mutation can run after a failed transfer;
+      genuinely unknown work remains fenced.
+- [ ] **Diagnose CI failures.** Separate the Linux timer-fetch `unknown` case from the
+      Windows daemon-readiness, event-firing and command-readback failures. The test helper
+      now preserves fixed Git stage codes; capture bounded process/IPC readiness and
+      progress facts for the other cases. Establish each cause before changing deadlines,
+      concurrency or checks. A green rerun alone does not explain an earlier failure.
+- [ ] **Unknown-outcome readback/resolution.** Connect exact readback and constrained owner
+      resolution under the [API contract](spec/api.md#input-turn-and-unknown-gates), including
+      a send with a lost native turn association. Release only the resolved command/turn
+      gate; never invent native completion or override capacity. Advertise the RPC/CLI
+      methods only when their handlers exist.
+- [ ] **Separate existing responsibilities.** Extract Store admission/dispatch and Router
+      command execution before adding more branches to those owners. Separate timer
+      scheduling and event-rule traversal where they share only storage plumbing.
+      [Architecture](architecture.md#internal-module-boundaries) names the boundaries;
+      retain transaction/effect ordering and the one writer/router. No crate/trait/LOC
+      target or parallel executor.
+- [ ] **Ordered Store reads.** For `list_unsettled_commands`, obtain an ordered partial-index
+      plan that preserves observer exclusions and `created_at,rowid` order. Verify planner
+      statistics/migration behavior; merely adding an index may leave the old sort plan.
+      For `list_processes`, pair `(owner,host_boot_id,pid,start_time)` with separate first-page
+      and cursor-range queries; the optional-cursor OR prevents a direct range seek.
+      Check identical pages and near/tail cursor plans on the bundled SQLite version.
+- [ ] **Linux process sampling.** Share one bounded `/proc` enumeration per monitoring
+      sweep across the current targets, instead of repeating it for each generation.
+      Follow [sampling work](spec/monitoring.md#sampling-work): preserve identity checks,
+      per-owner limits, incomplete samples and honest Unix custody. Measure enumeration
+      count and sample age before claiming a latency improvement.
+- [ ] **Unstarted plugin cleanup.** Validate before creating an instance directory where
+      possible; clean the exact generated empty directory on pre-spawn errors in
+      `PluginHost::start` and partial-create errors in `create_instance_dir`. Use empty-only
+      removal as the reader path does. Post-spawn or nonempty plugin data needs its own
+      lifetime evidence, not recursive deletion.
+- [ ] **Reconcile historical issues.** Revalidate #200 against the current generation
+      model; its pre-reset binding allocator/validator design is not an implementation
+      dependency. Mark the v1 work in #1, #3, #4, #5, #11, #140, #153 and #159 historical
+      or superseded after preserving any still-relevant requirement in its owning spec
+      and current layer. Keep #199 a proposed Later extension. Open issue text must not
+      silently restore the archived runtime or override this build order.
+
 ## L0 — Archive and smallest workspace
 
 - [x] **L0.1 Archive/reset.** v1 is preserved on branch `archive/v1-final` at
@@ -49,8 +105,6 @@ per-task report packets or another status registry.
       free `eliot` binary with help/version. CI runs fmt, scoped Clippy and brief
       help/version smoke commands on Windows/Ubuntu. No empty framework crates or
       test platform.
-
-**Next:** L4.2 actions/scripts.
 
 ## L1 — Core, Store, bus and one fake command path
 
@@ -144,6 +198,10 @@ No second executor, workflow graph or acceptance engine.
       Frozen inputs, scoped principal, exit/output handling and unknown outcomes use
       normal commands. Add Git fetch/push wrappers only with their concrete recipe;
       direct harness Git remains harness work, not intercepted by Eliot.
+      Agent actions, bounded Run scripts and `git.fetch` are connected; the remaining
+      wrappers stay unsupported as specified in [automation](spec/automation.md).
+      Add bounded `command.children` readback for retained expansions through the same
+      Router/CLI before advertising that target API.
 - [ ] **L4.3 Goals/requests.** Native Goal where installed Codex supports it; Eliot
       continuation/checks with turn/cost/no-progress limits. No check runs under the
       Store lock. Neither a failed check nor a missing terminal fact authorizes replay.
@@ -192,9 +250,16 @@ or speculative remote/GUI/service feature.
 
 ## L7 — Qualification, repair and release
 
-Now build/run the complete campaign against the connected product. Keep results in the
-PR/CI, not a permanent audit/readiness hierarchy.
+Implement the bounded retention path first, then build/run the complete campaign against
+the connected product. Keep results in the PR/CI, not a permanent audit/readiness hierarchy.
 
+- [ ] **Physical retention.** Wire retention settings to bounded Store cleanup invoked
+      by daemon maintenance. Implement event-prefix pruning and atomic command/child
+      cleanup under the [Core retention contract](spec/core.md#retention), including the
+      rule history floor, replay/idempotency window and source recovery dependencies.
+      Current bounded queries and rule backlog handling do not delete event/command
+      history. Keep open/unknown work and current projections; no full rewrite, forced
+      unknown resolution or separate cleanup ledger.
 - [ ] Core/Store/API/reducer and event replay, including retention and non-reused ids.
 - [ ] CLI fake E2E, exact generations/turns/requests, queue ordering and unknown outcomes.
 - [ ] Crash at admission, native effect, event commit, reply and source-drain boundaries;

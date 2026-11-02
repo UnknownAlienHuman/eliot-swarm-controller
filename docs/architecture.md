@@ -45,6 +45,24 @@ live in Store. Effects use the same router. No automation-to-vendor or
 coordination-to-vendor shortcut. Only Store code issues SQL; plugins never receive a
 database connection.
 
+### Internal module boundaries
+
+Use these boundaries when decomposing the current large Store/Router owners. They are
+ordinary modules inside the existing crates, not new services or dispatch abstractions.
+
+| Existing owner | Extraction boundary |
+| --- | --- |
+| Store `submit_tx` | command admission and its private validation helpers, sharing the caller's transaction and event accumulator |
+| Store `dispatch_inner` | dispatch state/generation changes, retaining the same writer, transaction scope and ordering |
+| Store migrations, workspace actions and source batches | separate cohesive schema, workspace and source-persistence helpers; keep publication after commit |
+| Router `process_command_inner` | command execution and its private preparation/settlement helpers as an internal `impl Router`; native I/O remains outside the Store lock |
+| Store `rules.rs` | timer scheduling apart from event-rule traversal; reuse existing `rule_history.rs` for finite catch-up rather than building a second history engine |
+
+Keep entry points small by moving their existing work, not by duplicating gates or
+adding forwarding traits. Retain authority, generation, idempotency and source checks at
+their owning boundaries. Canonical payload/ACK digests and credential hashes serve those
+contracts; file size alone is not a reason to remove them or add another integrity layer.
+
 The fake uses the same protocol as Codex. It is initially an echo/turn process, not a
 large simulator. Create crates as their callers arrive; this table is the eventual map,
 not six empty crates required for `--version`.
@@ -108,6 +126,12 @@ Historical/idle Agents are indexed records. Live harnesses consume their native 
 resources; logical fleet capacity is not a promise that one host runs a million model
 processes. Queries, event buffers, histories and fanouts are bounded/paginated. Add a
 pool, scheduler or new persistence table only for an implemented caller.
+
+A page limit bounds returned data, not the rows SQLite visits or sorts. Review actual
+filter/cursor/order plans while preserving visibility and ordering; confirm that a new
+index is selected, including continuation pages. Batch shared OS observation within one
+sweep where possible. Keep per-owner identity and completeness checks, and measure work
+before adding parallel workers or claiming a latency gain.
 
 Use [donors](reference/donors.md) as an extraction map, not a list of frameworks to
 combine. Ready-made dependencies/helpers come first; incompatible workflow/UI/security
