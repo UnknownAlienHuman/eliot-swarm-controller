@@ -429,7 +429,7 @@ turn: uncertain launch/send and unknown turns stay unknown and are never replaye
 
 Closure follows the [platform custody rules](monitoring.md#process-identity-and-custody).
 A PID being absent and the estimated Windows boot marker are insufficient. On Windows the
-named Job must be gone (the kernel keeps it while any member runs) or open with no member
+named Job must be gone or open with no member (its name disappears when the last handle closes, which for this kill-on-close Job starts terminating every member) and every recorded process identity, matched by PID and exact creation time, must have exited
 (`windows_job_closed`); a generation started before the namespace existed has no findable
 Job and stays retained. On Linux every recorded identity of the current boot must be gone
 or a zombie and the recorded plugin leader's process group empty (`unix_group_empty`,
