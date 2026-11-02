@@ -2567,6 +2567,10 @@ mod tests {
             .cleanup_view
             .take()
             .expect("settled failed private fetch view");
+        assert!(
+            read_private_ref(&view, &private_fetch_ref(&command_id)).is_err(),
+            "the failed transfer must not have written its private ref"
+        );
         cleanup_after_settlement(&fixture.data_root, &view);
 
         fixture.git.success(
