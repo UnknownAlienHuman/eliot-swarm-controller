@@ -296,24 +296,25 @@ impl Store {
             };
             tx.execute_batch("SAVEPOINT rule_catch_up_action")
                 .map_err(sql_error)?;
-            let mut admission = match submit_tx(&tx, principal, child_request, None, now, true) {
-                Ok(admission) if admission.is_new => admission,
-                Ok(_) => {
-                    return Err(Error::new(
-                        "source_integrity",
-                        "new rule catch-up child already exists",
-                    ));
-                }
-                Err(error) if core::is_deterministic_pre_admission_rejection(&error.code) => {
-                    tx.execute_batch(
-                        "ROLLBACK TO rule_catch_up_action; RELEASE rule_catch_up_action",
-                    )
-                    .map_err(sql_error)?;
-                    rejected.push((action.event_seq, error.code));
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
+            let mut admission =
+                match admission::submit_tx(&tx, principal, child_request, None, now, true) {
+                    Ok(admission) if admission.is_new => admission,
+                    Ok(_) => {
+                        return Err(Error::new(
+                            "source_integrity",
+                            "new rule catch-up child already exists",
+                        ));
+                    }
+                    Err(error) if core::is_deterministic_pre_admission_rejection(&error.code) => {
+                        tx.execute_batch(
+                            "ROLLBACK TO rule_catch_up_action; RELEASE rule_catch_up_action",
+                        )
+                        .map_err(sql_error)?;
+                        rejected.push((action.event_seq, error.code));
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
             annotate_rule_command_event(&tx, &child_id, &mut admission.events, cause.clone())?;
             if let Some(linked_command) = &admission.linked_command {
                 annotate_rule_command_event(

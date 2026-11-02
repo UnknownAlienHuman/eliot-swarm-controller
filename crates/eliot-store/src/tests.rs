@@ -7875,7 +7875,7 @@ fn typed_command_cause_updates_persisted_and_returned_event_without_legacy_backf
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .unwrap();
     let mut admission =
-        super::submit_tx(&tx, "owner", request.clone(), None, now + 1, false).unwrap();
+        super::admission::submit_tx(&tx, "owner", request.clone(), None, now + 1, false).unwrap();
     let event_index = admission
         .events
         .iter()

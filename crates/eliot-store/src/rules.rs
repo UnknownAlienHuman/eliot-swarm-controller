@@ -4081,7 +4081,7 @@ fn admit_rule_action_tx(
     let parent_cause = key.command_cause(&key.parent_id)?;
     let child_cause = key.command_cause(&key.child_id)?;
     request.id = key.child_id.clone();
-    let mut child_admission = submit_tx(tx, key.principal, request, None, now, true)?;
+    let mut child_admission = admission::submit_tx(tx, key.principal, request, None, now, true)?;
     if !child_admission.is_new {
         return Err(Error::new(
             "source_integrity",
