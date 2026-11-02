@@ -546,17 +546,16 @@ tracking ref unchanged; `HEAD`, local branches and the worktree are unchanged.
 
 ### Failed transfer and unknown readback
 
-The pending [Git fetch settlement repair](../roadmap.md#repairs-to-implemented-paths)
-must distinguish a definite failed transfer from an uncertain effect. After the existing
-interruption and custody checks, handle `exit_code = Some(nonzero)` before requiring the
-private fetched ref: when exact tracking-ref readback still equals the frozen old state, settle
-`failed`. A missing private ref is expected when the source ref disappears or transfer
-fails; it does not by itself imply that the later tracking-ref CAS may have run. Partial
-object downloads do not imply rollback, and do not require an `unknown` result for a
-known failed transfer. A missing exit status is not a definite nonzero exit. Preserve
-the existing private-ref/OID validation after success and the handling of interrupted
-transfers and unknown custody/readback/CAS outcomes. Keep private-view cleanup after
-durable settlement, using the existing Router/Store path.
+A definite failed transfer is distinct from an uncertain effect. After the interruption
+and custody checks, `exit_code = Some(nonzero)` is handled before the private fetched ref
+is required: when exact tracking-ref readback still equals the frozen old state, the
+command settles `failed` (`git_fetch_source_moved_or_failed`). A missing private ref is
+expected when the source ref disappears or the transfer fails; the fetch writes only the
+private ref, so its absence does not imply that the later tracking-ref CAS ran. Partial
+object downloads do not imply rollback and do not make a known failed transfer `unknown`.
+A missing exit status is not a definite nonzero exit: it still requires the
+private-ref/OID validation, and an unreadable private ref stays `unknown`. Private-view
+cleanup follows durable settlement through the existing Router/Store path.
 
 After proving the process stopped, read back the tracking ref through the same frozen
 configuration and canonical common directory. Unknown settlement is read-only: it never

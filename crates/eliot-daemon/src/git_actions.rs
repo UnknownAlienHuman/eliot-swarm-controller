@@ -372,6 +372,11 @@ pub(crate) async fn execute(
         };
     }
 
+    // A definite failed transfer usually leaves no private ref (for example a
+    // deleted source ref), so it settles from the tracking-ref readback alone.
+    if matches!(fetch.exit_code, Some(code) if code != 0) {
+        return settle_failed_transfer(&git, &repo, frozen, view).await;
+    }
     let fetched_oid = match read_private_ref(&view, &private_ref) {
         Ok(oid) => oid,
         Err(_) => {
@@ -383,19 +388,7 @@ pub(crate) async fn execute(
         }
     };
     if fetch.exit_code != Some(0) || fetched_oid != frozen.advertised_oid {
-        let current = read_tracking_ref(&git, &repo, &frozen.tracking_ref).await;
-        return match current {
-            Ok(current) if current == frozen.expected_old_oid => execution(
-                CommandState::Failed,
-                "git_fetch_source_moved_or_failed",
-                Some(view),
-            ),
-            _ => execution(
-                CommandState::Unknown,
-                "git_fetch_target_after_failed_transfer_unknown",
-                Some(view),
-            ),
-        };
+        return settle_failed_transfer(&git, &repo, frozen, view).await;
     }
     let object_check = match verify_registered_object_graph(
         &registered_process,
@@ -624,6 +617,28 @@ pub(crate) fn cleanup_after_settlement(data_root: &Path, view: &Path) {
         return;
     }
     let _ = fs::remove_dir_all(view);
+}
+
+/// The fetch only writes its private ref, so an unchanged tracking ref proves
+/// the later CAS never ran; any other readback stays unknown.
+async fn settle_failed_transfer(
+    git: &GitProbe,
+    repo: &RepositoryBinding,
+    frozen: &FrozenGitFetch,
+    view: PathBuf,
+) -> GitFetchExecution {
+    match read_tracking_ref(git, repo, &frozen.tracking_ref).await {
+        Ok(current) if current == frozen.expected_old_oid => execution(
+            CommandState::Failed,
+            "git_fetch_source_moved_or_failed",
+            Some(view),
+        ),
+        _ => execution(
+            CommandState::Unknown,
+            "git_fetch_target_after_failed_transfer_unknown",
+            Some(view),
+        ),
+    }
 }
 
 fn execution(state: CommandState, code: &str, cleanup_view: Option<PathBuf>) -> GitFetchExecution {
@@ -2511,6 +2526,80 @@ mod tests {
             .take()
             .expect("settled failed private fetch view");
         cleanup_after_settlement(&fixture.data_root, &view);
+    }
+
+    #[tokio::test]
+    async fn deleted_source_ref_fails_without_private_ref_and_allows_next_fetch() {
+        let mut fixture = LocalFetchFixture::new().await;
+        let frozen = fixture.freeze().await;
+        let head_before = fixture.checkout_head();
+        fixture.git.success(
+            &fixture.remote,
+            &git_args(&["update-ref", "-d", "refs/heads/main"]),
+        );
+
+        let command_id = Ulid::new().to_string();
+        let (_cancel, cancellation) = watch::channel(false);
+        let mut execution = execute(
+            &fixture.data_root,
+            &command_id,
+            &frozen,
+            &fixture.registration,
+            cancellation,
+        )
+        .await;
+        if execution.state != CommandState::Failed {
+            fixture.root.retain = true;
+        }
+        assert_eq!(
+            execution.state,
+            CommandState::Failed,
+            "unexpected fetch outcome: {}",
+            execution.outcome
+        );
+        assert_eq!(
+            execution.outcome["code"],
+            "git_fetch_source_moved_or_failed"
+        );
+        assert_eq!(fixture.tracking_oid(), None);
+        assert_eq!(fixture.checkout_head(), head_before);
+        let view = execution
+            .cleanup_view
+            .take()
+            .expect("settled failed private fetch view");
+        cleanup_after_settlement(&fixture.data_root, &view);
+
+        fixture.git.success(
+            &fixture.seed,
+            &git_args(&["push", "origin", "refs/heads/main"]),
+        );
+        let frozen = fixture.freeze().await;
+        let command_id = Ulid::new().to_string();
+        let (_cancel, cancellation) = watch::channel(false);
+        let mut execution = execute(
+            &fixture.data_root,
+            &command_id,
+            &frozen,
+            &fixture.registration,
+            cancellation,
+        )
+        .await;
+        if execution.state != CommandState::Applied {
+            fixture.root.retain = true;
+        }
+        assert_eq!(
+            execution.state,
+            CommandState::Applied,
+            "unexpected follow-up fetch outcome: {}",
+            execution.outcome
+        );
+        assert_eq!(
+            fixture.tracking_oid().as_deref(),
+            Some(fixture.remote_oid().as_str())
+        );
+        if let Some(view) = execution.cleanup_view.take() {
+            cleanup_after_settlement(&fixture.data_root, &view);
+        }
     }
 
     #[tokio::test]
