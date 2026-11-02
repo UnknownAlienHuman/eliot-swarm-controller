@@ -78,7 +78,7 @@ Use the existing Store/router and small internal modules. Keep evidence in the P
       For `list_processes`, pair `(owner,host_boot_id,pid,start_time)` with separate first-page
       and cursor-range queries; the optional-cursor OR prevents a direct range seek.
       Check identical pages and near/tail cursor plans on the bundled SQLite version.
-- [ ] **Linux process sampling.** Share one bounded `/proc` enumeration per monitoring
+- [x] **Linux process sampling.** Share one bounded `/proc` enumeration per monitoring
       sweep across the current targets, instead of repeating it for each generation.
       Follow [sampling work](spec/monitoring.md#sampling-work): preserve identity checks,
       per-owner limits, incomplete samples and honest Unix custody. Measure enumeration

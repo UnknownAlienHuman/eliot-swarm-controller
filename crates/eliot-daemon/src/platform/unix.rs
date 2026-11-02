@@ -2,7 +2,9 @@
 
 use super::process_observation::unknown_sample;
 #[cfg(target_os = "linux")]
-use super::process_observation::{MAX_PROCESS_SAMPLES, exited_sample};
+use super::process_observation::{
+    MAX_PROCESS_SAMPLES, SweepEntry, exited_sample, select_sweep_members,
+};
 use eliot_core::{Error, ProcessSample, ProcessSnapshot, Result};
 #[cfg(target_os = "linux")]
 use eliot_core::{ProcessIdentity, ProcessRecord, ProcessState};
@@ -274,6 +276,62 @@ pub(crate) struct ProcessGroupIdentity {
 
 #[cfg(target_os = "linux")]
 const MAX_PROC_SCAN_ENTRIES: usize = 65_536;
+
+/// One bounded host-process enumeration shared by a monitoring sweep.
+#[cfg(target_os = "linux")]
+pub(crate) struct LinuxProcessSweep {
+    pub(crate) entries: Vec<SweepEntry>,
+    pub(crate) complete: bool,
+}
+
+/// Enumerate host processes once per sweep. `/proc` is host-wide: the scan
+/// cap applies to this single enumeration, never per owner. A failed scan is
+/// an error (unavailable); truncation or stat errors are incomplete coverage,
+/// and an omitted process is not proof of exit.
+#[cfg(target_os = "linux")]
+pub(crate) fn enumerate_process_sweep() -> Result<LinuxProcessSweep> {
+    let mut sweep = LinuxProcessSweep {
+        entries: Vec::new(),
+        complete: true,
+    };
+    let entries =
+        fs::read_dir("/proc").map_err(|error| io_error("enumerate host processes", error))?;
+    // /proc is host-wide: scanned directory entries are bounded once per
+    // sweep. This never limits spawning or signals a process.
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_PROC_SCAN_ENTRIES {
+            sweep.complete = false;
+            break;
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                sweep.complete = false;
+                continue;
+            }
+        };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        match read_linux_process_stat(pid) {
+            Ok(stat) => sweep.entries.push(SweepEntry {
+                pid,
+                pgid: stat.pgid,
+                start_ticks: stat.start_ticks,
+                state: stat.state,
+                cpu_time_ns: stat.cpu_time_ns,
+                rss_bytes: stat.rss_bytes,
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => sweep.complete = false,
+        }
+    }
+    Ok(sweep)
+}
 
 #[cfg(target_os = "linux")]
 pub(crate) fn capture_process_group_identity(pid: u32) -> Result<ProcessGroupIdentity> {
@@ -643,7 +701,7 @@ impl ProcessObserver {
         })
     }
 
-    fn group_is_current(&self) -> bool {
+    pub(crate) fn group_is_current(&self) -> bool {
         read_linux_process_identity(self.group.pid).ok()
             == Some((self.group.pgid, self.group.start_ticks))
     }
@@ -664,6 +722,18 @@ impl ProcessObserver {
     }
 
     pub(crate) fn snapshot(&self, owner: &str, now: i64) -> Result<ProcessSnapshot> {
+        let leader_before = self.group_is_current();
+        let sweep = enumerate_process_sweep()?;
+        Ok(self.snapshot_from_sweep(owner, now, &sweep, leader_before))
+    }
+
+    pub(crate) fn snapshot_from_sweep(
+        &self,
+        owner: &str,
+        now: i64,
+        sweep: &LinuxProcessSweep,
+        leader_before: bool,
+    ) -> ProcessSnapshot {
         let root = ProcessSample {
             record: ProcessRecord {
                 identity: self.root.clone(),
@@ -680,57 +750,42 @@ impl ProcessObserver {
             samples: vec![self.refresh(&root, now)],
             complete: false,
         };
-        if !self.group_is_current() {
-            return Ok(snapshot);
+        if !leader_before {
+            return snapshot;
         }
-        let entries = fs::read_dir("/proc")
-            .map_err(|error| io_error("enumerate owned process group", error))?;
-        snapshot.complete = true;
-        // /proc is host-wide: both scanned directory entries and returned group
-        // members are bounded. This never limits spawning or signals a process.
-        for (index, entry) in entries.enumerate() {
-            if index >= MAX_PROC_SCAN_ENTRIES {
-                snapshot.complete = false;
-                break;
-            }
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(_) => {
-                    snapshot.complete = false;
-                    continue;
-                }
-            };
-            let Some(pid) = entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse::<u32>().ok())
-            else {
-                continue;
-            };
-            if pid == self.root.pid {
-                continue;
-            }
-            match read_linux_process_stat(pid) {
-                Ok(stat) if stat.pgid == self.group.pgid => {
-                    if snapshot.samples.len() >= MAX_PROCESS_SAMPLES {
-                        snapshot.complete = false;
-                        break;
-                    }
-                    snapshot
-                        .samples
-                        .push(self.sample(pid, stat, "child", owner, now));
-                }
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => snapshot.complete = false,
-            }
+        // The shared scan cap was applied once during enumeration; the member
+        // cap below applies per owner. This never limits spawning or signals.
+        snapshot.complete = sweep.complete;
+        let (members, members_complete) = select_sweep_members(
+            &sweep.entries,
+            self.group.pgid,
+            self.root.pid,
+            MAX_PROCESS_SAMPLES.saturating_sub(1),
+        );
+        if !members_complete {
+            snapshot.complete = false;
+        }
+        for member in members {
+            snapshot.samples.push(self.sample(
+                member.pid,
+                LinuxProcessStat {
+                    pgid: member.pgid,
+                    start_ticks: member.start_ticks,
+                    state: member.state,
+                    cpu_time_ns: member.cpu_time_ns,
+                    rss_bytes: member.rss_bytes,
+                },
+                "child",
+                owner,
+                now,
+            ));
         }
         if !self.group_is_current() {
             // The leader is no longer authority for newly discovered members.
             snapshot.samples.truncate(1);
             snapshot.complete = false;
         }
-        Ok(snapshot)
+        snapshot
     }
 
     pub(crate) fn register_pid(
@@ -954,5 +1009,18 @@ mod linux_process_stat_tests {
             Ok(_) => panic!("negative PGID is not a valid namespace process-group ID"),
         };
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn shared_sweep_enumerates_host_once() {
+        let sweep =
+            enumerate_process_sweep().expect("a shared sweep enumerates host processes once");
+        assert!(
+            sweep
+                .entries
+                .iter()
+                .any(|entry| entry.pid == std::process::id()),
+            "the sweep observes the test process itself"
+        );
     }
 }

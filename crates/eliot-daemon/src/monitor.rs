@@ -1,4 +1,6 @@
 //! OS facts and ephemeral counters, independent of the native lifecycle source.
+#[cfg(target_os = "linux")]
+use crate::platform::unix::enumerate_process_sweep;
 use crate::{
     bus::Bus,
     common::now_ms,
@@ -1314,9 +1316,72 @@ impl Monitoring {
             .values()
             .cloned()
             .collect();
+        #[cfg(target_os = "linux")]
+        if !self.sample_all_sweep(targets).await {
+            // The shared enumeration failed; fall through to per-target
+            // sampling so each target records its own unavailable observation.
+            let targets: Vec<_> = self
+                .inner
+                .targets
+                .lock_recover()
+                .values()
+                .cloned()
+                .collect();
+            for target in targets {
+                let _ = self.sample_target(&target).await;
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
         for target in targets {
             let _ = self.sample_target(&target).await;
         }
+    }
+
+    /// Sample every captured target from one shared host enumeration. New
+    /// targets attached mid-sweep wait for the next sweep. Returns false only
+    /// when the shared enumeration itself failed.
+    #[cfg(target_os = "linux")]
+    async fn sample_all_sweep(&self, targets: Vec<Arc<Target>>) -> bool {
+        if targets.is_empty() {
+            return true;
+        }
+        // Serialize with concurrent per-target samplers in capture order; a
+        // concurrent sampler holds at most one target lock, so this cannot
+        // deadlock.
+        let mut guards = Vec::with_capacity(targets.len());
+        for target in &targets {
+            guards.push(target.sampling.lock().await);
+        }
+        let observers: Vec<CustodyObserver> = targets
+            .iter()
+            .map(|target| target.observer.clone())
+            .collect();
+        let sweep = match tokio::task::spawn_blocking(move || {
+            let leaders_before: Vec<bool> = observers
+                .iter()
+                .map(|observer| observer.group_is_current())
+                .collect();
+            enumerate_process_sweep().map(|sweep| (leaders_before, sweep))
+        })
+        .await
+        {
+            Ok(Ok((leaders_before, sweep))) => (leaders_before, Arc::new(sweep)),
+            _ => return false,
+        };
+        for (target, leader_before) in targets.iter().zip(sweep.0) {
+            let observer = target.observer.clone();
+            let process_owner = target.owner.clone();
+            let sweep = Arc::clone(&sweep.1);
+            let sampled_at = now_ms();
+            let result = tokio::task::spawn_blocking(move || {
+                observer.snapshot_with_sweep(&process_owner, sampled_at, &sweep, leader_before)
+            })
+            .await
+            .map_err(|_| Error::new("process_observation", "process sampling task failed"))
+            .and_then(|result| result);
+            let _ = self.commit_snapshot(target, result, sampled_at).await;
+        }
+        true
     }
 
     async fn sample_target(&self, target: &Arc<Target>) -> Result<()> {
@@ -1329,6 +1394,15 @@ impl Monitoring {
                 .await
                 .map_err(|_| Error::new("process_observation", "process sampling task failed"))
                 .and_then(|result| result);
+        self.commit_snapshot(target, result, sampled_at).await
+    }
+
+    async fn commit_snapshot(
+        &self,
+        target: &Arc<Target>,
+        result: Result<ProcessSnapshot>,
+        sampled_at: i64,
+    ) -> Result<()> {
         let mut snapshot = match result {
             Ok(snapshot) => snapshot,
             Err(error) => {
