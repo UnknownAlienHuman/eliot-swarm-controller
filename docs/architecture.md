@@ -127,6 +127,12 @@ resources; logical fleet capacity is not a promise that one host runs a million 
 processes. Queries, event buffers, histories and fanouts are bounded/paginated. Add a
 pool, scheduler or new persistence table only for an implemented caller.
 
+A page limit bounds returned data, not the rows SQLite visits or sorts. Review actual
+filter/cursor/order plans while preserving visibility and ordering; confirm that a new
+index is selected, including continuation pages. Batch shared OS observation within one
+sweep where possible. Keep per-owner identity and completeness checks, and measure work
+before adding parallel workers or claiming a latency gain.
+
 Use [donors](reference/donors.md) as an extraction map, not a list of frameworks to
 combine. Ready-made dependencies/helpers come first; incompatible workflow/UI/security
 platforms stay out.

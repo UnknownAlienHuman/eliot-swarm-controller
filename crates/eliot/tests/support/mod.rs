@@ -12,6 +12,36 @@ use std::{
 
 pub const CLI: &str = env!("CARGO_BIN_EXE_eliot");
 const WAIT: Duration = Duration::from_secs(20);
+// Exact controller codes only; arbitrary outcome text stays out of CI logs.
+const GIT_FETCH_ERROR_CODES: &[&str] = &[
+    "git_fetch_cancelled_before_cas",
+    "git_fetch_cancelled_before_cas_unknown",
+    "git_fetch_cas_family_quiescence_unknown",
+    "git_fetch_cas_refused",
+    "git_fetch_cas_spawn_or_wait_unknown",
+    "git_fetch_family_quiescence_unknown",
+    "git_fetch_helper_changed_after_transfer",
+    "git_fetch_interrupted_before_cas",
+    "git_fetch_interrupted_readback_unknown",
+    "git_fetch_private_ref_readback_unknown",
+    "git_fetch_private_view_preparation_failed",
+    "git_fetch_readback_config_or_authority_changed",
+    "git_fetch_registered_object_readback_failed",
+    "git_fetch_registered_object_readback_target_unknown",
+    "git_fetch_registered_object_verification_unavailable",
+    "git_fetch_registered_object_verification_unknown",
+    "git_fetch_registered_object_verifier_quiescence_unknown",
+    "git_fetch_registration_changed_after_transfer",
+    "git_fetch_remote_config_changed",
+    "git_fetch_result_binding_invalid",
+    "git_fetch_source_moved_or_failed",
+    "git_fetch_spawn_or_wait_unknown",
+    "git_fetch_target_after_failed_transfer_unknown",
+    "git_fetch_tracking_readback_not_proven",
+    "git_fetch_tracking_ref_changed_before_cas",
+    "git_fetch_tracking_ref_unreadable_before_cas",
+    "git_fetch_transport_config_changed",
+];
 
 pub struct Captured {
     pub child: Child,
@@ -292,6 +322,7 @@ impl Fixture {
                     Some("unknown") => "unknown",
                     Some("unavailable") => "unavailable",
                     Some("unsupported") => "unsupported",
+                    Some(code) if GIT_FETCH_ERROR_CODES.contains(&code) => code,
                     Some(_) => "other",
                     None => "none",
                 };

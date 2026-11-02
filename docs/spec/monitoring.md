@@ -161,6 +161,18 @@ CREATE TABLE processes (
 CREATE INDEX processes_owner ON processes(owner,state);
 ```
 
+### Sampling work
+
+The pending [Linux sampling optimization](../roadmap.md#repairs-to-implemented-paths)
+should share one bounded host-process enumeration per sweep. Capture the target set first;
+validate each captured group leader before and after enumeration, and defer new targets
+to the next sweep. Retain full process identities, known-identity refresh and per-generation
+publication. Apply the scan cap once and member caps per owner, retaining known identities
+first. A scan failure remains unavailable; truncated/stat-error coverage is incomplete,
+and an omitted process is not proof of exit. Keep timestamps truthful and release the
+sweep snapshot after use. This does not strengthen Unix containment or replace Windows
+Job observation.
+
 ## Starting processes
 
 These rules apply to plugins, services, hooks, scripts, checks, Git and workspace setup:
