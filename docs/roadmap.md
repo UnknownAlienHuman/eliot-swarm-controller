@@ -72,7 +72,7 @@ Use the existing Store/router and small internal modules. Keep evidence in the P
       [Architecture](architecture.md#internal-module-boundaries) names the boundaries;
       retain transaction/effect ordering and the one writer/router. No crate/trait/LOC
       target or parallel executor.
-- [ ] **Ordered Store reads.** For `list_unsettled_commands`, obtain an ordered partial-index
+- [x] **Ordered Store reads.** For `list_unsettled_commands`, obtain an ordered partial-index
       plan that preserves observer exclusions and `created_at,rowid` order. Verify planner
       statistics/migration behavior; merely adding an index may leave the old sort plan.
       For `list_processes`, pair `(owner,host_boot_id,pid,start_time)` with separate first-page

@@ -41,12 +41,31 @@ const MAX_EVENT_BYTES: usize = 64 * 1024;
 const MAX_INPUT_BYTES: usize = 512 * 1024;
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const RETRY_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
-const CURRENT_SCHEMA_VERSION: i64 = 17;
+const CURRENT_SCHEMA_VERSION: i64 = 18;
 const COMMAND_METHOD: &str = "command.submit";
 const INITIAL_SOURCE: &str = "stream";
 const PROCESS_SOURCE: &str = "os";
 const WORKSPACE_PROCESS_SOURCE: &str = "workspace_process";
 const GIT_SOURCE: &str = "git";
+const LIST_UNSETTLED_COMMANDS_SQL: &str = "SELECT id, principal, method, target, expected_generation, generation,
+                        expected_turn_id, turn_id, request_id, verb, args, state, outcome,
+                        created_at, updated_at, probe
+                 FROM commands
+                 WHERE state IN ('accepted', 'queued', 'dispatched', 'unknown')
+                   AND NOT (state = 'unknown' AND verb IN ('attach','detach')
+                     AND EXISTS(SELECT 1 FROM agents a WHERE a.id = commands.target AND a.observe_only = 1)
+                     AND NOT EXISTS(SELECT 1 FROM source_state s WHERE s.agent = commands.target
+                         AND s.source NOT IN ('daemon','os','git','workspace_process') AND s.state = 'open'))
+                 ORDER BY created_at, rowid LIMIT ?1";
+const LIST_PROCESSES_FIRST_PAGE_SQL: &str =
+    "SELECT host_boot_id, pid, start_time, owner, role, state, exit_code, updated_at
+             FROM processes WHERE owner = ?1
+             ORDER BY host_boot_id, pid, start_time LIMIT ?2";
+const LIST_PROCESSES_CURSOR_PAGE_SQL: &str =
+    "SELECT host_boot_id, pid, start_time, owner, role, state, exit_code, updated_at
+             FROM processes WHERE owner = ?1
+               AND (host_boot_id, pid, start_time) > (?2, ?3, ?4)
+             ORDER BY host_boot_id, pid, start_time LIMIT ?5";
 
 macro_rules! db {
     ($expression:expr) => {
@@ -602,13 +621,29 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
-        if current < CURRENT_SCHEMA_VERSION {
+        if current < 17 {
             let tx = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
             capacity::create_store_identity_tx(&tx)?;
             db!(tx.execute("INSERT INTO schema_migrations(version) VALUES (17)", []));
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < CURRENT_SCHEMA_VERSION {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE INDEX commands_unsettled_created ON commands(created_at)
+                     WHERE state IN ('accepted', 'queued', 'dispatched', 'unknown');
+                 DROP INDEX commands_open;
+                 CREATE INDEX processes_owner_identity
+                     ON processes(owner, host_boot_id, pid, start_time);
+                 INSERT INTO schema_migrations(version) VALUES (18);",
+            )
+            .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
         Ok(())
@@ -1502,18 +1537,7 @@ impl Store {
         validate_limit(limit)?;
         let mut statement = self
             .connection
-            .prepare(
-                "SELECT id, principal, method, target, expected_generation, generation,
-                        expected_turn_id, turn_id, request_id, verb, args, state, outcome,
-                        created_at, updated_at, probe
-                 FROM commands
-                 WHERE state IN ('accepted', 'queued', 'dispatched', 'unknown')
-                   AND NOT (state = 'unknown' AND verb IN ('attach','detach')
-                     AND EXISTS(SELECT 1 FROM agents a WHERE a.id = commands.target AND a.observe_only = 1)
-                     AND NOT EXISTS(SELECT 1 FROM source_state s WHERE s.agent = commands.target
-                         AND s.source NOT IN ('daemon','os','git','workspace_process') AND s.state = 'open'))
-                 ORDER BY created_at, rowid LIMIT ?1",
-            )
+            .prepare(LIST_UNSETTLED_COMMANDS_SQL)
             .map_err(sql_error)?;
         let rows = statement
             .query_map([limit as i64], command_record_from_row)
@@ -2271,28 +2295,35 @@ impl Store {
     ) -> Result<Vec<ProcessRecord>> {
         require_nonempty(owner, "process owner")?;
         validate_limit(limit)?;
-        let after_start = after.map(validate_process_identity).transpose()?;
+        let cursor = after
+            .map(|identity| {
+                validate_process_identity(identity).map(|start_time| (identity, start_time))
+            })
+            .transpose()?;
         let mut statement = self
             .connection
-            .prepare(
-                "SELECT host_boot_id, pid, start_time, owner, role, state, exit_code, updated_at
-             FROM processes WHERE owner = ?1
-               AND (?2 IS NULL OR (host_boot_id, pid, start_time) > (?2, ?3, ?4))
-             ORDER BY host_boot_id, pid, start_time LIMIT ?5",
-            )
+            .prepare(match cursor {
+                None => LIST_PROCESSES_FIRST_PAGE_SQL,
+                Some(_) => LIST_PROCESSES_CURSOR_PAGE_SQL,
+            })
             .map_err(sql_error)?;
-        let rows = statement
-            .query_map(
-                params![
-                    owner,
-                    after.map(|id| id.host_boot_id.as_str()),
-                    after.map(|id| id.pid),
-                    after_start,
-                    limit as i64
-                ],
-                process_record_from_row,
-            )
-            .map_err(sql_error)?;
+        let rows = match cursor {
+            None => statement
+                .query_map(params![owner, limit as i64], process_record_from_row)
+                .map_err(sql_error)?,
+            Some((identity, start_time)) => statement
+                .query_map(
+                    params![
+                        owner,
+                        identity.host_boot_id.as_str(),
+                        identity.pid,
+                        start_time,
+                        limit as i64
+                    ],
+                    process_record_from_row,
+                )
+                .map_err(sql_error)?,
+        };
         let mut records = Vec::new();
         for row in rows {
             records.push(row.map_err(sql_error)?);
