@@ -354,8 +354,12 @@ impl PluginHost {
                 .lock_recover()
                 .insert(agent_token.clone());
         }
-        // Definitely pre-spawn: no child exists yet, so the generated
-        // directory is still empty. Remove exactly it, never recursively.
+        // The generated directory is never given to the child on these paths
+        // (spawn ignores it; the path is handed over only in the later
+        // initialize RPC), so empty-only removal is safe. On Windows a failed
+        // spawn may briefly create a suspended child, but it is terminated
+        // before executing and never receives this path. Remove exactly the
+        // generated directory, never recursively.
         if let Err(error) = self.state.monitoring.prepare_generation(&agent).await {
             remove_empty_instance_dir(&instance_dir);
             return Err(error);
@@ -696,6 +700,24 @@ impl PluginHost {
     }
 
     fn create_instance_dir(&self, key: &AgentKey) -> Result<(PathBuf, String)> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            self.create_instance_dir_with(key, |path| {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            self.create_instance_dir_with(key, |_| Ok(()))
+        }
+    }
+
+    fn create_instance_dir_with(
+        &self,
+        key: &AgentKey,
+        restrict: impl FnOnce(&Path) -> std::io::Result<()>,
+    ) -> Result<(PathBuf, String)> {
         let parent = self.state.data_root.join("plugins");
         std::fs::create_dir_all(&parent).map_err(|error| {
             Error::new(
@@ -710,18 +732,12 @@ impl PluginHost {
                 format!("create plugin instance directory: {error}"),
             )
         })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Err(error) =
-                std::fs::set_permissions(&instance_dir, std::fs::Permissions::from_mode(0o700))
-            {
-                remove_empty_instance_dir(&instance_dir);
-                return Err(Error::new(
-                    "platform_io",
-                    format!("restrict plugin instance directory: {error}"),
-                ));
-            }
+        if let Err(error) = restrict(&instance_dir) {
+            remove_empty_instance_dir(&instance_dir);
+            return Err(Error::new(
+                "platform_io",
+                format!("restrict plugin instance directory: {error}"),
+            ));
         }
         let credential = format!("{}{}", Ulid::new(), Ulid::new());
         Ok((instance_dir, credential))
@@ -4311,7 +4327,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_instance_dir_reports_a_blocked_parent_without_stray_paths() {
+    async fn create_instance_dir_reports_a_blocked_parent() {
         let data_root =
             std::env::temp_dir().join(format!("eliot-plugin-cleanup-blocked-{}", Ulid::new()));
         std::fs::create_dir_all(&data_root).unwrap();
@@ -4328,6 +4344,47 @@ mod tests {
         let error = host.create_instance_dir(&key).unwrap_err();
         assert_eq!(error.code, "platform_io");
         assert!(data_root.join("plugins").is_file());
+
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[test]
+    fn create_instance_dir_removes_the_partial_directory_when_restriction_fails() {
+        let data_root =
+            std::env::temp_dir().join(format!("eliot-plugin-cleanup-restrict-{}", Ulid::new()));
+        let store = Arc::new(AsyncMutex::new(
+            eliot_store::Store::open(Path::new(":memory:")).unwrap(),
+        ));
+        let host = instance_test_host(data_root.clone(), store);
+        let key = AgentKey {
+            id: "a1".to_owned(),
+            generation: 1,
+        };
+
+        // Force the post-mkdir restrict step (unix chmod 0o700 in production)
+        // to fail through the seam; the generated directory must be gone and
+        // plugins/ left empty.
+        let mut generated: Option<PathBuf> = None;
+        let error = host
+            .create_instance_dir_with(&key, |path| {
+                generated = Some(path.to_owned());
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "forced restrict failure",
+                ))
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "platform_io");
+        let generated = generated.expect("the restrict step must see the generated directory");
+        assert!(
+            !generated.exists(),
+            "a failed restrict must remove the partial directory"
+        );
+        assert!(data_root.join("plugins").is_dir());
+        assert!(
+            plugin_dir_entries(&data_root).is_empty(),
+            "a failed restrict must leave plugins/ empty"
+        );
 
         let _ = std::fs::remove_dir_all(&data_root);
     }

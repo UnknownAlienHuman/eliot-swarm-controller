@@ -1,7 +1,7 @@
 //! Owned reader transport shared by no-Agent discovery and bound observation.
 use super::{
     AgentKey, EventSource, PluginClient, PluginConnection, PluginHost, RPC_GRACE, STOP_GRACE,
-    deadline, serve_plugin_requests, source_secret_snapshot,
+    deadline, remove_empty_instance_dir, serve_plugin_requests, source_secret_snapshot,
 };
 use crate::{
     monitor::Monitoring,
@@ -92,7 +92,7 @@ impl PluginHost {
         let mut child = match self.spawn_plugin_process(harness, &instance_dir) {
             Ok(child) => child,
             Err(error) => {
-                let _ = std::fs::remove_dir(&instance_dir);
+                remove_empty_instance_dir(&instance_dir);
                 return ReaderOpen::failed_spawn(error);
             }
         };
@@ -130,7 +130,7 @@ impl PluginHost {
             #[cfg(not(any(unix, windows)))]
             let empty = false;
             drop(child);
-            let _ = std::fs::remove_dir(&instance_dir);
+            remove_empty_instance_dir(&instance_dir);
             return ReaderOpen {
                 result: Err(Error::new(
                     "process_pipes",
@@ -316,7 +316,7 @@ impl ReaderTransport {
             .finish(bounded_deadline(close_until, RPC_GRACE))
             .await;
         host.remove_plugin_secret(&self.credential);
-        let _ = std::fs::remove_dir(&self.instance_dir);
+        remove_empty_instance_dir(&self.instance_dir);
         ReaderClose {
             closed: reaped && empty && drained,
             stderr,
