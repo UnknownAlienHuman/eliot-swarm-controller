@@ -351,7 +351,9 @@ impl Fixture {
                     first_error.as_deref().unwrap_or("none"),
                     response
                         .as_ref()
-                        .map_or("none", |reply| reply.stderr.trim()),
+                        .map(|reply| error_snippet(&reply.stderr))
+                        .as_deref()
+                        .unwrap_or("none"),
                 );
             }
             thread::sleep(Duration::from_millis(50));
