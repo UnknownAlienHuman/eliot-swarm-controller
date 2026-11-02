@@ -56,7 +56,7 @@ Use the existing Store/router and small internal modules. Keep evidence in the P
       uncertain custody/readback/CAS must not be treated as definite failure.
       Completion: the next same-repository mutation can run after a failed transfer;
       genuinely unknown work remains fenced.
-- [ ] **Diagnose CI failures.** Separate the Linux timer-fetch `unknown` case from the
+- [x] **Diagnose CI failures.** Separate the Linux timer-fetch `unknown` case from the
       Windows daemon-readiness, event-firing and command-readback failures. The test helper
       now preserves fixed Git stage codes; capture bounded process/IPC readiness and
       progress facts for the other cases. Establish each cause before changing deadlines,

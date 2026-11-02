@@ -4738,7 +4738,8 @@ fn cli_event_rule_matching_reload_and_invalid_retention_survive_restart() {
         };
         assert!(
             reply.status.success(),
-            "Fake send was not admitted/completed"
+            "Fake send was not admitted/completed (exit {:?})",
+            reply.status.code()
         );
         fixture.wait_command(id, "applied");
     };
@@ -8740,8 +8741,26 @@ fn cli_event_rule_steers_exact_held_turn_in_global_and_project_scopes() {
             .to_owned();
 
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut polls = 0u32;
+        let mut turn_started_seen = false;
+        let mut rule_fired_seen = 0usize;
+        let mut events_seen = 0usize;
         let (started, firing, event_seq) = loop {
             let events = fixture.events();
+            polls += 1;
+            events_seen = events_seen.max(events.len());
+            turn_started_seen = turn_started_seen
+                || events.iter().any(|event| {
+                    event["kind"] == "turn.started"
+                        && event["data"]["command_id"] == send_id
+                        && event["agent"] == agent
+                        && event["generation"] == generation
+                });
+            rule_fired_seen = events
+                .iter()
+                .filter(|event| event["kind"] == "rule.fired" && event["data"]["rule"] == rule_id)
+                .count()
+                .max(rule_fired_seen);
             let started = events
                 .iter()
                 .find(|event| {
@@ -8767,7 +8786,7 @@ fn cli_event_rule_steers_exact_held_turn_in_global_and_project_scopes() {
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "event Steer firing deadline for {rule_id}"
+                "event Steer firing deadline for {rule_id} after {polls} polls; turn_started={turn_started_seen}; rule_fired={rule_fired_seen}; events={events_seen}"
             );
             std::thread::sleep(Duration::from_millis(25));
         };
