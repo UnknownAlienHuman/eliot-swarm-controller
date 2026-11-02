@@ -109,7 +109,8 @@ impl Store {
             action.id = derived_script_action_id(run_id, ordinal)?;
             rules::validate_script_output_rate_tx(&tx, &origin, action.target.as_deref(), now)?;
 
-            let admission = submit_tx(&tx, &run.command.principal, action, None, now, true)?;
+            let admission =
+                admission::submit_tx(&tx, &run.command.principal, action, None, now, true)?;
             if !admission.is_new {
                 return Err(Error::new(
                     "source_integrity",
