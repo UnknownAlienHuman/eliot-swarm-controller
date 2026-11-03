@@ -14,27 +14,14 @@ use serde::{Deserialize, Serialize};
 // JSON-RPC envelope
 // ---------------------------------------------------------------------------
 
-/// Minimal JSON-RPC error body. Only pre-admission/validation errors prove
-/// the command was not admitted (`native_rejected`); `interrupted`/`cancelled`
-/// and every other request error leave the write outcome uncertain (unknown).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct NativeJsonRpcErrorBody {
-    pub code: i64,
-    pub message: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub data: Option<serde_json::Value>,
-}
-
-impl NativeJsonRpcErrorBody {
-    /// Whether this request error proves the command was not admitted: the
-    /// JSON-RPC pre-admission/validation failures (`-32700` parse, `-32600`
-    /// invalid request, `-32601` method not found, `-32602` invalid params)
-    /// plus the MSP admission-failure kind `-32030 commandRejected` (the SS3.6
-    /// admission-failure table). Everything else — including `-32603`
-    /// internal and unknown future kinds — is unknown, never rejected.
-    pub fn is_not_admitted(&self) -> bool {
-        matches!(self.code, -32700 | -32600 | -32601 | -32602 | -32030)
-    }
+/// Whether a JSON-RPC request error code proves the command was not admitted:
+/// the JSON-RPC pre-admission/validation failures (`-32700` parse, `-32600`
+/// invalid request, `-32601` method not found, `-32602` invalid params) plus
+/// the MSP admission-failure kind `-32030 commandRejected` (the SS3.6
+/// admission-failure table). Everything else — including `-32603` internal
+/// and unknown future kinds — is unknown, never rejected.
+pub fn is_not_admitted(code: i64) -> bool {
+    matches!(code, -32700 | -32600 | -32601 | -32602 | -32030)
 }
 
 // ---------------------------------------------------------------------------
@@ -414,12 +401,7 @@ mod tests {
     #[test]
     fn only_pre_admission_errors_prove_no_write() {
         for code in [-32700, -32600, -32601, -32602, -32030] {
-            let body = NativeJsonRpcErrorBody {
-                code,
-                message: "not admitted".to_owned(),
-                data: None,
-            };
-            assert!(body.is_not_admitted(), "code={code}");
+            assert!(is_not_admitted(code), "code={code}");
         }
         // Internal errors, uncertain writes, all other MSP kinds and unknown
         // future codes never prove rejection; the caller maps them to unknown.
@@ -427,12 +409,7 @@ mod tests {
             -32603, -32001, -32002, -32010, -32011, -32013, -32014, -32020, -32021, -32022, -32024,
             -32025, -32031, -32032, -32040, -32041, -32042, -32050, -32999, 0,
         ] {
-            let body = NativeJsonRpcErrorBody {
-                code,
-                message: "uncertain".to_owned(),
-                data: None,
-            };
-            assert!(!body.is_not_admitted(), "code={code}");
+            assert!(!is_not_admitted(code), "code={code}");
         }
     }
 

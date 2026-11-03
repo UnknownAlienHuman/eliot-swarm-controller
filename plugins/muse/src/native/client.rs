@@ -11,7 +11,7 @@ use eliot_plugin::native_stdio::{
 };
 use serde_json::Value;
 
-use crate::native::types::NativeJsonRpcErrorBody;
+use crate::native::types::is_not_admitted;
 
 #[cfg(test)]
 use eliot_core::{SecretPolicy, StderrSnapshot, StderrSource};
@@ -33,19 +33,14 @@ impl NativeStdioConfig for MuseStdioConfig {
         // command was not admitted. Anything else — `interrupted`/`cancelled`,
         // `-32603` internal, all other MSP kinds, unknown codes — leaves an
         // admitted write unruled-out, so it is unknown, never rejected.
-        let body = NativeJsonRpcErrorBody {
-            code: error.code,
-            message: error.message,
-            data: error.data,
-        };
-        if body.is_not_admitted() {
-            Err(Error::new("native_rejected", body.message))
+        if is_not_admitted(error.code) {
+            Err(Error::new("native_rejected", error.message))
         } else {
             Err(Error::new(
                 "unknown",
                 format!(
                     "Muse request error {} left its write outcome uncertain",
-                    body.code
+                    error.code
                 ),
             ))
         }
