@@ -5,6 +5,5 @@
 # portable exit-0 placeholder: replace it with your project's check command,
 # which must exit 0 when the goal holds. Verify with: goal show AGENT
 # CI runs this exact command against the Fake profile (agent launched with
-# the Fake profile instead of codex-luna, nothing else changed); the live
-# Codex demonstration is pending the owner's go-ahead.
+# the Fake profile instead of codex-luna, nothing else changed).
 goal set AGENT --text keep-green --max-rounds 5 --check git --version

@@ -64,6 +64,11 @@ Agent epoch. No guaranteed exclusive native history cursor means no historical r
 If a selected API supplies one, use its exact continuation contract. List absence,
 update time or silence never proves terminal execution.
 
+A restart of the externally owned service while input is queued or running is decided
+when this harness is implemented: either proven continuation of that input on the same
+store, or proven final interruption. Until one is shown, the input stays unknown and is
+never replayed.
+
 ## Children, configuration and final checks
 
 Page all native history/child lists and retain exact parent ids. Parent idle does not

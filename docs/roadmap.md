@@ -88,7 +88,7 @@ Use the existing Store/router and small internal modules. Keep evidence in the P
       `PluginHost::start` and partial-create errors in `create_instance_dir`. Use empty-only
       removal as the reader path does. Post-spawn or nonempty plugin data needs its own
       lifetime evidence, not recursive deletion.
-- [ ] **Reconcile historical issues.** Revalidate #200 against the current generation
+- [x] **Reconcile historical issues.** Revalidate #200 against the current generation
       model; its pre-reset binding allocator/validator design is not an implementation
       dependency. Mark the v1 work in #1, #3, #4, #5, #11, #140, #153 and #159 historical
       or superseded after preserving any still-relevant requirement in its owning spec
@@ -211,7 +211,7 @@ No second executor, workflow graph or acceptance engine.
       and cost limits stay unsupported as specified in
       [automation](spec/automation.md). No check runs under the Store lock.
       Neither a failed check nor a missing terminal fact authorizes replay.
-- [ ] **L4.4 Recipes.** One timer, one event action and one bounded Goal using Codex.
+- [x] **L4.4 Recipes.** One timer, one event action and one bounded Goal using Codex.
       No second harness is necessary to demonstrate these behaviors.
 
 **Result:** the first harness can work unattended under explicit limits. Hook support
