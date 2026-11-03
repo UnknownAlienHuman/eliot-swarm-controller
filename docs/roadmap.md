@@ -49,10 +49,11 @@ Use the existing Store/router and small internal modules. Keep evidence in the P
       A retained old slot currently blocks resume even without a cap and can exhaust a
       shared scope. Completion: proven closure frees/transfers that slot, stale closure
       cannot free a newer slot, and unresolved custody stays visibly blocked without replay.
-- [ ] **Git fetch failure settlement.** Implement the [Git settlement contract](spec/automation.md#failed-transfer-and-unknown-readback):
+- [x] **Git fetch failure settlement.** Implement the [Git settlement contract](spec/automation.md#failed-transfer-and-unknown-readback):
       after interruption/custody checks, handle a definite nonzero exit before reading the
-      private ref. Exact unchanged tracking-ref readback permits `failed`; missing exit
-      status or uncertain custody/readback/CAS must not be treated as definite failure.
+      private ref. Exact unchanged tracking-ref readback permits `failed`; a missing exit
+      status is not a definite nonzero exit and still requires the private ref, and
+      uncertain custody/readback/CAS must not be treated as definite failure.
       Completion: the next same-repository mutation can run after a failed transfer;
       genuinely unknown work remains fenced.
 - [ ] **Diagnose CI failures.** Separate the Linux timer-fetch `unknown` case from the
