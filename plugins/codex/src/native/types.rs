@@ -611,15 +611,6 @@ pub struct NativeItemCompletedNotification {
     pub turn_id: String,
 }
 
-/// Minimal JSON-RPC error envelope for transport failures.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct NativeJsonRpcErrorBody {
-    pub code: i64,
-    pub message: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub data: Option<serde_json::Value>,
-}
-
 // ---------------------------------------------------------------------------
 // L2.2 control and server-request DTOs
 // ---------------------------------------------------------------------------
