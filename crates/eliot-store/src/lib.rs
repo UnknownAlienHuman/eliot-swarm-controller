@@ -43,6 +43,11 @@ const MAX_EVENT_BYTES: usize = 64 * 1024;
 const MAX_INPUT_BYTES: usize = 512 * 1024;
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const RETRY_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
+/// Allowed generator-clock skew for ULID age checks. A mutation id timestamp
+/// may run ahead of the Store commit clock by up to this margin; retention
+/// keeps rows long enough that such an id still reads `id_expired` after
+/// pruning. See docs/spec/configuration.md (daemon retention).
+const RETRY_CLOCK_SKEW_MS: i64 = 5 * 60 * 1_000;
 const CURRENT_SCHEMA_VERSION: i64 = 18;
 const COMMAND_METHOD: &str = "command.submit";
 const INITIAL_SOURCE: &str = "stream";

@@ -199,39 +199,27 @@ fn default_max_event_backlog() -> i64 {
     100_000
 }
 
-fn default_retention_days() -> i64 {
-    30
-}
-
 /// Physical retention windows consumed by daemon maintenance. See
-/// docs/spec/configuration.md: daemon retention.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+/// docs/spec/configuration.md: daemon retention. An unset window disables
+/// pruning for that side: no deletion without an owner window.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RetentionConfig {
-    #[serde(default = "default_retention_days")]
-    pub(crate) events_days: i64,
-    #[serde(default = "default_retention_days")]
-    pub(crate) commands_days: i64,
-}
-
-impl Default for RetentionConfig {
-    fn default() -> Self {
-        Self {
-            events_days: default_retention_days(),
-            commands_days: default_retention_days(),
-        }
-    }
+    #[serde(default)]
+    pub(crate) events_days: Option<i64>,
+    #[serde(default)]
+    pub(crate) commands_days: Option<i64>,
 }
 
 impl RetentionConfig {
     fn validate(self) -> core::Result<Self> {
-        if self.events_days <= 0 {
+        if self.events_days.is_some_and(|days| days <= 0) {
             return Err(core::Error::new(
                 "profile_error",
                 "config.toml: daemon.retention.events_days must be a positive integer",
             ));
         }
-        if self.commands_days <= 0 {
+        if self.commands_days.is_some_and(|days| days <= 0) {
             return Err(core::Error::new(
                 "profile_error",
                 "config.toml: daemon.retention.commands_days must be a positive integer",
@@ -1594,8 +1582,9 @@ mod tests {
             load_daemon_config(&fixture.root).unwrap(),
             DaemonConfig::default()
         );
-        assert_eq!(DaemonConfig::default().retention.events_days, 30);
-        assert_eq!(DaemonConfig::default().retention.commands_days, 30);
+        // Unset windows disable pruning: no deletion by default.
+        assert_eq!(DaemonConfig::default().retention.events_days, None);
+        assert_eq!(DaemonConfig::default().retention.commands_days, None);
 
         fixture.write("[daemon]\n");
         assert_eq!(
@@ -1608,8 +1597,19 @@ mod tests {
             load_daemon_config(&fixture.root).unwrap(),
             DaemonConfig {
                 retention: RetentionConfig {
-                    events_days: 7,
-                    commands_days: 14,
+                    events_days: Some(7),
+                    commands_days: Some(14),
+                },
+            }
+        );
+
+        fixture.write("[daemon]\nretention.events_days = 7\n");
+        assert_eq!(
+            load_daemon_config(&fixture.root).unwrap(),
+            DaemonConfig {
+                retention: RetentionConfig {
+                    events_days: Some(7),
+                    commands_days: None,
                 },
             }
         );

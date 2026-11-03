@@ -8,14 +8,19 @@
 //! retry window, and every row a live projection still references.
 
 use super::*;
+use std::time::Duration;
 
 const MS_PER_DAY: i64 = 24 * 60 * 60 * 1_000;
 /// Traversal backstop for parent/child sets. Parent links are bound once at
 /// admission, so sets are acyclic; reaching this fails the pass loudly rather
 /// than looping.
 const MAX_SET_DEPTH: i64 = 1_000;
-/// Candidate roots examined per pass. Total deleted rows stay bounded by
-/// `MAX_PAGE_ENTRIES`.
+/// Members collected per command set. A set larger than this is kept, not an
+/// error: fan-out is legitimate, while the depth bound above trips only on
+/// corruption. Total deleted rows stay bounded by `MAX_PAGE_ENTRIES`.
+const MAX_SET_MEMBERS: usize = MAX_PAGE_ENTRIES;
+/// Prunable roots deleted per pass. Kept roots are excluded by the selection
+/// query itself, so kept sets never starve the pass.
 const MAX_PRUNE_ROOTS: i64 = 50;
 
 /// Outcome of one bounded maintenance pass.
@@ -42,11 +47,12 @@ impl Store {
     /// expired contiguous prefix below every live cursor; command pruning
     /// removes whole closed child-sets leaf-first; writes pruning removes
     /// expired mutation bindings. Projections, source recovery state, timers,
-    /// and the event id allocator are never touched.
+    /// and the event id allocator are never touched. An unset (`None`) window
+    /// disables pruning for that side: no deletion without an owner window.
     pub fn prune_retention(
         &mut self,
-        events_days: i64,
-        commands_days: i64,
+        events_days: Option<i64>,
+        commands_days: Option<i64>,
         now: i64,
     ) -> Result<RetentionReport> {
         self.ensure_writer_healthy()?;
@@ -55,29 +61,88 @@ impl Store {
         result
     }
 
+    /// Run bounded passes until a pass deletes nothing or the tick budgets
+    /// run out. At least one pass always runs. `now` stays fixed so every
+    /// pass shares the same cutoffs.
+    pub fn prune_retention_tick(
+        &mut self,
+        events_days: Option<i64>,
+        commands_days: Option<i64>,
+        now: i64,
+        row_budget: i64,
+        time_budget: Duration,
+    ) -> Result<RetentionReport> {
+        let start = std::time::Instant::now();
+        let mut total = RetentionReport {
+            events_deleted: 0,
+            pruned_through: 0,
+            commands_deleted: 0,
+            writes_deleted: 0,
+        };
+        loop {
+            let pass = self.prune_retention(events_days, commands_days, now)?;
+            total.events_deleted += pass.events_deleted;
+            total.pruned_through = pass.pruned_through;
+            total.commands_deleted += pass.commands_deleted;
+            total.writes_deleted += pass.writes_deleted;
+            let pass_rows = pass.events_deleted + pass.commands_deleted + pass.writes_deleted;
+            if pass_rows == 0 {
+                break;
+            }
+            let total_rows = total.events_deleted + total.commands_deleted + total.writes_deleted;
+            if total_rows >= row_budget || start.elapsed() >= time_budget {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
     fn prune_retention_inner(
         &mut self,
-        events_days: i64,
-        commands_days: i64,
+        events_days: Option<i64>,
+        commands_days: Option<i64>,
         now: i64,
     ) -> Result<RetentionReport> {
-        if events_days <= 0 || commands_days <= 0 {
-            return Err(Error::new(
-                "invalid",
-                "retention windows must be positive days",
-            ));
-        }
-        let events_cutoff = now.saturating_sub(events_days.saturating_mul(MS_PER_DAY));
-        // Command/write bindings must outlive the retry window no matter how
-        // short the configured window is: a pruned id must read back as
-        // id_expired, never as a new request.
-        let commands_cutoff = now.saturating_sub(
-            commands_days
-                .saturating_mul(MS_PER_DAY)
-                .max(RETRY_WINDOW_MS),
-        );
-        let (events_deleted, pruned_through) = self.prune_events(events_cutoff)?;
-        let (commands_deleted, writes_deleted) = self.prune_commands_and_writes(commands_cutoff)?;
+        let events_cutoff = match events_days {
+            Some(days) => {
+                if days <= 0 {
+                    return Err(Error::new(
+                        "invalid",
+                        "retention windows must be positive days",
+                    ));
+                }
+                Some(now.saturating_sub(days.saturating_mul(MS_PER_DAY)))
+            }
+            None => None,
+        };
+        let commands_cutoff = match commands_days {
+            Some(days) => {
+                if days <= 0 {
+                    return Err(Error::new(
+                        "invalid",
+                        "retention windows must be positive days",
+                    ));
+                }
+                // Command/write bindings must outlive the retry window no
+                // matter how short the configured window is: a pruned id
+                // must read back as id_expired, never as a new request.
+                // The floor adds the allowed generator-clock skew, plus one
+                // millisecond so the integer-millisecond boundary favors
+                // retention: a ULID generated exactly the skew ahead of its
+                // row still reads expired after pruning.
+                let retry_floor = RETRY_WINDOW_MS + RETRY_CLOCK_SKEW_MS + 1;
+                Some(now.saturating_sub(days.saturating_mul(MS_PER_DAY).max(retry_floor)))
+            }
+            None => None,
+        };
+        let (events_deleted, pruned_through) = match events_cutoff {
+            Some(cutoff) => self.prune_events(cutoff)?,
+            None => (0, coverage_pruned_through(&self.connection)?),
+        };
+        let (commands_deleted, writes_deleted) = match commands_cutoff {
+            Some(cutoff) => self.prune_commands_and_writes(cutoff)?,
+            None => (0, 0),
+        };
         Ok(RetentionReport {
             events_deleted,
             pruned_through,
@@ -143,34 +208,59 @@ impl Store {
     }
 
     fn prune_commands_and_writes(&mut self, cutoff: i64) -> Result<(i64, i64)> {
+        // The open-child / turn / reference keep checks live in the selection
+        // itself: only fully prunable roots are returned, so kept sets never
+        // occupy the per-pass root budget and starve pruning.
         let roots: Vec<String> = self
             .connection
             .prepare(
-                "SELECT c.id FROM commands c
+                "WITH RECURSIVE
+                 old_sets(root, id, depth) AS (
+                     SELECT c.id, c.id, 0 FROM commands c
+                     WHERE c.parent_command IS NULL AND c.created_at <= ?1
+                     UNION ALL
+                     SELECT s.root, ch.id, s.depth + 1 FROM commands ch
+                     JOIN old_sets s ON ch.parent_command = s.id
+                     WHERE s.depth < ?2
+                 ),
+                 kept(root) AS (
+                     SELECT DISTINCT s.root FROM old_sets s
+                     JOIN commands m ON m.id = s.id
+                     WHERE m.state IN ('accepted', 'queued', 'dispatched', 'unknown')
+                        OR m.created_at > ?1
+                        OR s.depth >= ?2
+                        OR EXISTS (
+                            SELECT 1 FROM turns t
+                            WHERE t.agent = m.target AND t.generation = m.generation
+                              AND t.turn_id = m.turn_id
+                              AND t.state IN ('running', 'unknown')
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM workspaces w WHERE w.start_command_id = m.id
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM provider_holds h WHERE h.probe_command = m.id
+                        )
+                 )
+                 SELECT c.id FROM commands c
                  WHERE c.parent_command IS NULL
-                   AND c.state NOT IN ('accepted', 'queued', 'dispatched', 'unknown')
                    AND c.created_at <= ?1
-                   AND NOT EXISTS (
-                       SELECT 1 FROM turns t
-                       WHERE t.agent = c.target AND t.generation = c.generation
-                         AND t.turn_id = c.turn_id AND t.state IN ('running', 'unknown')
-                   )
-                   AND NOT EXISTS (
-                       SELECT 1 FROM workspaces w WHERE w.start_command_id = c.id
-                   )
-                   AND NOT EXISTS (
-                       SELECT 1 FROM provider_holds h WHERE h.probe_command = c.id
-                   )
-                 ORDER BY c.created_at, c.id LIMIT ?2",
+                   AND NOT EXISTS (SELECT 1 FROM kept k WHERE k.root = c.id)
+                 ORDER BY c.created_at, c.id LIMIT ?3",
             )
             .map_err(sql_error)?
-            .query_map(params![cutoff, MAX_PRUNE_ROOTS], |row| row.get(0))
+            .query_map(params![cutoff, MAX_SET_DEPTH, MAX_PRUNE_ROOTS], |row| {
+                row.get(0)
+            })
             .map_err(sql_error)?
             .collect::<rusqlite::Result<_>>()
             .map_err(sql_error)?;
         let mut doomed: Vec<SubtreeMember> = Vec::new();
         for root in &roots {
-            let members = subtree_members_tx(&self.connection, root)?;
+            let (members, truncated) = subtree_members_tx(&self.connection, root)?;
+            if truncated {
+                continue;
+            }
             if members.len() + doomed.len() > MAX_PAGE_ENTRIES && !doomed.is_empty() {
                 break;
             }
@@ -258,16 +348,51 @@ fn event_prune_end_tx(
             |row| row.get(0),
         )
         .map_err(sql_error)?;
-    let end = first_fresh.map(|fresh| fresh - 1).unwrap_or(ceiling);
+    let mut end = first_fresh.map(|fresh| fresh - 1).unwrap_or(ceiling);
+    // Native deduplication bindings outlive the window: never prune an event
+    // carrying a native_id while its source is still open. Native-bound
+    // events of closed sources may go.
+    let first_pinned: Option<i64> = tx
+        .query_row(
+            "SELECT MIN(e.seq) FROM events e
+             WHERE e.seq > ?1 AND e.seq <= ?2 AND e.native_id IS NOT NULL
+               AND EXISTS (
+                   SELECT 1 FROM source_state s
+                   WHERE s.agent = e.agent AND s.generation = e.generation
+                     AND s.source = e.source AND s.state = 'open'
+               )",
+            params![pruned_through, ceiling],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if let Some(pinned) = first_pinned {
+        end = end.min(pinned - 1);
+    }
     if end <= pruned_through {
         return Ok(None);
     }
     Ok(Some(end))
 }
 
+/// Current `rule_history_coverage.pruned_through` for reports when the events
+/// side is disabled.
+fn coverage_pruned_through(connection: &Connection) -> Result<i64> {
+    connection
+        .query_row(
+            "SELECT pruned_through FROM rule_history_coverage WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?
+        .ok_or_else(|| Error::new("source_integrity", "rule history coverage is absent"))
+}
+
 /// Every member of one command set with its keep signals. The caller deletes
-/// the set only when no member asks to be kept.
-fn subtree_members_tx(connection: &Connection, root: &str) -> Result<Vec<SubtreeMember>> {
+/// the set only when no member asks to be kept. Collection stops past
+/// `MAX_SET_MEMBERS` rows and reports truncation so the caller keeps the set:
+/// an oversize set is never partly pruned.
+fn subtree_members_tx(connection: &Connection, root: &str) -> Result<(Vec<SubtreeMember>, bool)> {
     let mut statement = connection
         .prepare(
             "WITH RECURSIVE subtree(id, depth) AS (
@@ -285,21 +410,25 @@ fn subtree_members_tx(connection: &Connection, root: &str) -> Result<Vec<Subtree
                     ),
                     EXISTS(SELECT 1 FROM workspaces w WHERE w.start_command_id = c.id),
                     EXISTS(SELECT 1 FROM provider_holds h WHERE h.probe_command = c.id)
-             FROM subtree s JOIN commands c ON c.id = s.id",
+             FROM subtree s JOIN commands c ON c.id = s.id
+             LIMIT ?3",
         )
         .map_err(sql_error)?;
     let rows = statement
-        .query_map(params![root, MAX_SET_DEPTH], |row| {
-            Ok(SubtreeMember {
-                id: row.get(0)?,
-                depth: row.get(1)?,
-                state: row.get(2)?,
-                created_at: row.get(3)?,
-                turn_bound: row.get(4)?,
-                workspace_ref: row.get(5)?,
-                probe_ref: row.get(6)?,
-            })
-        })
+        .query_map(
+            params![root, MAX_SET_DEPTH, MAX_SET_MEMBERS as i64 + 1],
+            |row| {
+                Ok(SubtreeMember {
+                    id: row.get(0)?,
+                    depth: row.get(1)?,
+                    state: row.get(2)?,
+                    created_at: row.get(3)?,
+                    turn_bound: row.get(4)?,
+                    workspace_ref: row.get(5)?,
+                    probe_ref: row.get(6)?,
+                })
+            },
+        )
         .map_err(sql_error)?;
     let mut members = Vec::new();
     for row in rows {
@@ -311,7 +440,11 @@ fn subtree_members_tx(connection: &Connection, root: &str) -> Result<Vec<Subtree
             "command set exceeds its traversal bound",
         ));
     }
-    Ok(members)
+    if members.len() > MAX_SET_MEMBERS {
+        members.pop();
+        return Ok((members, true));
+    }
+    Ok((members, false))
 }
 
 fn prune_writes_tx(tx: &Transaction<'_>, cutoff: i64) -> Result<i64> {
@@ -327,6 +460,7 @@ fn prune_writes_tx(tx: &Transaction<'_>, cutoff: i64) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eliot_core::{CommandState, NativeEvent, SourceBatch, parse_agent_id};
     use std::path::Path;
 
     const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -484,7 +618,7 @@ mod tests {
         }
         let fresh_first = insert_event(&mut store, NOW);
         insert_event(&mut store, NOW);
-        let report = store.prune_retention(30, 30, NOW).unwrap();
+        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
         assert_eq!(report.events_deleted, 5);
         assert_eq!(report.pruned_through, seqs[4]);
         assert_eq!(event_count(&store), 2);
@@ -503,7 +637,7 @@ mod tests {
         let second = insert_event(&mut store, old);
         insert_event(&mut store, NOW);
         insert_event(&mut store, old);
-        let report = store.prune_retention(30, 30, NOW).unwrap();
+        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
         assert_eq!(report.events_deleted, 2);
         assert_eq!(report.pruned_through, second);
         assert_eq!(event_count(&store), 2);
@@ -528,7 +662,7 @@ mod tests {
         // Expired rows above the cursor are still needed by the rule.
         insert_event(&mut store, old);
         insert_event(&mut store, old);
-        let report = store.prune_retention(30, 30, NOW).unwrap();
+        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
         assert_eq!(report.events_deleted, 3);
         assert_eq!(report.pruned_through, 3);
         assert_eq!(event_count(&store), 2);
@@ -546,7 +680,7 @@ mod tests {
             .unwrap();
         set_current_cursor(&mut store, "retire-rule", 5);
         set_retiring_cursor(&mut store, "retire-rule", 2, 5);
-        let report = store.prune_retention(30, 30, NOW).unwrap();
+        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
         assert_eq!(report.events_deleted, 2);
         assert_eq!(report.pruned_through, 2);
         assert_eq!(event_count(&store), 3);
@@ -563,7 +697,7 @@ mod tests {
             .ensure_rule_state("owner", &rule_input("off-rule", false), NOW)
             .unwrap();
         set_current_cursor(&mut store, "off-rule", 1);
-        let report = store.prune_retention(30, 30, NOW).unwrap();
+        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
         assert_eq!(report.events_deleted, 3);
         assert_eq!(report.pruned_through, 3);
         assert_eq!(event_count(&store), 0);
@@ -585,7 +719,7 @@ mod tests {
                 params![agent, NOW],
             )
             .unwrap();
-        let report = store.prune_retention(30, 30, NOW).unwrap();
+        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
         assert_eq!(report.events_deleted, 2);
         assert_eq!(report.pruned_through, 2);
         store
@@ -595,7 +729,7 @@ mod tests {
                 [agent],
             )
             .unwrap();
-        let report = store.prune_retention(30, 30, NOW).unwrap();
+        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
         assert_eq!(report.events_deleted, 2);
         assert_eq!(report.pruned_through, 4);
         assert_eq!(event_count(&store), 0);
@@ -617,7 +751,7 @@ mod tests {
                 params![agent, NOW],
             )
             .unwrap();
-        let report = store.prune_retention(30, 30, NOW).unwrap();
+        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
         assert_eq!(report.events_deleted, 4);
         assert_eq!(report.pruned_through, 4);
     }
@@ -637,7 +771,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        let report = store.prune_retention(30, 30, NOW).unwrap();
+        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
         assert_eq!(report.events_deleted, 3);
         let allocated_after: i64 = store
             .connection
@@ -660,10 +794,10 @@ mod tests {
         for _ in 0..2500 {
             insert_event(&mut store, old);
         }
-        let report = store.prune_retention(30, 30, NOW).unwrap();
+        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
         assert_eq!(report.events_deleted, MAX_PAGE_ENTRIES as i64);
         assert_eq!(report.pruned_through, MAX_PAGE_ENTRIES as i64);
-        let report = store.prune_retention(30, 30, NOW).unwrap();
+        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
         assert_eq!(report.events_deleted, MAX_PAGE_ENTRIES as i64);
         assert_eq!(report.pruned_through, 2 * MAX_PAGE_ENTRIES as i64);
         assert_eq!(event_count(&store), 500);
@@ -714,7 +848,7 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        let report = store.prune_retention(30, 30, NOW).unwrap();
+        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
         assert_eq!(report.events_deleted, 9);
         let after: Vec<Value> = store
             .connection
@@ -766,7 +900,7 @@ mod tests {
             )
             .unwrap();
         assert!(admitted.is_new);
-        let report = store.prune_retention(30, 30, NOW).unwrap();
+        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
         assert_eq!(report.pruned_through, captured);
         let error = store
             .admit_rule_catch_up(
@@ -821,7 +955,7 @@ mod tests {
             },
         );
         assert_eq!(command_count(&store), 5);
-        let report = store.prune_retention(30, 30, NOW).unwrap();
+        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
         assert_eq!(report.commands_deleted, 5);
         assert_eq!(command_count(&store), 0);
     }
@@ -842,7 +976,7 @@ mod tests {
                 },
             );
         }
-        let report = store.prune_retention(30, 30, NOW).unwrap();
+        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
         assert_eq!(report.commands_deleted, 0);
         assert_eq!(command_count(&store), 8);
     }
@@ -860,11 +994,11 @@ mod tests {
                 ..command_seed(Ulid::new().to_string(), NOW - 3_600_000)
             },
         );
-        let report = store.prune_retention(30, 30, NOW).unwrap();
+        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
         assert_eq!(report.commands_deleted, 0);
         assert_eq!(command_count(&store), 2);
         // The retry window holds even for a one-day window.
-        let report = store.prune_retention(30, 1, NOW).unwrap();
+        let report = store.prune_retention(Some(30), Some(1), NOW).unwrap();
         assert_eq!(report.commands_deleted, 0);
         assert_eq!(command_count(&store), 2);
     }
@@ -892,7 +1026,7 @@ mod tests {
                 [agent],
             )
             .unwrap();
-        let report = store.prune_retention(30, 30, NOW).unwrap();
+        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
         assert_eq!(report.commands_deleted, 0);
         store
             .connection
@@ -901,7 +1035,7 @@ mod tests {
                 [agent],
             )
             .unwrap();
-        let report = store.prune_retention(30, 30, NOW).unwrap();
+        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
         assert_eq!(report.commands_deleted, 0);
         store
             .connection
@@ -910,7 +1044,7 @@ mod tests {
                 [agent],
             )
             .unwrap();
-        let report = store.prune_retention(30, 30, NOW).unwrap();
+        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
         assert_eq!(report.commands_deleted, 1);
         assert_eq!(command_count(&store), 0);
     }
@@ -957,14 +1091,14 @@ mod tests {
                 params![probe, NOW],
             )
             .unwrap();
-        let report = store.prune_retention(30, 30, NOW).unwrap();
+        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
         assert_eq!(report.commands_deleted, 0);
         assert_eq!(command_count(&store), 2);
         store
             .connection
             .execute("DELETE FROM provider_holds WHERE scope = 'scope-1'", [])
             .unwrap();
-        let report = store.prune_retention(30, 30, NOW).unwrap();
+        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
         assert_eq!(report.commands_deleted, 1);
         // The workspace start stays pinned while its preparation row exists.
         assert_eq!(command_count(&store), 1);
@@ -987,7 +1121,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let report = store.prune_retention(30, 30, NOW).unwrap();
+        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
         assert_eq!(report.writes_deleted, 1);
         let remaining: i64 = store
             .connection
@@ -1017,7 +1151,7 @@ mod tests {
                 [&request.id],
             )
             .unwrap();
-        let report = store.prune_retention(30, 30, NOW).unwrap();
+        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
         assert_eq!(report.commands_deleted, 1);
         let error = store.submit("owner", request, NOW).unwrap_err();
         assert_eq!(error.code, "id_expired");
@@ -1030,7 +1164,7 @@ mod tests {
         fresh.expected_generation = Some(0);
         let admission = store.submit("owner", fresh.clone(), NOW).unwrap();
         assert!(admission.is_new);
-        let report = store.prune_retention(30, 30, NOW).unwrap();
+        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
         assert_eq!(report.commands_deleted, 0);
         let replay = store.submit("owner", fresh, NOW).unwrap();
         assert!(!replay.is_new);
@@ -1043,7 +1177,7 @@ mod tests {
         for _ in 0..1200 {
             insert_command(&mut store, command_seed(Ulid::new().to_string(), old));
         }
-        let report = store.prune_retention(30, 30, NOW).unwrap();
+        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
         assert_eq!(report.commands_deleted, MAX_PRUNE_ROOTS);
         assert_eq!(command_count(&store), 1200 - MAX_PRUNE_ROOTS);
     }
@@ -1057,7 +1191,7 @@ mod tests {
         }
         insert_event(&mut store, NOW);
         assert_eq!(store.read_events(0, 100, None).unwrap().len(), 4);
-        let report = store.prune_retention(30, 30, NOW).unwrap();
+        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
         assert_eq!(report.pruned_through, 3);
         let error = store.read_events(0, 100, None).unwrap_err();
         assert_eq!(error.code, "history_gap");
@@ -1073,10 +1207,482 @@ mod tests {
         let mut store = store();
         for (events_days, commands_days) in [(0, 30), (30, 0), (-1, 30), (30, -1)] {
             let error = store
-                .prune_retention(events_days, commands_days, NOW)
+                .prune_retention(Some(events_days), Some(commands_days), NOW)
                 .unwrap_err();
             assert_eq!(error.code, "invalid");
         }
         assert!(!store.is_write_faulted());
+    }
+
+    #[test]
+    fn unset_retention_disables_pruning_per_side() {
+        let mut store = store();
+        let old = NOW - 31 * DAY_MS;
+        for _ in 0..3 {
+            insert_event(&mut store, old);
+        }
+        insert_command(&mut store, command_seed(Ulid::new().to_string(), old));
+        let report = store.prune_retention(None, None, NOW).unwrap();
+        assert_eq!(report.events_deleted, 0);
+        assert_eq!(report.commands_deleted, 0);
+        assert_eq!(report.writes_deleted, 0);
+        assert_eq!(report.pruned_through, 0);
+        assert_eq!(event_count(&store), 3);
+        assert_eq!(command_count(&store), 1);
+        // Each side runs only when its own window is configured.
+        let report = store.prune_retention(Some(30), None, NOW).unwrap();
+        assert_eq!(report.events_deleted, 3);
+        assert_eq!(report.pruned_through, 3);
+        assert_eq!(report.commands_deleted, 0);
+        assert_eq!(command_count(&store), 1);
+    }
+
+    fn launch_agent(store: &mut Store, project: &str, now: i64) -> (String, String) {
+        let launch_id = ulid_at(now, 7);
+        let mut launch = SubmitCommand::new(launch_id.clone(), "launch");
+        launch.args = json!({
+            "project": project,
+            "workspace": "retention-workspace",
+        });
+        launch.expected_generation = Some(0);
+        let admission = store.submit("owner", launch, now).unwrap();
+        let agent = admission.command.target.unwrap();
+        store.dispatch(&launch_id, now).unwrap();
+        (agent, launch_id)
+    }
+
+    fn commit_ready(store: &mut Store, agent: &str, launch_id: &str, batch_id: &str, now: i64) {
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: batch_id.to_owned(),
+                    agent_id: agent.to_owned(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "session.ready".to_owned(),
+                        native_id: format!("{batch_id}:ready"),
+                        data: json!({"command_id": launch_id}),
+                    }],
+                    cursor: None,
+                },
+                now,
+            )
+            .unwrap();
+    }
+
+    fn source_state(store: &Store, agent_num: i64) -> String {
+        store
+            .connection
+            .query_row(
+                "SELECT state FROM source_state
+                 WHERE agent = ?1 AND generation = 1 AND source = 'stream'",
+                [agent_num],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn prune_events_pins_open_native_ids_and_frees_closed_ones() {
+        let mut store = store();
+        let old = NOW - 31 * DAY_MS;
+        let (agent, launch_id) = launch_agent(&mut store, "retention-native", old);
+        let agent_num = parse_agent_id(&agent).unwrap();
+        commit_ready(&mut store, &agent, &launch_id, "ready-batch", old);
+        store
+            .settle(&launch_id, CommandState::Applied, None, old)
+            .unwrap();
+        assert_eq!(source_state(&store, agent_num), "open");
+        let ready_seq: i64 = store
+            .connection
+            .query_row(
+                "SELECT seq FROM events WHERE native_id = 'ready-batch:ready'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let water_before = store.high_water().unwrap();
+
+        // The open native event pins the prefix: older daemon rows go, the
+        // native binding stays.
+        let report = store.prune_retention(Some(30), None, NOW).unwrap();
+        assert!(report.pruned_through < ready_seq);
+        assert!(report.events_deleted > 0);
+        let retained: bool = store
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE seq = ?1)",
+                [ready_seq],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(retained);
+
+        // Re-delivering the committed native id under a new batch still hits
+        // the deduplication binding instead of allocating a new seq.
+        let duplicate = store.put_batch(
+            SourceBatch {
+                batch_id: "ready-batch-redelivery".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ready".to_owned(),
+                    native_id: "ready-batch:ready".to_owned(),
+                    data: json!({"command_id": launch_id}),
+                }],
+                cursor: None,
+            },
+            NOW,
+        );
+        assert_eq!(duplicate.unwrap_err().code, "source_integrity");
+        assert_eq!(store.high_water().unwrap(), water_before);
+
+        // Native-bound events of closed sources may go.
+        store
+            .connection
+            .execute(
+                "UPDATE source_state SET state = 'closed'
+                 WHERE agent = ?1 AND generation = 1 AND source = 'stream'",
+                [agent_num],
+            )
+            .unwrap();
+        let report = store.prune_retention(Some(30), None, NOW).unwrap();
+        assert!(report.events_deleted > 0);
+        let retained: bool = store
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE seq = ?1)",
+                [ready_seq],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!retained);
+    }
+
+    #[test]
+    fn prune_commands_skips_kept_roots_without_starving() {
+        let mut store = store();
+        let old = NOW - 31 * DAY_MS;
+        // More than one root page of old roots whose children stay unknown,
+        // all sorting before the prunable roots.
+        for index in 0..60 {
+            let parent = Ulid::new().to_string();
+            insert_command(&mut store, command_seed(parent.clone(), old));
+            insert_command(
+                &mut store,
+                CommandSeed {
+                    parent: Some((parent, "rule_action".to_owned(), 0)),
+                    state: "unknown".to_owned(),
+                    ..command_seed(Ulid::new().to_string(), old + index)
+                },
+            );
+        }
+        for _ in 0..5 {
+            insert_command(
+                &mut store,
+                command_seed(Ulid::new().to_string(), old + DAY_MS),
+            );
+        }
+        assert_eq!(command_count(&store), 125);
+        let report = store.prune_retention(None, Some(30), NOW).unwrap();
+        assert_eq!(report.commands_deleted, 5);
+        assert_eq!(command_count(&store), 120);
+        // Nothing prunable remains; the kept roots are untouched.
+        let report = store.prune_retention(None, Some(30), NOW).unwrap();
+        assert_eq!(report.commands_deleted, 0);
+        assert_eq!(command_count(&store), 120);
+        let unknown_children: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM commands WHERE state = 'unknown'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unknown_children, 60);
+    }
+
+    #[test]
+    fn prune_commands_covers_ulid_clock_skew() {
+        let mut store = store();
+        // The ULID runs the full allowed skew ahead of the commit clock, and
+        // the row sits inside the skew-extended floor but past the bare
+        // 24-hour floor: without the margin it would prune while its id is
+        // still valid.
+        let skew = RETRY_CLOCK_SKEW_MS;
+        let submitted_at = NOW - RETRY_WINDOW_MS - skew + 60_000;
+        let mut request = SubmitCommand::new(ulid_at(submitted_at + skew, 1), "launch");
+        request.args = json!({
+            "project": "retention-skew-project",
+            "workspace": "retention-skew-workspace",
+        });
+        request.expected_generation = Some(0);
+        let admission = store
+            .submit("owner", request.clone(), submitted_at)
+            .unwrap();
+        assert!(admission.is_new);
+        store
+            .connection
+            .execute(
+                "UPDATE commands SET state = 'applied' WHERE id = ?1",
+                [&request.id],
+            )
+            .unwrap();
+        let report = store.prune_retention(None, Some(1), NOW).unwrap();
+        assert_eq!(report.commands_deleted, 0);
+        assert!(store.get_command(&request.id).unwrap().is_some());
+        // The id is still live, so it replays instead of expiring.
+        let replay = store.submit("owner", request, NOW).unwrap();
+        assert!(!replay.is_new);
+    }
+
+    #[test]
+    fn prune_tick_drains_multiple_batches_under_budgets() {
+        use std::time::Duration;
+        let mut store = store();
+        let old = NOW - 31 * DAY_MS;
+        for _ in 0..2500 {
+            insert_event(&mut store, old);
+        }
+        let report = store
+            .prune_retention_tick(Some(30), Some(30), NOW, i64::MAX, Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(report.events_deleted, 2500);
+        assert_eq!(report.pruned_through, 2500);
+        assert_eq!(event_count(&store), 0);
+    }
+
+    #[test]
+    fn prune_tick_stops_at_row_budget() {
+        use std::time::Duration;
+        let mut store = store();
+        let old = NOW - 31 * DAY_MS;
+        for _ in 0..2500 {
+            insert_event(&mut store, old);
+        }
+        let report = store
+            .prune_retention_tick(Some(30), Some(30), NOW, 1500, Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(report.events_deleted, 2000);
+        assert_eq!(report.pruned_through, 2000);
+        assert_eq!(event_count(&store), 500);
+    }
+
+    #[test]
+    fn prune_tick_zero_time_budget_runs_one_pass() {
+        use std::time::Duration;
+        let mut store = store();
+        let old = NOW - 31 * DAY_MS;
+        for _ in 0..2500 {
+            insert_event(&mut store, old);
+        }
+        let report = store
+            .prune_retention_tick(Some(30), Some(30), NOW, i64::MAX, Duration::ZERO)
+            .unwrap();
+        assert_eq!(report.events_deleted, MAX_PAGE_ENTRIES as i64);
+        assert_eq!(event_count(&store), 2500 - MAX_PAGE_ENTRIES as i64);
+    }
+
+    #[test]
+    fn prune_tick_drains_roots_across_passes() {
+        use std::time::Duration;
+        let mut store = store();
+        let old = NOW - 31 * DAY_MS;
+        for _ in 0..60 {
+            insert_command(&mut store, command_seed(Ulid::new().to_string(), old));
+        }
+        let report = store
+            .prune_retention_tick(None, Some(30), NOW, i64::MAX, Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(report.commands_deleted, 60);
+        assert_eq!(command_count(&store), 0);
+    }
+
+    fn start_send_turn(
+        store: &mut Store,
+        agent: &str,
+        command_id: &str,
+        probe: bool,
+        now: i64,
+    ) -> String {
+        store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: command_id.to_owned(),
+                    target: Some(agent.to_owned()),
+                    verb: "send".to_owned(),
+                    args: json!({"text": "retention probe input"}),
+                    expected_generation: Some(1),
+                    expected_turn_id: None,
+                    request_id: None,
+                    probe,
+                },
+                now,
+            )
+            .unwrap();
+        store.dispatch(command_id, now + 1).unwrap();
+        let turn_id = format!("turn-{command_id}");
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: format!("{command_id}-started"),
+                    agent_id: agent.to_owned(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "turn.started".to_owned(),
+                        native_id: format!("{command_id}-started"),
+                        data: json!({"command_id": command_id, "turn_id": turn_id}),
+                    }],
+                    cursor: None,
+                },
+                now + 2,
+            )
+            .unwrap();
+        turn_id
+    }
+
+    #[test]
+    fn provider_probe_scan_fails_loudly_across_pruned_history() {
+        let mut store = store();
+        let old = NOW - 31 * DAY_MS;
+        let (agent, launch_id) = launch_agent(&mut store, "retention-probe", old);
+        let agent_num = parse_agent_id(&agent).unwrap();
+        commit_ready(&mut store, &agent, &launch_id, "probe-ready", old);
+        store
+            .settle(&launch_id, CommandState::Applied, None, old)
+            .unwrap();
+        // A failed turn records a rate-limit hold; the probe send claims it.
+        let first_id = ulid_at(old + 3, 2);
+        let first_turn = start_send_turn(&mut store, &agent, &first_id, false, old + 3);
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: format!("{first_id}-completed"),
+                    agent_id: agent.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "turn.completed".to_owned(),
+                        native_id: format!("{first_id}-completed"),
+                        data: json!({
+                            "command_id": first_id,
+                            "turn_id": first_turn,
+                            "status": "failed",
+                            "provider_restriction": {"kind": "rate_limit", "retry_after": None::<i64>},
+                        }),
+                    }],
+                    cursor: None,
+                },
+                old + 6,
+            )
+            .unwrap();
+        let probe_id = ulid_at(old + 7, 3);
+        let probe_turn = start_send_turn(&mut store, &agent, &probe_id, true, old + 7);
+        let accepted_seq: i64 = store
+            .connection
+            .query_row(
+                "SELECT MAX(seq) FROM events
+                 WHERE kind = 'command.accepted'
+                   AND json_extract(data, '$.command_id') = ?1",
+                [&probe_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        // Prune the probe's accepted event while the source is closed, then
+        // reopen: the terminal scan must fail loudly instead of clearing the
+        // hold on incomplete history.
+        store
+            .connection
+            .execute(
+                "UPDATE source_state SET state = 'closed'
+                 WHERE agent = ?1 AND generation = 1 AND source = 'stream'",
+                [agent_num],
+            )
+            .unwrap();
+        let report = store.prune_retention(Some(30), None, NOW).unwrap();
+        assert!(report.pruned_through >= accepted_seq);
+        let accepted_survives: bool = store
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE seq = ?1)",
+                [accepted_seq],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!accepted_survives);
+        store
+            .connection
+            .execute(
+                "UPDATE source_state SET state = 'open'
+                 WHERE agent = ?1 AND generation = 1 AND source = 'stream'",
+                [agent_num],
+            )
+            .unwrap();
+        let terminal = store.put_batch(
+            SourceBatch {
+                batch_id: format!("{probe_id}-completed"),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "turn.completed".to_owned(),
+                    native_id: format!("{probe_id}-completed"),
+                    data: json!({
+                        "command_id": probe_id,
+                        "turn_id": probe_turn,
+                        "status": "completed",
+                    }),
+                }],
+                cursor: None,
+            },
+            NOW,
+        );
+        assert_eq!(terminal.unwrap_err().code, "source_integrity");
+        let hold_state: String = store
+            .connection
+            .query_row(
+                "SELECT state FROM provider_holds WHERE scope = 'profile:fake'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hold_state, "probing");
+    }
+
+    #[test]
+    fn oversize_command_set_is_kept_not_partly_pruned() {
+        let mut store = store();
+        let old = NOW - 31 * DAY_MS;
+        let root = Ulid::new().to_string();
+        insert_command(&mut store, command_seed(root.clone(), old));
+        for ordinal in 0..MAX_SET_MEMBERS as i64 + 1 {
+            insert_command(
+                &mut store,
+                CommandSeed {
+                    parent: Some((root.clone(), "rule_action".to_owned(), ordinal)),
+                    state: "applied".to_owned(),
+                    ..command_seed(Ulid::new().to_string(), old)
+                },
+            );
+        }
+        let (members, truncated) = subtree_members_tx(&store.connection, &root).unwrap();
+        assert!(truncated);
+        assert_eq!(members.len(), MAX_SET_MEMBERS);
+        let prunable = Ulid::new().to_string();
+        insert_command(&mut store, command_seed(prunable.clone(), old));
+        let report = store.prune_retention(None, Some(30), NOW).unwrap();
+        assert_eq!(report.commands_deleted, 1);
+        assert!(store.get_command(&root).unwrap().is_some());
+        assert!(store.get_command(&prunable).unwrap().is_none());
     }
 }

@@ -11,6 +11,10 @@ use tokio::sync::{Mutex, watch};
 
 /// Hourly cleanup is plenty for day-granularity retention windows.
 pub(crate) const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(3600);
+/// One tick loops bounded passes until a pass deletes nothing or a budget
+/// runs out.
+pub(crate) const RETENTION_TICK_ROW_BUDGET: i64 = 10_000;
+pub(crate) const RETENTION_TICK_TIME_BUDGET: Duration = Duration::from_secs(30);
 
 pub(crate) async fn run(
     store: Arc<Mutex<Store>>,
@@ -77,23 +81,27 @@ pub(crate) async fn run(
     }
 }
 
-/// Run one bounded retention pass now. This is the maintenance tick body; the
-/// loop above only schedules it.
+/// Run one retention tick now: bounded passes under the tick row and time
+/// budgets. This is the maintenance tick body; the loop above only
+/// schedules it.
 pub(crate) async fn run_once(
     store: &Mutex<Store>,
     retention: &config::RetentionConfig,
     now: i64,
 ) -> Result<RetentionReport> {
-    store
-        .lock()
-        .await
-        .prune_retention(retention.events_days, retention.commands_days, now)
+    store.lock().await.prune_retention_tick(
+        retention.events_days,
+        retention.commands_days,
+        now,
+        RETENTION_TICK_ROW_BUDGET,
+        RETENTION_TICK_TIME_BUDGET,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eliot_core::SubmitCommand;
+    use eliot_core::{NativeEvent, SourceBatch, SubmitCommand};
     use serde_json::json;
 
     #[tokio::test]
@@ -166,5 +174,86 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, "history_gap");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn maintenance_without_windows_deletes_nothing() {
+        let store = Mutex::new(Store::open(std::path::Path::new(":memory:")).unwrap());
+        let admitted_at = now_ms();
+        let pruned_at = admitted_at + 31 * 24 * 60 * 60 * 1_000;
+        let launch_id = {
+            let mut store = store.lock().await;
+            let mut launch = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+            launch.args = json!({
+                "project": "retention-disabled-project",
+                "workspace": "retention-disabled-workspace",
+            });
+            launch.expected_generation = Some(0);
+            let launch_id = launch.id.clone();
+            let agent = store
+                .submit("owner", launch, admitted_at)
+                .unwrap()
+                .command
+                .target
+                .unwrap();
+            store.dispatch(&launch_id, admitted_at).unwrap();
+            store
+                .put_batch(
+                    SourceBatch {
+                        batch_id: "disabled-ready".to_owned(),
+                        agent_id: agent,
+                        generation: 1,
+                        source: "stream".to_owned(),
+                        events: vec![NativeEvent {
+                            ts: None,
+                            kind: "session.ready".to_owned(),
+                            native_id: "disabled-ready".to_owned(),
+                            data: json!({"command_id": launch_id}),
+                        }],
+                        cursor: None,
+                    },
+                    admitted_at,
+                )
+                .unwrap();
+            store
+                .settle(
+                    &launch_id,
+                    eliot_core::CommandState::Applied,
+                    None,
+                    admitted_at,
+                )
+                .unwrap();
+            launch_id
+        };
+
+        let disabled = config::RetentionConfig::default();
+        let report = run_once(&store, &disabled, pruned_at).await.unwrap();
+        assert_eq!(report.events_deleted, 0);
+        assert_eq!(report.commands_deleted, 0);
+        assert_eq!(report.writes_deleted, 0);
+        assert!(
+            store
+                .lock()
+                .await
+                .get_command(&launch_id)
+                .unwrap()
+                .is_some()
+        );
+
+        // The same row prunes once its window is configured.
+        let enabled = config::RetentionConfig {
+            events_days: None,
+            commands_days: Some(30),
+        };
+        let report = run_once(&store, &enabled, pruned_at).await.unwrap();
+        assert_eq!(report.commands_deleted, 1);
+        assert!(
+            store
+                .lock()
+                .await
+                .get_command(&launch_id)
+                .unwrap()
+                .is_none()
+        );
     }
 }

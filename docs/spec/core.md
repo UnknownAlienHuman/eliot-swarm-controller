@@ -501,13 +501,16 @@ available through the authenticated private `source.state` request only; public 
 ## Retention
 
 The [physical retention increment](../roadmap.md#l7--qualification-repair-and-release)
-is pending. The following is its contract; bounded read pages alone do not bound stored
-history.
+is implemented by daemon maintenance through the existing Store writer. The following
+is its contract; bounded read pages alone do not bound stored history.
 
 Cleanup uses bounded batches through the existing Store writer. Delete only an expired,
 contiguous event prefix below every enabled current/retiring rule cursor. Open
 current-generation Git hint cursors pin the same prefix, so hint scans never skip
-unconsumed history silently. A lagging rule
+unconsumed history silently. Events carrying a `native_id` are pruned only after
+their source closes (`source_state.state = 'closed'` for that agent/generation/source);
+open sources pin their native-bound events so a redelivered batch still deduplicates.
+A lagging rule
 releases its pin only through the ordinary atomic backlog skip/pause transition. Advance
 `rule_history_coverage.pruned_through` in the same transaction as deletion, so replay and
 explicit catch-up return `history_gap` instead of silently omitting events. Never reset
@@ -524,6 +527,6 @@ Retain parent/child command sets while required by open work or the supported hi
 window; prune the set transactionally, children before parent, so callers never see a
 partly pruned expansion. Keep any set containing accepted, queued, dispatched or unknown
 work. Retain command bindings/results in `commands` and other mutation bindings/results
-in `writes` for at least the supported retry window. Cleanup must not make an accepted
-id look new or replay an external effect.
+in `writes` for at least the supported retry window plus the allowed clock-skew
+margin. Cleanup must not make an accepted id look new or replay an external effect.
 Once a complete expansion is gone, the target `command.children` API returns `history_gap`.
