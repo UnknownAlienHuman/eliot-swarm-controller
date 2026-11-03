@@ -408,29 +408,41 @@ reservation across daemon replacement. These limits describe Eliot's admitted wo
 not vendor entitlements, account permissions or provider quotas. Fake profiles may use
 named profile/account caps; Fake does not acquire a proxy route.
 
-The pending [restart recovery repair](../roadmap.md#repairs-to-implemented-paths) must
-connect retained reservations to a supported reconciliation path. Capture the old
-Agent/generation and its recorded process/custody identity; recover exact closure facts
-outside the Store lock. Reuse existing process/source state and capacity helpers;
-persist only any missing custody identity needed by this path, before the native start
-it identifies. Do not introduce a separate proof ledger.
+Restart recovery reconciles reservations that a daemon replacement leaves behind. After
+`recover_on_restart` and before IPC bind, the daemon reads every `lost` controlled
+generation whose `capacity_generation` still equals its generation, with the process
+identities recorded for owner `agent:<id>#<generation>`. It checks custody outside the
+Store lock, then commits the closure and `capacity.released` (or the transfer to an
+admitted resume) in one Store transaction conditional on `capacity_generation` still
+equaling that generation. Generations it cannot settle are rechecked every two seconds;
+no new generation of this daemon is ever among them. The only persisted custody identity
+added for this path is a random per-database namespace (`store_identity`): Windows names
+each Agent generation's kill-on-close Job `Global\eliot-<namespace>-<agent>-<generation>`
+before the suspended plugin starts, and never adopts an existing object of that name.
 
-Closure and source coverage are independent: drain recoverable data and commit native
-terminal facts first, or record an explicit gap for the lost tail. Only after this source
-reconciliation, commit the independently verified custody closure and release/transfer
-in one Store transaction conditional on `capacity_generation` still equaling that old
-generation. A gap, a stale/closed source, an Agent marked `lost`, a timeout or cleared
-provider hold never proves custody closed or a turn complete. Do not replay an uncertain
-launch/send or turn unknown work into a successful result to reclaim a slot.
+Closure and source coverage are independent. Restart already closes the lost
+generation's native sources as `stale`; a successor's source handoff records any gap for
+the lost tail, and release requires that no native source of that generation is open. A
+gap, a stale/closed source, an Agent marked `lost`, a timeout or cleared provider hold
+never proves custody closed or a turn complete. Release does not change any command or
+turn: uncertain launch/send and unknown turns stay unknown and are never replayed.
 
-Use the [platform custody rules](monitoring.md#process-identity-and-custody). A PID being
-absent and the current estimated Windows boot marker are insufficient by themselves;
-Windows recovery needs verifiable Job/process closure. Degraded Unix may retain possible
-escaped descendants. If closure cannot be established, retain the reservation and show
-the blocking Agent/generation and missing evidence in existing owner readback. Later
-exact native terminal-session evidence accepted by existing settlement, or separately
-verified custody closure, may settle it. An owner command/turn assertion is not a capacity
-override. Do not count unknown reservations as free slots.
+Closure follows the [platform custody rules](monitoring.md#process-identity-and-custody).
+A PID being absent and the estimated Windows boot marker are insufficient. On Windows the
+named Job must be gone or open with no member, and every recorded process identity,
+matched by PID and exact creation time, must have exited (`windows_job_closed`). The
+name disappears when the last handle closes, which for this kill-on-close Job without
+breakaway already terminates every member; a member never recorded in `processes` cannot
+be checked afterwards and relies on that kernel termination. A generation started before
+the namespace existed has no findable Job and stays retained. On Linux every recorded identity of the current boot must be gone
+or a zombie and the recorded plugin leader's process group empty (`unix_group_empty`,
+`orphan_possible: true`, since escaped descendants stay possible); identities from an
+earlier boot prove closure by reboot (`host_rebooted`). Otherwise the reservation stays,
+the first check records `capacity.retained` with the missing evidence, and a resume of
+that Agent is rejected with `capacity_unavailable` naming the retained generation. Later
+exact native terminal-session evidence accepted by existing settlement may still settle
+it. An owner command/turn assertion is not a capacity override. Do not count unknown
+reservations as free slots.
 
 Provider holds are durable Eliot state over the named local scope derived from the frozen
 route, account or profile. They do not infer vendor account identity, entitlement or

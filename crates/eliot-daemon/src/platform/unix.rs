@@ -449,6 +449,72 @@ fn read_linux_process_identity(pid: u32) -> std::io::Result<(i32, u64)> {
     Ok((stat.pgid, stat.start_ticks))
 }
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn linux_start_ticks(pid: u32) -> u64 {
+    read_linux_process_identity(pid)
+        .expect("read test process identity")
+        .1
+}
+
+/// Whether a process identity recorded by an earlier daemon is still that
+/// running process. A zombie or a reused PID is not.
+#[cfg(target_os = "linux")]
+pub(crate) fn recorded_process_alive(pid: u32, start_ticks: u64) -> Result<bool> {
+    match read_linux_process_stat(pid) {
+        Ok(stat) => Ok(stat.start_ticks == start_ticks && stat.state != ProcessState::Exited),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(unknown_process_identity(
+            "read recorded process identity",
+            error,
+        )),
+    }
+}
+
+/// Group probe for a leader recorded by an earlier daemon, after
+/// `recorded_process_alive` showed that leader is gone.
+#[cfg(target_os = "linux")]
+pub(crate) fn recorded_process_group_empty(leader: u32) -> Result<bool> {
+    let pgid = i32::try_from(leader).map_err(|_| {
+        Error::new(
+            "process_custody_unknown",
+            "recorded process-group leader cannot be a PGID",
+        )
+    })?;
+    process_group_empty(pgid)
+}
+
+/// A reused PGID conservatively reports nonempty; escaped descendants remain
+/// possible, so emptiness is not exact family containment.
+#[cfg(target_os = "linux")]
+fn process_group_empty(pgid: i32) -> Result<bool> {
+    // kill(-1, 0) is a broadcast probe, not a process-group probe.
+    // https://pubs.opengroup.org/onlinepubs/9799919799/functions/kill.html
+    if pgid <= 1 {
+        return Err(Error::new(
+            "process_custody_unknown",
+            "process-group emptiness requires a PGID greater than one",
+        ));
+    }
+    // SAFETY: the PGID exceeds one and signal zero sends no signal.
+    if unsafe { libc::kill(-pgid, 0) } == 0 {
+        return Ok(false);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(true),
+        Some(libc::EPERM) => Ok(false),
+        _ => Err(unknown_process_identity(
+            "observe process-group emptiness",
+            error,
+        )),
+    }
+}
+
 #[cfg(target_os = "linux")]
 struct LinuxProcessStat {
     pgid: i32,
@@ -593,30 +659,8 @@ impl ProcessObserver {
                 "known process-group emptiness requires recorded root exit",
             ));
         }
-        // kill(-1, 0) is a broadcast probe, not a process-group probe.
-        // https://pubs.opengroup.org/onlinepubs/9799919799/functions/kill.html
-        if self.group.pgid <= 1 {
-            return Err(Error::new(
-                "process_custody_unknown",
-                "known process-group emptiness requires captured PGID greater than one",
-            ));
-        }
-        // Only observe the captured group after reaping its leader. A reused
-        // PGID conservatively reports nonempty; escaped descendants remain
-        // possible, so this is not exact family containment.
-        // SAFETY: the captured PGID exceeds one and signal zero sends no signal.
-        if unsafe { libc::kill(-self.group.pgid, 0) } == 0 {
-            return Ok(false);
-        }
-        let error = std::io::Error::last_os_error();
-        match error.raw_os_error() {
-            Some(libc::ESRCH) => Ok(true),
-            Some(libc::EPERM) => Ok(false),
-            _ => Err(unknown_process_identity(
-                "observe known process-group emptiness",
-                error,
-            )),
-        }
+        // Only observe the captured group after reaping its leader.
+        process_group_empty(self.group.pgid)
     }
 
     pub(crate) fn snapshot(&self, owner: &str, now: i64) -> Result<ProcessSnapshot> {

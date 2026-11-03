@@ -14,6 +14,7 @@ mod platform;
 mod plugin_host;
 mod proxy;
 mod redaction;
+mod restart_capacity;
 mod router;
 pub(crate) mod scripts;
 mod setup;

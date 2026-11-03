@@ -3,6 +3,254 @@ use super::*;
 use eliot_core::CapacityScope;
 
 const MIGRATION_BATCH_SIZE: i64 = 128;
+const RETAINED_PAGE_SIZE: i64 = 128;
+
+/// A controlled generation left `lost` by a daemon replacement while it still
+/// reserves capacity, with the process identities recorded in its custody.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetainedGeneration {
+    pub agent: String,
+    pub generation: i64,
+    /// The generation started after this Store had a custody namespace, so
+    /// its custody was created under the name derived from it.
+    pub named_custody: bool,
+    pub processes: Vec<RecordedProcess>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordedProcess {
+    pub identity: ProcessIdentity,
+    pub role: String,
+    pub exited: bool,
+}
+
+impl Store {
+    /// Random per-database namespace for OS custody names. A later daemon finds
+    /// a previous generation's custody from it without storing another name.
+    pub fn custody_namespace(&self) -> Result<String> {
+        self.connection
+            .query_row(
+                "SELECT id FROM store_identity WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)
+    }
+
+    /// One page, ordered by Agent, of lost generations that still hold their
+    /// reservation. Call it at startup before any new generation can start.
+    pub fn restart_retained_generations(
+        &self,
+        after: Option<&str>,
+    ) -> Result<Vec<RetainedGeneration>> {
+        let after = after.map(parse_agent_id).transpose()?.unwrap_or(0);
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, generation FROM agents
+                 WHERE id > ?1 AND observe_only = 0 AND state = 'lost'
+                   AND capacity_generation = generation
+                 ORDER BY id LIMIT ?2",
+            )
+            .map_err(sql_error)?;
+        let agents = statement
+            .query_map(params![after, RETAINED_PAGE_SIZE], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(sql_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql_error)?;
+        let mut named = self
+            .connection
+            .prepare(
+                "SELECT EXISTS(
+                     SELECT 1 FROM events
+                     WHERE agent = ?1 AND generation = ?2 AND kind = 'agent.starting'
+                       AND seq > (SELECT since_seq FROM store_identity WHERE singleton = 1)
+                 )",
+            )
+            .map_err(sql_error)?;
+        let mut processes = self
+            .connection
+            .prepare(
+                "SELECT host_boot_id, pid, start_time, role, state = 'exited' FROM processes
+                 WHERE owner = ?1 ORDER BY host_boot_id, pid, start_time LIMIT ?2",
+            )
+            .map_err(sql_error)?;
+        let mut retained = Vec::with_capacity(agents.len());
+        for (agent_num, generation) in agents {
+            let named_custody = named
+                .query_row(params![agent_num, generation], |row| row.get(0))
+                .map_err(sql_error)?;
+            let agent = format_agent_id(agent_num);
+            let owner = format!("agent:{agent}#{generation}");
+            let rows = processes
+                .query_map(params![owner, MAX_PAGE_ENTRIES as i64 + 1], |row| {
+                    Ok(RecordedProcess {
+                        identity: ProcessIdentity {
+                            host_boot_id: row.get(0)?,
+                            pid: row.get(1)?,
+                            start_time: row.get::<_, i64>(2)? as u64,
+                        },
+                        role: row.get(3)?,
+                        exited: row.get(4)?,
+                    })
+                })
+                .map_err(sql_error)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(sql_error)?;
+            if rows.len() > MAX_PAGE_ENTRIES {
+                return Err(Error::new(
+                    "frame_too_large",
+                    "retained generation process readback exceeds its bound",
+                ));
+            }
+            retained.push(RetainedGeneration {
+                agent,
+                generation,
+                named_custody,
+                processes: rows,
+            });
+        }
+        Ok(retained)
+    }
+
+    /// Commit custody closure that the daemon verified outside the Store lock,
+    /// then release or transfer that generation's reservation in the same
+    /// transaction. A newer reservation or a non-lost Agent is left unchanged.
+    pub fn release_restart_closed_generation(
+        &mut self,
+        agent: &str,
+        generation: i64,
+        evidence: &str,
+        orphan_possible: bool,
+        now: i64,
+    ) -> Result<Vec<Event>> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let agent_num = parse_agent_id(agent)?;
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let current = load_agent_by_num(&tx, agent_num)?
+                .ok_or_else(|| Error::new("not_found", "restart capacity Agent was not found"))?;
+            observer::require_controlled(&current)?;
+            if current.state != AgentState::Lost
+                || current.generation != generation
+                || reservation_generation_tx(&tx, agent_num)? != Some(generation)
+            {
+                return Ok(Vec::new());
+            }
+            let open_native: bool = tx
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM source_state
+                         WHERE agent = ?1 AND generation = ?2 AND state = 'open'
+                           AND source NOT IN ('daemon', 'os', 'git', 'workspace_process')
+                     )",
+                    params![agent_num, generation],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?;
+            if open_native {
+                return Err(Error::new(
+                    "bad_state",
+                    "restart capacity release requires reconciled native sources",
+                ));
+            }
+            let owner = format!("agent:{agent}#{generation}");
+            let processes = tx
+                .execute(
+                    "UPDATE processes SET state = 'exited', exit_code = NULL, updated_at = ?1
+                 WHERE owner = ?2 AND state IN ('running', 'unknown')",
+                    params![now, owner],
+                )
+                .map_err(sql_error)?;
+            tx.execute(
+                "UPDATE source_state SET state = 'closed', updated_at = ?1
+                 WHERE agent = ?2 AND generation = ?3 AND source = 'os' AND state = 'open'",
+                params![now, agent_num, generation],
+            )
+            .map_err(sql_error)?;
+            let mut events = Vec::new();
+            if release_proven_generation_tx(&tx, agent_num, generation)? {
+                events.push(insert_daemon_event(
+                    &tx,
+                    now,
+                    "capacity.released",
+                    "source",
+                    Some(agent_num),
+                    Some(generation),
+                    json!({
+                        "reason": "restart_custody_closed",
+                        "evidence": evidence,
+                        "orphan_possible": orphan_possible,
+                        "processes": processes,
+                    }),
+                )?);
+            }
+            commit_transaction(tx, &self.write_faulted).map(|()| events)
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    /// Make a reservation that restart reconciliation cannot release visible
+    /// in event readback, naming the custody evidence that is missing.
+    pub fn record_restart_capacity_retained(
+        &mut self,
+        agent: &str,
+        generation: i64,
+        missing: &str,
+        now: i64,
+    ) -> Result<Vec<Event>> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let agent_num = parse_agent_id(agent)?;
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            if reservation_generation_tx(&tx, agent_num)? != Some(generation) {
+                return Ok(Vec::new());
+            }
+            let event = insert_daemon_event(
+                &tx,
+                now,
+                "capacity.retained",
+                "source",
+                Some(agent_num),
+                Some(generation),
+                json!({"reason": "restart_custody_unproven", "missing": missing}),
+            )?;
+            commit_transaction(tx, &self.write_faulted).map(|()| vec![event])
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+}
+
+/// `since_seq` marks where named custody begins: generations started before
+/// this migration ran under unnamed custody that a later daemon cannot find.
+pub(super) fn create_store_identity_tx(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        "CREATE TABLE store_identity (
+             singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+             id TEXT NOT NULL,
+             since_seq INTEGER NOT NULL
+         );",
+    )
+    .map_err(sql_error)?;
+    tx.execute(
+        "INSERT INTO store_identity(singleton, id, since_seq)
+         VALUES (1, ?1, COALESCE(
+             (SELECT seq FROM sqlite_sequence WHERE name = 'events'), 0))",
+        [Ulid::new().to_string()],
+    )
+    .map_err(sql_error)?;
+    Ok(())
+}
 
 pub(super) fn scopes(agent: &Agent) -> Result<Vec<CapacityScope>> {
     let mut scopes: Vec<CapacityScope> = match agent.profile_snapshot.get("capacity_scopes") {
@@ -50,10 +298,12 @@ pub(super) fn reserve_tx(tx: &Transaction<'_>, agent: &Agent, generation: i64) -
     let id = parse_agent_id(&agent.id)?;
     match reservation_generation_tx(tx, id)? {
         Some(reserved) if reserved == generation => return Ok(()),
-        Some(_) => {
+        Some(reserved) => {
             return Err(Error::new(
                 "capacity_unavailable",
-                "a prior generation retains its capacity reservation",
+                format!(
+                    "generation {reserved} retains its capacity reservation until its custody is proven closed"
+                ),
             ));
         }
         None => {}

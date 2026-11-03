@@ -353,7 +353,7 @@ impl PluginHost {
                 .insert(agent_token.clone());
         }
         self.state.monitoring.prepare_generation(&agent).await?;
-        let spawned = self.spawn_plugin(&agent, &instance_dir);
+        let spawned = self.spawn_plugin(&agent, &instance_dir).await;
         let mut child = match spawned {
             Ok(child) => child,
             Err(error) => return Err(error),
@@ -715,15 +715,21 @@ impl PluginHost {
         Ok((instance_dir, credential))
     }
 
-    fn spawn_plugin(&self, agent: &Agent, _instance_dir: &Path) -> Result<OwnedChild> {
+    async fn spawn_plugin(&self, agent: &Agent, _instance_dir: &Path) -> Result<OwnedChild> {
         let workspace = agent
             .workspace
             .as_deref()
             .ok_or_else(|| Error::new("invalid", "Agent launch requires a workspace"))?;
-        self.spawn_plugin_process(&agent.harness, Path::new(workspace))
+        let namespace = self.state.store.lock().await.custody_namespace()?;
+        let command = self.plugin_command(&agent.harness, Path::new(workspace))?;
+        OwnedChild::spawn_agent(command, &namespace, &agent.id, agent.generation)
     }
 
     fn spawn_plugin_process(&self, harness: &str, workspace: &Path) -> Result<OwnedChild> {
+        OwnedChild::spawn(self.plugin_command(harness, workspace)?)
+    }
+
+    fn plugin_command(&self, harness: &str, workspace: &Path) -> Result<ProcessCommand> {
         let executable = std::env::current_exe().map_err(|error| {
             Error::new("platform_io", format!("locate Eliot executable: {error}"))
         })?;
@@ -740,7 +746,7 @@ impl PluginHost {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        OwnedChild::spawn(command)
+        Ok(command)
     }
 
     fn remove_plugin_secret(&self, credential: &str) {

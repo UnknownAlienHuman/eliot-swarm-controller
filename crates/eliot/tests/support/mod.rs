@@ -445,6 +445,15 @@ impl Fixture {
         self.finish_shutdown();
     }
 
+    /// End the owned daemon without a shutdown request, as a crash would.
+    #[allow(dead_code)] // Used by another integration target; support is compiled per target.
+    pub fn kill_daemon(&mut self) {
+        let daemon = self.daemon.as_mut().expect("running owned daemon");
+        daemon.child.kill().expect("kill owned daemon");
+        daemon.wait(WAIT).expect("killed daemon exit deadline");
+        self.daemon = None;
+    }
+
     /// A shutdown acknowledgement is not exit evidence. Wait on this fixture's
     /// exact owned process without admitting a second shutdown mutation.
     pub fn finish_shutdown(&mut self) {
