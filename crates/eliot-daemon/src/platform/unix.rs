@@ -340,7 +340,7 @@ impl TestSleepGroup {
     }
 
     pub(crate) fn pid(&self) -> u32 {
-        self.child.id().expect("sleep child has a pid")
+        self.child.id()
     }
 
     pub(crate) fn kill_and_wait(&mut self) {
