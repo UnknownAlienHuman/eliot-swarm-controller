@@ -6,8 +6,9 @@ use eliot_core::api::{
     ProviderClearHoldRequest, ProviderCorrectiveEvidence, RuleCatchUpRequest, ScriptInterpreter,
 };
 use eliot_core::{
-    AgentState, CommandState, EventCause, NativeEvent, NativeStoreBinding, ProviderHoldState,
-    ProviderRestrictionKind, SourceBatch, SourceGap, SubmitCommand, TurnState,
+    AgentState, CommandState, EventCause, NativeEvent, NativeStoreBinding, ProcessIdentity,
+    ProcessRecord, ProviderHoldState, ProviderRestrictionKind, SourceBatch, SourceGap,
+    SubmitCommand, TurnState,
 };
 use eliot_core::{
     WorkspaceCancelOutcome, WorkspaceCreationOutcome, WorkspacePhase, WorkspacePreparationInput,
@@ -2677,6 +2678,19 @@ fn project_registration_migration_defaults_legacy_run_authority_to_deny() {
                        WHERE request_id IS NOT NULL;
                    CREATE INDEX commands_rule_action_window ON commands(created_at)
                        WHERE link_kind = 'rule_action';
+                   CREATE TABLE processes (
+                       host_boot_id TEXT NOT NULL CHECK(length(host_boot_id) > 0),
+                       pid INTEGER NOT NULL CHECK(pid > 0 AND pid <= 4294967295),
+                       start_time INTEGER NOT NULL CHECK(start_time >= 0),
+                       owner TEXT NOT NULL,
+                       role TEXT NOT NULL,
+                       state TEXT NOT NULL CHECK(state IN ('running', 'exited', 'unknown')),
+                       exit_code INTEGER,
+                       updated_at INTEGER NOT NULL,
+                       PRIMARY KEY(host_boot_id, pid, start_time),
+                       CHECK(exit_code IS NULL OR state = 'exited')
+                   );
+                   CREATE INDEX processes_owner ON processes(owner, state);
                    CREATE TABLE workspaces (
                        agent INTEGER PRIMARY KEY REFERENCES agents(id),
                        target_generation INTEGER NOT NULL CHECK(target_generation > 0),
@@ -2711,7 +2725,7 @@ fn project_registration_migration_defaults_legacy_run_authority_to_deny() {
             .expect("insert pre-migration project registration");
     }
 
-    let store = Store::open(&path).expect("apply registration and Git migration 16");
+    let store = Store::open(&path).expect("apply registration and Git migration 18");
     let version: i64 = store
         .connection
         .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
@@ -6192,11 +6206,16 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
     store
         .connection
         .execute_batch(
-            "DROP TABLE store_identity; DELETE FROM schema_migrations WHERE version = 17;",
+            "DROP TABLE store_identity; DELETE FROM schema_migrations WHERE version = 17;
+             DROP INDEX commands_unsettled_created;
+             DROP INDEX processes_owner_identity;
+             CREATE INDEX commands_open ON commands(state)
+                 WHERE state IN ('accepted', 'queued', 'dispatched', 'unknown');
+             DELETE FROM schema_migrations WHERE version = 18;",
         )
         .expect("roll back to schema 16");
     drop(store);
-    let mut store = Store::open(&path).expect("migrate 16 to 17");
+    let mut store = Store::open(&path).expect("migrate 16 to 18");
     store.recover_on_restart(now + 2).expect("recover");
     let retained = store
         .restart_retained_generations(None)
@@ -7649,7 +7668,19 @@ fn capacity_migration_uses_commands_and_physical_facts_without_rewriting_snapsho
              CREATE TABLE source_state(
                  agent INTEGER, generation INTEGER, source TEXT, state TEXT
              );
-             CREATE TABLE processes(owner TEXT, role TEXT, state TEXT);
+             CREATE TABLE processes(
+                 host_boot_id TEXT NOT NULL CHECK(length(host_boot_id) > 0),
+                 pid INTEGER NOT NULL CHECK(pid > 0 AND pid <= 4294967295),
+                 start_time INTEGER NOT NULL CHECK(start_time >= 0),
+                 owner TEXT NOT NULL,
+                 role TEXT NOT NULL,
+                 state TEXT NOT NULL CHECK(state IN ('running', 'exited', 'unknown')),
+                 exit_code INTEGER,
+                 updated_at INTEGER NOT NULL,
+                 PRIMARY KEY(host_boot_id, pid, start_time),
+                 CHECK(exit_code IS NULL OR state = 'exited')
+             );
+             CREATE INDEX processes_owner ON processes(owner, state);
              CREATE TABLE workspaces (
                  agent INTEGER PRIMARY KEY REFERENCES agents(id),
                  target_generation INTEGER NOT NULL CHECK(target_generation > 0),
@@ -7713,8 +7744,9 @@ fn capacity_migration_uses_commands_and_physical_facts_without_rewriting_snapsho
         )
         .expect("insert source facts");
         old.execute(
-            "INSERT INTO processes(owner, role, state)
-             VALUES ('agent:a6#1','plugin','exited')",
+            "INSERT INTO processes(host_boot_id, pid, start_time, owner, role, state,
+                 exit_code, updated_at)
+             VALUES ('boot',1,0,'agent:a6#1','plugin','exited',NULL,1)",
             [],
         )
         .expect("insert owned process exit fact");
@@ -8163,4 +8195,402 @@ fn native_turn_cause_uses_exact_verified_command_and_ignores_payload_cause() {
         .pop()
         .unwrap();
     assert_eq!(reread.cause, started.cause);
+}
+
+fn explain_plan(store: &Store, sql: &str, parameters: impl rusqlite::Params) -> String {
+    let mut statement = store
+        .connection
+        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .expect("prepare EXPLAIN QUERY PLAN");
+    let rows = statement
+        .query_map(parameters, |row| row.get::<_, String>(3))
+        .expect("read query plan");
+    let mut plan = Vec::new();
+    for row in rows {
+        plan.push(row.expect("plan row"));
+    }
+    plan.join("\n")
+}
+
+fn assert_ordered_index_plan(plan: &str, table: &str, access: &str) {
+    assert!(
+        plan.contains(access),
+        "query plan should contain {access}, got:\n{plan}"
+    );
+    for line in plan.lines() {
+        assert!(
+            !(line.contains(&format!("SCAN {table}")) && !line.contains("USING INDEX")),
+            "query plan should not table-scan {table}, got:\n{plan}"
+        );
+    }
+    assert!(
+        !plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+        "query plan should not sort, got:\n{plan}"
+    );
+}
+
+fn insert_command(store: &Store, id: &str, target: i64, verb: &str, state: &str, created_at: i64) {
+    store
+        .connection
+        .execute(
+            "INSERT INTO commands(id, principal, method, payload_digest, target, verb, args,
+                 state, created_at, updated_at)
+             VALUES (?1, 'owner', 'command.submit', x'00', ?2, ?3, '{}', ?4, ?5, ?5)",
+            rusqlite::params![id, target, verb, state, created_at],
+        )
+        .expect("insert command");
+}
+
+#[test]
+fn ordered_store_reads_install_v18_indexes() {
+    let store = Store::open(Path::new(":memory:")).expect("open Store");
+    let found: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'index'
+               AND name IN ('commands_unsettled_created', 'processes_owner_identity')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count v18 indexes");
+    assert_eq!(found, 2);
+    // The unordered commands_open partial index is redundant with
+    // commands_unsettled_created and would keep the old sort plan.
+    let dropped: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'index' AND name = 'commands_open'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count dropped index");
+    assert_eq!(dropped, 0);
+}
+
+#[test]
+fn ordered_store_reads_keep_unsettled_order_and_observer_exclusions() {
+    let store = Store::open(Path::new(":memory:")).expect("open Store");
+    store
+        .connection
+        .execute(
+            "INSERT INTO agents(project, harness, profile, state, created_at, updated_at)
+             VALUES ('proj', 'fake', 'fake', 'idle', 1000, 1000)",
+            [],
+        )
+        .expect("insert agent");
+    let agent = store.connection.last_insert_rowid();
+    let mut observers = Vec::new();
+    for _ in 0..2 {
+        store
+            .connection
+            .execute(
+                "INSERT INTO agents(project, harness, profile, state, origin, observe_only,
+                     created_at, updated_at)
+                 VALUES ('proj', 'codex', 'codex', 'unknown', 'external', 1, 1000, 1000)",
+                [],
+            )
+            .expect("insert observer");
+        observers.push(store.connection.last_insert_rowid());
+    }
+    let observed_with_source = observers[0];
+    let observed_without_source = observers[1];
+    store
+        .connection
+        .execute(
+            "INSERT INTO source_state(agent, generation, source, state, health, updated_at)
+             VALUES (?1, 0, 'stream', 'open', 'ok', 1000)",
+            [observed_with_source],
+        )
+        .expect("insert open source");
+
+    insert_command(&store, "cmd-applied", agent, "send", "applied", 100);
+    insert_command(&store, "cmd-rejected", agent, "send", "rejected", 150);
+    insert_command(&store, "cmd-accepted", agent, "send", "accepted", 200);
+    insert_command(&store, "cmd-queued", agent, "send", "queued", 250);
+    insert_command(&store, "cmd-dispatched", agent, "send", "dispatched", 300);
+    insert_command(&store, "cmd-tie-first", agent, "send", "queued", 400);
+    insert_command(&store, "cmd-tie-second", agent, "send", "accepted", 400);
+    insert_command(
+        &store,
+        "cmd-unknown-send",
+        observed_with_source,
+        "send",
+        "unknown",
+        500,
+    );
+    insert_command(
+        &store,
+        "cmd-unknown-attach-hidden",
+        observed_without_source,
+        "attach",
+        "unknown",
+        550,
+    );
+    insert_command(
+        &store,
+        "cmd-unknown-attach-visible",
+        observed_with_source,
+        "attach",
+        "unknown",
+        600,
+    );
+    insert_command(
+        &store,
+        "cmd-unknown-detach-managed",
+        agent,
+        "detach",
+        "unknown",
+        700,
+    );
+
+    let expected = [
+        "cmd-accepted",
+        "cmd-queued",
+        "cmd-dispatched",
+        "cmd-tie-first",
+        "cmd-tie-second",
+        "cmd-unknown-send",
+        "cmd-unknown-attach-visible",
+        "cmd-unknown-detach-managed",
+    ];
+    let listed = store.list_unsettled_commands(100).expect("list unsettled");
+    let ids: Vec<&str> = listed.iter().map(|command| command.id.as_str()).collect();
+    assert_eq!(ids, expected);
+    let first_page = store.list_unsettled_commands(3).expect("first page");
+    let first_ids: Vec<&str> = first_page
+        .iter()
+        .map(|command| command.id.as_str())
+        .collect();
+    assert_eq!(first_ids, expected[..3]);
+
+    let plan = explain_plan(
+        &store,
+        super::LIST_UNSETTLED_COMMANDS_SQL,
+        rusqlite::params![100],
+    );
+    assert_ordered_index_plan(
+        &plan,
+        "commands",
+        "SCAN commands USING INDEX commands_unsettled_created",
+    );
+    store
+        .connection
+        .execute_batch("ANALYZE")
+        .expect("analyze Store");
+    let analyzed_plan = explain_plan(
+        &store,
+        super::LIST_UNSETTLED_COMMANDS_SQL,
+        rusqlite::params![100],
+    );
+    assert_ordered_index_plan(
+        &analyzed_plan,
+        "commands",
+        "SCAN commands USING INDEX commands_unsettled_created",
+    );
+}
+
+fn insert_process(store: &Store, boot: &str, pid: u32, start_time: i64, owner: &str, state: &str) {
+    store
+        .connection
+        .execute(
+            "INSERT INTO processes(host_boot_id, pid, start_time, owner, role, state,
+                 exit_code, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'child', ?5, NULL, 1000)",
+            rusqlite::params![boot, pid, start_time, owner, state],
+        )
+        .expect("insert process");
+}
+
+/// Pre-split `list_processes` statement: the optional-cursor OR form. Kept as the
+/// page-identity oracle for the split first-page/cursor-range queries.
+fn legacy_process_page(
+    store: &Store,
+    owner: &str,
+    after: Option<&ProcessIdentity>,
+    limit: i64,
+) -> Vec<ProcessRecord> {
+    const LEGACY_SQL: &str =
+        "SELECT host_boot_id, pid, start_time, owner, role, state, exit_code, updated_at
+             FROM processes WHERE owner = ?1
+               AND (?2 IS NULL OR (host_boot_id, pid, start_time) > (?2, ?3, ?4))
+             ORDER BY host_boot_id, pid, start_time LIMIT ?5";
+    let start = after
+        .map(super::validate_process_identity)
+        .transpose()
+        .expect("valid cursor");
+    let mut statement = store
+        .connection
+        .prepare(LEGACY_SQL)
+        .expect("prepare legacy page");
+    let rows = statement
+        .query_map(
+            rusqlite::params![
+                owner,
+                after.map(|id| id.host_boot_id.as_str()),
+                after.map(|id| id.pid),
+                start,
+                limit
+            ],
+            super::process_record_from_row,
+        )
+        .expect("read legacy page");
+    rows.collect::<Result<Vec<_>, _>>()
+        .expect("collect legacy page")
+}
+
+#[test]
+fn ordered_store_reads_paginate_processes_by_owner_identity() {
+    let store = Store::open(Path::new(":memory:")).expect("open Store");
+    let owner = "owner-a";
+    for (boot, pid, start) in [
+        ("boot-b", 100, 10),
+        ("boot-a", 300, 30),
+        ("boot-a", 100, 20),
+        ("boot-a", 100, 10),
+        ("boot-b", 50, 5),
+    ] {
+        insert_process(&store, boot, pid, start, owner, "running");
+    }
+    insert_process(&store, "boot-a", 1, 1, "owner-b", "running");
+    let expected = [
+        ("boot-a", 100, 10),
+        ("boot-a", 100, 20),
+        ("boot-a", 300, 30),
+        ("boot-b", 50, 5),
+        ("boot-b", 100, 10),
+    ]
+    .map(|(boot, pid, start)| ProcessIdentity {
+        host_boot_id: boot.to_owned(),
+        pid,
+        start_time: start,
+    });
+
+    let full = store.list_processes(owner, None, 100).expect("list all");
+    let ids: Vec<ProcessIdentity> = full.iter().map(|row| row.identity.clone()).collect();
+    assert_eq!(ids, expected);
+
+    let mut walked = Vec::new();
+    let mut after: Option<ProcessIdentity> = None;
+    loop {
+        let page = store
+            .list_processes(owner, after.as_ref(), 2)
+            .expect("walk page");
+        if page.is_empty() {
+            break;
+        }
+        after = Some(page.last().expect("nonempty page").identity.clone());
+        walked.extend(page);
+    }
+    assert_eq!(walked, full);
+
+    let other = store
+        .list_processes("owner-b", None, 100)
+        .expect("other owner");
+    assert_eq!(other.len(), 1);
+
+    // A cursor between rows seeks the range start; a tail cursor ends the walk.
+    let between = store
+        .list_processes(
+            owner,
+            Some(&ProcessIdentity {
+                host_boot_id: "boot-a".to_owned(),
+                pid: 100,
+                start_time: 15,
+            }),
+            100,
+        )
+        .expect("between page");
+    assert_eq!(between.first().expect("between row").identity, expected[1]);
+    let past_tail = store
+        .list_processes(owner, Some(&expected[4]), 100)
+        .expect("past tail page");
+    assert!(past_tail.is_empty());
+
+    // Identical pages before/after the split on every cursor position.
+    let mut cursors: Vec<Option<ProcessIdentity>> = vec![None];
+    cursors.extend(expected.iter().cloned().map(Some));
+    for cursor in &cursors {
+        for limit in [1usize, 2, 100] {
+            assert_eq!(
+                store
+                    .list_processes(owner, cursor.as_ref(), limit)
+                    .expect("split page"),
+                legacy_process_page(&store, owner, cursor.as_ref(), limit as i64),
+                "split page differs at cursor {cursor:?} limit {limit}"
+            );
+        }
+    }
+    assert_eq!(
+        store
+            .list_processes("owner-b", None, 10)
+            .expect("split other"),
+        legacy_process_page(&store, "owner-b", None, 10)
+    );
+
+    assert_eq!(
+        store
+            .list_processes(
+                owner,
+                Some(&ProcessIdentity {
+                    host_boot_id: String::new(),
+                    pid: 1,
+                    start_time: 0,
+                }),
+                10,
+            )
+            .expect_err("empty boot id")
+            .code,
+        "invalid"
+    );
+    assert_eq!(
+        store
+            .list_processes(owner, Some(&expected[0]), 0)
+            .expect_err("empty limit")
+            .code,
+        "invalid"
+    );
+    assert_eq!(
+        store
+            .list_processes("", None, 10)
+            .expect_err("empty owner")
+            .code,
+        "invalid"
+    );
+
+    let first_plan = explain_plan(
+        &store,
+        super::LIST_PROCESSES_FIRST_PAGE_SQL,
+        rusqlite::params![owner, 2],
+    );
+    assert_ordered_index_plan(
+        &first_plan,
+        "processes",
+        "SEARCH processes USING INDEX processes_owner_identity (owner=?",
+    );
+    store
+        .connection
+        .execute_batch("ANALYZE")
+        .expect("analyze Store");
+    let analyzed_first = explain_plan(
+        &store,
+        super::LIST_PROCESSES_FIRST_PAGE_SQL,
+        rusqlite::params![owner, 2],
+    );
+    assert_ordered_index_plan(
+        &analyzed_first,
+        "processes",
+        "SEARCH processes USING INDEX processes_owner_identity (owner=?",
+    );
+    let analyzed_tail = explain_plan(
+        &store,
+        super::LIST_PROCESSES_CURSOR_PAGE_SQL,
+        rusqlite::params![owner, "boot-b", 100u32, 10i64, 2],
+    );
+    assert_ordered_index_plan(
+        &analyzed_tail,
+        "processes",
+        "SEARCH processes USING INDEX processes_owner_identity (owner=?",
+    );
 }
