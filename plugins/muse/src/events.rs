@@ -406,7 +406,7 @@ impl EventProcessor {
             .as_deref()
             .is_some_and(|observed| observed != session_id)
         {
-            self.record_gap("Muse session/start response disagreed with session/started")
+            self.record_gap("Muse start response disagreed with session/started")
                 .await?;
             return Err(Error::new(
                 "source_integrity",

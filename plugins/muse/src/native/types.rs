@@ -1,9 +1,11 @@
-//! Minimal MSP wire DTOs for the PR1 path, derived from the installed host's
-//! exported stable schema (`muse schema generate-json-schema`, Muse Code 1.4.0,
-//! bundle fingerprint `sha256:36466f63…0d3d7f`). Only the session-start,
-//! turn-start, view-event, stop/close and readback shapes this path uses are
-//! modelled. Unknown fields are ignored: the schema rules additive-optional
-//! evolution, so a strict DTO would reject valid host frames.
+//! Minimal MSP wire DTOs for the PR1 launch path plus the PR2 resume
+//! path, derived from the installed host's exported stable schema
+//! (`muse schema generate-json-schema`, Muse Code 1.4.0, bundle fingerprint
+//! `sha256:36466f63…0d3d7f`, re-verified for PR2). Only the session-start,
+//! session-resume, turn-start, view-event, stop/close and readback shapes
+//! this path uses are modelled. Unknown fields are ignored: the schema rules
+//! additive-optional evolution, so a strict DTO would reject valid host
+//! frames.
 //!
 //! No SDK code is copied here; these structs are written from the schema.
 
@@ -104,7 +106,7 @@ pub struct NativeSessionStartResult {
 }
 
 /// The session object every lifecycle method returns (SS2.4). Only the fields
-/// PR1 reads back are modelled; the rest are ignored per additive-optional.
+/// this path reads back are modelled; the rest are ignored per additive-optional.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeSession {
@@ -114,6 +116,12 @@ pub struct NativeSession {
     pub model_id: Option<String>,
     pub provider_id: Option<String>,
     pub workspace_root: Option<String>,
+    /// Total turns ever started on the session. The resume preflight proves
+    /// the retained no-turn case from this counter (`Some(0)`), since a
+    /// bounded view scan cannot prove absence; a missing counter refuses that
+    /// case rather than guessing.
+    #[serde(default)]
+    pub turn_count: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -177,6 +185,42 @@ pub struct NativeSessionReadParams {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeSessionReadResult {
+    pub session: NativeSession,
+    pub view_cursor: String,
+}
+
+/// `session/resume` params (SS2.5.2). `commandId` is the caller-minted SS2.5
+/// idempotency handle (UUIDv7): a resume that loads a session writes a
+/// durable `SessionResumed` record, so a lost reply is unknown and the write
+/// is never repeated. `excludeItems` keeps the served history out of the
+/// result; the new generation pages what it needs with `view/page` instead of
+/// republishing retained history as new turns.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeSessionResumeParams {
+    pub command_id: String,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude_items: Option<bool>,
+}
+
+/// The served-history envelope shared by `session/resume`, `session/fork`
+/// and `session/read` (SS2.5.2). Only the served mode is modelled: whatever
+/// the server served, this path never republishes retained items.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeSessionHistory {
+    pub mode: String,
+}
+
+/// `session/resume` result (SS2.5.2). `pendingRequests` stays opaque JSON:
+/// this slice refuses a resume with unsettled native requests because
+/// approvals and user-input dialogs are unconnected.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeSessionResumeResult {
+    pub history: NativeSessionHistory,
+    pub pending_requests: Vec<serde_json::Value>,
     pub session: NativeSession,
     pub view_cursor: String,
 }
@@ -456,6 +500,30 @@ mod tests {
         assert_eq!(session.session_id, "session-1");
         assert_eq!(session.status, "idle");
         assert_eq!(session.active_turn_id, None);
+    }
+
+    #[test]
+    fn resume_result_decodes_excluded_history_and_pending_requests() {
+        let resumed: NativeSessionResumeResult = serde_json::from_value(serde_json::json!({
+            "history": {"items": null, "mode": "none", "noneReason": "excluded", "snapshot": null},
+            "pendingRequests": [],
+            "session": {
+                "sessionId": "session-1",
+                "status": "idle",
+                "activeTurnId": null,
+                "modelId": "muse-spark-1.3-contributor",
+                "providerId": "meta",
+                "workspaceRoot": "C:\\work",
+                "turnCount": 1,
+            },
+            "viewCursor": "cursor-9",
+        }))
+        .expect("resume result decodes");
+        assert_eq!(resumed.history.mode, "none");
+        assert!(resumed.pending_requests.is_empty());
+        assert_eq!(resumed.session.session_id, "session-1");
+        assert_eq!(resumed.session.turn_count, Some(1));
+        assert_eq!(resumed.view_cursor, "cursor-9");
     }
 
     #[test]

@@ -250,8 +250,8 @@ Codex or for unrelated adapters.
 - [ ] **L6.4 Selected optional adapters.** Add only those explicitly selected for the
       release; record the selection here. Unselected adapters stay absent.
       Muse Code selected by the owner 2026-11-03. PR1 connects launch, send,
-      stop and profile readback; the remainder is resume (stacked PR2, needs
-      the store/router resume gates) plus approvals, steer, interrupt,
+      stop and profile readback; PR2 adds resume of the exact retained session
+      in a new generation. The remainder is approvals, steer, interrupt,
       configure and children, which stay unconnected.
 
 **Feature-complete local scope:** core, Codex, monitoring/workspaces, automation,
