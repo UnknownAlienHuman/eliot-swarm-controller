@@ -1789,10 +1789,12 @@ fn resume_workspace_stop_pending_tx(
     target: i64,
     old_generation: i64,
 ) -> Result<bool> {
-    let Some(workspace) = super::load_workspace(tx, target)? else {
+    let Some(workspace) = super::workspace::load_workspace(tx, target)? else {
         return Ok(false);
     };
-    if workspace.start_command_id != resume_id || !super::workspace_cancel_requested(&workspace) {
+    if workspace.start_command_id != resume_id
+        || !super::workspace::workspace_cancel_requested(&workspace)
+    {
         return Ok(false);
     }
     let next_generation = old_generation

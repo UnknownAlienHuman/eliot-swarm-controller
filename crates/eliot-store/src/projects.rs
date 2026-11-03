@@ -473,7 +473,7 @@ fn project_resume_binding_for_dispatch_tx(
         .as_deref()
         .ok_or_else(|| Error::new("not_allowed", "project Agent has no frozen workspace"))?;
     let (repo_path, repo_common_dir, workspace_phase, workspace_target_generation) =
-        match load_workspace(tx, target)? {
+        match workspace::load_workspace(tx, target)? {
             Some(workspace)
                 if workspace.project == registration.checkout
                     && workspace.repo_path == registration.checkout
@@ -792,7 +792,7 @@ fn project_binding_for_agent_tx(
     // L3 stores the canonical checkout path in WorkspacePreparation.project,
     // independently of the Agent.project label.
     let (repo_path, repo_common_dir, workspace_phase, workspace_target_generation) =
-        match load_workspace(tx, agent_num)? {
+        match workspace::load_workspace(tx, agent_num)? {
             Some(workspace)
                 if workspace.project == registration.checkout
                     && workspace.repo_path == registration.checkout

@@ -2732,7 +2732,7 @@ fn project_registration_migration_defaults_legacy_run_authority_to_deny() {
             row.get(0)
         })
         .expect("read Store migration version");
-    assert_eq!(version, super::CURRENT_SCHEMA_VERSION);
+    assert_eq!(version, super::schema::CURRENT_SCHEMA_VERSION);
     let legacy = store
         .get_project_registration("owner", "legacy-run")
         .expect("read migrated registration")

@@ -184,11 +184,11 @@ impl Store {
                         "launch no longer targets the initial created Agent generation",
                     ));
                 }
-                gate_workspace_start(&tx, &agent, &command.command, 1)?;
+                workspace::gate_workspace_start(&tx, &agent, &command.command, 1)?;
                 capacity::require_reservation_tx(&tx, agent_num, 1)?;
                 let snapshot = native_store
                     .map(|(expected, binding)| {
-                        launch_snapshot_with_native_store(&agent, expected, binding, id)
+                        workspace::launch_snapshot_with_native_store(&agent, expected, binding, id)
                     })
                     .transpose()?;
                 let token = format!("{}{}", Ulid::new(), Ulid::new());
@@ -283,7 +283,7 @@ impl Store {
                 let next_generation = agent.generation.checked_add(1).ok_or_else(|| {
                     Error::new("bad_state", "Agent generation cannot be incremented")
                 })?;
-                gate_workspace_start(&tx, &agent, &command.command, next_generation)?;
+                workspace::gate_workspace_start(&tx, &agent, &command.command, next_generation)?;
                 capacity::require_reservation_tx(&tx, agent_num, next_generation)?;
                 for old_id in pending_command_ids(&tx, agent_num, agent.generation)? {
                     if old_id == id {
@@ -381,9 +381,9 @@ impl Store {
                 )?);
             }
             "worktree.remove" => {
-                let mut workspace = load_workspace(&tx, agent_num)?
+                let mut workspace = workspace::load_workspace(&tx, agent_num)?
                     .ok_or_else(|| Error::new("not_found", "managed worktree was not found"))?;
-                require_workspace_removable(&tx, &agent, &workspace)?;
+                workspace::require_workspace_removable(&tx, &agent, &workspace)?;
                 if command_generation != agent.generation
                     || command
                         .command
@@ -429,9 +429,9 @@ impl Store {
                         "native_git_write_dispatched": false}),
                 );
                 workspace.updated_at = now;
-                persist_workspace(&tx, &old, &workspace)?;
+                workspace::persist_workspace(&tx, &old, &workspace)?;
                 update_command_state(&tx, id, CommandState::Dispatched, None, None, now)?;
-                events.push(workspace_event(&tx, &workspace, now)?);
+                events.push(workspace::workspace_event(&tx, &workspace, now)?);
                 events.push(insert_daemon_command_event(
                     &tx,
                     now,
