@@ -412,6 +412,7 @@ dependencies = [
  "eliot-daemon",
  "eliot-plugin",
  "eliot-plugin-codex",
+ "eliot-plugin-muse",
  "serde_json",
  "tokio",
  "ulid",
@@ -470,6 +471,22 @@ dependencies = [
 
 [[package]]
 name = "eliot-plugin-codex"
+version = "0.2.0-dev"
+dependencies = [
+ "chrono",
+ "eliot-core",
+ "eliot-plugin",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-util",
+ "ulid",
+]
+
+[[package]]
+name = "eliot-plugin-muse"
 version = "0.2.0-dev"
 dependencies = [
  "chrono",

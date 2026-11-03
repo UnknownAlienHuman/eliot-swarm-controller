@@ -1,0 +1,21 @@
+[package]
+name = "eliot-plugin-muse"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+eliot-core.workspace = true
+eliot-plugin.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+chrono.workspace = true
+ulid.workspace = true

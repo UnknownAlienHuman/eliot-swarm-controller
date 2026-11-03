@@ -249,6 +249,10 @@ Codex or for unrelated adapters.
       the capability. Missing semantics reject; no compatibility executor.
 - [ ] **L6.4 Selected optional adapters.** Add only those explicitly selected for the
       release; record the selection here. Unselected adapters stay absent.
+      Muse Code selected by the owner 2026-11-03. PR1 connects launch, send,
+      stop and profile readback; the remainder is resume (stacked PR2, needs
+      the store/router resume gates) plus approvals, steer, interrupt,
+      configure and children, which stay unconnected.
 
 **Feature-complete local scope:** core, Codex, monitoring/workspaces, automation,
 coordination and the selected adapters. Do not hold this milestone for an unused vendor

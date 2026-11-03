@@ -213,7 +213,7 @@ pub(super) fn submit_tx(
             } else {
                 required_string(&request.args, "harness")?
             };
-            if !matches!(harness.as_str(), "fake" | "codex") {
+            if !matches!(harness.as_str(), "fake" | "codex" | "muse") {
                 return Err(Error::new(
                     "unsupported",
                     format!("unsupported launch harness {harness}"),
@@ -236,7 +236,7 @@ pub(super) fn submit_tx(
                 None => {
                     return Err(Error::new(
                         "invalid",
-                        "the codex harness requires a frozen profile_snapshot",
+                        format!("the {harness} harness requires a frozen profile_snapshot"),
                     ));
                 }
             };
