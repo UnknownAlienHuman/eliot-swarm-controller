@@ -191,17 +191,34 @@ The implemented daemon retention setting is a `[daemon]` retention table:
 [daemon]
 retention.events_days = 30
 retention.commands_days = 30
+retention.mail_days = 30
 ```
 
-Both windows are optional positive integer days; each defaults to unset, which
-disables pruning for that side. A daemon without retention settings deletes
-nothing; set a window to prune expired history for that side. Daemon
-maintenance periodically prunes expired event history and closed command/child
-sets through the Store writer; see the
-[Core retention contract](core.md#retention). Command and write bindings always
-outlive the 24-hour retry window plus the 5-minute allowed clock-skew margin
-regardless of `commands_days`, so a pruned id resubmits as `id_expired`, never
-as new, even when its ULID timestamp runs ahead of the Store commit clock.
+All three windows are optional positive integer days; each defaults to unset,
+which disables pruning for that side. A daemon without retention settings
+deletes nothing; set a window to prune expired history for that side. Daemon
+maintenance periodically prunes expired event history, closed command/child
+sets and acknowledged mail older than `mail_days` through the Store writer;
+see the [Core retention contract](core.md#retention). Command and write
+bindings always outlive the 24-hour retry window plus the 5-minute allowed
+clock-skew margin regardless of `commands_days`, so a pruned id resubmits as
+`id_expired`, never as new, even when its ULID timestamp runs ahead of the
+Store commit clock. Mail rows outlive the same margin regardless of
+`mail_days`, so a removed delivery always reads `history_gap`, never
+`not_found`.
+
+The implemented unread mailbox bounds are a root-level mail table:
+
+```toml
+[mail]
+max_unread_bytes_per_agent = 10485760
+max_unread_messages_per_agent = 10000
+```
+
+Both bounds are positive signed 64-bit integers; each defaults to its
+[coordination](coordination.md#mailbox) contract value when unset (10 MiB of
+message text, 10,000 messages), and unlike retention windows they always
+apply. Zero, negative, wrong-type and unknown mail values are invalid.
 
 Inspection dated 2026-10-29 of installed OpenCodex 2.92.0 source
 src/server/index/serve-options.ts shows an anonymous literal GET /readyz: readiness

@@ -1,11 +1,14 @@
-//! Bounded physical retention: expired event-prefix pruning and atomic
-//! command/child-set cleanup through the one Store writer.
+//! Bounded physical retention: expired event-prefix pruning, atomic
+//! command/child-set cleanup, and acknowledged-mail pruning through the one
+//! Store writer.
 //!
 //! Owning contract: docs/spec/core.md#retention. Deletion is silent (no events
 //! are emitted) and never replays an effect: event pruning stays below every
 //! live rule/Git cursor and advances `rule_history_coverage.pruned_through` in
 //! the same transaction, while command/write pruning keeps open work, the
-//! retry window, and every row a live projection still references.
+//! retry window, and every row a live projection still references. Mail
+//! pruning deletes only acknowledged rows older than the mail window; unread
+//! mail is never pruned.
 
 use super::*;
 
@@ -29,6 +32,7 @@ pub struct RetentionReport {
     pub pruned_through: i64,
     pub commands_deleted: i64,
     pub writes_deleted: i64,
+    pub mail_deleted: i64,
 }
 
 struct SubtreeMember {
@@ -45,17 +49,20 @@ impl Store {
     /// Delete one bounded batch of expired history. Event pruning removes an
     /// expired contiguous prefix below every live cursor; command pruning
     /// removes whole closed child-sets leaf-first; writes pruning removes
-    /// expired mutation bindings. Projections, source recovery state, timers,
-    /// and the event id allocator are never touched. An unset (`None`) window
-    /// disables pruning for that side: no deletion without an owner window.
+    /// expired mutation bindings; mail pruning removes acknowledged messages
+    /// older than the mail window, never unread mail. Projections, source
+    /// recovery state, timers, and the event id allocator are never touched.
+    /// An unset (`None`) window disables pruning for that side: no deletion
+    /// without an owner window.
     pub fn prune_retention(
         &mut self,
         events_days: Option<i64>,
         commands_days: Option<i64>,
+        mail_days: Option<i64>,
         now: i64,
     ) -> Result<RetentionReport> {
         self.ensure_writer_healthy()?;
-        let result = self.prune_retention_inner(events_days, commands_days, now);
+        let result = self.prune_retention_inner(events_days, commands_days, mail_days, now);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -64,6 +71,7 @@ impl Store {
         &mut self,
         events_days: Option<i64>,
         commands_days: Option<i64>,
+        mail_days: Option<i64>,
         now: i64,
     ) -> Result<RetentionReport> {
         let events_cutoff = match events_days {
@@ -98,6 +106,24 @@ impl Store {
             }
             None => None,
         };
+        let mail_cutoff = match mail_days {
+            Some(days) => {
+                if days <= 0 {
+                    return Err(Error::new(
+                        "invalid",
+                        "retention windows must be positive days",
+                    ));
+                }
+                // Mail rows must outlive the retry window plus the allowed
+                // clock skew no matter how short the configured window is:
+                // the absent-delivery rule reads `history_gap` exactly past
+                // that age, and a pruned row must always land on the gap
+                // side of it, never `not_found`.
+                let retry_floor = RETRY_WINDOW_MS + RETRY_CLOCK_SKEW_MS + 1;
+                Some(now.saturating_sub(days.saturating_mul(MS_PER_DAY).max(retry_floor)))
+            }
+            None => None,
+        };
         let (events_deleted, pruned_through) = match events_cutoff {
             Some(cutoff) => self.prune_events(cutoff)?,
             None => (0, coverage_pruned_through(&self.connection)?),
@@ -106,11 +132,16 @@ impl Store {
             Some(cutoff) => self.prune_commands_and_writes(cutoff)?,
             None => (0, 0),
         };
+        let mail_deleted = match mail_cutoff {
+            Some(cutoff) => self.prune_mail(cutoff)?,
+            None => 0,
+        };
         Ok(RetentionReport {
             events_deleted,
             pruned_through,
             commands_deleted,
             writes_deleted,
+            mail_deleted,
         })
     }
 
@@ -272,6 +303,28 @@ impl Store {
         let writes = prune_writes_tx(&tx, cutoff)?;
         commit_transaction(tx, &self.write_faulted)?;
         Ok((deleted, writes))
+    }
+
+    /// Delete one bounded batch of acknowledged messages whose acknowledgement
+    /// is older than the mail cutoff, oldest ack first. Unread rows
+    /// (`read_at IS NULL`) never match, however old. Deletion is silent: no
+    /// events are emitted, and later reads of a removed delivery return
+    /// `history_gap` through the shared absent-id age rule.
+    fn prune_mail(&mut self, cutoff: i64) -> Result<i64> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let deleted = db!(tx.execute(
+            "DELETE FROM messages WHERE delivery_id IN (
+                 SELECT delivery_id FROM messages
+                 WHERE read_at IS NOT NULL AND read_at <= ?1
+                 ORDER BY read_at, delivery_id LIMIT ?2
+             )",
+            params![cutoff, MAX_PAGE_ENTRIES as i64],
+        ));
+        commit_transaction(tx, &self.write_faulted)?;
+        Ok(deleted as i64)
     }
 }
 
@@ -628,7 +681,9 @@ mod tests {
         }
         let fresh_first = insert_event(&mut store, NOW);
         insert_event(&mut store, NOW);
-        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
+        let report = store
+            .prune_retention(Some(30), Some(30), None, NOW)
+            .unwrap();
         assert_eq!(report.events_deleted, 5);
         assert_eq!(report.pruned_through, seqs[4]);
         assert_eq!(event_count(&store), 2);
@@ -647,7 +702,9 @@ mod tests {
         let second = insert_event(&mut store, old);
         insert_event(&mut store, NOW);
         insert_event(&mut store, old);
-        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
+        let report = store
+            .prune_retention(Some(30), Some(30), None, NOW)
+            .unwrap();
         assert_eq!(report.events_deleted, 2);
         assert_eq!(report.pruned_through, second);
         assert_eq!(event_count(&store), 2);
@@ -672,7 +729,9 @@ mod tests {
         // Expired rows above the cursor are still needed by the rule.
         insert_event(&mut store, old);
         insert_event(&mut store, old);
-        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
+        let report = store
+            .prune_retention(Some(30), Some(30), None, NOW)
+            .unwrap();
         assert_eq!(report.events_deleted, 3);
         assert_eq!(report.pruned_through, 3);
         assert_eq!(event_count(&store), 2);
@@ -690,7 +749,9 @@ mod tests {
             .unwrap();
         set_current_cursor(&mut store, "retire-rule", 5);
         set_retiring_cursor(&mut store, "retire-rule", 2, 5);
-        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
+        let report = store
+            .prune_retention(Some(30), Some(30), None, NOW)
+            .unwrap();
         assert_eq!(report.events_deleted, 2);
         assert_eq!(report.pruned_through, 2);
         assert_eq!(event_count(&store), 3);
@@ -707,7 +768,9 @@ mod tests {
             .ensure_rule_state("owner", &rule_input("off-rule", false), NOW)
             .unwrap();
         set_current_cursor(&mut store, "off-rule", 1);
-        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
+        let report = store
+            .prune_retention(Some(30), Some(30), None, NOW)
+            .unwrap();
         assert_eq!(report.events_deleted, 3);
         assert_eq!(report.pruned_through, 3);
         assert_eq!(event_count(&store), 0);
@@ -729,7 +792,9 @@ mod tests {
                 params![agent, NOW],
             )
             .unwrap();
-        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
+        let report = store
+            .prune_retention(Some(30), Some(30), None, NOW)
+            .unwrap();
         assert_eq!(report.events_deleted, 2);
         assert_eq!(report.pruned_through, 2);
         store
@@ -739,7 +804,9 @@ mod tests {
                 [agent],
             )
             .unwrap();
-        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
+        let report = store
+            .prune_retention(Some(30), Some(30), None, NOW)
+            .unwrap();
         assert_eq!(report.events_deleted, 2);
         assert_eq!(report.pruned_through, 4);
         assert_eq!(event_count(&store), 0);
@@ -761,7 +828,9 @@ mod tests {
                 params![agent, NOW],
             )
             .unwrap();
-        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
+        let report = store
+            .prune_retention(Some(30), Some(30), None, NOW)
+            .unwrap();
         assert_eq!(report.events_deleted, 4);
         assert_eq!(report.pruned_through, 4);
     }
@@ -781,7 +850,9 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
+        let report = store
+            .prune_retention(Some(30), Some(30), None, NOW)
+            .unwrap();
         assert_eq!(report.events_deleted, 3);
         let allocated_after: i64 = store
             .connection
@@ -804,10 +875,14 @@ mod tests {
         for _ in 0..2500 {
             insert_event(&mut store, old);
         }
-        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
+        let report = store
+            .prune_retention(Some(30), Some(30), None, NOW)
+            .unwrap();
         assert_eq!(report.events_deleted, MAX_PAGE_ENTRIES as i64);
         assert_eq!(report.pruned_through, MAX_PAGE_ENTRIES as i64);
-        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
+        let report = store
+            .prune_retention(Some(30), Some(30), None, NOW)
+            .unwrap();
         assert_eq!(report.events_deleted, MAX_PAGE_ENTRIES as i64);
         assert_eq!(report.pruned_through, 2 * MAX_PAGE_ENTRIES as i64);
         assert_eq!(event_count(&store), 500);
@@ -858,7 +933,9 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
+        let report = store
+            .prune_retention(Some(30), Some(30), None, NOW)
+            .unwrap();
         assert_eq!(report.events_deleted, 9);
         let after: Vec<Value> = store
             .connection
@@ -910,7 +987,9 @@ mod tests {
             )
             .unwrap();
         assert!(admitted.is_new);
-        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
+        let report = store
+            .prune_retention(Some(30), Some(30), None, NOW)
+            .unwrap();
         assert_eq!(report.pruned_through, captured);
         let error = store
             .admit_rule_catch_up(
@@ -965,7 +1044,9 @@ mod tests {
             },
         );
         assert_eq!(command_count(&store), 5);
-        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
+        let report = store
+            .prune_retention(Some(30), Some(30), None, NOW)
+            .unwrap();
         assert_eq!(report.commands_deleted, 5);
         assert_eq!(command_count(&store), 0);
     }
@@ -986,7 +1067,9 @@ mod tests {
                 },
             );
         }
-        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
+        let report = store
+            .prune_retention(Some(30), Some(30), None, NOW)
+            .unwrap();
         assert_eq!(report.commands_deleted, 0);
         assert_eq!(command_count(&store), 8);
     }
@@ -1004,11 +1087,13 @@ mod tests {
                 ..command_seed(Ulid::new().to_string(), NOW - 3_600_000)
             },
         );
-        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
+        let report = store
+            .prune_retention(Some(30), Some(30), None, NOW)
+            .unwrap();
         assert_eq!(report.commands_deleted, 0);
         assert_eq!(command_count(&store), 2);
         // The retry window holds even for a one-day window.
-        let report = store.prune_retention(Some(30), Some(1), NOW).unwrap();
+        let report = store.prune_retention(Some(30), Some(1), None, NOW).unwrap();
         assert_eq!(report.commands_deleted, 0);
         assert_eq!(command_count(&store), 2);
     }
@@ -1036,7 +1121,9 @@ mod tests {
                 [agent],
             )
             .unwrap();
-        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
+        let report = store
+            .prune_retention(Some(30), Some(30), None, NOW)
+            .unwrap();
         assert_eq!(report.commands_deleted, 0);
         store
             .connection
@@ -1045,7 +1132,9 @@ mod tests {
                 [agent],
             )
             .unwrap();
-        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
+        let report = store
+            .prune_retention(Some(30), Some(30), None, NOW)
+            .unwrap();
         assert_eq!(report.commands_deleted, 0);
         store
             .connection
@@ -1054,7 +1143,9 @@ mod tests {
                 [agent],
             )
             .unwrap();
-        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
+        let report = store
+            .prune_retention(Some(30), Some(30), None, NOW)
+            .unwrap();
         assert_eq!(report.commands_deleted, 1);
         assert_eq!(command_count(&store), 0);
     }
@@ -1101,14 +1192,18 @@ mod tests {
                 params![probe, NOW],
             )
             .unwrap();
-        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
+        let report = store
+            .prune_retention(Some(30), Some(30), None, NOW)
+            .unwrap();
         assert_eq!(report.commands_deleted, 0);
         assert_eq!(command_count(&store), 2);
         store
             .connection
             .execute("DELETE FROM provider_holds WHERE scope = 'scope-1'", [])
             .unwrap();
-        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
+        let report = store
+            .prune_retention(Some(30), Some(30), None, NOW)
+            .unwrap();
         assert_eq!(report.commands_deleted, 1);
         // The workspace start stays pinned while its preparation row exists.
         assert_eq!(command_count(&store), 1);
@@ -1131,7 +1226,9 @@ mod tests {
                 )
                 .unwrap();
         }
-        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
+        let report = store
+            .prune_retention(Some(30), Some(30), None, NOW)
+            .unwrap();
         assert_eq!(report.writes_deleted, 1);
         let remaining: i64 = store
             .connection
@@ -1161,7 +1258,9 @@ mod tests {
                 [&request.id],
             )
             .unwrap();
-        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
+        let report = store
+            .prune_retention(Some(30), Some(30), None, NOW)
+            .unwrap();
         assert_eq!(report.commands_deleted, 1);
         let error = store.submit("owner", request, NOW).unwrap_err();
         assert_eq!(error.code, "id_expired");
@@ -1174,7 +1273,9 @@ mod tests {
         fresh.expected_generation = Some(0);
         let admission = store.submit("owner", fresh.clone(), NOW).unwrap();
         assert!(admission.is_new);
-        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
+        let report = store
+            .prune_retention(Some(30), Some(30), None, NOW)
+            .unwrap();
         assert_eq!(report.commands_deleted, 0);
         let replay = store.submit("owner", fresh, NOW).unwrap();
         assert!(!replay.is_new);
@@ -1187,7 +1288,9 @@ mod tests {
         for _ in 0..1200 {
             insert_command(&mut store, command_seed(Ulid::new().to_string(), old));
         }
-        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
+        let report = store
+            .prune_retention(Some(30), Some(30), None, NOW)
+            .unwrap();
         assert_eq!(report.commands_deleted, MAX_PRUNE_ROOTS);
         assert_eq!(command_count(&store), 1200 - MAX_PRUNE_ROOTS);
     }
@@ -1201,7 +1304,9 @@ mod tests {
         }
         insert_event(&mut store, NOW);
         assert_eq!(store.read_events(0, 100, None).unwrap().len(), 4);
-        let report = store.prune_retention(Some(30), Some(30), NOW).unwrap();
+        let report = store
+            .prune_retention(Some(30), Some(30), None, NOW)
+            .unwrap();
         assert_eq!(report.pruned_through, 3);
         let error = store.read_events(0, 100, None).unwrap_err();
         assert_eq!(error.code, "history_gap");
@@ -1215,9 +1320,16 @@ mod tests {
     #[test]
     fn prune_retention_rejects_nonpositive_windows() {
         let mut store = store();
-        for (events_days, commands_days) in [(0, 30), (30, 0), (-1, 30), (30, -1)] {
+        for (events_days, commands_days, mail_days) in [
+            (0, 30, 30),
+            (30, 0, 30),
+            (30, 30, 0),
+            (-1, 30, 30),
+            (30, -1, 30),
+            (30, 30, -1),
+        ] {
             let error = store
-                .prune_retention(Some(events_days), Some(commands_days), NOW)
+                .prune_retention(Some(events_days), Some(commands_days), Some(mail_days), NOW)
                 .unwrap_err();
             assert_eq!(error.code, "invalid");
         }
@@ -1232,7 +1344,7 @@ mod tests {
             insert_event(&mut store, old);
         }
         insert_command(&mut store, command_seed(Ulid::new().to_string(), old));
-        let report = store.prune_retention(None, None, NOW).unwrap();
+        let report = store.prune_retention(None, None, None, NOW).unwrap();
         assert_eq!(report.events_deleted, 0);
         assert_eq!(report.commands_deleted, 0);
         assert_eq!(report.writes_deleted, 0);
@@ -1240,11 +1352,81 @@ mod tests {
         assert_eq!(event_count(&store), 3);
         assert_eq!(command_count(&store), 1);
         // Each side runs only when its own window is configured.
-        let report = store.prune_retention(Some(30), None, NOW).unwrap();
+        let report = store.prune_retention(Some(30), None, None, NOW).unwrap();
         assert_eq!(report.events_deleted, 3);
         assert_eq!(report.pruned_through, 3);
         assert_eq!(report.commands_deleted, 0);
         assert_eq!(command_count(&store), 1);
+    }
+
+    #[test]
+    fn mail_pruning_removes_only_old_acked_rows() {
+        let mut store = store();
+        let old = NOW - 31 * DAY_MS;
+        let young = NOW - DAY_MS;
+        insert_message(&mut store, "old-acked/a1", old, Some(old));
+        insert_message(&mut store, "young-acked/a1", old, Some(young));
+        insert_message(&mut store, "ancient-unread/a1", old, None);
+        insert_message(&mut store, "fresh-unread/a1", NOW, None);
+
+        let report = store.prune_retention(None, None, Some(30), NOW).unwrap();
+        assert_eq!(report.mail_deleted, 1);
+        assert_eq!(report.events_deleted, 0);
+        assert_eq!(report.commands_deleted, 0);
+        assert_eq!(report.writes_deleted, 0);
+        assert!(!message_exists(&store, "old-acked/a1"));
+        assert!(message_exists(&store, "young-acked/a1"));
+        // Unread mail is never pruned, however old.
+        assert!(message_exists(&store, "ancient-unread/a1"));
+        assert!(message_exists(&store, "fresh-unread/a1"));
+    }
+
+    #[test]
+    fn mail_pruning_honors_the_retry_floor_for_short_windows() {
+        let mut store = store();
+        // A one-day window still keeps rows younger than the retry window
+        // plus the allowed clock skew, so a pruned row always reads
+        // `history_gap`, never `not_found`.
+        let floor = RETRY_WINDOW_MS + RETRY_CLOCK_SKEW_MS + 1;
+        insert_message(
+            &mut store,
+            "below-floor/a1",
+            NOW - floor + 1,
+            Some(NOW - floor + 1),
+        );
+        insert_message(&mut store, "above-floor/a1", NOW - floor, Some(NOW - floor));
+        let report = store.prune_retention(None, None, Some(1), NOW).unwrap();
+        assert_eq!(report.mail_deleted, 1);
+        assert!(message_exists(&store, "below-floor/a1"));
+        assert!(!message_exists(&store, "above-floor/a1"));
+    }
+
+    #[test]
+    fn mail_pruning_deletes_one_bounded_batch_per_pass() {
+        let mut store = store();
+        let old = NOW - 31 * DAY_MS;
+        store.connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+        for index in 0..MAX_PAGE_ENTRIES + 5 {
+            insert_message(&mut store, &format!("batch-{index}/a1"), old, Some(old));
+        }
+        store.connection.execute_batch("COMMIT").unwrap();
+
+        let report = store.prune_retention(None, None, Some(30), NOW).unwrap();
+        assert_eq!(report.mail_deleted, MAX_PAGE_ENTRIES as i64);
+        let report = store.prune_retention(None, None, Some(30), NOW).unwrap();
+        assert_eq!(report.mail_deleted, 5);
+        let report = store.prune_retention(None, None, Some(30), NOW).unwrap();
+        assert_eq!(report.mail_deleted, 0);
+    }
+
+    #[test]
+    fn unset_mail_window_deletes_no_mail() {
+        let mut store = store();
+        let old = NOW - 31 * DAY_MS;
+        insert_message(&mut store, "old-acked/a1", old, Some(old));
+        let report = store.prune_retention(None, None, None, NOW).unwrap();
+        assert_eq!(report.mail_deleted, 0);
+        assert!(message_exists(&store, "old-acked/a1"));
     }
 
     fn launch_agent(store: &mut Store, project: &str, now: i64) -> (String, String) {
@@ -1300,6 +1482,34 @@ mod tests {
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM events WHERE seq = ?1)",
                 [seq],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn insert_message(
+        store: &mut Store,
+        delivery_id: &str,
+        admitted_at: i64,
+        read_at: Option<i64>,
+    ) {
+        store
+            .connection
+            .execute(
+                "INSERT INTO messages(delivery_id, sender, recipient, recipient_generation,
+                                      mode, text, content_digest, admitted_at, read_at)
+                 VALUES (?1, 'owner', 1, 1, 'queue', 'seeded', x'00', ?2, ?3)",
+                params![delivery_id, admitted_at, read_at],
+            )
+            .unwrap();
+    }
+
+    fn message_exists(store: &Store, delivery_id: &str) -> bool {
+        store
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE delivery_id = ?1)",
+                [delivery_id],
                 |row| row.get(0),
             )
             .unwrap()
@@ -1384,7 +1594,7 @@ mod tests {
 
         // Only the latest batch start pins the open source: the older native
         // event prunes while the source stays open.
-        let report = store.prune_retention(Some(30), None, NOW).unwrap();
+        let report = store.prune_retention(Some(30), None, None, NOW).unwrap();
         assert_eq!(report.pruned_through, started_seq - 1);
         assert!(!event_exists(&store, ready_seq));
         assert!(event_exists(&store, started_seq));
@@ -1399,7 +1609,7 @@ mod tests {
                 [agent_num],
             )
             .unwrap();
-        let report = store.prune_retention(Some(30), None, NOW).unwrap();
+        let report = store.prune_retention(Some(30), None, None, NOW).unwrap();
         assert!(report.events_deleted > 0);
         assert!(!event_exists(&store, started_seq));
     }
@@ -1419,7 +1629,7 @@ mod tests {
         assert!(first.events.is_empty());
         let ready_seq = native_seq(&store, "ready-batch:ready");
 
-        let report = store.prune_retention(Some(30), None, NOW).unwrap();
+        let report = store.prune_retention(Some(30), None, None, NOW).unwrap();
         assert!(report.events_deleted > 0);
         assert!(!event_exists(&store, ready_seq));
         assert!(event_exists(&store, first.ack.first_seq));
@@ -1473,7 +1683,7 @@ mod tests {
             .unwrap();
         assert!(gap_seq < 50);
 
-        let report = store.prune_retention(Some(30), None, NOW).unwrap();
+        let report = store.prune_retention(Some(30), None, None, NOW).unwrap();
         assert_eq!(report.events_deleted, gap_seq - 1);
         assert_eq!(report.pruned_through, gap_seq - 1);
         assert!(event_exists(&store, gap_seq));
@@ -1641,7 +1851,7 @@ mod tests {
             .unwrap();
         assert!(live_seq < 4000);
 
-        let report = store.prune_retention(Some(30), None, NOW).unwrap();
+        let report = store.prune_retention(Some(30), None, None, NOW).unwrap();
         assert_eq!(report.pruned_through, live_seq - 1);
         assert!(
             !event_exists(&store, stale_seq),
@@ -1672,7 +1882,7 @@ mod tests {
 
         // No batch committed yet (`last_batch_first_seq IS NULL`): the open
         // source pins from its first native event instead of pinning nothing.
-        let report = store.prune_retention(Some(30), None, NOW).unwrap();
+        let report = store.prune_retention(Some(30), None, None, NOW).unwrap();
         assert_eq!(report.pruned_through, first - 1);
         assert!(!event_exists(&store, below));
         assert!(event_exists(&store, first));
@@ -1706,7 +1916,7 @@ mod tests {
         let ready_b = native_seq(&store, "ready-b:ready");
         assert!(ready_b < pin_b);
 
-        let report = store.prune_retention(Some(30), None, NOW).unwrap();
+        let report = store.prune_retention(Some(30), None, None, NOW).unwrap();
         assert_eq!(report.pruned_through, pin_b - 1);
         assert!(!event_exists(&store, ready_b));
         assert!(event_exists(&store, pin_b));
@@ -1738,11 +1948,11 @@ mod tests {
             );
         }
         assert_eq!(command_count(&store), 125);
-        let report = store.prune_retention(None, Some(30), NOW).unwrap();
+        let report = store.prune_retention(None, Some(30), None, NOW).unwrap();
         assert_eq!(report.commands_deleted, 5);
         assert_eq!(command_count(&store), 120);
         // Nothing prunable remains; the kept roots are untouched.
-        let report = store.prune_retention(None, Some(30), NOW).unwrap();
+        let report = store.prune_retention(None, Some(30), None, NOW).unwrap();
         assert_eq!(report.commands_deleted, 0);
         assert_eq!(command_count(&store), 120);
         let unknown_children: i64 = store
@@ -1788,13 +1998,13 @@ mod tests {
             command_count(&store),
             (MAX_PRUNE_ROOTS as usize + 5) as i64 * (MAX_SET_MEMBERS as i64 + 1) + 5
         );
-        let report = store.prune_retention(None, Some(30), NOW).unwrap();
+        let report = store.prune_retention(None, Some(30), None, NOW).unwrap();
         assert_eq!(report.commands_deleted, 5);
         for root in &oversize_roots {
             assert!(store.get_command(root).unwrap().is_some());
         }
         // Nothing prunable remains; the oversize sets are untouched.
-        let report = store.prune_retention(None, Some(30), NOW).unwrap();
+        let report = store.prune_retention(None, Some(30), None, NOW).unwrap();
         assert_eq!(report.commands_deleted, 0);
         assert_eq!(
             command_count(&store),
@@ -1828,7 +2038,7 @@ mod tests {
                 [&request.id],
             )
             .unwrap();
-        let report = store.prune_retention(None, Some(1), NOW).unwrap();
+        let report = store.prune_retention(None, Some(1), None, NOW).unwrap();
         assert_eq!(report.commands_deleted, 0);
         assert!(store.get_command(&request.id).unwrap().is_some());
         // The id is still live, so it replays instead of expiring.
@@ -1942,7 +2152,7 @@ mod tests {
                 [agent_num],
             )
             .unwrap();
-        let report = store.prune_retention(Some(30), None, NOW).unwrap();
+        let report = store.prune_retention(Some(30), None, None, NOW).unwrap();
         assert!(report.pruned_through >= accepted_seq);
         let accepted_survives: bool = store
             .connection
@@ -2014,7 +2224,7 @@ mod tests {
         assert_eq!(members.len(), MAX_SET_MEMBERS);
         let prunable = Ulid::new().to_string();
         insert_command(&mut store, command_seed(prunable.clone(), old));
-        let report = store.prune_retention(None, Some(30), NOW).unwrap();
+        let report = store.prune_retention(None, Some(30), None, NOW).unwrap();
         assert_eq!(report.commands_deleted, 1);
         assert!(store.get_command(&root).unwrap().is_some());
         assert!(store.get_command(&prunable).unwrap().is_none());

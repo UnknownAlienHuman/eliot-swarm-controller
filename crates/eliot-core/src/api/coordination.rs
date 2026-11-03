@@ -31,6 +31,40 @@ pub const MAX_VAR_NOTE_BYTES: usize = 1024;
 pub const MAX_VAR_SCOPE_BYTES: usize = 1024;
 /// A routed recipient receives at most one generic wake notice per minute.
 pub const MAIL_NOTICE_COOLDOWN_MS: i64 = 60 * 1000;
+/// Default unread-text bound per Agent mailbox: 10 MiB.
+pub const DEFAULT_MAX_UNREAD_BYTES_PER_AGENT: i64 = 10 * 1024 * 1024;
+/// Default unread-message bound per Agent mailbox: 10,000 rows.
+pub const DEFAULT_MAX_UNREAD_MESSAGES_PER_AGENT: i64 = 10_000;
+
+/// Owner-configured unread bounds for one Agent mailbox (`[mail]` config).
+/// Admission rejects an overfull mailbox with `mailbox_full` before writing
+/// any row, so there is never a partial fanout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MailLimits {
+    pub max_unread_bytes_per_agent: i64,
+    pub max_unread_messages_per_agent: i64,
+}
+
+impl Default for MailLimits {
+    fn default() -> Self {
+        Self {
+            max_unread_bytes_per_agent: DEFAULT_MAX_UNREAD_BYTES_PER_AGENT,
+            max_unread_messages_per_agent: DEFAULT_MAX_UNREAD_MESSAGES_PER_AGENT,
+        }
+    }
+}
+
+impl MailLimits {
+    pub fn validate(&self) -> Result<()> {
+        if self.max_unread_bytes_per_agent <= 0 || self.max_unread_messages_per_agent <= 0 {
+            return Err(Error::new(
+                "invalid",
+                "mail unread bounds must be positive integers",
+            ));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

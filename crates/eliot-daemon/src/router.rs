@@ -2663,7 +2663,7 @@ impl Router {
                 // unauthorized caller cannot tell pruned from absent or probe
                 // cursors.
                 let gap = matches!(principal, Principal::Owner)
-                    && eliot_store::command_history_expired(id, now_ms());
+                    && eliot_store::history_expired(id, now_ms());
                 return Err(if gap {
                     Error::new(
                         "history_gap",
@@ -11886,7 +11886,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 old,
             )
             .unwrap();
-        let report = store.prune_retention(None, Some(30), now).unwrap();
+        let report = store.prune_retention(None, Some(30), None, now).unwrap();
         assert_eq!(report.commands_deleted, 2);
         launch_id
     }

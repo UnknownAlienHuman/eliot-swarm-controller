@@ -12,17 +12,17 @@
 
 use super::{
     Change, Error, MAX_EVENT_BYTES, Result, Store, canonical, command_binding, commit_transaction,
-    decode_json, encode_json, enforce_page_bytes, insert_daemon_event, load_agent_by_num,
-    load_command_record, provider_holds, sql_error, turn_state_name, validate_id_age,
-    write_binding,
+    decode_json, encode_json, enforce_page_bytes, history_expired, insert_daemon_event,
+    load_agent_by_num, load_command_record, provider_holds, sql_error, turn_state_name,
+    validate_id_age, write_binding,
 };
 use eliot_core::{
     CommandState, TurnState,
     api::{
         MAIL_NOTICE_COOLDOWN_MS, MailAckRequest, MailAckResponse, MailDelivery,
-        MailDeliverySummary, MailInboxRequest, MailInboxResponse, MailMode, MailReadRequest,
-        MailSendRequest, MailSendResponse, VarGetRequest, VarGetResponse, VarScope, VarSetRequest,
-        VarSetResponse, parse_var_scope,
+        MailDeliverySummary, MailInboxRequest, MailInboxResponse, MailLimits, MailMode,
+        MailReadRequest, MailSendRequest, MailSendResponse, VarGetRequest, VarGetResponse,
+        VarScope, VarSetRequest, VarSetResponse, parse_var_scope,
     },
     parse_agent_id,
 };
@@ -32,8 +32,6 @@ use serde_json::{Value, json};
 const MAIL_SEND_METHOD: &str = "mail.send";
 const MAIL_ACK_METHOD: &str = "mail.ack";
 const VAR_SET_METHOD: &str = "var.set";
-const MAX_UNREAD_BYTES_PER_AGENT: i64 = 10 * 1024 * 1024;
-const MAX_UNREAD_MESSAGES_PER_AGENT: i64 = 10_000;
 
 /// A claimed wake: the unread count for the generic notice text and the
 /// recipient generation the notice command must bind.
@@ -115,15 +113,18 @@ const DELIVERY_COLUMNS: &str = "m.delivery_id, m.sender, m.sender_generation,
 
 impl Store {
     /// Queue one message to concrete recipients, snapshotting their
-    /// generations in a single bounded transaction.
+    /// generations in a single bounded transaction. Every recipient mailbox
+    /// must fit the owner-configured unread `limits`, checked before any row
+    /// is written, so an overfull mailbox rejects without a partial fanout.
     pub fn mail_send(
         &mut self,
         principal: &str,
         request: &MailSendRequest,
+        limits: MailLimits,
         now: i64,
     ) -> Result<Change<MailSendResponse>> {
         self.ensure_writer_healthy()?;
-        let result = self.mail_send_inner(principal, request, now);
+        let result = self.mail_send_inner(principal, request, limits, now);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -133,10 +134,11 @@ impl Store {
         &self,
         principal: &str,
         request: &MailInboxRequest,
+        now: i64,
     ) -> Result<MailInboxResponse> {
         request.validate()?;
         let mailbox = self.resolve_mailbox(principal, request.agent.as_deref())?;
-        let mut deliveries = self.inbox_page(mailbox, request)?;
+        let mut deliveries = self.inbox_page(mailbox, request, now)?;
         enforce_page_bytes(&mut deliveries)?;
         let next = deliveries
             .last()
@@ -146,8 +148,15 @@ impl Store {
         Ok(response)
     }
 
-    /// Read one exact delivery. Read-only: nothing is marked.
-    pub fn mail_read(&self, principal: &str, request: &MailReadRequest) -> Result<MailDelivery> {
+    /// Read one exact delivery. Read-only: nothing is marked. An absent
+    /// delivery whose write id is old enough to have been pruned reads
+    /// `history_gap`; any other absent delivery reads `not_found`.
+    pub fn mail_read(
+        &self,
+        principal: &str,
+        request: &MailReadRequest,
+        now: i64,
+    ) -> Result<MailDelivery> {
         request.validate()?;
         let mailbox = self.resolve_mailbox(principal, request.agent.as_deref())?;
         let delivery: Option<MailDelivery> = self
@@ -160,7 +169,7 @@ impl Store {
             .optional()
             .map_err(sql_error)?;
         let Some(delivery) = delivery else {
-            return Err(Error::new("not_found", "mail delivery was not found"));
+            return Err(absent_delivery_error(&request.delivery_id, mailbox, now));
         };
         if delivery.recipient != mailbox_name(mailbox) {
             return Err(Error::new("not_found", "mail delivery was not found"));
@@ -386,7 +395,12 @@ impl Store {
         }
     }
 
-    fn inbox_page(&self, mailbox: i64, request: &MailInboxRequest) -> Result<Vec<MailDelivery>> {
+    fn inbox_page(
+        &self,
+        mailbox: i64,
+        request: &MailInboxRequest,
+        now: i64,
+    ) -> Result<Vec<MailDelivery>> {
         let after_row: Option<i64> = match request.after.as_deref() {
             None => None,
             Some(after) => {
@@ -400,7 +414,14 @@ impl Store {
                     .optional()
                     .map_err(sql_error)?;
                 Some(row.ok_or_else(|| {
-                    Error::new("invalid", "mail inbox cursor names no delivery here")
+                    if delivery_may_be_pruned(after, mailbox, now) {
+                        Error::new(
+                            "history_gap",
+                            "mail inbox cursor names removed history; restart from the first page",
+                        )
+                    } else {
+                        Error::new("invalid", "mail inbox cursor names no delivery here")
+                    }
                 })?)
             }
         };
@@ -429,9 +450,11 @@ impl Store {
         &mut self,
         principal: &str,
         request: &MailSendRequest,
+        limits: MailLimits,
         now: i64,
     ) -> Result<Change<MailSendResponse>> {
         request.validate()?;
+        limits.validate()?;
         if request.mode != MailMode::Queue {
             return Err(Error::new(
                 "unsupported",
@@ -518,7 +541,7 @@ impl Store {
             recipients.push(agent);
         }
         if let Some(reply) = request.reply_to_delivery.as_deref() {
-            Self::check_reply_participants_tx(&tx, reply, &sender, &recipients)?;
+            Self::check_reply_participants_tx(&tx, reply, &sender, &recipients, now)?;
         }
         let addition = i64::try_from(request.text.len()).unwrap_or(i64::MAX);
         for agent in &recipients {
@@ -530,7 +553,7 @@ impl Store {
                     |row| row.get(0),
                 )
                 .map_err(sql_error)?;
-            if unread >= MAX_UNREAD_MESSAGES_PER_AGENT {
+            if unread >= limits.max_unread_messages_per_agent {
                 return Err(Error::new(
                     "mailbox_full",
                     format!("mailbox {} has no unread room", agent.id),
@@ -544,7 +567,7 @@ impl Store {
                     |row| row.get(0),
                 )
                 .map_err(sql_error)?;
-            if bytes.saturating_add(addition) > MAX_UNREAD_BYTES_PER_AGENT {
+            if bytes.saturating_add(addition) > limits.max_unread_bytes_per_agent {
                 return Err(Error::new(
                     "mailbox_full",
                     format!("mailbox {} has no unread room", agent.id),
@@ -618,6 +641,7 @@ impl Store {
         reply: &str,
         sender: &Sender,
         recipients: &[eliot_core::Agent],
+        now: i64,
     ) -> Result<()> {
         let row: Option<(String, i64)> = tx
             .query_row(
@@ -628,7 +652,17 @@ impl Store {
             .optional()
             .map_err(sql_error)?;
         let Some((sender_name, recipient_num)) = row else {
-            return Err(Error::new("not_found", "replied-to delivery was not found"));
+            // A reply names exact history, but no single mailbox is
+            // authorized here yet: only the write-id age classifies it, and
+            // the age rule alone leaks nothing beyond the caller's own input.
+            let gap = reply
+                .split_once('/')
+                .is_some_and(|(head, _)| history_expired(head, now));
+            return Err(if gap {
+                Error::new("history_gap", "replied-to delivery is no longer retained")
+            } else {
+                Error::new("not_found", "replied-to delivery was not found")
+            });
         };
         let mut participants = vec![recipient_num];
         if sender_name != "owner" {
@@ -710,7 +744,7 @@ impl Store {
                 )
                 .map_err(sql_error)?;
             if !found {
-                return Err(Error::new("not_found", "mail delivery was not found"));
+                return Err(absent_delivery_error(delivery, mailbox, now));
             }
         }
         for delivery in &request.deliveries {
@@ -1023,6 +1057,36 @@ fn mailbox_name(num: i64) -> String {
     format!("a{num}")
 }
 
+/// Whether an absent delivery of an already-authorized mailbox may have been
+/// pruned: the recipient suffix must name this mailbox, and the write id must
+/// be older than the retry window plus the allowed clock skew, exactly the
+/// admission `id_expired` age rule shared with command history. Retention
+/// keeps every younger mail row, so any other absent delivery never existed.
+/// Pure: a function of the caller's own input, so it leaks nothing across
+/// mailboxes — a foreign suffix never reads a gap.
+fn delivery_may_be_pruned(delivery_id: &str, mailbox: i64, now: i64) -> bool {
+    let Some((head, tail)) = delivery_id.split_once('/') else {
+        return false;
+    };
+    if tail != mailbox_name(mailbox) {
+        return false;
+    }
+    history_expired(head, now)
+}
+
+/// Error for an absent delivery of an already-authorized mailbox:
+/// `history_gap` when the delivery may have been pruned, else `not_found`.
+fn absent_delivery_error(delivery_id: &str, mailbox: i64, now: i64) -> Error {
+    if delivery_may_be_pruned(delivery_id, mailbox, now) {
+        Error::new(
+            "history_gap",
+            "mail delivery is no longer retained; unread mail is never pruned",
+        )
+    } else {
+        Error::new("not_found", "mail delivery was not found")
+    }
+}
+
 fn retain_write_tx(
     tx: &Transaction<'_>,
     id: &str,
@@ -1139,6 +1203,33 @@ mod tests {
             .unwrap()
     }
 
+    const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
+
+    fn ulid_at(ts_ms: i64, tag: u8) -> String {
+        let mut bytes = [0_u8; 16];
+        bytes[..6].copy_from_slice(&(ts_ms as u64).to_be_bytes()[2..8]);
+        bytes[6..].copy_from_slice(&[tag; 10]);
+        Ulid::from_bytes(bytes).to_string()
+    }
+
+    fn insert_message(
+        store: &mut Store,
+        delivery_id: &str,
+        recipient: i64,
+        admitted_at: i64,
+        read_at: Option<i64>,
+    ) {
+        store
+            .connection
+            .execute(
+                "INSERT INTO messages(delivery_id, sender, recipient, recipient_generation,
+                                      mode, text, content_digest, admitted_at, read_at)
+                 VALUES (?1, 'owner', ?2, 1, 'queue', 'seeded', x'00', ?3, ?4)",
+                params![delivery_id, recipient, admitted_at, read_at],
+            )
+            .unwrap();
+    }
+
     #[test]
     fn mail_migration_installs_v21_tables() {
         let store = store();
@@ -1173,6 +1264,7 @@ mod tests {
             .mail_send(
                 "owner",
                 &send_request(vec![a.clone(), b.clone()], "hello"),
+                MailLimits::default(),
                 now,
             )
             .expect("queue mail")
@@ -1189,14 +1281,14 @@ mod tests {
             after: None,
         };
         let first = store
-            .mail_inbox(&agent_principal(&b), &inbox)
+            .mail_inbox(&agent_principal(&b), &inbox, now)
             .expect("read inbox");
         assert_eq!(first.deliveries.len(), 1);
         assert_eq!(first.deliveries[0].text, "hello");
         assert_eq!(first.deliveries[0].read_at, None);
         assert_eq!(first.next, Some(first.deliveries[0].delivery_id.clone()));
         let second = store
-            .mail_inbox(&agent_principal(&b), &inbox)
+            .mail_inbox(&agent_principal(&b), &inbox, now)
             .expect("reread inbox");
         assert_eq!(second, first);
         let one = store
@@ -1206,6 +1298,7 @@ mod tests {
                     agent: None,
                     delivery_id: first.deliveries[0].delivery_id.clone(),
                 },
+                now,
             )
             .expect("read one delivery");
         assert_eq!(one, first.deliveries[0]);
@@ -1224,7 +1317,7 @@ mod tests {
         assert_eq!(acked.acked, ack.deliveries);
         assert_eq!(unread(&store, &b), 0);
         let empty = store
-            .mail_inbox(&agent_principal(&b), &inbox)
+            .mail_inbox(&agent_principal(&b), &inbox, now)
             .expect("inbox after ack");
         assert!(empty.deliveries.is_empty());
         assert_eq!(empty.next, None);
@@ -1239,6 +1332,7 @@ mod tests {
                     agent: None,
                     delivery_id: first.deliveries[0].delivery_id.clone(),
                 },
+                now,
             )
             .expect("read acked delivery");
         assert!(read.read_at.is_some());
@@ -1257,7 +1351,12 @@ mod tests {
         let text = "y".repeat(32 * 1024);
         for _ in 0..50 {
             store
-                .mail_send("owner", &send_request(vec![a.clone()], &text), now)
+                .mail_send(
+                    "owner",
+                    &send_request(vec![a.clone()], &text),
+                    MailLimits::default(),
+                    now,
+                )
                 .expect("queue large mail");
         }
         assert_eq!(unread(&store, &a), 50);
@@ -1269,6 +1368,7 @@ mod tests {
                     limit: Some(100),
                     after: None,
                 },
+                now,
             )
             .expect("read truncated inbox");
         // The page fits the byte bound and keeps `next` on its last row.
@@ -1310,6 +1410,7 @@ mod tests {
                         limit: Some(100),
                         after: after.clone(),
                     },
+                    now,
                 )
                 .expect("read continuation page");
             if page.deliveries.is_empty() {
@@ -1345,9 +1446,12 @@ mod tests {
         let now = now_ms();
         let a = ready_agent(&mut store, "app", now);
         let request = send_request(vec![a.clone()], "same");
-        let first = store.mail_send("owner", &request, now).expect("send").value;
+        let first = store
+            .mail_send("owner", &request, MailLimits::default(), now)
+            .expect("send")
+            .value;
         let replay = store
-            .mail_send("owner", &request, now)
+            .mail_send("owner", &request, MailLimits::default(), now)
             .expect("replay")
             .value;
         assert_eq!(replay, first);
@@ -1356,12 +1460,15 @@ mod tests {
         let mut rebound = request.clone();
         rebound.text = "different".to_owned();
         assert_eq!(
-            store.mail_send("owner", &rebound, now).unwrap_err().code,
+            store
+                .mail_send("owner", &rebound, MailLimits::default(), now)
+                .unwrap_err()
+                .code,
             "id_conflict"
         );
         assert_eq!(
             store
-                .mail_send(&agent_principal(&a), &request, now)
+                .mail_send(&agent_principal(&a), &request, MailLimits::default(), now)
                 .unwrap_err()
                 .code,
             "id_conflict"
@@ -1369,19 +1476,28 @@ mod tests {
         let mut bad_id = send_request(vec![a.clone()], "bad");
         bad_id.id = "not-a-ulid".to_owned();
         assert_eq!(
-            store.mail_send("owner", &bad_id, now).unwrap_err().code,
+            store
+                .mail_send("owner", &bad_id, MailLimits::default(), now)
+                .unwrap_err()
+                .code,
             "invalid"
         );
         let mut expired = send_request(vec![a.clone()], "old");
         expired.id = Ulid::from_parts(1, 1).to_string();
         assert_eq!(
-            store.mail_send("owner", &expired, now).unwrap_err().code,
+            store
+                .mail_send("owner", &expired, MailLimits::default(), now)
+                .unwrap_err()
+                .code,
             "id_expired"
         );
         let mut presented = send_request(vec![a.clone()], "live");
         presented.mode = MailMode::Send;
         assert_eq!(
-            store.mail_send("owner", &presented, now).unwrap_err().code,
+            store
+                .mail_send("owner", &presented, MailLimits::default(), now)
+                .unwrap_err()
+                .code,
             "unsupported"
         );
     }
@@ -1396,6 +1512,7 @@ mod tests {
             .mail_send(
                 "owner",
                 &send_request(vec!["a999".to_owned()], "ghost"),
+                MailLimits::default(),
                 now,
             )
             .unwrap_err();
@@ -1407,6 +1524,7 @@ mod tests {
             .mail_send(
                 &agent_principal(&a),
                 &send_request(vec![b.clone()], "cross"),
+                MailLimits::default(),
                 now,
             )
             .unwrap_err();
@@ -1415,6 +1533,7 @@ mod tests {
             .mail_send(
                 &format!("agent:{a}:9"),
                 &send_request(vec![a.clone()], "stale"),
+                MailLimits::default(),
                 now,
             )
             .unwrap_err();
@@ -1425,6 +1544,7 @@ mod tests {
             .mail_send(
                 &agent_principal(&a),
                 &send_request(vec![c.clone()], "peer"),
+                MailLimits::default(),
                 now,
             )
             .expect("peer mail");
@@ -1438,7 +1558,12 @@ mod tests {
         let a = ready_agent(&mut store, "app", now);
         let stale = agent_principal(&a);
         let sent = store
-            .mail_send("owner", &send_request(vec![a.clone()], "hi"), now)
+            .mail_send(
+                "owner",
+                &send_request(vec![a.clone()], "hi"),
+                MailLimits::default(),
+                now,
+            )
             .expect("queue mail")
             .value;
         let delivery = sent.deliveries[0].delivery_id.clone();
@@ -1450,6 +1575,7 @@ mod tests {
                     limit: None,
                     after: None,
                 },
+                now,
             )
             .expect("inbox while current");
         // Advance the generation: the gen-1 principal is now previous.
@@ -1468,7 +1594,7 @@ mod tests {
             after: None,
         };
         assert_eq!(
-            store.mail_inbox(&stale, &inbox).unwrap_err().code,
+            store.mail_inbox(&stale, &inbox, now).unwrap_err().code,
             "stale_generation"
         );
         assert_eq!(
@@ -1479,6 +1605,7 @@ mod tests {
                         agent: None,
                         delivery_id: delivery.clone(),
                     },
+                    now
                 )
                 .unwrap_err()
                 .code,
@@ -1526,7 +1653,7 @@ mod tests {
         );
         // The current generation still reads, acks, and writes.
         store
-            .mail_inbox(&current, &inbox)
+            .mail_inbox(&current, &inbox, now)
             .expect("inbox with current generation");
         store
             .mail_read(
@@ -1535,6 +1662,7 @@ mod tests {
                     agent: None,
                     delivery_id: delivery.clone(),
                 },
+                now,
             )
             .expect("read with current generation");
         store
@@ -1554,50 +1682,60 @@ mod tests {
     }
 
     #[test]
+    fn mailbox_default_limits_match_the_coordination_contract() {
+        assert_eq!(
+            MailLimits::default(),
+            MailLimits {
+                max_unread_bytes_per_agent: 10 * 1024 * 1024,
+                max_unread_messages_per_agent: 10_000,
+            }
+        );
+        MailLimits::default()
+            .validate()
+            .expect("defaults are valid");
+    }
+
+    #[test]
     fn mailbox_bounds_reject_without_partial_fanout() {
         let mut store = store();
         let now = now_ms();
+        // Non-default bounds prove the plumbed limits are honored, not the
+        // compiled-in contract defaults.
+        let limits = MailLimits {
+            max_unread_bytes_per_agent: 16,
+            max_unread_messages_per_agent: 3,
+        };
         let a = ready_agent(&mut store, "app", now);
         let b = ready_agent(&mut store, "app", now);
-        let num_b = parse_agent_id(&b).unwrap();
-        store.connection.execute_batch("BEGIN IMMEDIATE").unwrap();
-        for index in 0..MAX_UNREAD_MESSAGES_PER_AGENT {
+        for _ in 0..3 {
             store
-                .connection
-                .execute(
-                    "INSERT INTO messages(delivery_id, sender, recipient, recipient_generation,
-                                          mode, text, content_digest, admitted_at)
-                     VALUES (?1, 'owner', ?2, 1, 'queue', '', x'00', ?3)",
-                    params![format!("fill-{index}/{b}"), num_b, now],
-                )
-                .unwrap();
+                .mail_send("owner", &send_request(vec![b.clone()], "hi"), limits, now)
+                .expect("fill the count bound");
         }
-        store.connection.execute_batch("COMMIT").unwrap();
         let error = store
             .mail_send(
                 "owner",
                 &send_request(vec![a.clone(), b.clone()], "one more"),
+                limits,
                 now,
             )
             .unwrap_err();
         assert_eq!(error.code, "mailbox_full");
         assert_eq!(unread(&store, &a), 0, "no partial fanout to a");
-        assert_eq!(unread(&store, &b), MAX_UNREAD_MESSAGES_PER_AGENT);
+        assert_eq!(unread(&store, &b), 3);
 
+        // The byte bound admits an exact fill and refuses one more byte.
         let big = ready_agent(&mut store, "app", now);
-        let num_big = parse_agent_id(&big).unwrap();
-        let filler = "x".repeat(MAX_UNREAD_BYTES_PER_AGENT as usize);
         store
-            .connection
-            .execute(
-                "INSERT INTO messages(delivery_id, sender, recipient, recipient_generation,
-                                      mode, text, content_digest, admitted_at)
-                 VALUES ('fill-bytes', 'owner', ?1, 1, 'queue', ?2, x'00', ?3)",
-                params![num_big, filler, now],
+            .mail_send(
+                "owner",
+                &send_request(vec![big.clone()], "0123456789abcdef"),
+                limits,
+                now,
             )
-            .unwrap();
+            .expect("fill the byte bound exactly");
         let error = store
-            .mail_send("owner", &send_request(vec![big.clone()], "y"), now)
+            .mail_send("owner", &send_request(vec![big.clone()], "y"), limits, now)
             .unwrap_err();
         assert_eq!(error.code, "mailbox_full");
     }
@@ -1606,30 +1744,169 @@ mod tests {
     fn mailbox_byte_bound_counts_bytes_not_characters() {
         let mut store = store();
         let now = now_ms();
+        // 'é' is 2 bytes in UTF-8 but 1 character: with a 4-byte bound, two
+        // of them fill it while counting only 2 characters. A
+        // character-counting sum would admit two more bytes; a byte sum
+        // refuses one more.
+        let limits = MailLimits {
+            max_unread_bytes_per_agent: 4,
+            ..MailLimits::default()
+        };
         let a = ready_agent(&mut store, "app", now);
-        let num = parse_agent_id(&a).unwrap();
-        // 'é' is 2 bytes in UTF-8 but 1 character: 5 MiB of them occupy the
-        // full 10 MiB byte bound while counting only 5 M characters. A
-        // character-counting sum would admit one more byte; a byte sum refuses.
-        let filler = "é".repeat((MAX_UNREAD_BYTES_PER_AGENT / 2) as usize);
-        assert_eq!(filler.len(), MAX_UNREAD_BYTES_PER_AGENT as usize);
-        assert_eq!(
-            filler.chars().count(),
-            (MAX_UNREAD_BYTES_PER_AGENT / 2) as usize
-        );
         store
-            .connection
-            .execute(
-                "INSERT INTO messages(delivery_id, sender, recipient, recipient_generation,
-                                      mode, text, content_digest, admitted_at)
-                 VALUES ('fill-nonascii', 'owner', ?1, 1, 'queue', ?2, x'00', ?3)",
-                params![num, filler, now],
-            )
-            .unwrap();
+            .mail_send("owner", &send_request(vec![a.clone()], "éé"), limits, now)
+            .expect("fill the byte bound exactly");
         let error = store
-            .mail_send("owner", &send_request(vec![a.clone()], "y"), now)
+            .mail_send("owner", &send_request(vec![a.clone()], "y"), limits, now)
             .unwrap_err();
         assert_eq!(error.code, "mailbox_full");
+    }
+
+    #[test]
+    fn mail_send_rejects_nonpositive_limits() {
+        let mut store = store();
+        let now = now_ms();
+        let a = ready_agent(&mut store, "app", now);
+        for limits in [
+            MailLimits {
+                max_unread_bytes_per_agent: 0,
+                ..MailLimits::default()
+            },
+            MailLimits {
+                max_unread_messages_per_agent: 0,
+                ..MailLimits::default()
+            },
+            MailLimits {
+                max_unread_bytes_per_agent: -1,
+                max_unread_messages_per_agent: -1,
+            },
+        ] {
+            let error = store
+                .mail_send("owner", &send_request(vec![a.clone()], "hi"), limits, now)
+                .unwrap_err();
+            assert_eq!(error.code, "invalid");
+        }
+        assert_eq!(unread(&store, &a), 0);
+        assert!(!store.is_write_faulted());
+    }
+
+    #[test]
+    fn removed_mail_history_reads_history_gap() {
+        let mut store = store();
+        let now = now_ms();
+        let a = ready_agent(&mut store, "app", now);
+        let b = ready_agent(&mut store, "app", now);
+        let num_a = parse_agent_id(&a).unwrap();
+        let old = now - 31 * DAY_MS;
+        let pruned_id = format!("{}/{}", ulid_at(old, 1), a);
+        let kept_id = format!("{}/{}", Ulid::new(), a);
+        insert_message(&mut store, &pruned_id, num_a, old, Some(old));
+        insert_message(&mut store, &kept_id, num_a, now, Some(now));
+
+        let report = store.prune_retention(None, None, Some(30), now).unwrap();
+        assert_eq!(report.mail_deleted, 1);
+        assert_eq!(report.events_deleted, 0);
+        assert_eq!(report.commands_deleted, 0);
+        assert_eq!(report.writes_deleted, 0);
+
+        // The removed delivery reads history_gap on every request path.
+        let read = MailReadRequest {
+            agent: None,
+            delivery_id: pruned_id.clone(),
+        };
+        assert_eq!(
+            store
+                .mail_read(&agent_principal(&a), &read, now)
+                .unwrap_err()
+                .code,
+            "history_gap"
+        );
+        let ack = MailAckRequest {
+            id: Ulid::new().to_string(),
+            agent: None,
+            deliveries: vec![pruned_id.clone()],
+        };
+        assert_eq!(
+            store
+                .mail_ack(&agent_principal(&a), &ack, now)
+                .unwrap_err()
+                .code,
+            "history_gap"
+        );
+        let cursor = MailInboxRequest {
+            agent: None,
+            limit: None,
+            after: Some(pruned_id.clone()),
+        };
+        assert_eq!(
+            store
+                .mail_inbox(&agent_principal(&a), &cursor, now)
+                .unwrap_err()
+                .code,
+            "history_gap"
+        );
+        let mut reply = send_request(vec![a.clone()], "reply");
+        reply.reply_to_delivery = Some(pruned_id.clone());
+        assert_eq!(
+            store
+                .mail_send("owner", &reply, MailLimits::default(), now)
+                .unwrap_err()
+                .code,
+            "history_gap"
+        );
+
+        // Young or foreign ids still read their old errors, and the kept row
+        // still reads.
+        let young = MailReadRequest {
+            agent: None,
+            delivery_id: format!("{}/{}", Ulid::new(), a),
+        };
+        assert_eq!(
+            store
+                .mail_read(&agent_principal(&a), &young, now)
+                .unwrap_err()
+                .code,
+            "not_found"
+        );
+        let foreign = MailReadRequest {
+            agent: None,
+            delivery_id: format!("{}/{}", ulid_at(old, 2), b),
+        };
+        assert_eq!(
+            store
+                .mail_read(&agent_principal(&a), &foreign, now)
+                .unwrap_err()
+                .code,
+            "not_found"
+        );
+        let young_cursor = MailInboxRequest {
+            agent: None,
+            limit: None,
+            after: Some(format!("{}/{}", Ulid::new(), a)),
+        };
+        assert_eq!(
+            store
+                .mail_inbox(&agent_principal(&a), &young_cursor, now)
+                .unwrap_err()
+                .code,
+            "invalid"
+        );
+        let mut young_reply = send_request(vec![a.clone()], "reply");
+        young_reply.reply_to_delivery = Some(format!("{}/{}", Ulid::new(), a));
+        assert_eq!(
+            store
+                .mail_send("owner", &young_reply, MailLimits::default(), now)
+                .unwrap_err()
+                .code,
+            "not_found"
+        );
+        let kept = MailReadRequest {
+            agent: None,
+            delivery_id: kept_id,
+        };
+        store
+            .mail_read(&agent_principal(&a), &kept, now)
+            .expect("young acked mail still reads");
     }
 
     #[test]
@@ -1642,6 +1919,7 @@ mod tests {
             .mail_send(
                 "owner",
                 &send_request(vec![a.clone(), b.clone()], "hi"),
+                MailLimits::default(),
                 now,
             )
             .expect("send")
@@ -1706,6 +1984,7 @@ mod tests {
             .mail_send(
                 &agent_principal(&a),
                 &send_request(vec![b.clone()], "start"),
+                MailLimits::default(),
                 now,
             )
             .expect("start thread")
@@ -1715,14 +1994,19 @@ mod tests {
         let mut reply = send_request(vec![a.clone()], "back");
         reply.reply_to_delivery = Some(parent.clone());
         store
-            .mail_send(&agent_principal(&b), &reply, now)
+            .mail_send(&agent_principal(&b), &reply, MailLimits::default(), now)
             .expect("participant reply");
 
         let mut outsider_recipient = send_request(vec![c.clone()], "hijack");
         outsider_recipient.reply_to_delivery = Some(parent.clone());
         assert_eq!(
             store
-                .mail_send(&agent_principal(&a), &outsider_recipient, now)
+                .mail_send(
+                    &agent_principal(&a),
+                    &outsider_recipient,
+                    MailLimits::default(),
+                    now
+                )
                 .unwrap_err()
                 .code,
             "invalid"
@@ -1731,7 +2015,12 @@ mod tests {
         outsider_sender.reply_to_delivery = Some(parent.clone());
         assert_eq!(
             store
-                .mail_send(&agent_principal(&c), &outsider_sender, now)
+                .mail_send(
+                    &agent_principal(&c),
+                    &outsider_sender,
+                    MailLimits::default(),
+                    now
+                )
                 .unwrap_err()
                 .code,
             "not_allowed"
@@ -1740,7 +2029,7 @@ mod tests {
         missing.reply_to_delivery = Some(format!("{}/{}", Ulid::new(), a));
         assert_eq!(
             store
-                .mail_send(&agent_principal(&b), &missing, now)
+                .mail_send(&agent_principal(&b), &missing, MailLimits::default(), now)
                 .unwrap_err()
                 .code,
             "not_found"
@@ -1999,7 +2288,12 @@ mod tests {
             None
         );
         store
-            .mail_send("owner", &send_request(vec![a.clone()], "wake"), now)
+            .mail_send(
+                "owner",
+                &send_request(vec![a.clone()], "wake"),
+                MailLimits::default(),
+                now,
+            )
             .expect("queue mail");
 
         let notice = Ulid::new().to_string();
@@ -2140,7 +2434,12 @@ mod tests {
         let now = now_ms();
         let a = ready_agent(&mut store, "app", now);
         store
-            .mail_send("owner", &send_request(vec![a.clone()], "wake"), now)
+            .mail_send(
+                "owner",
+                &send_request(vec![a.clone()], "wake"),
+                MailLimits::default(),
+                now,
+            )
             .expect("queue mail");
         let first = Ulid::new().to_string();
         store
@@ -2194,7 +2493,12 @@ mod tests {
             )
             .unwrap();
         store
-            .mail_send("owner", &send_request(vec![a.clone()], "wake"), now)
+            .mail_send(
+                "owner",
+                &send_request(vec![a.clone()], "wake"),
+                MailLimits::default(),
+                now,
+            )
             .expect("queue mail");
         let notice = Ulid::new().to_string();
         let claim = store

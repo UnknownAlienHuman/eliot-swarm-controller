@@ -655,7 +655,11 @@ bound; `next` is the last returned delivery id, or null on an empty page.
 only its own stable mailbox and may omit `agent`; the owner must name the
 mailbox explicitly. `mail.ack` acknowledges only the listed exact delivery
 ids, idempotently; an unknown or foreign id rejects the whole
-acknowledgement with `not_found` and marks nothing. All three writes bind
+acknowledgement with `not_found` and marks nothing. An absent delivery whose
+write-id ULID time is older than the retry window plus the allowed clock
+skew may have been pruned and reads `history_gap` on read, ack, inbox cursor
+and reply reference; any other absent delivery reads `not_found` (`invalid`
+for an inbox cursor). All three writes bind
 their ULID idempotently to principal, method and semantic payload.
 
 `var.set` and `var.get` address scopes encoded as `global` or

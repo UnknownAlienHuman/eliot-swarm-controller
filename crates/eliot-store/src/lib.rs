@@ -10,7 +10,7 @@ mod rules;
 mod scripts;
 
 pub use capacity::{RecordedProcess, RetainedGeneration};
-pub use command_children::{CommandChildrenPage, command_history_expired};
+pub use command_children::{CommandChildrenPage, history_expired};
 pub use coordination::{MailNoticeClaim, MailNoticeState};
 pub use goals::{
     GoalCheckResult, GoalCommitOutcome, GoalContinuation, GoalRoundCommit, GoalRoundCommitResult,

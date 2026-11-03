@@ -221,11 +221,12 @@ is added only for a native decision not expressible by the already-working strea
 
 Read [coordination](spec/coordination.md). Use two Codex Agents initially.
 
-- [ ] **L5.1 Mail/variables.** Addressed queued mail, separate delivery and acknowledgement,
+- [x] **L5.1 Mail/variables.** Addressed queued mail, separate delivery and acknowledgement,
       bounded coalesced generic notices, shared variables and CAS. No automatic status chatter.
-      `send`/`steer`/`inject` full-text presentation is `unsupported`; mail retention pruning
-      (`history_gap` for acked mail) and config-file `[mail]` limits stay unconnected
-      (note 38d remainder).
+      `send`/`steer`/`inject` full-text presentation is `unsupported`; unread bounds come
+      from the config-file `[mail]` table and acknowledged mail older than
+      `daemon.retention.mail_days` is pruned in bounded retention batches (unread mail is
+      never pruned; removed history reads `history_gap`).
 - [ ] **L5.2 Work attribution.** `who` reads L3 Git/edit projections; claims are
       advisory. No second ownership database or file-lock promise.
 - [ ] **L5.3 Hierarchy.** Controller-launched children and tree selectors, then native

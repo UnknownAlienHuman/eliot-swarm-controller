@@ -78,10 +78,12 @@ affect messages that arrived after the fetch. Lost output/ack may cause redispla
 silent message loss.
 
 Do not prune unread correspondence solely because generation changed. Bound admission
-with `mail.max_unread_bytes_per_agent` (default 10 MiB of message text); overflow returns
-`mailbox_full` without a partial fanout. `mail.max_unread_messages_per_agent`
-(default 10,000) also bounds metadata for empty/tiny messages. Acknowledged/history retention is bounded;
-requests for removed history return `history_gap`.
+with `mail.max_unread_bytes_per_agent` (default 10 MiB of message text, from the
+config-file `[mail]` table); overflow returns `mailbox_full` without a partial
+fanout. `mail.max_unread_messages_per_agent` (default 10,000) also bounds
+metadata for empty/tiny messages. Acknowledged/history retention is bounded by
+`daemon.retention.mail_days` (unset disables pruning; unread mail is never
+pruned); requests for removed history return `history_gap`.
 
 ```sql
 CREATE TABLE messages (

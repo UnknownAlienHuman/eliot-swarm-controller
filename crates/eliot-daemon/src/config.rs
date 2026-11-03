@@ -140,6 +140,8 @@ struct FileConfig {
     automation: AutomationConfig,
     #[serde(default)]
     daemon: DaemonConfig,
+    #[serde(default)]
+    mail: MailConfig,
 }
 
 /// Owner-approved interpreter and action-environment grant shared by project
@@ -209,6 +211,8 @@ pub(crate) struct RetentionConfig {
     pub(crate) events_days: Option<i64>,
     #[serde(default)]
     pub(crate) commands_days: Option<i64>,
+    #[serde(default)]
+    pub(crate) mail_days: Option<i64>,
 }
 
 impl RetentionConfig {
@@ -225,8 +229,68 @@ impl RetentionConfig {
                 "config.toml: daemon.retention.commands_days must be a positive integer",
             ));
         }
+        if self.mail_days.is_some_and(|days| days <= 0) {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: daemon.retention.mail_days must be a positive integer",
+            ));
+        }
         Ok(self)
     }
+}
+
+/// Unread mailbox bounds consumed by `mail.send` admission. See
+/// docs/spec/configuration.md: mail. Unlike retention windows, these always
+/// apply: an unset value keeps its coordination-contract default.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MailConfig {
+    #[serde(default = "default_max_unread_bytes_per_agent")]
+    pub(crate) max_unread_bytes_per_agent: i64,
+    #[serde(default = "default_max_unread_messages_per_agent")]
+    pub(crate) max_unread_messages_per_agent: i64,
+}
+
+impl Default for MailConfig {
+    fn default() -> Self {
+        Self {
+            max_unread_bytes_per_agent: default_max_unread_bytes_per_agent(),
+            max_unread_messages_per_agent: default_max_unread_messages_per_agent(),
+        }
+    }
+}
+
+impl MailConfig {
+    fn validate(self) -> core::Result<Self> {
+        if self.max_unread_bytes_per_agent <= 0 {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: mail.max_unread_bytes_per_agent must be a positive integer",
+            ));
+        }
+        if self.max_unread_messages_per_agent <= 0 {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: mail.max_unread_messages_per_agent must be a positive integer",
+            ));
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn limits(&self) -> core::api::MailLimits {
+        core::api::MailLimits {
+            max_unread_bytes_per_agent: self.max_unread_bytes_per_agent,
+            max_unread_messages_per_agent: self.max_unread_messages_per_agent,
+        }
+    }
+}
+
+fn default_max_unread_bytes_per_agent() -> i64 {
+    core::api::DEFAULT_MAX_UNREAD_BYTES_PER_AGENT
+}
+
+fn default_max_unread_messages_per_agent() -> i64 {
+    core::api::DEFAULT_MAX_UNREAD_MESSAGES_PER_AGENT
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -828,6 +892,13 @@ pub(crate) fn load_daemon_config(data_root: &Path) -> core::Result<DaemonConfig>
         return Ok(DaemonConfig::default());
     };
     config.daemon.validate()
+}
+
+pub(crate) fn load_mail_config(data_root: &Path) -> core::Result<MailConfig> {
+    let Some((config, _)) = read_config(data_root)? else {
+        return Ok(MailConfig::default());
+    };
+    config.mail.validate()
 }
 
 fn fake_snapshot() -> Value {
@@ -1785,6 +1856,7 @@ mod tests {
         // Unset windows disable pruning: no deletion by default.
         assert_eq!(DaemonConfig::default().retention.events_days, None);
         assert_eq!(DaemonConfig::default().retention.commands_days, None);
+        assert_eq!(DaemonConfig::default().retention.mail_days, None);
 
         fixture.write("[daemon]\n");
         assert_eq!(
@@ -1792,13 +1864,16 @@ mod tests {
             DaemonConfig::default()
         );
 
-        fixture.write("[daemon]\nretention.events_days = 7\nretention.commands_days = 14\n");
+        fixture.write(
+            "[daemon]\nretention.events_days = 7\nretention.commands_days = 14\nretention.mail_days = 21\n",
+        );
         assert_eq!(
             load_daemon_config(&fixture.root).unwrap(),
             DaemonConfig {
                 retention: RetentionConfig {
                     events_days: Some(7),
                     commands_days: Some(14),
+                    mail_days: Some(21),
                 },
             }
         );
@@ -1810,6 +1885,7 @@ mod tests {
                 retention: RetentionConfig {
                     events_days: Some(7),
                     commands_days: None,
+                    mail_days: None,
                 },
             }
         );
@@ -1823,12 +1899,82 @@ mod tests {
             "[daemon]\nretention.events_days = -1\n",
             "[daemon]\nretention.commands_days = 0\n",
             "[daemon]\nretention.commands_days = -30\n",
+            "[daemon]\nretention.mail_days = 0\n",
+            "[daemon]\nretention.mail_days = -30\n",
             "[daemon]\nretention.events_days = \"30\"\n",
             "[daemon]\nretention.unknown = 1\n",
             "[daemon]\nunknown_table.value = 1\n",
         ] {
             fixture.write(source);
             let error = load_daemon_config(&fixture.root).unwrap_err();
+            assert_eq!(error.code, "profile_error", "source: {source}");
+        }
+    }
+
+    #[test]
+    fn mail_config_defaults_to_the_coordination_contract_bounds() {
+        let fixture = AutomationConfigFixture::new();
+        assert_eq!(
+            load_mail_config(&fixture.root).unwrap(),
+            MailConfig::default()
+        );
+        assert_eq!(
+            MailConfig::default().max_unread_bytes_per_agent,
+            core::api::DEFAULT_MAX_UNREAD_BYTES_PER_AGENT
+        );
+        assert_eq!(
+            MailConfig::default().max_unread_messages_per_agent,
+            core::api::DEFAULT_MAX_UNREAD_MESSAGES_PER_AGENT
+        );
+
+        fixture.write("[mail]\n");
+        assert_eq!(
+            load_mail_config(&fixture.root).unwrap(),
+            MailConfig::default()
+        );
+
+        fixture.write("[mail]\nmax_unread_bytes_per_agent = 1024\n");
+        assert_eq!(
+            load_mail_config(&fixture.root).unwrap(),
+            MailConfig {
+                max_unread_bytes_per_agent: 1024,
+                max_unread_messages_per_agent: core::api::DEFAULT_MAX_UNREAD_MESSAGES_PER_AGENT,
+            }
+        );
+
+        fixture.write(
+            "[mail]\nmax_unread_bytes_per_agent = 1024\nmax_unread_messages_per_agent = 8\n",
+        );
+        let loaded = load_mail_config(&fixture.root).unwrap();
+        assert_eq!(
+            loaded,
+            MailConfig {
+                max_unread_bytes_per_agent: 1024,
+                max_unread_messages_per_agent: 8,
+            }
+        );
+        assert_eq!(
+            loaded.limits(),
+            core::api::MailLimits {
+                max_unread_bytes_per_agent: 1024,
+                max_unread_messages_per_agent: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn mail_config_rejects_nonpositive_and_unknown_values() {
+        let fixture = AutomationConfigFixture::new();
+        for source in [
+            "[mail]\nmax_unread_bytes_per_agent = 0\n",
+            "[mail]\nmax_unread_bytes_per_agent = -1\n",
+            "[mail]\nmax_unread_messages_per_agent = 0\n",
+            "[mail]\nmax_unread_messages_per_agent = -10\n",
+            "[mail]\nmax_unread_bytes_per_agent = \"1024\"\n",
+            "[mail]\nunknown = 1\n",
+        ] {
+            fixture.write(source);
+            let error = load_mail_config(&fixture.root).unwrap_err();
             assert_eq!(error.code, "profile_error", "source: {source}");
         }
     }
