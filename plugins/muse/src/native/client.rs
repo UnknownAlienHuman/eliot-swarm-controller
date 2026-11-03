@@ -1,0 +1,839 @@
+use eliot_core::{Error, Result, SecretPolicy, StderrSnapshot, StderrSource};
+use eliot_plugin::{StderrCapture, StderrView, spawn_stderr, sync::LockExt};
+use futures_util::{SinkExt, StreamExt};
+use serde::Serialize;
+use serde_json::{Map, Value};
+use std::{
+    collections::HashMap,
+    ffi::OsString,
+    path::PathBuf,
+    process::{ExitStatus, Stdio},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+use tokio::{
+    process::{Child, ChildStdin, Command},
+    sync::{Semaphore, mpsc, oneshot, watch},
+    time::{Instant, timeout_at},
+};
+use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
+
+use crate::native::types::NativeJsonRpcErrorBody;
+
+const MAX_NATIVE_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_PENDING_CALLS: usize = 16;
+const NATIVE_EVENT_QUEUE: usize = 64;
+
+type PendingCalls = Arc<StdMutex<HashMap<String, oneshot::Sender<Result<Value>>>>>;
+type NativeWriter = Arc<tokio::sync::Mutex<FramedWrite<ChildStdin, LinesCodec>>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StreamState {
+    Open,
+    Overflow,
+    Closed,
+    Malformed,
+}
+
+pub(crate) enum NativeFrame {
+    Notification {
+        method: String,
+        params: Value,
+    },
+    Request {
+        id: Value,
+        method: String,
+        params: Value,
+    },
+}
+
+pub(crate) struct NativeLaunch {
+    pub program: OsString,
+    pub args: Vec<OsString>,
+    pub cwd: PathBuf,
+    pub environment: Vec<(OsString, OsString)>,
+}
+
+#[derive(Clone)]
+pub(crate) struct NativeClient {
+    writer: NativeWriter,
+    pending: PendingCalls,
+    pending_slots: Arc<Semaphore>,
+    next_id: Arc<AtomicU64>,
+    stderr: StderrView,
+    policy: SecretPolicy,
+}
+
+pub(crate) struct NativeProcess {
+    child: Child,
+    client: NativeClient,
+    frames: Option<mpsc::Receiver<NativeFrame>>,
+    stream: watch::Receiver<StreamState>,
+    output_reader: Option<tokio::task::JoinHandle<Result<()>>>,
+    output_reader_result: Option<Result<()>>,
+    stderr: Option<StderrCapture>,
+}
+
+#[derive(Serialize)]
+struct OutboundRequest<'a> {
+    jsonrpc: &'static str,
+    id: String,
+    method: &'a str,
+    params: Value,
+}
+
+#[derive(Serialize)]
+struct OutboundNotification<'a> {
+    jsonrpc: &'static str,
+    method: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    params: Option<Value>,
+}
+
+#[derive(Serialize)]
+struct OutboundResponse {
+    jsonrpc: &'static str,
+    id: Value,
+    error: NativeRpcError,
+}
+
+#[derive(Serialize)]
+struct NativeRpcError {
+    code: i64,
+    message: &'static str,
+}
+
+#[derive(serde::Deserialize)]
+struct NativeServerRequest {
+    id: Value,
+    method: String,
+    #[serde(default)]
+    params: Option<Value>,
+}
+
+#[derive(serde::Deserialize)]
+struct NativeServerResponse {
+    id: Value,
+    #[serde(default)]
+    result: Option<Value>,
+    #[serde(default)]
+    error: Option<NativeJsonRpcErrorBody>,
+}
+
+#[derive(serde::Deserialize)]
+struct NativeServerNotification {
+    method: String,
+    #[serde(default)]
+    params: Option<Value>,
+}
+
+struct PendingGuard {
+    pending: PendingCalls,
+    id: String,
+}
+
+impl NativeProcess {
+    pub async fn spawn(launch: NativeLaunch, policy: SecretPolicy) -> Result<Self> {
+        let mut command = Command::new(&launch.program);
+        command
+            .args(&launch.args)
+            .current_dir(&launch.cwd)
+            .envs(launch.environment)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let mut child = command.spawn().map_err(|error| {
+            Error::new(
+                "native_spawn",
+                policy.redact_text(&format!(
+                    "could not start the configured Muse session host: {error}"
+                )),
+            )
+        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| Error::new("native_spawn", "Muse session host stdin was not piped"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::new("native_spawn", "Muse session host stdout was not piped"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| Error::new("native_spawn", "Muse session host stderr was not piped"))?;
+        let stderr = spawn_stderr(stderr, Arc::new(policy.clone()));
+
+        let writer = Arc::new(tokio::sync::Mutex::new(FramedWrite::new(
+            stdin,
+            LinesCodec::new(),
+        )));
+        let pending = Arc::new(StdMutex::new(HashMap::new()));
+        let client = NativeClient {
+            writer,
+            pending: Arc::clone(&pending),
+            pending_slots: Arc::new(Semaphore::new(MAX_PENDING_CALLS)),
+            next_id: Arc::new(AtomicU64::new(0)),
+            stderr: stderr.view(),
+            policy,
+        };
+        let (frame_tx, frame_rx) = mpsc::channel(NATIVE_EVENT_QUEUE);
+        let (stream_tx, stream_rx) = watch::channel(StreamState::Open);
+        let reader_client = client.clone();
+        let output_reader = tokio::spawn(async move {
+            read_native_stream(stdout, frame_tx, stream_tx, reader_client).await
+        });
+
+        Ok(Self {
+            child,
+            client,
+            frames: Some(frame_rx),
+            stream: stream_rx,
+            output_reader: Some(output_reader),
+            output_reader_result: None,
+            stderr: Some(stderr),
+        })
+    }
+
+    /// The actual app-server child PID; birth and custody are verified by the host.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
+    pub fn client(&self) -> NativeClient {
+        self.client.clone()
+    }
+
+    pub fn take_frames(&mut self) -> Result<mpsc::Receiver<NativeFrame>> {
+        self.frames
+            .take()
+            .ok_or_else(|| Error::new("bad_state", "Muse native event reader already has an owner"))
+    }
+
+    pub fn stream_state(&self) -> watch::Receiver<StreamState> {
+        self.stream.clone()
+    }
+
+    /// Wait for the single stdout reader to finish; a timeout leaves that same
+    /// reader running so a later wait can observe its completion without reuse.
+    pub async fn await_output_drained(&mut self, deadline: Instant) -> Result<()> {
+        let result = self.await_stdout_drained(deadline).await;
+        if let Some(stderr) = self.stderr.take() {
+            let _ = stderr.finish(deadline).await;
+        }
+        result.map_err(|error| self.client.diagnostic_error(error))
+    }
+
+    async fn await_stdout_drained(&mut self, deadline: Instant) -> Result<()> {
+        if let Some(result) = &self.output_reader_result {
+            return result.clone();
+        }
+        let reader_result = {
+            let reader = self
+                .output_reader
+                .as_mut()
+                .ok_or_else(|| Error::new("unknown", "Muse stdout reader is unavailable"))?;
+            if reader.is_finished() {
+                (&mut *reader).await
+            } else {
+                match timeout_at(deadline, reader).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        return Err(Error::new(
+                            "unknown",
+                            "Muse stdout reader did not drain before its deadline",
+                        ));
+                    }
+                }
+            }
+        };
+        let result = match reader_result {
+            Ok(result) => result,
+            Err(error) => Err(Error::new(
+                "unknown",
+                format!("Muse stdout reader task failed: {error}"),
+            )),
+        };
+        drop(self.output_reader.take());
+        self.output_reader_result = Some(result.clone());
+        result
+    }
+
+    pub async fn terminate(&mut self, force: bool, deadline: Instant) -> Result<ExitStatus> {
+        if let Some(status) = self.child.try_wait().map_err(|error| {
+            Error::new(
+                "native_process",
+                format!("Muse process readback failed: {error}"),
+            )
+        })? {
+            self.await_output_drained(deadline).await?;
+            return Ok(status);
+        }
+
+        if !force {
+            let close_deadline = (Instant::now() + Duration::from_millis(500)).min(deadline);
+            let _ = self.client.close_input(close_deadline).await;
+            let grace_deadline = (Instant::now() + Duration::from_secs(2)).min(deadline);
+            if let Ok(Ok(status)) = timeout_at(grace_deadline, self.child.wait()).await {
+                self.await_output_drained(deadline).await?;
+                return Ok(status);
+            }
+        }
+
+        match timeout_at(deadline, self.child.kill()).await {
+            Err(_) => {
+                return Err(Error::new(
+                    "unknown",
+                    "Muse process termination outcome is unknown",
+                ));
+            }
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                if let Some(status) = self.child.try_wait().map_err(|readback| {
+                    Error::new(
+                        "unknown",
+                        format!(
+                            "Muse process exit readback failed after termination error: {readback}"
+                        ),
+                    )
+                })? {
+                    self.await_output_drained(deadline).await?;
+                    return Ok(status);
+                }
+                return Err(Error::new(
+                    "native_process",
+                    format!("Muse process termination failed: {error}"),
+                ));
+            }
+        }
+        let status = timeout_at(deadline, self.child.wait())
+            .await
+            .map_err(|_| Error::new("unknown", "Muse process exit could not be confirmed"))?
+            .map_err(|error| {
+                Error::new(
+                    "native_process",
+                    format!("Muse process wait failed: {error}"),
+                )
+            })?;
+        self.await_output_drained(deadline).await?;
+        Ok(status)
+    }
+}
+
+impl NativeClient {
+    pub async fn call(&self, method: &str, params: Value, deadline: Instant) -> Result<Value> {
+        self.call_inner(method, params, deadline)
+            .await
+            .map_err(|error| self.diagnostic_error(error))
+    }
+
+    pub(crate) fn stderr_snapshot(&self) -> StderrSnapshot {
+        self.stderr.snapshot()
+    }
+
+    pub(crate) fn diagnostic_error(&self, mut error: Error) -> Error {
+        error.message = self.policy.redact_text(&error.message);
+        error.with_stderr(StderrSource::Harness, self.stderr_snapshot())
+    }
+
+    async fn call_inner(&self, method: &str, params: Value, deadline: Instant) -> Result<Value> {
+        if method.trim().is_empty() || !params.is_object() {
+            return Err(Error::new(
+                "invalid",
+                "Muse session host call requires a method and object params",
+            ));
+        }
+
+        let sequence = self
+            .next_id
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| Error::new("internal", "Muse request id space exhausted"))?;
+        let id = format!("muse-{sequence}");
+        let encoded = encode_native_frame(&OutboundRequest {
+            jsonrpc: "2.0",
+            id: id.clone(),
+            method,
+            params,
+        })?;
+        let _permit = timeout_at(deadline, Arc::clone(&self.pending_slots).acquire_owned())
+            .await
+            .map_err(|_| {
+                Error::new(
+                    "native_not_dispatched",
+                    "Muse request capacity deadline elapsed before dispatch",
+                )
+            })?
+            .map_err(|_| {
+                Error::new(
+                    "native_not_dispatched",
+                    "Muse response router closed before dispatch",
+                )
+            })?;
+
+        let (response_tx, response_rx) = oneshot::channel();
+        {
+            self.pending.lock_recover().insert(id.clone(), response_tx);
+        }
+        let _guard = PendingGuard {
+            pending: Arc::clone(&self.pending),
+            id,
+        };
+
+        if let Err(error) = self.write_encoded(encoded, deadline).await {
+            if error.code == "native_not_dispatched" {
+                return Err(error);
+            }
+            return Err(Error::new(
+                "unknown",
+                format!("Muse {method} dispatch outcome is unknown"),
+            ));
+        }
+        timeout_at(deadline, response_rx)
+            .await
+            .map_err(|_| Error::new("unknown", format!("Muse {method} response is unknown")))?
+            .map_err(|_| Error::new("unknown", format!("Muse {method} response channel closed")))?
+    }
+
+    pub async fn notify(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        deadline: Instant,
+    ) -> Result<()> {
+        if method.trim().is_empty() || params.as_ref().is_some_and(|value| !value.is_object()) {
+            return Err(Error::new(
+                "invalid",
+                "Muse session host notification has invalid method or params",
+            ));
+        }
+        let encoded = encode_native_frame(&OutboundNotification {
+            jsonrpc: "2.0",
+            method,
+            params,
+        })?;
+        self.write_encoded(encoded, deadline).await
+    }
+
+    pub async fn close_input(&self, deadline: Instant) -> Result<()> {
+        let mut writer = match timeout_at(deadline, self.writer.lock()).await {
+            Ok(writer) => writer,
+            Err(_) => {
+                return Err(Error::new(
+                    "native_not_dispatched",
+                    "Muse input close deadline elapsed before dispatch",
+                ));
+            }
+        };
+        if Instant::now() >= deadline {
+            return Err(Error::new(
+                "native_not_dispatched",
+                "Muse input close deadline elapsed before dispatch",
+            ));
+        }
+        match timeout_at(deadline, SinkExt::<String>::close(&mut *writer)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) | Err(_) => Err(Error::new(
+                "unknown",
+                "Muse session host input close outcome is unknown",
+            )),
+        }
+    }
+
+    pub async fn reject_unsupported_request(
+        &self,
+        id: Value,
+        method: &str,
+        params: &Value,
+        deadline: Instant,
+    ) -> Result<()> {
+        let (code, message) = if method.trim().is_empty() || !params.is_object() {
+            (-32600, "unsupported native request envelope")
+        } else {
+            (-32601, "unsupported")
+        };
+        let encoded = encode_native_frame(&OutboundResponse {
+            jsonrpc: "2.0",
+            id,
+            error: NativeRpcError { code, message },
+        })?;
+        self.write_encoded(encoded, deadline).await
+    }
+
+    async fn write_encoded(&self, encoded: String, deadline: Instant) -> Result<()> {
+        self.write_encoded_inner(encoded, deadline)
+            .await
+            .map_err(|error| self.diagnostic_error(error))
+    }
+
+    async fn write_encoded_inner(&self, encoded: String, deadline: Instant) -> Result<()> {
+        let mut writer = match timeout_at(deadline, self.writer.lock()).await {
+            Ok(writer) => writer,
+            Err(_) => {
+                return Err(Error::new(
+                    "native_not_dispatched",
+                    "Muse write deadline elapsed before dispatch",
+                ));
+            }
+        };
+        if Instant::now() >= deadline {
+            return Err(Error::new(
+                "native_not_dispatched",
+                "Muse write deadline elapsed before dispatch",
+            ));
+        }
+        match timeout_at(deadline, writer.send(encoded)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) | Err(_) => Err(Error::new(
+                "unknown",
+                "Muse session host write outcome is unknown",
+            )),
+        }
+    }
+
+    fn route_response(&self, id: &Value, result: Result<Value>) {
+        let key = id
+            .as_str()
+            .map(ToOwned::to_owned)
+            .or_else(|| serde_json::to_string(id).ok());
+        let Some(key) = key else { return };
+        let sender = self.pending.lock_recover().remove(&key);
+        if let Some(sender) = sender {
+            let _ = sender.send(result);
+        }
+    }
+
+    fn fail_pending(&self, error: Error) {
+        let pending = {
+            let mut pending = self.pending.lock_recover();
+            std::mem::take(&mut *pending)
+        };
+        for (_, sender) in pending {
+            let _ = sender.send(Err(error.clone()));
+        }
+    }
+}
+
+async fn read_native_stream(
+    stdout: tokio::process::ChildStdout,
+    frames: mpsc::Sender<NativeFrame>,
+    stream: watch::Sender<StreamState>,
+    client: NativeClient,
+) -> Result<()> {
+    let mut reader = FramedRead::new(
+        stdout,
+        LinesCodec::new_with_max_length(MAX_NATIVE_FRAME_BYTES.saturating_sub(1)),
+    );
+    let mut overflowed = false;
+    while let Some(line) = reader.next().await {
+        let line = match line {
+            Ok(line) if line.len().saturating_add(1) <= MAX_NATIVE_FRAME_BYTES => line,
+            _ => {
+                return Err(mark_stream_malformed(
+                    &stream,
+                    &client,
+                    "Muse session host stream ended on an invalid or oversized frame",
+                ));
+            }
+        };
+        let value: Value = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(_) => {
+                return Err(mark_stream_malformed(
+                    &stream,
+                    &client,
+                    "Muse session host stream contained invalid JSON",
+                ));
+            }
+        };
+        if !valid_jsonrpc_version(&value) {
+            return Err(mark_stream_malformed(
+                &stream,
+                &client,
+                "Muse session host stream contained an invalid JSON-RPC version",
+            ));
+        }
+
+        if let Some(id) = value.get("id").cloned() {
+            if value.get("method").is_some() {
+                let request: NativeServerRequest = match serde_json::from_value(value) {
+                    Ok(request) => request,
+                    Err(_) => {
+                        return Err(mark_stream_malformed(
+                            &stream,
+                            &client,
+                            "Muse server request did not match its JSON-RPC envelope",
+                        ));
+                    }
+                };
+                if request.id != id {
+                    return Err(mark_stream_malformed(
+                        &stream,
+                        &client,
+                        "Muse server request id changed while decoding",
+                    ));
+                }
+                send_native_frame(
+                    &frames,
+                    NativeFrame::Request {
+                        id: request.id,
+                        method: request.method,
+                        params: request.params.unwrap_or_else(empty_object),
+                    },
+                    &stream,
+                    &mut overflowed,
+                );
+            } else if value.get("result").is_some() || value.get("error").is_some() {
+                let response: NativeServerResponse = match serde_json::from_value(value) {
+                    Ok(response) => response,
+                    Err(_) => {
+                        return Err(mark_stream_malformed(
+                            &stream,
+                            &client,
+                            "Muse server response did not match its JSON-RPC envelope",
+                        ));
+                    }
+                };
+                if response.id != id {
+                    return Err(mark_stream_malformed(
+                        &stream,
+                        &client,
+                        "Muse server response id changed while decoding",
+                    ));
+                }
+                let result = match (response.result, response.error) {
+                    (Some(result), None) => Ok(result),
+                    // Schema errors table: only pre-admission/validation
+                    // errors prove the command was not admitted. Anything
+                    // else — `interrupted`/`cancelled`, `-32603` internal,
+                    // all other MSP kinds, unknown codes — leaves an admitted
+                    // write unruled-out, so it is unknown, never rejected.
+                    (None, Some(error)) if error.is_not_admitted() => {
+                        Err(Error::new("native_rejected", error.message))
+                    }
+                    (None, Some(error)) => Err(Error::new(
+                        "unknown",
+                        format!(
+                            "Muse request error {} left its write outcome uncertain",
+                            error.code
+                        ),
+                    )),
+                    _ => Err(Error::new(
+                        "native_protocol",
+                        "Muse response must contain exactly one result or error",
+                    )),
+                };
+                client.route_response(&response.id, result);
+            } else {
+                return Err(mark_stream_malformed(
+                    &stream,
+                    &client,
+                    "Muse session host response omitted both result and error",
+                ));
+            }
+        } else {
+            if value.get("method").is_none() {
+                return Err(mark_stream_malformed(
+                    &stream,
+                    &client,
+                    "Muse session host frame was not a notification or response",
+                ));
+            }
+            let notification: NativeServerNotification = match serde_json::from_value(value) {
+                Ok(notification) => notification,
+                Err(_) => {
+                    return Err(mark_stream_malformed(
+                        &stream,
+                        &client,
+                        "Muse notification did not match its JSON-RPC envelope",
+                    ));
+                }
+            };
+            send_native_frame(
+                &frames,
+                NativeFrame::Notification {
+                    method: notification.method,
+                    params: notification.params.unwrap_or_else(empty_object),
+                },
+                &stream,
+                &mut overflowed,
+            );
+        }
+    }
+
+    if overflowed {
+        stream.send_replace(StreamState::Overflow);
+        let error = Error::new(
+            "unknown",
+            "Muse session host event queue overflowed before stdout reached EOF",
+        );
+        client.fail_pending(error.clone());
+        return Err(error);
+    }
+
+    stream.send_replace(StreamState::Closed);
+    client.fail_pending(Error::new(
+        "unknown",
+        "Muse session host stream closed while an outcome may be pending",
+    ));
+    Ok(())
+}
+
+fn mark_stream_malformed(
+    stream: &watch::Sender<StreamState>,
+    client: &NativeClient,
+    message: &str,
+) -> Error {
+    stream.send_replace(StreamState::Malformed);
+    let error = Error::new("unknown", message);
+    client.fail_pending(error.clone());
+    error
+}
+
+fn send_native_frame(
+    frames: &mpsc::Sender<NativeFrame>,
+    frame: NativeFrame,
+    stream: &watch::Sender<StreamState>,
+    overflowed: &mut bool,
+) {
+    if *overflowed {
+        return;
+    }
+    if frames.try_send(frame).is_err() {
+        *overflowed = true;
+        stream.send_replace(StreamState::Overflow);
+    }
+}
+
+fn valid_jsonrpc_version(value: &Value) -> bool {
+    value
+        .get("jsonrpc")
+        .is_none_or(|version| version.as_str() == Some("2.0"))
+}
+
+fn encode_native_frame(message: &impl Serialize) -> Result<String> {
+    let encoded = serde_json::to_string(message).map_err(|_| {
+        Error::new(
+            "native_encode",
+            "Muse session host frame could not be encoded",
+        )
+    })?;
+    if encoded.len().saturating_add(1) > MAX_NATIVE_FRAME_BYTES {
+        return Err(Error::new(
+            "frame_too_large",
+            "Muse session host frame exceeds 1 MiB",
+        ));
+    }
+    Ok(encoded)
+}
+
+fn empty_object() -> Value {
+    Value::Object(Map::new())
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        self.pending.lock_recover().remove(&self.id);
+    }
+}
+
+impl Drop for NativeProcess {
+    fn drop(&mut self) {
+        if let Some(reader) = &self.output_reader {
+            reader.abort();
+        }
+        // StderrCapture owns and cancels its reader; client views cannot keep it alive.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn stderr_fixture_child() {
+        if std::env::var_os("ELIOT_MUSE_NATIVE_STDERR_FIXTURE").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+        {
+            return;
+        }
+        let mut stderr = std::io::stderr().lock();
+        stderr
+            .write_all(&vec![b'x'; 32 * 1024])
+            .expect("fixture stderr");
+        stderr
+            .write_all(b"\nnative-child failure vendor-secret xy\n")
+            .expect("fixture marker");
+        stderr.flush().expect("flush fixture stderr");
+    }
+
+    #[tokio::test]
+    async fn native_stderr_is_owned_redacted_and_keeps_unknown() {
+        let launch = NativeLaunch {
+            program: std::env::current_exe()
+                .expect("test executable")
+                .into_os_string(),
+            args: [
+                "--exact",
+                "native::client::tests::stderr_fixture_child",
+                "--nocapture",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
+            cwd: std::env::current_dir().expect("test cwd"),
+            environment: vec![(
+                OsString::from("ELIOT_MUSE_NATIVE_STDERR_FIXTURE"),
+                OsString::from("1"),
+            )],
+        };
+        let mut native = NativeProcess::spawn(launch, SecretPolicy::new(["vendor-secret", "xy"]))
+            .await
+            .expect("start synthetic child");
+        let client = native.client();
+        // The test harness's stdout is deliberately not a native protocol frame.
+        let error = client
+            .call(
+                "initialize",
+                serde_json::json!({}),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .expect_err("malformed/closed transport has unknown outcome");
+        let _ = native
+            .terminate(false, Instant::now() + Duration::from_secs(5))
+            .await;
+        let error = client.diagnostic_error(error.with_stderr(
+            StderrSource::Plugin,
+            StderrSnapshot {
+                text: "plugin context".to_owned(),
+                truncated: false,
+                eof: true,
+                read_error: false,
+            },
+        ));
+        assert_eq!(error.code, "unknown");
+        assert!(native.stderr.is_none());
+        let snapshot = client.stderr_snapshot();
+        assert!(snapshot.eof);
+        assert!(!snapshot.read_error);
+        assert!(snapshot.truncated);
+        assert!(snapshot.text.len() <= eliot_core::MAX_STDERR_BYTES);
+        assert!(snapshot.text.contains("native-child failure"));
+        assert!(!snapshot.text.contains("vendor-secret"));
+        assert!(!snapshot.text.contains("xy"));
+        assert_eq!(error.diagnostics.len(), 2);
+        let error = crate::host::contextual_error(error, "unknown", "native cleanup readback");
+        assert_eq!(error.diagnostics.len(), 2);
+        let encoded = serde_json::to_string(&error).expect("bounded error wire");
+        assert!(!encoded.contains("vendor-secret"));
+        assert!(!encoded.contains("xy"));
+        let restored: Error = serde_json::from_str(&encoded).expect("decode error diagnostics");
+        assert_eq!(restored, error);
+    }
+}

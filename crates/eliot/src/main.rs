@@ -577,6 +577,9 @@ enum PluginCommand {
     /// Internal Codex plugin entry point (hidden until L2.2 caller).
     #[command(hide = true)]
     Codex,
+    /// Internal Muse plugin entry point (hidden).
+    #[command(hide = true)]
+    Muse,
 }
 
 struct Failure {
@@ -1607,6 +1610,12 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             }
             PluginCommand::Codex => {
                 eliot_plugin_codex::run_codex()
+                    .await
+                    .map_err(|error| Failure::new(1, error.to_string()))?;
+                Ok(0)
+            }
+            PluginCommand::Muse => {
+                eliot_plugin_muse::run_muse()
                     .await
                     .map_err(|error| Failure::new(1, error.to_string()))?;
                 Ok(0)

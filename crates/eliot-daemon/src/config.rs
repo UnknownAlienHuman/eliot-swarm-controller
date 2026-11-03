@@ -872,7 +872,7 @@ fn snapshot_from_entry(
         }
         return Ok(fake_profile_snapshot());
     }
-    if harness != "codex" {
+    if harness != "codex" && harness != "muse" {
         return Err(profile_field_error(
             source,
             table_offset,
@@ -881,6 +881,9 @@ fn snapshot_from_entry(
             "unsupported harness",
             "unsupported",
         ));
+    }
+    if harness == "muse" {
+        return muse_snapshot_from_entry(name, entry, table_offset, source);
     }
     let model = entry
         .model
@@ -1005,6 +1008,159 @@ fn snapshot_from_entry(
     snapshot.insert(
         "approval_policy".to_owned(),
         Value::String(approval_policy.to_owned()),
+    );
+    snapshot.insert(
+        "pass_env".to_owned(),
+        Value::Array(pass_env.into_iter().map(Value::String).collect()),
+    );
+    snapshot.insert("scratch".to_owned(), json!(scratch));
+    if !entry.setup.is_empty() {
+        snapshot.insert(
+            "setup".to_owned(),
+            serde_json::to_value(&entry.setup)
+                .map_err(|_| core::Error::new("profile_error", "setup could not be encoded"))?,
+        );
+    }
+    Ok(Value::Object(snapshot))
+}
+
+/// Freeze a Muse profile. The PR1 slice carries an explicit model id, a
+/// required explicit native `cmd` (no PATH default: resolving `muse` would
+/// land on the launcher wrapper and orphan the host on stop) and an optional
+/// reasoning effort; collaboration presets, adopted routes and non-default
+/// permission/approval postures stay rejected until their native mappings
+/// land.
+fn muse_snapshot_from_entry(
+    name: &str,
+    entry: &ProfileEntry,
+    table_offset: usize,
+    source: &str,
+) -> core::Result<Value> {
+    let model = entry
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .ok_or_else(|| {
+            profile_field_error(
+                source,
+                table_offset,
+                name,
+                "model",
+                "required non-empty model is missing",
+                "profile_error",
+            )
+        })?;
+    validate_model(name, model, source, table_offset)?;
+    let effort = entry.effort.as_deref().map(str::trim);
+    if effort.is_some_and(|value| {
+        value.is_empty() || value.len() > MAX_EFFORT_LEN || value.chars().any(char::is_control)
+    }) {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "effort",
+            "must be non-empty, at most 128 characters and contain no controls",
+            "profile_error",
+        ));
+    }
+    if entry.collaboration_mode.is_some() {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "collaboration_mode",
+            "the Muse slice has no collaboration preset mapping",
+            "unsupported",
+        ));
+    }
+    if entry
+        .permissions
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|permissions| permissions != PERMISSION_WORKSPACE_WRITE)
+    {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "permissions",
+            "the Muse slice runs the host-default sandbox posture",
+            "unsupported",
+        ));
+    }
+    if entry
+        .approval_policy
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|policy| policy != APPROVAL_POLICY_NEVER)
+    {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "approval_policy",
+            "the Muse slice leaves approvals unconnected",
+            "unsupported",
+        ));
+    }
+    let pass_env = match entry.pass_env.as_deref() {
+        Some(names) => validate_pass_env(name, names, source, table_offset)?,
+        None => Vec::new(),
+    };
+    let cmd = match entry.cmd.as_deref() {
+        Some(cmd) => reject_script_wrapper(
+            name,
+            validate_cmd(name, cmd, source, table_offset)?,
+            source,
+            table_offset,
+        )?,
+        None => {
+            return Err(profile_field_error(
+                source,
+                table_offset,
+                name,
+                "cmd",
+                "required explicit cmd is missing",
+                "profile_error",
+            ));
+        }
+    };
+    crate::setup::validate_entries(&entry.setup).map_err(|error| {
+        profile_field_error(
+            source,
+            table_offset,
+            name,
+            "setup",
+            &error.message,
+            "profile_error",
+        )
+    })?;
+    let scratch = normalize_scratch(&entry.scratch).map_err(|error| {
+        profile_field_error(
+            source,
+            table_offset,
+            name,
+            "scratch",
+            &error.message,
+            "profile_error",
+        )
+    })?;
+    let mut snapshot = serde_json::Map::new();
+    snapshot.insert("harness".to_owned(), Value::String("muse".to_owned()));
+    snapshot.insert("cmd".to_owned(), Value::String(cmd));
+    snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
+    if let Some(effort) = effort {
+        snapshot.insert("effort".to_owned(), Value::String(effort.to_owned()));
+    }
+    snapshot.insert(
+        "permissions".to_owned(),
+        Value::String(PERMISSION_WORKSPACE_WRITE.to_owned()),
+    );
+    snapshot.insert(
+        "approval_policy".to_owned(),
+        Value::String(APPROVAL_POLICY_NEVER.to_owned()),
     );
     snapshot.insert(
         "pass_env".to_owned(),
@@ -1292,6 +1448,28 @@ fn validate_pass_env(
     }
     Ok(out)
 }
+/// The Muse plugin stops its host by PID, so a script wrapper would leave the
+/// real `muse serve` running; Codex lives in an Agent Job that ends the tree.
+fn reject_script_wrapper(
+    profile: &str,
+    cmd: String,
+    source: &str,
+    offset: usize,
+) -> core::Result<String> {
+    let lower = cmd.to_ascii_lowercase();
+    if lower.ends_with(".cmd") || lower.ends_with(".bat") || lower.ends_with(".ps1") {
+        return Err(profile_field_error(
+            source,
+            offset,
+            profile,
+            "cmd",
+            "must name one native executable path, not a .cmd/.bat/.ps1 wrapper",
+            "profile_error",
+        ));
+    }
+    Ok(cmd)
+}
+
 fn validate_cmd(profile: &str, cmd: &str, source: &str, offset: usize) -> core::Result<String> {
     let cmd = cmd.trim();
     if cmd.is_empty() || cmd.len() > MAX_CMD_LEN {
@@ -2320,6 +2498,69 @@ harness = 'codex'
                 .contains("future_option: unknown configuration field")
         );
         assert!(!error.message.contains("private-value"));
+    }
+
+    #[test]
+    fn muse_profile_freezes_model_effort_and_cmd() {
+        let source = r#"
+[profiles.muse]
+harness = "muse"
+cmd = "C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe"
+model = "muse-spark-1.3-contributor"
+effort = "medium"
+pass_env = ["EXAMPLE_API_KEY"]
+"#;
+        let snapshot = resolve_text_profile(source, "muse").unwrap();
+        assert_eq!(snapshot["harness"], "muse");
+        assert_eq!(
+            snapshot["cmd"],
+            "C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe"
+        );
+        assert_eq!(snapshot["model"], "muse-spark-1.3-contributor");
+        assert_eq!(snapshot["effort"], "medium");
+        assert_eq!(snapshot["permissions"], "workspace-write");
+        assert_eq!(snapshot["approval_policy"], "never");
+        assert_eq!(snapshot["pass_env"], json!(["EXAMPLE_API_KEY"]));
+
+        for source in [
+            "[profiles.muse]\nharness='muse'\n",
+            "[profiles.muse]\nharness='muse'\nmodel='muse-spark-1.3-contributor'\ncollaboration_mode='plan'\n",
+            "[profiles.muse]\nharness='muse'\nmodel='muse-spark-1.3-contributor'\npermissions='read-only'\n",
+            "[profiles.muse]\nharness='muse'\nmodel='muse-spark-1.3-contributor'\napproval_policy='on-request'\n",
+        ] {
+            assert!(resolve_text_profile(source, "muse").is_err(), "{source}");
+        }
+        // No PATH default: an explicit native cmd is required, and script
+        // wrappers are rejected (their PID would orphan the host on stop).
+        for source in [
+            "[profiles.muse]\nharness='muse'\nmodel='muse-spark-1.3-contributor'\n",
+            "[profiles.muse]\nharness='muse'\nmodel='muse-spark-1.3-contributor'\ncmd='C:/Tools/MuseCode/muse.cmd'\n",
+            "[profiles.muse]\nharness='muse'\nmodel='muse-spark-1.3-contributor'\ncmd='C:/Tools/MuseCode/muse.bat'\n",
+            "[profiles.muse]\nharness='muse'\nmodel='muse-spark-1.3-contributor'\ncmd='C:/Tools/MuseCode/launch.ps1'\n",
+        ] {
+            let error = resolve_text_profile(source, "muse").expect_err("must reject");
+            assert_eq!(error.code, "profile_error", "{source}");
+        }
+    }
+
+    #[test]
+    fn codex_keeps_accepting_script_wrapper_cmds() {
+        // Codex custody is the Agent Job, which ends the whole tree on stop.
+        for cmd in [
+            "C:/Tools/Codex/codex.cmd",
+            "codex.bat",
+            "C:/Tools/launch.ps1",
+        ] {
+            let source = format!(
+                "[profiles.codex-luna]\nharness='codex'\nmodel='gpt-6-luna'\ncmd='{cmd}'\n"
+            );
+            let snapshot =
+                resolve_text_profile(&source, "codex-luna").expect("codex accepts wrappers");
+            assert_eq!(snapshot["cmd"], cmd, "{source}");
+        }
+        let source = "[profiles.codex-luna]\nharness='codex'\nmodel='gpt-6-luna'\ncmd='C:/Tools/Codex/codex.exe'\n";
+        let snapshot = resolve_text_profile(source, "codex-luna").unwrap();
+        assert_eq!(snapshot["cmd"], "C:/Tools/Codex/codex.exe");
     }
 
     #[test]

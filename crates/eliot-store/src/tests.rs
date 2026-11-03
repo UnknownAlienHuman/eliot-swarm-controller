@@ -77,6 +77,10 @@ fn initial_source_families_match_fake_and_codex_harness_boundaries() {
         &["session", "turn", "message", "tool", "request"][..]
     );
     assert_eq!(
+        super::source_families_for_harness("muse").unwrap(),
+        &["session", "turn", "message"][..]
+    );
+    assert_eq!(
         super::source_families_for_harness("other")
             .unwrap_err()
             .code,

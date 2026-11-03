@@ -4426,6 +4426,7 @@ fn source_families_for_harness(harness: &str) -> Result<&'static [&'static str]>
     match harness {
         "fake" => Ok(&["session", "turn", "message", "request"]),
         "codex" => Ok(&["session", "turn", "message", "tool", "request"]),
+        "muse" => Ok(&["session", "turn", "message"]),
         other => Err(Error::new(
             "unsupported",
             format!("unsupported launch harness {other}"),
