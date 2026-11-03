@@ -417,23 +417,15 @@ const REPLACE_CONTENTION: std::time::Duration = std::time::Duration::from_secs(2
 /// shares delete access, makes `MoveFileExW` fail with `ERROR_ACCESS_DENIED`, and
 /// CLI clients read `daemon.json` while a restarting daemon republishes it. Those
 /// reads are brief, so the local, idempotent rename is retried for a bounded time.
+/// This blocks the calling thread for at most `REPLACE_CONTENTION`: once at daemon
+/// startup, and on log rotation, whose file only the daemon itself normally opens.
 pub(crate) fn replace_file(source: &Path, target: &Path) -> Result<()> {
-    let source_wide = wide_path(source);
-    let target_wide = wide_path(target);
     let deadline = std::time::Instant::now() + REPLACE_CONTENTION;
     loop {
-        // SAFETY: both paths are NUL-terminated UTF-16 strings for this call.
-        if unsafe {
-            MoveFileExW(
-                source_wide.as_ptr(),
-                target_wide.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        } != 0
-        {
-            return Ok(());
-        }
-        let error = std::io::Error::last_os_error();
+        let error = match replace_file_once(source, target) {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
         let contended = matches!(
             error.raw_os_error().map(|code| code as u32),
             Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION)
@@ -442,6 +434,24 @@ pub(crate) fn replace_file(source: &Path, target: &Path) -> Result<()> {
             return Err(io_error("replace daemon metadata", error));
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+pub(crate) fn replace_file_once(source: &Path, target: &Path) -> std::io::Result<()> {
+    let source_wide = wide_path(source);
+    let target_wide = wide_path(target);
+    // SAFETY: both paths are NUL-terminated UTF-16 strings for this call.
+    if unsafe {
+        MoveFileExW(
+            source_wide.as_ptr(),
+            target_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 

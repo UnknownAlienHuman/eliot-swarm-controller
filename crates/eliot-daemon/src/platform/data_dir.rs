@@ -570,7 +570,16 @@ mod tests {
         data.publish_daemon(&lock, "first-endpoint", "test")
             .expect("first publish");
         // A CLI client reading daemon.json while a restarted daemon republishes it.
-        let reader = File::open(data.path().join(DAEMON_INFO_FILE)).expect("open metadata");
+        let target = data.path().join(DAEMON_INFO_FILE);
+        let reader = File::open(&target).expect("open metadata");
+        // Pin the premise: while the reader holds the file, a single replace fails
+        // with the error CI saw, so the publish below must go through the retry.
+        let probe = data.path().join(".replace-probe.tmp");
+        fs::write(&probe, b"{}").expect("write probe");
+        let single = super::super::windows::replace_file_once(&probe, &target)
+            .expect_err("a held target refuses a single replace");
+        assert_eq!(single.raw_os_error(), Some(5), "{single}");
+        fs::remove_file(&probe).expect("remove probe");
         let release = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(150));
             drop(reader);
