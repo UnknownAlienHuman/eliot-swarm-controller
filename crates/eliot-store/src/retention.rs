@@ -354,18 +354,23 @@ fn event_prune_end_tx(
     // `source.gap` events carry no native_id, so the native pin never covers
     // them — yet the Git coverage check re-reads the retained gap event by
     // `gap_seq` while its boundary is still live. Keep every event at or
-    // after the oldest live gap of an open source: the check reads the gap
-    // only while `gap_from` still equals the source cursor (a NULL cursor
-    // reads as zero), so a superseded gap pins nothing and can never stall
-    // pruning. Closed sources pin nothing either: `record_git_observation`
-    // refuses them before the coverage check, and gap re-acknowledgement
-    // returns the stored seq without reading the event row.
+    // after the oldest live gap of an open current-generation source: the
+    // check reads the gap only while `gap_from` still equals the source
+    // cursor (a NULL cursor reads as zero), so a superseded gap pins nothing
+    // and can never stall pruning. Stale generations keep their open git rows
+    // (generation transitions never close them), but like the Git cursor
+    // floor above, only the readable current generation pins. Closed sources
+    // pin nothing either: `record_git_observation` refuses them before the
+    // coverage check, and gap re-acknowledgement returns the stored seq
+    // without reading the event row.
     let first_gap: Option<i64> = tx
         .query_row(
-            "SELECT MIN(gap_seq) FROM source_state
-             WHERE state = 'open' AND gap_seq IS NOT NULL
-               AND gap_from IS NOT NULL AND gap_from = COALESCE(cursor, '0')
-               AND gap_seq > ?1 AND gap_seq <= ?2",
+            "SELECT MIN(s.gap_seq) FROM source_state s
+             JOIN agents a ON a.id = s.agent
+             WHERE s.state = 'open' AND s.gap_seq IS NOT NULL
+               AND s.gap_from IS NOT NULL AND s.gap_from = COALESCE(s.cursor, '0')
+               AND s.generation = a.generation
+               AND s.gap_seq > ?1 AND s.gap_seq <= ?2",
             params![pruned_through, ceiling],
             |row| row.get(0),
         )
@@ -1493,6 +1498,159 @@ mod tests {
                 "coverage still passes for {family}"
             );
         }
+    }
+
+    #[test]
+    fn prune_events_scopes_gap_pin_to_current_generation() {
+        let mut store = store();
+        let old = NOW - 31 * DAY_MS;
+        let (agent, launch_id) = launch_agent(&mut store, "retention-gap-gen", old);
+        let agent_num = parse_agent_id(&agent).unwrap();
+        commit_ready(&mut store, &agent, &launch_id, "ready-batch", old);
+        store
+            .settle(&launch_id, CommandState::Applied, None, old)
+            .unwrap();
+        store
+            .ensure_git_source(&agent, 1, "retention-workspace", old)
+            .unwrap();
+        // Stale gap: recorded while generation 1 is current, kept live.
+        let stale = store
+            .record_source_gap(
+                SourceGap {
+                    gap_id: "gap-stale".to_owned(),
+                    agent_id: agent.clone(),
+                    generation: 1,
+                    source: "git".to_owned(),
+                    families: vec!["file".to_owned(), "git".to_owned()],
+                    reason: "stale generation gap".to_owned(),
+                    from: Some("50".to_owned()),
+                    to: Some("60".to_owned()),
+                },
+                old + 1,
+            )
+            .unwrap();
+        let stale_seq = stale.value.seq;
+        store
+            .connection
+            .execute(
+                "UPDATE source_state SET cursor = '50'
+                 WHERE agent = ?1 AND generation = 1 AND source = 'git'",
+                [agent_num],
+            )
+            .unwrap();
+
+        // Real lifecycle transition: stop then resume. Resume closes every
+        // old-generation source except os/git/workspace_process, so the
+        // generation-1 git row stays open with its live gap.
+        store
+            .connection
+            .execute(
+                "UPDATE agents SET native_scope = 'retention-gap-gen:scope',
+                 native_ref = 'retention-gap-gen:thread' WHERE id = ?1",
+                [agent_num],
+            )
+            .unwrap();
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: "ended-batch".to_owned(),
+                    agent_id: agent.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "session.ended".to_owned(),
+                        native_id: "ended-batch:ended".to_owned(),
+                        data: json!({}),
+                    }],
+                    cursor: None,
+                },
+                old + 2,
+            )
+            .unwrap();
+        let stop_id = ulid_at(old + 3, 8);
+        let mut stop = SubmitCommand::new(stop_id.clone(), "stop");
+        stop.target = Some(agent.clone());
+        stop.expected_generation = Some(1);
+        store.submit("owner", stop, old + 3).unwrap();
+        store.dispatch(&stop_id, old + 4).unwrap();
+        store
+            .settle(
+                &stop_id,
+                CommandState::Applied,
+                Some(json!({"state": "applied"})),
+                old + 5,
+            )
+            .unwrap();
+        let resume_id = ulid_at(old + 6, 9);
+        let mut resume = SubmitCommand::new(resume_id.clone(), "resume");
+        resume.target = Some(agent.clone());
+        resume.expected_generation = Some(1);
+        store.submit("owner", resume, old + 6).unwrap();
+        store.dispatch(&resume_id, old + 7).unwrap();
+        assert_eq!(store.get_agent(&agent).unwrap().unwrap().generation, 2);
+
+        // The stale row survives the transition open with its live gap.
+        let stale_row: (String, Option<i64>, Option<String>, Option<String>) = store
+            .connection
+            .query_row(
+                "SELECT state, gap_seq, gap_from, cursor FROM source_state
+                 WHERE agent = ?1 AND generation = 1 AND source = 'git'",
+                [agent_num],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            stale_row,
+            (
+                "open".to_owned(),
+                Some(stale_seq),
+                Some("50".to_owned()),
+                Some("50".to_owned())
+            )
+        );
+
+        // Current-generation gap with its own live boundary.
+        store
+            .ensure_git_source(&agent, 2, "retention-workspace", old + 8)
+            .unwrap();
+        let live = store
+            .record_source_gap(
+                SourceGap {
+                    gap_id: "gap-live".to_owned(),
+                    agent_id: agent.clone(),
+                    generation: 2,
+                    source: "git".to_owned(),
+                    families: vec!["file".to_owned(), "git".to_owned()],
+                    reason: "current generation gap".to_owned(),
+                    from: Some("4000".to_owned()),
+                    to: Some("4060".to_owned()),
+                },
+                old + 9,
+            )
+            .unwrap();
+        let live_seq = live.value.seq;
+        assert!(stale_seq < live_seq);
+        store
+            .connection
+            .execute(
+                "UPDATE source_state SET cursor = '4000'
+                 WHERE agent = ?1 AND generation = 2 AND source = 'git'",
+                [agent_num],
+            )
+            .unwrap();
+        assert!(live_seq < 4000);
+
+        let report = store.prune_retention(Some(30), None, NOW).unwrap();
+        assert_eq!(report.pruned_through, live_seq - 1);
+        assert!(
+            !event_exists(&store, stale_seq),
+            "stale generation gap no longer pins"
+        );
+        assert!(
+            event_exists(&store, live_seq),
+            "current generation gap still pins"
+        );
     }
 
     #[test]
