@@ -125,7 +125,7 @@ pub(super) fn submit_tx(
                 "workspace preparation requires launch or resume",
             ));
         }
-        validate_workspace_input(input)?;
+        workspace::validate_workspace_input(input)?;
     } else if request.verb == "launch"
         && request
             .args
@@ -253,13 +253,14 @@ pub(super) fn submit_tx(
                 }
                 None => required_string(&request.args, "workspace")?,
             };
-            if preparation.is_some() && load_workspace_by_path(tx, &workspace)?.is_some() {
+            if preparation.is_some() && workspace::load_workspace_by_path(tx, &workspace)?.is_some()
+            {
                 return Err(Error::new(
                     "id_conflict",
                     "worktree path is already managed",
                 ));
             }
-            require_managed_path_ready(tx, &workspace)?;
+            workspace::require_managed_path_ready(tx, &workspace)?;
             if request.args.get("prompt").is_some() {
                 return Err(Error::new(
                     "invalid",
@@ -464,9 +465,9 @@ pub(super) fn submit_tx(
                     "invalid worktree.remove binding or arguments",
                 ));
             }
-            let workspace = load_workspace(tx, agent_num)?
+            let workspace = workspace::load_workspace(tx, agent_num)?
                 .ok_or_else(|| Error::new("not_found", "Agent has no managed worktree"))?;
-            require_workspace_removable(tx, &agent, &workspace)?;
+            workspace::require_workspace_removable(tx, &agent, &workspace)?;
             let args = json!({"target_generation": workspace.target_generation});
             events.push(admit_command(
                 tx,
@@ -493,7 +494,7 @@ pub(super) fn submit_tx(
             let agent = load_agent_by_num(tx, agent_num)?
                 .ok_or_else(|| Error::new("not_found", format!("Agent {target} was not found")))?;
             if let Some(path) = &agent.workspace {
-                require_managed_path_ready(tx, path)?;
+                workspace::require_managed_path_ready(tx, path)?;
             }
             if !matches!(agent.harness.as_str(), "codex" | "fake") {
                 return Err(Error::new(
@@ -774,7 +775,13 @@ pub(super) fn submit_tx(
     };
 
     if matches!(request.verb.as_str(), "launch" | "resume") {
-        admit_workspace_preparation(tx, &request, preparation.as_ref(), now, &mut events)?;
+        workspace::admit_workspace_preparation(
+            tx,
+            &request,
+            preparation.as_ref(),
+            now,
+            &mut events,
+        )?;
     }
     let command = load_command(tx, &request.id)?
         .ok_or_else(|| Error::new("internal", "new command was not visible in its transaction"))?;

@@ -66,7 +66,7 @@ Use the existing Store/router and small internal modules. Keep evidence in the P
       a send with a lost native turn association. Release only the resolved command/turn
       gate; never invent native completion or override capacity. Advertise the RPC/CLI
       methods only when their handlers exist.
-- [ ] **Separate existing responsibilities.** Extract Store admission/dispatch and Router
+- [x] **Separate existing responsibilities.** Extract Store admission/dispatch and Router
       command execution before adding more branches to those owners. Separate timer
       scheduling and event-rule traversal where they share only storage plumbing.
       [Architecture](architecture.md#internal-module-boundaries) names the boundaries;
