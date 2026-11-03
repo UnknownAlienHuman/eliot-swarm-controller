@@ -16,8 +16,9 @@
 #   eliot timer show refresh-origin-main
 #   eliot timer run refresh-origin-main   # immediate manual firing, same action
 #
-# CI runs this exact file against the Fake profile (profile swapped, nothing
-# else changed); the live Codex demonstration is pending the owner's go-ahead.
+# CI runs this exact rule file against the Fake profile; its registration swaps
+# the profile, the checkout path and the fetch endpoint for a local test remote.
+# The live Codex demonstration is pending the owner's go-ahead.
 
 [[rule]]
 id = "refresh-origin-main"

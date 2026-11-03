@@ -140,14 +140,15 @@ required. Keep the model choice in the profile, outside core types and tests.
 ## Recipes
 
 Three copy-pasteable Codex-profile recipes live in
-[`config/recipes/`](../../config/recipes/). Each is Fake-tested in CI (profile
-swapped, nothing else changed); the live Codex demonstration is pending the
-owner's go-ahead.
+[`config/recipes/`](../../config/recipes/). Each rule file or goal command is Fake-tested in CI
+verbatim with the Fake profile; the timer test also substitutes a local checkout
+and fetch endpoint for the example registration. The live Codex demonstration is
+pending the owner's go-ahead.
 
 ### 1. Hourly `git.fetch` of a registered project
 
 Copy `config/recipes/timer-git-fetch.toml` to `<data_dir>/rules/`, and register
-the project in `<data_dir>/config.toml` (the file header shows the exact
+the project in `<data_dir>/config.toml` (the file header shows an example
 `[projects.app]` snippet). Verify, then fire immediately with the same action:
 
 ```powershell
