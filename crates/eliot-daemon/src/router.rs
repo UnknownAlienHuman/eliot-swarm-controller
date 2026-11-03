@@ -1,4 +1,5 @@
 mod command;
+mod resolution;
 
 use crate::{
     automation::RuleDefinition,
@@ -18,15 +19,15 @@ use eliot_core::{
         AgentGetResponse, AgentGitRequest, AgentGitResponse, AgentHistoryRequest, AgentListRequest,
         AgentListResponse, AgentListRow, AgentProcessesRequest, AgentProcessesResponse,
         AgentResultRequest, AgentResultResponse, AgentStatsRequest, AgentStatsResponse,
-        CommandGetRequest, CommandResolveRequest, CommandSubmitRequest, CommandSubmitResponse,
-        DaemonShutdownRequest, DaemonShutdownResponse, DaemonStatusRequest, DaemonStatusResponse,
-        DiscoverPage, EventsFilter, EventsReadRequest, EventsReadResponse, EventsSubscribeRequest,
+        CommandGetRequest, CommandSubmitRequest, CommandSubmitResponse, DaemonShutdownRequest,
+        DaemonShutdownResponse, DaemonStatusRequest, DaemonStatusResponse, DiscoverPage,
+        EventsFilter, EventsReadRequest, EventsReadResponse, EventsSubscribeRequest,
         EventsSubscribeResponse, FrozenGitFetch, GitFetchDefinitionArgs, GitView,
         MAX_OBSERVATION_PAGE_BYTES, ObservationPage, ObservationQuery, ObservationView,
         ProcessPageCursor, ProjectRegistrationView, ProviderClearHoldRequest, ProviderHoldsRequest,
         RuleCatchUpRequest, RuleGetRequest, RuleStateView, ShutdownMode, SourceState,
         StatusBlocker, TimerGetRequest, TimerRunRequest, TimerStateView, TurnGetRequest,
-        TurnResolveRequest, UnsettledCommandSummary, WorkspaceCustodyView,
+        UnsettledCommandSummary, WorkspaceCustodyView,
     },
     is_deterministic_pre_admission_rejection,
 };
@@ -3165,50 +3166,6 @@ impl Router {
             .await?;
         serde_json::to_value(turn)
             .map_err(|error| Error::new("internal", format!("encode turn: {error}")))
-    }
-
-    async fn command_resolve(&self, params: &Value, principal: &Principal) -> Result<Value> {
-        require_owner(principal)?;
-        if contains_known_secret_including_keys(params, &self.inner.secrets) {
-            return Err(Error::new(
-                "secret_in_payload",
-                "command resolution contains a known credential",
-            ));
-        }
-        let request: CommandResolveRequest = serde_json::from_value(params.clone())
-            .map_err(|_| Error::new("invalid", "command.resolve params are invalid"))?;
-        request.validate()?;
-        let change = {
-            let mut store = self.inner.store.lock().await;
-            let change = store.resolve_command("owner", &request, now_ms())?;
-            self.publish_locked(&change.events);
-            change
-        };
-        self.signal_progress();
-        serde_json::to_value(change.value)
-            .map_err(|_| Error::new("internal", "command resolution could not be encoded"))
-    }
-
-    async fn turn_resolve(&self, params: &Value, principal: &Principal) -> Result<Value> {
-        require_owner(principal)?;
-        if contains_known_secret_including_keys(params, &self.inner.secrets) {
-            return Err(Error::new(
-                "secret_in_payload",
-                "turn resolution contains a known credential",
-            ));
-        }
-        let request: TurnResolveRequest = serde_json::from_value(params.clone())
-            .map_err(|_| Error::new("invalid", "turn.resolve params are invalid"))?;
-        request.validate()?;
-        let change = {
-            let mut store = self.inner.store.lock().await;
-            let change = store.resolve_turn("owner", &request, now_ms())?;
-            self.publish_locked(&change.events);
-            change
-        };
-        self.signal_progress();
-        serde_json::to_value(change.value)
-            .map_err(|_| Error::new("internal", "turn resolution could not be encoded"))
     }
 
     async fn events_read(&self, params: &Value, principal: &Principal) -> Result<Value> {
@@ -7997,230 +7954,6 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 .code,
             "unsupported"
         );
-    }
-
-    #[tokio::test]
-    async fn resolution_rpcs_are_owner_only_registered_and_secret_scanned() {
-        let router = router();
-        let agent = Principal::Agent {
-            id: "a1".to_owned(),
-            generation: 1,
-        };
-        assert_eq!(
-            router
-                .command_resolve(&Value::Null, &agent)
-                .await
-                .unwrap_err()
-                .code,
-            "not_allowed"
-        );
-        assert_eq!(
-            router
-                .turn_resolve(&Value::Null, &agent)
-                .await
-                .unwrap_err()
-                .code,
-            "not_allowed"
-        );
-        router
-            .inner
-            .secrets
-            .lock_recover()
-            .insert("router-test-known-secret".to_owned());
-        assert_eq!(
-            router
-                .command_resolve(
-                    &json!({"id":"resolve-id", "command_id":"command-id", "as":"failed",
-                        "reason":"leaks router-test-known-secret"}),
-                    &Principal::Owner,
-                )
-                .await
-                .unwrap_err()
-                .code,
-            "secret_in_payload"
-        );
-        assert_eq!(
-            router
-                .turn_resolve(
-                    &json!({"id":"resolve-id", "agent":"a1", "generation":1,
-                        "turn_id":"turn-1", "status":"failed",
-                        "reason":"leaks router-test-known-secret"}),
-                    &Principal::Owner,
-                )
-                .await
-                .unwrap_err()
-                .code,
-            "secret_in_payload"
-        );
-        // Registered methods reject malformed params as invalid, not as
-        // unimplemented. command.children stays unsupported.
-        for (method, payload) in [("command.resolve", json!({})), ("turn.resolve", json!({}))] {
-            assert_eq!(
-                router
-                    .handle(
-                        method,
-                        json!({
-                            "_auth":{"kind":"owner", "credential":"owner-credential"},
-                            "_payload":payload
-                        })
-                    )
-                    .await
-                    .unwrap_err()
-                    .code,
-                "invalid"
-            );
-        }
-        assert_eq!(
-            router
-                .handle(
-                    "command.children",
-                    json!({
-                        "_auth":{"kind":"owner", "credential":"owner-credential"},
-                        "_payload":{}
-                    })
-                )
-                .await
-                .unwrap_err()
-                .code,
-            "unsupported"
-        );
-    }
-
-    #[tokio::test]
-    async fn command_resolve_handler_records_the_owner_assertion() {
-        let router = router();
-        let now = now_ms();
-        let launch_id = ulid::Ulid::new().to_string();
-        let mut launch = SubmitCommand::new(launch_id.clone(), "launch");
-        launch.args = json!({"project":"resolve-rpc", "workspace":"synthetic-workspace"});
-        launch.expected_generation = Some(0);
-        let agent = {
-            let mut store = router.inner.store.lock().await;
-            let agent = store
-                .submit("owner", launch, now)
-                .unwrap()
-                .command
-                .target
-                .unwrap();
-            store.dispatch(&launch_id, now).unwrap();
-            store
-                .settle(&launch_id, CommandState::Unknown, None, now)
-                .unwrap();
-            agent
-        };
-        let resolve_id = ulid::Ulid::new().to_string();
-        let response = router
-            .command_resolve(
-                &json!({"id":resolve_id, "command_id":launch_id, "as":"failed",
-                    "reason":"owner verified the uncertain launch"}),
-                &Principal::Owner,
-            )
-            .await
-            .unwrap();
-        assert_eq!(response["id"], resolve_id);
-        assert_eq!(response["command_id"], launch_id);
-        assert_eq!(response["state"], "failed");
-        let read = router
-            .command_get(&json!({"id":launch_id}), &Principal::Owner)
-            .await
-            .unwrap();
-        assert_eq!(read["state"], "failed");
-        assert_eq!(read["target"], agent);
-        assert_eq!(read["outcome"]["resolution_source"], "owner");
-    }
-
-    #[tokio::test]
-    async fn queued_send_wakes_on_command_resolved_and_dispatches() {
-        let router = router();
-        let now = now_ms();
-        let launch_id = ulid::Ulid::new().to_string();
-        let mut launch = SubmitCommand::new(launch_id.clone(), "launch");
-        launch.args = json!({"project":"resolve-wake", "workspace":"synthetic-workspace"});
-        launch.expected_generation = Some(0);
-        let (first_id, second_id) = {
-            let mut store = router.inner.store.lock().await;
-            let agent = store
-                .submit("owner", launch, now)
-                .unwrap()
-                .command
-                .target
-                .unwrap();
-            store.dispatch(&launch_id, now).unwrap();
-            store
-                .put_batch(
-                    eliot_core::SourceBatch {
-                        batch_id: ulid::Ulid::new().to_string(),
-                        agent_id: agent.clone(),
-                        generation: 1,
-                        source: "stream".to_owned(),
-                        events: vec![eliot_core::NativeEvent {
-                            ts: None,
-                            kind: "session.ready".to_owned(),
-                            native_id: ulid::Ulid::new().to_string(),
-                            data: json!({"command_id":launch_id}),
-                        }],
-                        cursor: None,
-                    },
-                    now,
-                )
-                .unwrap();
-            store
-                .settle(&launch_id, CommandState::Applied, None, now)
-                .unwrap();
-            let mut first = SubmitCommand::new(ulid::Ulid::new().to_string(), "send");
-            first.target = Some(agent.clone());
-            first.expected_generation = Some(1);
-            first.args = json!({"text":"uncertain input"});
-            let first_id = first.id.clone();
-            store.submit("owner", first, now).unwrap();
-            store.dispatch(&first_id, now).unwrap();
-            store
-                .settle(&first_id, CommandState::Unknown, None, now)
-                .unwrap();
-            let mut second = SubmitCommand::new(ulid::Ulid::new().to_string(), "send");
-            second.target = Some(agent.clone());
-            second.expected_generation = Some(1);
-            second.args = json!({"text":"gated input"});
-            let second_id = second.id.clone();
-            let admitted = store.submit("owner", second, now).unwrap();
-            assert_eq!(admitted.command.state, CommandState::Queued);
-            (first_id, second_id)
-        };
-
-        let mut events = router.inner.bus.subscribe();
-        router.schedule_command(second_id.clone(), None);
-        // Grace for the spawned dispatch task to reach its event waiter. No
-        // bus traffic exists yet, so the later wake can only come from the
-        // owner resolution published below.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        {
-            let mut store = router.inner.store.lock().await;
-            let request = CommandResolveRequest {
-                id: ulid::Ulid::new().to_string(),
-                command_id: first_id.clone(),
-                resolution: eliot_core::api::CommandResolution::Failed,
-                reason: "owner verified the uncertain effect".to_owned(),
-            };
-            let change = store.resolve_command("owner", &request, now_ms()).unwrap();
-            assert_eq!(change.events.len(), 1);
-            assert_eq!(change.events[0].kind, "command.resolved");
-            router.publish_locked(&change.events);
-        }
-
-        let dispatched = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            loop {
-                let event = events.recv().await.expect("Router event bus remains open");
-                if event.kind == "command.dispatched"
-                    && event.data.get("command_id").and_then(Value::as_str)
-                        == Some(second_id.as_str())
-                {
-                    break event;
-                }
-            }
-        })
-        .await
-        .expect("command.resolved wakes the queued send to dispatch");
-        assert_eq!(dispatched.data["command_id"], second_id);
     }
 
     #[tokio::test]

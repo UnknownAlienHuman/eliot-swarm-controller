@@ -387,28 +387,36 @@ Owner resolution of unknown outcomes is implemented and owner-only. Both calls t
 a mutation id, bind it idempotently to the exact assertion payload, and record an
 owner assertion, never a native receipt. Each releases only the resolved
 command/turn gate: sibling unknown commands and turns stay fenced, and neither
-assertion establishes process closure or overrides a
-[capacity reservation](configuration.md#accounts-and-configured-capacity).
+assertion establishes process closure. A resolution never releases a
+[capacity reservation](configuration.md#accounts-and-configured-capacity): a
+retained reservation is released only by custody closure (restart recovery).
 Known failure can include partial effects; it never implies rollback or automatic retry.
+Observe-only Agents have no resolvable commands or turns; resolving any of
+theirs is refused with `not_allowed`.
 
 `command.resolve {id, command_id, as: applied|failed, reason}` requires the target
 command to be stored `unknown`; dispatched, queued, accepted, and terminal
-commands are refused with `bad_state`. The command keeps any committed turn
+commands are refused with `bad_state`. `launch` and `resume` resolve as `failed`
+only: `applied` is refused with `bad_state`, since an applied start without its
+Agent transition is inconsistent. The command keeps any committed turn
 association and gains no invented one — including a send whose native turn
-association was lost, which resolves without creating a turn. The terminal state
-carries `resolution_source=owner` on the row, in the outcome, and in the emitted
-`command.resolved` event; no `command.applied`/`command.failed` receipt is emitted.
+association was lost, which resolves without creating a turn. The outcome
+carries `resolution_source=owner`, as does the emitted `command.resolved`
+event; no `command.applied`/`command.failed` receipt is emitted.
 Future turn-result metadata retains the planned `command_ids` and `usage` fields.
 
 `turn.resolve {id, agent, generation, turn, status: completed|failed|interrupted,
-reason}` requires the turn to be stored `unknown` and exact readback proving it
-inactive (no longer the Agent's active turn) or the generation terminal; a
-still-active turn is refused with `bad_state`, as is an already terminal one. A
-generation that does not match the Agent's current generation is
-`stale_generation`. The turn completes with the asserted status and
-`resolution_source=owner`, and a `turn.resolved` event is emitted; no native
-`turn.completed` receipt is invented. No command row is touched. The current
-`Turn` read object does not expose the resolution source.
+reason}` requires the turn to be stored `unknown`; running and terminal turns
+are refused with `bad_state`. It further requires either a stored terminal
+generation (`Lost`, `Stopped`, or `Failed` — Eliot no longer controls it) or a
+native readback through the plugin (`agent.snapshot` for the exact turn)
+proving the turn inactive. The stored active turn alone is never proof: a live
+generation without such a readback is refused with `bad_state`. A generation
+that does not match the Agent's current generation is `stale_generation`. The
+turn completes with the asserted status, and a `turn.resolved` event carrying
+`resolution_source=owner` is emitted; no native `turn.completed` receipt is
+invented and no command row is touched. The current `Turn` read object does not
+expose the resolution source.
 
 ## Provider holds
 

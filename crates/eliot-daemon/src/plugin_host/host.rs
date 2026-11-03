@@ -107,6 +107,13 @@ enum RuntimeMessage {
         command: Command,
         reply: oneshot::Sender<Result<Value>>,
     },
+    Snapshot {
+        agent_id: String,
+        generation: i64,
+        command_id: String,
+        turn_id: String,
+        reply: oneshot::Sender<Result<Value>>,
+    },
     Stop {
         command: Command,
         force: bool,
@@ -590,6 +597,48 @@ impl PluginHost {
         result.map_err(|error| diagnose_error(error, &stderr, &credentials))
     }
 
+    /// Read one exact native turn through the owned plugin (`agent.snapshot`
+    /// with a turn id). A readback, not a dispatched verb: it never mutates
+    /// native state and carries no outcome semantics of its own.
+    pub(crate) async fn snapshot_turn(
+        &self,
+        agent: &Agent,
+        command_id: &str,
+        turn_id: &str,
+    ) -> Result<Value> {
+        let key = AgentKey {
+            id: agent.id.clone(),
+            generation: agent.generation,
+        };
+        let (sender, stderr, credentials) = self.runtime_sender(&key)?;
+        let (reply, response) = oneshot::channel();
+        timeout_at(
+            Instant::now() + RPC_DEADLINE,
+            sender.send(RuntimeMessage::Snapshot {
+                agent_id: agent.id.clone(),
+                generation: agent.generation,
+                command_id: command_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                reply,
+            }),
+        )
+        .await
+        .map_err(|_| Error::new("busy", "Agent plugin command queue is full"))?
+        .map_err(|_| Error::new("unknown", "owned Agent plugin is no longer available"))?;
+        let result = match timeout_at(Instant::now() + RPC_DEADLINE + RPC_GRACE, response).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(Error::new(
+                "unknown",
+                "Agent plugin ended before the turn snapshot was returned",
+            )),
+            Err(_) => Err(Error::new(
+                "unknown",
+                "Agent plugin snapshot exceeded its absolute deadline",
+            )),
+        };
+        result.map_err(|error| diagnose_error(error, &stderr, &credentials))
+    }
+
     pub(crate) async fn force_all(&self) {
         if !self.cancel_discoveries().await {
             crate::logging::record(
@@ -677,6 +726,34 @@ impl PluginHost {
                         format!("Agent plugin does not advertise {verb}"),
                     ))
                 }
+            })
+    }
+
+    /// Channel to an owned plugin runtime without a harness-verb gate, for
+    /// host-level readback (`agent.snapshot`) rather than dispatched verbs.
+    fn runtime_sender(
+        &self,
+        key: &AgentKey,
+    ) -> Result<(mpsc::Sender<RuntimeMessage>, StderrView, Arc<[String]>)> {
+        self.state
+            .running
+            .lock_recover()
+            .get(key)
+            .map(|entry| {
+                (
+                    entry.sender.clone(),
+                    entry.stderr.clone(),
+                    Arc::clone(&entry.source_credentials),
+                )
+            })
+            .ok_or_else(|| {
+                Error::new(
+                    "not_found",
+                    format!(
+                        "no owned plugin exists for {} generation {}",
+                        key.id, key.generation
+                    ),
+                )
             })
     }
 
@@ -1114,6 +1191,28 @@ async fn run_agent_inner(
                                 let _ = reply.send(result);
                             }
                         }
+                    }
+                    RuntimeMessage::Snapshot { agent_id, generation, command_id, turn_id, reply } => {
+                        let params = json!({
+                            "agent_id": agent_id,
+                            "generation": generation,
+                            "command_id": command_id,
+                            "turn_id": turn_id,
+                        });
+                        let result = client.call("agent.snapshot", params, deadline()).await
+                            .map_err(|error| redact_native_error(error, &source_credentials))
+                            .map(|mut value| {
+                                crate::redaction::redact_outcome(
+                                    &mut value,
+                                    &source_credentials,
+                                );
+                                value
+                            });
+                        let result = diagnose_result(result, &stderr, &source_credentials);
+                        if let Err(error) = &result {
+                            record_plugin_error(error, &agent.id, agent.generation, &command_id, &source_credentials);
+                        }
+                        let _ = reply.send(result);
                     }
                     RuntimeMessage::Stop { command, force, deadlines, reply } => {
                         let params = json!({
@@ -4250,6 +4349,27 @@ mod tests {
             .unwrap()
             .command
             .clone()
+    }
+
+    #[tokio::test]
+    async fn snapshot_turn_without_an_owned_plugin_fails_fast() {
+        let data_root =
+            std::env::temp_dir().join(format!("eliot-snapshot-no-runtime-{}", Ulid::new()));
+        let mut store = eliot_store::Store::open(Path::new(":memory:")).unwrap();
+        let submitted = submit_launch(&mut store, "snapshot-absent", "synthetic-workspace");
+        let agent_id = submitted.target.clone().unwrap();
+        let store = Arc::new(AsyncMutex::new(store));
+        let host = instance_test_host(data_root.clone(), store);
+        let mut agent = Agent::new(&agent_id, "snapshot-absent", "fake", "fake", 0);
+        agent.generation = 1;
+
+        let error = host
+            .snapshot_turn(&agent, "send-1", "turn-1")
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "not_found");
+
+        let _ = std::fs::remove_dir_all(&data_root);
     }
 
     #[tokio::test]

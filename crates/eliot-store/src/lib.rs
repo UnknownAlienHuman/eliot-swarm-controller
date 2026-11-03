@@ -11,6 +11,7 @@ mod scripts;
 
 pub use capacity::{RecordedProcess, RetainedGeneration};
 pub use projects::ProjectRegistrationInput;
+pub use resolution::TurnInactiveProof;
 pub use rules::{
     RuleCatchUpAction, RuleCatchUpActionOutcome, RuleCatchUpAdmission, RuleCursorOutcome,
     RuleDefinitionInput, RuleEventAdmission, RuleProcessingState, TimerDefinitionInput,

@@ -1,9 +1,11 @@
-use super::Store;
+use super::{Store, TurnInactiveProof};
 use eliot_core::{
-    AgentState, CommandState, NativeEvent, SourceBatch, SubmitCommand, TurnState,
+    AgentState, CommandState, NativeEvent, SourceBatch, SourceHandoff, SourceHandoffGap,
+    SubmitCommand, TurnState,
     api::{CommandResolution, CommandResolveRequest, TurnResolveRequest, TurnResolveStatus},
     parse_agent_id,
 };
+use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 use std::{
     path::Path,
@@ -118,17 +120,24 @@ fn resolve_turn_request(
     }
 }
 
+/// Resolution source recorded for a command: the outcome of a resolved
+/// command carries `resolution_source=owner`; anything else has none.
 fn command_resolution_source(store: &Store, id: &str) -> Option<String> {
     store
-        .connection
-        .query_row(
-            "SELECT resolution_source FROM commands WHERE id = ?1",
-            [id],
-            |row| row.get(0),
-        )
+        .get_command(id)
         .unwrap()
+        .and_then(|command| command.outcome)
+        .and_then(|outcome| {
+            outcome
+                .get("resolution_source")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
 }
 
+/// Resolution source recorded for a turn: the latest `turn.resolved` event
+/// for the exact turn carries `resolution_source=owner` in its data; a turn
+/// with no such event was never owner-resolved.
 fn turn_resolution_source(
     store: &Store,
     agent: &str,
@@ -136,14 +145,26 @@ fn turn_resolution_source(
     turn_id: &str,
 ) -> Option<String> {
     let agent_num = parse_agent_id(agent).unwrap();
-    store
+    let data: Option<String> = store
         .connection
         .query_row(
-            "SELECT resolution_source FROM turns WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3",
+            "SELECT data FROM events
+             WHERE kind = 'turn.resolved' AND agent = ?1 AND generation = ?2
+               AND json_extract(data, '$.turn_id') = ?3
+             ORDER BY seq DESC LIMIT 1",
             rusqlite::params![agent_num, generation, turn_id],
             |row| row.get(0),
         )
-        .unwrap()
+        .optional()
+        .unwrap();
+    data.and_then(|json| {
+        serde_json::from_str::<Value>(&json).ok().and_then(|value| {
+            value
+                .get("resolution_source")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+    })
 }
 
 fn write_row(store: &Store, id: &str) -> (String, String, Value) {
@@ -630,7 +651,7 @@ fn resolve_command_write_ids_replay_or_conflict() {
     };
     assert_eq!(
         store
-            .resolve_turn("owner", &turn_collision, now)
+            .resolve_turn("owner", &turn_collision, None, now)
             .unwrap_err()
             .code,
         "id_conflict"
@@ -784,7 +805,7 @@ fn resolve_unknown_turn_after_stop_completes_with_asserted_status() {
     let request = resolve_turn_request(&agent, 1, "turn-1", TurnResolveStatus::Failed);
     let resolve_id = request.id.clone();
     let change = store
-        .resolve_turn("owner", &request, now)
+        .resolve_turn("owner", &request, None, now)
         .expect("resolve unknown turn");
     assert_eq!(change.value.id, resolve_id);
     assert_eq!(change.value.agent, agent);
@@ -857,6 +878,7 @@ fn resolve_turn_refusals_keep_active_and_terminal_turns_fenced() {
         .resolve_turn(
             "owner",
             &resolve_turn_request(&agent, 1, "turn-active", TurnResolveStatus::Failed),
+            None,
             now,
         )
         .unwrap_err();
@@ -889,6 +911,7 @@ fn resolve_turn_refusals_keep_active_and_terminal_turns_fenced() {
         .resolve_turn(
             "owner",
             &resolve_turn_request(&agent, 1, "turn-active", TurnResolveStatus::Failed),
+            None,
             now,
         )
         .unwrap_err();
@@ -903,6 +926,7 @@ fn resolve_turn_refusals_keep_active_and_terminal_turns_fenced() {
             .resolve_turn(
                 "owner",
                 &resolve_turn_request(agent_id, generation, turn_id, TurnResolveStatus::Failed),
+                None,
                 now,
             )
             .unwrap_err();
@@ -913,6 +937,7 @@ fn resolve_turn_refusals_keep_active_and_terminal_turns_fenced() {
         .resolve_turn(
             "agent:a1:1",
             &resolve_turn_request(&agent, 1, "turn-active", TurnResolveStatus::Failed),
+            None,
             now,
         )
         .unwrap_err();
@@ -922,7 +947,7 @@ fn resolve_turn_refusals_keep_active_and_terminal_turns_fenced() {
     empty_agent.agent = " ".to_owned();
     assert_eq!(
         store
-            .resolve_turn("owner", &empty_agent, now)
+            .resolve_turn("owner", &empty_agent, None, now)
             .unwrap_err()
             .code,
         "invalid"
@@ -931,7 +956,7 @@ fn resolve_turn_refusals_keep_active_and_terminal_turns_fenced() {
     negative.generation = -1;
     assert_eq!(
         store
-            .resolve_turn("owner", &negative, now)
+            .resolve_turn("owner", &negative, None, now)
             .unwrap_err()
             .code,
         "invalid"
@@ -940,7 +965,7 @@ fn resolve_turn_refusals_keep_active_and_terminal_turns_fenced() {
     empty_turn.turn_id = String::new();
     assert_eq!(
         store
-            .resolve_turn("owner", &empty_turn, now)
+            .resolve_turn("owner", &empty_turn, None, now)
             .unwrap_err()
             .code,
         "invalid"
@@ -950,7 +975,7 @@ fn resolve_turn_refusals_keep_active_and_terminal_turns_fenced() {
     empty_reason.reason = "  ".to_owned();
     assert_eq!(
         store
-            .resolve_turn("owner", &empty_reason, now)
+            .resolve_turn("owner", &empty_reason, None, now)
             .unwrap_err()
             .code,
         "invalid"
@@ -991,13 +1016,13 @@ fn resolve_turn_write_ids_replay_or_conflict() {
     let request = resolve_turn_request(&agent, 1, "turn-1", TurnResolveStatus::Interrupted);
     let resolve_id = request.id.clone();
     let first = store
-        .resolve_turn("owner", &request, now)
+        .resolve_turn("owner", &request, None, now)
         .expect("resolve unknown turn");
     assert_eq!(first.events.len(), 1);
     let high_water = store.high_water().unwrap();
 
     let replay = store
-        .resolve_turn("owner", &request, now)
+        .resolve_turn("owner", &request, None, now)
         .expect("replay retained resolution");
     assert_eq!(replay.value, first.value);
     assert!(replay.events.is_empty());
@@ -1007,7 +1032,7 @@ fn resolve_turn_write_ids_replay_or_conflict() {
     conflict.status = TurnResolveStatus::Completed;
     assert_eq!(
         store
-            .resolve_turn("owner", &conflict, now)
+            .resolve_turn("owner", &conflict, None, now)
             .unwrap_err()
             .code,
         "id_conflict"
@@ -1018,7 +1043,7 @@ fn resolve_turn_write_ids_replay_or_conflict() {
     command_collision.id = send_id.clone();
     assert_eq!(
         store
-            .resolve_turn("owner", &command_collision, now)
+            .resolve_turn("owner", &command_collision, None, now)
             .unwrap_err()
             .code,
         "id_conflict"
@@ -1044,7 +1069,10 @@ fn resolve_turn_write_ids_replay_or_conflict() {
         reason: "stale assertion".to_owned(),
     };
     assert_eq!(
-        store.resolve_turn("owner", &expired, now).unwrap_err().code,
+        store
+            .resolve_turn("owner", &expired, None, now)
+            .unwrap_err()
+            .code,
         "id_expired"
     );
 }
@@ -1087,6 +1115,7 @@ fn resolve_turn_leaves_sibling_unknown_turn_untouched() {
         .resolve_turn(
             "owner",
             &resolve_turn_request(&first_agent, 1, "turn-1", TurnResolveStatus::Failed),
+            None,
             now,
         )
         .expect("resolve first unknown turn");
@@ -1164,6 +1193,7 @@ fn owner_turn_assertion_is_distinguishable_from_native_completion() {
         .resolve_turn(
             "owner",
             &resolve_turn_request(&agent, 1, "turn-uncertain", TurnResolveStatus::Failed),
+            None,
             now,
         )
         .expect("resolve unknown turn");
@@ -1201,4 +1231,443 @@ fn owner_turn_assertion_is_distinguishable_from_native_completion() {
     assert!(!kinds.contains(&("turn-native".to_owned(), "turn.resolved".to_owned())));
     assert!(kinds.contains(&("turn-uncertain".to_owned(), "turn.resolved".to_owned())));
     assert!(!kinds.contains(&("turn-uncertain".to_owned(), "turn.completed".to_owned())));
+}
+
+fn attach_request() -> SubmitCommand {
+    SubmitCommand {
+        id: Ulid::new().to_string(),
+        target: None,
+        verb: "attach".to_owned(),
+        args: json!({"mode":"observe","profile":"fake","harness":"fake",
+            "native_scope":"fixture:scope","native_ref":"fixture-native",
+            "profile_snapshot":{"harness":"fake"}}),
+        expected_generation: None,
+        expected_turn_id: None,
+        request_id: None,
+        probe: false,
+    }
+}
+
+fn attach_observer(store: &mut Store, now: i64) -> (String, String) {
+    let request = attach_request();
+    let command_id = request.id.clone();
+    let admitted = store.submit("owner", request, now).expect("admit attach");
+    let agent = admitted.command.target.expect("attach target");
+    store.dispatch(&command_id, now).expect("dispatch attach");
+    (agent, command_id)
+}
+
+fn settle_attach(store: &mut Store, agent: &str, command_id: &str, now: i64) {
+    store
+        .settle_observe_attach(
+            command_id,
+            json!({"agent_id":agent,"generation":1,"command_id":command_id,
+                "native_scope":"fixture:scope","native_ref":"fixture-native",
+                "state":"attached","observation_state":"unknown",
+                "metadata":{},"coverage":{}}),
+            now,
+        )
+        .expect("settle observer attach");
+}
+
+fn observe_transcript(store: &mut Store, agent: &str, now: i64) {
+    store
+        .record_observed_source_handoff(
+            SourceHandoff {
+                agent_id: agent.to_owned(),
+                generation: 1,
+                source: "observe".to_owned(),
+                families: vec!["turn".to_owned(), "message".to_owned()],
+                successor: "transcript".to_owned(),
+                mechanism: "rollout_tail".to_owned(),
+                cursor: None,
+                gap: Some(SourceHandoffGap {
+                    gap_id: "edge-gap".to_owned(),
+                    reason: "live_edge".to_owned(),
+                    from: None,
+                    to: Some("edge:0".to_owned()),
+                }),
+            },
+            ("fixture:scope", "fixture-native"),
+            now,
+        )
+        .expect("hand observed turns to the transcript reader");
+}
+
+fn observed_message(store: &mut Store, agent: &str, turn_id: &str, now: i64) {
+    let batch_id = Ulid::new().to_string();
+    store
+        .put_observed_batch(
+            SourceBatch {
+                batch_id: batch_id.clone(),
+                agent_id: agent.to_owned(),
+                generation: 1,
+                source: "transcript".to_owned(),
+                events: vec![NativeEvent {
+                    ts: Some(now),
+                    kind: "message.completed".to_owned(),
+                    native_id: batch_id.clone(),
+                    data: json!({"turn_id":turn_id,"text":"observed answer","phase":"final_answer"}),
+                }],
+                cursor: Some(format!("edge:{batch_id}")),
+            },
+            ("fixture:scope", "fixture-native"),
+            now,
+        )
+        .expect("commit observed message");
+}
+
+#[test]
+fn resolve_turn_refuses_observe_only_agents_before_and_after_restart() {
+    let mut store = store();
+    let now = now_ms();
+    let (agent, attach_id) = attach_observer(&mut store, now);
+    settle_attach(&mut store, &agent, &attach_id, now + 1);
+    observe_transcript(&mut store, &agent, now + 2);
+    observed_message(&mut store, &agent, "observed-turn", now + 3);
+    let turn = store.get_turn(&agent, 1, "observed-turn").unwrap().unwrap();
+    assert_eq!(turn.state, TurnState::Unknown);
+
+    // An attached observer owns nothing: refusal does not wait for a restart.
+    let error = store
+        .resolve_turn(
+            "owner",
+            &resolve_turn_request(&agent, 1, "observed-turn", TurnResolveStatus::Failed),
+            None,
+            now + 4,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, "not_allowed");
+
+    // Restart fences the observer as unknown with no active turn; the stored
+    // unknown turn must still not pass.
+    store.recover_on_restart(now + 5).expect("recover");
+    let agent_row = store.get_agent(&agent).unwrap().unwrap();
+    assert!(agent_row.observe_only);
+    assert_eq!(agent_row.state, AgentState::Unknown);
+    assert!(agent_row.active_turn.is_none());
+    assert_eq!(
+        store
+            .get_turn(&agent, 1, "observed-turn")
+            .unwrap()
+            .unwrap()
+            .state,
+        TurnState::Unknown
+    );
+
+    let error = store
+        .resolve_turn(
+            "owner",
+            &resolve_turn_request(&agent, 1, "observed-turn", TurnResolveStatus::Failed),
+            None,
+            now + 6,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, "not_allowed");
+    assert_eq!(
+        store
+            .get_turn(&agent, 1, "observed-turn")
+            .unwrap()
+            .unwrap()
+            .state,
+        TurnState::Unknown
+    );
+    assert_eq!(
+        turn_resolution_source(&store, &agent, 1, "observed-turn"),
+        None
+    );
+}
+
+#[test]
+fn resolve_command_refuses_observe_only_agent_commands() {
+    let mut store = store();
+    let now = now_ms();
+    let (agent, attach_id) = attach_observer(&mut store, now);
+    store.recover_on_restart(now + 1).expect("recover");
+    assert_eq!(
+        store.get_command(&attach_id).unwrap().unwrap().state,
+        CommandState::Unknown
+    );
+    assert!(store.get_agent(&agent).unwrap().unwrap().observe_only);
+
+    for resolution in [CommandResolution::Failed, CommandResolution::Applied] {
+        let error = store
+            .resolve_command(
+                "owner",
+                &resolve_command_request(&attach_id, resolution),
+                now + 2,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "not_allowed");
+    }
+    assert_eq!(
+        store.get_command(&attach_id).unwrap().unwrap().state,
+        CommandState::Unknown
+    );
+    assert_eq!(command_resolution_source(&store, &attach_id), None);
+}
+
+#[test]
+fn resolve_turn_needs_a_terminal_generation_or_a_native_proof() {
+    let mut store = store();
+    let now = now_ms();
+    let agent = ready_agent(&mut store, "resolve-live-proof", now);
+
+    let send = send_request(&agent, "held input");
+    let send_id = send.id.clone();
+    store.submit("owner", send, now).expect("admit send");
+    store.dispatch(&send_id, now).expect("dispatch send");
+    store
+        .put_batch(
+            native_batch(
+                &agent,
+                1,
+                "turn.started",
+                json!({"command_id": send_id, "turn_id": "turn-1"}),
+            ),
+            now,
+        )
+        .expect("commit exact turn association");
+    assert!(
+        !store
+            .get_agent(&agent)
+            .unwrap()
+            .unwrap()
+            .state
+            .is_terminal()
+    );
+
+    // No current Store flow marks a controlled turn unknown while its
+    // generation stays live (stop and restart always terminalize it), so pin
+    // the gate directly: the stored active turn alone is never proof.
+    let agent_num = parse_agent_id(&agent).unwrap();
+    store
+        .connection
+        .execute(
+            "UPDATE turns SET state = 'unknown' WHERE agent = ?1 AND generation = 1 AND turn_id = 'turn-1'",
+            [agent_num],
+        )
+        .expect("retain unknown turn on the live generation");
+    let error = store
+        .resolve_turn(
+            "owner",
+            &resolve_turn_request(&agent, 1, "turn-1", TurnResolveStatus::Failed),
+            None,
+            now,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, "bad_state");
+    store
+        .connection
+        .execute(
+            "UPDATE agents SET active_turn = NULL WHERE id = ?1",
+            [agent_num],
+        )
+        .expect("clear the stored active turn");
+    let error = store
+        .resolve_turn(
+            "owner",
+            &resolve_turn_request(&agent, 1, "turn-1", TurnResolveStatus::Failed),
+            None,
+            now,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, "bad_state");
+
+    // A proof for another turn proves nothing about this one.
+    let other = TurnInactiveProof {
+        turn_id: "turn-other".to_owned(),
+    };
+    let error = store
+        .resolve_turn(
+            "owner",
+            &resolve_turn_request(&agent, 1, "turn-1", TurnResolveStatus::Failed),
+            Some(&other),
+            now,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, "bad_state");
+
+    // A native readback proving this exact turn inactive releases it, while
+    // the live Agent and its send stay exactly as they were.
+    let proof = TurnInactiveProof {
+        turn_id: "turn-1".to_owned(),
+    };
+    let change = store
+        .resolve_turn(
+            "owner",
+            &resolve_turn_request(&agent, 1, "turn-1", TurnResolveStatus::Failed),
+            Some(&proof),
+            now,
+        )
+        .expect("resolve proven-inactive turn on a live generation");
+    assert_eq!(change.events.len(), 1);
+    assert_eq!(change.events[0].kind, "turn.resolved");
+    let resolved = store.get_turn(&agent, 1, "turn-1").unwrap().unwrap();
+    assert_eq!(resolved.state, TurnState::Completed);
+    assert_eq!(resolved.status.as_deref(), Some("failed"));
+    assert_eq!(
+        turn_resolution_source(&store, &agent, 1, "turn-1"),
+        Some("owner".to_owned())
+    );
+    assert!(
+        !store
+            .get_agent(&agent)
+            .unwrap()
+            .unwrap()
+            .state
+            .is_terminal()
+    );
+    assert_eq!(
+        store.get_command(&send_id).unwrap().unwrap().state,
+        CommandState::Applied
+    );
+}
+
+#[test]
+fn resolve_command_allows_launch_and_resume_only_as_failed() {
+    let mut store = store();
+    let now = now_ms();
+
+    let launch_id = Ulid::new().to_string();
+    store
+        .submit(
+            "owner",
+            SubmitCommand {
+                id: launch_id.clone(),
+                target: None,
+                verb: "launch".to_owned(),
+                args: json!({"project":"resolve-start-rule", "workspace":"synthetic-workspace"}),
+                expected_generation: Some(0),
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now,
+        )
+        .expect("admit launch");
+    store.dispatch(&launch_id, now).expect("dispatch launch");
+    store
+        .settle(&launch_id, CommandState::Unknown, None, now)
+        .expect("retain unknown launch");
+    let error = store
+        .resolve_command(
+            "owner",
+            &resolve_command_request(&launch_id, CommandResolution::Applied),
+            now,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, "bad_state");
+    assert_eq!(
+        store.get_command(&launch_id).unwrap().unwrap().state,
+        CommandState::Unknown
+    );
+    assert_eq!(command_resolution_source(&store, &launch_id), None);
+
+    let agent = ready_agent(&mut store, "resolve-resume-rule", now);
+    store
+        .put_batch(native_batch(&agent, 1, "session.ended", json!({})), now)
+        .expect("commit terminal session fact");
+    let mut stop = SubmitCommand::new(Ulid::new().to_string(), "stop");
+    stop.target = Some(agent.clone());
+    stop.expected_generation = Some(1);
+    let stop_id = stop.id.clone();
+    store.submit("owner", stop, now).expect("admit stop");
+    store.dispatch(&stop_id, now).expect("dispatch stop");
+    store
+        .settle(&stop_id, CommandState::Applied, None, now)
+        .expect("settle applied stop");
+    // The synthetic launch retains no native subject; record one so the
+    // resume exercises admission instead of the native-subject fence.
+    store
+        .connection
+        .execute(
+            "UPDATE agents SET native_scope = 'fixture:scope', native_ref = 'fixture-native'
+             WHERE id = ?1",
+            [parse_agent_id(&agent).unwrap()],
+        )
+        .expect("retain a native subject for the stopped Agent");
+    let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
+    resume.target = Some(agent.clone());
+    resume.expected_generation = Some(1);
+    let resume_id = resume.id.clone();
+    store.submit("owner", resume, now).expect("admit resume");
+    store.dispatch(&resume_id, now).expect("dispatch resume");
+    store
+        .settle(&resume_id, CommandState::Unknown, None, now)
+        .expect("retain unknown resume");
+    let error = store
+        .resolve_command(
+            "owner",
+            &resolve_command_request(&resume_id, CommandResolution::Applied),
+            now,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, "bad_state");
+    store
+        .resolve_command(
+            "owner",
+            &resolve_command_request(&resume_id, CommandResolution::Failed),
+            now,
+        )
+        .expect("resolve unknown resume as failed");
+    let resolved = store.get_command(&resume_id).unwrap().unwrap();
+    assert_eq!(resolved.state, CommandState::Failed);
+    assert_eq!(
+        command_resolution_source(&store, &resume_id),
+        Some("owner".to_owned())
+    );
+}
+
+#[test]
+fn turn_readback_command_finds_the_latest_bound_send() {
+    let mut store = store();
+    let now = now_ms();
+    let agent = ready_agent(&mut store, "resolve-readback", now);
+
+    let send = send_request(&agent, "held input");
+    let send_id = send.id.clone();
+    store.submit("owner", send, now).expect("admit send");
+    store.dispatch(&send_id, now).expect("dispatch send");
+    store
+        .put_batch(
+            native_batch(
+                &agent,
+                1,
+                "turn.started",
+                json!({"command_id": send_id, "turn_id": "turn-1"}),
+            ),
+            now,
+        )
+        .expect("commit exact turn association");
+    assert_eq!(
+        store.turn_readback_command(&agent, 1, "turn-1").unwrap(),
+        Some(send_id.clone())
+    );
+    assert_eq!(
+        store
+            .turn_readback_command(&agent, 1, "turn-missing")
+            .unwrap(),
+        None
+    );
+
+    // A turn control bound to the same turn is not a readback binding.
+    let mut interrupt = SubmitCommand::new(Ulid::new().to_string(), "interrupt");
+    interrupt.target = Some(agent.clone());
+    interrupt.args = json!({});
+    interrupt.expected_generation = Some(1);
+    interrupt.expected_turn_id = Some("turn-1".to_owned());
+    store
+        .submit("owner", interrupt, now)
+        .expect("admit interrupt");
+    assert_eq!(
+        store.turn_readback_command(&agent, 1, "turn-1").unwrap(),
+        Some(send_id)
+    );
+
+    let other = ready_agent(&mut store, "resolve-readback-other", now);
+    assert_eq!(
+        store.turn_readback_command(&other, 1, "turn-1").unwrap(),
+        None
+    );
 }
