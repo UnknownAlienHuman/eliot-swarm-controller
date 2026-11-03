@@ -330,7 +330,9 @@ fn event_prune_end_tx(
     // source pin only events at or after its latest batch start. Older native
     // events of an open source may go, and one old native event of a
     // long-lived source never blocks pruning. Native-bound events of closed
-    // sources may go.
+    // sources may go. A NULL batch start (no batch committed yet) pins from
+    // the source's first native event instead of pinning nothing: the
+    // comparison alone would silently disable the pin for that source.
     let first_pinned: Option<i64> = tx
         .query_row(
             "SELECT MIN(e.seq) FROM events e
@@ -339,7 +341,8 @@ fn event_prune_end_tx(
                    SELECT 1 FROM source_state s
                    WHERE s.agent = e.agent AND s.generation = e.generation
                      AND s.source = e.source AND s.state = 'open'
-                     AND e.seq >= s.last_batch_first_seq
+                     AND (s.last_batch_first_seq IS NULL
+                          OR e.seq >= s.last_batch_first_seq)
                )",
             params![pruned_through, ceiling],
             |row| row.get(0),
@@ -347,6 +350,28 @@ fn event_prune_end_tx(
         .map_err(sql_error)?;
     if let Some(pinned) = first_pinned {
         end = end.min(pinned - 1);
+    }
+    // `source.gap` events carry no native_id, so the native pin never covers
+    // them — yet the Git coverage check re-reads the retained gap event by
+    // `gap_seq` while its boundary is still live. Keep every event at or
+    // after the oldest live gap of an open source: the check reads the gap
+    // only while `gap_from` still equals the source cursor (a NULL cursor
+    // reads as zero), so a superseded gap pins nothing and can never stall
+    // pruning. Closed sources pin nothing either: `record_git_observation`
+    // refuses them before the coverage check, and gap re-acknowledgement
+    // returns the stored seq without reading the event row.
+    let first_gap: Option<i64> = tx
+        .query_row(
+            "SELECT MIN(gap_seq) FROM source_state
+             WHERE state = 'open' AND gap_seq IS NOT NULL
+               AND gap_from IS NOT NULL AND gap_from = COALESCE(cursor, '0')
+               AND gap_seq > ?1 AND gap_seq <= ?2",
+            params![pruned_through, ceiling],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if let Some(gap) = first_gap {
+        end = end.min(gap - 1);
     }
     if end <= pruned_through {
         return Ok(None);
@@ -440,7 +465,7 @@ fn prune_writes_tx(tx: &Transaction<'_>, cutoff: i64) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eliot_core::{CommandState, NativeEvent, SourceBatch, parse_agent_id};
+    use eliot_core::{CommandState, NativeEvent, SourceBatch, SourceGap, parse_agent_id};
     use std::path::Path;
 
     const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -1286,6 +1311,18 @@ mod tests {
             .unwrap()
     }
 
+    fn insert_native_event(store: &mut Store, agent: i64, ts: i64, native_id: &str) -> i64 {
+        store
+            .connection
+            .execute(
+                "INSERT INTO events(ts, kind, agent, generation, source, native_id, data)
+                 VALUES (?1, 'message.completed', ?2, 1, 'stream', ?3, '{}')",
+                params![ts, agent, native_id],
+            )
+            .unwrap();
+        store.connection.last_insert_rowid()
+    }
+
     /// Commit a `turn.started` batch for a fresh send and return the batch,
     /// so the caller can re-send the identical batch later.
     fn commit_started(store: &mut Store, agent: &str, command_id: &str, now: i64) -> SourceBatch {
@@ -1390,6 +1427,132 @@ mod tests {
         assert_eq!(redelivery.ack, first.ack);
         assert!(redelivery.events.is_empty());
         assert_eq!(store.high_water().unwrap(), water_before);
+    }
+
+    #[test]
+    fn prune_events_pins_live_gap_event_for_git_coverage() {
+        let mut store = store();
+        let old = NOW - 31 * DAY_MS;
+        let (agent, _) = launch_agent(&mut store, "retention-gap", old);
+        let agent_num = parse_agent_id(&agent).unwrap();
+        store
+            .ensure_git_source(&agent, 1, "retention-workspace", old)
+            .unwrap();
+        let gap = store
+            .record_source_gap(
+                SourceGap {
+                    gap_id: "gap-1".to_owned(),
+                    agent_id: agent.clone(),
+                    generation: 1,
+                    source: "git".to_owned(),
+                    families: vec!["file".to_owned(), "git".to_owned()],
+                    reason: "retained gap pin".to_owned(),
+                    from: Some("0".to_owned()),
+                    to: Some("60".to_owned()),
+                },
+                old,
+            )
+            .unwrap();
+        let gap_seq = gap.value.seq;
+        // Advance the cursor past the retained gap while keeping its boundary
+        // live: the Git hint cursor pin no longer covers the gap event, so
+        // only the gap pin keeps it. The Store accepts any gap boundary
+        // strings; the coverage check reads the retained boundary.
+        store
+            .connection
+            .execute(
+                "UPDATE source_state SET cursor = '50', gap_from = '50'
+                 WHERE agent = ?1 AND generation = 1 AND source = 'git'",
+                [agent_num],
+            )
+            .unwrap();
+        assert!(gap_seq < 50);
+
+        let report = store.prune_retention(Some(30), None, NOW).unwrap();
+        assert_eq!(report.events_deleted, gap_seq - 1);
+        assert_eq!(report.pruned_through, gap_seq - 1);
+        assert!(event_exists(&store, gap_seq));
+
+        // The Git coverage check still passes afterwards: the retained gap
+        // event is present with a matching digest.
+        let source = crate::load_source_state(&store.connection, agent_num, 1, "git")
+            .unwrap()
+            .expect("git source state");
+        for family in ["file", "git"] {
+            assert!(
+                crate::git_interval_gap_covers(
+                    &store.connection,
+                    agent_num,
+                    1,
+                    &source,
+                    50,
+                    60,
+                    family
+                )
+                .unwrap(),
+                "coverage still passes for {family}"
+            );
+        }
+    }
+
+    #[test]
+    fn prune_events_null_batch_start_pins_from_first_native_event() {
+        let mut store = store();
+        let old = NOW - 31 * DAY_MS;
+        let below = insert_event(&mut store, old);
+        let agent = insert_agent(&mut store, 1);
+        store
+            .connection
+            .execute(
+                "INSERT INTO source_state(agent, generation, source, state, health, updated_at)
+                 VALUES (?1, 1, 'stream', 'open', 'ok', ?2)",
+                params![agent, NOW],
+            )
+            .unwrap();
+        let first = insert_native_event(&mut store, agent, old, "null-pin-first");
+        let second = insert_native_event(&mut store, agent, old, "null-pin-second");
+
+        // No batch committed yet (`last_batch_first_seq IS NULL`): the open
+        // source pins from its first native event instead of pinning nothing.
+        let report = store.prune_retention(Some(30), None, NOW).unwrap();
+        assert_eq!(report.pruned_through, first - 1);
+        assert!(!event_exists(&store, below));
+        assert!(event_exists(&store, first));
+        assert!(event_exists(&store, second));
+    }
+
+    #[test]
+    fn prune_events_pins_minimum_across_two_open_sources() {
+        let mut store = store();
+        let old = NOW - 31 * DAY_MS;
+        // Commit the lower pin first, so the minimum belongs to the earlier
+        // source and the later source cannot mask it.
+        let (agent_b, launch_b) = launch_agent(&mut store, "retention-min-b", old);
+        commit_ready(&mut store, &agent_b, &launch_b, "ready-b", old);
+        store
+            .settle(&launch_b, CommandState::Applied, None, old)
+            .unwrap();
+        let send_b = ulid_at(old + 3, 4);
+        commit_started(&mut store, &agent_b, &send_b, old + 3);
+        let other = old + 1_000;
+        let (agent_a, launch_a) = launch_agent(&mut store, "retention-min-a", other);
+        commit_ready(&mut store, &agent_a, &launch_a, "ready-a", other);
+        store
+            .settle(&launch_a, CommandState::Applied, None, other)
+            .unwrap();
+        let send_a = ulid_at(other + 3, 5);
+        commit_started(&mut store, &agent_a, &send_a, other + 3);
+        let pin_b = native_seq(&store, &format!("{send_b}-started"));
+        let pin_a = native_seq(&store, &format!("{send_a}-started"));
+        assert!(pin_b < pin_a);
+        let ready_b = native_seq(&store, "ready-b:ready");
+        assert!(ready_b < pin_b);
+
+        let report = store.prune_retention(Some(30), None, NOW).unwrap();
+        assert_eq!(report.pruned_through, pin_b - 1);
+        assert!(!event_exists(&store, ready_b));
+        assert!(event_exists(&store, pin_b));
+        assert!(event_exists(&store, pin_a));
     }
 
     #[test]
