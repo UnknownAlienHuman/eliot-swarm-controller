@@ -841,9 +841,7 @@ mod tests {
         tokio::time::timeout(
             Duration::from_secs(10),
             std::future::poll_fn(|cx| {
-                if started.load(Ordering::SeqCst) == 0
-                    && round.as_mut().poll(cx).is_ready()
-                {
+                if started.load(Ordering::SeqCst) == 0 && round.as_mut().poll(cx).is_ready() {
                     panic!("round finished without running its check");
                 }
                 if started.load(Ordering::SeqCst) > 0 {
