@@ -1,4 +1,5 @@
 mod command;
+mod coordination;
 mod goals;
 mod resolution;
 
@@ -243,6 +244,12 @@ impl Router {
             "goal.clear" => self.goal_clear(&params, &principal).await,
             "goal.resume" => self.goal_resume(&params, &principal).await,
             "goal.round" => self.goal_round(&params, &principal).await,
+            "mail.send" => self.mail_send(&params, &principal).await,
+            "mail.inbox" => self.mail_inbox(&params, &principal).await,
+            "mail.read" => self.mail_read(&params, &principal).await,
+            "mail.ack" => self.mail_ack(&params, &principal).await,
+            "var.set" => self.var_set(&params, &principal).await,
+            "var.get" => self.var_get(&params, &principal).await,
             _ => Err(Error::new(
                 "unsupported",
                 format!("daemon method {method} is not implemented"),

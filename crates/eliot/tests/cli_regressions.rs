@@ -14061,3 +14061,214 @@ fn cli_recipe_bounded_goal_runs_exact_command_against_fake() {
     );
     fixture.stop(false);
 }
+
+#[test]
+fn owner_mail_roundtrip_across_two_fake_agents() {
+    let mut fixture = Fixture::new("owner mail roundtrip");
+    fixture.start();
+    let workspace = fixture.workspace.to_str().unwrap().to_owned();
+    let first = fixture.json(&["launch", "--profile", "fake", "--workspace", &workspace]);
+    let second = fixture.json(&["launch", "--profile", "fake", "--workspace", &workspace]);
+    let a = first["target"].as_str().expect("fake Agent").to_owned();
+    let b = second["target"].as_str().expect("fake Agent").to_owned();
+
+    let sent = fixture.json(&[
+        "msg",
+        "send",
+        "--to",
+        &a,
+        "--to",
+        &b,
+        "--thread",
+        "review",
+        "hello agents",
+    ]);
+    let deliveries = sent["deliveries"].as_array().expect("fanout");
+    assert_eq!(deliveries.len(), 2);
+    assert_eq!(deliveries[0]["recipient"], a);
+    assert_eq!(deliveries[1]["recipient"], b);
+
+    // Reads never mark: repeated inbox reads return the same unread row.
+    let inbox_a = fixture.json(&["inbox", &a]);
+    let rows = inbox_a["deliveries"].as_array().expect("inbox rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["sender"], "owner");
+    assert!(rows[0]["sender_generation"].is_null());
+    assert_eq!(rows[0]["thread"], "review");
+    assert_eq!(rows[0]["text"], "hello agents");
+    assert!(rows[0]["read_at"].is_null());
+    let delivery = rows[0]["delivery_id"]
+        .as_str()
+        .expect("delivery id")
+        .to_owned();
+    let again = fixture.json(&["inbox", &a]);
+    assert_eq!(again, inbox_a);
+    let shown = fixture.json(&["msg", "show", &delivery, "--agent", &a]);
+    assert_eq!(shown["delivery_id"], delivery);
+    assert!(shown["read_at"].is_null());
+
+    // Only the exact-id ack marks it.
+    let acked = fixture.json(&["msg", "ack", "--agent", &a, "--delivery", &delivery]);
+    assert_eq!(acked["acked"][0], delivery);
+    let empty = fixture.json(&["inbox", &a]);
+    assert!(empty["deliveries"].as_array().expect("rows").is_empty());
+
+    // The other recipient still holds its own row, and an owner reply
+    // references the exact delivery.
+    let inbox_b = fixture.json(&["inbox", &b]);
+    let parent = inbox_b["deliveries"][0]["delivery_id"]
+        .as_str()
+        .expect("parent delivery")
+        .to_owned();
+    let reply = fixture.json(&["msg", "send", "--to", &b, "--reply-to", &parent, "noted"]);
+    assert_eq!(reply["deliveries"].as_array().expect("reply").len(), 1);
+    for agent in [&a, &b] {
+        let stop = fixture.json(&["stop", agent]);
+        fixture.wait_command(
+            stop["command_id"].as_str().expect("stop command"),
+            "applied",
+        );
+    }
+    fixture.stop(false);
+}
+
+#[test]
+fn owner_var_cas_conflict_and_global_scope() {
+    let mut fixture = Fixture::new("owner var cas");
+    fixture.start();
+    let set = fixture.json(&["var", "set", "--scope", "project:app", "branch", "main"]);
+    assert_eq!(set["version"], 1);
+    assert_eq!(set["set_by"], "owner");
+
+    let conflict = cli(
+        &fixture.data,
+        &[
+            "var",
+            "set",
+            "--scope",
+            "project:app",
+            "--expect-version",
+            "0",
+            "branch",
+            "stale",
+        ],
+    );
+    assert_eq!(conflict.status.code(), Some(3));
+    assert!(conflict.stderr.contains("version_conflict"));
+
+    let read = fixture.json(&["var", "get", "--scope", "project:app", "branch"]);
+    assert_eq!(read["value"], "main");
+    assert_eq!(read["version"], 1);
+
+    let bumped = fixture.json(&[
+        "var",
+        "set",
+        "--scope",
+        "project:app",
+        "--expect-version",
+        "1",
+        "--note",
+        "why",
+        "branch",
+        "dev",
+    ]);
+    assert_eq!(bumped["version"], 2);
+
+    let global = fixture.json(&[
+        "var",
+        "set",
+        "--scope",
+        "global",
+        "--as-json",
+        "flag",
+        "true",
+    ]);
+    assert_eq!(global["version"], 1);
+    let gread = fixture.json(&["var", "get", "--scope", "global", "flag"]);
+    assert_eq!(gread["value"], true);
+
+    let events = fixture.events();
+    let changed: Vec<_> = events
+        .iter()
+        .filter(|event| event["kind"] == "var.changed")
+        .collect();
+    assert_eq!(changed.len(), 3);
+    assert_eq!(changed[0]["data"]["key"], "branch");
+    assert_eq!(changed[0]["data"]["version"], 1);
+    assert_eq!(changed[2]["data"]["scope"], "global");
+    fixture.stop(false);
+}
+
+#[test]
+fn mail_wake_notice_coalesces_to_one_generic_command() {
+    let mut fixture = Fixture::new("mail wake notice");
+    fixture.start();
+    let workspace = fixture.workspace.to_str().unwrap().to_owned();
+    let first = fixture.json(&[
+        "launch",
+        "--profile",
+        "fake",
+        "--workspace",
+        &workspace,
+        "--wait",
+    ]);
+    let second = fixture.json(&[
+        "launch",
+        "--profile",
+        "fake",
+        "--workspace",
+        &workspace,
+        "--wait",
+    ]);
+    let a = first["target"].as_str().expect("fake Agent").to_owned();
+    let b = second["target"].as_str().expect("fake Agent").to_owned();
+
+    // Two rapid deliveries: the first wakes, the second is coalesced.
+    fixture.json(&["msg", "send", "--to", &a, "wake-body-one"]);
+    fixture.json(&["msg", "send", "--to", &a, "wake-body-two"]);
+    // The other mailbox gets its own single wake.
+    fixture.json(&["msg", "send", "--to", &b, "wake-body-other"]);
+
+    let events = fixture.events();
+    let mut notices = Vec::new();
+    for event in &events {
+        if event["kind"] != "command.accepted" {
+            continue;
+        }
+        let Some(id) = event["data"]["command_id"].as_str() else {
+            continue;
+        };
+        let command = fixture.json(&["cmd", "show", id]);
+        if command["verb"] != "send" {
+            continue;
+        }
+        let text = command["args"]["text"].as_str().unwrap_or("");
+        if text.contains("unread messages; run eliot inbox") {
+            assert!(
+                !text.contains("wake-body"),
+                "notice must never contain the body"
+            );
+            let target = command["target"].as_str().unwrap_or("").to_owned();
+            notices.push((target, text.to_owned()));
+        }
+    }
+    assert_eq!(notices.len(), 2, "one coalesced notice per mailbox");
+    assert!(
+        notices
+            .iter()
+            .any(|(target, text)| target == &a && text == "1 unread messages; run eliot inbox")
+    );
+    assert!(
+        notices
+            .iter()
+            .any(|(target, text)| target == &b && text == "1 unread messages; run eliot inbox")
+    );
+    for agent in [&a, &b] {
+        let stop = fixture.json(&["stop", agent]);
+        fixture.wait_command(
+            stop["command_id"].as_str().expect("stop command"),
+            "applied",
+        );
+    }
+    fixture.stop(false);
+}

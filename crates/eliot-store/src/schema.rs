@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 20;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 21;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -527,7 +527,7 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
-        if current < CURRENT_SCHEMA_VERSION {
+        if current < 20 {
             let tx = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -537,6 +537,40 @@ impl Store {
                      ADD COLUMN round_key_kind TEXT NOT NULL DEFAULT 'idle'
                      CHECK(round_key_kind IN ('idle', 'slot'));
                  INSERT INTO schema_migrations(version) VALUES (20);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < CURRENT_SCHEMA_VERSION {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE TABLE messages (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     delivery_id TEXT NOT NULL UNIQUE,
+                     sender TEXT NOT NULL, sender_generation INTEGER,
+                     recipient INTEGER NOT NULL, recipient_generation INTEGER NOT NULL,
+                     thread TEXT, reply_to_delivery TEXT,
+                     mode TEXT NOT NULL, text TEXT NOT NULL, content_digest BLOB NOT NULL,
+                     admitted_at INTEGER NOT NULL, presented_at INTEGER,
+                     presentation_command TEXT, read_at INTEGER
+                 );
+                 CREATE INDEX messages_inbox ON messages(recipient,read_at,id);
+                 CREATE INDEX messages_thread ON messages(thread,id);
+                 CREATE TABLE vars (
+                     scope TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
+                     version INTEGER NOT NULL, set_by TEXT NOT NULL, note TEXT,
+                     set_at INTEGER NOT NULL,
+                     PRIMARY KEY(scope,key)
+                 );
+                 CREATE TABLE mail_notices (
+                     recipient INTEGER PRIMARY KEY REFERENCES agents(id),
+                     last_notice_at INTEGER NOT NULL,
+                     open_notice_command TEXT
+                 );
+                 INSERT INTO schema_migrations(version) VALUES (21);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

@@ -11,6 +11,7 @@ mod scripts;
 
 pub use capacity::{RecordedProcess, RetainedGeneration};
 pub use command_children::{CommandChildrenPage, command_history_expired};
+pub use coordination::{MailNoticeClaim, MailNoticeState};
 pub use goals::{
     GoalCheckResult, GoalCommitOutcome, GoalContinuation, GoalRoundCommit, GoalRoundCommitResult,
     GoalRoundKey, GoalRoundProbe,
@@ -87,6 +88,7 @@ macro_rules! db {
 
 mod admission;
 mod command_children;
+mod coordination;
 mod dispatch;
 mod goals;
 mod observer;
