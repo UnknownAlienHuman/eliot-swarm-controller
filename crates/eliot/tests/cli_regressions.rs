@@ -13036,6 +13036,25 @@ fn cli_goal_crud_pause_and_native_unsupported() {
     ]);
     assert_eq!(launched["state"], "applied");
     let agent = launched["target"].as_str().unwrap().to_owned();
+    // Automatic driving needs a bound: an unbounded set is refused.
+    let unbounded = cli(
+        &fixture.data,
+        &[
+            "goal",
+            "set",
+            &agent,
+            "--text",
+            "keep green",
+            "--check",
+            "check-goal",
+        ],
+    );
+    assert_eq!(unbounded.status.code(), Some(3));
+    assert!(
+        unbounded.stderr.contains("max_turns or max_rounds"),
+        "unbounded goal must name its missing bound: {}",
+        unbounded.stderr.lines().next().unwrap_or("")
+    );
     // --check consumes the remaining arguments, so it goes last.
     let set = fixture.json(&[
         "goal",
@@ -13068,6 +13087,48 @@ fn cli_goal_crud_pause_and_native_unsupported() {
     let cleared = fixture.json(&["goal", "clear", &agent]);
     assert_eq!(cleared["revision"], 4);
     assert_eq!(cleared["status"], "cleared");
+    // A cadenced Goal captures its slot anchor; its first slot is not due yet.
+    let cadenced = fixture.json(&[
+        "goal",
+        "set",
+        &agent,
+        "--text",
+        "keep green",
+        "--cadence-ms",
+        "60000",
+        "--check",
+        "check-goal",
+    ]);
+    assert_eq!(cadenced["revision"], 5);
+    assert_eq!(cadenced["definition"]["cadence_ms"], 60000);
+    assert!(cadenced["cadence_anchor_ms"].as_i64().unwrap() > 0);
+    let slot = cli(&fixture.data, &["goal", "round", &agent, "--slot", "1"]);
+    assert_eq!(slot.status.code(), Some(3));
+    assert!(
+        slot.stderr.contains("stale_round"),
+        "future slot must be refused: {}",
+        slot.stderr.lines().next().unwrap_or("")
+    );
+    for args in [
+        vec!["goal", "round", agent.as_str()],
+        vec![
+            "goal",
+            "round",
+            agent.as_str(),
+            "--idle-seq",
+            "1",
+            "--slot",
+            "1",
+        ],
+    ] {
+        let usage = cli(&fixture.data, &args);
+        assert_eq!(usage.status.code(), Some(2));
+        assert!(
+            usage.stderr.contains("exactly one of --idle-seq, --slot"),
+            "round needs exactly one key form: {}",
+            usage.stderr.lines().next().unwrap_or("")
+        );
+    }
     let native = cli(
         &fixture.data,
         &[
@@ -13307,6 +13368,8 @@ fn cli_goal_round_completes_idle_fake_agent() {
         &agent,
         "--text",
         "keep green",
+        "--max-rounds",
+        "6",
         "--check",
         CLI,
         "--version",
@@ -13329,15 +13392,21 @@ fn cli_goal_round_completes_idle_fake_agent() {
             outcome = Some(round.json());
             break;
         }
+        // The automatic driver rounds through the same path and may
+        // complete the goal first; that completion counts.
+        if fixture.json(&["goal", "show", &agent])["status"] == "completed" {
+            break;
+        }
         assert_eq!(round.status.code(), Some(3));
         assert!(
-            round.stderr.contains("stale_round"),
-            "round retry must be a stale key: {}",
+            round.stderr.contains("stale_round") || round.stderr.contains("busy"),
+            "round retry must be a stale key or a driver-held claim: {}",
             round.stderr.lines().next().unwrap_or("")
         );
     }
-    let round = outcome.expect("round committed within bounded retries");
-    assert_eq!(round["outcome"], "completed");
+    if let Some(round) = outcome {
+        assert_eq!(round["outcome"], "completed");
+    }
     let shown = fixture.json(&["goal", "show", &agent]);
     assert_eq!(shown["status"], "completed");
     assert_eq!(shown["counters"]["rounds"], 1);
@@ -13348,6 +13417,98 @@ fn cli_goal_round_completes_idle_fake_agent() {
             .unwrap_or("")
             .contains("eliot"),
         "completed round retains its check observation"
+    );
+    let stop = fixture.json(&["stop", &agent]);
+    fixture.wait_command(
+        stop["command_id"].as_str().expect("stop command"),
+        "applied",
+    );
+    fixture.stop(false);
+}
+
+#[test]
+fn cli_goal_auto_round_drives_idle_fake_agent() {
+    let mut fixture = Fixture::new("goal auto");
+    fixture.start();
+    let launched = fixture.json(&[
+        "launch",
+        "--profile",
+        "fake",
+        "--workspace",
+        fixture.workspace.to_str().unwrap(),
+    ]);
+    assert_eq!(launched["state"], "applied");
+    let agent = launched["target"].as_str().unwrap().to_owned();
+    let generation = launched["generation"].as_i64().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let ready = fixture.events().iter().any(|event| {
+            event["kind"] == "session.ready"
+                && event["agent"] == agent
+                && event["generation"] == generation
+        });
+        if ready {
+            break;
+        }
+        assert!(Instant::now() < deadline, "fake ready deadline");
+        thread::sleep(Duration::from_millis(50));
+    }
+    // The test binary itself is the portable exit-0 check.
+    let set = fixture.json(&[
+        "goal",
+        "set",
+        &agent,
+        "--text",
+        "keep green",
+        "--max-rounds",
+        "6",
+        "--check",
+        CLI,
+        "--version",
+    ]);
+    assert_eq!(set["revision"], 1);
+    // One fake turn; its completion commits the idle event the automatic
+    // driver rounds on. No explicit `goal round` call follows.
+    let send_id = ulid::Ulid::new().to_string();
+    let send = cli(
+        &fixture.data,
+        &[
+            "--id",
+            &send_id,
+            "send",
+            &agent,
+            "--generation",
+            &generation.to_string(),
+            "--wait",
+            "--timeout-seconds",
+            "10",
+            "--",
+            "do some work",
+        ],
+    );
+    assert!(
+        send.status.success(),
+        "fake send must complete: {}",
+        send.stderr.lines().next().unwrap_or("")
+    );
+    fixture.wait_command(&send_id, "applied");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let shown = loop {
+        let shown = fixture.json(&["goal", "show", &agent]);
+        if shown["status"] == "completed" {
+            break shown;
+        }
+        assert!(Instant::now() < deadline, "auto round deadline");
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(shown["counters"]["rounds"], 1);
+    assert_eq!(shown["counters"]["last_exit_code"], 0);
+    assert!(
+        shown["last_round_key"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("idle:"),
+        "auto round keys on the idle event"
     );
     let stop = fixture.json(&["stop", &agent]);
     fixture.wait_command(

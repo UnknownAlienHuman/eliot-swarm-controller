@@ -130,6 +130,18 @@ async fn run_owned(
         )
         .await
     });
+    {
+        let goal_router = router.clone();
+        let goal_shutdown = automation_stop.subscribe();
+        automation_tasks.spawn(async move {
+            crate::router::run_goal_driver(
+                goal_router,
+                crate::router::real_goal_check,
+                goal_shutdown,
+            )
+            .await
+        });
+    }
     let (maintenance_stop, maintenance_shutdown) = watch::channel(false);
     let mut maintenance_tasks = JoinSet::new();
     {

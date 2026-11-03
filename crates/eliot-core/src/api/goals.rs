@@ -21,6 +21,10 @@ pub const MAX_GOAL_CHECK_TIMEOUT_MS: i64 = 600_000;
 pub const DEFAULT_GOAL_CHECK_TIMEOUT_MS: i64 = 60_000;
 /// Upper bound for every Goal turn/round/progress limit.
 pub const MAX_GOAL_LIMIT: i64 = 1_000_000;
+/// Cadence bounds in milliseconds. Below a minute a cadence would spin
+/// checks; above a week the Goal outlives any useful unattended window.
+pub const MIN_GOAL_CADENCE_MS: i64 = 60_000;
+pub const MAX_GOAL_CADENCE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 /// Reported while no usage source exists.
 pub const GOAL_COST_UNSUPPORTED: &str = "unsupported (no usage source)";
 
@@ -97,6 +101,10 @@ pub struct GoalDefinition {
     pub max_rounds: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_without_progress: Option<i64>,
+    /// Optional cadence in milliseconds. A cadenced Goal rounds on anchored
+    /// time slots instead of idle events; without one rounds name idle seqs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cadence_ms: Option<i64>,
 }
 
 fn default_check_timeout() -> i64 {
@@ -154,6 +162,28 @@ impl GoalDefinition {
                 ));
             }
         }
+        if let Some(cadence_ms) = self.cadence_ms
+            && !(MIN_GOAL_CADENCE_MS..=MAX_GOAL_CADENCE_MS).contains(&cadence_ms)
+        {
+            return Err(Error::new(
+                "invalid",
+                "goal cadence must be between 1 minute and 7 days in milliseconds",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Automatic `on_idle` driving needs a bound: a Goal without a cadence
+    /// is driven on every idle event, so it must set `max_turns` or
+    /// `max_rounds`. Cadenced Goals round only on explicit slots and need
+    /// none. Checked at `set`, never on stored views.
+    pub fn require_auto_bound(&self) -> Result<()> {
+        if self.cadence_ms.is_none() && self.max_turns.is_none() && self.max_rounds.is_none() {
+            return Err(Error::new(
+                "invalid",
+                "goal without a cadence drives automatically on idle and needs max_turns or max_rounds",
+            ));
+        }
         Ok(())
     }
 }
@@ -173,6 +203,11 @@ pub struct GoalCounters {
     pub last_exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_output_digest: Option<String>,
+    /// Digest of the last complete read-only workspace fingerprint. Absent
+    /// when the Goal has no Git observation or the latest one is incomplete;
+    /// an incomplete fingerprint never extends a no-progress streak.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_observation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -272,6 +307,10 @@ pub struct GoalView {
     pub mode: GoalMode,
     pub generation: i64,
     pub revision: i64,
+    /// Epoch-millisecond anchor of a cadenced Goal's slots, captured when
+    /// the cadence was set and stable across pause/resume. Absent without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cadence_anchor_ms: Option<i64>,
     pub status: GoalStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused_reason: Option<String>,
@@ -297,6 +336,21 @@ impl GoalView {
         }
         if self.revision < 0 {
             return Err(Error::new("invalid", "goal revision must be nonnegative"));
+        }
+        if self.cadence_anchor_ms.is_some_and(|anchor| anchor < 0) {
+            return Err(Error::new(
+                "invalid",
+                "goal cadence anchor must be nonnegative",
+            ));
+        }
+        if self.definition.cadence_ms.is_none() && self.cadence_anchor_ms.is_some() {
+            return Err(Error::new("invalid", "goal cadence anchor needs a cadence"));
+        }
+        if self.definition.cadence_ms.is_some() && self.cadence_anchor_ms.is_none() {
+            return Err(Error::new(
+                "invalid",
+                "cadenced goal needs its captured anchor",
+            ));
         }
         self.definition.validate()?;
         self.counters.validate()?;
@@ -335,7 +389,13 @@ impl GoalSetRequest {
                 "goal cost limits need a usage source; usage is unsupported",
             ));
         }
-        self.definition.validate()
+        self.definition.validate()?;
+        // Native mode is refused as unsupported either way; only Eliot
+        // Goals drive automatically and need the bound.
+        if self.mode == GoalMode::Eliot {
+            self.definition.require_auto_bound()?;
+        }
+        Ok(())
     }
 
     pub fn validate_response(&self, response: &GoalView) -> Result<()> {
@@ -484,7 +544,13 @@ pub struct GoalRoundRequest {
     pub agent: String,
     #[serde(default = "default_mode")]
     pub mode: GoalMode,
-    pub idle_seq: i64,
+    /// Idle-event key. Exactly one of the two key forms is present; the
+    /// form must match the Goal (slots for cadenced Goals, idle seqs else).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_seq: Option<i64>,
+    /// Anchored cadence slot index (first slot is 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<i64>,
 }
 
 impl GoalRoundRequest {
@@ -493,11 +559,26 @@ impl GoalRoundRequest {
             return Err(Error::new("invalid", "goal round id must be nonempty"));
         }
         validate_agent(&self.agent)?;
-        if self.idle_seq < 0 {
-            return Err(Error::new(
-                "invalid",
-                "goal round idle_seq must be nonnegative",
-            ));
+        match (self.idle_seq, self.slot) {
+            (Some(idle_seq), None) => {
+                if idle_seq < 0 {
+                    return Err(Error::new(
+                        "invalid",
+                        "goal round idle_seq must be nonnegative",
+                    ));
+                }
+            }
+            (None, Some(slot)) => {
+                if slot < 1 {
+                    return Err(Error::new("invalid", "goal round slot must be at least 1"));
+                }
+            }
+            _ => {
+                return Err(Error::new(
+                    "invalid",
+                    "goal round needs exactly one of idle_seq, slot",
+                ));
+            }
         }
         Ok(())
     }
@@ -615,6 +696,7 @@ mod tests {
             max_turns: Some(5),
             max_rounds: Some(10),
             max_without_progress: Some(3),
+            cadence_ms: None,
         }
     }
 
@@ -624,6 +706,7 @@ mod tests {
             mode: GoalMode::Eliot,
             generation: 2,
             revision: 1,
+            cadence_anchor_ms: None,
             status: GoalStatus::Active,
             paused_reason: None,
             blocked_reason: None,
@@ -689,6 +772,15 @@ mod tests {
         omitted.max_rounds = None;
         omitted.max_without_progress = None;
         omitted.validate().unwrap();
+        let mut cadenced = definition();
+        cadenced.cadence_ms = Some(MIN_GOAL_CADENCE_MS);
+        cadenced.validate().unwrap();
+        cadenced.cadence_ms = Some(MAX_GOAL_CADENCE_MS);
+        cadenced.validate().unwrap();
+        for bad in [0, MIN_GOAL_CADENCE_MS - 1, MAX_GOAL_CADENCE_MS + 1] {
+            cadenced.cadence_ms = Some(bad);
+            assert!(cadenced.validate().is_err());
+        }
         let wire = serde_json::to_value(&omitted).unwrap();
         assert_eq!(
             serde_json::from_value::<GoalDefinition>(wire).unwrap(),
@@ -731,6 +823,55 @@ mod tests {
         let defaulted: GoalSetRequest =
             serde_json::from_value(json!({"agent":"a1","definition":definition()})).unwrap();
         assert_eq!(defaulted.mode, GoalMode::Eliot);
+    }
+
+    #[test]
+    fn goal_set_requires_a_bound_for_automatic_goals() {
+        let unbounded = GoalDefinition {
+            max_turns: None,
+            max_rounds: None,
+            max_without_progress: None,
+            cadence_ms: None,
+            ..definition()
+        };
+        let request = GoalSetRequest {
+            agent: "a1".to_owned(),
+            mode: GoalMode::Eliot,
+            definition: unbounded,
+            max_cost: None,
+        };
+        assert_eq!(request.validate().unwrap_err().code, "invalid");
+        // Either bound enables automatic driving.
+        for bounded in [
+            GoalDefinition {
+                max_turns: Some(4),
+                max_rounds: None,
+                ..request.definition.clone()
+            },
+            GoalDefinition {
+                max_turns: None,
+                max_rounds: Some(6),
+                ..request.definition.clone()
+            },
+        ] {
+            GoalSetRequest {
+                definition: bounded,
+                ..request.clone()
+            }
+            .validate()
+            .unwrap();
+        }
+        // Cadenced Goals round only on explicit slots: no bound needed.
+        let cadenced = GoalDefinition {
+            cadence_ms: Some(MIN_GOAL_CADENCE_MS),
+            ..request.definition.clone()
+        };
+        GoalSetRequest {
+            definition: cadenced,
+            ..request.clone()
+        }
+        .validate()
+        .unwrap();
     }
 
     #[test]
@@ -828,7 +969,8 @@ mod tests {
             id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
             agent: "a1".to_owned(),
             mode: GoalMode::Eliot,
-            idle_seq: 9,
+            idle_seq: Some(9),
+            slot: None,
         };
         request.validate().unwrap();
         let completed = GoalRoundResponse {
@@ -911,5 +1053,66 @@ mod tests {
             let request: GoalRoundRequest = serde_json::from_value(invalid).unwrap();
             assert!(request.validate().is_err());
         }
+    }
+
+    #[test]
+    fn goal_round_takes_exactly_one_key_form() {
+        let slot = GoalRoundRequest {
+            id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            agent: "a1".to_owned(),
+            mode: GoalMode::Eliot,
+            idle_seq: None,
+            slot: Some(3),
+        };
+        slot.validate().unwrap();
+        let wire = serde_json::to_value(&slot).unwrap();
+        assert_eq!(wire["slot"], json!(3));
+        assert!(wire.get("idle_seq").is_none());
+        assert_eq!(
+            serde_json::from_value::<GoalRoundRequest>(wire).unwrap(),
+            slot
+        );
+        // Old idle-only requests still parse.
+        let legacy: GoalRoundRequest =
+            serde_json::from_value(json!({"id":"x","agent":"a1","idle_seq":9})).unwrap();
+        assert_eq!((legacy.idle_seq, legacy.slot), (Some(9), None));
+        legacy.validate().unwrap();
+        for invalid in [
+            json!({"id":"x","agent":"a1"}),
+            json!({"id":"x","agent":"a1","idle_seq":9,"slot":3}),
+            json!({"id":"x","agent":"a1","slot":0}),
+            json!({"id":"x","agent":"a1","slot":-2}),
+        ] {
+            let request: GoalRoundRequest = serde_json::from_value(invalid).unwrap();
+            assert!(request.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn goal_cadence_anchor_binds_to_its_cadence() {
+        let mut cadenced = view();
+        cadenced.definition.cadence_ms = Some(MIN_GOAL_CADENCE_MS);
+        assert!(cadenced.validate().is_err());
+        cadenced.cadence_anchor_ms = Some(1_700_000_000_000);
+        cadenced.validate().unwrap();
+        let wire = serde_json::to_value(&cadenced).unwrap();
+        assert_eq!(wire["cadence_anchor_ms"], json!(1_700_000_000_000i64));
+        assert_eq!(serde_json::from_value::<GoalView>(wire).unwrap(), cadenced);
+        let mut anchored = view();
+        anchored.cadence_anchor_ms = Some(7);
+        assert!(anchored.validate().is_err());
+        let mut negative = cadenced.clone();
+        negative.cadence_anchor_ms = Some(-1);
+        assert!(negative.validate().is_err());
+        // Old views omit the anchor; it defaults to absent.
+        let unanchored: GoalView = serde_json::from_value(json!({
+            "agent": "a1", "mode": "eliot", "generation": 2, "revision": 1,
+            "status": "active", "definition": definition(),
+            "counters": GoalCounters::default(),
+            "cost_status": GOAL_COST_UNSUPPORTED, "updated_at": 7,
+        }))
+        .unwrap();
+        assert!(unanchored.cadence_anchor_ms.is_none());
+        unanchored.validate().unwrap();
     }
 }

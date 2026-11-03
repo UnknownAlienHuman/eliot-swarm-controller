@@ -13,7 +13,7 @@ pub use capacity::{RecordedProcess, RetainedGeneration};
 pub use command_children::{CommandChildrenPage, command_history_expired};
 pub use goals::{
     GoalCheckResult, GoalCommitOutcome, GoalContinuation, GoalRoundCommit, GoalRoundCommitResult,
-    GoalRoundProbe,
+    GoalRoundKey, GoalRoundProbe,
 };
 pub use projects::ProjectRegistrationInput;
 pub use resolution::TurnInactiveProof;
