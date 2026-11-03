@@ -544,7 +544,14 @@ impl FakeMsp {
             "session_starts": self.counts.get("session/start").copied().unwrap_or(0),
             "turn_starts": self.counts.get("turn/start").copied().unwrap_or(0),
         });
-        let _ = std::fs::write(&self.report_path, serde_json::to_string(&report).unwrap());
+        // Atomic publish: the harness may SIGKILL this fixture at any point
+        // (failed-start discard), and a truncated report would fail the
+        // scenario with a parse error. A rename lands whole or not at all.
+        let tmp = self.report_path.with_extension("json.tmp");
+        if std::fs::write(&tmp, serde_json::to_string(&report).unwrap()).is_err() {
+            return;
+        }
+        let _ = std::fs::rename(&tmp, &self.report_path);
     }
 }
 
