@@ -8601,3 +8601,591 @@ fn ordered_store_reads_paginate_processes_by_owner_identity() {
         "SEARCH processes USING INDEX processes_owner_identity (owner=?",
     );
 }
+
+/// Launch a `muse`-harness Agent through generation-1 readiness, returning
+/// the Agent, its launch command, and its retained native subject. The
+/// session stays live; tests end it with `end_muse_session` when they need a
+/// terminal old generation.
+fn ready_muse_agent(
+    store: &mut Store,
+    project: &str,
+    profile: &str,
+    workspace: &str,
+    now: i64,
+) -> (String, String, String, String) {
+    let mut launch = SubmitCommand::new(Ulid::new().to_string(), "launch");
+    launch.args = json!({
+        "project": project,
+        "harness": "muse",
+        "profile": profile,
+        "profile_snapshot": {"harness": "muse", "model": "muse-test-model"},
+        "workspace": workspace,
+    });
+    launch.expected_generation = Some(0);
+    let launch_id = launch.id.clone();
+    let agent = store
+        .submit("owner", launch, now)
+        .expect("admit muse launch")
+        .command
+        .target
+        .expect("muse launch Agent");
+    let native_scope = format!("{project}:{agent}:scope");
+    let native_ref = format!("{project}:{agent}:session");
+    store
+        .dispatch(&launch_id, now + 1)
+        .expect("dispatch muse launch");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("{project}:ready"),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ready".to_owned(),
+                    native_id: format!("{project}:ready"),
+                    data: json!({
+                        "command_id": launch_id.as_str(),
+                        "native_scope": native_scope.as_str(),
+                        "native_ref": native_ref.as_str(),
+                    }),
+                }],
+                cursor: None,
+            },
+            now + 2,
+        )
+        .expect("commit muse session readiness");
+    store
+        .settle(&launch_id, CommandState::Applied, None, now + 3)
+        .expect("settle muse launch");
+    (agent, launch_id, native_scope, native_ref)
+}
+
+fn end_muse_session(store: &mut Store, agent: &str, project: &str, now: i64) {
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("{project}:ended"),
+                agent_id: agent.to_owned(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ended".to_owned(),
+                    native_id: format!("{project}:ended"),
+                    data: json!({}),
+                }],
+                cursor: None,
+            },
+            now,
+        )
+        .expect("commit muse terminal session fact");
+}
+
+fn gen1_event_rows(store: &Store, agent: &str) -> i64 {
+    store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE agent = ?1 AND generation = 1",
+            [eliot_core::parse_agent_id(agent).expect("valid Agent id")],
+            |row| row.get(0),
+        )
+        .expect("count generation-1 event rows")
+}
+
+#[test]
+fn muse_resume_passes_admission_and_dispatch_gates_with_exact_linked_input() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let project = "muse-resume-gates";
+    let (agent, _, native_scope, native_ref) = ready_muse_agent(
+        &mut store,
+        project,
+        "muse-test",
+        "synthetic-muse-resume",
+        now,
+    );
+    assert_eq!(store.get_agent(&agent).unwrap().unwrap().harness, "muse");
+
+    // Note 34c: Eliot's own terminal gate for the old generation. A resume
+    // while generation 1 is still running is refused before any native I/O;
+    // the plugin's `notLoaded` preflight never substitutes for this gate.
+    let mut early = SubmitCommand::new(Ulid::new().to_string(), "resume");
+    early.target = Some(agent.clone());
+    early.expected_generation = Some(1);
+    early.args = json!({"text": "too early"});
+    assert_eq!(
+        store
+            .submit("owner", early, now + 5)
+            .expect_err("live generation refuses resume")
+            .code,
+        "bad_state"
+    );
+    end_muse_session(&mut store, &agent, project, now + 6);
+
+    // Admission mints the linked SEND id before any write: the exact
+    // `{resume}/send` handle the new generation will dispatch, carrying the
+    // exact linked text while the parent keeps empty args.
+    let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
+    resume.target = Some(agent.clone());
+    resume.expected_generation = Some(1);
+    resume.args = json!({"text": "continue in the new generation"});
+    let resume_id = resume.id.clone();
+    let admission = store
+        .submit("owner", resume, now + 7)
+        .expect("admit muse resume with linked input");
+    assert_eq!(admission.command.state, CommandState::Accepted);
+    assert_eq!(admission.command.generation, Some(1));
+    assert_eq!(admission.command.args, json!({}));
+    let linked = admission
+        .linked_command
+        .as_ref()
+        .expect("resume text is stored as its linked SEND");
+    let send_id = linked.id.clone();
+    assert_eq!(send_id, format!("{resume_id}/send"));
+    assert_eq!(linked.verb, "send");
+    assert_eq!(linked.expected_generation, Some(2));
+    assert_eq!(linked.generation, Some(2));
+    assert_eq!(linked.state, CommandState::Queued);
+    assert_eq!(linked.args["text"], "continue in the new generation");
+
+    assert_eq!(
+        store
+            .dispatch(&resume_id, now + 8)
+            .expect("dispatch muse resume")
+            .value
+            .state,
+        CommandState::Dispatched
+    );
+    let starting = store.get_agent(&agent).unwrap().unwrap();
+    assert_eq!(starting.generation, 2);
+    assert_eq!(starting.state, AgentState::Starting);
+    assert_eq!(
+        starting.native_scope.as_deref(),
+        Some(native_scope.as_str())
+    );
+    assert_eq!(starting.native_ref.as_deref(), Some(native_ref.as_str()));
+
+    // Note 34b (Store half): generation-1 output after the resume is
+    // rejected, never applied to generation 2. The old host's batch cannot
+    // land new rows once the Agent has advanced.
+    let gen1_rows = gen1_event_rows(&store, &agent);
+    assert_eq!(
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: format!("{project}:stale-turn"),
+                    agent_id: agent.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "turn.started".to_owned(),
+                        native_id: format!("{project}:stale-turn"),
+                        data: json!({"command_id": "gen1-command", "turn_id": "gen1-turn"}),
+                    }],
+                    cursor: None,
+                },
+                now + 9,
+            )
+            .expect_err("stale generation-1 batch is rejected")
+            .code,
+        "stale_generation"
+    );
+    assert_eq!(gen1_event_rows(&store, &agent), gen1_rows);
+
+    // Generation-2 readiness binds the exact resume command id minted before
+    // the write; a forged command id proves nothing.
+    assert_eq!(
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: format!("{project}:wrong-command"),
+                    agent_id: agent.clone(),
+                    generation: 2,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "session.ready".to_owned(),
+                        native_id: format!("{project}:wrong-command"),
+                        data: json!({
+                            "command_id": "not-the-resume-command",
+                            "native_scope": native_scope.as_str(),
+                            "native_ref": native_ref.as_str(),
+                        }),
+                    }],
+                    cursor: None,
+                },
+                now + 10,
+            )
+            .expect_err("forged readiness command is rejected")
+            .code,
+        "source_integrity"
+    );
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("{project}:ready-2"),
+                agent_id: agent.clone(),
+                generation: 2,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ready".to_owned(),
+                    native_id: format!("{project}:ready-2"),
+                    data: json!({
+                        "command_id": resume_id.as_str(),
+                        "native_scope": native_scope.as_str(),
+                        "native_ref": native_ref.as_str(),
+                    }),
+                }],
+                cursor: None,
+            },
+            now + 11,
+        )
+        .expect("commit generation-2 readiness");
+    store
+        .settle(&resume_id, CommandState::Applied, None, now + 12)
+        .expect("settle muse resume");
+    assert_eq!(
+        store
+            .dispatch(&send_id, now + 13)
+            .expect("dispatch linked muse input")
+            .value
+            .state,
+        CommandState::Dispatched
+    );
+    let turn_id = format!("muse-resume-turn-{}", Ulid::new());
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("{project}:turn-2"),
+                agent_id: agent.clone(),
+                generation: 2,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "turn.started".to_owned(),
+                    native_id: format!("{project}:turn-2-started"),
+                    data: json!({
+                        "command_id": send_id.as_str(),
+                        "turn_id": turn_id.as_str(),
+                    }),
+                }],
+                cursor: None,
+            },
+            now + 14,
+        )
+        .expect("associate the exact linked muse input");
+    let applied = store.get_command(&send_id).unwrap().unwrap();
+    assert_eq!(applied.state, CommandState::Applied);
+    assert_eq!(applied.turn_id.as_deref(), Some(turn_id.as_str()));
+    assert_eq!(
+        store.get_turn(&agent, 2, &turn_id).unwrap().unwrap().state,
+        TurnState::Running
+    );
+}
+
+#[test]
+fn muse_project_resume_passes_the_projects_gate_with_linked_input() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let project = "muse-project-resume";
+    let checkout = "/synthetic-muse-project-resume";
+    let principal = format!("project:{project}");
+    store
+        .upsert_project_registration(
+            "owner",
+            &ProjectRegistrationInput {
+                id: project.to_owned(),
+                checkout: checkout.to_owned(),
+                repo_common_dir: format!("{checkout}/.git"),
+                git: None,
+                profiles: vec!["muse-profile".to_owned()],
+                actions: vec!["resume".to_owned(), "send".to_owned()],
+                interpreters: BTreeMap::new(),
+                run_env: Vec::new(),
+            },
+            now,
+        )
+        .expect("register project resume and linked send");
+    let (agent, _, native_scope, native_ref) =
+        ready_muse_agent(&mut store, project, "muse-profile", checkout, now + 1);
+    end_muse_session(&mut store, &agent, project, now + 6);
+
+    // The project principal's linked SEND passes the projects resume binding
+    // gate (`projects.rs`), which admits the `muse` harness like Codex/Fake.
+    let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
+    resume.target = Some(agent.clone());
+    resume.expected_generation = Some(1);
+    resume.args = json!({"text": "project resume input"});
+    let resume_id = resume.id.clone();
+    let admission = store
+        .submit(&principal, resume, now + 7)
+        .expect("admit project muse resume with linked input");
+    let send_id = admission
+        .linked_command
+        .as_ref()
+        .expect("project resume text is stored as its linked SEND")
+        .id
+        .clone();
+    assert_eq!(send_id, format!("{resume_id}/send"));
+    store
+        .dispatch(&resume_id, now + 8)
+        .expect("dispatch project muse resume");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("{project}:ready-2"),
+                agent_id: agent.clone(),
+                generation: 2,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ready".to_owned(),
+                    native_id: format!("{project}:ready-2"),
+                    data: json!({
+                        "command_id": resume_id.as_str(),
+                        "native_scope": native_scope.as_str(),
+                        "native_ref": native_ref.as_str(),
+                    }),
+                }],
+                cursor: None,
+            },
+            now + 9,
+        )
+        .expect("commit project generation-2 readiness");
+    store
+        .settle(&resume_id, CommandState::Applied, None, now + 10)
+        .expect("settle project muse resume");
+    store
+        .dispatch(&send_id, now + 11)
+        .expect("dispatch linked project input against its next-generation binding");
+    let turn_id = format!("muse-project-resume-turn-{}", Ulid::new());
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("{project}:turn-2"),
+                agent_id: agent.clone(),
+                generation: 2,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "turn.started".to_owned(),
+                    native_id: format!("{project}:turn-2-started"),
+                    data: json!({
+                        "command_id": send_id.as_str(),
+                        "turn_id": turn_id.as_str(),
+                    }),
+                }],
+                cursor: None,
+            },
+            now + 12,
+        )
+        .expect("associate the exact linked project input");
+    assert_eq!(
+        store.get_command(&send_id).unwrap().unwrap().state,
+        CommandState::Applied
+    );
+}
+
+#[test]
+fn muse_resume_gates_refuse_an_unlisted_harness() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+
+    // Admission refuses resume for a harness outside codex/fake/muse even
+    // when the old generation is terminal with a retained native subject.
+    let (agent, _, _, _) = ready_muse_agent(
+        &mut store,
+        "muse-harness-refusal",
+        "muse-test",
+        "synthetic-muse-harness-refusal",
+        now,
+    );
+    end_muse_session(&mut store, &agent, "muse-harness-refusal", now + 5);
+    store
+        .connection
+        .execute(
+            "UPDATE agents SET harness = 'other' WHERE id = ?1",
+            [eliot_core::parse_agent_id(&agent).expect("valid Agent id")],
+        )
+        .expect("retarget the Agent at an unlisted harness");
+    let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
+    resume.target = Some(agent.clone());
+    resume.expected_generation = Some(1);
+    assert_eq!(
+        store
+            .submit("owner", resume, now + 6)
+            .expect_err("unlisted harness refuses resume at admission")
+            .code,
+        "unsupported"
+    );
+
+    // Dispatch rechecks the same gate: a resume admitted for `muse` cannot
+    // dispatch once the Agent no longer names a supported harness.
+    let (second, _, _, _) = ready_muse_agent(
+        &mut store,
+        "muse-harness-refusal-dispatch",
+        "muse-test",
+        "synthetic-muse-harness-refusal-dispatch",
+        now + 10,
+    );
+    end_muse_session(
+        &mut store,
+        &second,
+        "muse-harness-refusal-dispatch",
+        now + 15,
+    );
+    let mut second_resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
+    second_resume.target = Some(second.clone());
+    second_resume.expected_generation = Some(1);
+    let second_id = second_resume.id.clone();
+    store
+        .submit("owner", second_resume, now + 16)
+        .expect("admit the muse resume before the harness change");
+    store
+        .connection
+        .execute(
+            "UPDATE agents SET harness = 'other' WHERE id = ?1",
+            [eliot_core::parse_agent_id(&second).expect("valid Agent id")],
+        )
+        .expect("retarget the second Agent at an unlisted harness");
+    assert_eq!(
+        store
+            .dispatch(&second_id, now + 17)
+            .expect_err("unlisted harness refuses resume at dispatch")
+            .code,
+        "unsupported"
+    );
+    assert_eq!(
+        store.get_command(&second_id).unwrap().unwrap().state,
+        CommandState::Accepted
+    );
+}
+
+#[test]
+fn muse_unknown_resume_is_never_redriven() {
+    use eliot_core::api::{CommandResolution, CommandResolveRequest};
+
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let project = "muse-unknown-resume";
+    let (agent, _, _, _) = ready_muse_agent(
+        &mut store,
+        project,
+        "muse-test",
+        "synthetic-muse-unknown-resume",
+        now,
+    );
+    end_muse_session(&mut store, &agent, project, now + 5);
+
+    // Note 34d: the lost resume reply settles the command Unknown. After a
+    // plugin restart Eliot must never drive it as a second `session/resume`
+    // write: only a Store-confirmed dispatch reaches a plugin, and dispatch
+    // requires an Accepted/Queued command.
+    let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
+    resume.target = Some(agent.clone());
+    resume.expected_generation = Some(1);
+    resume.args = json!({"text": "uncertain resume input"});
+    let resume_id = resume.id.clone();
+    let admission = store
+        .submit("owner", resume.clone(), now + 6)
+        .expect("admit muse resume");
+    let send_id = admission
+        .linked_command
+        .as_ref()
+        .expect("unknown resume still banks its linked input")
+        .id
+        .clone();
+    store
+        .dispatch(&resume_id, now + 7)
+        .expect("dispatch muse resume");
+    store
+        .settle(
+            &resume_id,
+            CommandState::Unknown,
+            Some(json!({"reason": "resume reply was lost"})),
+            now + 8,
+        )
+        .expect("settle the lost resume reply as unknown");
+
+    // A replay of the same command id is idempotent: not new, no events, no
+    // second dispatch — the router only schedules new admissions.
+    let replay = store
+        .submit("owner", resume, now + 9)
+        .expect("replay the unknown resume id");
+    assert!(!replay.is_new);
+    assert!(replay.events.is_empty());
+    assert_eq!(replay.command.state, CommandState::Unknown);
+    assert_eq!(
+        replay
+            .linked_command
+            .as_ref()
+            .expect("replay keeps the linked input")
+            .id,
+        send_id
+    );
+
+    // The Unknown command itself cannot dispatch again, and the Agent has
+    // advanced past the old generation, so no fresh resume can target it
+    // either. The linked input stays queued, never dispatched.
+    assert_eq!(
+        store
+            .dispatch(&resume_id, now + 10)
+            .expect_err("unknown resume cannot dispatch")
+            .code,
+        "bad_state"
+    );
+    let mut fresh = SubmitCommand::new(Ulid::new().to_string(), "resume");
+    fresh.target = Some(agent.clone());
+    fresh.expected_generation = Some(1);
+    assert_eq!(
+        store
+            .submit("owner", fresh, now + 11)
+            .expect_err("old generation no longer resumes")
+            .code,
+        "stale_generation"
+    );
+    assert_eq!(
+        store.get_command(&resume_id).unwrap().unwrap().state,
+        CommandState::Unknown
+    );
+    assert_eq!(
+        store.get_command(&send_id).unwrap().unwrap().state,
+        CommandState::Queued
+    );
+
+    // Owner resolution of the uncertain resume is failed-only: it records an
+    // outcome without ever re-driving the native write.
+    let refused = store
+        .resolve_command(
+            "owner",
+            &CommandResolveRequest {
+                id: Ulid::new().to_string(),
+                command_id: resume_id.clone(),
+                resolution: CommandResolution::Applied,
+                reason: "must not claim an unproven resume".to_owned(),
+            },
+            now + 12,
+        )
+        .expect_err("unknown resume cannot resolve as applied");
+    assert_eq!(refused.code, "bad_state");
+    store
+        .resolve_command(
+            "owner",
+            &CommandResolveRequest {
+                id: Ulid::new().to_string(),
+                command_id: resume_id.clone(),
+                resolution: CommandResolution::Failed,
+                reason: "owner confirmed the resume never took effect".to_owned(),
+            },
+            now + 13,
+        )
+        .expect("unknown resume resolves as failed");
+    assert_eq!(
+        store.get_command(&resume_id).unwrap().unwrap().state,
+        CommandState::Failed
+    );
+}

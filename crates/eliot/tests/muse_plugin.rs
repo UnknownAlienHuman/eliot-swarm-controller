@@ -56,6 +56,18 @@ fn main() {
         println!("ok - workspace mismatch is rejected before session.ready");
         scenario_invalid_profile_rejected_before_spawn().await;
         println!("ok - invalid profile rejected before spawn");
+        scenario_resume_reopens_the_retained_session_in_a_new_generation().await;
+        println!("ok - resume reopens the retained session in a new generation");
+        scenario_resume_of_gone_session_is_an_explicit_error().await;
+        println!("ok - resume of a gone session is an explicit error");
+        scenario_lost_resume_reply_is_unknown_with_one_write().await;
+        println!("ok - lost resume reply is unknown with exactly one write");
+        scenario_resume_with_pending_requests_is_refused().await;
+        println!("ok - resume with pending requests is refused");
+        scenario_resume_rejects_stale_generation_1_output().await;
+        println!("ok - resume rejects stale generation-1 output");
+        scenario_resume_refuses_served_history_and_keeps_the_retained_id().await;
+        println!("ok - resume refuses served history and keeps the retained id");
     });
     println!("muse_plugin: all scenarios passed");
 }
@@ -64,11 +76,18 @@ fn main() {
 // Fake MSP host fixture (runs as a child of the plugin under test)
 // ---------------------------------------------------------------------------
 
+/// The retained native session and its retained completed turn for the
+/// resume scripts. The scenario passes the same pair in `resume_from` and
+/// the retained source state.
+const RETAINED_SESSION: &str = "fake-retained-session-1";
+const RETAINED_TURN: &str = "fake-retained-turn-1";
+
 struct FakeMsp {
     script: String,
     report_path: PathBuf,
     session_id: Option<String>,
     turn_active: bool,
+    turn_count: i64,
     cursor_seq: u64,
     view_log: Vec<(String, String, Value)>,
     counts: HashMap<String, u64>,
@@ -83,10 +102,21 @@ fn fake_msp_main(script: &str) {
         report_path,
         session_id: None,
         turn_active: false,
+        turn_count: 0,
         cursor_seq: 0,
         view_log: Vec::new(),
         counts: HashMap::new(),
     };
+    if matches!(
+        fake.script.as_str(),
+        "resume-happy"
+            | "resume-pending"
+            | "drop-session-resume"
+            | "resume-stale-replay"
+            | "resume-inline-history"
+    ) {
+        fake.seed_retained_session();
+    }
     fake.run();
 }
 
@@ -117,6 +147,56 @@ impl FakeMsp {
             self.write_report();
         }
         self.write_report();
+    }
+
+    /// A stored session with one completed turn, as a previous Eliot
+    /// generation left it. Only `view/page` can see this history; nothing is
+    /// pushed until the new generation acts.
+    fn seed_retained_session(&mut self) {
+        self.session_id = Some(RETAINED_SESSION.to_owned());
+        self.turn_count = 1;
+        let started_cursor = self.next_cursor();
+        self.view_log.push((
+            started_cursor.clone(),
+            "turn/started".to_owned(),
+            json!({
+                "commandId": RETAINED_TURN,
+                "sessionId": RETAINED_SESSION,
+                "sourceRange": Self::source_range(),
+                "turnId": RETAINED_TURN,
+                "viewCursor": started_cursor,
+            }),
+        ));
+        let item_cursor = self.next_cursor();
+        self.view_log.push((
+            item_cursor.clone(),
+            "item/completed".to_owned(),
+            json!({
+                "item": {
+                    "itemId": "fake-item-retained-1",
+                    "kind": "agentMessage",
+                    "revision": 2,
+                    "status": "completed",
+                    "text": "Retained reply from the previous generation.",
+                    "turnId": RETAINED_TURN,
+                },
+                "sessionId": RETAINED_SESSION,
+                "sourceRange": Self::source_range(),
+                "viewCursor": item_cursor,
+            }),
+        ));
+        let completed_cursor = self.next_cursor();
+        self.view_log.push((
+            completed_cursor.clone(),
+            "turn/completed".to_owned(),
+            json!({
+                "sessionId": RETAINED_SESSION,
+                "sourceRange": Self::source_range(),
+                "terminal": "completed",
+                "turnId": RETAINED_TURN,
+                "viewCursor": completed_cursor,
+            }),
+        ));
     }
 
     fn handle_call(&mut self, frame: &Value, stdout: &mut std::io::StdoutLock) -> bool {
@@ -198,6 +278,78 @@ impl FakeMsp {
                     }),
                 );
             }
+            "session/resume" => {
+                if self.script == "drop-session-resume" {
+                    // Lost reply: exit without answering. The report already
+                    // records this receipt.
+                    std::process::exit(0);
+                }
+                let requested = params
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if self.session_id.as_deref() != Some(requested) || requested.is_empty() {
+                    self.reply_error(stdout, &id, -32020, "Session not found");
+                    return true;
+                }
+                assert!(
+                    params
+                        .get("commandId")
+                        .and_then(Value::as_str)
+                        .is_some_and(|command| !command.trim().is_empty()),
+                    "resume carries its idempotency handle"
+                );
+                assert_eq!(
+                    params.get("excludeItems"),
+                    Some(&Value::Bool(true)),
+                    "resume pages history itself instead of republishing it"
+                );
+                assert!(
+                    params.get("input").is_none(),
+                    "resume never carries old input"
+                );
+                let workspace = std::env::var("ELIOT_FAKE_MSP_WORKSPACE").unwrap_or_default();
+                let session = self.session_object(requested, "idle", None, MODEL, &workspace);
+                let pending = if self.script == "resume-pending" {
+                    json!([{
+                        "kind": "approval",
+                        "approvalId": "fake-approval-1",
+                        "viewCursor": self.head_cursor(),
+                    }])
+                } else {
+                    json!([])
+                };
+                // `resume-inline-history` serves retained history despite
+                // `excludeItems: true`: the plugin must refuse the resume
+                // instead of republishing it.
+                let history = if self.script == "resume-inline-history" {
+                    json!({
+                        "items": [{
+                            "itemId": "fake-item-retained-1",
+                            "kind": "agentMessage",
+                            "revision": 2,
+                            "status": "completed",
+                            "text": "Retained reply from the previous generation.",
+                            "turnId": RETAINED_TURN,
+                        }],
+                        "mode": "inline",
+                        "snapshot": null,
+                    })
+                } else {
+                    json!({"items": null, "mode": "none", "noneReason": "excluded", "snapshot": null})
+                };
+                self.reply(
+                    stdout,
+                    &id,
+                    json!({
+                        "history": history,
+                        "pendingRequests": pending,
+                        "session": session,
+                        "viewCursor": self.head_cursor(),
+                    }),
+                );
+                self.emit(stdout, "session/started", json!({"session": session}));
+            }
             "turn/start" => {
                 if self.script == "drop-turn-start" {
                     // Lost reply: exit without answering. The report already
@@ -227,6 +379,24 @@ impl FakeMsp {
                     );
                     return true;
                 }
+                if self.script == "resume-stale-replay" {
+                    // Old-host output redelivered on the new generation's
+                    // stream: the retained generation-1 turn completion.
+                    // Stream-only — it is not in the durable view — and the
+                    // plugin must gap it, never apply it to generation 2.
+                    let stale = json!({
+                        "jsonrpc": "2.0",
+                        "method": "turn/completed",
+                        "params": {
+                            "sessionId": RETAINED_SESSION,
+                            "sourceRange": Self::source_range(),
+                            "terminal": "completed",
+                            "turnId": RETAINED_TURN,
+                            "viewCursor": "fake-stale-cursor-1",
+                        },
+                    });
+                    writeln!(stdout, "{stale}").expect("fixture stale event");
+                }
                 let command = params
                     .get("commandId")
                     .and_then(Value::as_str)
@@ -234,6 +404,7 @@ impl FakeMsp {
                     .to_owned();
                 let session_id = self.session_id.clone().unwrap_or_default();
                 self.turn_active = true;
+                self.turn_count += 1;
                 self.reply(
                     stdout,
                     &id,
@@ -348,6 +519,10 @@ impl FakeMsp {
                 self.turn_active = false;
             }
             "session/read" => {
+                if self.script == "resume-gone" {
+                    self.reply_error(stdout, &id, -32020, "Session not found");
+                    return true;
+                }
                 let session_id = self.session_id.clone().unwrap_or_default();
                 let (status, active): (&str, Option<&str>) = if self.turn_active {
                     ("running", Some("fake-active-turn"))
@@ -516,7 +691,7 @@ impl FakeMsp {
             "providerId": "meta",
             "sessionId": session_id,
             "status": status,
-            "turnCount": 0,
+            "turnCount": self.turn_count,
             "updatedAt": "2026-11-03T00:00:00Z",
             "workspaceRoot": if workspace.is_empty() { Value::Null } else { Value::String(workspace.to_owned()) },
         })
@@ -542,6 +717,7 @@ impl FakeMsp {
             "script": self.script,
             "counts": self.counts,
             "session_starts": self.counts.get("session/start").copied().unwrap_or(0),
+            "session_resumes": self.counts.get("session/resume").copied().unwrap_or(0),
             "turn_starts": self.counts.get("turn/start").copied().unwrap_or(0),
         });
         // Atomic publish: the harness may SIGKILL this fixture at any point
@@ -795,8 +971,53 @@ impl Host {
     }
 }
 
+struct PendingStart {
+    root: PathBuf,
+    agent_id: String,
+    host: Host,
+    params: Value,
+    generation: i64,
+}
+
+struct FailedAttempt {
+    root: PathBuf,
+    agent_id: String,
+    host: Host,
+    params: Value,
+}
+
 impl Scenario {
     async fn start(script: &str, profile: Value) -> Self {
+        let agent_id = ulid::Ulid::new().to_string();
+        let (pending, rx) =
+            Self::setup_start(script, profile, agent_id, 1, Value::Null, Value::Null).await;
+        pending.finish(rx, None).await
+    }
+
+    async fn start_resume(
+        script: &str,
+        profile: Value,
+        agent_id: String,
+        resume_from: Value,
+        source_state: Value,
+        retained_ref: &str,
+    ) -> Self {
+        let (pending, rx) =
+            Self::setup_start(script, profile, agent_id, 2, resume_from, source_state).await;
+        pending.finish(rx, Some(retained_ref)).await
+    }
+
+    /// Spawn the plugin and dispatch `agent.start`, returning the in-flight
+    /// call for the scenario to drive. Resume runs at generation 2 with the
+    /// retained subject, like a new generation after a stopped one.
+    async fn setup_start(
+        script: &str,
+        profile: Value,
+        agent_id: String,
+        generation: i64,
+        resume_from: Value,
+        source_state: Value,
+    ) -> (PendingStart, oneshot::Receiver<Result<Value, String>>) {
         let root: PathBuf = std::env::temp_dir().join(format!(
             "eliot-muse-plugin-test-{}",
             ulid::Ulid::new().to_string().to_lowercase()
@@ -804,7 +1025,6 @@ impl Scenario {
         std::fs::create_dir_all(root.join("data")).unwrap();
         std::fs::create_dir_all(root.join("instance")).unwrap();
         std::fs::create_dir_all(root.join("workspace")).unwrap();
-        let agent_id = ulid::Ulid::new().to_string();
         let mut host = Host::spawn(&root).await;
         let manifest = host
             .call(
@@ -823,7 +1043,10 @@ impl Scenario {
             manifest.get("protocol").and_then(Value::as_str),
             Some("eliot-plugin/1")
         );
-        assert_eq!(manifest["verbs"], json!(["launch", "send", "stop"]));
+        assert_eq!(
+            manifest["verbs"],
+            json!(["launch", "resume", "send", "stop"])
+        );
         assert_eq!(
             manifest["sources"]["controlled"],
             json!({"message": "stream", "session": "stream", "turn": "stream"})
@@ -832,27 +1055,50 @@ impl Scenario {
         let self_exe = std::env::current_exe().expect("test executable");
         let mut full_profile = profile;
         full_profile["cmd"] = Value::String(self_exe.to_string_lossy().into_owned());
-        let rx = host
-            .begin_call(
-                "agent.start",
-                json!({
-                    "agent_id": agent_id,
-                    "generation": 1,
-                    "command_id": start_id,
-                    "profile": full_profile,
-                    "workspace": root.join("workspace").to_string_lossy(),
-                    "target_environment": {
-                        "ELIOT_FAKE_MSP_SCRIPT": script,
-                        "ELIOT_FAKE_MSP_REPORT": root.join("report.json").to_string_lossy(),
-                    },
-                    "note": null,
-                    "source_plan": {"session": "stream", "turn": "stream", "message": "stream"},
-                    "source_state": null,
-                    "resume_from": null,
-                    "initial": null,
-                }),
-            )
-            .await;
+        let params = json!({
+            "agent_id": agent_id,
+            "generation": generation,
+            "command_id": start_id,
+            "profile": full_profile,
+            "workspace": root.join("workspace").to_string_lossy(),
+            "target_environment": {
+                "ELIOT_FAKE_MSP_SCRIPT": script,
+                "ELIOT_FAKE_MSP_REPORT": root.join("report.json").to_string_lossy(),
+                "ELIOT_FAKE_MSP_WORKSPACE": root.join("workspace").to_string_lossy(),
+            },
+            "note": null,
+            "source_plan": {"session": "stream", "turn": "stream", "message": "stream"},
+            "source_state": source_state,
+            "resume_from": resume_from,
+            "initial": null,
+        });
+        let rx = host.begin_call("agent.start", params.clone()).await;
+        (
+            PendingStart {
+                root,
+                agent_id,
+                host,
+                params,
+                generation,
+            },
+            rx,
+        )
+    }
+
+    fn report(&self) -> Value {
+        let text = std::fs::read_to_string(self.root.join("report.json")).expect("fake MSP report");
+        serde_json::from_str(&text).expect("fake MSP report JSON")
+    }
+}
+
+impl PendingStart {
+    /// Drive the in-flight start to readiness. `expected_native_ref` pins
+    /// the resumed session; launch leaves it absent.
+    async fn finish(
+        mut self,
+        rx: oneshot::Receiver<Result<Value, String>>,
+        expected_native_ref: Option<&str>,
+    ) -> Scenario {
         let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
         // `agent.start` only resolves after the harness child registers and
         // the session.ready batch commits; answer both while it is in flight.
@@ -860,29 +1106,19 @@ impl Scenario {
         let ready = loop {
             tokio::select! {
                 biased;
-                request = host.next_request() => {
+                request = self.host.next_request() => {
                     match request.method.as_str() {
                         "process.put" => {
-                            let pid = request.params.get("pid").and_then(Value::as_u64).unwrap_or(0);
-                            assert!(pid > 0);
-                            assert_eq!(request.params.get("role").and_then(Value::as_str), Some("harness"));
-                            host.respond(&request.id, json!({
-                                "identity": {"host_boot_id": "test-boot", "pid": pid, "start_time": 1},
-                                "owner": format!("agent:{agent_id}#1"),
-                                "role": "harness",
-                                "state": "running",
-                                "exit_code": null,
-                                "updated_at": 1,
-                            })).await;
+                            answer_process_put(&mut self.host, &self.agent_id, self.generation, &request).await;
                         }
                         "events.put" => {
                             let events = request.params.get("events").and_then(Value::as_array).cloned().unwrap_or_default();
                             assert_eq!(events.len(), 1, "one native record per batch");
                             assert_eq!(events[0].get("kind").and_then(Value::as_str), Some("session.ready"));
                             ready_data = Some(events[0].get("data").cloned().unwrap_or(Value::Null));
-                            let first = host.next_seq;
-                            host.next_seq += 1;
-                            host.respond(&request.id, json!({
+                            let first = self.host.next_seq;
+                            self.host.next_seq += 1;
+                            self.host.respond(&request.id, json!({
                                 "first_seq": first, "last_seq": first,
                                 "cursor": request.params.get("cursor").cloned().unwrap_or(Value::Null),
                             })).await;
@@ -897,15 +1133,23 @@ impl Scenario {
             .expect("agent.start deadline")
             .expect("agent.start response channel")
             .expect("agent.start ready");
+        let start_id = self
+            .params
+            .get("command_id")
+            .and_then(Value::as_str)
+            .expect("start command id");
         assert_eq!(ready.get("state").and_then(Value::as_str), Some("ready"));
         assert_eq!(
             ready.get("agent_id").and_then(Value::as_str),
-            Some(agent_id.as_str())
+            Some(self.agent_id.as_str())
         );
-        assert_eq!(ready.get("generation").and_then(Value::as_i64), Some(1));
+        assert_eq!(
+            ready.get("generation").and_then(Value::as_i64),
+            Some(self.generation)
+        );
         assert_eq!(
             ready.get("command_id").and_then(Value::as_str),
-            Some(start_id.as_str())
+            Some(start_id)
         );
         let ready_data = ready_data.expect("session.ready batch");
         let native_scope = ready_data
@@ -921,6 +1165,12 @@ impl Scenario {
             .and_then(Value::as_str)
             .unwrap_or_default();
         assert!(!native_ref.is_empty());
+        if let Some(expected) = expected_native_ref {
+            assert_eq!(
+                native_ref, expected,
+                "resume reopens the exact retained session"
+            );
+        }
         assert_eq!(
             ready.get("native_scope").and_then(Value::as_str),
             Some(native_scope)
@@ -951,17 +1201,107 @@ impl Scenario {
                 .and_then(Value::as_bool),
             Some(true)
         );
-        Self {
-            root,
-            agent_id,
-            host,
+        Scenario {
+            root: self.root,
+            agent_id: self.agent_id,
+            host: self.host,
         }
     }
 
+    /// Drive the in-flight start to an explicit error. The harness child
+    /// still registers (it spawns before preflight/dispatch), a dead host's
+    /// stream gap is acknowledged, but no `session.ready` may commit: no
+    /// Agent session is created.
+    async fn finish_expecting_error(
+        mut self,
+        rx: oneshot::Receiver<Result<Value, String>>,
+        expected_code: &str,
+    ) -> FailedAttempt {
+        let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
+        let outcome = loop {
+            tokio::select! {
+                biased;
+                request = self.host.next_request() => {
+                    match request.method.as_str() {
+                        "process.put" => {
+                            answer_process_put(&mut self.host, &self.agent_id, self.generation, &request).await;
+                        }
+                        "source.gap" => {
+                            let gap_id = request.params.get("gap_id").and_then(Value::as_str).unwrap_or_default().to_owned();
+                            let seq = self.host.next_seq;
+                            self.host.next_seq += 1;
+                            self.host.respond(&request.id, json!({"gap_id": gap_id, "seq": seq})).await;
+                        }
+                        "events.put" => panic!("no session.ready may commit on a failed start"),
+                        other => panic!("unexpected host request during start: {other}"),
+                    }
+                }
+                result = &mut rx => break result,
+            }
+        };
+        let outcome = outcome
+            .expect("agent.start deadline")
+            .expect("agent.start response channel");
+        assert_eq!(outcome, Err(expected_code.to_owned()));
+        FailedAttempt {
+            root: self.root,
+            agent_id: self.agent_id,
+            host: self.host,
+            params: self.params,
+        }
+    }
+}
+
+impl FailedAttempt {
     fn report(&self) -> Value {
         let text = std::fs::read_to_string(self.root.join("report.json")).expect("fake MSP report");
         serde_json::from_str(&text).expect("fake MSP report JSON")
     }
+
+    /// Reissue the exact retained start: a failed start replays its stored
+    /// error and an unknown start stays unknown, both without new native I/O.
+    async fn retry(&mut self, expected_code: &str) {
+        let outcome = self.host.call("agent.start", self.params.clone()).await;
+        assert_eq!(outcome, Err(expected_code.to_owned()));
+    }
+}
+
+async fn answer_process_put(
+    host: &mut Host,
+    agent_id: &str,
+    generation: i64,
+    request: &HostRequest,
+) {
+    let pid = request
+        .params
+        .get("pid")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    assert!(pid > 0);
+    assert_eq!(
+        request.params.get("agent_id").and_then(Value::as_str),
+        Some(agent_id)
+    );
+    assert_eq!(
+        request.params.get("generation").and_then(Value::as_i64),
+        Some(generation)
+    );
+    assert_eq!(
+        request.params.get("role").and_then(Value::as_str),
+        Some("harness")
+    );
+    host.respond(
+        &request.id,
+        json!({
+            "identity": {"host_boot_id": "test-boot", "pid": pid, "start_time": 1},
+            "owner": format!("agent:{agent_id}#{generation}"),
+            "role": "harness",
+            "state": "running",
+            "exit_code": null,
+            "updated_at": 1,
+        }),
+    )
+    .await;
 }
 
 fn muse_profile() -> Value {
@@ -971,8 +1311,52 @@ fn muse_profile() -> Value {
         "effort": EFFORT,
         "permissions": "workspace-write",
         "approval_policy": "never",
-        "pass_env": ["ELIOT_FAKE_MSP_SCRIPT", "ELIOT_FAKE_MSP_REPORT"],
+        "pass_env": ["ELIOT_FAKE_MSP_SCRIPT", "ELIOT_FAKE_MSP_REPORT", "ELIOT_FAKE_MSP_WORKSPACE"],
     })
+}
+
+/// The native scope the plugin derives from the fake host home. This mirrors
+/// `muse_scope` in the plugin (FNV-1a over the Windows-lowercased home); the
+/// resume subject must carry it exactly.
+fn fake_native_scope() -> String {
+    let home = "C:\\fake-muse-home";
+    let canonical = if cfg!(windows) {
+        home.to_lowercase()
+    } else {
+        home.to_owned()
+    };
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in canonical.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("muse-home:{hash:016x}")
+}
+
+/// The retained generation-1 readback a resume of the seeded fake session
+/// carries: the exact subject plus the retained completed turn.
+fn retained_resume_subject(agent_id: &str) -> (Value, Value) {
+    let resume_from = json!({
+        "native_scope": fake_native_scope(),
+        "native_ref": RETAINED_SESSION,
+    });
+    let source_state = json!({
+        "retained_generation": 1,
+        "retained_source": {
+            "agent_id": agent_id,
+            "generation": 1,
+            "source": "stream",
+            "families": ["session", "turn", "message"],
+        },
+        "current_turn": {
+            "turn_id": RETAINED_TURN,
+            "state": "completed",
+            "status": "completed",
+            "started_at": 1,
+            "completed_at": 2,
+        },
+    });
+    (resume_from, source_state)
 }
 
 /// One send round trip. The plugin only answers `agent.command` after its
@@ -982,6 +1366,7 @@ fn muse_profile() -> Value {
 async fn send_turn(
     host: &mut Host,
     agent_id: &str,
+    generation: i64,
     text: &str,
 ) -> (String, String, Vec<(String, Value)>) {
     let send_id = ulid::Ulid::new().to_string();
@@ -990,7 +1375,7 @@ async fn send_turn(
             "agent.command",
             json!({
                 "agent_id": agent_id,
-                "generation": 1,
+                "generation": generation,
                 "command_id": send_id,
                 "verb": "send",
                 "args": {"text": text},
@@ -1044,7 +1429,7 @@ async fn send_turn(
             Some("message.completed") => "turn.completed",
             other => panic!("turn facts out of order after {other:?}"),
         };
-        let events = host.answer_events_put(agent_id, 1, expected).await;
+        let events = host.answer_events_put(agent_id, generation, expected).await;
         committed.push((
             expected.to_owned(),
             events[0].get("data").cloned().unwrap_or(Value::Null),
@@ -1065,11 +1450,170 @@ async fn send_turn(
     (send_id, turn_id, committed)
 }
 
+/// Like `send_turn`, but tolerates exactly one `source.gap` interleaved with
+/// the turn batches in arrival order: stale generation-1 output is gapped,
+/// never applied. Returns the send id, the applied turn id, every committed
+/// `(kind, data)` in order, and the recorded gap reason.
+async fn send_turn_with_stale_replay(
+    host: &mut Host,
+    agent_id: &str,
+    generation: i64,
+    text: &str,
+) -> (String, String, Vec<(String, Value)>, String) {
+    async fn answer_batch(
+        host: &mut Host,
+        request: &HostRequest,
+        committed: &mut Vec<(String, Value)>,
+        gap_reason: &mut Option<String>,
+        agent_id: &str,
+        generation: i64,
+    ) {
+        match request.method.as_str() {
+            "events.put" => {
+                let events = request
+                    .params
+                    .get("events")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                assert_eq!(events.len(), 1, "one native record per batch");
+                committed.push((
+                    events[0]
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    events[0].get("data").cloned().unwrap_or(Value::Null),
+                ));
+                let first = host.next_seq;
+                host.next_seq += 1;
+                host.respond(
+                    &request.id,
+                    json!({
+                        "first_seq": first, "last_seq": first,
+                        "cursor": request.params.get("cursor").cloned().unwrap_or(Value::Null),
+                    }),
+                )
+                .await;
+            }
+            "source.gap" => {
+                assert!(gap_reason.is_none(), "stale output records exactly one gap");
+                assert_eq!(
+                    request.params.get("agent_id").and_then(Value::as_str),
+                    Some(agent_id)
+                );
+                assert_eq!(
+                    request.params.get("generation").and_then(Value::as_i64),
+                    Some(generation)
+                );
+                assert_eq!(
+                    request.params.get("source").and_then(Value::as_str),
+                    Some("stream")
+                );
+                *gap_reason = Some(
+                    request
+                        .params
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                );
+                let gap_id = request
+                    .params
+                    .get("gap_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let seq = host.next_seq;
+                host.next_seq += 1;
+                host.respond(&request.id, json!({"gap_id": gap_id, "seq": seq}))
+                    .await;
+            }
+            other => panic!("unexpected host request during stale-replay send: {other}"),
+        }
+    }
+
+    let send_id = ulid::Ulid::new().to_string();
+    let rx = host
+        .begin_call(
+            "agent.command",
+            json!({
+                "agent_id": agent_id,
+                "generation": generation,
+                "command_id": send_id,
+                "verb": "send",
+                "args": {"text": text},
+                "turn_id": null,
+                "request_id": null,
+            }),
+        )
+        .await;
+    let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
+    let mut committed: Vec<(String, Value)> = Vec::new();
+    let mut gap_reason: Option<String> = None;
+    let applied = loop {
+        tokio::select! {
+            biased;
+            request = host.next_request() => {
+                answer_batch(host, &request, &mut committed, &mut gap_reason, agent_id, generation).await;
+            }
+            result = &mut rx => break result,
+        }
+    };
+    let applied = applied
+        .expect("send deadline")
+        .expect("send response channel")
+        .expect("send applied");
+    assert_eq!(
+        applied.get("state").and_then(Value::as_str),
+        Some("applied")
+    );
+    let turn_id = applied
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .expect("applied turn id")
+        .to_owned();
+    assert!(!turn_id.is_empty());
+    while committed.last().map(|(kind, _)| kind.as_str()) != Some("turn.completed")
+        || gap_reason.is_none()
+    {
+        let request = host.next_request().await;
+        answer_batch(
+            host,
+            &request,
+            &mut committed,
+            &mut gap_reason,
+            agent_id,
+            generation,
+        )
+        .await;
+    }
+    for (kind, data) in &committed {
+        assert_eq!(
+            data.get("turn_id").and_then(Value::as_str),
+            Some(turn_id.as_str()),
+            "turn binding of {kind}"
+        );
+        assert_eq!(
+            data.get("command_id").and_then(Value::as_str),
+            Some(send_id.as_str()),
+            "command binding of {kind}"
+        );
+    }
+    (
+        send_id,
+        turn_id,
+        committed,
+        gap_reason.expect("stale output gap"),
+    )
+}
+
 /// Like `send_turn`, but the turn may commit any number of `message.completed`
 /// batches (routine once tools are involved) before `turn.completed`.
 async fn send_multi_message_turn(
     host: &mut Host,
     agent_id: &str,
+    generation: i64,
     text: &str,
 ) -> (String, String, Vec<(String, Value)>) {
     let send_id = ulid::Ulid::new().to_string();
@@ -1078,7 +1622,7 @@ async fn send_multi_message_turn(
             "agent.command",
             json!({
                 "agent_id": agent_id,
-                "generation": 1,
+                "generation": generation,
                 "command_id": send_id,
                 "verb": "send",
                 "args": {"text": text},
@@ -1178,14 +1722,19 @@ async fn send_multi_message_turn(
 
 /// One stop round trip with the same in-flight acknowledgement. Returns the
 /// committed `(kind, data)` batches; gaps are acknowledged and recorded too.
-async fn stop_agent(host: &mut Host, agent_id: &str, force: bool) -> Vec<(String, Value)> {
+async fn stop_agent(
+    host: &mut Host,
+    agent_id: &str,
+    generation: i64,
+    force: bool,
+) -> Vec<(String, Value)> {
     let stop_id = ulid::Ulid::new().to_string();
     let rx = host
         .begin_call(
             "agent.stop",
             json!({
                 "agent_id": agent_id,
-                "generation": 1,
+                "generation": generation,
                 "command_id": stop_id,
                 "force": force,
             }),
@@ -1245,7 +1794,7 @@ async fn scenario_launch_send_snapshot_stop() {
     let agent_id = scenario.agent_id.clone();
 
     let (send_id, turn_id, committed) =
-        send_turn(&mut scenario.host, &agent_id, "Say hello.").await;
+        send_turn(&mut scenario.host, &agent_id, 1, "Say hello.").await;
     assert_eq!(
         committed
             .iter()
@@ -1304,7 +1853,7 @@ async fn scenario_launch_send_snapshot_stop() {
     );
 
     // A second turn on the same session works after the first completes.
-    let (_, _, committed) = send_turn(&mut scenario.host, &agent_id, "Again.").await;
+    let (_, _, committed) = send_turn(&mut scenario.host, &agent_id, 1, "Again.").await;
     assert_eq!(
         committed
             .iter()
@@ -1313,7 +1862,7 @@ async fn scenario_launch_send_snapshot_stop() {
         ["turn.started", "message.completed", "turn.completed"]
     );
 
-    let committed = stop_agent(&mut scenario.host, &agent_id, false).await;
+    let committed = stop_agent(&mut scenario.host, &agent_id, 1, false).await;
     assert_eq!(
         committed
             .iter()
@@ -1344,7 +1893,7 @@ async fn scenario_two_agent_messages_snapshot_matches_stream() {
     let agent_id = scenario.agent_id.clone();
 
     let (send_id, turn_id, committed) =
-        send_multi_message_turn(&mut scenario.host, &agent_id, "Say it twice.").await;
+        send_multi_message_turn(&mut scenario.host, &agent_id, 1, "Say it twice.").await;
     assert_eq!(
         committed
             .iter()
@@ -1411,7 +1960,7 @@ async fn scenario_two_agent_messages_snapshot_matches_stream() {
         Some(true)
     );
 
-    stop_agent(&mut scenario.host, &agent_id, false).await;
+    stop_agent(&mut scenario.host, &agent_id, 1, false).await;
     scenario
         .host
         .call("shutdown", json!({}))
@@ -1426,7 +1975,7 @@ async fn scenario_two_agent_messages_snapshot_matches_stream() {
 async fn scenario_failed_turn_reports_restriction() {
     let mut scenario = Scenario::start("failed-turn", muse_profile()).await;
     let agent_id = scenario.agent_id.clone();
-    let (_, _, committed) = send_turn(&mut scenario.host, &agent_id, "Fail please.").await;
+    let (_, _, committed) = send_turn(&mut scenario.host, &agent_id, 1, "Fail please.").await;
     assert_eq!(
         committed
             .iter()
@@ -1450,7 +1999,7 @@ async fn scenario_failed_turn_reports_restriction() {
         data.get("final_text").and_then(Value::as_str),
         Some("partial reply before the failure.")
     );
-    stop_agent(&mut scenario.host, &agent_id, true).await;
+    stop_agent(&mut scenario.host, &agent_id, 1, true).await;
     scenario
         .host
         .call("shutdown", json!({}))
@@ -1523,7 +2072,7 @@ async fn scenario_lost_reply_is_unknown_without_rewrite() {
 
     // The dead host's stream gap may arrive before, during or after the
     // stop; stop_agent acknowledges it and waits for the ended batch.
-    stop_agent(&mut scenario.host, &agent_id, true).await;
+    stop_agent(&mut scenario.host, &agent_id, 1, true).await;
     scenario
         .host
         .call("shutdown", json!({}))
@@ -1600,7 +2149,7 @@ async fn send_unknown_without_rewrite(script: &str) {
         .await;
     assert_eq!(fresh, Err("unknown".to_owned()));
     assert_eq!(scenario.report()["turn_starts"], json!(1));
-    stop_agent(&mut scenario.host, &agent_id, false).await;
+    stop_agent(&mut scenario.host, &agent_id, 1, false).await;
     scenario
         .host
         .call("shutdown", json!({}))
@@ -1773,4 +2322,366 @@ async fn scenario_invalid_profile_rejected_before_spawn() {
         "no host may spawn before profile validation"
     );
     let _ = std::fs::remove_dir_all(&root);
+}
+
+async fn scenario_resume_reopens_the_retained_session_in_a_new_generation() {
+    let agent_id = ulid::Ulid::new().to_string();
+    let (resume_from, source_state) = retained_resume_subject(&agent_id);
+    let mut scenario = Scenario::start_resume(
+        "resume-happy",
+        muse_profile(),
+        agent_id,
+        resume_from,
+        source_state,
+        RETAINED_SESSION,
+    )
+    .await;
+    let agent_id = scenario.agent_id.clone();
+
+    // Resume replays nothing: no fresh session, no turn until new input.
+    let report = scenario.report();
+    assert_eq!(report["session_starts"], json!(0));
+    assert_eq!(report["session_resumes"], json!(1));
+    assert_eq!(report["turn_starts"], json!(0));
+
+    // Explicit new input runs as a new turn in the new generation; the
+    // retained turn id never reappears as a live turn.
+    let (send_id, turn_id, committed) =
+        send_turn(&mut scenario.host, &agent_id, 2, "Continue the work.").await;
+    assert_ne!(turn_id, RETAINED_TURN);
+    assert_eq!(
+        committed
+            .iter()
+            .map(|(kind, _)| kind.as_str())
+            .collect::<Vec<_>>(),
+        ["turn.started", "message.completed", "turn.completed"]
+    );
+    assert_eq!(
+        committed[1].1.get("text").and_then(Value::as_str),
+        Some("Hello from the fake MSP host.")
+    );
+
+    // Native readback over the resumed session proves the new terminal turn.
+    let snapshot = scenario
+        .host
+        .call(
+            "agent.snapshot",
+            json!({
+                "agent_id": agent_id,
+                "generation": 2,
+                "command_id": send_id,
+                "turn_id": Value::Null,
+            }),
+        )
+        .await
+        .expect("snapshot");
+    assert_eq!(snapshot.get("state").and_then(Value::as_str), Some("idle"));
+    assert_eq!(
+        snapshot["last_turn"].get("turn_id").and_then(Value::as_str),
+        Some(turn_id.as_str())
+    );
+    assert_eq!(
+        snapshot.get("result_known").and_then(Value::as_bool),
+        Some(true)
+    );
+
+    let committed = stop_agent(&mut scenario.host, &agent_id, 2, false).await;
+    assert_eq!(
+        committed
+            .iter()
+            .map(|(kind, _)| kind.as_str())
+            .collect::<Vec<_>>(),
+        ["session.ended"]
+    );
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    let stderr = scenario.host.shutdown_child().await;
+    assert!(!stderr.contains("panicked"), "plugin stderr: {stderr}");
+
+    let report = scenario.report();
+    assert_eq!(report["session_starts"], json!(0));
+    assert_eq!(report["session_resumes"], json!(1));
+    assert_eq!(report["turn_starts"], json!(1));
+    let _ = std::fs::remove_dir_all(&scenario.root);
+}
+
+async fn scenario_resume_of_gone_session_is_an_explicit_error() {
+    let agent_id = ulid::Ulid::new().to_string();
+    let (resume_from, source_state) = retained_resume_subject(&agent_id);
+    let (pending, rx) = Scenario::setup_start(
+        "resume-gone",
+        muse_profile(),
+        agent_id,
+        2,
+        resume_from,
+        source_state,
+    )
+    .await;
+    let mut attempt = pending.finish_expecting_error(rx, "native_readback").await;
+
+    // Preflight refused the gone session, so the resume was never
+    // dispatched and no Agent session was created.
+    let report = attempt.report();
+    assert_eq!(report["counts"]["session/read"], json!(1));
+    assert_eq!(report["session_starts"], json!(0));
+    assert_eq!(report["session_resumes"], json!(0));
+    assert_eq!(report["turn_starts"], json!(0));
+
+    // The failure is retained like a failed start: the same command replays
+    // it without new native I/O.
+    attempt.retry("native_readback").await;
+    assert_eq!(attempt.report()["counts"]["session/read"], json!(1));
+
+    attempt
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    attempt.host.shutdown_child().await;
+    let _ = std::fs::remove_dir_all(&attempt.root);
+}
+
+async fn scenario_lost_resume_reply_is_unknown_with_one_write() {
+    let agent_id = ulid::Ulid::new().to_string();
+    let (resume_from, source_state) = retained_resume_subject(&agent_id);
+    let (pending, rx) = Scenario::setup_start(
+        "drop-session-resume",
+        muse_profile(),
+        agent_id,
+        2,
+        resume_from,
+        source_state,
+    )
+    .await;
+    let mut attempt = pending.finish_expecting_error(rx, "unknown").await;
+    assert_eq!(attempt.report()["session_resumes"], json!(1));
+
+    // The unknown resume is never dispatched again.
+    attempt.retry("unknown").await;
+    assert_eq!(attempt.report()["session_resumes"], json!(1));
+    assert_eq!(attempt.report()["turn_starts"], json!(0));
+
+    // Tear down through stop like a lost send: the dead host's gap and the
+    // ended batch are acknowledged, then the plugin exits cleanly.
+    let agent_id = attempt.agent_id.clone();
+    stop_agent(&mut attempt.host, &agent_id, 2, true).await;
+    attempt
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    attempt.host.shutdown_child().await;
+    assert_eq!(attempt.report()["session_resumes"], json!(1));
+    let _ = std::fs::remove_dir_all(&attempt.root);
+}
+
+async fn scenario_resume_rejects_stale_generation_1_output() {
+    let agent_id = ulid::Ulid::new().to_string();
+    let (resume_from, source_state) = retained_resume_subject(&agent_id);
+    let mut scenario = Scenario::start_resume(
+        "resume-stale-replay",
+        muse_profile(),
+        agent_id,
+        resume_from,
+        source_state,
+        RETAINED_SESSION,
+    )
+    .await;
+    let agent_id = scenario.agent_id.clone();
+
+    // The old host's generation-1 turn completion is redelivered on the new
+    // generation's stream during the first send: exactly one gap records the
+    // rejection, and the new turn still commits its exact facts.
+    let (send_id, turn_id, committed, gap_reason) =
+        send_turn_with_stale_replay(&mut scenario.host, &agent_id, 2, "Continue the work.").await;
+    assert_eq!(
+        gap_reason,
+        "Muse terminal notification did not match the exact active turn"
+    );
+    assert_ne!(turn_id, RETAINED_TURN);
+    assert_eq!(
+        committed
+            .iter()
+            .map(|(kind, _)| kind.as_str())
+            .collect::<Vec<_>>(),
+        ["turn.started", "message.completed", "turn.completed"]
+    );
+    for (kind, data) in &committed {
+        assert_ne!(
+            data.get("turn_id").and_then(Value::as_str),
+            Some(RETAINED_TURN),
+            "stale turn is never applied to generation 2: {kind}"
+        );
+        assert!(
+            !data
+                .to_string()
+                .contains("Retained reply from the previous generation"),
+            "stale text is never applied to generation 2: {kind}"
+        );
+    }
+    assert_eq!(
+        committed[1].1.get("text").and_then(Value::as_str),
+        Some("Hello from the fake MSP host.")
+    );
+    assert_eq!(
+        committed[2].1.get("status").and_then(Value::as_str),
+        Some("completed")
+    );
+
+    // Readback over the resumed session still proves the exact new terminal
+    // turn; the retained turn never surfaces as a generation-2 fact.
+    let snapshot = scenario
+        .host
+        .call(
+            "agent.snapshot",
+            json!({
+                "agent_id": agent_id,
+                "generation": 2,
+                "command_id": send_id,
+                "turn_id": Value::Null,
+            }),
+        )
+        .await
+        .expect("snapshot");
+    assert_eq!(snapshot.get("state").and_then(Value::as_str), Some("idle"));
+    assert_eq!(
+        snapshot["last_turn"].get("turn_id").and_then(Value::as_str),
+        Some(turn_id.as_str())
+    );
+    assert_eq!(
+        snapshot.get("result_known").and_then(Value::as_bool),
+        Some(true)
+    );
+
+    // The gap latches the session fail-closed: no further input is accepted
+    // on the disputed stream.
+    let fresh = scenario
+        .host
+        .call(
+            "agent.command",
+            json!({
+                "agent_id": agent_id,
+                "generation": 2,
+                "command_id": ulid::Ulid::new().to_string(),
+                "verb": "send",
+                "args": {"text": "After the stale replay."},
+                "turn_id": null,
+                "request_id": null,
+            }),
+        )
+        .await;
+    assert_eq!(fresh, Err("unknown".to_owned()));
+
+    stop_agent(&mut scenario.host, &agent_id, 2, false).await;
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    let stderr = scenario.host.shutdown_child().await;
+    assert!(!stderr.contains("panicked"), "plugin stderr: {stderr}");
+
+    let report = scenario.report();
+    assert_eq!(report["session_starts"], json!(0));
+    assert_eq!(report["session_resumes"], json!(1));
+    assert_eq!(report["turn_starts"], json!(1));
+    let _ = std::fs::remove_dir_all(&scenario.root);
+}
+
+async fn scenario_resume_refuses_served_history_and_keeps_the_retained_id() {
+    let agent_id = ulid::Ulid::new().to_string();
+    let (resume_from, source_state) = retained_resume_subject(&agent_id);
+    let (pending, rx) = Scenario::setup_start(
+        "resume-inline-history",
+        muse_profile(),
+        agent_id,
+        2,
+        resume_from,
+        source_state,
+    )
+    .await;
+    let mut attempt = pending.finish_expecting_error(rx, "unknown").await;
+
+    // `excludeItems: true` was requested but the host served `history.mode:
+    // "inline"`: the resume fails without adopting anything served, exactly
+    // one write happened, and no turn started.
+    let report = attempt.report();
+    assert_eq!(report["session_resumes"], json!(1));
+    assert_eq!(report["turn_starts"], json!(0));
+
+    // The unknown resume is never dispatched again.
+    attempt.retry("unknown").await;
+    assert_eq!(attempt.report()["session_resumes"], json!(1));
+
+    // The retained session id is kept: readback still addresses the exact
+    // retained session, never a served foreign identity.
+    let start_id = attempt
+        .params
+        .get("command_id")
+        .and_then(Value::as_str)
+        .expect("start command id")
+        .to_owned();
+    let agent_id = attempt.agent_id.clone();
+    let snapshot = attempt
+        .host
+        .call(
+            "agent.snapshot",
+            json!({
+                "agent_id": agent_id,
+                "generation": 2,
+                "command_id": start_id,
+                "turn_id": Value::Null,
+            }),
+        )
+        .await
+        .expect("snapshot");
+    assert_eq!(snapshot.get("state").and_then(Value::as_str), Some("idle"));
+    assert_eq!(
+        snapshot.get("native_ref").and_then(Value::as_str),
+        Some(RETAINED_SESSION)
+    );
+
+    stop_agent(&mut attempt.host, &agent_id, 2, false).await;
+    attempt
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    attempt.host.shutdown_child().await;
+    assert_eq!(attempt.report()["session_resumes"], json!(1));
+    let _ = std::fs::remove_dir_all(&attempt.root);
+}
+
+async fn scenario_resume_with_pending_requests_is_refused() {
+    let agent_id = ulid::Ulid::new().to_string();
+    let (resume_from, source_state) = retained_resume_subject(&agent_id);
+    let (pending, rx) = Scenario::setup_start(
+        "resume-pending",
+        muse_profile(),
+        agent_id,
+        2,
+        resume_from,
+        source_state,
+    )
+    .await;
+    let mut attempt = pending.finish_expecting_error(rx, "unsupported").await;
+
+    // The refused resume wrote once and started no turn.
+    let report = attempt.report();
+    assert_eq!(report["session_resumes"], json!(1));
+    assert_eq!(report["turn_starts"], json!(0));
+
+    attempt.retry("unsupported").await;
+    assert_eq!(attempt.report()["session_resumes"], json!(1));
+
+    attempt
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    attempt.host.shutdown_child().await;
+    let _ = std::fs::remove_dir_all(&attempt.root);
 }
