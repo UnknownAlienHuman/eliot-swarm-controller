@@ -163,13 +163,23 @@ pub struct NativeSessionSetReasoningEffortResult {
     pub status: String,
 }
 
-/// `session/setModel` params (SS3.8): reconfigure the session's model; the
-/// profile carries no provider, so only the model id travels.
+/// `session/setModel` params (SS3.8): the model-picker gesture. The
+/// selection is a `ModelSelection` object: the profile carries no provider,
+/// so only the catalog model id travels inside it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeSessionSetModelParams {
     pub command_id: String,
     pub session_id: String,
+    pub model: NativeModelSelection,
+}
+
+/// A model selection (SS3.8, `ModelSelection`): the catalog model id is
+/// required; label, provider routing and profile stay omitted, so the
+/// server default rules for everything but the model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeModelSelection {
     pub model_id: String,
 }
 
@@ -1023,14 +1033,16 @@ mod tests {
         let set_model = NativeSessionSetModelParams {
             command_id: "cmd-3".to_owned(),
             session_id: "session-1".to_owned(),
-            model_id: "muse-test-model".to_owned(),
+            model: NativeModelSelection {
+                model_id: "muse-test-model".to_owned(),
+            },
         };
         assert_eq!(
             serde_json::to_value(&set_model).expect("setModel params serialize"),
             json!({
                 "commandId": "cmd-3",
                 "sessionId": "session-1",
-                "modelId": "muse-test-model",
+                "model": {"modelId": "muse-test-model"},
             })
         );
         let set_approval = NativeSessionSetApprovalModeParams {

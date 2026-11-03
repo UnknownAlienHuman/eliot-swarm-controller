@@ -58,6 +58,8 @@ fn main() {
         println!("ok - invalid profile rejected before spawn");
         scenario_resume_reopens_the_retained_session_in_a_new_generation().await;
         println!("ok - resume reopens the retained session in a new generation");
+        scenario_resume_realigns_drifted_model_and_approval().await;
+        println!("ok - resume realigns a drifted model and approval mode");
         scenario_resume_of_gone_session_is_an_explicit_error().await;
         println!("ok - resume of a gone session is an explicit error");
         scenario_lost_resume_reply_is_unknown_with_one_write().await;
@@ -94,6 +96,8 @@ fn main() {
         println!("ok - interrupt cancels the exact turn");
         scenario_control_interrupt_rejected_after_terminal().await;
         println!("ok - interrupt after terminal is stale");
+        scenario_control_interrupt_stale_retry_reevaluates().await;
+        println!("ok - stale interrupt retry re-evaluates without a slot leak");
         scenario_control_steer_rejected_for_stale_turn().await;
         println!("ok - steer for a stale turn is rejected");
         scenario_control_steer_missing_text_is_invalid().await;
@@ -940,11 +944,16 @@ impl FakeMsp {
                     .unwrap_or_default()
                     .to_owned();
                 let model = params
-                    .get("modelId")
+                    .get("model")
+                    .and_then(|model| model.get("modelId"))
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned();
                 assert!(!model.is_empty(), "setModel names its model");
+                assert!(
+                    params.get("modelId").is_none(),
+                    "setModel carries the model selection object, never a flat modelId"
+                );
                 self.session_model = model;
                 self.reply(
                     stdout,
@@ -3592,6 +3601,61 @@ async fn scenario_control_interrupt_rejected_after_terminal() {
     finish_scenario(scenario, false).await;
 }
 
+/// A stale interrupt refusal consumes no control slot: the exact-command
+/// retry re-evaluates to `stale_turn` instead of replaying a leaked
+/// `Pending` ("already in flight"), with no native I/O on either call.
+async fn scenario_control_interrupt_stale_retry_reevaluates() {
+    let mut scenario = Scenario::start("turn-controls", muse_profile()).await;
+    let agent_id = scenario.agent_id.clone();
+
+    let (_send_id, turn_id, _) =
+        send_parked(&mut scenario.host, &agent_id, 1, "Count the stars.", 0).await;
+    let (_, first, mut committed) = control(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "interrupt",
+        &turn_id,
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        first.expect("interrupt responds")["state"],
+        json!("applied")
+    );
+    drain_turn_completed(&mut scenario.host, &agent_id, 1, &mut committed).await;
+    let stale_id = ulid::Ulid::new().to_string();
+    let (second, committed) = control_with_id(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        &stale_id,
+        "interrupt",
+        &turn_id,
+        json!({}),
+    )
+    .await;
+    assert_eq!(second, Err("stale_turn".to_owned()));
+    assert!(committed.is_empty(), "no batches may commit after terminal");
+    let (retry, committed) = control_with_id(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        &stale_id,
+        "interrupt",
+        &turn_id,
+        json!({}),
+    )
+    .await;
+    assert_eq!(retry, Err("stale_turn".to_owned()));
+    assert!(
+        committed.is_empty(),
+        "the retry re-evaluates without writing"
+    );
+    assert_eq!(scenario.report()["interrupts"], json!(1));
+    finish_scenario(scenario, false).await;
+}
+
 /// Steer against a turn that is not active: rejected locally, nothing
 /// commits, and the native lane is never touched.
 async fn scenario_control_steer_rejected_for_stale_turn() {
@@ -4049,6 +4113,82 @@ async fn scenario_resume_reopens_the_retained_session_in_a_new_generation() {
     assert_eq!(report["session_starts"], json!(0));
     assert_eq!(report["session_resumes"], json!(1));
     assert_eq!(report["turn_starts"], json!(1));
+    let _ = std::fs::remove_dir_all(&scenario.root);
+}
+
+/// Resume realigns a drifted retained session: the fake retains another
+/// model and the server-default approval mode, both different from the
+/// profile, so both setters run, one `session/read` confirms both, and
+/// readiness carries `model_verified` + `approval_verified`.
+async fn scenario_resume_realigns_drifted_model_and_approval() {
+    let agent_id = ulid::Ulid::new().to_string();
+    let (resume_from, source_state) = retained_resume_subject(&agent_id);
+    let mut profile = muse_profile();
+    profile["approval"] = json!("promptUnmatched");
+    let mut scenario = Scenario::start_resume(
+        "resume-realign",
+        profile,
+        agent_id,
+        resume_from,
+        source_state,
+        RETAINED_SESSION,
+    )
+    .await;
+    let agent_id = scenario.agent_id.clone();
+
+    // Both setters ran against the drifted session, and one readback
+    // confirms both (the second `session/read`; the first is the resume
+    // preflight).
+    let report = scenario.report();
+    assert_eq!(report["session_starts"], json!(0));
+    assert_eq!(report["session_resumes"], json!(1));
+    assert_eq!(report["set_models"], json!(1));
+    assert_eq!(report["set_approvals"], json!(1));
+    assert_eq!(report["counts"]["session/read"], json!(2));
+    assert_eq!(
+        scenario.start_result["requested"]["approval"],
+        json!("promptUnmatched")
+    );
+    assert_eq!(
+        scenario.start_result["effective"]["model_verified"],
+        json!(true)
+    );
+    assert_eq!(
+        scenario.start_result["effective"]["approval"],
+        json!("promptUnmatched")
+    );
+    assert_eq!(
+        scenario.start_result["effective"]["approval_verified"],
+        json!(true)
+    );
+
+    // The realigned session runs new input as a clean new turn.
+    let (_send_id, turn_id, committed) =
+        send_turn(&mut scenario.host, &agent_id, 2, "Continue the work.").await;
+    assert_ne!(turn_id, RETAINED_TURN);
+    assert_eq!(
+        committed
+            .iter()
+            .map(|(kind, _)| kind.as_str())
+            .collect::<Vec<_>>(),
+        ["turn.started", "message.completed", "turn.completed"]
+    );
+
+    let stopped = stop_agent(&mut scenario.host, &agent_id, 2, false).await;
+    assert_eq!(
+        stopped
+            .iter()
+            .map(|(kind, _)| kind.as_str())
+            .collect::<Vec<_>>(),
+        ["session.ended"]
+    );
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    let stderr = scenario.host.shutdown_child().await;
+    assert!(!stderr.contains("panicked"), "plugin stderr: {stderr}");
     let _ = std::fs::remove_dir_all(&scenario.root);
 }
 

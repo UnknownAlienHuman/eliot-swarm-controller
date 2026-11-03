@@ -7,8 +7,8 @@ use crate::{
             NativeApprovalListPendingParams, NativeApprovalListPendingResult,
             NativeClientCapabilities, NativeClientInfo, NativeInitializeParams,
             NativeInitializeResult, NativeItemCompletedNotification, NativeModelCatalogEntry,
-            NativeModelEffortVariants, NativeModelListParams, NativeModelListResult, NativeSession,
-            NativeSessionReadParams, NativeSessionReadResult,
+            NativeModelEffortVariants, NativeModelListParams, NativeModelListResult,
+            NativeModelSelection, NativeSession, NativeSessionReadParams, NativeSessionReadResult,
             NativeSessionReasoningEffortChangedNotification, NativeSessionResumeParams,
             NativeSessionResumeResult, NativeSessionSetApprovalModeParams,
             NativeSessionSetApprovalModeResult, NativeSessionSetModelParams,
@@ -754,7 +754,9 @@ impl MusePlugin {
             let model_params = NativeSessionSetModelParams {
                 command_id: model_command.clone(),
                 session_id: native_session.session_id.clone(),
-                model_id: requested_model.clone(),
+                model: NativeModelSelection {
+                    model_id: requested_model.clone(),
+                },
             };
             let model_value = serde_json::to_value(model_params).map_err(|_| {
                 Error::new(
@@ -1443,6 +1445,7 @@ impl MusePlugin {
             return Ok(result);
         }
         if session.phase == SessionPhase::Stopped {
+            abandon_control(session, &params.command_id);
             return Err(Error::new(
                 "bad_state",
                 "Muse plugin is stopping; no further input is accepted",
@@ -1461,6 +1464,7 @@ impl MusePlugin {
             }
         };
         if !live {
+            abandon_control(session, &params.command_id);
             return Err(Error::new(
                 "stale_turn",
                 "Muse turn/cancel does not match the exact active turn",
@@ -2532,6 +2536,15 @@ fn settle_control(session: &mut AgentSession, command_id: &str, outcome: Control
     if let Some(command) = session.control_commands.get_mut(command_id) {
         command.outcome = outcome;
     }
+}
+
+/// Drop a control entry `control_replay` inserted before any native write.
+/// A deterministic pre-write refusal (stale turn, stopping host) proves no
+/// write happened, so the entry is removed instead of settled: the exact
+/// command re-evaluates on retry (no stale `Pending` "already in flight"),
+/// and refusals consume none of the 32 per-generation slots.
+fn abandon_control(session: &mut AgentSession, command_id: &str) {
+    session.control_commands.remove(command_id);
 }
 
 fn validate_binding(session: &AgentSession, agent_id: &str, generation: i64) -> Result<()> {
