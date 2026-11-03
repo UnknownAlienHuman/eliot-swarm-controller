@@ -296,9 +296,11 @@ static SWEEP_ENUMERATIONS: AtomicUsize = AtomicUsize::new(0);
 static SWEEP_FAIL_FORCED: AtomicBool = AtomicBool::new(false);
 
 /// Serializes tests that count enumerations or force scan failure. Test
-/// threads otherwise race on the shared counter and on `/proc` itself.
+/// threads otherwise race on the shared counter and on `/proc` itself. Async
+/// tests hold it across awaits, so this is an async-aware mutex; synchronous
+/// tests use `blocking_lock` outside any runtime.
 #[cfg(all(test, target_os = "linux"))]
-pub(crate) static SWEEP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static SWEEP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) fn test_sweep_enumerations() -> usize {
@@ -1090,7 +1092,7 @@ mod linux_process_stat_tests {
 
     #[test]
     fn shared_sweep_enumerates_host_once() {
-        let _lock = SWEEP_TEST_LOCK.lock().unwrap();
+        let _lock = SWEEP_TEST_LOCK.blocking_lock();
         let sweep =
             enumerate_process_sweep().expect("a shared sweep enumerates host processes once");
         assert!(
@@ -1124,7 +1126,7 @@ mod linux_process_stat_tests {
 
     #[test]
     fn shared_sweep_serves_two_groups_with_single_enumeration() {
-        let _lock = SWEEP_TEST_LOCK.lock().unwrap();
+        let _lock = SWEEP_TEST_LOCK.blocking_lock();
         let group_a = TestSleepGroup::spawn().expect("spawn group A leader");
         let group_b = TestSleepGroup::spawn().expect("spawn group B leader");
         let observer_a = observer_for(&group_a);
@@ -1167,7 +1169,7 @@ mod linux_process_stat_tests {
 
     #[test]
     fn dead_group_pays_no_scan_and_keeps_no_members() {
-        let _lock = SWEEP_TEST_LOCK.lock().unwrap();
+        let _lock = SWEEP_TEST_LOCK.blocking_lock();
         let mut group = TestSleepGroup::spawn().expect("spawn group leader");
         let pid = group.pid();
         let observer = observer_for(&group);

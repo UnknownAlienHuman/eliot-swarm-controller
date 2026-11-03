@@ -2002,7 +2002,7 @@ mod tests {
         let group_b = TestSleepGroup::spawn().expect("spawn group B leader");
         let agent_b = attach_sweep_target(&monitoring, &store, "sweep-fail-b", group_b.pid()).await;
 
-        let _lock = SWEEP_TEST_LOCK.lock().unwrap();
+        let _lock = SWEEP_TEST_LOCK.lock().await;
         test_reset_sweep_enumerations();
         let _forced = ForcedSweepFailure::arm();
         monitoring.sample_all_sweep(captured).await;
@@ -2065,7 +2065,7 @@ mod tests {
             );
         }
 
-        let _lock = SWEEP_TEST_LOCK.lock().unwrap();
+        let _lock = SWEEP_TEST_LOCK.lock().await;
         test_reset_sweep_enumerations();
         monitoring.sample_all_sweep(all).await;
         assert_eq!(
@@ -2111,7 +2111,7 @@ mod tests {
             .collect();
         assert_eq!(all.len(), 2);
 
-        let _lock = SWEEP_TEST_LOCK.lock().unwrap();
+        let _lock = SWEEP_TEST_LOCK.lock().await;
         test_reset_sweep_enumerations();
         monitoring.sample_all_sweep(all).await;
         assert_eq!(
