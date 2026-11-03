@@ -1110,7 +1110,12 @@ fn muse_snapshot_from_entry(
         None => Vec::new(),
     };
     let cmd = match entry.cmd.as_deref() {
-        Some(cmd) => validate_cmd(name, cmd, source, table_offset)?,
+        Some(cmd) => reject_script_wrapper(
+            name,
+            validate_cmd(name, cmd, source, table_offset)?,
+            source,
+            table_offset,
+        )?,
         None => {
             return Err(profile_field_error(
                 source,
@@ -1443,6 +1448,28 @@ fn validate_pass_env(
     }
     Ok(out)
 }
+/// The Muse plugin stops its host by PID, so a script wrapper would leave the
+/// real `muse serve` running; Codex lives in an Agent Job that ends the tree.
+fn reject_script_wrapper(
+    profile: &str,
+    cmd: String,
+    source: &str,
+    offset: usize,
+) -> core::Result<String> {
+    let lower = cmd.to_ascii_lowercase();
+    if lower.ends_with(".cmd") || lower.ends_with(".bat") || lower.ends_with(".ps1") {
+        return Err(profile_field_error(
+            source,
+            offset,
+            profile,
+            "cmd",
+            "must name one native executable path, not a .cmd/.bat/.ps1 wrapper",
+            "profile_error",
+        ));
+    }
+    Ok(cmd)
+}
+
 fn validate_cmd(profile: &str, cmd: &str, source: &str, offset: usize) -> core::Result<String> {
     let cmd = cmd.trim();
     if cmd.is_empty() || cmd.len() > MAX_CMD_LEN {
@@ -1458,18 +1485,6 @@ fn validate_cmd(profile: &str, cmd: &str, source: &str, offset: usize) -> core::
     const BACKSLASH: char = '\\';
     let file = cmd.rsplit(['/', BACKSLASH]).next().unwrap_or(cmd);
     let lower = file.to_ascii_lowercase();
-    // Script wrappers resolve to a launcher PID that would orphan the real
-    // native host on stop; only a native binary keeps PID custody exact.
-    if lower.ends_with(".cmd") || lower.ends_with(".bat") || lower.ends_with(".ps1") {
-        return Err(profile_field_error(
-            source,
-            offset,
-            profile,
-            "cmd",
-            "must name one native executable path, not a .cmd/.bat/.ps1 wrapper",
-            "profile_error",
-        ));
-    }
     let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
     const SHELLS: &[&str] = &[
         "sh",
@@ -2529,7 +2544,8 @@ pass_env = ["EXAMPLE_API_KEY"]
     }
 
     #[test]
-    fn script_wrapper_cmd_is_rejected_for_codex_too() {
+    fn codex_keeps_accepting_script_wrapper_cmds() {
+        // Codex custody is the Agent Job, which ends the whole tree on stop.
         for cmd in [
             "C:/Tools/Codex/codex.cmd",
             "codex.bat",
@@ -2538,8 +2554,9 @@ pass_env = ["EXAMPLE_API_KEY"]
             let source = format!(
                 "[profiles.codex-luna]\nharness='codex'\nmodel='gpt-6-luna'\ncmd='{cmd}'\n"
             );
-            let error = resolve_text_profile(&source, "codex-luna").expect_err("must reject");
-            assert_eq!(error.code, "profile_error", "{source}");
+            let snapshot =
+                resolve_text_profile(&source, "codex-luna").expect("codex accepts wrappers");
+            assert_eq!(snapshot["cmd"], cmd, "{source}");
         }
         let source = "[profiles.codex-luna]\nharness='codex'\nmodel='gpt-6-luna'\ncmd='C:/Tools/Codex/codex.exe'\n";
         let snapshot = resolve_text_profile(source, "codex-luna").unwrap();
