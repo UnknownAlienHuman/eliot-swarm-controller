@@ -283,7 +283,7 @@ pub struct GoalView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_round_key: Option<String>,
     /// Live in-flight round if any, else the latest unknown marker of this
-    /// revision. Absent when no round is unresolved.
+    /// generation. Absent when no round is unresolved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub round_marker: Option<GoalRoundMarker>,
     pub updated_at: i64,

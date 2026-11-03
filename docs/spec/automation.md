@@ -804,7 +804,7 @@ observed. Before work, the round reads Agent state, pending requests, source
 health and unknown gates, and refuses unless the Agent is cleanly idle at that
 key: idle state, no active turn, no pending requests, every open harness
 source healthy (`daemon`/`os`/`git`/`workspace_process` monitors stay
-advisory), no unknown command, no open command, and the key names a real event
+advisory), no unknown command, no open command, and the key names an idle event
 of that Agent generation and is still its latest. A turn budget already spent
 outside any round blocks without running the check.
 

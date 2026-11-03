@@ -360,21 +360,30 @@ impl Router {
     }
 
     /// Burn a claimed round key without committing any outcome. Best
-    /// effort: abandon only fails when the Store writer is already faulted,
-    /// which fails loudly on the next use either way.
+    /// effort, but a failure is logged: abandon only fails when the Store
+    /// writer is already faulted, which fails loudly on the next use either
+    /// way.
     async fn abandon_goal_round(
         &self,
         request: &GoalRoundRequest,
         probe: &eliot_store::GoalRoundProbe,
     ) {
-        let _ = self.inner.store.lock().await.goal_abandon_round(
+        if let Err(error) = self.inner.store.lock().await.goal_abandon_round(
             &request.agent,
             request.mode.as_str(),
             probe.view.generation,
             probe.view.revision,
             request.idle_seq,
             now_ms(),
-        );
+        ) {
+            let policy = self.secret_policy_snapshot();
+            crate::logging::record(
+                &policy,
+                "daemon.goal_abandon_failed",
+                &[("agent", &request.agent)],
+                Some(&error),
+            );
+        }
     }
 
     async fn commit_goal_round(
@@ -387,14 +396,22 @@ impl Router {
             let result = match store.goal_commit_round(&commit, now_ms()) {
                 Ok(result) => result,
                 Err(error) => {
-                    let _ = store.goal_abandon_round(
+                    if let Err(abandon) = store.goal_abandon_round(
                         &commit.agent,
                         &commit.mode,
                         commit.expected_generation,
                         commit.expected_revision,
                         commit.round_key,
                         now_ms(),
-                    );
+                    ) {
+                        let policy = self.secret_policy_snapshot();
+                        crate::logging::record(
+                            &policy,
+                            "daemon.goal_abandon_failed",
+                            &[("agent", &commit.agent)],
+                            Some(&abandon),
+                        );
+                    }
                     return Err(error);
                 }
             };

@@ -202,10 +202,11 @@ impl Store {
         {
             return Err(Error::new("busy", "goal round already in flight"));
         }
+        // The burn ignores revision: pause/clear/resume bump it but never
+        // unburn an unknown round key of this generation.
         if markers.iter().any(|marker| {
             marker.round_key == idle_seq
                 && marker.generation == row.generation
-                && marker.revision == row.revision
                 && !marker.is_live(&self.goal_holder)
         }) {
             return Err(Error::new("stale_round", "goal round key was already used"));
@@ -214,7 +215,7 @@ impl Store {
         {
             return Err(Error::new(
                 "stale_round",
-                "round key does not name an event of this Agent generation",
+                "round key does not name an idle event of this Agent generation",
             ));
         }
         let view = self.goal_view(row)?;
@@ -678,12 +679,12 @@ impl Store {
         {
             return Err(Error::new("busy", "goal round already in flight"));
         }
+        // The burn ignores revision: pause/clear/resume bump it but never
+        // unburn an unknown round key of this generation.
         if row.last_round_key.as_deref() == Some(&round_key_text(idle_seq))
-            || markers.iter().any(|marker| {
-                marker.round_key == idle_seq
-                    && marker.generation == row.generation
-                    && marker.revision == row.revision
-            })
+            || markers
+                .iter()
+                .any(|marker| marker.round_key == idle_seq && marker.generation == row.generation)
         {
             return Err(Error::new("stale_round", "goal round key was already used"));
         }
@@ -717,7 +718,7 @@ impl Store {
         if !round_key_names_generation_event(&tx, agent_num, row.generation, idle_seq)? {
             return Err(Error::new(
                 "stale_round",
-                "round key does not name an event of this Agent generation",
+                "round key does not name an idle event of this Agent generation",
             ));
         }
         if max_agent_seq_tx(&tx, agent_num, row.generation)? != idle_seq {
@@ -829,7 +830,7 @@ impl Store {
         if !round_key_names_generation_event(&tx, agent_num, row.generation, commit.round_key)? {
             return Err(Error::new(
                 "stale_round",
-                "round key does not name an event of this Agent generation",
+                "round key does not name an idle event of this Agent generation",
             ));
         }
         if max_agent_seq_tx(&tx, agent_num, row.generation)? != commit.round_key {
@@ -1018,7 +1019,6 @@ fn round_key_text(seq: i64) -> String {
 #[derive(Clone, Debug)]
 struct GoalMarkerRow {
     generation: i64,
-    revision: i64,
     round_key: i64,
     holder: String,
     state: String,
@@ -1034,8 +1034,8 @@ impl GoalMarkerRow {
 
 impl Store {
     /// Render one Goal row with a live turn count and its unresolved round
-    /// marker (the live in-flight round if any, else this revision's latest
-    /// unknown marker).
+    /// marker (the live in-flight round if any, else this generation's
+    /// latest unknown marker).
     fn goal_view(&self, row: GoalRow) -> Result<GoalView> {
         let turn_count = count_turns(&self.connection, row.agent_num, row.generation)?;
         let mut counters = row.state.counters.clone();
@@ -1048,7 +1048,6 @@ impl Store {
             row.agent_num,
             &row.mode,
             row.generation,
-            row.revision,
         )?;
         Ok(GoalView {
             agent: format!("a{}", row.agent_num),
@@ -1072,15 +1071,15 @@ impl Store {
     }
 }
 
-/// The live in-flight marker if one exists, else this revision's latest
-/// unknown marker (crashed `running` rows read as `unknown`).
+/// The live in-flight marker if one exists, else this generation's
+/// latest unknown marker (crashed `running` rows read as `unknown`).
+/// Revision bumps never hide it.
 fn display_goal_marker(
     connection: &Connection,
     holder: &str,
     agent_num: i64,
     mode: &str,
     generation: i64,
-    revision: i64,
 ) -> Result<Option<GoalRoundMarker>> {
     let live: Option<(i64, i64, i64, i64)> = connection
         .query_row(
@@ -1101,24 +1100,26 @@ fn display_goal_marker(
             updated_at,
         }));
     }
-    let burned: Option<(i64, i64)> = connection
+    let burned: Option<(i64, i64, i64)> = connection
         .query_row(
-            "SELECT round_key, updated_at FROM goal_markers
-             WHERE agent = ?1 AND mode = ?2 AND generation = ?3 AND revision = ?4
-               AND (state = 'unknown' OR holder <> ?5)
+            "SELECT round_key, revision, updated_at FROM goal_markers
+             WHERE agent = ?1 AND mode = ?2 AND generation = ?3
+               AND (state = 'unknown' OR holder <> ?4)
              ORDER BY updated_at DESC, round_key DESC LIMIT 1",
-            params![agent_num, mode, generation, revision, holder],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            params![agent_num, mode, generation, holder],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()
         .map_err(sql_error)?;
-    Ok(burned.map(|(round_key, updated_at)| GoalRoundMarker {
-        round_key: round_key_text(round_key),
-        generation,
-        revision,
-        state: GoalMarkerState::Unknown,
-        updated_at,
-    }))
+    Ok(
+        burned.map(|(round_key, revision, updated_at)| GoalRoundMarker {
+            round_key: round_key_text(round_key),
+            generation,
+            revision,
+            state: GoalMarkerState::Unknown,
+            updated_at,
+        }),
+    )
 }
 
 fn load_goal_markers(
@@ -1128,7 +1129,7 @@ fn load_goal_markers(
 ) -> Result<Vec<GoalMarkerRow>> {
     let mut statement = connection
         .prepare(
-            "SELECT generation, revision, round_key, holder, state
+            "SELECT generation, round_key, holder, state
              FROM goal_markers WHERE agent = ?1 AND mode = ?2",
         )
         .map_err(sql_error)?;
@@ -1136,10 +1137,9 @@ fn load_goal_markers(
         .query_map(params![agent_num, mode], |row| {
             Ok(GoalMarkerRow {
                 generation: row.get(0)?,
-                revision: row.get(1)?,
-                round_key: row.get(2)?,
-                holder: row.get(3)?,
-                state: row.get(4)?,
+                round_key: row.get(1)?,
+                holder: row.get(2)?,
+                state: row.get(3)?,
             })
         })
         .map_err(sql_error)?
@@ -1154,7 +1154,7 @@ fn load_goal_markers_tx(
 ) -> Result<Vec<GoalMarkerRow>> {
     let mut statement = tx
         .prepare(
-            "SELECT generation, revision, round_key, holder, state
+            "SELECT generation, round_key, holder, state
              FROM goal_markers WHERE agent = ?1 AND mode = ?2",
         )
         .map_err(sql_error)?;
@@ -1162,10 +1162,9 @@ fn load_goal_markers_tx(
         .query_map(params![agent_num, mode], |row| {
             Ok(GoalMarkerRow {
                 generation: row.get(0)?,
-                revision: row.get(1)?,
-                round_key: row.get(2)?,
-                holder: row.get(3)?,
-                state: row.get(4)?,
+                round_key: row.get(1)?,
+                holder: row.get(2)?,
+                state: row.get(3)?,
             })
         })
         .map_err(sql_error)?
@@ -1182,7 +1181,7 @@ fn load_goal_marker_tx(
     round_key: i64,
 ) -> Result<Option<GoalMarkerRow>> {
     tx.query_row(
-        "SELECT generation, revision, round_key, holder, state
+        "SELECT generation, round_key, holder, state
          FROM goal_markers
          WHERE agent = ?1 AND mode = ?2 AND generation = ?3 AND revision = ?4
            AND round_key = ?5",
@@ -1190,10 +1189,9 @@ fn load_goal_marker_tx(
         |row| {
             Ok(GoalMarkerRow {
                 generation: row.get(0)?,
-                revision: row.get(1)?,
-                round_key: row.get(2)?,
-                holder: row.get(3)?,
-                state: row.get(4)?,
+                round_key: row.get(1)?,
+                holder: row.get(2)?,
+                state: row.get(3)?,
             })
         },
     )
@@ -1201,8 +1199,9 @@ fn load_goal_marker_tx(
     .map_err(sql_error)
 }
 
-/// The round key must name a real event of this Agent generation, not just
-/// equal its latest seq (which is vacuously true at 0 with no events).
+/// The round key must name an idle event of this Agent generation: the
+/// event-time subject snapshot shows the Agent idle. A missing row, a row
+/// of another Agent/generation, or a non-idle subject is a stale key.
 fn round_key_names_generation_event(
     connection: &Connection,
     agent_num: i64,
@@ -1211,17 +1210,35 @@ fn round_key_names_generation_event(
 ) -> Result<bool> {
     connection
         .query_row(
-            "SELECT agent, generation FROM events WHERE seq = ?1",
+            "SELECT agent, generation, subject FROM events WHERE seq = ?1",
             params![seq],
-            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
         )
         .optional()
         .map_err(sql_error)
         .map(|found| {
-            found.is_some_and(|(agent, row_generation)| {
-                agent == Some(agent_num) && row_generation == Some(generation)
+            found.is_some_and(|(agent, row_generation, subject)| {
+                agent == Some(agent_num)
+                    && row_generation == Some(generation)
+                    && subject_is_idle(subject.as_deref())
             })
         })
+}
+
+/// An event-time subject snapshot proves the Agent was idle at that
+/// event. A missing or unreadable subject proves nothing.
+fn subject_is_idle(subject: Option<&str>) -> bool {
+    subject.is_some_and(|text| {
+        serde_json::from_str::<EventSubject>(text)
+            .map(|subject| subject.state == AgentState::Idle)
+            .unwrap_or(false)
+    })
 }
 
 fn load_goal_row(connection: &Connection, agent_num: i64, mode: &str) -> Result<Option<GoalRow>> {

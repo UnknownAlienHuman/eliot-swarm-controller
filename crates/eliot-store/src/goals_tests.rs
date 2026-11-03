@@ -487,8 +487,9 @@ fn goal_probe_reports_unhealthy_harness_sources_and_pending_requests() {
     store
         .set_process_source_status(&agent, 1, "stale", false, now + 2)
         .expect("mark monitor stale");
+    let idle_key = store.high_water().unwrap();
     let probe = store
-        .goal_round_probe(&agent, "eliot", store.high_water().unwrap(), now + 3)
+        .goal_round_probe(&agent, "eliot", idle_key, now + 3)
         .unwrap();
     assert!(probe.unhealthy_sources.is_empty());
     store
@@ -526,8 +527,17 @@ fn goal_probe_reports_unhealthy_harness_sources_and_pending_requests() {
             now + 5,
         )
         .expect("open request");
+    // The open request left a non-idle latest event: it cannot be a
+    // round key. The older idle key still probes the live facts.
+    assert_eq!(
+        store
+            .goal_round_probe(&agent, "eliot", store.high_water().unwrap(), now + 6)
+            .unwrap_err()
+            .code,
+        "stale_round"
+    );
     let probe = store
-        .goal_round_probe(&agent, "eliot", store.high_water().unwrap(), now + 6)
+        .goal_round_probe(&agent, "eliot", idle_key, now + 6)
         .unwrap();
     assert_eq!(probe.agent_state, AgentState::Waiting);
     assert_eq!(probe.active_turn.as_deref(), Some("turn-1"));
@@ -771,14 +781,32 @@ fn goal_commit_refuses_revision_and_event_drift() {
         .goal_abandon_round(&agent, "eliot", 1, view.revision, key, now + 3)
         .unwrap();
     let current = store.goal_get(&agent, "eliot").unwrap().unwrap();
-    claim(&mut store, &agent, current.revision, key, now + 4);
+    // The abandoned key stays burned across pause → resume: it can never
+    // be claimed again, at any revision. Event drift is tested below on a
+    // fresh key instead.
+    assert_eq!(
+        store
+            .goal_claim_round(&agent, "eliot", key, current.revision, now + 4)
+            .unwrap_err()
+            .code,
+        "stale_round"
+    );
+    let fresh_send = send_request(&agent, "advance the key");
+    let fresh_id = fresh_send.id.clone();
+    store
+        .submit("owner", fresh_send, now + 4)
+        .expect("admit send");
+    complete_send(&mut store, &agent, &fresh_id, "turn-drift-0", now + 4);
+    let fresh = store.high_water().unwrap();
+    assert!(fresh > key);
+    claim(&mut store, &agent, current.revision, fresh, now + 5);
     let late = send_request(&agent, "late input");
     let late_id = late.id.clone();
     store
-        .submit("owner", late, now + 4)
+        .submit("owner", late, now + 6)
         .expect("admit late send");
     store
-        .dispatch(&late_id, now + 4)
+        .dispatch(&late_id, now + 6)
         .expect("dispatch late send");
     store
         .put_batch(
@@ -788,21 +816,21 @@ fn goal_commit_refuses_revision_and_event_drift() {
                 "turn.started",
                 json!({"command_id": late_id, "turn_id": "turn-9"}),
             ),
-            now + 4,
+            now + 6,
         )
         .expect("commit late event");
-    assert!(store.high_water().unwrap() > key);
+    assert!(store.high_water().unwrap() > fresh);
     let stale_key = commit_for(
         &agent,
         current.revision,
-        key,
+        fresh,
         Some(passed_check()),
         None,
         None,
     );
     assert_eq!(
         store
-            .goal_commit_round(&stale_key, now + 5)
+            .goal_commit_round(&stale_key, now + 7)
             .unwrap_err()
             .code,
         "stale_round"
@@ -1523,4 +1551,111 @@ fn goal_commit_refuses_a_check_without_an_exit_code() {
     let current = store.goal_get(&agent, "eliot").unwrap().unwrap();
     assert_eq!(current.counters.rounds, 0);
     assert!(current.last_round_key.is_none());
+}
+
+#[test]
+fn goal_burned_key_survives_pause_and_resume() {
+    let path = goal_crash_store_path();
+    let now = now_ms();
+    let (agent, key) = {
+        let mut store = Store::open(&path).expect("open file Store");
+        let agent = ready_agent(&mut store, "goal-pause-burn", now);
+        let view = store
+            .goal_set(&agent, "eliot", &definition("green"), now)
+            .unwrap();
+        let key = store.high_water().unwrap();
+        claim(&mut store, &agent, view.revision, key, now);
+        // Crash: the handle drops with the marker `running`.
+        (agent, key)
+    };
+    let mut store = Store::open(&path).expect("reopen file Store");
+    store.goal_pause(&agent, "eliot", None, now + 1).unwrap();
+    let resumed = store.goal_resume(&agent, "eliot", now + 2).unwrap();
+    assert_eq!(resumed.status, GoalStatus::Active);
+    // The crashed key stays burned at the new revision: refused at probe
+    // AND claim, and still visible in `goal show`.
+    assert_eq!(
+        store
+            .goal_round_probe(&agent, "eliot", key, now + 3)
+            .unwrap_err()
+            .code,
+        "stale_round"
+    );
+    assert_eq!(
+        store
+            .goal_claim_round(&agent, "eliot", key, resumed.revision, now + 3)
+            .unwrap_err()
+            .code,
+        "stale_round"
+    );
+    let shown = store.goal_get(&agent, "eliot").unwrap().unwrap();
+    let marker = shown.round_marker.expect("burned key stays visible");
+    assert_eq!(marker.state, GoalMarkerState::Unknown);
+    assert_eq!(marker.round_key, format!("idle:{key}"));
+    remove_goal_crash_store_files(&path);
+}
+
+#[test]
+fn goal_round_key_must_name_an_idle_event() {
+    let mut store = store();
+    let now = now_ms();
+    let agent = ready_agent(&mut store, "goal-idle-key", now);
+    store
+        .goal_set(&agent, "eliot", &definition("green"), now)
+        .unwrap();
+    // Start a turn and leave it open: the latest event names a busy Agent.
+    let send = send_request(&agent, "leave a turn open");
+    let send_id = send.id.clone();
+    store.submit("owner", send, now + 1).expect("admit send");
+    store.dispatch(&send_id, now + 1).expect("dispatch send");
+    store
+        .put_batch(
+            native_batch(
+                &agent,
+                1,
+                "turn.started",
+                json!({"command_id": send_id, "turn_id": "turn-busy-1"}),
+            ),
+            now + 1,
+        )
+        .expect("start turn");
+    let key = store.high_water().unwrap();
+    let subject: String = store
+        .connection
+        .query_row("SELECT subject FROM events WHERE seq = ?1", [key], |row| {
+            row.get(0)
+        })
+        .expect("read latest event subject");
+    assert!(
+        !subject.contains("\"state\":\"idle\""),
+        "latest event must be non-idle: {subject}"
+    );
+    assert_eq!(
+        store
+            .goal_round_probe(&agent, "eliot", key, now + 2)
+            .unwrap_err()
+            .code,
+        "stale_round"
+    );
+    // Completing the turn leaves an idle latest event: the probe passes.
+    store
+        .put_batch(
+            native_batch(
+                &agent,
+                1,
+                "turn.completed",
+                json!({"command_id": send_id, "turn_id": "turn-busy-1",
+                    "status": "completed"}),
+            ),
+            now + 3,
+        )
+        .expect("complete turn");
+    store
+        .settle(&send_id, CommandState::Applied, None, now + 3)
+        .expect("settle send");
+    let fresh = store.high_water().unwrap();
+    assert!(fresh > key);
+    store
+        .goal_round_probe(&agent, "eliot", fresh, now + 4)
+        .expect("idle latest event probes");
 }
