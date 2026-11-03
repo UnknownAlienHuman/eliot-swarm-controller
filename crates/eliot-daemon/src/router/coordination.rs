@@ -165,7 +165,9 @@ impl Router {
     /// Offer one generic wake to a routed recipient. Every gate — disabled
     /// flag, no live plugin owner, the Store's atomic claim, or the ordinary
     /// send admission (provider hold, drain, unknown gates) — skips the
-    /// notice; a skipped wake never fails the queued delivery.
+    /// notice; a skipped wake never fails the queued delivery. When the
+    /// claimed `send` is not admitted, the claim is released so the failure
+    /// does not consume the notice cooldown.
     async fn wake_recipient(&self, recipient: &str) {
         let snapshot = {
             let store = self.inner.store.lock().await;
@@ -203,7 +205,10 @@ impl Router {
             "expected_generation": claim.generation,
             "args": {"text": notice_text(claim.unread)},
         });
-        let _ = self.submit(&params, &Principal::Owner).await;
+        if self.submit(&params, &Principal::Owner).await.is_err() {
+            let mut store = self.inner.store.lock().await;
+            let _ = store.mail_notice_release(recipient, &notice_id);
+        }
     }
 }
 

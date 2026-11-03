@@ -273,6 +273,17 @@ impl Store {
         )
     }
 
+    /// Release a claimed wake whose notice command was never admitted, so a
+    /// failed `send` does not consume the notice cooldown. Only clears when
+    /// the stored open command still names this notice; a newer claim is
+    /// never disturbed.
+    pub fn mail_notice_release(&mut self, recipient: &str, notice_command: &str) -> Result<()> {
+        self.ensure_writer_healthy()?;
+        let result = self.mail_notice_release_inner(recipient, notice_command);
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
     fn resolve_mailbox(&self, principal: &str, agent: Option<&str>) -> Result<i64> {
         match parse_sender(principal)? {
             Sender::Owner => {
@@ -291,11 +302,24 @@ impl Store {
                 }
                 Ok(num)
             }
-            Sender::Agent { num, id, .. } => {
+            Sender::Agent {
+                num,
+                id,
+                generation,
+            } => {
                 if agent.is_some_and(|mailbox| mailbox != id) {
                     return Err(Error::new(
                         "not_allowed",
                         "Agents read only their own mailbox",
+                    ));
+                }
+                let current = load_agent_by_num(&self.connection, num)?.ok_or_else(|| {
+                    Error::new("stale_generation", "Agent generation is no longer current")
+                })?;
+                if current.generation != generation {
+                    return Err(Error::new(
+                        "stale_generation",
+                        "Agent generation is no longer current",
                     ));
                 }
                 Ok(num)
@@ -310,6 +334,20 @@ impl Store {
         write: bool,
     ) -> Result<VarScope> {
         let sender = parse_sender(principal)?;
+        if let Sender::Agent {
+            num, generation, ..
+        } = &sender
+        {
+            let current = load_agent_by_num(&self.connection, *num)?.ok_or_else(|| {
+                Error::new("stale_generation", "Agent generation is no longer current")
+            })?;
+            if current.generation != *generation {
+                return Err(Error::new(
+                    "stale_generation",
+                    "Agent generation is no longer current",
+                ));
+            }
+        }
         let resolved = match (scope, &sender) {
             (Some(scope), _) => parse_var_scope(scope)?,
             (None, Sender::Agent { num, .. }) => {
@@ -500,7 +538,7 @@ impl Store {
             }
             let bytes: i64 = tx
                 .query_row(
-                    "SELECT COALESCE(SUM(LENGTH(text)), 0) FROM messages
+                    "SELECT COALESCE(SUM(LENGTH(CAST(text AS BLOB))), 0) FROM messages
                      WHERE recipient = ?1 AND read_at IS NULL",
                     params![num],
                     |row| row.get(0),
@@ -760,23 +798,33 @@ impl Store {
         }
         validate_id_age(&request.id, now)?;
 
-        let current: Option<i64> = tx
+        let current: Option<(String, i64)> = tx
             .query_row(
-                "SELECT version FROM vars WHERE scope = ?1 AND key = ?2",
+                "SELECT value, version FROM vars WHERE scope = ?1 AND key = ?2",
                 params![encoded_scope, request.key],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(sql_error)?;
-        let current = current.unwrap_or(0);
+        let (current_value, current) = match current {
+            Some((value, version)) => (Some(value), version),
+            None => (None, 0),
+        };
         if request
             .expect_version
             .is_some_and(|expected| expected != current)
         {
-            return Err(Error::new(
-                "version_conflict",
-                "variable version does not match the expectation",
-            ));
+            let mut message = format!(
+                "variable version does not match the expectation (current version: {current}"
+            );
+            if let Some(value) = current_value.as_deref()
+                && value.len() <= eliot_core::api::MAX_VAR_VALUE_BYTES
+            {
+                message.push_str(", value: ");
+                message.push_str(value);
+            }
+            message.push(')');
+            return Err(Error::new("version_conflict", message));
         }
         let version = current + 1;
         db!(tx.execute(
@@ -954,6 +1002,20 @@ impl Store {
             unread,
             generation: agent.generation,
         }))
+    }
+
+    fn mail_notice_release_inner(&mut self, recipient: &str, notice_command: &str) -> Result<()> {
+        let num = parse_agent_id(recipient)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        db!(tx.execute(
+            "DELETE FROM mail_notices WHERE recipient = ?1 AND open_notice_command = ?2",
+            params![num, notice_command],
+        ));
+        commit_transaction(tx, &self.write_faulted)?;
+        Ok(())
     }
 }
 
@@ -1185,6 +1247,99 @@ mod tests {
     }
 
     #[test]
+    fn mail_inbox_truncates_large_pages_within_byte_bound() {
+        let mut store = store();
+        let now = now_ms();
+        let a = ready_agent(&mut store, "app", now);
+        let principal = agent_principal(&a);
+        // 50 messages of 32 KiB each: 1.6 MiB total, well under the 10 MiB
+        // mailbox bound but over the 900 KiB page bound.
+        let text = "y".repeat(32 * 1024);
+        for _ in 0..50 {
+            store
+                .mail_send("owner", &send_request(vec![a.clone()], &text), now)
+                .expect("queue large mail");
+        }
+        assert_eq!(unread(&store, &a), 50);
+        let first = store
+            .mail_inbox(
+                &principal,
+                &MailInboxRequest {
+                    agent: None,
+                    limit: Some(100),
+                    after: None,
+                },
+            )
+            .expect("read truncated inbox");
+        // The page fits the byte bound and keeps `next` on its last row.
+        assert!(
+            first.deliveries.len() < 50,
+            "expected truncation, got {}",
+            first.deliveries.len()
+        );
+        let encoded = serde_json::to_string(&first.deliveries).expect("encode page");
+        assert!(
+            encoded.len() <= 900 * 1024,
+            "page exceeds 900 KiB: {}",
+            encoded.len()
+        );
+        assert_eq!(
+            first.next,
+            Some(
+                first
+                    .deliveries
+                    .last()
+                    .expect("nonempty page")
+                    .delivery_id
+                    .clone()
+            )
+        );
+        // Continuation returns the remainder with no loss or duplication.
+        let mut seen: Vec<String> = first
+            .deliveries
+            .iter()
+            .map(|delivery| delivery.delivery_id.clone())
+            .collect();
+        let mut after = first.next.clone();
+        loop {
+            let page = store
+                .mail_inbox(
+                    &principal,
+                    &MailInboxRequest {
+                        agent: None,
+                        limit: Some(100),
+                        after: after.clone(),
+                    },
+                )
+                .expect("read continuation page");
+            if page.deliveries.is_empty() {
+                assert_eq!(page.next, None);
+                break;
+            }
+            assert_eq!(
+                page.next,
+                Some(
+                    page.deliveries
+                        .last()
+                        .expect("nonempty page")
+                        .delivery_id
+                        .clone()
+                )
+            );
+            for delivery in &page.deliveries {
+                assert!(
+                    !seen.contains(&delivery.delivery_id),
+                    "duplicate delivery {}",
+                    delivery.delivery_id
+                );
+                seen.push(delivery.delivery_id.clone());
+            }
+            after = page.next.clone();
+        }
+        assert_eq!(seen.len(), 50, "all large messages are reachable");
+    }
+
+    #[test]
     fn mail_send_replays_and_rejects_rebinding() {
         let mut store = store();
         let now = now_ms();
@@ -1277,6 +1432,128 @@ mod tests {
     }
 
     #[test]
+    fn stale_agent_principal_cannot_read_ack_or_write_vars() {
+        let mut store = store();
+        let now = now_ms();
+        let a = ready_agent(&mut store, "app", now);
+        let stale = agent_principal(&a);
+        let sent = store
+            .mail_send("owner", &send_request(vec![a.clone()], "hi"), now)
+            .expect("queue mail")
+            .value;
+        let delivery = sent.deliveries[0].delivery_id.clone();
+        store
+            .mail_inbox(
+                &stale,
+                &MailInboxRequest {
+                    agent: None,
+                    limit: None,
+                    after: None,
+                },
+            )
+            .expect("inbox while current");
+        // Advance the generation: the gen-1 principal is now previous.
+        let num = parse_agent_id(&a).unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE agents SET generation = 2 WHERE id = ?1",
+                params![num],
+            )
+            .unwrap();
+        let current = format!("agent:{a}:2");
+        let inbox = MailInboxRequest {
+            agent: None,
+            limit: None,
+            after: None,
+        };
+        assert_eq!(
+            store.mail_inbox(&stale, &inbox).unwrap_err().code,
+            "stale_generation"
+        );
+        assert_eq!(
+            store
+                .mail_read(
+                    &stale,
+                    &MailReadRequest {
+                        agent: None,
+                        delivery_id: delivery.clone(),
+                    },
+                )
+                .unwrap_err()
+                .code,
+            "stale_generation"
+        );
+        assert_eq!(
+            store
+                .mail_ack(
+                    &stale,
+                    &MailAckRequest {
+                        id: Ulid::new().to_string(),
+                        agent: None,
+                        deliveries: vec![delivery.clone()],
+                    },
+                    now,
+                )
+                .unwrap_err()
+                .code,
+            "stale_generation"
+        );
+        let var_set = VarSetRequest {
+            id: Ulid::new().to_string(),
+            scope: Some("project:app".to_owned()),
+            key: "k".to_owned(),
+            value: json!(1),
+            expect_version: None,
+            note: None,
+        };
+        assert_eq!(
+            store.var_set(&stale, &var_set, now).unwrap_err().code,
+            "stale_generation"
+        );
+        assert_eq!(
+            store
+                .var_get(
+                    &stale,
+                    &VarGetRequest {
+                        scope: Some("project:app".to_owned()),
+                        key: "k".to_owned(),
+                    },
+                )
+                .unwrap_err()
+                .code,
+            "stale_generation"
+        );
+        // The current generation still reads, acks, and writes.
+        store
+            .mail_inbox(&current, &inbox)
+            .expect("inbox with current generation");
+        store
+            .mail_read(
+                &current,
+                &MailReadRequest {
+                    agent: None,
+                    delivery_id: delivery.clone(),
+                },
+            )
+            .expect("read with current generation");
+        store
+            .var_set(&current, &var_set, now)
+            .expect("var write with current generation");
+        store
+            .mail_ack(
+                &current,
+                &MailAckRequest {
+                    id: Ulid::new().to_string(),
+                    agent: None,
+                    deliveries: vec![delivery],
+                },
+                now,
+            )
+            .expect("ack with current generation");
+    }
+
+    #[test]
     fn mailbox_bounds_reject_without_partial_fanout() {
         let mut store = store();
         let now = now_ms();
@@ -1321,6 +1598,36 @@ mod tests {
             .unwrap();
         let error = store
             .mail_send("owner", &send_request(vec![big.clone()], "y"), now)
+            .unwrap_err();
+        assert_eq!(error.code, "mailbox_full");
+    }
+
+    #[test]
+    fn mailbox_byte_bound_counts_bytes_not_characters() {
+        let mut store = store();
+        let now = now_ms();
+        let a = ready_agent(&mut store, "app", now);
+        let num = parse_agent_id(&a).unwrap();
+        // 'é' is 2 bytes in UTF-8 but 1 character: 5 MiB of them occupy the
+        // full 10 MiB byte bound while counting only 5 M characters. A
+        // character-counting sum would admit one more byte; a byte sum refuses.
+        let filler = "é".repeat((MAX_UNREAD_BYTES_PER_AGENT / 2) as usize);
+        assert_eq!(filler.len(), MAX_UNREAD_BYTES_PER_AGENT as usize);
+        assert_eq!(
+            filler.chars().count(),
+            (MAX_UNREAD_BYTES_PER_AGENT / 2) as usize
+        );
+        store
+            .connection
+            .execute(
+                "INSERT INTO messages(delivery_id, sender, recipient, recipient_generation,
+                                      mode, text, content_digest, admitted_at)
+                 VALUES ('fill-nonascii', 'owner', ?1, 1, 'queue', ?2, x'00', ?3)",
+                params![num, filler, now],
+            )
+            .unwrap();
+        let error = store
+            .mail_send("owner", &send_request(vec![a.clone()], "y"), now)
             .unwrap_err();
         assert_eq!(error.code, "mailbox_full");
     }
@@ -1479,7 +1786,8 @@ mod tests {
         let second = store.var_set(&principal, &blind, now).expect("blind write");
         assert_eq!(second.value.version, 2);
 
-        // A stale expectation conflicts without writing.
+        // A stale expectation conflicts without writing, returning the
+        // current version and value.
         let stale = VarSetRequest {
             id: Ulid::new().to_string(),
             scope: Some(scope.clone()),
@@ -1488,9 +1796,38 @@ mod tests {
             expect_version: Some(1),
             note: None,
         };
-        assert_eq!(
-            store.var_set(&principal, &stale, now).unwrap_err().code,
-            "version_conflict"
+        let conflict = store.var_set(&principal, &stale, now).unwrap_err();
+        assert_eq!(conflict.code, "version_conflict");
+        assert!(
+            conflict.message.contains("current version: 2"),
+            "conflict reports version: {}",
+            conflict.message
+        );
+        assert!(
+            conflict.message.contains("\"dev\""),
+            "conflict reports value: {}",
+            conflict.message
+        );
+        // An expectation on an absent row reports version 0 with no value.
+        let missing = VarSetRequest {
+            id: Ulid::new().to_string(),
+            scope: Some(scope.clone()),
+            key: "absent".to_owned(),
+            value: json!(1),
+            expect_version: Some(1),
+            note: None,
+        };
+        let absent = store.var_set(&principal, &missing, now).unwrap_err();
+        assert_eq!(absent.code, "version_conflict");
+        assert!(
+            absent.message.contains("current version: 0"),
+            "absent reports version 0: {}",
+            absent.message
+        );
+        assert!(
+            !absent.message.contains("value:"),
+            "absent reports no value: {}",
+            absent.message
         );
         let read = store
             .var_get(
@@ -1795,5 +2132,91 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn notice_release_frees_cooldown_without_disturbing_newer_claims() {
+        let mut store = store();
+        let now = now_ms();
+        let a = ready_agent(&mut store, "app", now);
+        store
+            .mail_send("owner", &send_request(vec![a.clone()], "wake"), now)
+            .expect("queue mail");
+        let first = Ulid::new().to_string();
+        store
+            .mail_notice_claim(&a, &first, now)
+            .expect("claim")
+            .expect("first wake");
+        assert!(store.mail_notice_state(&a).unwrap().is_some());
+        // A failed send releases the claim: no cooldown remains.
+        store
+            .mail_notice_release(&a, &first)
+            .expect("release failed claim");
+        assert_eq!(store.mail_notice_state(&a).unwrap(), None);
+        // An immediate retry can claim again.
+        let second = Ulid::new().to_string();
+        store
+            .mail_notice_claim(&a, &second, now + 1)
+            .expect("reclaim")
+            .expect("retry wake");
+        // Releasing the stale first notice leaves the newer claim standing.
+        store
+            .mail_notice_release(&a, &first)
+            .expect("release stale notice");
+        let state = store
+            .mail_notice_state(&a)
+            .unwrap()
+            .expect("newer claim stands");
+        assert_eq!(state.open_notice_command.as_deref(), Some(second.as_str()));
+        // Releasing an unknown recipient id is a parse error, not a panic.
+        assert!(store.mail_notice_release("a0", &second).is_err());
+    }
+
+    #[test]
+    fn busy_recipient_queues_notice_and_keeps_cooldown() {
+        let mut store = store();
+        let now = now_ms();
+        let a = ready_agent(&mut store, "app", now);
+        let num = parse_agent_id(&a).unwrap();
+        // Busy with a running turn: sends queue instead of failing.
+        store
+            .connection
+            .execute(
+                "UPDATE agents SET state = 'busy', active_turn = 't1' WHERE id = ?1",
+                params![num],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO turns(agent, generation, turn_id, state) VALUES (?1, 1, 't1', 'running')",
+                params![num],
+            )
+            .unwrap();
+        store
+            .mail_send("owner", &send_request(vec![a.clone()], "wake"), now)
+            .expect("queue mail");
+        let notice = Ulid::new().to_string();
+        let claim = store
+            .mail_notice_claim(&a, &notice, now)
+            .expect("claim")
+            .expect("busy recipient still wakes");
+        assert_eq!(claim.generation, 1);
+        // The notice send is admitted as queued for the busy Agent.
+        let mut send = SubmitCommand::new(notice.clone(), "send");
+        send.target = Some(a.clone());
+        send.expected_generation = Some(1);
+        send.args = json!({"text": "1 unread messages; run eliot inbox"});
+        let admitted = store.submit("owner", send, now).expect("admit notice send");
+        assert_eq!(admitted.command.state, CommandState::Queued);
+        // The cooldown stands: a second wake is suppressed by the open command.
+        assert_eq!(
+            store
+                .mail_notice_claim(&a, &Ulid::new().to_string(), now + 61_000)
+                .unwrap(),
+            None
+        );
+        let state = store.mail_notice_state(&a).unwrap().expect("notice state");
+        assert_eq!(state.open_notice_command.as_deref(), Some(notice.as_str()));
     }
 }
