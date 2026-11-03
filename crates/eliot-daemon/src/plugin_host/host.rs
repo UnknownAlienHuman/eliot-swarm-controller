@@ -319,7 +319,8 @@ impl PluginHost {
             }
         }
 
-        let (instance_dir, credential) = self.create_instance_dir(&key)?;
+        // Validate the committed credential and frozen environment before
+        // creating anything on disk; both are pure reads of admitted state.
         let agent_token = {
             let store = self.state.store.lock().await;
             store
@@ -332,6 +333,7 @@ impl PluginHost {
                 })?
         };
         let target_environment = build_target_environment(&agent, &agent_token)?;
+        let (instance_dir, credential) = self.create_instance_dir(&key)?;
         let source_credentials = source_secret_snapshot(
             &agent.profile_snapshot,
             &target_environment,
@@ -352,11 +354,23 @@ impl PluginHost {
                 .lock_recover()
                 .insert(agent_token.clone());
         }
-        self.state.monitoring.prepare_generation(&agent).await?;
+        // The generated directory is never given to the child on these paths
+        // (spawn ignores it; the path is handed over only in the later
+        // initialize RPC), so empty-only removal is safe. On Windows a failed
+        // spawn may briefly create a suspended child, but it is terminated
+        // before executing and never receives this path. Remove exactly the
+        // generated directory, never recursively.
+        if let Err(error) = self.state.monitoring.prepare_generation(&agent).await {
+            remove_empty_instance_dir(&instance_dir);
+            return Err(error);
+        }
         let spawned = self.spawn_plugin(&agent, &instance_dir).await;
         let mut child = match spawned {
             Ok(child) => child,
-            Err(error) => return Err(error),
+            Err(error) => {
+                remove_empty_instance_dir(&instance_dir);
+                return Err(error);
+            }
         };
         let observer = match child.observer() {
             Ok(observer) => observer,
@@ -686,6 +700,24 @@ impl PluginHost {
     }
 
     fn create_instance_dir(&self, key: &AgentKey) -> Result<(PathBuf, String)> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            self.create_instance_dir_with(key, |path| {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            self.create_instance_dir_with(key, |_| Ok(()))
+        }
+    }
+
+    fn create_instance_dir_with(
+        &self,
+        key: &AgentKey,
+        restrict: impl FnOnce(&Path) -> std::io::Result<()>,
+    ) -> Result<(PathBuf, String)> {
         let parent = self.state.data_root.join("plugins");
         std::fs::create_dir_all(&parent).map_err(|error| {
             Error::new(
@@ -700,16 +732,12 @@ impl PluginHost {
                 format!("create plugin instance directory: {error}"),
             )
         })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&instance_dir, std::fs::Permissions::from_mode(0o700))
-                .map_err(|error| {
-                    Error::new(
-                        "platform_io",
-                        format!("restrict plugin instance directory: {error}"),
-                    )
-                })?;
+        if let Err(error) = restrict(&instance_dir) {
+            remove_empty_instance_dir(&instance_dir);
+            return Err(Error::new(
+                "platform_io",
+                format!("restrict plugin instance directory: {error}"),
+            ));
         }
         let credential = format!("{}{}", Ulid::new(), Ulid::new());
         Ok((instance_dir, credential))
@@ -765,6 +793,12 @@ impl PluginHost {
         fence_runtime_generation(&self.state, key);
         signal_progress(&self.state);
     }
+}
+
+/// Remove exactly a generated instance directory while it is still empty.
+/// `remove_dir` refuses nonempty or missing paths; this never deletes recursively.
+fn remove_empty_instance_dir(path: &Path) {
+    let _ = std::fs::remove_dir(path);
 }
 
 async fn run_agent(
@@ -4147,5 +4181,230 @@ mod tests {
         let native_read = native_io.read(&mut bytes);
         tokio::pin!(native_read);
         assert!(futures_util::poll!(&mut native_read).is_pending());
+    }
+
+    fn instance_test_host(data_root: PathBuf, store: StoreHandle) -> PluginHost {
+        let bus = Bus::new(64);
+        let secrets = Arc::new(Mutex::new(HashSet::new()));
+        let monitoring = Monitoring::new(store.clone(), bus.clone(), secrets.clone());
+        let (progress, _) = watch::channel(0);
+        PluginHost::new(
+            PluginHostOptions::new(data_root, "owner-test".to_owned()),
+            store,
+            bus,
+            secrets,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashSet::new())),
+            progress,
+            monitoring,
+        )
+    }
+
+    fn launch_command_for(agent_id: &str, generation: i64) -> Command {
+        Command {
+            id: Ulid::new().to_string(),
+            principal: "owner".to_owned(),
+            method: "command.submit".to_owned(),
+            verb: "launch".to_owned(),
+            target: Some(agent_id.to_owned()),
+            expected_generation: None,
+            generation: Some(generation),
+            args: json!({}),
+            state: CommandState::Dispatched,
+            turn_id: None,
+            request_id: None,
+            outcome: None,
+            created_at: 0,
+            updated_at: 0,
+            probe: false,
+        }
+    }
+
+    fn plugin_dir_entries(data_root: &Path) -> Vec<PathBuf> {
+        let plugins = data_root.join("plugins");
+        if !plugins.exists() {
+            return Vec::new();
+        }
+        std::fs::read_dir(&plugins)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect()
+    }
+
+    fn submit_launch(store: &mut eliot_store::Store, project: &str, workspace: &str) -> Command {
+        store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: Ulid::new().to_string(),
+                    target: None,
+                    verb: "launch".to_owned(),
+                    args: json!({"project": project, "workspace": workspace}),
+                    expected_generation: Some(0),
+                    expected_turn_id: None,
+                    request_id: None,
+                    probe: false,
+                },
+                now_ms(),
+            )
+            .unwrap()
+            .command
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn start_validates_the_generation_credential_before_creating_an_instance_dir() {
+        let data_root =
+            std::env::temp_dir().join(format!("eliot-plugin-cleanup-precreate-{}", Ulid::new()));
+        let workspace =
+            std::env::temp_dir().join(format!("eliot-plugin-cleanup-workspace-{}", Ulid::new()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let workspace = workspace.to_string_lossy().into_owned();
+        let mut store = eliot_store::Store::open(Path::new(":memory:")).unwrap();
+        // Admit the Agent but never dispatch, so no generation credential exists.
+        let submitted = submit_launch(&mut store, "precreate", &workspace);
+        let agent_id = submitted.target.clone().unwrap();
+        let store = Arc::new(AsyncMutex::new(store));
+        let host = instance_test_host(data_root.clone(), store);
+        let mut agent = Agent::new(&agent_id, "precreate", "fake", "fake", 0);
+        agent.generation = 1;
+        agent.workspace = Some(workspace.clone());
+
+        let error = host
+            .start(agent, launch_command_for(&agent_id, 1), None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "bad_state");
+        assert!(
+            plugin_dir_entries(&data_root).is_empty(),
+            "no instance directory may exist before the credential check"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_root);
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn start_removes_only_the_exact_empty_instance_dir_on_a_pre_spawn_error() {
+        let data_root =
+            std::env::temp_dir().join(format!("eliot-plugin-cleanup-prespawn-{}", Ulid::new()));
+        let workspace =
+            std::env::temp_dir().join(format!("eliot-plugin-cleanup-workspace-{}", Ulid::new()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let workspace = workspace.to_string_lossy().into_owned();
+        // Admit a different workspace than the one start() observes, so
+        // prepare_generation fails deterministically before any spawn.
+        let admitted = format!("{workspace}-admitted-elsewhere");
+        let mut store = eliot_store::Store::open(Path::new(":memory:")).unwrap();
+        let submitted = submit_launch(&mut store, "prespawn", &admitted);
+        let agent_id = submitted.target.clone().unwrap();
+        store.dispatch(&submitted.id, now_ms()).unwrap();
+        let store = Arc::new(AsyncMutex::new(store));
+        let host = instance_test_host(data_root.clone(), store);
+        let mut agent = Agent::new(&agent_id, "prespawn", "fake", "fake", 0);
+        agent.generation = 1;
+        agent.workspace = Some(workspace.clone());
+
+        let error = host
+            .start(agent, launch_command_for(&agent_id, 1), None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "source_integrity");
+        assert!(
+            error.message.contains("does not match the Agent"),
+            "unexpected pre-spawn failure: {error:?}"
+        );
+        // The plugins root was created, but the generated child is gone. A
+        // post-spawn path would have left it behind.
+        assert!(data_root.join("plugins").is_dir());
+        assert!(
+            plugin_dir_entries(&data_root).is_empty(),
+            "a pre-spawn error must remove the exact generated empty directory"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_root);
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn create_instance_dir_reports_a_blocked_parent() {
+        let data_root =
+            std::env::temp_dir().join(format!("eliot-plugin-cleanup-blocked-{}", Ulid::new()));
+        std::fs::create_dir_all(&data_root).unwrap();
+        std::fs::write(data_root.join("plugins"), b"not a directory").unwrap();
+        let store = Arc::new(AsyncMutex::new(
+            eliot_store::Store::open(Path::new(":memory:")).unwrap(),
+        ));
+        let host = instance_test_host(data_root.clone(), store);
+        let key = AgentKey {
+            id: "a1".to_owned(),
+            generation: 1,
+        };
+
+        let error = host.create_instance_dir(&key).unwrap_err();
+        assert_eq!(error.code, "platform_io");
+        assert!(data_root.join("plugins").is_file());
+
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[test]
+    fn create_instance_dir_removes_the_partial_directory_when_restriction_fails() {
+        let data_root =
+            std::env::temp_dir().join(format!("eliot-plugin-cleanup-restrict-{}", Ulid::new()));
+        let store = Arc::new(AsyncMutex::new(
+            eliot_store::Store::open(Path::new(":memory:")).unwrap(),
+        ));
+        let host = instance_test_host(data_root.clone(), store);
+        let key = AgentKey {
+            id: "a1".to_owned(),
+            generation: 1,
+        };
+
+        // Force the post-mkdir restrict step (unix chmod 0o700 in production)
+        // to fail through the seam; the generated directory must be gone and
+        // plugins/ left empty.
+        let mut generated: Option<PathBuf> = None;
+        let error = host
+            .create_instance_dir_with(&key, |path| {
+                generated = Some(path.to_owned());
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "forced restrict failure",
+                ))
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "platform_io");
+        let generated = generated.expect("the restrict step must see the generated directory");
+        assert!(
+            !generated.exists(),
+            "a failed restrict must remove the partial directory"
+        );
+        assert!(data_root.join("plugins").is_dir());
+        assert!(
+            plugin_dir_entries(&data_root).is_empty(),
+            "a failed restrict must leave plugins/ empty"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[test]
+    fn empty_instance_dir_removal_never_touches_nonempty_or_missing_paths() {
+        let root =
+            std::env::temp_dir().join(format!("eliot-plugin-cleanup-removal-{}", Ulid::new()));
+        let empty = root.join("empty");
+        let nonempty = root.join("nonempty");
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::create_dir_all(&nonempty).unwrap();
+        std::fs::write(nonempty.join("plugin-data"), b"must survive").unwrap();
+
+        remove_empty_instance_dir(&empty);
+        assert!(!empty.exists());
+        remove_empty_instance_dir(&nonempty);
+        assert!(nonempty.join("plugin-data").is_file());
+        remove_empty_instance_dir(&root.join("missing"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
