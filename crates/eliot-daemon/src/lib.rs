@@ -9,6 +9,7 @@ mod fs_invalidation;
 mod git_actions;
 mod git_monitor;
 pub(crate) mod logging;
+mod maintenance;
 mod monitor;
 mod platform;
 mod plugin_host;

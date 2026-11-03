@@ -2,7 +2,7 @@ use crate::{
     automation,
     bus::Bus,
     common::now_ms,
-    logging,
+    logging, maintenance,
     platform::{DataDir, IpcListener, IpcStream, data_dir::DaemonLock},
     restart_capacity,
     router::Router,
@@ -86,6 +86,7 @@ async fn run_owned(
     };
     let retained = restart_capacity::reconcile(&capacity, retained, true).await;
     let automation_config = crate::config::load_automation_config(data_dir.path())?;
+    let daemon_config = crate::config::load_daemon_config(data_dir.path())?;
     // Parse global definitions and seed only new rules before publishing ready.
     let (global_rules, initial_deferred_notice) =
         automation::initialize_global_rules(&router, data_dir.path(), &policy).await?;
@@ -129,6 +130,23 @@ async fn run_owned(
         )
         .await
     });
+    let (maintenance_stop, maintenance_shutdown) = watch::channel(false);
+    let mut maintenance_tasks = JoinSet::new();
+    {
+        let store = Arc::clone(&store);
+        let data_root = data_dir.path().to_path_buf();
+        let policy = Arc::clone(&policy);
+        maintenance_tasks.spawn(async move {
+            maintenance::run(
+                store,
+                data_root,
+                policy,
+                daemon_config,
+                maintenance_shutdown,
+            )
+            .await
+        });
+    }
     let mut progress = router.progress_receiver();
     let mut connections = JoinSet::new();
     let outcome = loop {
@@ -201,6 +219,17 @@ async fn run_owned(
                     _ => {}
                 }
             }
+            joined = maintenance_tasks.join_next(), if !maintenance_tasks.is_empty() => {
+                match joined {
+                    Some(Ok(Err(error))) => {
+                        logging::record(&policy, "daemon.maintenance_failed", &[], Some(&error));
+                    }
+                    Some(Err(_)) => {
+                        logging::record(&policy, "daemon.maintenance_task_failed", &[], None);
+                    }
+                    _ => {}
+                }
+            }
             joined = connections.join_next(), if !connections.is_empty() => {
                 if matches!(joined, Some(Err(_))) {
                     logging::record(&policy, "daemon.connection_task_failed", &[], None);
@@ -231,6 +260,16 @@ async fn run_owned(
                 logging::record(&policy, "daemon.rule_worker_failed", &[], Some(&error));
             }
             Err(_) => logging::record(&policy, "daemon.rule_worker_task_failed", &[], None),
+        }
+    }
+    maintenance_stop.send_replace(true);
+    while let Some(joined) = maintenance_tasks.join_next().await {
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                logging::record(&policy, "daemon.maintenance_failed", &[], Some(&error));
+            }
+            Err(_) => logging::record(&policy, "daemon.maintenance_task_failed", &[], None),
         }
     }
     if router.is_force_requested() {

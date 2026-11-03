@@ -535,6 +535,10 @@ fn has_intervening_same_scope_restriction_tx(
             |row| row.get(0),
         )
         .map_err(sql_error)?;
+    // A pruned accepted event fails here instead of clearing a hold on
+    // incomplete history: pruning deletes a contiguous prefix, so a surviving
+    // accepted event means the whole (accepted, terminal] range survives and
+    // the scan below is complete.
     let accepted_seq = accepted_seq.ok_or_else(|| {
         Error::new(
             "source_integrity",

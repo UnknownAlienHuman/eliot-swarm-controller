@@ -440,7 +440,10 @@ it adds no owner-only modifier or parallel executor. `retry_after` controls prob
 eligibility only; its expiry never clears a hold. Only a successful exact-bound probe
 completion clears a rate-limit/quota hold. A known failed or interrupted probe leaves
 the hold and releases only its definitive probe claim. An unknown probe retains both
-hold and claim across restart; it is not retried automatically.
+hold and claim across restart; it is not retried automatically. When retention has
+pruned the probe's accepted event, the terminal scan fails with `source_integrity`
+instead of clearing the hold on incomplete history; the owner corrects the stuck
+hold with the existing `provider clear-hold`.
 
 Auth and ModelRemoved holds are not probe-eligible and do not expire automatically. An
 owner clears them with one of the closed corrective evidence values:

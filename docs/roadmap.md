@@ -254,7 +254,7 @@ or speculative remote/GUI/service feature.
 Implement the bounded retention path first, then build/run the complete campaign against
 the connected product. Keep results in the PR/CI, not a permanent audit/readiness hierarchy.
 
-- [ ] **Physical retention.** Wire retention settings to bounded Store cleanup invoked
+- [x] **Physical retention.** Wire retention settings to bounded Store cleanup invoked
       by daemon maintenance. Implement event-prefix pruning and atomic command/child
       cleanup under the [Core retention contract](spec/core.md#retention), including the
       rule history floor, replay/idempotency window and source recovery dependencies.

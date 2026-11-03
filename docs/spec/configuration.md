@@ -123,8 +123,6 @@ ignored content within these frozen directories, never tracked dirt.
 
 ```toml
 [daemon]
-retention.events_days = 30
-retention.commands_days = 30
 idempotency_window = "24h"
 limits.max_depth = 8
 limits.max_children_per_agent = 20
@@ -186,6 +184,24 @@ max_event_backlog = 100000
 
 `max_event_backlog` is a positive signed 64-bit integer. It defaults to `100000`; zero,
 negative, wrong-type and unknown automation values are invalid.
+
+The implemented daemon retention setting is a `[daemon]` retention table:
+
+```toml
+[daemon]
+retention.events_days = 30
+retention.commands_days = 30
+```
+
+Both windows are optional positive integer days; each defaults to unset, which
+disables pruning for that side. A daemon without retention settings deletes
+nothing; set a window to prune expired history for that side. Daemon
+maintenance periodically prunes expired event history and closed command/child
+sets through the Store writer; see the
+[Core retention contract](core.md#retention). Command and write bindings always
+outlive the 24-hour retry window plus the 5-minute allowed clock-skew margin
+regardless of `commands_days`, so a pruned id resubmits as `id_expired`, never
+as new, even when its ULID timestamp runs ahead of the Store commit clock.
 
 Inspection dated 2026-10-29 of installed OpenCodex 2.92.0 source
 src/server/index/serve-options.ts shows an anonymous literal GET /readyz: readiness

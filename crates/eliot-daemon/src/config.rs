@@ -138,6 +138,8 @@ struct FileConfig {
     projects: HashMap<String, toml::Spanned<ProjectEntry>>,
     #[serde(default)]
     automation: AutomationConfig,
+    #[serde(default)]
+    daemon: DaemonConfig,
 }
 
 /// Owner-approved interpreter and action-environment grant shared by project
@@ -195,6 +197,51 @@ impl AutomationConfig {
 
 fn default_max_event_backlog() -> i64 {
     100_000
+}
+
+/// Physical retention windows consumed by daemon maintenance. See
+/// docs/spec/configuration.md: daemon retention. An unset window disables
+/// pruning for that side: no deletion without an owner window.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RetentionConfig {
+    #[serde(default)]
+    pub(crate) events_days: Option<i64>,
+    #[serde(default)]
+    pub(crate) commands_days: Option<i64>,
+}
+
+impl RetentionConfig {
+    fn validate(self) -> core::Result<Self> {
+        if self.events_days.is_some_and(|days| days <= 0) {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: daemon.retention.events_days must be a positive integer",
+            ));
+        }
+        if self.commands_days.is_some_and(|days| days <= 0) {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: daemon.retention.commands_days must be a positive integer",
+            ));
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DaemonConfig {
+    #[serde(default)]
+    pub(crate) retention: RetentionConfig,
+}
+
+impl DaemonConfig {
+    fn validate(self) -> core::Result<Self> {
+        Ok(Self {
+            retention: self.retention.validate()?,
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -772,6 +819,13 @@ pub(crate) fn load_automation_config(data_root: &Path) -> core::Result<Automatio
     config
         .automation
         .validate(&source, &route_credential_env_names)
+}
+
+pub(crate) fn load_daemon_config(data_root: &Path) -> core::Result<DaemonConfig> {
+    let Some((config, _)) = read_config(data_root)? else {
+        return Ok(DaemonConfig::default());
+    };
+    config.daemon.validate()
 }
 
 fn fake_snapshot() -> Value {
@@ -1519,6 +1573,64 @@ mod tests {
                 run_env: Vec::new(),
             }]
         );
+    }
+
+    #[test]
+    fn daemon_retention_defaults_and_parses_windows() {
+        let fixture = AutomationConfigFixture::new();
+        assert_eq!(
+            load_daemon_config(&fixture.root).unwrap(),
+            DaemonConfig::default()
+        );
+        // Unset windows disable pruning: no deletion by default.
+        assert_eq!(DaemonConfig::default().retention.events_days, None);
+        assert_eq!(DaemonConfig::default().retention.commands_days, None);
+
+        fixture.write("[daemon]\n");
+        assert_eq!(
+            load_daemon_config(&fixture.root).unwrap(),
+            DaemonConfig::default()
+        );
+
+        fixture.write("[daemon]\nretention.events_days = 7\nretention.commands_days = 14\n");
+        assert_eq!(
+            load_daemon_config(&fixture.root).unwrap(),
+            DaemonConfig {
+                retention: RetentionConfig {
+                    events_days: Some(7),
+                    commands_days: Some(14),
+                },
+            }
+        );
+
+        fixture.write("[daemon]\nretention.events_days = 7\n");
+        assert_eq!(
+            load_daemon_config(&fixture.root).unwrap(),
+            DaemonConfig {
+                retention: RetentionConfig {
+                    events_days: Some(7),
+                    commands_days: None,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn daemon_retention_rejects_nonpositive_and_unknown_values() {
+        let fixture = AutomationConfigFixture::new();
+        for source in [
+            "[daemon]\nretention.events_days = 0\n",
+            "[daemon]\nretention.events_days = -1\n",
+            "[daemon]\nretention.commands_days = 0\n",
+            "[daemon]\nretention.commands_days = -30\n",
+            "[daemon]\nretention.events_days = \"30\"\n",
+            "[daemon]\nretention.unknown = 1\n",
+            "[daemon]\nunknown_table.value = 1\n",
+        ] {
+            fixture.write(source);
+            let error = load_daemon_config(&fixture.root).unwrap_err();
+            assert_eq!(error.code, "profile_error", "source: {source}");
+        }
     }
 
     #[test]

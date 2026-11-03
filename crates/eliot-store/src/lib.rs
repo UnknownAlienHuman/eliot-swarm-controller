@@ -12,6 +12,7 @@ mod scripts;
 pub use capacity::{RecordedProcess, RetainedGeneration};
 pub use projects::ProjectRegistrationInput;
 pub use resolution::TurnInactiveProof;
+pub use retention::RetentionReport;
 pub use rules::{
     RuleCatchUpAction, RuleCatchUpActionOutcome, RuleCatchUpAdmission, RuleCursorOutcome,
     RuleDefinitionInput, RuleEventAdmission, RuleProcessingState, TimerDefinitionInput,
@@ -42,6 +43,11 @@ const MAX_EVENT_BYTES: usize = 64 * 1024;
 const MAX_INPUT_BYTES: usize = 512 * 1024;
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const RETRY_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
+/// Allowed generator-clock skew for ULID age checks. A mutation id timestamp
+/// may run ahead of the Store commit clock by up to this margin; retention
+/// keeps rows long enough that such an id still reads `id_expired` after
+/// pruning. See docs/spec/configuration.md (daemon retention).
+const RETRY_CLOCK_SKEW_MS: i64 = 5 * 60 * 1_000;
 const CURRENT_SCHEMA_VERSION: i64 = 18;
 const COMMAND_METHOD: &str = "command.submit";
 const INITIAL_SOURCE: &str = "stream";
@@ -79,6 +85,7 @@ mod dispatch;
 mod observer;
 mod observer_live;
 mod resolution;
+mod retention;
 mod source_handoff;
 
 fn sql_error(error: rusqlite::Error) -> Error {
@@ -1610,6 +1617,25 @@ impl Store {
         validate_limit(limit)?;
         if after < 0 || through.is_some_and(|bound| bound < after) {
             return Err(Error::new("invalid", "invalid event sequence bounds"));
+        }
+        // Replay must report pruned history instead of silently omitting it.
+        // Live rule cursors always stay above this floor, so the rule worker
+        // never trips here; client-supplied replay cursors do.
+        let retained: i64 = self
+            .connection
+            .query_row(
+                "SELECT pruned_through FROM rule_history_coverage WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?
+            .ok_or_else(|| Error::new("source_integrity", "rule history coverage is absent"))?;
+        if after < retained {
+            return Err(Error::new(
+                "history_gap",
+                "requested event history is no longer fully retained",
+            ));
         }
         let mut statement = self
             .connection

@@ -92,7 +92,8 @@ more than the configured limit, atomically record the skipped range, advance to 
 high-water, clear retirement and pause the rule with `backlog_exceeded`. Existing
 commands continue. Explicit catch-up fails `history_gap`
 when its requested history has already been pruned. Once pruning is connected, a lagging
-rule cannot pin expired storage indefinitely.
+rule cannot pin expired storage indefinitely. Rate-limit windows longer than
+command retention count only retained history.
 
 During explicit history catch-up, project Run actions use the same freeze path as live firing,
 capturing each matching event and the validated current rule revision. Project authorization
@@ -272,7 +273,10 @@ grant does not authorize it. Revalidate current project authority and the captur
 Agent/generation binding before effects. STEER uses the existing Router control path,
 including its harness capability, text validation, provider-hold and exact active-turn
 checks; it supplies input to that captured turn, without starting a new turn. An applied
-STEER does not assert task completion. See [Store command admission and dispatch](../../crates/eliot-store/src/lib.rs).
+STEER does not assert task completion. When retention has pruned a hold's probe accepted
+event, that hold's terminal scan fails with `source_integrity` instead of clearing on
+incomplete history; the owner corrects it with the existing `provider clear-hold`.
+See [Store command admission and dispatch](../../crates/eliot-store/src/lib.rs).
 
 Each committed event retains its event-time subject snapshot (or absence) and any
 Store-verified cause. Depth 0 denotes a proven ordinary controller command; rule, timer
