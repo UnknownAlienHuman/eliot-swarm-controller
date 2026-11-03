@@ -72,8 +72,18 @@ fn main() {
         println!("ok - decide internal error is unknown without rewrite");
         scenario_stale_choice_after_update_is_rejected().await;
         println!("ok - stale choice after update is rejected");
+        scenario_stale_requirement_is_rejected_then_valid_reply_applies().await;
+        println!("ok - stale requirement is rejected, then a valid reply applies");
         scenario_multistage_approval_decides_each_stage().await;
         println!("ok - multistage approval decides each stage");
+        scenario_lost_decide_reply_is_unknown_without_rewrite().await;
+        println!("ok - lost decide reply is unknown without a second write");
+        scenario_stale_pull_does_not_reopen_stream_resolved_request().await;
+        println!("ok - stale pull does not reopen a stream-resolved request");
+        scenario_request_details_redact_secrets().await;
+        println!("ok - request details redact secrets");
+        scenario_resume_with_undecodable_pull_proceeds().await;
+        println!("ok - resume with an undecodable pull proceeds");
         scenario_unknown_native_request_is_rejected_with_a_gap().await;
         println!("ok - unknown native request is rejected with a gap");
         scenario_resume_rejects_stale_generation_1_output().await;
@@ -138,6 +148,8 @@ fn fake_msp_main(script: &str) {
             | "drop-session-resume"
             | "resume-stale-replay"
             | "resume-inline-history"
+            | "resume-stale-pull"
+            | "resume-undecodable-pull"
     ) {
         fake.seed_retained_session();
     }
@@ -368,6 +380,17 @@ impl FakeMsp {
                             "viewCursor": self.head_cursor(),
                         },
                     ])
+                } else if matches!(
+                    self.script.as_str(),
+                    "resume-stale-pull" | "resume-undecodable-pull"
+                ) {
+                    json!([
+                        {
+                            "kind": "approval",
+                            "approvalId": "fake-approval-1",
+                            "viewCursor": self.head_cursor(),
+                        },
+                    ])
                 } else {
                     json!([])
                 };
@@ -477,6 +500,31 @@ impl FakeMsp {
                 self.turn_active = true;
                 self.turn_count += 1;
                 self.last_turn = Some(command.clone());
+                if self.script == "resume-stale-pull" {
+                    // The pending approval resolves on the stream after the
+                    // resume snapshot captured it: the re-issued open binds
+                    // the live turn, then the resolution wins. Both buffer
+                    // until the associate roundtrip, so the stale snapshot
+                    // entry (retained-turn-bound) applies strictly after the
+                    // stream resolution and must not reopen it.
+                    let open =
+                        self.approval_request_params(&session_id, &command, "fake-approval-1", 1);
+                    self.emit_request(stdout, "approval/request", open);
+                    let cursor = self.next_cursor();
+                    self.emit(
+                        stdout,
+                        "approval/resolved",
+                        json!({
+                            "approvalId": "fake-approval-1",
+                            "decision": "approved",
+                            "resolvedBy": {"kind": "user"},
+                            "sessionId": session_id,
+                            "sourceRange": Self::source_range(),
+                            "turnId": command,
+                            "viewCursor": cursor,
+                        }),
+                    );
+                }
                 self.reply(
                     stdout,
                     &id,
@@ -528,7 +576,10 @@ impl FakeMsp {
                         | "request-prompt"
                         | "request-stale-choice"
                         | "request-multistage"
+                        | "request-stale-decide"
+                        | "request-redact"
                         | "decide-internal-error"
+                        | "decide-lost-reply"
                 ) {
                     // Parked turn: the request opens now and the completion
                     // lands only after the scenario answers it.
@@ -563,6 +614,67 @@ impl FakeMsp {
                             let updated =
                                 self.approval_updated_params(&session_id, "fake-approval-1", 2);
                             self.emit(stdout, "approval/updated", updated);
+                        }
+                        "request-redact" => {
+                            // The script name travels as a
+                            // target-environment value, so it is a
+                            // configured secret: embed it in the free-text
+                            // offer fields the committed request.opened must
+                            // redact. Choice ids stay exact (the scenario
+                            // still replies by id).
+                            let secret = self.script.clone();
+                            let mut open = self.approval_request_params(
+                                &session_id,
+                                &command,
+                                "fake-approval-1",
+                                1,
+                            );
+                            open["subject"]["command"] = json!(format!("deploy --token {secret}"));
+                            if let Some(choices) = open
+                                .get_mut("availableChoices")
+                                .and_then(Value::as_array_mut)
+                            {
+                                for choice in choices {
+                                    if let Some(label) = choice.get_mut("label") {
+                                        *label = json!(format!(
+                                            "{} {secret}",
+                                            label.as_str().unwrap_or_default()
+                                        ));
+                                    }
+                                }
+                            }
+                            self.emit_request(stdout, "approval/request", open);
+                            let mut prompt = self.user_input_request_params(
+                                &session_id,
+                                &command,
+                                "fake-prompt-1",
+                            );
+                            if let Some(questions) =
+                                prompt.get_mut("questions").and_then(Value::as_array_mut)
+                            {
+                                for question in questions {
+                                    if let Some(text) = question.get_mut("question") {
+                                        *text = json!(format!(
+                                            "{} [{secret}]",
+                                            text.as_str().unwrap_or_default()
+                                        ));
+                                    }
+                                    if let Some(options) =
+                                        question.get_mut("options").and_then(Value::as_array_mut)
+                                    {
+                                        for option in options {
+                                            if let Some(label) = option.get_mut("label") {
+                                                *label = json!(format!(
+                                                    "{} {secret}",
+                                                    label.as_str().unwrap_or_default()
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            self.emit_request(stdout, "userInput/request", prompt);
+                            self.prompts_opened = 1;
                         }
                         _ => {
                             let open = self.approval_request_params(
@@ -691,6 +803,18 @@ impl FakeMsp {
                 assert!(!approval_id.is_empty(), "decide names its approval");
                 assert!(!choice_id.is_empty(), "decide names its choice");
                 assert!(!command_id.is_empty(), "decide mints its command id");
+                if self.script == "request-stale-decide" && self.approval_stage == 1 {
+                    // The multi-stage race, lost: the stage advanced between
+                    // the client's read and intake, so the stage-1 decision
+                    // is rejected as stale (never written) and the update
+                    // carries the current requirement for the retry.
+                    self.approval_stage = 2;
+                    self.reply_error(stdout, &id, -32053, "approval requirement is stale");
+                    let session_id = self.session_id.clone().unwrap_or_default();
+                    let updated = self.approval_updated_params(&session_id, &approval_id, 2);
+                    self.emit(stdout, "approval/updated", updated);
+                    return true;
+                }
                 // The multi-stage race guard: the decision must carry the
                 // approval's CURRENT requirement, never a stale snapshot.
                 assert_eq!(
@@ -707,6 +831,11 @@ impl FakeMsp {
                     // unknown and never resubmit.
                     self.reply_error(stdout, &id, -32603, "internal error");
                     return true;
+                }
+                if self.script == "decide-lost-reply" {
+                    // Lost reply: exit without answering. The report already
+                    // records this receipt.
+                    std::process::exit(0);
                 }
                 let staged = self.script == "request-multistage" && self.approval_stage == 1;
                 self.reply(
@@ -744,8 +873,12 @@ impl FakeMsp {
                         "viewCursor": cursor,
                     }),
                 );
-                let turn_id = self.last_turn_id();
-                self.complete_open_turn(stdout, &turn_id);
+                // A turn parked on both an approval and prompts completes
+                // only once every prompt has settled.
+                if self.prompts_opened == 0 {
+                    let turn_id = self.last_turn_id();
+                    self.complete_open_turn(stdout, &turn_id);
+                }
             }
             "userInput/answer" => {
                 let user_input_id = params
@@ -817,6 +950,26 @@ impl FakeMsp {
                         "fake-prompt-1",
                     );
                     json!({"approvals": [approval], "userInputs": [prompt]})
+                } else if self.script == "resume-stale-pull" {
+                    let approval = self.approval_request_params(
+                        RETAINED_SESSION,
+                        RETAINED_TURN,
+                        "fake-approval-1",
+                        1,
+                    );
+                    json!({"approvals": [approval], "userInputs": []})
+                } else if self.script == "resume-undecodable-pull" {
+                    // Well-formed enough to decode the pull, but bound to a
+                    // foreign session: describe fails and the entry is
+                    // skipped (and gapped) instead of adopted.
+                    let mut approval = self.approval_request_params(
+                        RETAINED_SESSION,
+                        RETAINED_TURN,
+                        "fake-approval-1",
+                        1,
+                    );
+                    approval["sessionId"] = json!("fake-foreign-session");
+                    json!({"approvals": [approval], "userInputs": []})
                 } else {
                     json!({"approvals": [], "userInputs": []})
                 };
@@ -1685,6 +1838,110 @@ impl PendingStart {
         }
     }
 
+    /// Drive the in-flight resume start to readiness with one expected source
+    /// gap: the undecodable snapshot entry gaps the source after
+    /// `session.ready` without failing the resume. Returns the scenario and
+    /// the recorded gap reason.
+    async fn finish_with_snapshot_gap(
+        mut self,
+        rx: oneshot::Receiver<Result<Value, String>>,
+        expected_native_ref: Option<&str>,
+    ) -> (Scenario, String) {
+        let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
+        // `agent.start` only resolves after the harness child registers, the
+        // session.ready batch commits, and the post-readiness snapshot adopt
+        // records its gap; answer all three while it is in flight.
+        let mut ready_data: Option<Value> = None;
+        let mut gap_reason: Option<String> = None;
+        let ready = loop {
+            tokio::select! {
+                biased;
+                request = self.host.next_request() => {
+                    match request.method.as_str() {
+                        "process.put" => {
+                            answer_process_put(&mut self.host, &self.agent_id, self.generation, &request).await;
+                        }
+                        "events.put" => {
+                            let events = request.params.get("events").and_then(Value::as_array).cloned().unwrap_or_default();
+                            assert_eq!(events.len(), 1, "one native record per batch");
+                            assert_eq!(events[0].get("kind").and_then(Value::as_str), Some("session.ready"));
+                            assert!(ready_data.is_none(), "session.ready commits once");
+                            ready_data = Some(events[0].get("data").cloned().unwrap_or(Value::Null));
+                            let first = self.host.next_seq;
+                            self.host.next_seq += 1;
+                            self.host.respond(&request.id, json!({
+                                "first_seq": first, "last_seq": first,
+                                "cursor": request.params.get("cursor").cloned().unwrap_or(Value::Null),
+                            })).await;
+                        }
+                        "source.gap" => {
+                            assert!(ready_data.is_some(), "the snapshot gap lands after readiness");
+                            assert!(gap_reason.is_none(), "one snapshot gap");
+                            gap_reason = Some(
+                                request
+                                    .params
+                                    .get("reason")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_owned(),
+                            );
+                            let gap_id = request.params.get("gap_id").and_then(Value::as_str).unwrap_or_default().to_owned();
+                            let seq = self.host.next_seq;
+                            self.host.next_seq += 1;
+                            self.host.respond(&request.id, json!({"gap_id": gap_id, "seq": seq})).await;
+                        }
+                        other => panic!("unexpected host request during start: {other}"),
+                    }
+                }
+                result = &mut rx => break result,
+            }
+        };
+        let ready = ready
+            .expect("agent.start deadline")
+            .expect("agent.start response channel")
+            .expect("agent.start ready");
+        let start_id = self
+            .params
+            .get("command_id")
+            .and_then(Value::as_str)
+            .expect("start command id");
+        assert_eq!(ready.get("state").and_then(Value::as_str), Some("ready"));
+        assert_eq!(
+            ready.get("agent_id").and_then(Value::as_str),
+            Some(self.agent_id.as_str())
+        );
+        assert_eq!(
+            ready.get("generation").and_then(Value::as_i64),
+            Some(self.generation)
+        );
+        assert_eq!(
+            ready.get("command_id").and_then(Value::as_str),
+            Some(start_id)
+        );
+        let ready_data = ready_data.expect("session.ready batch");
+        let native_ref = ready_data
+            .get("native_ref")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(!native_ref.is_empty());
+        if let Some(expected) = expected_native_ref {
+            assert_eq!(
+                native_ref, expected,
+                "resume reopens the exact retained session"
+            );
+        }
+        let gap_reason = gap_reason.expect("the snapshot gap was recorded");
+        (
+            Scenario {
+                root: self.root,
+                agent_id: self.agent_id,
+                host: self.host,
+                start_result: ready,
+            },
+            gap_reason,
+        )
+    }
+
     /// Drive the in-flight start to an explicit error. The harness child
     /// still registers (it spawns before preflight/dispatch), a dead host's
     /// stream gap is acknowledged, but no `session.ready` may commit: no
@@ -2424,6 +2681,54 @@ async fn reply_with_id(
         .expect("reply response channel")
         .expect("reply responds");
     (command_id.to_owned(), result, committed)
+}
+
+/// Drive one reply with fresh command ids until it applies. A reply sent
+/// before the processor has applied the stream update it depends on is
+/// rejected locally (consumed reply, or choice unknown to the old offer)
+/// without touching the native lane; the loop is state-based, never a fixed
+/// sleep. Bounded: exhaustion fails the scenario instead of hanging it.
+async fn reply_until_applied(
+    host: &mut Host,
+    agent_id: &str,
+    generation: i64,
+    verb: &str,
+    request_id: &str,
+    turn_id: &str,
+    args: Value,
+) -> (String, Value) {
+    for _ in 0..500 {
+        let (command_id, result, in_flight) = reply(
+            host,
+            agent_id,
+            generation,
+            verb,
+            request_id,
+            turn_id,
+            args.clone(),
+        )
+        .await;
+        match result.get("state").and_then(Value::as_str) {
+            Some("applied") => {
+                // The resolution lands after the reply: the processor is
+                // busy inside this control call when the decide ack arrives,
+                // so no stream frame can commit while it is in flight.
+                assert!(in_flight.is_empty(), "resolution lands after the reply");
+                return (command_id, result);
+            }
+            // Any other non-rejected outcome (unknown, an RPC error shape)
+            // is a real failure, not a not-yet-applied update.
+            Some("rejected") => {
+                assert!(
+                    in_flight.is_empty(),
+                    "a locally rejected reply commits nothing"
+                );
+                continue;
+            }
+            other => panic!("reply ended {other:?} instead of applying: {result}"),
+        }
+    }
+    panic!("reply never applied after 500 attempts");
 }
 
 async fn scenario_launch_send_snapshot_stop() {
@@ -3645,6 +3950,508 @@ async fn scenario_stale_choice_after_update_is_rejected() {
     let _ = std::fs::remove_dir_all(&scenario.root);
 }
 
+/// Note-39a error rule on the decide lane: a `-32053` stale requirement is a
+/// schema-documented validation failure (never written), so the reply is
+/// rejected and the request stays open; the update carries the current
+/// requirement and the following valid reply applies.
+async fn scenario_stale_requirement_is_rejected_then_valid_reply_applies() {
+    let mut scenario = Scenario::start("request-stale-decide", muse_profile()).await;
+    let agent_id = scenario.agent_id.clone();
+
+    let (_send_id, turn_id, committed) =
+        send_parked(&mut scenario.host, &agent_id, 1, "List files.", 1).await;
+    let opened = committed
+        .iter()
+        .find(|(kind, _)| kind == "request.opened")
+        .map(|(_, data)| data)
+        .expect("request.opened");
+    let request_id = opened["request_id"].as_str().expect("request id");
+
+    // The stage-1 decision loses the multi-stage race: rejected, never
+    // written, and the request stays available for a corrected reply.
+    let (_, first, in_flight) = reply(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "approve",
+        request_id,
+        &turn_id,
+        json!({}),
+    )
+    .await;
+    assert_eq!(first["state"], json!("rejected"));
+    assert!(in_flight.is_empty());
+    assert_eq!(scenario.report()["decides"], json!(1));
+
+    // The update carries the current (stage-2) requirement; the following
+    // valid reply against it applies and binds the resolution.
+    let (reply_id, second) = reply_until_applied(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "approve",
+        request_id,
+        &turn_id,
+        json!({"choice_id": "allow-session"}),
+    )
+    .await;
+    assert_eq!(second["state"], json!("applied"));
+    let resolved = scenario
+        .host
+        .answer_events_put(&agent_id, 1, "request.resolved")
+        .await;
+    assert_eq!(resolved[0]["data"]["command_id"], json!(reply_id));
+    assert_eq!(resolved[0]["data"]["request_id"], json!(request_id));
+    scenario
+        .host
+        .answer_events_put(&agent_id, 1, "message.completed")
+        .await;
+    scenario
+        .host
+        .answer_events_put(&agent_id, 1, "turn.completed")
+        .await;
+
+    // Exactly two decides wrote: the stale one and the valid retry.
+    // Premature retries decide nothing (the stage-2 choice is unknown to the
+    // old offer) and never touch the native lane.
+    assert_eq!(scenario.report()["decides"], json!(2));
+
+    stop_agent(&mut scenario.host, &agent_id, 1, false).await;
+    // The receipt is fire-and-forget: assert it only once the stop
+    // roundtrip has flushed the native lane.
+    assert_eq!(scenario.report()["receipts"], json!(1));
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+    let _ = std::fs::remove_dir_all(&scenario.root);
+}
+
+/// Transport loss during a decide: the reply is unknown (the write may or
+/// may not have landed) and neither an exact retry nor a fresh reply writes
+/// a second decision.
+async fn scenario_lost_decide_reply_is_unknown_without_rewrite() {
+    let mut scenario = Scenario::start("decide-lost-reply", muse_profile()).await;
+    let agent_id = scenario.agent_id.clone();
+
+    let (_send_id, turn_id, committed) =
+        send_parked(&mut scenario.host, &agent_id, 1, "List files.", 1).await;
+    let request_id = committed
+        .iter()
+        .find(|(kind, _)| kind == "request.opened")
+        .map(|(_, data)| data["request_id"].as_str().expect("request id").to_owned())
+        .expect("request.opened");
+
+    let reply_id = ulid::Ulid::new().to_string();
+    let result = reply_tolerating_gaps(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        &reply_id,
+        ReplyTarget {
+            verb: "approve",
+            request_id: &request_id,
+            turn_id: &turn_id,
+            args: json!({}),
+        },
+    )
+    .await;
+    assert_eq!(result["state"], json!("unknown"));
+    assert_eq!(scenario.report()["decides"], json!(1));
+
+    // The exact-command retry replays the retained unknown outcome without
+    // touching the native lane a second time.
+    let retry = reply_tolerating_gaps(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        &reply_id,
+        ReplyTarget {
+            verb: "approve",
+            request_id: &request_id,
+            turn_id: &turn_id,
+            args: json!({}),
+        },
+    )
+    .await;
+    assert_eq!(retry["state"], json!("unknown"));
+    assert_eq!(scenario.report()["decides"], json!(1));
+
+    // A fresh reply to the same request is unknown too: the uncertain write
+    // is never repeated under another id.
+    let fresh = reply_tolerating_gaps(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        &ulid::Ulid::new().to_string(),
+        ReplyTarget {
+            verb: "approve",
+            request_id: &request_id,
+            turn_id: &turn_id,
+            args: json!({}),
+        },
+    )
+    .await;
+    assert_eq!(fresh["state"], json!("unknown"));
+    assert_eq!(scenario.report()["decides"], json!(1));
+
+    // The dead host's stream gap may arrive before, during or after the
+    // stop; stop_agent acknowledges it and waits for the ended batch.
+    stop_agent(&mut scenario.host, &agent_id, 1, true).await;
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+    assert_eq!(scenario.report()["decides"], json!(1));
+    let _ = std::fs::remove_dir_all(&scenario.root);
+}
+
+/// Like `reply_with_id`, but tolerates the dead host's stream gap arriving
+/// around the reply: acknowledge it and keep waiting for the reply outcome.
+async fn reply_tolerating_gaps(
+    host: &mut Host,
+    agent_id: &str,
+    generation: i64,
+    command_id: &str,
+    target: ReplyTarget<'_>,
+) -> Value {
+    let rx = host
+        .begin_call(
+            "agent.command",
+            json!({
+                "agent_id": agent_id,
+                "generation": generation,
+                "command_id": command_id,
+                "verb": target.verb,
+                "args": target.args,
+                "turn_id": target.turn_id,
+                "request_id": target.request_id,
+            }),
+        )
+        .await;
+    let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
+    let result = loop {
+        tokio::select! {
+            biased;
+            request = host.next_request() => {
+                assert_eq!(request.method, "source.gap");
+                let gap_id = request
+                    .params
+                    .get("gap_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let seq = host.next_seq;
+                host.next_seq += 1;
+                host.respond(&request.id, json!({"gap_id": gap_id, "seq": seq}))
+                    .await;
+            }
+            result = &mut rx => break result,
+        }
+    };
+    result
+        .expect("reply deadline")
+        .expect("reply response channel")
+        .expect("reply responds")
+}
+
+/// The observation-counter guard: the resume snapshot is captured before the
+/// pull, the pending approval resolves on the stream after the capture, and
+/// the stale snapshot entry must not reopen it when it applies.
+async fn scenario_stale_pull_does_not_reopen_stream_resolved_request() {
+    let agent_id = ulid::Ulid::new().to_string();
+    let (resume_from, source_state) = retained_resume_subject(&agent_id);
+    let mut scenario = Scenario::start_resume(
+        "resume-stale-pull",
+        muse_profile(),
+        agent_id,
+        resume_from,
+        source_state,
+        RETAINED_SESSION,
+    )
+    .await;
+    let agent_id = scenario.agent_id.clone();
+    assert_eq!(scenario.start_result["snapshot_pull"], json!("ok"));
+    assert_eq!(scenario.report()["pending_pulls"], json!(1));
+
+    // The stream opens the re-issued approval on the live turn and resolves
+    // it, all inside the associate roundtrip; the stale snapshot entry
+    // applies strictly after the resolution. The turn completes right
+    // behind, so the tail batches may already be in flight when the send
+    // applies: drain whatever the parked send has not already collected.
+    let (_send_id, turn_id, mut committed) =
+        send_parked(&mut scenario.host, &agent_id, 2, "Continue the work.", 1).await;
+    for missing in [
+        "turn.started",
+        "request.opened",
+        "request.closed",
+        "message.completed",
+        "turn.completed",
+    ]
+    .into_iter()
+    .skip(committed.len())
+    {
+        let more = scenario.host.answer_events_put(&agent_id, 2, missing).await;
+        committed.extend(
+            more.into_iter()
+                .map(|event| (missing.to_owned(), event["data"].clone())),
+        );
+    }
+    assert_eq!(
+        committed
+            .iter()
+            .map(|(kind, _)| kind.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "turn.started",
+            "request.opened",
+            "request.closed",
+            "message.completed",
+            "turn.completed"
+        ]
+    );
+    let opened = &committed[1].1;
+    let request_id = opened["request_id"].as_str().expect("request id");
+    assert!(
+        request_id.contains(&turn_id),
+        "the stream opened the live-bound request: {request_id}"
+    );
+    assert_ne!(turn_id, RETAINED_TURN);
+    assert_eq!(committed[2].1["request_id"], json!(request_id));
+
+    // No decision wrote, no second open landed, no gap fired.
+    let report = scenario.report();
+    assert_eq!(report["decides"], json!(0));
+    assert_eq!(report["pending_pulls"], json!(1));
+
+    let stopped = stop_agent(&mut scenario.host, &agent_id, 2, false).await;
+    assert_eq!(
+        stopped
+            .iter()
+            .map(|(kind, _)| kind.as_str())
+            .collect::<Vec<_>>(),
+        ["session.ended"]
+    );
+    // The re-issued open is receipted exactly once; the stale snapshot entry
+    // never presents, so it needs no receipt.
+    assert_eq!(scenario.report()["receipts"], json!(1));
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+    let _ = std::fs::remove_dir_all(&scenario.root);
+}
+
+/// Committed request.opened details redact the approval subject (including
+/// its command string), questions and available choices with the configured
+/// secrets; the in-memory offer stays exact so replies still work.
+async fn scenario_request_details_redact_secrets() {
+    const SECRET: &str = "request-redact";
+    let mut scenario = Scenario::start("request-redact", muse_profile()).await;
+    let agent_id = scenario.agent_id.clone();
+
+    let (_send_id, turn_id, committed) =
+        send_parked(&mut scenario.host, &agent_id, 1, "Deploy it.", 2).await;
+    let opens: Vec<&Value> = committed
+        .iter()
+        .filter(|(kind, _)| kind == "request.opened")
+        .map(|(_, data)| data)
+        .collect();
+    assert_eq!(opens.len(), 2);
+    let approval = opens
+        .iter()
+        .find(|data| data["kind"] == json!("approval"))
+        .expect("approval opened");
+    let prompt = opens
+        .iter()
+        .find(|data| data["kind"] == json!("user_input"))
+        .expect("prompt opened");
+    let approval_id = approval["request_id"]
+        .as_str()
+        .expect("approval id")
+        .to_owned();
+    let prompt_id = prompt["request_id"].as_str().expect("prompt id").to_owned();
+
+    // The persisted offer redacts every secret-bearing free-text field.
+    assert_eq!(
+        approval["details"]["subject"]["command"],
+        json!("deploy --token [REDACTED]")
+    );
+    for choice in approval["details"]["available_choices"]
+        .as_array()
+        .expect("offered choices")
+    {
+        let label = choice.get("label").and_then(Value::as_str).expect("label");
+        assert!(
+            label.contains("[REDACTED]"),
+            "choice label redacted: {label}"
+        );
+        assert!(!label.contains(SECRET), "choice label hides the secret");
+    }
+    for question in prompt["details"]["questions"]
+        .as_array()
+        .expect("offered questions")
+    {
+        let text = question
+            .get("question")
+            .and_then(Value::as_str)
+            .expect("question text");
+        assert!(text.contains("[REDACTED]"), "question redacted: {text}");
+        assert!(!text.contains(SECRET), "question hides the secret");
+        for option in question
+            .get("options")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+        {
+            let label = option
+                .get("label")
+                .and_then(Value::as_str)
+                .expect("option label");
+            assert!(label.contains("[REDACTED]"), "option redacted: {label}");
+            assert!(!label.contains(SECRET), "option hides the secret");
+        }
+    }
+    assert!(
+        !approval.to_string().contains(SECRET),
+        "persisted approval hides the secret"
+    );
+    assert!(
+        !prompt.to_string().contains(SECRET),
+        "persisted prompt hides the secret"
+    );
+
+    // Replies still decide from the exact in-memory offer.
+    let (approve_id, approved, _) = reply(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "approve",
+        &approval_id,
+        &turn_id,
+        json!({}),
+    )
+    .await;
+    assert_eq!(approved["state"], json!("applied"));
+    let resolved = scenario
+        .host
+        .answer_events_put(&agent_id, 1, "request.resolved")
+        .await;
+    assert_eq!(resolved[0]["data"]["command_id"], json!(approve_id));
+
+    let (answer_id, answered, _) = reply(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "answer",
+        &prompt_id,
+        &turn_id,
+        json!({"answers": {
+            "q1": {"selected_label": "staging request-redact"},
+            "q2": {"selected_labels": ["dry-run request-redact", "force request-redact"]},
+        }}),
+    )
+    .await;
+    assert_eq!(answered["state"], json!("applied"));
+    let resolved = scenario
+        .host
+        .answer_events_put(&agent_id, 1, "request.resolved")
+        .await;
+    assert_eq!(resolved[0]["data"]["command_id"], json!(answer_id));
+    scenario
+        .host
+        .answer_events_put(&agent_id, 1, "message.completed")
+        .await;
+    scenario
+        .host
+        .answer_events_put(&agent_id, 1, "turn.completed")
+        .await;
+
+    let report = scenario.report();
+    assert_eq!(report["decides"], json!(1));
+    assert_eq!(report["answers"], json!(1));
+
+    stop_agent(&mut scenario.host, &agent_id, 1, false).await;
+    assert_eq!(scenario.report()["receipts"], json!(2));
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+    let _ = std::fs::remove_dir_all(&scenario.root);
+}
+
+/// A pulled entry that fails describe is skipped with an explicit gap
+/// instead of adopted, and the resume still proceeds: adoption never fails
+/// the resume. The gap carries the standard source consequence (new input is
+/// refused unknown), while the owned session still stops cleanly.
+async fn scenario_resume_with_undecodable_pull_proceeds() {
+    let agent_id = ulid::Ulid::new().to_string();
+    let (resume_from, source_state) = retained_resume_subject(&agent_id);
+    let (pending, rx) = Scenario::setup_start(
+        "resume-undecodable-pull",
+        muse_profile(),
+        agent_id,
+        2,
+        resume_from,
+        source_state,
+    )
+    .await;
+    let (mut scenario, gap_reason) = pending
+        .finish_with_snapshot_gap(rx, Some(RETAINED_SESSION))
+        .await;
+    let agent_id = scenario.agent_id.clone();
+    assert_eq!(
+        gap_reason,
+        "Muse pulled request snapshot contained an undecodable entry"
+    );
+    assert_eq!(scenario.start_result["snapshot_pull"], json!("ok"));
+    assert_eq!(scenario.report()["pending_pulls"], json!(1));
+
+    // The foreign entry never opens, and the gapped source refuses new
+    // input without dispatching it.
+    let send = scenario
+        .host
+        .call(
+            "agent.command",
+            json!({
+                "agent_id": agent_id,
+                "generation": 2,
+                "command_id": ulid::Ulid::new().to_string(),
+                "verb": "send",
+                "args": {"text": "Continue the work."},
+                "turn_id": null,
+                "request_id": null,
+            }),
+        )
+        .await;
+    assert_eq!(send, Err("unknown".to_owned()));
+    assert_eq!(scenario.report()["turn_starts"], json!(0));
+
+    let stopped = stop_agent(&mut scenario.host, &agent_id, 2, false).await;
+    assert_eq!(
+        stopped
+            .iter()
+            .map(|(kind, _)| kind.as_str())
+            .collect::<Vec<_>>(),
+        ["session.ended"]
+    );
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+    let _ = std::fs::remove_dir_all(&scenario.root);
+}
+
 /// Multi-stage approvals: the first decision applies with `terminal: false`,
 /// the update resets the consumed reply, and the second stage decides
 /// (here: a deny with feedback) to the terminal resolution.
@@ -3675,13 +4482,11 @@ async fn scenario_multistage_approval_decides_each_stage() {
     )
     .await;
     assert_eq!(first["state"], json!("applied"));
-    // The stage update commits nothing observable: give the processor's
-    // frame queue a beat to apply it before the second-stage reply. The
-    // scenario roundtrip alone already orders this in practice; the sleep
-    // covers pathological scheduling.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let (second_id, second, _) = reply(
+    // The stage update commits nothing observable, so the second-stage reply
+    // retries (state-based, never a fixed sleep) until the processor has
+    // applied it: premature attempts are rejected locally while the consumed
+    // first-stage reply is still outstanding, without touching the native lane.
+    let (second_id, second) = reply_until_applied(
         &mut scenario.host,
         &agent_id,
         1,

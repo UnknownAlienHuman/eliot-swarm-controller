@@ -96,6 +96,7 @@ enum Control {
         entries: Vec<CorePending>,
         expected: Vec<String>,
         capture: u64,
+        snapshot_had_undecodable: bool,
         reply: oneshot::Sender<Result<()>>,
     },
     BeginStop {
@@ -262,11 +263,13 @@ impl EventHandle {
         entries: Vec<CorePending>,
         expected: Vec<String>,
         capture: u64,
+        snapshot_had_undecodable: bool,
     ) -> Result<()> {
         self.send(|reply| Control::AdoptPulled {
             entries,
             expected,
             capture,
+            snapshot_had_undecodable,
             reply,
         })
         .await
@@ -385,9 +388,12 @@ impl EventProcessor {
                 entries,
                 expected,
                 capture,
+                snapshot_had_undecodable,
                 reply,
             } => {
-                let result = self.adopt_pulled(entries, expected, capture).await;
+                let result = self
+                    .adopt_pulled(entries, expected, capture, snapshot_had_undecodable)
+                    .await;
                 let _ = reply.send(result);
                 true
             }
@@ -790,12 +796,13 @@ impl EventProcessor {
             .active_command_id
             .clone()
             .ok_or_else(|| Error::new("unknown", "Muse request has no Eliot send command"))?;
+        let policy = SecretPolicy::new(self.secrets.iter().cloned());
         let data = json!({
             "command_id": command_id,
             "request_id": request.id,
             "turn_id": request.turn_id,
             "kind": request.kind,
-            "details": request.details,
+            "details": redact_request_details_for_commit(&request.details, &policy),
         });
         if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
             self.defer_gap("Muse normalized request exceeded the persisted-event bound");
@@ -1008,7 +1015,17 @@ impl EventProcessor {
         entries: Vec<CorePending>,
         expected: Vec<String>,
         capture: u64,
+        snapshot_had_undecodable: bool,
     ) -> Result<()> {
+        // The pull landed but at least one entry could not be described: an
+        // explicit gap records the missing presentation instead of silently
+        // dropping it. Adoption runs after readiness, so this never fails the
+        // resume (a gap acknowledgement failure is ignored the same way).
+        if snapshot_had_undecodable {
+            let _ = self
+                .record_gap("Muse pulled request snapshot contained an undecodable entry")
+                .await;
+        }
         for id in expected.into_iter().take(MAX_PENDING_REQUESTS) {
             if !id.trim().is_empty() {
                 self.expected_requests.insert(id);
@@ -1056,14 +1073,16 @@ impl EventProcessor {
             return Ok(());
         }
         let Some(command_id) = self.status.active_command_id.clone() else {
+            self.defer_gap("Muse pulled request arrived with no active command");
             return Ok(());
         };
+        let policy = SecretPolicy::new(self.secrets.iter().cloned());
         let data = json!({
             "command_id": command_id,
             "request_id": entry.id,
             "turn_id": entry.turn_id,
             "kind": entry.kind,
-            "details": entry.details,
+            "details": redact_request_details_for_commit(&entry.details, &policy),
         });
         if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
             self.defer_gap("Muse pulled request exceeded the persisted-event bound");
@@ -1909,6 +1928,23 @@ fn orphan_request_id(method: &str, params: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty())
         .map(str::to_owned)
+}
+
+/// Redact the free-text offer fields of a described request for the committed
+/// `request.opened` event: the approval `subject` (including its `command`
+/// string), `questions` and `available_choices`. The in-memory offer stays raw
+/// so choice/requirement matching and re-issue comparison keep working on
+/// exact native values; only the persisted copy is redacted.
+fn redact_request_details_for_commit(details: &Value, policy: &SecretPolicy) -> Value {
+    let mut redacted = details.clone();
+    if let Some(fields) = redacted.as_object_mut() {
+        for key in ["subject", "questions", "available_choices"] {
+            if let Some(field) = fields.get_mut(key) {
+                policy.redact_values(field);
+            }
+        }
+    }
+    redacted
 }
 
 /// The native approval/user-input id a described request answers to.

@@ -568,8 +568,9 @@ impl MusePlugin {
         // A lost resume reply leaves the write unknown under the minted
         // command id; the resume is never dispatched a second time.
         let mut snapshot_pull: Option<bool> = None;
+        let mut resume_pointers = Vec::new();
         let native_session = if resume_subject.is_some() {
-            let resumed = match serde_json::from_value::<NativeSessionResumeResult>(
+            let mut resumed = match serde_json::from_value::<NativeSessionResumeResult>(
                 response_value.clone(),
             ) {
                 Ok(resumed)
@@ -596,21 +597,13 @@ impl MusePlugin {
                     ));
                 }
             };
-            // Late-joiner pointers: the full payloads arrive as re-issued
-            // server-to-client requests right after this response, and the
-            // pull below covers any re-issue the stream loses. Adoption is
-            // best-effort and never fails the resume: entries that bind to a
-            // live turn open, the dead generation's orphans drop.
+            // Late-joiner pointers are pulled after readiness (below): the
+            // full payloads arrive as re-issued server-to-client requests
+            // right after this response, and the pull covers any re-issue the
+            // stream loses. The re-issues buffer until a turn associates, so
+            // adoption still registers before they apply.
             if !resumed.pending_requests.is_empty() {
-                snapshot_pull = Some(
-                    adopt_resume_snapshot(
-                        &session.native_client,
-                        &session.events,
-                        &resumed.session.session_id,
-                        &resumed.pending_requests,
-                    )
-                    .await,
-                );
+                resume_pointers = std::mem::take(&mut resumed.pending_requests);
             }
             if resumed.session.status != "idle" {
                 self.session = Some(session);
@@ -782,6 +775,21 @@ impl MusePlugin {
             ));
         }
         session.phase = SessionPhase::Ready;
+        // Adoption is best-effort and never fails the resume: entries that
+        // bind to a live turn open, the dead generation's orphans drop. It
+        // runs after readiness so a corrupt snapshot entry gaps the source
+        // without failing the resume itself.
+        if !resume_pointers.is_empty() {
+            snapshot_pull = Some(
+                adopt_resume_snapshot(
+                    &session.native_client,
+                    &session.events,
+                    native_session.session_id.as_str(),
+                    &resume_pointers,
+                )
+                .await,
+            );
+        }
         let mut result = json!({
             "agent_id": params.agent_id,
             "generation": params.generation,
@@ -1990,7 +1998,9 @@ async fn adopt_resume_snapshot(
         .ok()
         .and_then(|value| serde_json::from_value(value).ok());
     let Some(pulled) = pulled else {
-        let _ = events.adopt_pulled(Vec::new(), expected, capture).await;
+        let _ = events
+            .adopt_pulled(Vec::new(), expected, capture, false)
+            .await;
         return false;
     };
     let wanted = expected
@@ -1998,6 +2008,7 @@ async fn adopt_resume_snapshot(
         .map(String::as_str)
         .collect::<std::collections::HashSet<_>>();
     let mut entries = Vec::new();
+    let mut snapshot_had_undecodable = false;
     for approval in &pulled.approvals {
         if !wanted.contains(approval.approval_id.as_str()) {
             continue;
@@ -2005,9 +2016,11 @@ async fn adopt_resume_snapshot(
         let raw = serde_json::to_value(approval).unwrap_or(Value::Null);
         // The pull is session-scoped but the binding is still verified: a
         // foreign-session entry fails describe and is skipped, never adopted.
-        if let Ok(entry) = describe_request("approval/request", &raw, session_id, &approval.turn_id)
-        {
-            entries.push(entry);
+        // Skipped entries are reported (the event path gaps them) instead of
+        // silently dropped; adoption still never fails the resume.
+        match describe_request("approval/request", &raw, session_id, &approval.turn_id) {
+            Ok(entry) => entries.push(entry),
+            Err(_) => snapshot_had_undecodable = true,
         }
     }
     for prompt in &pulled.user_inputs {
@@ -2015,12 +2028,14 @@ async fn adopt_resume_snapshot(
             continue;
         }
         let raw = serde_json::to_value(prompt).unwrap_or(Value::Null);
-        if let Ok(entry) = describe_request("userInput/request", &raw, session_id, &prompt.turn_id)
-        {
-            entries.push(entry);
+        match describe_request("userInput/request", &raw, session_id, &prompt.turn_id) {
+            Ok(entry) => entries.push(entry),
+            Err(_) => snapshot_had_undecodable = true,
         }
     }
-    let _ = events.adopt_pulled(entries, expected, capture).await;
+    let _ = events
+        .adopt_pulled(entries, expected, capture, snapshot_had_undecodable)
+        .await;
     true
 }
 

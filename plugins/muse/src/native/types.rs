@@ -19,12 +19,28 @@ use serde::{Deserialize, Serialize};
 
 /// Whether a JSON-RPC request error code proves the command was not admitted:
 /// the JSON-RPC pre-admission/validation failures (`-32700` parse, `-32600`
-/// invalid request, `-32601` method not found, `-32602` invalid params) plus
-/// the MSP admission-failure kind `-32030 commandRejected` (the SS3.6
-/// admission-failure table). Everything else — including `-32603` internal
-/// and unknown future kinds — is unknown, never rejected.
+/// invalid request, `-32601` method not found, `-32602` invalid params), the
+/// MSP admission-failure kind `-32030 commandRejected` (the SS3.6
+/// admission-failure table), and the SS5 request-path validation failures the
+/// installed schema defines as not admitted. A decision/answer refused with
+/// one of these was never written, so the owner may reply again with
+/// corrected values. Schema rows (stable `msp.schema.json`):
+/// `ApprovalDecideParams.choiceId` ("One of the current `availableChoices`;
+/// else -32052"), `ApprovalDecideParams.requirementId` ("a stale value is
+/// -32053"), `UserInputAnswerParams` ("Answers that do not match the prompt
+/// fail -32057"), `ErrorData.choiceId` ("Rejected server-minted choice on
+/// `approvalChoiceInvalid`") and `ErrorData.currentRequirementId` ("Current
+/// stage token on `approvalRequirementStale`" — the retry payload).
+/// Everything else — including `-32603` internal, the lookup/state outcomes
+/// `-32050`/`-32055` (target gone; the stream or turn end is authoritative),
+/// `-32051`/`-32056` (already resolved/settled; the winning outcome travels
+/// on the view stream) and `-32054` (reviewer unavailable; the write fate is
+/// uncertain) — and unknown future kinds is unknown, never rejected.
 pub fn is_not_admitted(code: i64) -> bool {
-    matches!(code, -32700 | -32600 | -32601 | -32602 | -32030)
+    matches!(
+        code,
+        -32700 | -32600 | -32601 | -32602 | -32030 | -32052 | -32053 | -32057
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -722,18 +738,25 @@ mod tests {
 
     #[test]
     fn only_pre_admission_errors_prove_no_write() {
-        for code in [-32700, -32600, -32601, -32602, -32030] {
+        // The request-path validation failures the installed schema defines
+        // as not admitted (SS5 rows cited on `is_not_admitted`): a decision
+        // refused with one of these was never written, so the owner may reply
+        // again with corrected values.
+        for code in [
+            -32700, -32600, -32601, -32602, -32030, -32052, -32053, -32057,
+        ] {
             assert!(is_not_admitted(code), "code={code}");
         }
         // Internal errors, uncertain writes, all other MSP kinds and unknown
         // future codes never prove rejection; the caller maps them to unknown.
-        // The request-path kinds (stale requirement, invalid choice/answer,
-        // already resolved) are pinned here too: a lost decide/answer race is
-        // unknown, never a proof of non-admission.
+        // The remaining request-path kinds name lookup/state outcomes with no
+        // validation row (target gone, already resolved/settled, reviewer
+        // unavailable): a lost decide/answer race stays unknown, never a
+        // proof of non-admission.
         for code in [
             -32603, -32001, -32002, -32010, -32011, -32013, -32014, -32020, -32021, -32022, -32024,
-            -32025, -32031, -32032, -32040, -32041, -32042, -32050, -32051, -32052, -32053, -32054,
-            -32055, -32056, -32057, -32999, 0,
+            -32025, -32031, -32032, -32040, -32041, -32042, -32050, -32051, -32054, -32055, -32056,
+            -32999, 0,
         ] {
             assert!(!is_not_admitted(code), "code={code}");
         }
