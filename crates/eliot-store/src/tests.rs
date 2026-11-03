@@ -78,7 +78,7 @@ fn initial_source_families_match_fake_and_codex_harness_boundaries() {
     );
     assert_eq!(
         super::source_families_for_harness("muse").unwrap(),
-        &["session", "turn", "message"][..]
+        &["session", "turn", "message", "request"][..]
     );
     assert_eq!(
         super::source_families_for_harness("other")
@@ -9190,4 +9190,116 @@ fn muse_unknown_resume_is_never_redriven() {
         store.get_command(&resume_id).unwrap().unwrap().state,
         CommandState::Failed
     );
+}
+
+#[test]
+fn muse_request_replies_pass_admission_and_dispatch_while_turn_controls_wait() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let project = "muse-request-replies";
+    let (agent, _, _, _) = ready_muse_agent(
+        &mut store,
+        project,
+        "muse-test",
+        "synthetic-muse-request-replies",
+        now,
+    );
+    let send = send_request(&agent, 1, "open a request turn");
+    let send_id = send.id.clone();
+    store.submit("owner", send, now + 5).unwrap();
+    store.dispatch(&send_id, now + 6).unwrap();
+    let turn_id = format!("muse-request-turn-{}", Ulid::new());
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: Ulid::new().to_string(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "turn.started".to_owned(),
+                    native_id: Ulid::new().to_string(),
+                    data: json!({"command_id":send_id, "turn_id":turn_id}),
+                }],
+                cursor: None,
+            },
+            now + 7,
+        )
+        .expect("commit the muse request turn");
+    let open_request = |native_id: &str, request_id: &str, kind: &str| NativeEvent {
+        ts: None,
+        kind: "request.opened".to_owned(),
+        native_id: native_id.to_owned(),
+        data: json!({
+            "command_id":send_id,
+            "request_id":request_id,
+            "turn_id":turn_id,
+            "kind":kind,
+            "details":{"session_id":"native-session","turn_id":turn_id},
+        }),
+    };
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: Ulid::new().to_string(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![
+                    open_request("muse-reply-approve", "muse-request-approve", "approval"),
+                    open_request("muse-reply-deny", "muse-request-deny", "approval"),
+                    open_request("muse-reply-answer", "muse-request-answer", "user_input"),
+                ],
+                cursor: None,
+            },
+            now + 8,
+        )
+        .expect("commit muse pending requests");
+
+    // A1 connects approve/deny/answer for `muse`: each admits against its
+    // exact pending request and dispatches to the plugin's agent.command.
+    for (verb, request_id) in [
+        ("approve", "muse-request-approve"),
+        ("deny", "muse-request-deny"),
+        ("answer", "muse-request-answer"),
+    ] {
+        let mut reply = SubmitCommand::new(Ulid::new().to_string(), verb);
+        reply.target = Some(agent.clone());
+        reply.expected_generation = Some(1);
+        reply.expected_turn_id = Some(turn_id.clone());
+        reply.request_id = Some(request_id.to_owned());
+        let reply_id = reply.id.clone();
+        let admission = store
+            .submit("owner", reply, now + 9)
+            .unwrap_or_else(|error| panic!("admit muse {verb}: {error:?}"));
+        assert_eq!(admission.command.state, CommandState::Accepted);
+        assert_eq!(
+            store
+                .dispatch(&reply_id, now + 10)
+                .unwrap_or_else(|error| panic!("dispatch muse {verb}: {error:?}"))
+                .value
+                .state,
+            CommandState::Dispatched
+        );
+    }
+
+    // Steer and interrupt stay unsupported for `muse` until A2 connects the
+    // exact-current-turn native controls.
+    for verb in ["steer", "interrupt"] {
+        let mut control = SubmitCommand::new(Ulid::new().to_string(), verb);
+        control.target = Some(agent.clone());
+        control.expected_generation = Some(1);
+        control.expected_turn_id = Some(turn_id.clone());
+        if verb == "steer" {
+            control.args = json!({"text": "not yet connected"});
+        }
+        assert_eq!(
+            store
+                .submit("owner", control, now + 11)
+                .expect_err("muse turn control waits for A2")
+                .code,
+            "unsupported"
+        );
+    }
 }

@@ -1,11 +1,12 @@
-//! Minimal MSP wire DTOs for the PR1 launch path plus the PR2 resume
-//! path, derived from the installed host's exported stable schema
+//! Minimal MSP wire DTOs for the launch/send/stop path (PR1), the resume
+//! path (PR2) and the native-request path (A1: approve/deny/answer), derived
+//! from the installed host's exported stable schema
 //! (`muse schema generate-json-schema`, Muse Code 1.4.0, bundle fingerprint
-//! `sha256:36466f63…0d3d7f`, re-verified for PR2). Only the session-start,
-//! session-resume, turn-start, view-event, stop/close and readback shapes
-//! this path uses are modelled. Unknown fields are ignored: the schema rules
-//! additive-optional evolution, so a strict DTO would reject valid host
-//! frames.
+//! `sha256:36466f63…0d3d7f`, re-verified for A1). Only the session-start,
+//! session-resume, turn-start, view-event, stop/close, request/decide/answer
+//! and readback shapes this path uses are modelled. Unknown fields are
+//! ignored: the schema rules additive-optional evolution, so a strict DTO
+//! would reject valid host frames.
 //!
 //! No SDK code is copied here; these structs are written from the schema.
 
@@ -18,12 +19,28 @@ use serde::{Deserialize, Serialize};
 
 /// Whether a JSON-RPC request error code proves the command was not admitted:
 /// the JSON-RPC pre-admission/validation failures (`-32700` parse, `-32600`
-/// invalid request, `-32601` method not found, `-32602` invalid params) plus
-/// the MSP admission-failure kind `-32030 commandRejected` (the SS3.6
-/// admission-failure table). Everything else — including `-32603` internal
-/// and unknown future kinds — is unknown, never rejected.
+/// invalid request, `-32601` method not found, `-32602` invalid params), the
+/// MSP admission-failure kind `-32030 commandRejected` (the SS3.6
+/// admission-failure table), and the SS5 request-path validation failures the
+/// installed schema defines as not admitted. A decision/answer refused with
+/// one of these was never written, so the owner may reply again with
+/// corrected values. Schema rows (stable `msp.schema.json`):
+/// `ApprovalDecideParams.choiceId` ("One of the current `availableChoices`;
+/// else -32052"), `ApprovalDecideParams.requirementId` ("a stale value is
+/// -32053"), `UserInputAnswerParams` ("Answers that do not match the prompt
+/// fail -32057"), `ErrorData.choiceId` ("Rejected server-minted choice on
+/// `approvalChoiceInvalid`") and `ErrorData.currentRequirementId` ("Current
+/// stage token on `approvalRequirementStale`" — the retry payload).
+/// Everything else — including `-32603` internal, the lookup/state outcomes
+/// `-32050`/`-32055` (target gone; the stream or turn end is authoritative),
+/// `-32051`/`-32056` (already resolved/settled; the winning outcome travels
+/// on the view stream) and `-32054` (reviewer unavailable; the write fate is
+/// uncertain) — and unknown future kinds is unknown, never rejected.
 pub fn is_not_admitted(code: i64) -> bool {
-    matches!(code, -32700 | -32600 | -32601 | -32602 | -32030)
+    matches!(
+        code,
+        -32700 | -32600 | -32601 | -32602 | -32030 | -32052 | -32053 | -32057
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -213,14 +230,17 @@ pub struct NativeSessionHistory {
     pub mode: String,
 }
 
-/// `session/resume` result (SS2.5.2). `pendingRequests` stays opaque JSON:
-/// this slice refuses a resume with unsettled native requests because
-/// approvals and user-input dialogs are unconnected.
+/// `session/resume` result (SS2.5.2). `pendingRequests` is the late-joiner
+/// pointer set: the full payloads arrive as re-issued server-to-client
+/// requests right after the resume response, and the event path adopts only
+/// ids that still bind to the live turn (guarded by its local observation
+/// counter). Entries that belong to the dead generation's turn are
+/// receipted-and-dropped orphans, never answered.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeSessionResumeResult {
     pub history: NativeSessionHistory,
-    pub pending_requests: Vec<serde_json::Value>,
+    pub pending_requests: Vec<NativePendingRequestPointer>,
     pub session: NativeSession,
     pub view_cursor: String,
 }
@@ -434,6 +454,280 @@ pub const REASONING_EFFORT_TIERS: [&str; 8] = [
     "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
 ];
 
+// ---------------------------------------------------------------------------
+// Native requests: approvals and user input (SS5.x)
+// ---------------------------------------------------------------------------
+
+/// One offered approval choice. `decision` and `scope` are wire-open: the
+/// reply path accepts only the known approve/deny decisions for its verb and
+/// never auto-approves an unknown future decision.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeApprovalChoice {
+    pub choice_id: String,
+    pub decision: String,
+    pub label: String,
+    pub scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepts_feedback: Option<bool>,
+}
+
+/// The multi-stage race guard (SS5.4): a decision must carry the approval's
+/// current requirement or the host answers `-32053 approvalRequirementStale`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeApprovalRequirementRef {
+    pub approval_id: String,
+    pub source_index: i64,
+}
+
+/// Full params shared by `approval/request` and `approval/requested` (SS5.3).
+/// Only the bound identity, the offered choices with their current
+/// requirement, and the owner-visible provenance are modelled. `rawArgs` is
+/// deliberately unmodelled: it is unbounded tool-call JSON, never persisted —
+/// the request path records only its byte length from the raw params.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeApprovalRequestParams {
+    pub approval_id: String,
+    pub available_choices: Vec<NativeApprovalChoice>,
+    pub current_requirement_id: NativeApprovalRequirementRef,
+    pub item_id: String,
+    pub session_id: String,
+    pub subject: serde_json::Value,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub turn_id: String,
+    pub view_cursor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_escalated: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protected_write: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_origin: Option<serde_json::Value>,
+}
+
+/// `approval/decide` params (SS5.4): a standard SS3 command — session-loaded
+/// host, caller-minted `commandId` idempotency handle, durable intake before
+/// ack, value-identical replay.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeApprovalDecideParams {
+    pub approval_id: String,
+    pub choice_id: String,
+    pub command_id: String,
+    pub requirement_id: NativeApprovalRequirementRef,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feedback: Option<String>,
+}
+
+/// `approval/decide` result (SS5.4). `terminal == false` means the choice
+/// satisfied one stage while further requirements remain: the approval stays
+/// pending and an updated `approval/request` follows.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeApprovalDecideResult {
+    pub approval_id: String,
+    pub command_id: String,
+    pub status: String,
+    pub terminal: bool,
+}
+
+/// `approval/resolved` params: the first durable terminal decision. Only the
+/// binding fields are modelled; the decision itself has no Eliot channel
+/// (`request.resolved` carries no details by Store contract).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeApprovalResolvedNotification {
+    pub approval_id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub view_cursor: String,
+}
+
+/// `approval/updated` params: the refreshed pending view plus one change.
+/// Only the fields that refresh the in-memory offer (choices, requirement)
+/// and the binding fields are modelled.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeApprovalUpdatedNotification {
+    pub approval_id: String,
+    pub available_choices: Vec<NativeApprovalChoice>,
+    pub current_requirement_id: NativeApprovalRequirementRef,
+    pub session_id: String,
+    pub view_cursor: String,
+}
+
+/// `approval/listPending` params (SS5.7): the pull dual of the re-issued
+/// requests. A log-fold read — no lease, works on loaded and unloaded
+/// sessions, never subscribes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeApprovalListPendingParams {
+    pub session_id: String,
+}
+
+/// `approval/listPending` result (SS5.7): point-in-time, ordered by opening
+/// view cursor. Acting on it race-safely is the caller's job — the decision
+/// carries the `requirementId` guard regardless of how the client learned the
+/// state, and this path additionally guards snapshot adoption with its local
+/// observation counter.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeApprovalListPendingResult {
+    #[serde(default)]
+    pub approvals: Vec<NativeApprovalRequestParams>,
+    #[serde(default)]
+    pub user_inputs: Vec<NativeUserInputRequestParams>,
+}
+
+/// One pending-request late-joiner pointer served by `session/resume`
+/// (SS2.5.2). The full payloads arrive as re-issued server-to-client requests
+/// right after the resume response; the pointer only names which ids to
+/// expect (and to receipt-and-drop as orphans when they belong to the dead
+/// generation's turn).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativePendingRequestPointer {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_input_id: Option<String>,
+    pub view_cursor: String,
+}
+
+impl NativePendingRequestPointer {
+    /// The exact native request id this pointer names, or `None` when the
+    /// entry carries no id for its kind (accepted by the published schema).
+    pub fn request_id(&self) -> Option<&str> {
+        match self.kind.as_str() {
+            "approval" => self.approval_id.as_deref(),
+            "userInput" => self.user_input_id.as_deref(),
+            _ => None,
+        }
+    }
+}
+
+/// One offered user-input option. Only the selected label is modelled.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeUserInputOption {
+    pub label: String,
+}
+
+/// The question's answer shape: closed `single | multiple` plus optional
+/// selection bounds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeUserInputSelection {
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_selections: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_selections: Option<i64>,
+}
+
+/// One offered user-input question (SS5.10).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeUserInputQuestion {
+    pub header: String,
+    pub id: String,
+    pub options: Vec<NativeUserInputOption>,
+    pub question: String,
+    pub selection: NativeUserInputSelection,
+}
+
+/// Full params shared by `userInput/request` and `userInput/requested`
+/// (SS5.10). Only the bound identity, the offered questions, and the
+/// owner-visible provenance are modelled.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeUserInputRequestParams {
+    pub item_id: String,
+    pub questions: Vec<NativeUserInputQuestion>,
+    pub session_id: String,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub turn_id: String,
+    pub user_input_id: String,
+    pub view_cursor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_resolution_ms: Option<i64>,
+}
+
+/// One wire answer (SS5.10.2): `questionId` plus exactly one of
+/// `selectedLabel` (single mode), `selectedLabels` (multiple mode, within
+/// min/max bounds), or `freeText` (<=500 chars); plus an optional `note`
+/// (<=500 chars).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeUserInputAnswer {
+    pub question_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_labels: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// `userInput/answer` params (SS5.10.2): answer every question.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeUserInputAnswerParams {
+    pub answers: Vec<NativeUserInputAnswer>,
+    pub command_id: String,
+    pub session_id: String,
+    pub user_input_id: String,
+}
+
+/// `userInput/answer` result (SS5.10.2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeUserInputAnswerResult {
+    pub command_id: String,
+    pub status: String,
+    pub user_input_id: String,
+}
+
+/// `userInput/cancel` params (SS5.10.2): decline to answer; the tool call
+/// resolves with a cancelled result the model sees.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeUserInputCancelParams {
+    pub command_id: String,
+    pub session_id: String,
+    pub user_input_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// `userInput/cancel` result (SS5.10.2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeUserInputCancelResult {
+    pub command_id: String,
+    pub status: String,
+    pub user_input_id: String,
+}
+
+/// `userInput/settled` params: the first durable prompt settlement. Only the
+/// binding fields are modelled; the outcome has no Eliot channel.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeUserInputSettledNotification {
+    pub session_id: String,
+    pub user_input_id: String,
+    pub view_cursor: String,
+}
+
 pub fn is_reasoning_effort_tier(value: &str) -> bool {
     REASONING_EFFORT_TIERS.contains(&value)
 }
@@ -444,14 +738,25 @@ mod tests {
 
     #[test]
     fn only_pre_admission_errors_prove_no_write() {
-        for code in [-32700, -32600, -32601, -32602, -32030] {
+        // The request-path validation failures the installed schema defines
+        // as not admitted (SS5 rows cited on `is_not_admitted`): a decision
+        // refused with one of these was never written, so the owner may reply
+        // again with corrected values.
+        for code in [
+            -32700, -32600, -32601, -32602, -32030, -32052, -32053, -32057,
+        ] {
             assert!(is_not_admitted(code), "code={code}");
         }
         // Internal errors, uncertain writes, all other MSP kinds and unknown
         // future codes never prove rejection; the caller maps them to unknown.
+        // The remaining request-path kinds name lookup/state outcomes with no
+        // validation row (target gone, already resolved/settled, reviewer
+        // unavailable): a lost decide/answer race stays unknown, never a
+        // proof of non-admission.
         for code in [
             -32603, -32001, -32002, -32010, -32011, -32013, -32014, -32020, -32021, -32022, -32024,
-            -32025, -32031, -32032, -32040, -32041, -32042, -32050, -32999, 0,
+            -32025, -32031, -32032, -32040, -32041, -32042, -32050, -32051, -32054, -32055, -32056,
+            -32999, 0,
         ] {
             assert!(!is_not_admitted(code), "code={code}");
         }
@@ -548,5 +853,105 @@ mod tests {
         for other in ["", "default", "auto", "MEDIUM", " medium"] {
             assert!(!is_reasoning_effort_tier(other), "other={other}");
         }
+    }
+
+    #[test]
+    fn approval_request_decodes_choices_requirement_and_child_origin() {
+        let params: NativeApprovalRequestParams = serde_json::from_value(serde_json::json!({
+            "approvalId": "approval-1",
+            "availableChoices": [
+                {"choiceId": "allow", "decision": "approved", "label": "Allow",
+                 "scope": "once", "acceptsFeedback": false},
+                {"choiceId": "deny", "decision": "denied", "label": "Deny",
+                 "scope": "once", "acceptsFeedback": true,
+                 "rulePreview": "deny rm -rf /"},
+            ],
+            "currentRequirementId": {"approvalId": "approval-1", "sourceIndex": 1},
+            "itemId": "item-1",
+            "judgeEscalated": false,
+            "protectedWrite": true,
+            "rawArgs": "{\"command\":\"rm -rf /\"}",
+            "sessionId": "session-1",
+            "sourceRange": {"first": {"streamSeq": 1}, "last": {"streamSeq": 1},
+                            "stream": {"kind": "run"}},
+            "subagentOrigin": {"childRunId": "run-1", "childSessionId": "child-1",
+                               "subagentId": "subagent-1"},
+            "subject": {"kind": "shell", "command": "rm -rf /"},
+            "taskId": "task-1",
+            "toolCallId": "call-1",
+            "toolName": "shell",
+            "turnId": "turn-1",
+            "viewCursor": "cursor-3",
+        }))
+        .expect("approval request decodes");
+        assert_eq!(params.approval_id, "approval-1");
+        assert_eq!(params.available_choices.len(), 2);
+        assert_eq!(params.current_requirement_id.source_index, 1);
+        assert!(params.subagent_origin.is_some());
+        assert_eq!(params.view_cursor, "cursor-3");
+    }
+
+    #[test]
+    fn user_input_request_decodes_questions_and_selection_modes() {
+        let params: NativeUserInputRequestParams = serde_json::from_value(serde_json::json!({
+            "autoResolutionMs": 60000,
+            "itemId": "item-2",
+            "questions": [{
+                "header": "Deploy",
+                "id": "q1",
+                "options": [{"label": "staging"}, {"label": "production"}],
+                "question": "Where?",
+                "selection": {"mode": "single"},
+            }],
+            "sessionId": "session-1",
+            "sourceRange": {"first": {"streamSeq": 1}, "last": {"streamSeq": 1},
+                            "stream": {"kind": "run"}},
+            "toolCallId": "call-2",
+            "toolName": "ask",
+            "turnId": "turn-1",
+            "userInputId": "prompt-1",
+            "viewCursor": "cursor-4",
+        }))
+        .expect("user-input request decodes");
+        assert_eq!(params.user_input_id, "prompt-1");
+        assert_eq!(params.questions.len(), 1);
+        assert_eq!(params.questions[0].selection.mode, "single");
+    }
+
+    #[test]
+    fn resume_pointer_names_its_exact_request_id_or_nothing() {
+        let approval: NativePendingRequestPointer = serde_json::from_value(serde_json::json!({
+            "kind": "approval", "approvalId": "approval-1", "viewCursor": "cursor-1",
+        }))
+        .expect("approval pointer decodes");
+        assert_eq!(approval.request_id(), Some("approval-1"));
+        let prompt: NativePendingRequestPointer = serde_json::from_value(serde_json::json!({
+            "kind": "userInput", "userInputId": "prompt-1", "viewCursor": "cursor-2",
+        }))
+        .expect("prompt pointer decodes");
+        assert_eq!(prompt.request_id(), Some("prompt-1"));
+        // The published schema accepts an entry carrying no id at all; the
+        // path treats it as naming nothing, never as a blank request id.
+        let empty: NativePendingRequestPointer = serde_json::from_value(serde_json::json!({
+            "kind": "approval", "viewCursor": "cursor-3",
+        }))
+        .expect("id-less pointer decodes");
+        assert_eq!(empty.request_id(), None);
+        let future: NativePendingRequestPointer = serde_json::from_value(serde_json::json!({
+            "kind": "futureKind", "approvalId": "approval-9", "viewCursor": "cursor-4",
+        }))
+        .expect("future-kind pointer decodes");
+        assert_eq!(future.request_id(), None);
+    }
+
+    #[test]
+    fn list_pending_result_decodes_both_pending_halves() {
+        let result: NativeApprovalListPendingResult = serde_json::from_value(serde_json::json!({
+            "approvals": [],
+            "userInputs": [],
+        }))
+        .expect("empty pending halves decode");
+        assert!(result.approvals.is_empty());
+        assert!(result.user_inputs.is_empty());
     }
 }

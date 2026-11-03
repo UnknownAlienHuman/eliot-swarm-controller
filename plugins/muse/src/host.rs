@@ -1,8 +1,10 @@
 use crate::{
-    events::{self, EventConfig, EventHandle, TurnFacts},
+    events::{self, EventConfig, EventHandle, TurnFacts, rejected_control, unknown_control},
     native::{
         NativeClient, NativeLaunch, NativeProcess, native_no_write,
+        requests::describe_request,
         types::{
+            NativeApprovalListPendingParams, NativeApprovalListPendingResult,
             NativeClientCapabilities, NativeClientInfo, NativeInitializeParams,
             NativeInitializeResult, NativeItemCompletedNotification, NativeModelCatalogEntry,
             NativeModelEffortVariants, NativeModelListParams, NativeModelListResult, NativeSession,
@@ -34,6 +36,7 @@ use tokio::{sync::mpsc, time::Instant};
 const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const VIEW_PAGE_SIZE: i64 = 1000;
 const MAX_VIEW_PAGES: usize = 4;
+const MAX_CONTROL_COMMANDS: usize = 32;
 
 #[derive(Default)]
 struct MusePlugin {
@@ -78,7 +81,23 @@ struct AgentSession {
     command_turns: HashMap<String, String>,
     unknown_commands: HashSet<String>,
     rejected_commands: HashSet<String>,
+    control_commands: HashMap<String, ControlCommand>,
     stop_command_id: Option<String>,
+}
+
+struct ControlCommand {
+    verb: String,
+    turn_id: Option<String>,
+    request_id: Option<String>,
+    args: Value,
+    outcome: ControlOutcome,
+}
+
+enum ControlOutcome {
+    Pending,
+    Applied(Value),
+    Rejected(Value),
+    Unknown,
 }
 
 struct TargetEnvironment {
@@ -401,6 +420,7 @@ impl MusePlugin {
             command_turns: HashMap::new(),
             unknown_commands: HashSet::new(),
             rejected_commands: HashSet::new(),
+            control_commands: HashMap::new(),
             stop_command_id: None,
         };
 
@@ -547,8 +567,10 @@ impl MusePlugin {
         };
         // A lost resume reply leaves the write unknown under the minted
         // command id; the resume is never dispatched a second time.
+        let mut snapshot_pull: Option<bool> = None;
+        let mut resume_pointers = Vec::new();
         let native_session = if resume_subject.is_some() {
-            let resumed = match serde_json::from_value::<NativeSessionResumeResult>(
+            let mut resumed = match serde_json::from_value::<NativeSessionResumeResult>(
                 response_value.clone(),
             ) {
                 Ok(resumed)
@@ -575,16 +597,13 @@ impl MusePlugin {
                     ));
                 }
             };
+            // Late-joiner pointers are pulled after readiness (below): the
+            // full payloads arrive as re-issued server-to-client requests
+            // right after this response, and the pull covers any re-issue the
+            // stream loses. The re-issues buffer until a turn associates, so
+            // adoption still registers before they apply.
             if !resumed.pending_requests.is_empty() {
-                let error = discard_failed_start(
-                    &mut session,
-                    Error::new(
-                        "unsupported",
-                        "Muse resume found unsettled native requests; approvals are not connected",
-                    ),
-                )
-                .await;
-                return Err(self.retain_failed_start(&params, error));
+                resume_pointers = std::mem::take(&mut resumed.pending_requests);
             }
             if resumed.session.status != "idle" {
                 self.session = Some(session);
@@ -756,7 +775,22 @@ impl MusePlugin {
             ));
         }
         session.phase = SessionPhase::Ready;
-        let result = json!({
+        // Adoption is best-effort and never fails the resume: entries that
+        // bind to a live turn open, the dead generation's orphans drop. It
+        // runs after readiness so a corrupt snapshot entry gaps the source
+        // without failing the resume itself.
+        if !resume_pointers.is_empty() {
+            snapshot_pull = Some(
+                adopt_resume_snapshot(
+                    &session.native_client,
+                    &session.events,
+                    native_session.session_id.as_str(),
+                    &resume_pointers,
+                )
+                .await,
+            );
+        }
+        let mut result = json!({
             "agent_id": params.agent_id,
             "generation": params.generation,
             "command_id": params.command_id,
@@ -770,6 +804,20 @@ impl MusePlugin {
             },
             "effective": effective,
         });
+        // Whether the resume late-joiner pull landed. `failed` is visible but
+        // never fatal: the re-issued stream requests still adopt the pointers.
+        if let Some(pulled) = snapshot_pull
+            && let Some(fields) = result.as_object_mut()
+        {
+            fields.insert(
+                "snapshot_pull".to_owned(),
+                Value::String(if pulled {
+                    "ok".to_owned()
+                } else {
+                    "failed".to_owned()
+                }),
+            );
+        }
         session.start_result = Some(result.clone());
         self.session = Some(session);
         Ok(result)
@@ -786,10 +834,11 @@ impl MusePlugin {
                 version: env!("CARGO_PKG_VERSION").to_owned(),
                 title: Some("Eliot".to_owned()),
             },
-            // PR1 cannot render a user-input dialog; `false` withholds
-            // `userInput/request` toward this client (schema D-047).
+            // A1 answers `userInput/request` through Eliot's answer/deny
+            // verbs; `true` (the D-047 capable posture) has the host serve
+            // prompts toward this client.
             capabilities: Some(NativeClientCapabilities {
-                user_input_dialogs: Some(false),
+                user_input_dialogs: Some(true),
             }),
         };
         let init_value = serde_json::to_value(init_params)
@@ -861,6 +910,7 @@ impl MusePlugin {
         validate_identity(&params.agent_id, params.generation, &params.command_id)?;
         match params.verb.as_str() {
             "send" => self.send_command(params).await,
+            "approve" | "deny" | "answer" => self.reply_request(params).await,
             _ => Err(Error::new(
                 "unsupported",
                 "Muse plugin command verb is not implemented",
@@ -1039,6 +1089,91 @@ impl MusePlugin {
             ));
         }
         Ok(json!({"state": "applied", "turn_id": turn_id}))
+    }
+
+    async fn reply_request(&mut self, params: AgentCommandParams) -> Result<Value> {
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| Error::new("bad_state", "Muse Agent session has not started"))?;
+        validate_binding(session, &params.agent_id, params.generation)?;
+        let turn_id = params
+            .turn_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                Error::new(
+                    "stale_turn",
+                    "Muse request reply needs its captured turn id",
+                )
+            })?;
+        let request_id = params
+            .request_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                Error::new(
+                    "not_found",
+                    "Muse request reply needs its captured request id",
+                )
+            })?;
+        if let Some(result) = control_replay(session, &params)? {
+            return Ok(result);
+        }
+        match session
+            .events
+            .reply_request(
+                params.command_id.clone(),
+                request_id.to_owned(),
+                turn_id.to_owned(),
+                params.verb.clone(),
+                params.args.clone(),
+            )
+            .await
+        {
+            Ok(result) => {
+                let outcome = match result.get("state").and_then(Value::as_str) {
+                    Some("applied") => ControlOutcome::Applied(result.clone()),
+                    Some("rejected") => ControlOutcome::Rejected(result.clone()),
+                    Some("unknown") => ControlOutcome::Unknown,
+                    _ => {
+                        let result = unknown_control("Muse request reply omitted its outcome");
+                        settle_control(session, &params.command_id, ControlOutcome::Unknown);
+                        return Ok(result);
+                    }
+                };
+                settle_control(session, &params.command_id, outcome);
+                Ok(result)
+            }
+            Err(error) if native_no_write(&error.code) => {
+                let result = rejected_control("Muse request reply was not dispatched");
+                settle_control(
+                    session,
+                    &params.command_id,
+                    ControlOutcome::Rejected(result.clone()),
+                );
+                Ok(result)
+            }
+            Err(error) if error.code == "unknown" => {
+                settle_control(session, &params.command_id, ControlOutcome::Unknown);
+                Ok(unknown_control("Muse request reply outcome is unknown"))
+            }
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    "invalid" | "unsupported" | "secret_in_payload" | "stale_turn" | "not_found"
+                ) =>
+            {
+                let result = rejected_control(&error.message);
+                settle_control(
+                    session,
+                    &params.command_id,
+                    ControlOutcome::Rejected(result.clone()),
+                );
+                Ok(result)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn snapshot(&mut self, raw: &Value) -> Result<Value> {
@@ -1830,10 +1965,131 @@ fn unknown_snapshot(params: &AgentSnapshotParams, reason: &str) -> Result<Value>
     }))
 }
 
+/// Adopt a resume late-joiner pointer set. The observation counter is
+/// captured before the pull, the pulled full params are described
+/// (shape-validated; turn liveness is checked when the event path applies
+/// them), and the event path adopts what still binds — guarded so a newer
+/// stream resolution always wins over this stale snapshot. Returns whether
+/// the pull itself landed; adoption never fails the resume either way.
+async fn adopt_resume_snapshot(
+    client: &NativeClient,
+    events: &EventHandle,
+    session_id: &str,
+    pointers: &[crate::native::types::NativePendingRequestPointer],
+) -> bool {
+    let capture = events.status().observation;
+    let expected = pointers
+        .iter()
+        .filter_map(|pointer| pointer.request_id())
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let params = NativeApprovalListPendingParams {
+        session_id: session_id.to_owned(),
+    };
+    let encoded = serde_json::to_value(params).unwrap_or(Value::Null);
+    let pulled: Option<NativeApprovalListPendingResult> = client
+        .call(
+            "approval/listPending",
+            encoded,
+            Instant::now() + RPC_TIMEOUT,
+        )
+        .await
+        .ok()
+        .and_then(|value| serde_json::from_value(value).ok());
+    let Some(pulled) = pulled else {
+        let _ = events
+            .adopt_pulled(Vec::new(), expected, capture, false)
+            .await;
+        return false;
+    };
+    let wanted = expected
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    let mut entries = Vec::new();
+    let mut snapshot_had_undecodable = false;
+    for approval in &pulled.approvals {
+        if !wanted.contains(approval.approval_id.as_str()) {
+            continue;
+        }
+        let raw = serde_json::to_value(approval).unwrap_or(Value::Null);
+        // The pull is session-scoped but the binding is still verified: a
+        // foreign-session entry fails describe and is skipped, never adopted.
+        // Skipped entries are reported (the event path gaps them) instead of
+        // silently dropped; adoption still never fails the resume.
+        match describe_request("approval/request", &raw, session_id, &approval.turn_id) {
+            Ok(entry) => entries.push(entry),
+            Err(_) => snapshot_had_undecodable = true,
+        }
+    }
+    for prompt in &pulled.user_inputs {
+        if !wanted.contains(prompt.user_input_id.as_str()) {
+            continue;
+        }
+        let raw = serde_json::to_value(prompt).unwrap_or(Value::Null);
+        match describe_request("userInput/request", &raw, session_id, &prompt.turn_id) {
+            Ok(entry) => entries.push(entry),
+            Err(_) => snapshot_had_undecodable = true,
+        }
+    }
+    let _ = events
+        .adopt_pulled(entries, expected, capture, snapshot_had_undecodable)
+        .await;
+    true
+}
+
 fn known_command(session: &AgentSession, command_id: &str) -> bool {
     session.start_command_id == command_id
         || session.command_inputs.contains_key(command_id)
         || session.stop_command_id.as_deref() == Some(command_id)
+}
+
+fn control_replay(
+    session: &mut AgentSession,
+    params: &AgentCommandParams,
+) -> Result<Option<Value>> {
+    if let Some(previous) = session.control_commands.get(&params.command_id) {
+        if previous.verb != params.verb
+            || previous.turn_id != params.turn_id
+            || previous.request_id != params.request_id
+            || previous.args != params.args
+        {
+            return Err(Error::new(
+                "source_integrity",
+                "Muse control command id was reused with different binding",
+            ));
+        }
+        return Ok(Some(match &previous.outcome {
+            ControlOutcome::Applied(result) | ControlOutcome::Rejected(result) => result.clone(),
+            ControlOutcome::Pending => unknown_control("Muse control command is already in flight"),
+            ControlOutcome::Unknown => {
+                unknown_control("Muse control command outcome is unresolved")
+            }
+        }));
+    }
+    if session.control_commands.len() >= MAX_CONTROL_COMMANDS {
+        return Ok(Some(rejected_control(
+            "Muse L6.4 per-generation control history bound has been reached",
+        )));
+    }
+    session.control_commands.insert(
+        params.command_id.clone(),
+        ControlCommand {
+            verb: params.verb.clone(),
+            turn_id: params.turn_id.clone(),
+            request_id: params.request_id.clone(),
+            args: params.args.clone(),
+            outcome: ControlOutcome::Pending,
+        },
+    );
+    Ok(None)
+}
+
+fn settle_control(session: &mut AgentSession, command_id: &str, outcome: ControlOutcome) {
+    if let Some(command) = session.control_commands.get_mut(command_id) {
+        command.outcome = outcome;
+    }
 }
 
 fn validate_binding(session: &AgentSession, agent_id: &str, generation: i64) -> Result<()> {
@@ -1867,13 +2123,13 @@ fn validate_source_plan(source_plan: Option<&Value>) -> Result<()> {
             "Muse start requires an installed stream source plan",
         ));
     };
-    if ["session", "turn", "message"]
+    if ["session", "turn", "message", "request"]
         .iter()
         .any(|family| plan.get(*family).and_then(Value::as_str) != Some("stream"))
     {
         return Err(Error::new(
             "unsupported",
-            "Muse start requires stream ownership for session, turn, and message",
+            "Muse start requires stream ownership for session, turn, message, and request",
         ));
     }
     Ok(())
@@ -1985,7 +2241,7 @@ pub(crate) fn muse_scope(muse_home: &str) -> String {
 /// share the same 48-bit unix-millisecond prefix, so setting the version and
 /// variant bits on fresh ULID bytes yields a valid UUIDv7 without a new
 /// dependency; the randomness comes from the ULID generator.
-fn new_command_id() -> String {
+pub(crate) fn new_command_id() -> String {
     let mut bytes = ulid::Ulid::new().0.to_be_bytes();
     bytes[6] = (bytes[6] & 0x0F) | 0x70;
     bytes[8] = (bytes[8] & 0x3F) | 0x80;
@@ -2003,6 +2259,7 @@ fn new_command_id() -> String {
 fn muse_manifest() -> PluginManifest {
     let controlled = BTreeMap::from([
         ("message".to_owned(), "stream".to_owned()),
+        ("request".to_owned(), "stream".to_owned()),
         ("session".to_owned(), "stream".to_owned()),
         ("turn".to_owned(), "stream".to_owned()),
     ]);
@@ -2017,6 +2274,9 @@ fn muse_manifest() -> PluginManifest {
             "launch".to_owned(),
             "resume".to_owned(),
             "send".to_owned(),
+            "approve".to_owned(),
+            "deny".to_owned(),
+            "answer".to_owned(),
             "stop".to_owned(),
         ],
         child_verbs: Vec::new(),
@@ -2095,7 +2355,12 @@ mod tests {
         assert_eq!(manifest.harness_version, "1.4.0");
         assert!(manifest.available);
         assert_eq!(manifest.mode, "per_agent");
-        assert_eq!(manifest.verbs, ["launch", "resume", "send", "stop"]);
+        assert_eq!(
+            manifest.verbs,
+            [
+                "launch", "resume", "send", "approve", "deny", "answer", "stop"
+            ]
+        );
         assert!(manifest.child_verbs.is_empty());
         assert!(!manifest.features.start_requires_input);
         assert!(!manifest.features.native_children);
@@ -2106,19 +2371,27 @@ mod tests {
     }
 
     #[test]
-    fn source_plan_requires_the_pr1_stream_families() {
+    fn source_plan_requires_the_connected_stream_families() {
         assert!(validate_source_plan(None).is_err());
         assert!(
             validate_source_plan(Some(&json!({
                 "session": "stream", "turn": "stream", "message": "stream",
+                "request": "stream",
             })))
             .is_ok()
         );
         assert!(
             validate_source_plan(Some(&json!({
-                "session": "stream", "turn": "stream", "message": "stream", "tool": "stream",
+                "session": "stream", "turn": "stream", "message": "stream",
+                "request": "stream", "tool": "stream",
             })))
             .is_ok()
+        );
+        assert!(
+            validate_source_plan(Some(&json!({
+                "session": "stream", "turn": "stream", "message": "stream",
+            })))
+            .is_err()
         );
         assert!(
             validate_source_plan(Some(&json!({
