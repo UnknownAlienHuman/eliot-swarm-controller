@@ -410,7 +410,10 @@ reason}` requires the turn to be stored `unknown`; running and terminal turns
 are refused with `bad_state`. It further requires either a stored terminal
 generation (`Lost`, `Stopped`, or `Failed` — Eliot no longer controls it) or a
 native readback through the plugin (`agent.snapshot` for the exact turn)
-proving the turn inactive. The stored active turn alone is never proof: a live
+proving the turn inactive. The readback proves the turn inactive only when it
+binds this Agent generation, names the turn as its last turn with
+`terminal: true` and a terminal status, and does not report it as the active
+turn. The stored active turn alone is never proof: a live
 generation without such a readback is refused with `bad_state`. A generation
 that does not match the Agent's current generation is `stale_generation`. The
 turn completes with the asserted status, and a `turn.resolved` event carrying
