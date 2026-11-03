@@ -507,10 +507,13 @@ is its contract; bounded read pages alone do not bound stored history.
 Cleanup uses bounded batches through the existing Store writer. Delete only an expired,
 contiguous event prefix below every enabled current/retiring rule cursor. Open
 current-generation Git hint cursors pin the same prefix, so hint scans never skip
-unconsumed history silently. Events carrying a `native_id` are pruned only after
-their source closes (`source_state.state = 'closed'` for that agent/generation/source);
-open sources pin their native-bound events so a redelivered batch still deduplicates.
-A lagging rule
+unconsumed history silently. Only the latest batch of a source can be re-delivered
+idempotently: a new batch replaces only its last-batch acknowledgement, and an
+older batch is rejected with `source_integrity`. So for an open source, only
+events with `seq >= source_state.last_batch_first_seq` (and anything after that)
+are pinned; older native events of an open source may be pruned, and one old
+native event of a long-lived source never blocks pruning. Native-bound events of
+closed sources may go. A lagging rule
 releases its pin only through the ordinary atomic backlog skip/pause transition. Advance
 `rule_history_coverage.pruned_through` in the same transaction as deletion, so replay and
 explicit catch-up return `history_gap` instead of silently omitting events. Never reset

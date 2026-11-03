@@ -273,7 +273,10 @@ grant does not authorize it. Revalidate current project authority and the captur
 Agent/generation binding before effects. STEER uses the existing Router control path,
 including its harness capability, text validation, provider-hold and exact active-turn
 checks; it supplies input to that captured turn, without starting a new turn. An applied
-STEER does not assert task completion. See [Store command admission and dispatch](../../crates/eliot-store/src/lib.rs).
+STEER does not assert task completion. When retention has pruned a hold's probe accepted
+event, that hold's terminal scan fails with `source_integrity` instead of clearing on
+incomplete history; the owner corrects it with the existing `provider clear-hold`.
+See [Store command admission and dispatch](../../crates/eliot-store/src/lib.rs).
 
 Each committed event retains its event-time subject snapshot (or absence) and any
 Store-verified cause. Depth 0 denotes a proven ordinary controller command; rule, timer

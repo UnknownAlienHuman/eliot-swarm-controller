@@ -89,13 +89,55 @@ pub(crate) async fn run_once(
     retention: &config::RetentionConfig,
     now: i64,
 ) -> Result<RetentionReport> {
-    store.lock().await.prune_retention_tick(
-        retention.events_days,
-        retention.commands_days,
+    run_once_with_budgets(
+        store,
+        retention,
         now,
         RETENTION_TICK_ROW_BUDGET,
         RETENTION_TICK_TIME_BUDGET,
     )
+    .await
+}
+
+/// Run bounded passes until a pass deletes nothing or the tick budgets run
+/// out. At least one pass always runs. `now` stays fixed so every pass
+/// shares the same cutoffs. The Store lock is taken per bounded pass and
+/// released between passes, so one tick never holds the lock for the whole
+/// time budget.
+pub(crate) async fn run_once_with_budgets(
+    store: &Mutex<Store>,
+    retention: &config::RetentionConfig,
+    now: i64,
+    row_budget: i64,
+    time_budget: Duration,
+) -> Result<RetentionReport> {
+    let start = std::time::Instant::now();
+    let mut total = RetentionReport {
+        events_deleted: 0,
+        pruned_through: 0,
+        commands_deleted: 0,
+        writes_deleted: 0,
+    };
+    loop {
+        let pass = {
+            let mut guard = store.lock().await;
+            guard.prune_retention(retention.events_days, retention.commands_days, now)?
+        };
+        total.events_deleted += pass.events_deleted;
+        total.pruned_through = pass.pruned_through;
+        total.commands_deleted += pass.commands_deleted;
+        total.writes_deleted += pass.writes_deleted;
+        let pass_rows = pass.events_deleted + pass.commands_deleted + pass.writes_deleted;
+        if pass_rows == 0 {
+            break;
+        }
+        let total_rows = total.events_deleted + total.commands_deleted + total.writes_deleted;
+        if total_rows >= row_budget || start.elapsed() >= time_budget {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    Ok(total)
 }
 
 #[cfg(test)]
@@ -103,6 +145,158 @@ mod tests {
     use super::*;
     use eliot_core::{NativeEvent, SourceBatch, SubmitCommand};
     use serde_json::json;
+
+    async fn seed_settled_launches(
+        store: &Mutex<Store>,
+        count: usize,
+        admitted_at: i64,
+    ) -> Vec<String> {
+        let mut guard = store.lock().await;
+        let mut ids = Vec::with_capacity(count);
+        for index in 0..count {
+            let mut launch = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+            launch.args = json!({
+                "project": format!("retention-tick-project-{index}"),
+                "workspace": format!("retention-tick-workspace-{index}"),
+            });
+            launch.expected_generation = Some(0);
+            let id = launch.id.clone();
+            guard.submit("owner", launch, admitted_at).unwrap();
+            guard.dispatch(&id, admitted_at).unwrap();
+            guard
+                .settle(&id, eliot_core::CommandState::Applied, None, admitted_at)
+                .unwrap();
+            ids.push(id);
+        }
+        ids
+    }
+
+    fn commands_retention() -> config::RetentionConfig {
+        config::RetentionConfig {
+            events_days: None,
+            commands_days: Some(30),
+        }
+    }
+
+    #[tokio::test]
+    async fn tick_drains_roots_across_passes() {
+        let store = Mutex::new(Store::open(std::path::Path::new(":memory:")).unwrap());
+        let admitted_at = now_ms();
+        let pruned_at = admitted_at + 31 * 24 * 60 * 60 * 1_000;
+        let ids = seed_settled_launches(&store, 60, admitted_at).await;
+        let report = run_once_with_budgets(
+            &store,
+            &commands_retention(),
+            pruned_at,
+            i64::MAX,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.commands_deleted, 60);
+        let guard = store.lock().await;
+        for id in &ids {
+            assert!(guard.get_command(id).unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn tick_stops_at_row_budget() {
+        let store = Mutex::new(Store::open(std::path::Path::new(":memory:")).unwrap());
+        let admitted_at = now_ms();
+        let pruned_at = admitted_at + 31 * 24 * 60 * 60 * 1_000;
+        let ids = seed_settled_launches(&store, 120, admitted_at).await;
+        let report = run_once_with_budgets(
+            &store,
+            &commands_retention(),
+            pruned_at,
+            75,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        // Whole bounded passes: 50 + 50 reaches the 75-row budget.
+        assert_eq!(report.commands_deleted, 100);
+        let guard = store.lock().await;
+        let remaining = ids
+            .iter()
+            .filter(|id| guard.get_command(id).unwrap().is_some())
+            .count();
+        assert_eq!(remaining, 20);
+    }
+
+    #[tokio::test]
+    async fn tick_zero_time_budget_runs_one_pass() {
+        let store = Mutex::new(Store::open(std::path::Path::new(":memory:")).unwrap());
+        let admitted_at = now_ms();
+        let pruned_at = admitted_at + 31 * 24 * 60 * 60 * 1_000;
+        let ids = seed_settled_launches(&store, 120, admitted_at).await;
+        let report = run_once_with_budgets(
+            &store,
+            &commands_retention(),
+            pruned_at,
+            i64::MAX,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.commands_deleted, 50);
+        let guard = store.lock().await;
+        let remaining = ids
+            .iter()
+            .filter(|id| guard.get_command(id).unwrap().is_some())
+            .count();
+        assert_eq!(remaining, 70);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tick_releases_store_lock_between_passes() {
+        let store = Arc::new(Mutex::new(
+            Store::open(std::path::Path::new(":memory:")).unwrap(),
+        ));
+        let admitted_at = now_ms();
+        let pruned_at = admitted_at + 31 * 24 * 60 * 60 * 1_000;
+        let ids = seed_settled_launches(&store, 510, admitted_at).await;
+        // Roots prune in id order within one created_at, so the smallest id
+        // goes in the first pass and the largest only in the last data pass:
+        // smallest-gone with largest-present is proof of a mid-tick lock
+        // acquisition, with no timing assertions.
+        let first = ids.iter().min().unwrap().clone();
+        let last = ids.iter().max().unwrap().clone();
+        let retention = commands_retention();
+        let tick = tokio::spawn({
+            let store = Arc::clone(&store);
+            async move {
+                run_once_with_budgets(
+                    &store,
+                    &retention,
+                    pruned_at,
+                    i64::MAX,
+                    Duration::from_secs(60),
+                )
+                .await
+            }
+        });
+        // Pure spin, no yield: the tick runs on another worker, and yielding
+        // here would queue this observer behind the tick's own inter-pass
+        // yield, so every probe would land while the tick holds the lock.
+        // The tick's yields keep each free window long; the probe holds the
+        // lock only for two reads.
+        let mut saw_mid_tick = false;
+        while !tick.is_finished() {
+            if let Ok(guard) = store.try_lock() {
+                let first_gone = guard.get_command(&first).unwrap().is_none();
+                let last_present = guard.get_command(&last).unwrap().is_some();
+                saw_mid_tick |= first_gone && last_present;
+            }
+        }
+        let report = tick.await.unwrap().unwrap();
+        assert_eq!(report.commands_deleted, 510);
+        assert!(
+            saw_mid_tick,
+            "tick never released the Store lock between passes"
+        );
+    }
 
     #[tokio::test]
     async fn maintenance_prunes_and_replay_reports_history_gap() {

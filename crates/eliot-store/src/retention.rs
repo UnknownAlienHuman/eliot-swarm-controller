@@ -8,7 +8,6 @@
 //! retry window, and every row a live projection still references.
 
 use super::*;
-use std::time::Duration;
 
 const MS_PER_DAY: i64 = 24 * 60 * 60 * 1_000;
 /// Traversal backstop for parent/child sets. Parent links are bound once at
@@ -59,42 +58,6 @@ impl Store {
         let result = self.prune_retention_inner(events_days, commands_days, now);
         self.fault_on_persistence_error(&result);
         result
-    }
-
-    /// Run bounded passes until a pass deletes nothing or the tick budgets
-    /// run out. At least one pass always runs. `now` stays fixed so every
-    /// pass shares the same cutoffs.
-    pub fn prune_retention_tick(
-        &mut self,
-        events_days: Option<i64>,
-        commands_days: Option<i64>,
-        now: i64,
-        row_budget: i64,
-        time_budget: Duration,
-    ) -> Result<RetentionReport> {
-        let start = std::time::Instant::now();
-        let mut total = RetentionReport {
-            events_deleted: 0,
-            pruned_through: 0,
-            commands_deleted: 0,
-            writes_deleted: 0,
-        };
-        loop {
-            let pass = self.prune_retention(events_days, commands_days, now)?;
-            total.events_deleted += pass.events_deleted;
-            total.pruned_through = pass.pruned_through;
-            total.commands_deleted += pass.commands_deleted;
-            total.writes_deleted += pass.writes_deleted;
-            let pass_rows = pass.events_deleted + pass.commands_deleted + pass.writes_deleted;
-            if pass_rows == 0 {
-                break;
-            }
-            let total_rows = total.events_deleted + total.commands_deleted + total.writes_deleted;
-            if total_rows >= row_budget || start.elapsed() >= time_budget {
-                break;
-            }
-        }
-        Ok(total)
     }
 
     fn prune_retention_inner(
@@ -208,9 +171,9 @@ impl Store {
     }
 
     fn prune_commands_and_writes(&mut self, cutoff: i64) -> Result<(i64, i64)> {
-        // The open-child / turn / reference keep checks live in the selection
-        // itself: only fully prunable roots are returned, so kept sets never
-        // occupy the per-pass root budget and starve pruning.
+        // The open-child / turn / reference / oversize keep checks live in
+        // the selection itself: only fully prunable roots are returned, so
+        // kept sets never occupy the per-pass root budget and starve pruning.
         let roots: Vec<String> = self
             .connection
             .prepare(
@@ -241,23 +204,36 @@ impl Store {
                         OR EXISTS (
                             SELECT 1 FROM provider_holds h WHERE h.probe_command = m.id
                         )
+                 ),
+                 oversize(root) AS (
+                     SELECT s.root FROM old_sets s
+                     GROUP BY s.root HAVING COUNT(*) > ?4
                  )
                  SELECT c.id FROM commands c
                  WHERE c.parent_command IS NULL
                    AND c.created_at <= ?1
                    AND NOT EXISTS (SELECT 1 FROM kept k WHERE k.root = c.id)
+                   AND NOT EXISTS (SELECT 1 FROM oversize o WHERE o.root = c.id)
                  ORDER BY c.created_at, c.id LIMIT ?3",
             )
             .map_err(sql_error)?
-            .query_map(params![cutoff, MAX_SET_DEPTH, MAX_PRUNE_ROOTS], |row| {
-                row.get(0)
-            })
+            .query_map(
+                params![
+                    cutoff,
+                    MAX_SET_DEPTH,
+                    MAX_PRUNE_ROOTS,
+                    MAX_SET_MEMBERS as i64
+                ],
+                |row| row.get(0),
+            )
             .map_err(sql_error)?
             .collect::<rusqlite::Result<_>>()
             .map_err(sql_error)?;
         let mut doomed: Vec<SubtreeMember> = Vec::new();
         for root in &roots {
             let (members, truncated) = subtree_members_tx(&self.connection, root)?;
+            // The selection already excludes oversize sets; this stays as a
+            // backstop so one can never be partly pruned.
             if truncated {
                 continue;
             }
@@ -349,9 +325,12 @@ fn event_prune_end_tx(
         )
         .map_err(sql_error)?;
     let mut end = first_fresh.map(|fresh| fresh - 1).unwrap_or(ceiling);
-    // Native deduplication bindings outlive the window: never prune an event
-    // carrying a native_id while its source is still open. Native-bound
-    // events of closed sources may go.
+    // Only the latest batch of a source can be re-delivered idempotently: a
+    // new batch replaces only its last-batch acknowledgement, so for an open
+    // source pin only events at or after its latest batch start. Older native
+    // events of an open source may go, and one old native event of a
+    // long-lived source never blocks pruning. Native-bound events of closed
+    // sources may go.
     let first_pinned: Option<i64> = tx
         .query_row(
             "SELECT MIN(e.seq) FROM events e
@@ -360,6 +339,7 @@ fn event_prune_end_tx(
                    SELECT 1 FROM source_state s
                    WHERE s.agent = e.agent AND s.generation = e.generation
                      AND s.source = e.source AND s.state = 'open'
+                     AND e.seq >= s.last_batch_first_seq
                )",
             params![pruned_through, ceiling],
             |row| row.get(0),
@@ -1284,8 +1264,67 @@ mod tests {
             .unwrap()
     }
 
+    fn event_exists(store: &Store, seq: i64) -> bool {
+        store
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE seq = ?1)",
+                [seq],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn native_seq(store: &Store, native_id: &str) -> i64 {
+        store
+            .connection
+            .query_row(
+                "SELECT seq FROM events WHERE native_id = ?1",
+                [native_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Commit a `turn.started` batch for a fresh send and return the batch,
+    /// so the caller can re-send the identical batch later.
+    fn commit_started(store: &mut Store, agent: &str, command_id: &str, now: i64) -> SourceBatch {
+        store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: command_id.to_owned(),
+                    target: Some(agent.to_owned()),
+                    verb: "send".to_owned(),
+                    args: json!({"text": "retention second batch"}),
+                    expected_generation: Some(1),
+                    expected_turn_id: None,
+                    request_id: None,
+                    probe: false,
+                },
+                now,
+            )
+            .unwrap();
+        store.dispatch(command_id, now + 1).unwrap();
+        let batch = SourceBatch {
+            batch_id: format!("{command_id}-started"),
+            agent_id: agent.to_owned(),
+            generation: 1,
+            source: "stream".to_owned(),
+            events: vec![NativeEvent {
+                ts: None,
+                kind: "turn.started".to_owned(),
+                native_id: format!("{command_id}-started"),
+                data: json!({"command_id": command_id, "turn_id": format!("turn-{command_id}")}),
+            }],
+            cursor: None,
+        };
+        store.put_batch(batch.clone(), now + 2).unwrap();
+        batch
+    }
+
     #[test]
-    fn prune_events_pins_open_native_ids_and_frees_closed_ones() {
+    fn prune_events_prunes_older_native_events_of_open_source() {
         let mut store = store();
         let old = NOW - 31 * DAY_MS;
         let (agent, launch_id) = launch_agent(&mut store, "retention-native", old);
@@ -1294,52 +1333,20 @@ mod tests {
         store
             .settle(&launch_id, CommandState::Applied, None, old)
             .unwrap();
+        let send_id = ulid_at(old + 3, 4);
+        commit_started(&mut store, &agent, &send_id, old + 3);
         assert_eq!(source_state(&store, agent_num), "open");
-        let ready_seq: i64 = store
-            .connection
-            .query_row(
-                "SELECT seq FROM events WHERE native_id = 'ready-batch:ready'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let water_before = store.high_water().unwrap();
+        let ready_seq = native_seq(&store, "ready-batch:ready");
+        let started_seq = native_seq(&store, &format!("{send_id}-started"));
+        assert!(ready_seq < started_seq);
 
-        // The open native event pins the prefix: older daemon rows go, the
-        // native binding stays.
+        // Only the latest batch start pins the open source: the older native
+        // event prunes while the source stays open.
         let report = store.prune_retention(Some(30), None, NOW).unwrap();
-        assert!(report.pruned_through < ready_seq);
-        assert!(report.events_deleted > 0);
-        let retained: bool = store
-            .connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM events WHERE seq = ?1)",
-                [ready_seq],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(retained);
-
-        // Re-delivering the committed native id under a new batch still hits
-        // the deduplication binding instead of allocating a new seq.
-        let duplicate = store.put_batch(
-            SourceBatch {
-                batch_id: "ready-batch-redelivery".to_owned(),
-                agent_id: agent.clone(),
-                generation: 1,
-                source: "stream".to_owned(),
-                events: vec![NativeEvent {
-                    ts: None,
-                    kind: "session.ready".to_owned(),
-                    native_id: "ready-batch:ready".to_owned(),
-                    data: json!({"command_id": launch_id}),
-                }],
-                cursor: None,
-            },
-            NOW,
-        );
-        assert_eq!(duplicate.unwrap_err().code, "source_integrity");
-        assert_eq!(store.high_water().unwrap(), water_before);
+        assert_eq!(report.pruned_through, started_seq - 1);
+        assert!(!event_exists(&store, ready_seq));
+        assert!(event_exists(&store, started_seq));
+        assert_eq!(source_state(&store, agent_num), "open");
 
         // Native-bound events of closed sources may go.
         store
@@ -1352,15 +1359,37 @@ mod tests {
             .unwrap();
         let report = store.prune_retention(Some(30), None, NOW).unwrap();
         assert!(report.events_deleted > 0);
-        let retained: bool = store
-            .connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM events WHERE seq = ?1)",
-                [ready_seq],
-                |row| row.get(0),
-            )
+        assert!(!event_exists(&store, started_seq));
+    }
+
+    #[test]
+    fn prune_events_latest_batch_redelivers_idempotently_after_pruning() {
+        let mut store = store();
+        let old = NOW - 31 * DAY_MS;
+        let (agent, launch_id) = launch_agent(&mut store, "retention-redelivery", old);
+        commit_ready(&mut store, &agent, &launch_id, "ready-batch", old);
+        store
+            .settle(&launch_id, CommandState::Applied, None, old)
             .unwrap();
-        assert!(!retained);
+        let send_id = ulid_at(old + 3, 5);
+        let batch = commit_started(&mut store, &agent, &send_id, old + 3);
+        let first = store.put_batch(batch.clone(), old + 4).unwrap();
+        assert!(first.events.is_empty());
+        let ready_seq = native_seq(&store, "ready-batch:ready");
+
+        let report = store.prune_retention(Some(30), None, NOW).unwrap();
+        assert!(report.events_deleted > 0);
+        assert!(!event_exists(&store, ready_seq));
+        assert!(event_exists(&store, first.ack.first_seq));
+        let water_before = store.high_water().unwrap();
+
+        // Re-sending the already committed latest batch (same id + digest)
+        // after pruning returns the stored acknowledgement and allocates no
+        // new seq.
+        let redelivery = store.put_batch(batch, NOW).unwrap();
+        assert_eq!(redelivery.ack, first.ack);
+        assert!(redelivery.events.is_empty());
+        assert_eq!(store.high_water().unwrap(), water_before);
     }
 
     #[test]
@@ -1407,6 +1436,52 @@ mod tests {
     }
 
     #[test]
+    fn prune_commands_skips_oversize_roots_without_starving() {
+        let mut store = store();
+        let old = NOW - 31 * DAY_MS;
+        // More than one root page of old oversize sets, all sorting before
+        // the prunable roots: each holds MAX_SET_MEMBERS + 1 rows.
+        let mut oversize_roots = Vec::new();
+        for _ in 0..(MAX_PRUNE_ROOTS as usize + 5) {
+            let root = Ulid::new().to_string();
+            insert_command(&mut store, command_seed(root.clone(), old));
+            for ordinal in 0..MAX_SET_MEMBERS as i64 {
+                insert_command(
+                    &mut store,
+                    CommandSeed {
+                        parent: Some((root.clone(), "rule_action".to_owned(), ordinal)),
+                        state: "applied".to_owned(),
+                        ..command_seed(Ulid::new().to_string(), old)
+                    },
+                );
+            }
+            oversize_roots.push(root);
+        }
+        for _ in 0..5 {
+            insert_command(
+                &mut store,
+                command_seed(Ulid::new().to_string(), old + DAY_MS),
+            );
+        }
+        assert_eq!(
+            command_count(&store),
+            (MAX_PRUNE_ROOTS as usize + 5) as i64 * (MAX_SET_MEMBERS as i64 + 1) + 5
+        );
+        let report = store.prune_retention(None, Some(30), NOW).unwrap();
+        assert_eq!(report.commands_deleted, 5);
+        for root in &oversize_roots {
+            assert!(store.get_command(root).unwrap().is_some());
+        }
+        // Nothing prunable remains; the oversize sets are untouched.
+        let report = store.prune_retention(None, Some(30), NOW).unwrap();
+        assert_eq!(report.commands_deleted, 0);
+        assert_eq!(
+            command_count(&store),
+            (MAX_PRUNE_ROOTS as usize + 5) as i64 * (MAX_SET_MEMBERS as i64 + 1)
+        );
+    }
+
+    #[test]
     fn prune_commands_covers_ulid_clock_skew() {
         let mut store = store();
         // The ULID runs the full allowed skew ahead of the commit clock, and
@@ -1438,68 +1513,6 @@ mod tests {
         // The id is still live, so it replays instead of expiring.
         let replay = store.submit("owner", request, NOW).unwrap();
         assert!(!replay.is_new);
-    }
-
-    #[test]
-    fn prune_tick_drains_multiple_batches_under_budgets() {
-        use std::time::Duration;
-        let mut store = store();
-        let old = NOW - 31 * DAY_MS;
-        for _ in 0..2500 {
-            insert_event(&mut store, old);
-        }
-        let report = store
-            .prune_retention_tick(Some(30), Some(30), NOW, i64::MAX, Duration::from_secs(60))
-            .unwrap();
-        assert_eq!(report.events_deleted, 2500);
-        assert_eq!(report.pruned_through, 2500);
-        assert_eq!(event_count(&store), 0);
-    }
-
-    #[test]
-    fn prune_tick_stops_at_row_budget() {
-        use std::time::Duration;
-        let mut store = store();
-        let old = NOW - 31 * DAY_MS;
-        for _ in 0..2500 {
-            insert_event(&mut store, old);
-        }
-        let report = store
-            .prune_retention_tick(Some(30), Some(30), NOW, 1500, Duration::from_secs(60))
-            .unwrap();
-        assert_eq!(report.events_deleted, 2000);
-        assert_eq!(report.pruned_through, 2000);
-        assert_eq!(event_count(&store), 500);
-    }
-
-    #[test]
-    fn prune_tick_zero_time_budget_runs_one_pass() {
-        use std::time::Duration;
-        let mut store = store();
-        let old = NOW - 31 * DAY_MS;
-        for _ in 0..2500 {
-            insert_event(&mut store, old);
-        }
-        let report = store
-            .prune_retention_tick(Some(30), Some(30), NOW, i64::MAX, Duration::ZERO)
-            .unwrap();
-        assert_eq!(report.events_deleted, MAX_PAGE_ENTRIES as i64);
-        assert_eq!(event_count(&store), 2500 - MAX_PAGE_ENTRIES as i64);
-    }
-
-    #[test]
-    fn prune_tick_drains_roots_across_passes() {
-        use std::time::Duration;
-        let mut store = store();
-        let old = NOW - 31 * DAY_MS;
-        for _ in 0..60 {
-            insert_command(&mut store, command_seed(Ulid::new().to_string(), old));
-        }
-        let report = store
-            .prune_retention_tick(None, Some(30), NOW, i64::MAX, Duration::from_secs(60))
-            .unwrap();
-        assert_eq!(report.commands_deleted, 60);
-        assert_eq!(command_count(&store), 0);
     }
 
     fn start_send_turn(
