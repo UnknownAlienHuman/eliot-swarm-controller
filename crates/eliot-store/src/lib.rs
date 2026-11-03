@@ -11,6 +11,7 @@ mod scripts;
 
 pub use capacity::{RecordedProcess, RetainedGeneration};
 pub use projects::ProjectRegistrationInput;
+pub use resolution::TurnInactiveProof;
 pub use rules::{
     RuleCatchUpAction, RuleCatchUpActionOutcome, RuleCatchUpAdmission, RuleCursorOutcome,
     RuleDefinitionInput, RuleEventAdmission, RuleProcessingState, TimerDefinitionInput,
@@ -77,6 +78,7 @@ mod admission;
 mod dispatch;
 mod observer;
 mod observer_live;
+mod resolution;
 mod source_handoff;
 
 fn sql_error(error: rusqlite::Error) -> Error {
@@ -9019,3 +9021,5 @@ mod git_fetch_tests;
 
 #[cfg(test)]
 mod git_workspace_fence_tests;
+#[cfg(test)]
+mod resolution_tests;

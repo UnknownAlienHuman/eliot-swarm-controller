@@ -11,6 +11,7 @@ mod native_requests;
 mod provider;
 mod read_validation;
 mod reads;
+mod resolutions;
 mod rules;
 mod scripts;
 mod timers;
@@ -48,6 +49,10 @@ pub use provider::{
 pub use reads::{
     AgentResultRequest, AgentResultResponse, CommandGetRequest, RuleGetRequest, RuleStateView,
     TurnGetRequest,
+};
+pub use resolutions::{
+    CommandResolution, CommandResolveRequest, CommandResolveResponse, TurnResolveRequest,
+    TurnResolveResponse, TurnResolveStatus,
 };
 pub use rules::{RuleCatchUpRequest, RuleLimit, RuleLimitScope};
 pub use scripts::{

@@ -3039,3 +3039,91 @@ mod start_resume_tests {
         assert_eq!(state.phase, SessionPhase::Unknown);
     }
 }
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    fn snapshot_state() -> FakeState {
+        FakeState {
+            credential: Some("fixture-credential".to_owned()),
+            binding: Some(Binding {
+                agent_id: "a1".to_owned(),
+                generation: 1,
+            }),
+            start_command_id: Some("launch-1".to_owned()),
+            ..FakeState::default()
+        }
+    }
+
+    fn snapshot_params(command_id: &str, turn_id: &str) -> Value {
+        json!({
+            "agent_id": "a1",
+            "generation": 1,
+            "command_id": command_id,
+            "turn_id": turn_id,
+        })
+    }
+
+    #[test]
+    fn snapshot_reports_completed_active_and_uncertain_turns() {
+        // Completed turn: no active marker, the last turn names the request.
+        let completed = FakeState {
+            phase: SessionPhase::Idle,
+            active_turn: None,
+            active_command_id: None,
+            last_turn: Some(LastTurn {
+                command_id: "send-1".to_owned(),
+                turn_id: "turn-1".to_owned(),
+                text: "done".to_owned(),
+            }),
+            ..snapshot_state()
+        };
+        let snapshot = handle_snapshot(&snapshot_params("send-1", "turn-1"), &completed)
+            .unwrap_or_else(|error| panic!("unexpected snapshot error {}", error.code));
+        assert_eq!(snapshot["agent_id"], "a1");
+        assert_eq!(snapshot["generation"], 1);
+        assert!(snapshot["active_turn"].is_null());
+        assert_eq!(snapshot["last_turn"]["turn_id"], "turn-1");
+        assert_eq!(snapshot["last_turn"]["status"], "completed");
+
+        // Active turn: the active marker names the request.
+        let active = FakeState {
+            phase: SessionPhase::Busy,
+            active_turn: Some("turn-1".to_owned()),
+            active_command_id: Some("send-1".to_owned()),
+            ..snapshot_state()
+        };
+        let snapshot = handle_snapshot(&snapshot_params("send-1", "turn-1"), &active)
+            .unwrap_or_else(|error| panic!("unexpected snapshot error {}", error.code));
+        assert_eq!(snapshot["active_turn"], "turn-1");
+
+        // Uncertain turn: the outcome was never proven, so the active marker
+        // stays even though a last turn is also recorded.
+        let uncertain = FakeState {
+            phase: SessionPhase::Unknown,
+            active_turn: Some("turn-1".to_owned()),
+            active_command_id: Some("send-1".to_owned()),
+            last_turn: Some(LastTurn {
+                command_id: "send-1".to_owned(),
+                turn_id: "turn-1".to_owned(),
+                text: "done".to_owned(),
+            }),
+            batch_unknown: true,
+            ..snapshot_state()
+        };
+        let snapshot = handle_snapshot(&snapshot_params("send-1", "turn-1"), &uncertain)
+            .unwrap_or_else(|error| panic!("unexpected snapshot error {}", error.code));
+        assert_eq!(snapshot["active_turn"], "turn-1");
+        assert_eq!(snapshot["last_turn"]["turn_id"], "turn-1");
+
+        // An unknown command or turn is an error, not an empty snapshot.
+        for params in [
+            snapshot_params("send-unknown", "turn-1"),
+            snapshot_params("send-1", "turn-unknown"),
+        ] {
+            let error = handle_snapshot(&params, &completed).unwrap_err();
+            assert_eq!(error.data.unwrap()["code"], "not_found");
+        }
+    }
+}

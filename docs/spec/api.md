@@ -87,7 +87,8 @@ rule actions have bounded derived ids. No general receipt/floor framework.
 | `agent.git/edits` | current Git snapshot and paginated native-attributed edits |
 | `command.submit/get` | implemented immutable admission and command readback |
 | `turn.get` | implemented running/completed/unknown turn read |
-| `command.children/resolve`, `turn.resolve` | later child readback and constrained owner resolution; no current handlers |
+| `command.resolve`, `turn.resolve` | constrained owner resolution of unknown outcomes; owner-only |
+| `command.children` | later child readback; no current handler |
 | `project.list/get` | owner-only read of registered project authority |
 | `rule.get/catch_up` | owner-only rule read and finite committed-history catch-up |
 | `timer.get/run` | owner-only timer read and idempotent manual firing |
@@ -104,11 +105,11 @@ Canonical public wire types are re-exported by
 define field names, JSON shapes and grammar; this spec owns behavior and authority. Principal
 authentication precedes method parameter validation.
 
-The method inventory includes later-layer methods. `command.children`, `command.resolve`
-and `turn.resolve` are target APIs only and are not registered by the current Router;
-calling them now returns `unsupported`. Their semantics below preserve the intended
-future contract, but do not imply current availability. The same rule applies to later
-methods identified in the Purpose column or by the roadmap.
+The method inventory includes later-layer methods. `command.children` is a target
+API only and is not registered by the current Router; calling it now returns
+`unsupported`. Its semantics below preserve the intended future contract, but do
+not imply current availability. The same rule applies to later methods identified
+in the Purpose column or by the roadmap.
 
 | Surface | Canonical DTO definitions |
 | --- | --- |
@@ -116,6 +117,7 @@ methods identified in the Purpose column or by the roadmap.
 | Project registration view | [agent_views.rs](../../crates/eliot-core/src/api/agent_views.rs) |
 | Nested observation/Git views | [monitor_views.rs](../../crates/eliot-core/src/api/monitor_views.rs) |
 | Command, turn and result queries | [reads.rs](../../crates/eliot-core/src/api/reads.rs) |
+| Command and turn owner resolution | [resolutions.rs](../../crates/eliot-core/src/api/resolutions.rs) |
 | Rule reads and history catch-up | [reads.rs](../../crates/eliot-core/src/api/reads.rs), [rules.rs](../../crates/eliot-core/src/api/rules.rs) |
 | Command submission and shutdown | [mutations.rs](../../crates/eliot-core/src/api/mutations.rs) and [Core `SubmitCommand`](../../crates/eliot-core/src/lib.rs) |
 | Timer schedules and requests | [timers.rs](../../crates/eliot-core/src/api/timers.rs) |
@@ -381,19 +383,43 @@ effective settings are read back or explicitly resolved. Timeout does not releas
 hold, even when the observed Agent state is idle. This is a predicate over existing
 command rows, not another queue/table. Stop/interrupt/request replies/readback still work.
 
-The target contract for future owner turn resolution requires exact readback proving it
-inactive or the generation terminal. Future resolution metadata may record
-`resolution_source=owner`; the current `Turn` read object does not expose that field.
-Resolution remains an owner assertion, not a synthetic native completion. Future
-turn-result metadata retains the planned `command_ids` and `usage` fields.
-The target contract for future owner command resolution is
-`command.resolve {id, command_id, as: applied|failed, reason}`; it records an owner
-assertion, never a native receipt, and releases only the relevant hold. Future
-`turn.resolve` likewise takes a mutation id, Agent/generation/turn,
-terminal status and reason; it cannot bypass the inactive/terminal precondition.
-Neither assertion establishes process closure or overrides a
-[capacity reservation](configuration.md#accounts-and-configured-capacity).
+Owner resolution of unknown outcomes is implemented and owner-only. Both calls take
+a mutation id, bind it idempotently to the exact assertion payload, and record an
+owner assertion, never a native receipt. Each releases only the resolved
+command/turn gate: sibling unknown commands and turns stay fenced, and neither
+assertion establishes process closure. A resolution never releases a
+[capacity reservation](configuration.md#accounts-and-configured-capacity): a
+retained reservation is released only by custody closure (restart recovery).
 Known failure can include partial effects; it never implies rollback or automatic retry.
+Observe-only Agents have no resolvable commands or turns; resolving any of
+theirs is refused with `not_allowed`.
+
+`command.resolve {id, command_id, as: applied|failed, reason}` requires the target
+command to be stored `unknown`; dispatched, queued, accepted, and terminal
+commands are refused with `bad_state`. `launch` and `resume` resolve as `failed`
+only: `applied` is refused with `bad_state`, since an applied start without its
+Agent transition is inconsistent. The command keeps any committed turn
+association and gains no invented one — including a send whose native turn
+association was lost, which resolves without creating a turn. The outcome
+carries `resolution_source=owner`, as does the emitted `command.resolved`
+event; no `command.applied`/`command.failed` receipt is emitted.
+Future turn-result metadata retains the planned `command_ids` and `usage` fields.
+
+`turn.resolve {id, agent, generation, turn_id, status: completed|failed|interrupted,
+reason}` requires the turn to be stored `unknown`; running and terminal turns
+are refused with `bad_state`. It further requires either a stored terminal
+generation (`Lost`, `Stopped`, or `Failed` — Eliot no longer controls it) or a
+native readback through the plugin (`agent.snapshot` for the exact turn)
+proving the turn inactive. The readback proves the turn inactive only when it
+binds this Agent generation, names the turn as its last turn with
+`terminal: true` and a terminal status, and does not report it as the active
+turn. The stored active turn alone is never proof: a live
+generation without such a readback is refused with `bad_state`. A generation
+that does not match the Agent's current generation is `stale_generation`. The
+turn completes with the asserted status, and a `turn.resolved` event carrying
+`resolution_source=owner` is emitted; no native `turn.completed` receipt is
+invented and no command row is touched. The current `Turn` read object does not
+expose the resolution source.
 
 ## Provider holds
 
@@ -655,9 +681,10 @@ eliot provider clear-hold SCOPE --corrective-evidence credentials_updated|config
 eliot plugin NAME | plugin-test ... | hook ... | mcp
 ```
 
-In particular, `turn resolve` and `cmd children|cancel|resolve` are not implemented CLI
-forms. `turn show` and `cmd show` are available. The deferred resolution and child-read
-semantics above do not make those command forms callable today.
+In particular, `cmd children|cancel` are not implemented CLI forms. `cmd show`,
+`cmd resolve`, and `turn resolve` are available; `turn show` remains unavailable.
+The deferred child-read semantics above do not make that command form callable
+today.
 
 Only current-layer commands appear in help and Agent guidance. Exit codes: 0 success/
 queued; 1 definite failure; 2 usage; 3 pre-effect rejection; 4 unknown; 5 wait timeout;

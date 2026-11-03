@@ -1,4 +1,5 @@
 mod command;
+mod resolution;
 
 use crate::{
     automation::RuleDefinition,
@@ -210,6 +211,7 @@ impl Router {
             }
             "command.submit" => self.submit(&params, &principal).await,
             "command.get" => self.command_get(&params, &principal).await,
+            "command.resolve" => self.command_resolve(&params, &principal).await,
             "agent.get" => self.agent_get(&params, &principal).await,
             "agent.discover" => self.agent_discover(&params, &principal).await,
             "agent.history" => self.agent_history(&params, &principal).await,
@@ -220,6 +222,7 @@ impl Router {
             "agent.git" => self.agent_git(&params, &principal).await,
             "agent.edits" => self.agent_edits(&params, &principal).await,
             "turn.get" => self.turn_get(&params, &principal).await,
+            "turn.resolve" => self.turn_resolve(&params, &principal).await,
             "events.read" => self.events_read(&params, &principal).await,
             "events.subscribe" => self.events_subscribe(&params, &principal).await,
             "project.get" => self.project_get(&params, &principal).await,
@@ -3784,7 +3787,11 @@ impl Router {
                 unknown.insert(id.to_owned());
             } else if matches!(
                 event.kind.as_str(),
-                "command.applied" | "command.failed" | "command.rejected" | "command.cancelled"
+                "command.applied"
+                    | "command.failed"
+                    | "command.rejected"
+                    | "command.cancelled"
+                    | "command.resolved"
             ) {
                 unknown.remove(id);
                 causes.remove(id);
