@@ -23,7 +23,7 @@ Use supported typed APIs, not an inferred method list from a different host vers
 | Eliot verb | Installed MSP mechanism to verify |
 | --- | --- |
 | launch/send | session/start then turn/start; readiness, input association and result separate |
-| steer/interrupt | exact current native turn controls; cancel/unqueue are different semantics |
+| steer/interrupt | steer is turn/steer with the exact expected turn; interrupt is turn/cancel on the exact turn (halt running, keep queue; turn/unqueue targets queued submits, never used here) |
 | inject | exact supported steer or explicit next-send prepend, mechanism reported |
 | stop/resume | clear/pause native Goal as necessary and close owned host; resume exact session without old input |
 | approve/deny/answer | exact session/child request id and offered choice/requirement |

@@ -113,6 +113,9 @@ pub struct NativeSessionStartParams {
     pub model_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_root: Option<String>,
+    /// Starting approval mode; the server default rules when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -133,6 +136,10 @@ pub struct NativeSession {
     pub model_id: Option<String>,
     pub provider_id: Option<String>,
     pub workspace_root: Option<String>,
+    /// The effective approval-mode projection; optional on the session
+    /// object, always present on the `session/setApprovalMode` ack.
+    #[serde(default)]
+    pub approval_mode: Option<NativeEffectiveApprovalModeState>,
     /// Total turns ever started on the session. The resume preflight proves
     /// the retained no-turn case from this counter (`Some(0)`), since a
     /// bounded view scan cannot prove absence; a missing counter refuses that
@@ -154,6 +161,51 @@ pub struct NativeSessionSetReasoningEffortParams {
 pub struct NativeSessionSetReasoningEffortResult {
     pub command_id: String,
     pub status: String,
+}
+
+/// `session/setModel` params (SS3.8): reconfigure the session's model; the
+/// profile carries no provider, so only the model id travels.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeSessionSetModelParams {
+    pub command_id: String,
+    pub session_id: String,
+    pub model_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeSessionSetModelResult {
+    pub command_id: String,
+    pub status: String,
+}
+
+/// `session/setApprovalMode` params (SS5.12): select a preconfigured approval
+/// enforcement mode mid-session; select, never create.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeSessionSetApprovalModeParams {
+    pub command_id: String,
+    pub session_id: String,
+    pub mode: String,
+}
+
+/// The effective approval-mode projection (`EffectiveApprovalModeState`,
+/// SS5.12): the same object `session/setApprovalMode` returns as
+/// `effectiveMode` and the `Session` object carries as `approvalMode`. Only
+/// the mode in effect is modelled; source and audit identity are ignored.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeEffectiveApprovalModeState {
+    pub mode: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeSessionSetApprovalModeResult {
+    pub command_id: String,
+    pub status: String,
+    pub effective_mode: NativeEffectiveApprovalModeState,
 }
 
 /// `model/list` params (SS3.10): a query, not a command — no `commandId`.
@@ -279,6 +331,55 @@ pub struct NativeTurnStartResult {
     pub command_id: String,
     pub disposition: String,
     pub started_new_turn: bool,
+    pub status: String,
+    pub turn_id: String,
+}
+
+/// `turn/cancel` params (SS3.5): plain cancellation of the exact active turn
+/// on the normal command lane — halt running, keep queue. `turnId` is
+/// schema-optional (omit to target the foreground turn), but this path
+/// always names the exact active turn; the foreground fallback is never
+/// used. Queued submits are a different object (`turn/unqueue`) and are
+/// never touched here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeTurnCancelParams {
+    pub command_id: String,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+}
+
+/// `turn/cancel` result: admission only — the turn is over when its
+/// `turn/completed` with terminal `cancelled` folds on the view stream.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeTurnCancelResult {
+    pub command_id: String,
+    pub status: String,
+    pub turn_id: String,
+}
+
+/// `turn/steer` params (SS3.3): inject input into the turn the caller names,
+/// failing if that turn is no longer active. `expectedTurnId` is the race
+/// guard — input meant for turn A can never leak into turn B — so it always
+/// carries the exact active turn. No per-steer tier travels; the session
+/// standing default applies.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeTurnSteerParams {
+    pub command_id: String,
+    pub expected_turn_id: String,
+    pub input: Vec<NativeTurnInputPart>,
+    pub session_id: String,
+}
+
+/// `turn/steer` result: `turnId` names the absorbing turn and must equal the
+/// expected one, else the input landed somewhere unexpected.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeTurnSteerResult {
+    pub command_id: String,
     pub status: String,
     pub turn_id: String,
 }
@@ -732,9 +833,18 @@ pub fn is_reasoning_effort_tier(value: &str) -> bool {
     REASONING_EFFORT_TIERS.contains(&value)
 }
 
+/// The closed approval-mode vocabulary (`ApprovalMode`, SS5.12): select, never
+/// create. Anything outside it is rejected before any native call.
+pub const APPROVAL_MODES: [&str; 4] = ["allowAll", "promptUnmatched", "onRequest", "denyUnmatched"];
+
+pub fn is_approval_mode(value: &str) -> bool {
+    APPROVAL_MODES.contains(&value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn only_pre_admission_errors_prove_no_write() {
@@ -853,6 +963,101 @@ mod tests {
         for other in ["", "default", "auto", "MEDIUM", " medium"] {
             assert!(!is_reasoning_effort_tier(other), "other={other}");
         }
+    }
+
+    #[test]
+    fn approval_vocabulary_is_the_closed_four_modes() {
+        assert_eq!(APPROVAL_MODES.len(), 4);
+        for mode in APPROVAL_MODES {
+            assert!(is_approval_mode(mode), "mode={mode}");
+        }
+        for other in [
+            "",
+            "default",
+            "never",
+            "on-request",
+            "PROMPTUNMATCHED",
+            " allowAll",
+        ] {
+            assert!(!is_approval_mode(other), "other={other}");
+        }
+    }
+
+    #[test]
+    fn cancel_and_steer_params_shape() {
+        let cancel = NativeTurnCancelParams {
+            command_id: "cmd-1".to_owned(),
+            session_id: "session-1".to_owned(),
+            turn_id: Some("turn-1".to_owned()),
+        };
+        assert_eq!(
+            serde_json::to_value(&cancel).expect("cancel params serialize"),
+            json!({
+                "commandId": "cmd-1",
+                "sessionId": "session-1",
+                "turnId": "turn-1",
+            })
+        );
+        let steer = NativeTurnSteerParams {
+            command_id: "cmd-2".to_owned(),
+            expected_turn_id: "turn-1".to_owned(),
+            input: vec![NativeTurnInputPart {
+                part_type: "text".to_owned(),
+                text: Some("follow-up".to_owned()),
+            }],
+            session_id: "session-1".to_owned(),
+        };
+        assert_eq!(
+            serde_json::to_value(&steer).expect("steer params serialize"),
+            json!({
+                "commandId": "cmd-2",
+                "expectedTurnId": "turn-1",
+                "input": [{"type": "text", "text": "follow-up"}],
+                "sessionId": "session-1",
+            })
+        );
+    }
+
+    #[test]
+    fn configure_setter_params_shape() {
+        let set_model = NativeSessionSetModelParams {
+            command_id: "cmd-3".to_owned(),
+            session_id: "session-1".to_owned(),
+            model_id: "muse-test-model".to_owned(),
+        };
+        assert_eq!(
+            serde_json::to_value(&set_model).expect("setModel params serialize"),
+            json!({
+                "commandId": "cmd-3",
+                "sessionId": "session-1",
+                "modelId": "muse-test-model",
+            })
+        );
+        let set_approval = NativeSessionSetApprovalModeParams {
+            command_id: "cmd-4".to_owned(),
+            session_id: "session-1".to_owned(),
+            mode: "promptUnmatched".to_owned(),
+        };
+        assert_eq!(
+            serde_json::to_value(&set_approval).expect("setApprovalMode params serialize"),
+            json!({
+                "commandId": "cmd-4",
+                "sessionId": "session-1",
+                "mode": "promptUnmatched",
+            })
+        );
+        let ack: NativeSessionSetApprovalModeResult = serde_json::from_value(json!({
+            "commandId": "cmd-4",
+            "status": "accepted",
+            "effectiveMode": {
+                "mode": "promptUnmatched",
+                "source": "explicit",
+                "lastCommandId": "cmd-4",
+            },
+            "applyOutcome": "applied",
+        }))
+        .expect("setApprovalMode ack decodes");
+        assert_eq!(ack.effective_mode.mode, "promptUnmatched");
     }
 
     #[test]

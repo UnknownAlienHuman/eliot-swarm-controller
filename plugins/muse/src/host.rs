@@ -10,12 +10,15 @@ use crate::{
             NativeModelEffortVariants, NativeModelListParams, NativeModelListResult, NativeSession,
             NativeSessionReadParams, NativeSessionReadResult,
             NativeSessionReasoningEffortChangedNotification, NativeSessionResumeParams,
-            NativeSessionResumeResult, NativeSessionSetReasoningEffortParams,
+            NativeSessionResumeResult, NativeSessionSetApprovalModeParams,
+            NativeSessionSetApprovalModeResult, NativeSessionSetModelParams,
+            NativeSessionSetModelResult, NativeSessionSetReasoningEffortParams,
             NativeSessionSetReasoningEffortResult, NativeSessionStartParams,
-            NativeSessionStartResult, NativeTurnCompletedNotification, NativeTurnInputPart,
-            NativeTurnStartParams, NativeTurnStartResult, NativeTurnStartedNotification,
-            NativeTurnTerminal, NativeUnframedViewEvent, NativeViewPageParams,
-            NativeViewPageResult, is_reasoning_effort_tier,
+            NativeSessionStartResult, NativeTurnCancelParams, NativeTurnCancelResult,
+            NativeTurnCompletedNotification, NativeTurnInputPart, NativeTurnStartParams,
+            NativeTurnStartResult, NativeTurnStartedNotification, NativeTurnSteerParams,
+            NativeTurnSteerResult, NativeTurnTerminal, NativeUnframedViewEvent,
+            NativeViewPageParams, NativeViewPageResult, is_approval_mode, is_reasoning_effort_tier,
         },
     },
 };
@@ -345,6 +348,15 @@ impl MusePlugin {
                 "Muse profile effort is not a supported reasoning tier",
             ));
         }
+        let requested_approval = optional_profile_text(profile, "approval")?;
+        if let Some(mode) = requested_approval.as_deref()
+            && !is_approval_mode(mode)
+        {
+            return Err(Error::new(
+                "profile_error",
+                "Muse profile approval is not a supported approval mode",
+            ));
+        }
         let workspace = params
             .workspace
             .as_deref()
@@ -378,8 +390,8 @@ impl MusePlugin {
         secrets.push(initialized.credential.clone());
         // Sandbox posture is fixed at host birth (`muse serve` flags) and stays
         // the host default until a permissions mapping lands; approval mode is
-        // wire-selected and stays the server default while approvals are
-        // unconnected.
+        // profile-selected when the frozen profile carries one (server default
+        // otherwise).
         let launch = NativeLaunch {
             program,
             args: vec![OsString::from("serve")],
@@ -517,6 +529,7 @@ impl MusePlugin {
                 command_id: new_command_id(),
                 model_id: Some(requested_model.clone()),
                 workspace_root: Some(workspace.to_string_lossy().into_owned()),
+                approval_mode: requested_approval.clone(),
             };
             (
                 "session/start",
@@ -727,19 +740,202 @@ impl MusePlugin {
             };
             effort_verified = effective_effort.as_deref() == Some(effort);
         }
+        // Model and approval alignment on resume: the frozen profile is the
+        // source of truth, so a retained session running another model or
+        // approval mode is realigned via the setters (launch already passes
+        // both to `session/start`). Either setter runs idle — the resume
+        // preflight proved it — so admission applies immediately and one
+        // `session/read` confirms both.
+        let mut setters_ran = false;
+        if resume_subject.is_some()
+            && native_session.model_id.as_deref() != Some(requested_model.as_str())
+        {
+            let model_command = new_command_id();
+            let model_params = NativeSessionSetModelParams {
+                command_id: model_command.clone(),
+                session_id: native_session.session_id.clone(),
+                model_id: requested_model.clone(),
+            };
+            let model_value = serde_json::to_value(model_params).map_err(|_| {
+                Error::new(
+                    "internal",
+                    "Muse session/setModel params could not be encoded",
+                )
+            })?;
+            let model_response = match session
+                .native_client
+                .call(
+                    "session/setModel",
+                    model_value,
+                    Instant::now() + RPC_TIMEOUT,
+                )
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    let error = discard_failed_start(
+                        &mut session,
+                        contextual_error(
+                            error,
+                            "profile_error",
+                            "Muse session/setModel did not admit the profile model",
+                        ),
+                    )
+                    .await;
+                    return Err(self.retain_failed_start(&params, error));
+                }
+            };
+            let model_ack: NativeSessionSetModelResult =
+                match serde_json::from_value(model_response) {
+                    Ok(ack) => ack,
+                    Err(_) => {
+                        let error = discard_failed_start(
+                            &mut session,
+                            Error::new(
+                                "profile_error",
+                                "Muse session/setModel ack did not match the 1.4 schema",
+                            ),
+                        )
+                        .await;
+                        return Err(self.retain_failed_start(&params, error));
+                    }
+                };
+            if model_ack.command_id != model_command || model_ack.status != "accepted" {
+                let error = discard_failed_start(
+                    &mut session,
+                    Error::new(
+                        "profile_error",
+                        "Muse session/setModel did not acknowledge the exact submitted command",
+                    ),
+                )
+                .await;
+                return Err(self.retain_failed_start(&params, error));
+            }
+            setters_ran = true;
+        }
+        if let Some(approval) = requested_approval.as_deref()
+            && resume_subject.is_some()
+            && native_session
+                .approval_mode
+                .as_ref()
+                .is_none_or(|state| state.mode != approval)
+        {
+            let approval_command = new_command_id();
+            let approval_params = NativeSessionSetApprovalModeParams {
+                command_id: approval_command.clone(),
+                session_id: native_session.session_id.clone(),
+                mode: approval.to_owned(),
+            };
+            let approval_value = serde_json::to_value(approval_params).map_err(|_| {
+                Error::new(
+                    "internal",
+                    "Muse session/setApprovalMode params could not be encoded",
+                )
+            })?;
+            let approval_response = match session
+                .native_client
+                .call(
+                    "session/setApprovalMode",
+                    approval_value,
+                    Instant::now() + RPC_TIMEOUT,
+                )
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    let error = discard_failed_start(
+                        &mut session,
+                        contextual_error(
+                            error,
+                            "profile_error",
+                            "Muse session/setApprovalMode did not admit the profile approval mode",
+                        ),
+                    )
+                    .await;
+                    return Err(self.retain_failed_start(&params, error));
+                }
+            };
+            let approval_ack: NativeSessionSetApprovalModeResult =
+                match serde_json::from_value(approval_response) {
+                    Ok(ack) => ack,
+                    Err(_) => {
+                        let error = discard_failed_start(
+                            &mut session,
+                            Error::new(
+                                "profile_error",
+                                "Muse session/setApprovalMode ack did not match the 1.4 schema",
+                            ),
+                        )
+                        .await;
+                        return Err(self.retain_failed_start(&params, error));
+                    }
+                };
+            if approval_ack.command_id != approval_command
+                || approval_ack.status != "accepted"
+                || approval_ack.effective_mode.mode != approval
+            {
+                let error = discard_failed_start(
+                    &mut session,
+                    Error::new(
+                        "profile_error",
+                        "Muse session/setApprovalMode did not acknowledge the requested mode",
+                    ),
+                )
+                .await;
+                return Err(self.retain_failed_start(&params, error));
+            }
+            setters_ran = true;
+        }
+        // Effective readback: one `session/read` confirms both aligned values
+        // (the `Session` object carries `modelId` and `approvalMode`); when
+        // no setter ran, the start/resume result already states them.
+        let (effective_model, effective_approval) =
+            if setters_ran {
+                let reread =
+                    match read_owned_session(&session.native_client, &native_session.session_id)
+                        .await
+                    {
+                        Ok(reread) => reread,
+                        Err(error) => {
+                            let error = discard_failed_start(&mut session, error).await;
+                            return Err(self.retain_failed_start(&params, error));
+                        }
+                    };
+                (
+                    reread.model_id.clone(),
+                    reread.approval_mode.map(|state| state.mode),
+                )
+            } else {
+                (
+                    native_session.model_id.clone(),
+                    native_session
+                        .approval_mode
+                        .as_ref()
+                        .map(|state| state.mode.clone()),
+                )
+            };
+        let model_verified = effective_model.as_deref() == Some(requested_model.as_str());
+        let approval_verified = requested_approval
+            .as_deref()
+            .is_some_and(|approval| effective_approval.as_deref() == Some(approval));
         let effective = json!({
-            "model": native_session.model_id.clone(),
+            "model": effective_model.clone(),
             "model_provider": native_session.provider_id.clone(),
+            "model_verified": model_verified,
             "cwd": native_session.workspace_root.clone(),
             "effort": initialized_native.effort.clone(),
             "effort_verified": effort_verified,
+            "approval": requested_approval.clone(),
+            "approval_verified": approval_verified,
             "schema_fingerprint": initialized_native.fingerprint.clone(),
         });
         // The effective settings are checked BEFORE readiness: on any
         // mismatch no `session.ready` is published and no session is kept.
         let effort_match = initialized_native.effort.is_none() || effort_verified;
+        let approval_match = requested_approval.is_none() || approval_verified;
         let settings_match = effort_match
-            && native_session.model_id.as_deref() == Some(requested_model.as_str())
+            && approval_match
+            && model_verified
             && native_session
                 .workspace_root
                 .as_deref()
@@ -749,7 +945,7 @@ impl MusePlugin {
                 &mut session,
                 Error::new(
                     "profile_error",
-                    "Muse effective model, workspace root, or reasoning effort did not match the frozen profile",
+                    "Muse effective model, workspace root, reasoning effort, or approval mode did not match the frozen profile",
                 ),
             )
             .await;
@@ -800,6 +996,7 @@ impl MusePlugin {
             "requested": {
                 "model": requested_model,
                 "effort": initialized_native.effort,
+                "approval": requested_approval,
                 "cwd": workspace.to_string_lossy(),
             },
             "effective": effective,
@@ -910,6 +1107,8 @@ impl MusePlugin {
         validate_identity(&params.agent_id, params.generation, &params.command_id)?;
         match params.verb.as_str() {
             "send" => self.send_command(params).await,
+            "steer" => self.steer_command(params).await,
+            "interrupt" => self.interrupt_command(params).await,
             "approve" | "deny" | "answer" => self.reply_request(params).await,
             _ => Err(Error::new(
                 "unsupported",
@@ -1089,6 +1288,220 @@ impl MusePlugin {
             ));
         }
         Ok(json!({"state": "applied", "turn_id": turn_id}))
+    }
+
+    async fn steer_command(&mut self, params: AgentCommandParams) -> Result<Value> {
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| Error::new("bad_state", "Muse Agent session has not started"))?;
+        validate_binding(session, &params.agent_id, params.generation)?;
+        if params.request_id.is_some() {
+            return Err(Error::new(
+                "invalid",
+                "turn/steer does not accept request_id",
+            ));
+        }
+        let turn_id = params
+            .turn_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| Error::new("stale_turn", "turn/steer requires a captured turn id"))?;
+        let text = params
+            .args
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::new("invalid", "Muse steer requires args.text"))?;
+        if text.len() > MAX_TEXT_BYTES {
+            return Ok(rejected_control("Muse steer input exceeds 512 KiB"));
+        }
+        if session.secrets.iter().any(|secret| text.contains(secret)) {
+            return Err(Error::new(
+                "secret_in_payload",
+                "Muse steer contains a known credential",
+            ));
+        }
+        if let Some(result) = control_replay(session, &params)? {
+            return Ok(result);
+        }
+        if session.phase != SessionPhase::Ready
+            || session.events.status().active_turn_id.as_deref() != Some(turn_id)
+            || session.events.status().source_unknown
+        {
+            let result = rejected_control("Muse steer does not match a healthy active turn");
+            settle_control(
+                session,
+                &params.command_id,
+                ControlOutcome::Rejected(result.clone()),
+            );
+            return Ok(result);
+        }
+        let Some(native_session) = session.session_id.clone() else {
+            let result = unknown_control("Muse session identity is unresolved");
+            settle_control(session, &params.command_id, ControlOutcome::Unknown);
+            return Ok(result);
+        };
+        // `expectedTurnId` always carries the exact active turn: input meant
+        // for turn A can never leak into turn B, and the ack must confirm the
+        // same turn absorbed it.
+        let native_command_id = new_command_id();
+        let steer_params = NativeTurnSteerParams {
+            command_id: native_command_id.clone(),
+            expected_turn_id: turn_id.to_owned(),
+            input: vec![NativeTurnInputPart {
+                part_type: "text".to_owned(),
+                text: Some(text.to_owned()),
+            }],
+            session_id: native_session,
+        };
+        let encoded = serde_json::to_value(steer_params)
+            .map_err(|_| Error::new("internal", "Muse turn/steer params could not be encoded"))?;
+        let response = session
+            .native_client
+            .call("turn/steer", encoded, Instant::now() + RPC_TIMEOUT)
+            .await;
+        match response {
+            Err(error)
+                if native_no_write(&error.code)
+                    || error.code == "native_rejected"
+                    || error.code == "frame_too_large" =>
+            {
+                let result = rejected_control("Muse turn/steer was not applied");
+                settle_control(
+                    session,
+                    &params.command_id,
+                    ControlOutcome::Rejected(result.clone()),
+                );
+                Ok(result)
+            }
+            Err(_) => {
+                let result = unknown_control("Muse turn/steer outcome is unknown");
+                settle_control(session, &params.command_id, ControlOutcome::Unknown);
+                Ok(result)
+            }
+            Ok(value) => {
+                let steered: NativeTurnSteerResult = serde_json::from_value(value)
+                    .map_err(|_| Error::new("internal", "Muse turn/steer response was invalid"))?;
+                if steered.command_id != native_command_id
+                    || steered.status != "accepted"
+                    || steered.turn_id != turn_id
+                {
+                    let result = unknown_control("Muse turn/steer was not absorbed by its turn");
+                    settle_control(session, &params.command_id, ControlOutcome::Unknown);
+                    return Ok(result);
+                }
+                let result = json!({
+                    "state": "applied",
+                    "command_id": params.command_id,
+                    "turn_id": turn_id,
+                });
+                settle_control(
+                    session,
+                    &params.command_id,
+                    ControlOutcome::Applied(result.clone()),
+                );
+                Ok(result)
+            }
+        }
+    }
+
+    async fn interrupt_command(&mut self, params: AgentCommandParams) -> Result<Value> {
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| Error::new("bad_state", "Muse Agent session has not started"))?;
+        validate_binding(session, &params.agent_id, params.generation)?;
+        let turn_id = params
+            .turn_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| Error::new("stale_turn", "turn/cancel requires a captured turn id"))?;
+        if params.request_id.is_some() {
+            return Err(Error::new(
+                "invalid",
+                "turn/cancel does not accept request_id",
+            ));
+        }
+        if let Some(result) = control_replay(session, &params)? {
+            return Ok(result);
+        }
+        if session.phase == SessionPhase::Stopped {
+            return Err(Error::new(
+                "bad_state",
+                "Muse plugin is stopping; no further input is accepted",
+            ));
+        }
+        if session.events.status().active_turn_id.as_deref() != Some(turn_id) {
+            return Err(Error::new(
+                "stale_turn",
+                "Muse turn/cancel does not match the exact active turn",
+            ));
+        }
+        let Some(native_session) = session.session_id.clone() else {
+            let result = unknown_control("Muse session identity is unresolved");
+            settle_control(session, &params.command_id, ControlOutcome::Unknown);
+            return Ok(result);
+        };
+        // The exact active turn is always named explicitly: halt running,
+        // keep queue — queued submits are a different object (`turn/unqueue`)
+        // and are never touched here. Admission is not the stop: the turn
+        // ends when its `turn/completed` with terminal `cancelled` folds on
+        // the stream.
+        let native_command_id = new_command_id();
+        let cancel_params = NativeTurnCancelParams {
+            command_id: native_command_id.clone(),
+            session_id: native_session,
+            turn_id: Some(turn_id.to_owned()),
+        };
+        let encoded = serde_json::to_value(cancel_params)
+            .map_err(|_| Error::new("internal", "Muse turn/cancel params could not be encoded"))?;
+        let response = session
+            .native_client
+            .call("turn/cancel", encoded, Instant::now() + RPC_TIMEOUT)
+            .await;
+        match response {
+            Err(error)
+                if native_no_write(&error.code)
+                    || error.code == "native_rejected"
+                    || error.code == "frame_too_large" =>
+            {
+                let result = rejected_control("Muse turn/cancel was not applied");
+                settle_control(
+                    session,
+                    &params.command_id,
+                    ControlOutcome::Rejected(result.clone()),
+                );
+                Ok(result)
+            }
+            Err(_) => {
+                let result = unknown_control("Muse turn/cancel outcome is unknown");
+                settle_control(session, &params.command_id, ControlOutcome::Unknown);
+                Ok(result)
+            }
+            Ok(value) => {
+                let cancelled: NativeTurnCancelResult = serde_json::from_value(value)
+                    .map_err(|_| Error::new("internal", "Muse turn/cancel response was invalid"))?;
+                if cancelled.command_id != native_command_id
+                    || cancelled.status != "accepted"
+                    || cancelled.turn_id != turn_id
+                {
+                    let result = unknown_control("Muse turn/cancel did not stop its exact turn");
+                    settle_control(session, &params.command_id, ControlOutcome::Unknown);
+                    return Ok(result);
+                }
+                let result = json!({
+                    "state": "applied",
+                    "command_id": params.command_id,
+                    "turn_id": turn_id,
+                });
+                settle_control(
+                    session,
+                    &params.command_id,
+                    ControlOutcome::Applied(result.clone()),
+                );
+                Ok(result)
+            }
+        }
     }
 
     async fn reply_request(&mut self, params: AgentCommandParams) -> Result<Value> {
@@ -2274,6 +2687,8 @@ fn muse_manifest() -> PluginManifest {
             "launch".to_owned(),
             "resume".to_owned(),
             "send".to_owned(),
+            "steer".to_owned(),
+            "interrupt".to_owned(),
             "approve".to_owned(),
             "deny".to_owned(),
             "answer".to_owned(),
@@ -2319,6 +2734,7 @@ mod tests {
             model_id: Some("muse-spark-1.3-contributor".to_owned()),
             provider_id: Some("meta".to_owned()),
             workspace_root: Some("C:\\work".to_owned()),
+            approval_mode: None,
             turn_count,
         }
     }
@@ -2358,7 +2774,15 @@ mod tests {
         assert_eq!(
             manifest.verbs,
             [
-                "launch", "resume", "send", "approve", "deny", "answer", "stop"
+                "launch",
+                "resume",
+                "send",
+                "steer",
+                "interrupt",
+                "approve",
+                "deny",
+                "answer",
+                "stop"
             ]
         );
         assert!(manifest.child_verbs.is_empty());

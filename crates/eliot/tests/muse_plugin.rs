@@ -70,8 +70,8 @@ fn main() {
         println!("ok - answer and deny settle prompts");
         scenario_decide_internal_error_is_unknown_without_rewrite().await;
         println!("ok - decide internal error is unknown without rewrite");
-        scenario_stale_choice_after_update_is_rejected().await;
-        println!("ok - stale choice after update is rejected");
+        scenario_unknown_choice_is_rejected_without_write().await;
+        println!("ok - unknown choice is rejected without a write");
         scenario_stale_requirement_is_rejected_then_valid_reply_applies().await;
         println!("ok - stale requirement is rejected, then a valid reply applies");
         scenario_multistage_approval_decides_each_stage().await;
@@ -90,6 +90,24 @@ fn main() {
         println!("ok - resume rejects stale generation-1 output");
         scenario_resume_refuses_served_history_and_keeps_the_retained_id().await;
         println!("ok - resume refuses served history and keeps the retained id");
+        scenario_control_interrupt_cancels_exact_turn().await;
+        println!("ok - interrupt cancels the exact turn");
+        scenario_control_interrupt_rejected_after_terminal().await;
+        println!("ok - interrupt after terminal is stale");
+        scenario_control_steer_rejected_for_stale_turn().await;
+        println!("ok - steer for a stale turn is rejected");
+        scenario_control_steer_missing_text_is_invalid().await;
+        println!("ok - steer without text is invalid");
+        scenario_control_steer_forwards_text_to_exact_turn().await;
+        println!("ok - steer forwards text to the exact turn");
+        scenario_control_interrupt_cancels_waiting_request_turn().await;
+        println!("ok - interrupt cancels a turn waiting on a request");
+        scenario_control_steer_lost_reply_is_unknown_without_rewrite().await;
+        println!("ok - lost steer reply is unknown without a second write");
+        scenario_launch_approval_is_adopted_and_verified().await;
+        println!("ok - launch approval is adopted and verified");
+        scenario_approval_mismatch_is_rejected_before_ready().await;
+        println!("ok - approval mismatch is rejected before session.ready");
     });
     println!("muse_plugin: all scenarios passed");
 }
@@ -119,6 +137,11 @@ struct FakeMsp {
     prompts_opened: u64,
     prompts_settled: u64,
     last_turn: Option<String>,
+    session_model: String,
+    approval_mode: String,
+    approval_source: String,
+    start_approval: Option<String>,
+    last_steer_text: String,
 }
 
 fn fake_msp_main(script: &str) {
@@ -140,6 +163,11 @@ fn fake_msp_main(script: &str) {
         prompts_opened: 0,
         prompts_settled: 0,
         last_turn: None,
+        session_model: MODEL.to_owned(),
+        approval_mode: "allowAll".to_owned(),
+        approval_source: "startup".to_owned(),
+        start_approval: None,
+        last_steer_text: String::new(),
     };
     if matches!(
         fake.script.as_str(),
@@ -150,6 +178,7 @@ fn fake_msp_main(script: &str) {
             | "resume-inline-history"
             | "resume-stale-pull"
             | "resume-undecodable-pull"
+            | "resume-realign"
     ) {
         fake.seed_retained_session();
     }
@@ -289,6 +318,21 @@ impl FakeMsp {
                 } else {
                     model
                 };
+                self.session_model = model.clone();
+                let start_approval = params
+                    .get("approvalMode")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                self.start_approval = start_approval.clone();
+                // The ignored-approval script drops the profile mode: the
+                // session keeps the server default and the pre-ready gate
+                // must refuse it.
+                if self.script != "launch-approval-ignored"
+                    && let Some(mode) = start_approval
+                {
+                    self.approval_mode = mode;
+                    self.approval_source = "startup".to_owned();
+                }
                 let cursor = self.next_cursor();
                 let session = self.session_object(&session_id, "idle", None, &model, &workspace);
                 self.reply(
@@ -366,7 +410,18 @@ impl FakeMsp {
                     "resume never carries old input"
                 );
                 let workspace = std::env::var("ELIOT_FAKE_MSP_WORKSPACE").unwrap_or_default();
-                let session = self.session_object(requested, "idle", None, MODEL, &workspace);
+                // The realign script retains a drifted session: another model
+                // and the server-default approval mode, both different from
+                // the profile. Every other resume script retains the profile
+                // model.
+                let (model, approval) = if self.script == "resume-realign" {
+                    ("muse-old-model", "allowAll")
+                } else {
+                    (MODEL, self.approval_mode.as_str())
+                };
+                self.session_model = model.to_owned();
+                self.approval_mode = approval.to_owned();
+                let session = self.session_object(requested, "idle", None, model, &workspace);
                 let pending = if self.script == "resume-pending" {
                     json!([
                         {
@@ -574,17 +629,22 @@ impl FakeMsp {
                     self.script.as_str(),
                     "request-approval"
                         | "request-prompt"
-                        | "request-stale-choice"
+                        | "request-unknown-choice"
                         | "request-multistage"
                         | "request-stale-decide"
                         | "request-redact"
                         | "decide-internal-error"
                         | "decide-lost-reply"
+                        | "turn-controls"
+                        | "control-lost"
                 ) {
                     // Parked turn: the request opens now and the completion
-                    // lands only after the scenario answers it.
+                    // lands only after the scenario answers it. The bare
+                    // control scripts park with no opens: the scenario steers
+                    // and interrupts the live turn itself.
                     self.approval_stage = 1;
                     match self.script.as_str() {
+                        "turn-controls" | "control-lost" => {}
                         "request-prompt" => {
                             let first = self.user_input_request_params(
                                 &session_id,
@@ -600,7 +660,7 @@ impl FakeMsp {
                             self.emit_request(stdout, "userInput/request", second);
                             self.prompts_opened = 2;
                         }
-                        "request-stale-choice" => {
+                        "request-unknown-choice" => {
                             // The open carries the stage-2 offer and the
                             // update repeats it: the stage-1 choice id the
                             // scenario names is unknown to the current offer
@@ -788,8 +848,142 @@ impl FakeMsp {
                     json!({
                         "history": {"items": [], "mode": "inline", "snapshot": null},
                         "pendingRequests": [],
-                        "session": self.session_object(&session_id, status, active, MODEL, ""),
+                        "session": self.session_object(&session_id, status, active, &self.session_model, ""),
                         "viewCursor": self.head_cursor(),
+                    }),
+                );
+            }
+            "turn/cancel" => {
+                let command = params
+                    .get("commandId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let turn = params
+                    .get("turnId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                assert!(!command.is_empty(), "cancel mints its command id");
+                // The exact live turn is always named explicitly; the
+                // foreground fallback is never used.
+                assert_eq!(
+                    Some(turn.as_str()),
+                    self.last_turn.as_deref(),
+                    "cancel names the exact live turn"
+                );
+                assert!(
+                    params.get("retract").is_none(),
+                    "cancel never pairs a retract"
+                );
+                if self.script == "control-lost" {
+                    // Lost reply: exit without answering. The report already
+                    // records this receipt.
+                    std::process::exit(0);
+                }
+                self.reply(
+                    stdout,
+                    &id,
+                    json!({"commandId": command, "status": "accepted", "turnId": turn}),
+                );
+                // Admission is not the stop: the turn ends when its
+                // turn/completed with terminal cancelled folds.
+                self.complete_open_turn_cancelled(stdout, &turn);
+            }
+            "turn/steer" => {
+                let command = params
+                    .get("commandId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let expected = params
+                    .get("expectedTurnId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                assert!(!command.is_empty(), "steer mints its command id");
+                assert_eq!(
+                    Some(expected.as_str()),
+                    self.last_turn.as_deref(),
+                    "steer names the exact live turn"
+                );
+                let text = params
+                    .get("input")
+                    .and_then(Value::as_array)
+                    .and_then(|input| input.first())
+                    .and_then(|part| part.get("text"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                assert!(!text.is_empty(), "steer carries its text part");
+                self.last_steer_text = text.to_owned();
+                // Publish before the reply: the scenario reads the report
+                // once the ack lands, and the post-frame rewrite may lose
+                // that race.
+                self.write_report();
+                if self.script == "control-lost" {
+                    // Lost reply: exit without answering. The report already
+                    // records this receipt.
+                    std::process::exit(0);
+                }
+                self.reply(
+                    stdout,
+                    &id,
+                    json!({"commandId": command, "status": "accepted", "turnId": expected}),
+                );
+                // Absorbed silently: the turn keeps running, no new turn
+                // starts, nothing commits until the turn itself folds.
+            }
+            "session/setModel" => {
+                let command = params
+                    .get("commandId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let model = params
+                    .get("modelId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                assert!(!model.is_empty(), "setModel names its model");
+                self.session_model = model;
+                self.reply(
+                    stdout,
+                    &id,
+                    json!({"commandId": command, "status": "accepted"}),
+                );
+            }
+            "session/setApprovalMode" => {
+                let command = params
+                    .get("commandId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let mode = params
+                    .get("mode")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                assert!(
+                    matches!(
+                        mode.as_str(),
+                        "allowAll" | "promptUnmatched" | "onRequest" | "denyUnmatched"
+                    ),
+                    "setApprovalMode selects a preconfigured mode"
+                );
+                self.approval_mode = mode.clone();
+                self.approval_source = "approvalReconfigure".to_owned();
+                self.reply(
+                    stdout,
+                    &id,
+                    json!({
+                        "commandId": command,
+                        "status": "accepted",
+                        "effectiveMode": {
+                            "mode": mode,
+                            "source": "approvalReconfigure",
+                            "lastCommandId": command,
+                        },
+                        "applyOutcome": "applied",
                     }),
                 );
             }
@@ -1141,6 +1335,11 @@ impl FakeMsp {
     ) -> Value {
         json!({
             "activeTurnId": active_turn,
+            "approvalMode": {
+                "mode": self.approval_mode,
+                "source": self.approval_source,
+                "lastCommandId": null,
+            },
             "createdAt": "2026-11-03T00:00:00Z",
             "forkedFrom": null,
             "modelId": model,
@@ -1334,6 +1533,25 @@ impl FakeMsp {
         self.turn_active = false;
     }
 
+    /// Fold an interrupted turn: the terminal `cancelled` record with no
+    /// further content. The partial `item/started` never completes.
+    fn complete_open_turn_cancelled(&mut self, stdout: &mut std::io::StdoutLock, turn_id: &str) {
+        let session_id = self.session_id.clone().unwrap_or_default();
+        let cursor = self.next_cursor();
+        self.emit(
+            stdout,
+            "turn/completed",
+            json!({
+                "sessionId": session_id,
+                "sourceRange": Self::source_range(),
+                "terminal": "cancelled",
+                "turnId": turn_id,
+                "viewCursor": cursor,
+            }),
+        );
+        self.turn_active = false;
+    }
+
     fn final_text(script: &str) -> &'static str {
         match script {
             "failed-turn" => "partial reply before the failure.",
@@ -1353,6 +1571,12 @@ impl FakeMsp {
             "answers": method_count("userInput/answer"),
             "cancels": method_count("userInput/cancel"),
             "pending_pulls": method_count("approval/listPending"),
+            "interrupts": method_count("turn/cancel"),
+            "steers": method_count("turn/steer"),
+            "last_steer_text": self.last_steer_text,
+            "set_models": method_count("session/setModel"),
+            "set_approvals": method_count("session/setApprovalMode"),
+            "start_approval_mode": self.start_approval,
             "receipts": self.receipts,
         });
         // Atomic publish: the harness may SIGKILL this fixture at any point
@@ -1682,7 +1906,15 @@ impl Scenario {
         assert_eq!(
             manifest["verbs"],
             json!([
-                "launch", "resume", "send", "approve", "deny", "answer", "stop"
+                "launch",
+                "resume",
+                "send",
+                "steer",
+                "interrupt",
+                "approve",
+                "deny",
+                "answer",
+                "stop"
             ])
         );
         assert_eq!(
@@ -2740,6 +2972,158 @@ async fn reply_until_applied(
     panic!("reply never applied after 500 attempts");
 }
 
+/// Drive one `steer`/`interrupt` agent.command against the exact turn with a
+/// fixed command id, collecting any committed batches that land while it is
+/// in flight. Turn controls never carry a request id. The outcome is a
+/// `Result`: stale-turn and invalid controls fail the call itself.
+async fn control_with_id(
+    host: &mut Host,
+    agent_id: &str,
+    generation: i64,
+    command_id: &str,
+    verb: &str,
+    turn_id: &str,
+    args: Value,
+) -> (Result<Value, String>, Vec<(String, Value)>) {
+    let rx = host
+        .begin_call(
+            "agent.command",
+            json!({
+                "agent_id": agent_id,
+                "generation": generation,
+                "command_id": command_id,
+                "verb": verb,
+                "args": args,
+                "turn_id": turn_id,
+                "request_id": null,
+            }),
+        )
+        .await;
+    let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
+    let mut committed = Vec::new();
+    let result = loop {
+        tokio::select! {
+            biased;
+            request = host.next_request() => {
+                assert_eq!(request.method, "events.put");
+                let events = request
+                    .params
+                    .get("events")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                assert_eq!(events.len(), 1, "one native record per batch");
+                committed.push((
+                    events[0]
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    events[0].get("data").cloned().unwrap_or(Value::Null),
+                ));
+                let first = host.next_seq;
+                host.next_seq += 1;
+                host.respond(&request.id, json!({
+                    "first_seq": first,
+                    "last_seq": first,
+                    "cursor": request.params.get("cursor").cloned().unwrap_or(Value::Null),
+                }))
+                .await;
+            }
+            result = &mut rx => break result,
+        }
+    };
+    let result = result
+        .expect("control deadline")
+        .expect("control response channel");
+    (result, committed)
+}
+
+/// Drain the cancelled terminal the interrupt admitted: the ack may win or
+/// lose the race against its `turn.completed` batch, so collect until the
+/// terminal is in hand.
+async fn drain_turn_completed(
+    host: &mut Host,
+    agent_id: &str,
+    generation: i64,
+    committed: &mut Vec<(String, Value)>,
+) {
+    while !committed.iter().any(|(kind, _)| kind == "turn.completed") {
+        let events = host
+            .answer_events_put(agent_id, generation, "turn.completed")
+            .await;
+        committed.push((
+            "turn.completed".to_owned(),
+            events[0].get("data").cloned().unwrap_or(Value::Null),
+        ));
+    }
+}
+
+async fn control(
+    host: &mut Host,
+    agent_id: &str,
+    generation: i64,
+    verb: &str,
+    turn_id: &str,
+    args: Value,
+) -> (String, Result<Value, String>, Vec<(String, Value)>) {
+    let command_id = ulid::Ulid::new().to_string();
+    let (result, committed) =
+        control_with_id(host, agent_id, generation, &command_id, verb, turn_id, args).await;
+    (command_id, result, committed)
+}
+
+/// Like `control_with_id`, but tolerates the dead host's stream gap arriving
+/// around the control: acknowledge it and keep waiting for the outcome.
+async fn control_tolerating_gaps(
+    host: &mut Host,
+    agent_id: &str,
+    generation: i64,
+    command_id: &str,
+    verb: &str,
+    turn_id: &str,
+    args: Value,
+) -> Value {
+    let rx = host
+        .begin_call(
+            "agent.command",
+            json!({
+                "agent_id": agent_id,
+                "generation": generation,
+                "command_id": command_id,
+                "verb": verb,
+                "args": args,
+                "turn_id": turn_id,
+                "request_id": null,
+            }),
+        )
+        .await;
+    let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
+    let result = loop {
+        tokio::select! {
+            biased;
+            request = host.next_request() => {
+                assert_eq!(request.method, "source.gap");
+                let gap_id = request
+                    .params
+                    .get("gap_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let seq = host.next_seq;
+                host.next_seq += 1;
+                host.respond(&request.id, json!({"gap_id": gap_id, "seq": seq}))
+                    .await;
+            }
+            result = &mut rx => break result,
+        }
+    };
+    result
+        .expect("control deadline")
+        .expect("control response channel")
+        .expect("control responds")
+}
+
 async fn scenario_launch_send_snapshot_stop() {
     let mut scenario = Scenario::start("happy", muse_profile()).await;
     let agent_id = scenario.agent_id.clone();
@@ -3112,22 +3496,325 @@ async fn send_unknown_without_rewrite(script: &str) {
 }
 
 async fn scenario_effort_mismatch_is_rejected_before_ready() {
-    start_mismatch_before_ready("effort-mismatch").await;
+    start_mismatch_before_ready("effort-mismatch", muse_profile()).await;
 }
 
 async fn scenario_model_mismatch_is_rejected_before_ready() {
-    start_mismatch_before_ready("model-mismatch").await;
+    start_mismatch_before_ready("model-mismatch", muse_profile()).await;
 }
 
 async fn scenario_workspace_mismatch_is_rejected_before_ready() {
-    start_mismatch_before_ready("cwd-mismatch").await;
+    start_mismatch_before_ready("cwd-mismatch", muse_profile()).await;
+}
+
+/// Shut an idle scenario down: graceful stop (forced when the native host
+/// is dead), plugin shutdown, and temp-dir cleanup.
+async fn finish_scenario(mut scenario: Scenario, force: bool) {
+    let agent_id = scenario.agent_id.clone();
+    stop_agent(&mut scenario.host, &agent_id, 1, force).await;
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+    let _ = std::fs::remove_dir_all(&scenario.root);
+}
+
+/// Interrupt on the exact active turn: `turn/cancel` is admitted and the
+/// turn ends when its `cancelled` terminal folds as `interrupted`.
+async fn scenario_control_interrupt_cancels_exact_turn() {
+    let mut scenario = Scenario::start("turn-controls", muse_profile()).await;
+    let agent_id = scenario.agent_id.clone();
+
+    let (_send_id, turn_id, _) =
+        send_parked(&mut scenario.host, &agent_id, 1, "Count the stars.", 0).await;
+    let (command_id, result, mut committed) = control(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "interrupt",
+        &turn_id,
+        json!({}),
+    )
+    .await;
+    let result = result.expect("interrupt responds");
+    assert_eq!(result["state"], json!("applied"));
+    assert_eq!(result["command_id"], json!(command_id));
+    assert_eq!(result["turn_id"], json!(turn_id));
+    drain_turn_completed(&mut scenario.host, &agent_id, 1, &mut committed).await;
+    let completed: Vec<&(String, Value)> = committed
+        .iter()
+        .filter(|(kind, _)| kind == "turn.completed")
+        .collect();
+    assert_eq!(completed.len(), 1, "interrupt completes the exact turn");
+    assert_eq!(completed[0].1["turn_id"], json!(turn_id));
+    assert_eq!(completed[0].1["status"], json!("interrupted"));
+    assert_eq!(committed.len(), 1, "only the terminal folds");
+    assert_eq!(scenario.report()["interrupts"], json!(1));
+    finish_scenario(scenario, false).await;
+}
+
+/// Interrupt after the terminal: the turn is no longer active, so the
+/// control fails `stale_turn` with no native I/O.
+async fn scenario_control_interrupt_rejected_after_terminal() {
+    let mut scenario = Scenario::start("turn-controls", muse_profile()).await;
+    let agent_id = scenario.agent_id.clone();
+
+    let (_send_id, turn_id, _) =
+        send_parked(&mut scenario.host, &agent_id, 1, "Count the stars.", 0).await;
+    let (_, first, mut committed) = control(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "interrupt",
+        &turn_id,
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        first.expect("interrupt responds")["state"],
+        json!("applied")
+    );
+    drain_turn_completed(&mut scenario.host, &agent_id, 1, &mut committed).await;
+    let (_, second, committed) = control(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "interrupt",
+        &turn_id,
+        json!({}),
+    )
+    .await;
+    assert_eq!(second, Err("stale_turn".to_owned()));
+    assert!(committed.is_empty(), "no batches may commit after terminal");
+    assert_eq!(scenario.report()["interrupts"], json!(1));
+    finish_scenario(scenario, false).await;
+}
+
+/// Steer against a turn that is not active: rejected locally, nothing
+/// commits, and the native lane is never touched.
+async fn scenario_control_steer_rejected_for_stale_turn() {
+    let mut scenario = Scenario::start("turn-controls", muse_profile()).await;
+    let agent_id = scenario.agent_id.clone();
+
+    let (_send_id, turn_id, _) =
+        send_parked(&mut scenario.host, &agent_id, 1, "Count the stars.", 0).await;
+    let stale = ulid::Ulid::new().to_string();
+    let (_, result, committed) = control(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "steer",
+        &stale,
+        json!({"text": "stale does not steer"}),
+    )
+    .await;
+    assert_eq!(result.expect("steer responds")["state"], json!("rejected"));
+    assert!(committed.is_empty(), "stale steer must commit nothing");
+    assert_eq!(scenario.report()["steers"], json!(0));
+    let (_, end, mut committed) = control(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "interrupt",
+        &turn_id,
+        json!({}),
+    )
+    .await;
+    assert_eq!(end.expect("interrupt responds")["state"], json!("applied"));
+    drain_turn_completed(&mut scenario.host, &agent_id, 1, &mut committed).await;
+    finish_scenario(scenario, false).await;
+}
+
+/// Steer without text: the call itself is invalid, before any turn check or
+/// native I/O.
+async fn scenario_control_steer_missing_text_is_invalid() {
+    let mut scenario = Scenario::start("turn-controls", muse_profile()).await;
+    let agent_id = scenario.agent_id.clone();
+
+    let (_send_id, turn_id, _) =
+        send_parked(&mut scenario.host, &agent_id, 1, "Count the stars.", 0).await;
+    let (_, result, committed) = control(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "steer",
+        &turn_id,
+        json!({}),
+    )
+    .await;
+    assert_eq!(result, Err("invalid".to_owned()));
+    assert!(committed.is_empty(), "invalid steer must commit nothing");
+    assert_eq!(scenario.report()["steers"], json!(0));
+    let (_, end, mut committed) = control(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "interrupt",
+        &turn_id,
+        json!({}),
+    )
+    .await;
+    assert_eq!(end.expect("interrupt responds")["state"], json!("applied"));
+    drain_turn_completed(&mut scenario.host, &agent_id, 1, &mut committed).await;
+    finish_scenario(scenario, false).await;
+}
+
+/// Steer on the exact active turn: `turn/steer` carries the expected turn
+/// and the text crosses verbatim; absorption is silent (no new turn, no
+/// commits) until the turn itself folds.
+async fn scenario_control_steer_forwards_text_to_exact_turn() {
+    let mut scenario = Scenario::start("turn-controls", muse_profile()).await;
+    let agent_id = scenario.agent_id.clone();
+
+    let (_send_id, turn_id, _) =
+        send_parked(&mut scenario.host, &agent_id, 1, "Count the stars.", 0).await;
+    let (command_id, result, committed) = control(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "steer",
+        &turn_id,
+        json!({"text": "orbit the northern tower"}),
+    )
+    .await;
+    let result = result.expect("steer responds");
+    assert_eq!(result["state"], json!("applied"));
+    assert_eq!(result["command_id"], json!(command_id));
+    assert_eq!(result["turn_id"], json!(turn_id));
+    assert!(committed.is_empty(), "steer absorbs silently");
+    let report = scenario.report();
+    assert_eq!(report["steers"], json!(1));
+    assert_eq!(report["last_steer_text"], json!("orbit the northern tower"));
+    let (_, end, mut committed) = control(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "interrupt",
+        &turn_id,
+        json!({}),
+    )
+    .await;
+    assert_eq!(end.expect("interrupt responds")["state"], json!("applied"));
+    drain_turn_completed(&mut scenario.host, &agent_id, 1, &mut committed).await;
+    finish_scenario(scenario, false).await;
+}
+
+/// Interrupt while the send's turn waits on an open request: the exact turn
+/// still cancels, the terminal folds `interrupted`, and the dead turn's
+/// open request is dropped, never answered.
+async fn scenario_control_interrupt_cancels_waiting_request_turn() {
+    let mut scenario = Scenario::start("request-approval", muse_profile()).await;
+    let agent_id = scenario.agent_id.clone();
+
+    let (_send_id, turn_id, parked) =
+        send_parked(&mut scenario.host, &agent_id, 1, "List files.", 1).await;
+    assert!(
+        parked.iter().any(|(kind, _)| kind == "request.opened"),
+        "the send waits on an open request"
+    );
+    let (_, result, mut committed) = control(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "interrupt",
+        &turn_id,
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        result.expect("interrupt responds")["state"],
+        json!("applied")
+    );
+    drain_turn_completed(&mut scenario.host, &agent_id, 1, &mut committed).await;
+    let completed: Vec<&(String, Value)> = committed
+        .iter()
+        .filter(|(kind, _)| kind == "turn.completed")
+        .collect();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].1["turn_id"], json!(turn_id));
+    assert_eq!(completed[0].1["status"], json!("interrupted"));
+    assert_eq!(committed.len(), 1, "no request resolution commits");
+    assert_eq!(scenario.report()["interrupts"], json!(1));
+    assert_eq!(scenario.report()["decides"], json!(0));
+    finish_scenario(scenario, false).await;
+}
+
+/// Transport loss during a steer: the control is unknown (the write may or
+/// may not have landed) and the exact-command retry replays the retained
+/// unknown outcome without touching the native lane a second time.
+async fn scenario_control_steer_lost_reply_is_unknown_without_rewrite() {
+    let mut scenario = Scenario::start("control-lost", muse_profile()).await;
+    let agent_id = scenario.agent_id.clone();
+
+    let (_send_id, turn_id, _) =
+        send_parked(&mut scenario.host, &agent_id, 1, "Count the stars.", 0).await;
+    let command_id = ulid::Ulid::new().to_string();
+    let args = json!({"text": "lost on the wire"});
+    let result = control_tolerating_gaps(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        &command_id,
+        "steer",
+        &turn_id,
+        args.clone(),
+    )
+    .await;
+    assert_eq!(result["state"], json!("unknown"));
+    assert_eq!(scenario.report()["steers"], json!(1));
+    let retry = control_tolerating_gaps(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        &command_id,
+        "steer",
+        &turn_id,
+        args,
+    )
+    .await;
+    assert_eq!(retry["state"], json!("unknown"));
+    assert_eq!(scenario.report()["steers"], json!(1));
+    finish_scenario(scenario, true).await;
+}
+
+/// Configure readback on launch: the profile approval mode travels on
+/// `session/start` and the effective block verifies it.
+async fn scenario_launch_approval_is_adopted_and_verified() {
+    let mut profile = muse_profile();
+    profile["approval"] = json!("promptUnmatched");
+    let scenario = Scenario::start("happy", profile).await;
+    assert_eq!(
+        scenario.start_result["requested"]["approval"],
+        json!("promptUnmatched")
+    );
+    assert_eq!(
+        scenario.start_result["effective"]["approval"],
+        json!("promptUnmatched")
+    );
+    assert_eq!(
+        scenario.start_result["effective"]["approval_verified"],
+        json!(true)
+    );
+    assert_eq!(
+        scenario.report()["start_approval_mode"],
+        json!("promptUnmatched")
+    );
+    finish_scenario(scenario, false).await;
+}
+
+async fn scenario_approval_mismatch_is_rejected_before_ready() {
+    let mut profile = muse_profile();
+    profile["approval"] = json!("promptUnmatched");
+    start_mismatch_before_ready("launch-approval-ignored", profile).await;
 }
 
 /// Drive `agent.start` against a script whose effective settings disagree
 /// with the frozen profile: the start fails `profile_error` with no
 /// `session.ready` batch, and a retained retry repeats the stored error
 /// without new native I/O.
-async fn start_mismatch_before_ready(script: &str) {
+async fn start_mismatch_before_ready(script: &str, profile: Value) {
     let root: PathBuf = std::env::temp_dir().join(format!(
         "eliot-muse-plugin-test-{}",
         ulid::Ulid::new().to_string().to_lowercase()
@@ -3150,7 +3837,7 @@ async fn start_mismatch_before_ready(script: &str) {
     .expect("initialize");
     let start_id = ulid::Ulid::new().to_string();
     let self_exe = std::env::current_exe().expect("test executable");
-    let mut full_profile = muse_profile();
+    let mut full_profile = profile;
     full_profile["cmd"] = Value::String(self_exe.to_string_lossy().into_owned());
     let start_params = json!({
         "agent_id": agent_id,
@@ -3232,7 +3919,8 @@ async fn scenario_invalid_profile_rejected_before_spawn() {
     )
     .await
     .expect("initialize");
-    // Missing model, then missing explicit cmd: both fail before any spawn.
+    // Missing model, then missing explicit cmd, then an approval mode
+    // outside the closed vocabulary: all fail before any spawn.
     for profile in [
         json!({"harness": "muse"}),
         json!({
@@ -3242,6 +3930,11 @@ async fn scenario_invalid_profile_rejected_before_spawn() {
             "permissions": "workspace-write",
             "approval_policy": "never",
             "pass_env": [],
+        }),
+        json!({
+            "harness": "muse",
+            "model": MODEL,
+            "approval": "sometimes",
         }),
     ] {
         let start_id = ulid::Ulid::new().to_string();
@@ -3889,8 +4582,8 @@ async fn scenario_decide_internal_error_is_unknown_without_rewrite() {
 /// locally without a write, while a reply against the current offer applies
 /// with the current requirement. The update repeats the opened offer, so the
 /// first reply behaves identically whether the update has applied yet or not.
-async fn scenario_stale_choice_after_update_is_rejected() {
-    let mut scenario = Scenario::start("request-stale-choice", muse_profile()).await;
+async fn scenario_unknown_choice_is_rejected_without_write() {
+    let mut scenario = Scenario::start("request-unknown-choice", muse_profile()).await;
     let agent_id = scenario.agent_id.clone();
 
     let (_send_id, turn_id, committed) =
