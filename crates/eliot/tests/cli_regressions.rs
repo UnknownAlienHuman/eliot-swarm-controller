@@ -22,8 +22,8 @@ use eliot_core::{
     Turn as CoreTurn, TurnState,
 };
 use serde_json::{Value, json};
-use std::time::Duration;
-use std::{collections::HashSet, fs, path::Path, process::Command};
+use std::time::{Duration, Instant};
+use std::{collections::HashSet, fs, path::Path, process::Command, thread};
 use support::Captured;
 use support::{CLI, Fixture, cli, run};
 
@@ -13024,6 +13024,79 @@ fn cli_cmd_children_pages_a_retained_launch_expansion() {
 }
 
 #[test]
+fn cli_goal_crud_pause_and_native_unsupported() {
+    let mut fixture = Fixture::new("goal crud");
+    fixture.start();
+    let launched = fixture.json(&[
+        "launch",
+        "--profile",
+        "fake",
+        "--workspace",
+        fixture.workspace.to_str().unwrap(),
+    ]);
+    assert_eq!(launched["state"], "applied");
+    let agent = launched["target"].as_str().unwrap().to_owned();
+    // --check consumes the remaining arguments, so it goes last.
+    let set = fixture.json(&[
+        "goal",
+        "set",
+        &agent,
+        "--text",
+        "keep green",
+        "--max-turns",
+        "4",
+        "--check",
+        "check-goal",
+        "--strict",
+    ]);
+    assert_eq!(set["revision"], 1);
+    assert_eq!(set["status"], "active");
+    assert_eq!(
+        set["definition"]["check"],
+        json!(["check-goal", "--strict"])
+    );
+    assert_eq!(set["definition"]["max_turns"], 4);
+    assert_eq!(set["cost_status"], "unsupported (no usage source)");
+    let shown = fixture.json(&["goal", "show", &agent]);
+    assert_eq!(shown, set);
+    let paused = fixture.json(&["goal", "pause", &agent, "--reason", "waiting"]);
+    assert_eq!(paused["revision"], 2);
+    assert_eq!(paused["status"], "paused");
+    let resumed = fixture.json(&["goal", "resume", &agent]);
+    assert_eq!(resumed["revision"], 3);
+    assert_eq!(resumed["status"], "active");
+    let cleared = fixture.json(&["goal", "clear", &agent]);
+    assert_eq!(cleared["revision"], 4);
+    assert_eq!(cleared["status"], "cleared");
+    let native = cli(
+        &fixture.data,
+        &[
+            "goal",
+            "set",
+            &agent,
+            "--mode",
+            "native",
+            "--text",
+            "x",
+            "--check",
+            "check-goal",
+        ],
+    );
+    assert_eq!(native.status.code(), Some(3));
+    assert!(
+        native.stderr.contains("unsupported"),
+        "native goal must report unsupported: {}",
+        native.stderr.lines().next().unwrap_or("")
+    );
+    let stop = fixture.json(&["stop", &agent]);
+    fixture.wait_command(
+        stop["command_id"].as_str().expect("stop command"),
+        "applied",
+    );
+    fixture.stop(false);
+}
+
+#[test]
 fn cli_cmd_children_pages_a_multi_child_catch_up_and_reports_history_gap() {
     let mut fixture = Fixture::new("cmd children multi-page");
     fixture.start();
@@ -13197,5 +13270,89 @@ fn cli_cmd_children_pages_a_multi_child_catch_up_and_reports_history_gap() {
     for child_id in &child_ids {
         fixture.wait_command(child_id, "applied");
     }
+    fixture.stop(false);
+}
+
+#[test]
+fn cli_goal_round_completes_idle_fake_agent() {
+    let mut fixture = Fixture::new("goal round");
+    fixture.start();
+    let launched = fixture.json(&[
+        "launch",
+        "--profile",
+        "fake",
+        "--workspace",
+        fixture.workspace.to_str().unwrap(),
+    ]);
+    assert_eq!(launched["state"], "applied");
+    let agent = launched["target"].as_str().unwrap().to_owned();
+    let generation = launched["generation"].as_i64().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let ready = fixture.events().iter().any(|event| {
+            event["kind"] == "session.ready"
+                && event["agent"] == agent
+                && event["generation"] == generation
+        });
+        if ready {
+            break;
+        }
+        assert!(Instant::now() < deadline, "fake ready deadline");
+        thread::sleep(Duration::from_millis(50));
+    }
+    // The test binary itself is the portable exit-0 check.
+    let set = fixture.json(&[
+        "goal",
+        "set",
+        &agent,
+        "--text",
+        "keep green",
+        "--check",
+        CLI,
+        "--version",
+    ]);
+    assert_eq!(set["revision"], 1);
+    let mut outcome = None;
+    for _ in 0..5 {
+        let key = fixture
+            .events()
+            .iter()
+            .filter(|event| event["agent"] == agent && event["generation"] == generation)
+            .filter_map(|event| event["seq"].as_i64())
+            .max()
+            .unwrap_or(0);
+        let round = cli(
+            &fixture.data,
+            &["goal", "round", &agent, "--idle-seq", &key.to_string()],
+        );
+        if round.status.success() {
+            outcome = Some(round.json());
+            break;
+        }
+        assert_eq!(round.status.code(), Some(3));
+        assert!(
+            round.stderr.contains("stale_round"),
+            "round retry must be a stale key: {}",
+            round.stderr.lines().next().unwrap_or("")
+        );
+    }
+    let round = outcome.expect("round committed within bounded retries");
+    assert_eq!(round["outcome"], "completed");
+    let shown = fixture.json(&["goal", "show", &agent]);
+    assert_eq!(shown["status"], "completed");
+    assert_eq!(shown["counters"]["rounds"], 1);
+    assert_eq!(shown["counters"]["last_exit_code"], 0);
+    assert!(
+        shown["counters"]["last_observation"]
+            .as_str()
+            .unwrap_or("")
+            .contains("eliot"),
+        "completed round retains its check observation"
+    );
+    let stop = fixture.json(&["stop", &agent]);
+    fixture.wait_command(
+        stop["command_id"].as_str().expect("stop command"),
+        "applied",
+    );
     fixture.stop(false);
 }

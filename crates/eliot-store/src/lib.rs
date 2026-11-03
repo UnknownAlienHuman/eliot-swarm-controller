@@ -11,6 +11,10 @@ mod scripts;
 
 pub use capacity::{RecordedProcess, RetainedGeneration};
 pub use command_children::{CommandChildrenPage, command_history_expired};
+pub use goals::{
+    GoalCheckResult, GoalCommitOutcome, GoalContinuation, GoalRoundCommit, GoalRoundCommitResult,
+    GoalRoundProbe,
+};
 pub use projects::ProjectRegistrationInput;
 pub use resolution::TurnInactiveProof;
 pub use retention::RetentionReport;
@@ -84,6 +88,7 @@ macro_rules! db {
 mod admission;
 mod command_children;
 mod dispatch;
+mod goals;
 mod observer;
 mod observer_live;
 mod resolution;
@@ -6063,3 +6068,6 @@ mod git_fetch_tests;
 mod git_workspace_fence_tests;
 #[cfg(test)]
 mod resolution_tests;
+
+#[cfg(test)]
+mod goals_tests;

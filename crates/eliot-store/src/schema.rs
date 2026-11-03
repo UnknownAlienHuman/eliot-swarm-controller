@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 18;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 19;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -478,7 +478,7 @@ impl Store {
             db!(tx.execute("INSERT INTO schema_migrations(version) VALUES (17)", []));
             tx.commit().map_err(sql_error)?;
         }
-        if current < CURRENT_SCHEMA_VERSION {
+        if current < 18 {
             let tx = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -490,6 +490,28 @@ impl Store {
                  CREATE INDEX processes_owner_identity
                      ON processes(owner, host_boot_id, pid, start_time);
                  INSERT INTO schema_migrations(version) VALUES (18);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < CURRENT_SCHEMA_VERSION {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE TABLE goals (
+                     agent INTEGER NOT NULL,
+                     mode TEXT NOT NULL,
+                     generation INTEGER NOT NULL,
+                     revision INTEGER NOT NULL,
+                     definition TEXT NOT NULL,
+                     state TEXT NOT NULL,
+                     last_round_key TEXT,
+                     updated_at INTEGER NOT NULL,
+                     PRIMARY KEY(agent, mode)
+                 );
+                 INSERT INTO schema_migrations(version) VALUES (19);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

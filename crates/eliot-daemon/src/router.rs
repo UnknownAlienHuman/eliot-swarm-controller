@@ -1,4 +1,5 @@
 mod command;
+mod goals;
 mod resolution;
 
 use crate::{
@@ -234,6 +235,12 @@ impl Router {
             "timer.run" => self.timer_run(&params, &principal).await,
             "provider.holds" => self.provider_holds(&params, &principal).await,
             "provider.clear_hold" => self.provider_clear_hold(&params, &principal).await,
+            "goal.set" => self.goal_set(&params, &principal).await,
+            "goal.get" => self.goal_get(&params, &principal).await,
+            "goal.pause" => self.goal_pause(&params, &principal).await,
+            "goal.clear" => self.goal_clear(&params, &principal).await,
+            "goal.resume" => self.goal_resume(&params, &principal).await,
+            "goal.round" => self.goal_round(&params, &principal).await,
             _ => Err(Error::new(
                 "unsupported",
                 format!("daemon method {method} is not implemented"),

@@ -6211,11 +6211,12 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
              DROP INDEX processes_owner_identity;
              CREATE INDEX commands_open ON commands(state)
                  WHERE state IN ('accepted', 'queued', 'dispatched', 'unknown');
-             DELETE FROM schema_migrations WHERE version = 18;",
+             DELETE FROM schema_migrations WHERE version = 18;
+             DROP TABLE goals; DELETE FROM schema_migrations WHERE version = 19;",
         )
         .expect("roll back to schema 16");
     drop(store);
-    let mut store = Store::open(&path).expect("migrate 16 to 18");
+    let mut store = Store::open(&path).expect("migrate 16 to 19");
     store.recover_on_restart(now + 2).expect("recover");
     let retained = store
         .restart_retained_generations(None)

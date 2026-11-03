@@ -8,14 +8,16 @@ use eliot_core::{
         AgentListResponse, AgentProcessesRequest, AgentProcessesResponse, AgentResultRequest,
         AgentResultResponse, AgentStatsRequest, AgentStatsResponse, CommandChildrenRequest,
         CommandChildrenResponse, CommandGetRequest, CommandResolution, CommandResolveRequest,
-        CommandResolveResponse, CommandSubmitResponse, DaemonShutdownRequest,
-        DaemonShutdownResponse, DaemonStatusRequest, DaemonStatusResponse, DiscoverPage,
-        EventsFilter, EventsReadRequest, EventsReadResponse, EventsSubscribeRequest,
-        EventsSubscribeResponse, ObservationPage, ProjectRegistrationView,
-        ProviderClearHoldRequest, ProviderClearHoldResponse, ProviderCorrectiveEvidence,
-        ProviderHoldsRequest, ProviderHoldsResponse, RuleCatchUpRequest, RuleGetRequest,
-        RuleStateView, ShutdownMode, TimerGetRequest, TimerRunRequest, TimerStateView,
-        TurnGetRequest, TurnResolveRequest, TurnResolveResponse, TurnResolveStatus,
+        CommandResolveResponse, CommandSubmitResponse, DEFAULT_GOAL_CHECK_TIMEOUT_MS,
+        DaemonShutdownRequest, DaemonShutdownResponse, DaemonStatusRequest, DaemonStatusResponse,
+        DiscoverPage, EventsFilter, EventsReadRequest, EventsReadResponse, EventsSubscribeRequest,
+        EventsSubscribeResponse, GoalClearRequest, GoalDefinition, GoalGetRequest, GoalMode,
+        GoalPauseRequest, GoalResumeRequest, GoalRoundRequest, GoalRoundResponse, GoalSetRequest,
+        GoalView, ObservationPage, ProjectRegistrationView, ProviderClearHoldRequest,
+        ProviderClearHoldResponse, ProviderCorrectiveEvidence, ProviderHoldsRequest,
+        ProviderHoldsResponse, RuleCatchUpRequest, RuleGetRequest, RuleStateView, ShutdownMode,
+        TimerGetRequest, TimerRunRequest, TimerStateView, TurnGetRequest, TurnResolveRequest,
+        TurnResolveResponse, TurnResolveStatus,
     },
 };
 use serde_json::{Value, json};
@@ -104,6 +106,11 @@ enum CliCommand {
     Timer {
         #[command(subcommand)]
         command: TimerCommand,
+    },
+    /// Set, read or drive one Agent's Eliot-mode Goal.
+    Goal {
+        #[command(subcommand)]
+        command: GoalCommand,
     },
     /// Discover one page of native sessions through an explicit profile.
     Discover {
@@ -475,6 +482,71 @@ enum TimerCommand {
 }
 
 #[derive(Subcommand)]
+enum GoalCommand {
+    /// Set (or replace) the Agent's Eliot-mode Goal with an explicit check command.
+    Set {
+        #[arg(value_name = "AGENT")]
+        agent: String,
+        #[arg(long, value_parser = ["eliot", "native"], default_value = "eliot")]
+        mode: String,
+        #[arg(long, value_name = "TEXT")]
+        text: String,
+        /// Explicit check argv; pass last since it consumes the remaining arguments.
+        #[arg(long, num_args = 1.., allow_hyphen_values = true, value_name = "ARG")]
+        check: Vec<String>,
+        #[arg(long, value_name = "PATH")]
+        check_cwd: Option<String>,
+        #[arg(long, value_name = "MS")]
+        check_timeout_ms: Option<i64>,
+        #[arg(long, value_name = "N")]
+        max_turns: Option<i64>,
+        #[arg(long, value_name = "N")]
+        max_rounds: Option<i64>,
+        #[arg(long, value_name = "N")]
+        max_without_progress: Option<i64>,
+    },
+    /// Show the Goal definition, counters, budgets and limits.
+    Show {
+        #[arg(value_name = "AGENT")]
+        agent: String,
+        #[arg(long, value_parser = ["eliot", "native"], default_value = "eliot")]
+        mode: String,
+    },
+    /// Pause the Goal; a paused Goal takes no rounds.
+    Pause {
+        #[arg(value_name = "AGENT")]
+        agent: String,
+        #[arg(long, value_parser = ["eliot", "native"], default_value = "eliot")]
+        mode: String,
+        #[arg(long, value_name = "REASON")]
+        reason: Option<String>,
+    },
+    /// Clear the Goal; only `set` revives a cleared Goal.
+    Clear {
+        #[arg(value_name = "AGENT")]
+        agent: String,
+        #[arg(long, value_parser = ["eliot", "native"], default_value = "eliot")]
+        mode: String,
+    },
+    /// Resume a paused Goal on its bound generation.
+    Resume {
+        #[arg(value_name = "AGENT")]
+        agent: String,
+        #[arg(long, value_parser = ["eliot", "native"], default_value = "eliot")]
+        mode: String,
+    },
+    /// Run one round keyed by the exact idle event seq.
+    Round {
+        #[arg(value_name = "AGENT")]
+        agent: String,
+        #[arg(long, value_parser = ["eliot", "native"], default_value = "eliot")]
+        mode: String,
+        #[arg(long, value_name = "SEQ", value_parser = clap::value_parser!(i64).range(0..))]
+        idle_seq: i64,
+    },
+}
+
+#[derive(Subcommand)]
 enum ProjectCommand {
     /// List owner-registered projects and their authority bounds.
     List,
@@ -525,6 +597,7 @@ impl Failure {
                 | "not_allowed"
                 | "bad_state"
                 | "stale_generation"
+                | "stale_round"
                 | "invalid"
                 | "unsupported"
                 | "not_found"
@@ -859,6 +932,146 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 let value = command_value(response)?;
                 print_value(&value, json_output);
                 Ok(exit_code)
+            }
+        },
+        CliCommand::Goal { command } => match command {
+            GoalCommand::Set {
+                agent,
+                mode,
+                text,
+                check,
+                check_cwd,
+                check_timeout_ms,
+                max_turns,
+                max_rounds,
+                max_without_progress,
+            } => {
+                let request = GoalSetRequest {
+                    agent,
+                    mode: goal_mode(&mode)?,
+                    definition: GoalDefinition {
+                        text,
+                        check,
+                        check_cwd,
+                        check_timeout_ms: check_timeout_ms.unwrap_or(DEFAULT_GOAL_CHECK_TIMEOUT_MS),
+                        max_turns,
+                        max_rounds,
+                        max_without_progress,
+                    },
+                    max_cost: None,
+                };
+                request
+                    .validate()
+                    .map_err(|error| Failure::from_core(error, true))?;
+                let response: GoalView =
+                    eliot_daemon::client_call_typed(&data_dir, "goal.set", &request)
+                        .await
+                        .map_err(|error| Failure::from_core(error, true))?;
+                request
+                    .validate_response(&response)
+                    .map_err(|error| Failure::from_core(error, true))?;
+                let value = serde_json::to_value(response)
+                    .map_err(|_| Failure::new(4, "goal.set response is invalid"))?;
+                print_value(&value, json_output);
+                Ok(0)
+            }
+            GoalCommand::Show { agent, mode } => {
+                let request = GoalGetRequest {
+                    agent,
+                    mode: goal_mode(&mode)?,
+                };
+                read_and_print!("goal.get", request, GoalView)
+            }
+            GoalCommand::Pause {
+                agent,
+                mode,
+                reason,
+            } => {
+                let request = GoalPauseRequest {
+                    agent,
+                    mode: goal_mode(&mode)?,
+                    reason,
+                };
+                request
+                    .validate()
+                    .map_err(|error| Failure::from_core(error, true))?;
+                let response: GoalView =
+                    eliot_daemon::client_call_typed(&data_dir, "goal.pause", &request)
+                        .await
+                        .map_err(|error| Failure::from_core(error, true))?;
+                request
+                    .validate_response(&response)
+                    .map_err(|error| Failure::from_core(error, true))?;
+                let value = serde_json::to_value(response)
+                    .map_err(|_| Failure::new(4, "goal.pause response is invalid"))?;
+                print_value(&value, json_output);
+                Ok(0)
+            }
+            GoalCommand::Clear { agent, mode } => {
+                let request = GoalClearRequest {
+                    agent,
+                    mode: goal_mode(&mode)?,
+                };
+                request
+                    .validate()
+                    .map_err(|error| Failure::from_core(error, true))?;
+                let response: GoalView =
+                    eliot_daemon::client_call_typed(&data_dir, "goal.clear", &request)
+                        .await
+                        .map_err(|error| Failure::from_core(error, true))?;
+                request
+                    .validate_response(&response)
+                    .map_err(|error| Failure::from_core(error, true))?;
+                let value = serde_json::to_value(response)
+                    .map_err(|_| Failure::new(4, "goal.clear response is invalid"))?;
+                print_value(&value, json_output);
+                Ok(0)
+            }
+            GoalCommand::Resume { agent, mode } => {
+                let request = GoalResumeRequest {
+                    agent,
+                    mode: goal_mode(&mode)?,
+                };
+                request
+                    .validate()
+                    .map_err(|error| Failure::from_core(error, true))?;
+                let response: GoalView =
+                    eliot_daemon::client_call_typed(&data_dir, "goal.resume", &request)
+                        .await
+                        .map_err(|error| Failure::from_core(error, true))?;
+                request
+                    .validate_response(&response)
+                    .map_err(|error| Failure::from_core(error, true))?;
+                let value = serde_json::to_value(response)
+                    .map_err(|_| Failure::new(4, "goal.resume response is invalid"))?;
+                print_value(&value, json_output);
+                Ok(0)
+            }
+            GoalCommand::Round {
+                agent,
+                mode,
+                idle_seq,
+            } => {
+                let request = GoalRoundRequest {
+                    id: mutation_id(id)?,
+                    agent,
+                    mode: goal_mode(&mode)?,
+                    idle_seq,
+                };
+                request
+                    .validate()
+                    .map_err(|error| Failure::from_core(error, true))?;
+                let response: GoalRoundResponse =
+                    eliot_daemon::client_call_typed(&data_dir, "goal.round", &request)
+                        .await
+                        .map_err(|error| Failure::from_core(error, true))?;
+                request
+                    .validate_response(&response)
+                    .map_err(|error| Failure::from_core(error, true))?;
+                let value = serde_json::to_value(response)
+                    .map_err(|_| Failure::new(4, "goal.round response is invalid"))?;
+                print_value(&value, json_output);
+                Ok(0)
             }
         },
         CliCommand::Discover {
@@ -1419,6 +1632,10 @@ fn start_daemon(data_dir: &Path, json_output: bool) -> Result<(), Failure> {
         println!("daemon starting; diagnostics: {}", log_path.display());
     }
     Ok(())
+}
+
+fn goal_mode(mode: &str) -> Result<GoalMode, Failure> {
+    GoalMode::parse(mode).map_err(|_| Failure::new(2, "--mode must be eliot or native"))
 }
 
 fn mutation_id(supplied_id: Option<String>) -> Result<String, Failure> {
