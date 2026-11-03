@@ -11,19 +11,25 @@ use super::windows::ProcessObserver as PlatformObserver;
 /// Bounds observations, not the number of processes an owner may launch.
 pub(crate) const MAX_PROCESS_SAMPLES: usize = 1024;
 
-/// One host process captured by a shared sampling-sweep enumeration. The
-/// sweep producer owns the single bounded scan; per-owner grouping below is
-/// pure so its capping behavior is unit-testable on every platform.
+/// Parsed `/proc/<pid>/stat` identity and counters for one host process.
+/// Pure data, so sweep grouping stays unit-testable on every platform; only
+/// the `/proc` reader itself is Linux-only.
 #[cfg(any(target_os = "linux", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct SweepEntry {
-    pub pid: u32,
+pub(crate) struct LinuxProcessStat {
     pub pgid: i32,
     pub start_ticks: u64,
     pub state: ProcessState,
     pub cpu_time_ns: Option<u64>,
     pub rss_bytes: Option<u64>,
 }
+
+/// One host process captured by a shared sampling-sweep enumeration: its pid
+/// next to its parsed stat record. The sweep producer owns the single bounded
+/// scan; per-owner grouping below is pure so its capping behavior is
+/// unit-testable on every platform.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) type SweepEntry = (u32, LinuxProcessStat);
 
 /// Select one owner's members from a single shared enumeration, in
 /// enumeration order: skip other groups and the group root, then stop at the
@@ -39,7 +45,7 @@ pub(crate) fn select_sweep_members(
 ) -> (Vec<SweepEntry>, bool) {
     let mut members = Vec::new();
     for entry in entries {
-        if entry.pid == root_pid || entry.pgid != group {
+        if entry.0 == root_pid || entry.1.pgid != group {
             continue;
         }
         if members.len() >= capacity {
@@ -298,59 +304,45 @@ mod sweep_tests {
     use super::*;
 
     fn entry(pid: u32, pgid: i32) -> SweepEntry {
-        SweepEntry {
+        (
             pid,
-            pgid,
-            start_ticks: u64::from(pid) * 100,
-            state: ProcessState::Running,
-            cpu_time_ns: Some(u64::from(pid)),
-            rss_bytes: None,
-        }
+            LinuxProcessStat {
+                pgid,
+                start_ticks: u64::from(pid) * 100,
+                state: ProcessState::Running,
+                cpu_time_ns: Some(u64::from(pid)),
+                rss_bytes: None,
+            },
+        )
     }
 
-    /// One host enumeration serves every owner in a sweep: the enumeration
-    /// count per sweep is exactly one regardless of group count.
-    struct FakeSweep {
-        enumerations: usize,
-        entries: Vec<SweepEntry>,
-    }
-
-    impl FakeSweep {
-        fn enumerate(&mut self) -> Vec<SweepEntry> {
-            self.enumerations += 1;
-            self.entries.clone()
-        }
-    }
-
+    /// One shared host enumeration serves every owner in a sweep. Grouping is
+    /// pure and tested here; the enumeration count itself is asserted against
+    /// the real enumerator by the Linux sweep tests.
     #[test]
-    fn one_enumeration_serves_every_group_with_per_owner_caps() {
-        let mut sweep = FakeSweep {
-            enumerations: 0,
-            entries: vec![
-                entry(10, 10), // group A root
-                entry(11, 10),
-                entry(12, 10),
-                entry(20, 20), // group B root
-                entry(21, 20),
-                entry(22, 20),
-                entry(23, 20),
-                entry(30, 30), // unrelated group root
-            ],
-        };
-        let entries = sweep.enumerate();
+    fn shared_entries_serve_every_group_with_per_owner_caps() {
+        let entries = vec![
+            entry(10, 10), // group A root
+            entry(11, 10),
+            entry(12, 10),
+            entry(20, 20), // group B root
+            entry(21, 20),
+            entry(22, 20),
+            entry(23, 20),
+            entry(30, 30), // unrelated group root
+        ];
         let (group_a, a_complete) = select_sweep_members(&entries, 10, 10, MAX_PROCESS_SAMPLES);
         let (group_b, b_complete) = select_sweep_members(&entries, 20, 20, 2);
         let (group_c, c_complete) = select_sweep_members(&entries, 30, 30, MAX_PROCESS_SAMPLES);
-        assert_eq!(sweep.enumerations, 1, "one enumeration per sweep");
-        assert_eq!(entries.len(), 8, "eight host entries enumerated once");
+        assert_eq!(entries.len(), 8, "eight host entries shared by the sweep");
         assert_eq!(
-            group_a.iter().map(|entry| entry.pid).collect::<Vec<_>>(),
+            group_a.iter().map(|entry| entry.0).collect::<Vec<_>>(),
             vec![11, 12]
         );
         assert!(a_complete);
         // The per-owner member cap truncates only that owner, in order.
         assert_eq!(
-            group_b.iter().map(|entry| entry.pid).collect::<Vec<_>>(),
+            group_b.iter().map(|entry| entry.0).collect::<Vec<_>>(),
             vec![21, 22]
         );
         assert!(!b_complete);
@@ -358,9 +350,9 @@ mod sweep_tests {
         assert!(group_c.is_empty());
         assert!(c_complete);
         // Full identities survive grouping.
-        assert_eq!(group_a[0].start_ticks, 1_100);
-        assert_eq!(group_a[0].cpu_time_ns, Some(11));
-        assert_eq!(group_a[0].state, ProcessState::Running);
+        assert_eq!(group_a[0].1.start_ticks, 1_100);
+        assert_eq!(group_a[0].1.cpu_time_ns, Some(11));
+        assert_eq!(group_a[0].1.state, ProcessState::Running);
     }
 
     #[test]
