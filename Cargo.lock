@@ -489,13 +489,11 @@ dependencies = [
 name = "eliot-plugin-muse"
 version = "0.2.0-dev"
 dependencies = [
- "chrono",
  "eliot-core",
  "eliot-plugin",
  "futures-util",
  "serde",
  "serde_json",
- "sha2",
  "tokio",
  "tokio-util",
  "ulid",

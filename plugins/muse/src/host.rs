@@ -522,7 +522,7 @@ impl MusePlugin {
                     "Muse session/setReasoningEffort params could not be encoded",
                 )
             })?;
-            let effort_response = session
+            let effort_response = match session
                 .native_client
                 .call(
                     "session/setReasoningEffort",
@@ -530,20 +530,48 @@ impl MusePlugin {
                     Instant::now() + RPC_TIMEOUT,
                 )
                 .await
-                .map_err(|error| {
-                    contextual_error(
-                        error,
-                        "profile_error",
-                        "Muse session/setReasoningEffort did not admit the profile effort",
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    let error = discard_failed_start(
+                        &mut session,
+                        contextual_error(
+                            error,
+                            "profile_error",
+                            "Muse session/setReasoningEffort did not admit the profile effort",
+                        ),
                     )
-                })?;
+                    .await;
+                    self.failed_start = Some(FailedStart {
+                        agent_id: params.agent_id,
+                        generation: params.generation,
+                        command_id: params.command_id,
+                        error: error.clone(),
+                    });
+                    return Err(error);
+                }
+            };
             let effort_ack: NativeSessionSetReasoningEffortResult =
-                serde_json::from_value(effort_response).map_err(|_| {
-                    Error::new(
-                        "profile_error",
-                        "Muse session/setReasoningEffort ack did not match the 1.4 schema",
-                    )
-                })?;
+                match serde_json::from_value(effort_response) {
+                    Ok(ack) => ack,
+                    Err(_) => {
+                        let error = discard_failed_start(
+                            &mut session,
+                            Error::new(
+                                "profile_error",
+                                "Muse session/setReasoningEffort ack did not match the 1.4 schema",
+                            ),
+                        )
+                        .await;
+                        self.failed_start = Some(FailedStart {
+                            agent_id: params.agent_id,
+                            generation: params.generation,
+                            command_id: params.command_id,
+                            error: error.clone(),
+                        });
+                        return Err(error);
+                    }
+                };
             if effort_ack.command_id != effort_command || effort_ack.status != "accepted" {
                 let error = discard_failed_start(
                     &mut session,
@@ -1248,9 +1276,9 @@ async fn read_owned_turn(
                 .await?,
         )
         .map_err(|_| Error::new("native_readback", "Muse view/page response was invalid"))?;
-        for event in response.events {
+        for event in response.events.iter().rev() {
             observe_view_event(
-                &event,
+                event,
                 session_id,
                 turn_id,
                 &policy,

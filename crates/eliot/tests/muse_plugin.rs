@@ -38,6 +38,8 @@ fn main() {
     runtime.block_on(async {
         scenario_launch_send_snapshot_stop().await;
         println!("ok - launch/send/snapshot/stop");
+        scenario_two_agent_messages_snapshot_matches_stream().await;
+        println!("ok - two agentMessages: snapshot matches the stream fold");
         scenario_failed_turn_reports_restriction().await;
         println!("ok - failed turn reports its restriction");
         scenario_lost_reply_is_unknown_without_rewrite().await;
@@ -221,6 +223,28 @@ impl FakeMsp {
                         "viewCursor": cursor,
                     }),
                 );
+                if self.script == "two-messages" {
+                    // A routine multi-message turn: the stream fold keeps the
+                    // LAST agentMessage, and the snapshot readback must agree.
+                    let cursor = self.next_cursor();
+                    self.emit(
+                        stdout,
+                        "item/completed",
+                        json!({
+                            "item": {
+                                "itemId": format!("fake-item-{}-2", command),
+                                "kind": "agentMessage",
+                                "revision": 2,
+                                "status": "completed",
+                                "text": "Second reply from the fake MSP host.",
+                                "turnId": command,
+                            },
+                            "sessionId": session_id,
+                            "sourceRange": Self::source_range(),
+                            "viewCursor": cursor,
+                        }),
+                    );
+                }
                 let cursor = self.next_cursor();
                 if self.script == "failed-turn" {
                     self.emit(
@@ -965,6 +989,117 @@ async fn send_turn(
     (send_id, turn_id, committed)
 }
 
+/// Like `send_turn`, but the turn may commit any number of `message.completed`
+/// batches (routine once tools are involved) before `turn.completed`.
+async fn send_multi_message_turn(
+    host: &mut Host,
+    agent_id: &str,
+    text: &str,
+) -> (String, String, Vec<(String, Value)>) {
+    let send_id = ulid::Ulid::new().to_string();
+    let rx = host
+        .begin_call(
+            "agent.command",
+            json!({
+                "agent_id": agent_id,
+                "generation": 1,
+                "command_id": send_id,
+                "verb": "send",
+                "args": {"text": text},
+                "turn_id": null,
+                "request_id": null,
+            }),
+        )
+        .await;
+    let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
+    let mut committed: Vec<(String, Value)> = Vec::new();
+    let applied = loop {
+        tokio::select! {
+            biased;
+            request = host.next_request() => {
+                assert_eq!(request.method, "events.put");
+                let events = request.params.get("events").and_then(Value::as_array).cloned().unwrap_or_default();
+                assert_eq!(events.len(), 1, "one native record per batch");
+                committed.push((
+                    events[0].get("kind").and_then(Value::as_str).unwrap_or_default().to_owned(),
+                    events[0].get("data").cloned().unwrap_or(Value::Null),
+                ));
+                let first = host.next_seq;
+                host.next_seq += 1;
+                host.respond(&request.id, json!({
+                    "first_seq": first, "last_seq": first,
+                    "cursor": request.params.get("cursor").cloned().unwrap_or(Value::Null),
+                })).await;
+            }
+            result = &mut rx => break result,
+        }
+    };
+    let applied = applied
+        .expect("send deadline")
+        .expect("send response channel")
+        .expect("send applied");
+    assert_eq!(
+        applied.get("state").and_then(Value::as_str),
+        Some("applied")
+    );
+    let turn_id = applied
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .expect("applied turn id")
+        .to_owned();
+    assert!(!turn_id.is_empty());
+    // Drain every message fact in commit order; only `turn.completed` ends it.
+    assert_eq!(
+        committed.first().map(|(kind, _)| kind.as_str()),
+        Some("turn.started")
+    );
+    while committed.last().map(|(kind, _)| kind.as_str()) != Some("turn.completed") {
+        let request = host.next_request().await;
+        assert_eq!(request.method, "events.put");
+        let events = request
+            .params
+            .get("events")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(events.len(), 1, "one native record per batch");
+        let kind = events[0]
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            kind == "message.completed" || kind == "turn.completed",
+            "turn facts out of order after {:?}",
+            committed.last().map(|(kind, _)| kind.as_str())
+        );
+        let first = host.next_seq;
+        host.next_seq += 1;
+        host.respond(
+            &request.id,
+            json!({
+                "first_seq": first, "last_seq": first,
+                "cursor": request.params.get("cursor").cloned().unwrap_or(Value::Null),
+            }),
+        )
+        .await;
+        committed.push((kind, events[0].get("data").cloned().unwrap_or(Value::Null)));
+    }
+    for (kind, data) in &committed {
+        assert_eq!(
+            data.get("turn_id").and_then(Value::as_str),
+            Some(turn_id.as_str()),
+            "turn binding of {kind}"
+        );
+        assert_eq!(
+            data.get("command_id").and_then(Value::as_str),
+            Some(send_id.as_str()),
+            "command binding of {kind}"
+        );
+    }
+    (send_id, turn_id, committed)
+}
+
 /// One stop round trip with the same in-flight acknowledgement. Returns the
 /// committed `(kind, data)` batches; gaps are acknowledged and recorded too.
 async fn stop_agent(host: &mut Host, agent_id: &str, force: bool) -> Vec<(String, Value)> {
@@ -1125,6 +1260,90 @@ async fn scenario_launch_send_snapshot_stop() {
     let report = scenario.report();
     assert_eq!(report["session_starts"], json!(1));
     assert_eq!(report["turn_starts"], json!(2));
+    let _ = std::fs::remove_dir_all(&scenario.root);
+}
+
+async fn scenario_two_agent_messages_snapshot_matches_stream() {
+    let mut scenario = Scenario::start("two-messages", muse_profile()).await;
+    let agent_id = scenario.agent_id.clone();
+
+    let (send_id, turn_id, committed) =
+        send_multi_message_turn(&mut scenario.host, &agent_id, "Say it twice.").await;
+    assert_eq!(
+        committed
+            .iter()
+            .map(|(kind, _)| kind.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "turn.started",
+            "message.completed",
+            "message.completed",
+            "turn.completed"
+        ]
+    );
+    assert_eq!(
+        committed[1].1.get("text").and_then(Value::as_str),
+        Some("Hello from the fake MSP host.")
+    );
+    assert_eq!(
+        committed[2].1.get("text").and_then(Value::as_str),
+        Some("Second reply from the fake MSP host.")
+    );
+    // The stream fold keeps the LAST agentMessage ...
+    assert_eq!(
+        committed[3].1.get("status").and_then(Value::as_str),
+        Some("completed")
+    );
+    assert_eq!(
+        committed[3].1.get("final_text").and_then(Value::as_str),
+        Some("Second reply from the fake MSP host.")
+    );
+
+    // ... and the snapshot readback over the durable view must agree with it.
+    let snapshot = scenario
+        .host
+        .call(
+            "agent.snapshot",
+            json!({
+                "agent_id": agent_id,
+                "generation": 1,
+                "command_id": send_id,
+                "turn_id": Value::Null,
+            }),
+        )
+        .await
+        .expect("snapshot");
+    assert_eq!(snapshot.get("state").and_then(Value::as_str), Some("idle"));
+    assert_eq!(
+        snapshot["last_turn"].get("turn_id").and_then(Value::as_str),
+        Some(turn_id.as_str())
+    );
+    assert_eq!(
+        snapshot["last_turn"]
+            .get("terminal")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        snapshot["last_turn"]
+            .get("final_text")
+            .and_then(Value::as_str),
+        Some("Second reply from the fake MSP host.")
+    );
+    assert_eq!(
+        snapshot.get("result_known").and_then(Value::as_bool),
+        Some(true)
+    );
+
+    stop_agent(&mut scenario.host, &agent_id, false).await;
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    let stderr = scenario.host.shutdown_child().await;
+    assert!(!stderr.contains("panicked"), "plugin stderr: {stderr}");
+    assert_eq!(scenario.report()["turn_starts"], json!(1));
     let _ = std::fs::remove_dir_all(&scenario.root);
 }
 
