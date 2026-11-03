@@ -43,6 +43,22 @@ resolution cannot be overwritten by stale snapshot data. This is an in-memory ra
 not another persisted Agent epoch. `notLoaded` alone does not prove session closure.
 Parent completion does not complete children; aggregate usage must be marked explicitly.
 
+Native requests open durably bound to the exact session, turn and native request id
+with the offered choices or questions (child approvals keep their subagent origin as
+provenance); the transport receipt acknowledges presentation only and the
+decision travels as `approval/decide`, `userInput/answer` or `userInput/cancel`
+with the exact ids, an offered choice, and the current requirement. Replies decide
+from the current offer, never the opened snapshot: a stale choice is rejected, a
+consumed multi-stage reply resets on `approval/updated`, and only
+schema-documented pre-admission/validation errors prove rejection (anything else is
+unknown, never resubmitted). Approve and deny take an optional `choice_id` and
+optional `feedback` where the choice accepts it; answer takes `answers` mapping
+every offered question id to exactly one of `selected_label`, `selected_labels`
+or `free_text` plus an optional `note`. Resume pulls `approval/listPending` once
+for its pointer set and opens only what still binds to the live turn; anything
+naming the dead generation's turn is receipted and dropped as an orphan, never
+answered, and a failed pull never fails the resume.
+
 ## Route and final checks
 
 Do not assume a generic base-URL override. Use explicit native account/billing profiles

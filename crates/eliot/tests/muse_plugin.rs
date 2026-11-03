@@ -62,8 +62,20 @@ fn main() {
         println!("ok - resume of a gone session is an explicit error");
         scenario_lost_resume_reply_is_unknown_with_one_write().await;
         println!("ok - lost resume reply is unknown with exactly one write");
-        scenario_resume_with_pending_requests_is_refused().await;
-        println!("ok - resume with pending requests is refused");
+        scenario_resume_with_pending_requests_adopts_and_proceeds().await;
+        println!("ok - resume with pending requests adopts and proceeds");
+        scenario_approve_resolves_the_exact_offered_choice().await;
+        println!("ok - approve resolves the exact offered choice");
+        scenario_answer_and_deny_settle_prompts().await;
+        println!("ok - answer and deny settle prompts");
+        scenario_decide_internal_error_is_unknown_without_rewrite().await;
+        println!("ok - decide internal error is unknown without rewrite");
+        scenario_stale_choice_after_update_is_rejected().await;
+        println!("ok - stale choice after update is rejected");
+        scenario_multistage_approval_decides_each_stage().await;
+        println!("ok - multistage approval decides each stage");
+        scenario_unknown_native_request_is_rejected_with_a_gap().await;
+        println!("ok - unknown native request is rejected with a gap");
         scenario_resume_rejects_stale_generation_1_output().await;
         println!("ok - resume rejects stale generation-1 output");
         scenario_resume_refuses_served_history_and_keeps_the_retained_id().await;
@@ -91,6 +103,12 @@ struct FakeMsp {
     cursor_seq: u64,
     view_log: Vec<(String, String, Value)>,
     counts: HashMap<String, u64>,
+    next_server_id: u64,
+    receipts: u64,
+    approval_stage: i64,
+    prompts_opened: u64,
+    prompts_settled: u64,
+    last_turn: Option<String>,
 }
 
 fn fake_msp_main(script: &str) {
@@ -106,6 +124,12 @@ fn fake_msp_main(script: &str) {
         cursor_seq: 0,
         view_log: Vec::new(),
         counts: HashMap::new(),
+        next_server_id: 0,
+        receipts: 0,
+        approval_stage: 1,
+        prompts_opened: 0,
+        prompts_settled: 0,
+        last_turn: None,
     };
     if matches!(
         fake.script.as_str(),
@@ -139,6 +163,16 @@ impl FakeMsp {
             self.write_report();
             if frame.get("id").is_none() {
                 continue; // Notification (`initialized`); no reply.
+            }
+            if frame.get("method").is_none() {
+                // Client response to a server-initiated request (a
+                // presentation receipt or a typed rejection): record it, no
+                // reply.
+                if frame.get("result").is_some() || frame.get("error").is_some() {
+                    self.receipts += 1;
+                    self.write_report();
+                }
+                continue;
             }
             if !self.handle_call(&frame, &mut stdout) {
                 return;
@@ -207,7 +241,18 @@ impl FakeMsp {
             .unwrap_or_default();
         let params = frame.get("params").cloned().unwrap_or(Value::Null);
         match method {
-            "initialize" => self.reply(stdout, &id, self.initialize_result()),
+            "initialize" => {
+                // A1 answers userInput/request through Eliot's answer/deny
+                // verbs, so the client must declare the capable posture.
+                assert_eq!(
+                    params
+                        .get("capabilities")
+                        .and_then(|capabilities| capabilities.get("userInputDialogs")),
+                    Some(&Value::Bool(true)),
+                    "client declares user-input dialogs"
+                );
+                self.reply(stdout, &id, self.initialize_result())
+            }
             "model/list" => self.reply(stdout, &id, self.model_list_result()),
             "session/start" => {
                 let session_id = format!("fake-session-{}", self.counts["session/start"]);
@@ -311,11 +356,18 @@ impl FakeMsp {
                 let workspace = std::env::var("ELIOT_FAKE_MSP_WORKSPACE").unwrap_or_default();
                 let session = self.session_object(requested, "idle", None, MODEL, &workspace);
                 let pending = if self.script == "resume-pending" {
-                    json!([{
-                        "kind": "approval",
-                        "approvalId": "fake-approval-1",
-                        "viewCursor": self.head_cursor(),
-                    }])
+                    json!([
+                        {
+                            "kind": "approval",
+                            "approvalId": "fake-approval-1",
+                            "viewCursor": self.head_cursor(),
+                        },
+                        {
+                            "kind": "userInput",
+                            "userInputId": "fake-prompt-1",
+                            "viewCursor": self.head_cursor(),
+                        },
+                    ])
                 } else {
                     json!([])
                 };
@@ -349,6 +401,25 @@ impl FakeMsp {
                     }),
                 );
                 self.emit(stdout, "session/started", json!({"session": session}));
+                if self.script == "resume-pending" {
+                    // SS5.6: the full payloads arrive as re-issued
+                    // server-to-client requests right after the resume
+                    // response. Both name the retained (dead) turn, so the
+                    // new generation receipts and drops them as orphans.
+                    let approval = self.approval_request_params(
+                        RETAINED_SESSION,
+                        RETAINED_TURN,
+                        "fake-approval-1",
+                        1,
+                    );
+                    self.emit_request(stdout, "approval/request", approval);
+                    let prompt = self.user_input_request_params(
+                        RETAINED_SESSION,
+                        RETAINED_TURN,
+                        "fake-prompt-1",
+                    );
+                    self.emit_request(stdout, "userInput/request", prompt);
+                }
             }
             "turn/start" => {
                 if self.script == "drop-turn-start" {
@@ -405,6 +476,7 @@ impl FakeMsp {
                 let session_id = self.session_id.clone().unwrap_or_default();
                 self.turn_active = true;
                 self.turn_count += 1;
+                self.last_turn = Some(command.clone());
                 self.reply(
                     stdout,
                     &id,
@@ -444,6 +516,66 @@ impl FakeMsp {
                         "viewCursor": cursor,
                     }),
                 );
+                if self.script == "request-unknown-method" {
+                    // A request family this slice cannot present: the plugin
+                    // rejects it with a typed error and gaps the source while
+                    // the turn itself still completes.
+                    self.emit_request(stdout, "zzz/unknown", json!({"turnId": command}));
+                }
+                if matches!(
+                    self.script.as_str(),
+                    "request-approval"
+                        | "request-prompt"
+                        | "request-stale-choice"
+                        | "request-multistage"
+                        | "decide-internal-error"
+                ) {
+                    // Parked turn: the request opens now and the completion
+                    // lands only after the scenario answers it.
+                    self.approval_stage = 1;
+                    match self.script.as_str() {
+                        "request-prompt" => {
+                            let first = self.user_input_request_params(
+                                &session_id,
+                                &command,
+                                "fake-prompt-1",
+                            );
+                            self.emit_request(stdout, "userInput/request", first);
+                            let second = self.user_input_request_params(
+                                &session_id,
+                                &command,
+                                "fake-prompt-2",
+                            );
+                            self.emit_request(stdout, "userInput/request", second);
+                            self.prompts_opened = 2;
+                        }
+                        "request-stale-choice" => {
+                            let open = self.approval_request_params(
+                                &session_id,
+                                &command,
+                                "fake-approval-1",
+                                1,
+                            );
+                            self.emit_request(stdout, "approval/request", open);
+                            // The offer advances before any reply: stage-1
+                            // choice ids go stale.
+                            self.approval_stage = 2;
+                            let updated =
+                                self.approval_updated_params(&session_id, "fake-approval-1", 2);
+                            self.emit(stdout, "approval/updated", updated);
+                        }
+                        _ => {
+                            let open = self.approval_request_params(
+                                &session_id,
+                                &command,
+                                "fake-approval-1",
+                                1,
+                            );
+                            self.emit_request(stdout, "approval/request", open);
+                        }
+                    }
+                    return true;
+                }
                 let cursor = self.next_cursor();
                 let final_text = Self::final_text(&self.script);
                 self.emit(
@@ -540,6 +672,156 @@ impl FakeMsp {
                     }),
                 );
             }
+            "approval/decide" => {
+                let approval_id = params
+                    .get("approvalId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let choice_id = params
+                    .get("choiceId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let command_id = params
+                    .get("commandId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                assert!(!approval_id.is_empty(), "decide names its approval");
+                assert!(!choice_id.is_empty(), "decide names its choice");
+                assert!(!command_id.is_empty(), "decide mints its command id");
+                // The multi-stage race guard: the decision must carry the
+                // approval's CURRENT requirement, never a stale snapshot.
+                assert_eq!(
+                    params
+                        .get("requirementId")
+                        .and_then(|requirement| requirement.get("sourceIndex"))
+                        .and_then(Value::as_i64),
+                    Some(self.approval_stage),
+                    "decide carries the current requirement",
+                );
+                if self.script == "decide-internal-error" {
+                    // An internal failure AFTER intake: the reply proves
+                    // nothing about the write, so the plugin must report
+                    // unknown and never resubmit.
+                    self.reply_error(stdout, &id, -32603, "internal error");
+                    return true;
+                }
+                let staged = self.script == "request-multistage" && self.approval_stage == 1;
+                self.reply(
+                    stdout,
+                    &id,
+                    json!({
+                        "approvalId": approval_id,
+                        "commandId": command_id,
+                        "status": "accepted",
+                        "terminal": !staged,
+                    }),
+                );
+                let session_id = self.session_id.clone().unwrap_or_default();
+                if staged {
+                    self.approval_stage = 2;
+                    let updated = self.approval_updated_params(&session_id, &approval_id, 2);
+                    self.emit(stdout, "approval/updated", updated);
+                    return true;
+                }
+                let cursor = self.next_cursor();
+                self.emit(
+                    stdout,
+                    "approval/resolved",
+                    json!({
+                        "approvalId": approval_id,
+                        "decision": if choice_id.starts_with("deny") {
+                            "denied"
+                        } else {
+                            "approved"
+                        },
+                        "resolvedBy": {"kind": "user"},
+                        "sessionId": session_id,
+                        "sourceRange": Self::source_range(),
+                        "turnId": self.last_turn_id(),
+                        "viewCursor": cursor,
+                    }),
+                );
+                let turn_id = self.last_turn_id();
+                self.complete_open_turn(stdout, &turn_id);
+            }
+            "userInput/answer" => {
+                let user_input_id = params
+                    .get("userInputId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let command_id = params
+                    .get("commandId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                assert!(!user_input_id.is_empty(), "answer names its prompt");
+                assert!(!command_id.is_empty(), "answer mints its command id");
+                assert!(
+                    params.get("answers").and_then(Value::as_array).is_some(),
+                    "answer carries answers",
+                );
+                self.reply(
+                    stdout,
+                    &id,
+                    json!({
+                        "commandId": command_id,
+                        "status": "accepted",
+                        "userInputId": user_input_id,
+                    }),
+                );
+                self.settle_prompt(stdout, &user_input_id, "answered");
+            }
+            "userInput/cancel" => {
+                let user_input_id = params
+                    .get("userInputId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                assert!(!user_input_id.is_empty(), "cancel names its prompt");
+                let command_id = params
+                    .get("commandId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                self.reply(
+                    stdout,
+                    &id,
+                    json!({
+                        "commandId": command_id,
+                        "status": "accepted",
+                        "userInputId": user_input_id,
+                    }),
+                );
+                self.settle_prompt(stdout, &user_input_id, "cancelled");
+            }
+            "approval/listPending" => {
+                assert_eq!(
+                    params.get("sessionId").and_then(Value::as_str),
+                    self.session_id.as_deref(),
+                    "pull is scoped to the owned session",
+                );
+                let pulled = if self.script == "resume-pending" {
+                    let approval = self.approval_request_params(
+                        RETAINED_SESSION,
+                        RETAINED_TURN,
+                        "fake-approval-1",
+                        1,
+                    );
+                    let prompt = self.user_input_request_params(
+                        RETAINED_SESSION,
+                        RETAINED_TURN,
+                        "fake-prompt-1",
+                    );
+                    json!({"approvals": [approval], "userInputs": [prompt]})
+                } else {
+                    json!({"approvals": [], "userInputs": []})
+                };
+                self.reply(stdout, &id, pulled);
+            }
             "view/page" => {
                 let events = self.page_events(&params);
                 self.reply(
@@ -578,6 +860,19 @@ impl FakeMsp {
         }
         let frame = json!({"jsonrpc": "2.0", "method": method, "params": params});
         writeln!(stdout, "{}", frame).expect("fixture event");
+    }
+
+    /// A server-initiated must-answer request. Unlike notifications these
+    /// carry an id the client must answer, and they are not view events.
+    fn emit_request(&mut self, stdout: &mut std::io::StdoutLock, method: &str, params: Value) {
+        self.next_server_id += 1;
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": format!("fake-srv-{}", self.next_server_id),
+            "method": method,
+            "params": params,
+        });
+        writeln!(stdout, "{}", frame).expect("fixture server request");
     }
 
     fn next_cursor(&mut self) -> String {
@@ -705,6 +1000,178 @@ impl FakeMsp {
         })
     }
 
+    /// Schema-shaped `approval/request` params for one fake approval at the
+    /// given multi-stage source index.
+    fn approval_request_params(
+        &mut self,
+        session_id: &str,
+        turn_id: &str,
+        approval_id: &str,
+        stage: i64,
+    ) -> Value {
+        let choices = if stage <= 1 {
+            json!([
+                {"choiceId": "allow", "decision": "approved", "label": "Allow",
+                 "scope": "once", "acceptsFeedback": false},
+                {"choiceId": "deny", "decision": "denied", "label": "Deny",
+                 "scope": "once", "acceptsFeedback": true},
+            ])
+        } else {
+            json!([
+                {"choiceId": "allow-session", "decision": "approvedForSession",
+                 "label": "Allow for session", "scope": "session",
+                 "acceptsFeedback": false},
+                {"choiceId": "deny", "decision": "denied", "label": "Deny",
+                 "scope": "once", "acceptsFeedback": true},
+            ])
+        };
+        let cursor = self.next_cursor();
+        json!({
+            "approvalId": approval_id,
+            "availableChoices": choices,
+            "currentRequirementId": {"approvalId": approval_id, "sourceIndex": stage},
+            "itemId": format!("fake-item-{approval_id}"),
+            "judgeEscalated": false,
+            "protectedWrite": false,
+            "rawArgs": "{\"command\":\"ls\"}",
+            "sessionId": session_id,
+            "sourceRange": Self::source_range(),
+            "subject": {"kind": "shell", "command": "ls"},
+            "taskId": format!("fake-task-{approval_id}"),
+            "toolCallId": format!("fake-call-{approval_id}"),
+            "toolName": "shell",
+            "turnId": turn_id,
+            "viewCursor": cursor,
+        })
+    }
+
+    /// Schema-shaped `userInput/request` params. Prompt 1 mixes a
+    /// single-choice and a multiple-choice question; prompt 2 is free text.
+    fn user_input_request_params(
+        &mut self,
+        session_id: &str,
+        turn_id: &str,
+        user_input_id: &str,
+    ) -> Value {
+        let questions = if user_input_id == "fake-prompt-1" {
+            json!([
+                {"header": "Deploy", "id": "q1",
+                 "options": [{"label": "staging"}, {"label": "production"}],
+                 "question": "Where?", "selection": {"mode": "single"}},
+                {"header": "Flags", "id": "q2",
+                 "options": [{"label": "dry-run"}, {"label": "force"}],
+                 "question": "Which flags?",
+                 "selection": {"mode": "multiple", "minSelections": 1, "maxSelections": 2}},
+            ])
+        } else {
+            json!([
+                {"header": "Note", "id": "q9", "options": [],
+                 "question": "Say something.", "selection": {"mode": "single"}},
+            ])
+        };
+        let cursor = self.next_cursor();
+        json!({
+            "itemId": format!("fake-item-{user_input_id}"),
+            "questions": questions,
+            "sessionId": session_id,
+            "sourceRange": Self::source_range(),
+            "toolCallId": format!("fake-call-{user_input_id}"),
+            "toolName": "ask",
+            "turnId": turn_id,
+            "userInputId": user_input_id,
+            "viewCursor": cursor,
+        })
+    }
+
+    /// Schema-shaped `approval/updated` params for the given stage.
+    fn approval_updated_params(
+        &mut self,
+        session_id: &str,
+        approval_id: &str,
+        stage: i64,
+    ) -> Value {
+        let open = self.approval_request_params(session_id, "unused-turn", approval_id, stage);
+        json!({
+            "approvalId": approval_id,
+            "availableChoices": open["availableChoices"],
+            "change": {"kind": "stageSatisfied"},
+            "currentRequirementId": open["currentRequirementId"],
+            "sessionId": session_id,
+            "sourceRange": Self::source_range(),
+            "subject": open["subject"],
+            "viewCursor": open["viewCursor"],
+        })
+    }
+
+    fn last_turn_id(&self) -> String {
+        self.last_turn.clone().unwrap_or_default()
+    }
+
+    /// Settle one prompt; the parked turn completes once every opened prompt
+    /// has settled.
+    fn settle_prompt(
+        &mut self,
+        stdout: &mut std::io::StdoutLock,
+        user_input_id: &str,
+        outcome: &str,
+    ) {
+        let session_id = self.session_id.clone().unwrap_or_default();
+        let cursor = self.next_cursor();
+        self.emit(
+            stdout,
+            "userInput/settled",
+            json!({
+                "outcome": outcome,
+                "sessionId": session_id,
+                "sourceRange": Self::source_range(),
+                "userInputId": user_input_id,
+                "viewCursor": cursor,
+            }),
+        );
+        self.prompts_settled += 1;
+        if self.prompts_opened > 0 && self.prompts_settled >= self.prompts_opened {
+            let turn_id = self.last_turn_id();
+            self.complete_open_turn(stdout, &turn_id);
+        }
+    }
+
+    /// Complete the fake turn the way `turn/start` does: one agentMessage,
+    /// then the terminal record.
+    fn complete_open_turn(&mut self, stdout: &mut std::io::StdoutLock, turn_id: &str) {
+        let session_id = self.session_id.clone().unwrap_or_default();
+        let cursor = self.next_cursor();
+        self.emit(
+            stdout,
+            "item/completed",
+            json!({
+                "item": {
+                    "itemId": format!("fake-item-{turn_id}-1"),
+                    "kind": "agentMessage",
+                    "revision": 2,
+                    "status": "completed",
+                    "text": "Hello from the fake MSP host.",
+                    "turnId": turn_id,
+                },
+                "sessionId": session_id,
+                "sourceRange": Self::source_range(),
+                "viewCursor": cursor,
+            }),
+        );
+        let cursor = self.next_cursor();
+        self.emit(
+            stdout,
+            "turn/completed",
+            json!({
+                "sessionId": session_id,
+                "sourceRange": Self::source_range(),
+                "terminal": "completed",
+                "turnId": turn_id,
+                "viewCursor": cursor,
+            }),
+        );
+        self.turn_active = false;
+    }
+
     fn final_text(script: &str) -> &'static str {
         match script {
             "failed-turn" => "partial reply before the failure.",
@@ -713,12 +1180,18 @@ impl FakeMsp {
     }
 
     fn write_report(&self) {
+        let method_count = |method: &str| self.counts.get(method).copied().unwrap_or(0);
         let report = json!({
             "script": self.script,
             "counts": self.counts,
-            "session_starts": self.counts.get("session/start").copied().unwrap_or(0),
-            "session_resumes": self.counts.get("session/resume").copied().unwrap_or(0),
-            "turn_starts": self.counts.get("turn/start").copied().unwrap_or(0),
+            "session_starts": method_count("session/start"),
+            "session_resumes": method_count("session/resume"),
+            "turn_starts": method_count("turn/start"),
+            "decides": method_count("approval/decide"),
+            "answers": method_count("userInput/answer"),
+            "cancels": method_count("userInput/cancel"),
+            "pending_pulls": method_count("approval/listPending"),
+            "receipts": self.receipts,
         });
         // Atomic publish: the harness may SIGKILL this fixture at any point
         // (failed-start discard), and a truncated report would fail the
@@ -757,6 +1230,7 @@ struct Scenario {
     root: PathBuf,
     agent_id: String,
     host: Host,
+    start_result: Value,
 }
 
 impl Host {
@@ -1045,11 +1519,13 @@ impl Scenario {
         );
         assert_eq!(
             manifest["verbs"],
-            json!(["launch", "resume", "send", "stop"])
+            json!([
+                "launch", "resume", "send", "approve", "deny", "answer", "stop"
+            ])
         );
         assert_eq!(
             manifest["sources"]["controlled"],
-            json!({"message": "stream", "session": "stream", "turn": "stream"})
+            json!({"message": "stream", "request": "stream", "session": "stream", "turn": "stream"})
         );
         let start_id = ulid::Ulid::new().to_string();
         let self_exe = std::env::current_exe().expect("test executable");
@@ -1067,7 +1543,7 @@ impl Scenario {
                 "ELIOT_FAKE_MSP_WORKSPACE": root.join("workspace").to_string_lossy(),
             },
             "note": null,
-            "source_plan": {"session": "stream", "turn": "stream", "message": "stream"},
+            "source_plan": {"session": "stream", "turn": "stream", "message": "stream", "request": "stream"},
             "source_state": source_state,
             "resume_from": resume_from,
             "initial": null,
@@ -1205,6 +1681,7 @@ impl PendingStart {
             root: self.root,
             agent_id: self.agent_id,
             host: self.host,
+            start_result: ready,
         }
     }
 
@@ -1789,6 +2266,166 @@ async fn stop_agent(
     committed
 }
 
+/// A send whose turn parks on native requests: drain until the applied
+/// response plus the script's `expected_opens` request opens, and return the
+/// send id, the turn id, and every batch committed. The opens may commit on
+/// either side of the applied response (the request frame races the
+/// associate roundtrip), so the tail drains by count, not by phase.
+async fn send_parked(
+    host: &mut Host,
+    agent_id: &str,
+    generation: i64,
+    text: &str,
+    expected_opens: usize,
+) -> (String, String, Vec<(String, Value)>) {
+    let command_id = ulid::Ulid::new().to_string();
+    let rx = host
+        .begin_call(
+            "agent.command",
+            json!({
+                "agent_id": agent_id,
+                "generation": generation,
+                "command_id": command_id,
+                "verb": "send",
+                "args": {"text": text},
+            }),
+        )
+        .await;
+    let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
+    let mut committed: Vec<(String, Value)> = Vec::new();
+    let send = loop {
+        tokio::select! {
+            biased;
+            request = host.next_request() => {
+                assert_eq!(request.method, "events.put");
+                let events = request.params.get("events").and_then(Value::as_array).cloned().unwrap_or_default();
+                assert_eq!(events.len(), 1, "one native record per batch");
+                committed.push((
+                    events[0].get("kind").and_then(Value::as_str).unwrap_or_default().to_owned(),
+                    events[0].get("data").cloned().unwrap_or(Value::Null),
+                ));
+                let first = host.next_seq;
+                host.next_seq += 1;
+                host.respond(&request.id, json!({
+                    "first_seq": first, "last_seq": first,
+                    "cursor": request.params.get("cursor").cloned().unwrap_or(Value::Null),
+                })).await;
+            }
+            result = &mut rx => break result,
+        }
+    };
+    let send = send
+        .expect("send deadline")
+        .expect("send response channel")
+        .expect("send applied");
+    assert_eq!(send.get("state").and_then(Value::as_str), Some("applied"));
+    assert!(committed.iter().any(|(kind, _)| kind == "turn.started"));
+    let turn_id = send
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .expect("turn id")
+        .to_owned();
+    while committed
+        .iter()
+        .filter(|(kind, _)| kind == "request.opened")
+        .count()
+        < expected_opens
+    {
+        let events = host
+            .answer_events_put(agent_id, generation, "request.opened")
+            .await;
+        committed.push((
+            "request.opened".to_owned(),
+            events[0].get("data").cloned().unwrap_or(Value::Null),
+        ));
+    }
+    (command_id, turn_id, committed)
+}
+
+/// Drive one approve/deny/answer reply and return its command id, result,
+/// and the batches committed while it was in flight.
+async fn reply(
+    host: &mut Host,
+    agent_id: &str,
+    generation: i64,
+    verb: &str,
+    request_id: &str,
+    turn_id: &str,
+    args: Value,
+) -> (String, Value, Vec<(String, Value)>) {
+    reply_with_id(
+        host,
+        agent_id,
+        generation,
+        &ulid::Ulid::new().to_string(),
+        ReplyTarget {
+            verb,
+            request_id,
+            turn_id,
+            args,
+        },
+    )
+    .await
+}
+
+struct ReplyTarget<'a> {
+    verb: &'a str,
+    request_id: &'a str,
+    turn_id: &'a str,
+    args: Value,
+}
+
+async fn reply_with_id(
+    host: &mut Host,
+    agent_id: &str,
+    generation: i64,
+    command_id: &str,
+    target: ReplyTarget<'_>,
+) -> (String, Value, Vec<(String, Value)>) {
+    let rx = host
+        .begin_call(
+            "agent.command",
+            json!({
+                "agent_id": agent_id,
+                "generation": generation,
+                "command_id": command_id,
+                "verb": target.verb,
+                "args": target.args,
+                "turn_id": target.turn_id,
+                "request_id": target.request_id,
+            }),
+        )
+        .await;
+    let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
+    let mut committed: Vec<(String, Value)> = Vec::new();
+    let result = loop {
+        tokio::select! {
+            biased;
+            request = host.next_request() => {
+                assert_eq!(request.method, "events.put");
+                let events = request.params.get("events").and_then(Value::as_array).cloned().unwrap_or_default();
+                assert_eq!(events.len(), 1, "one native record per batch");
+                committed.push((
+                    events[0].get("kind").and_then(Value::as_str).unwrap_or_default().to_owned(),
+                    events[0].get("data").cloned().unwrap_or(Value::Null),
+                ));
+                let first = host.next_seq;
+                host.next_seq += 1;
+                host.respond(&request.id, json!({
+                    "first_seq": first, "last_seq": first,
+                    "cursor": request.params.get("cursor").cloned().unwrap_or(Value::Null),
+                })).await;
+            }
+            result = &mut rx => break result,
+        }
+    };
+    let result = result
+        .expect("reply deadline")
+        .expect("reply response channel")
+        .expect("reply responds");
+    (command_id.to_owned(), result, committed)
+}
+
 async fn scenario_launch_send_snapshot_stop() {
     let mut scenario = Scenario::start("happy", muse_profile()).await;
     let agent_id = scenario.agent_id.clone();
@@ -2212,7 +2849,7 @@ async fn start_mismatch_before_ready(script: &str) {
             "ELIOT_FAKE_MSP_REPORT": root.join("report.json").to_string_lossy(),
         },
         "note": null,
-        "source_plan": {"session": "stream", "turn": "stream", "message": "stream"},
+        "source_plan": {"session": "stream", "turn": "stream", "message": "stream", "request": "stream"},
         "source_state": null,
         "resume_from": null,
         "initial": null,
@@ -2305,7 +2942,7 @@ async fn scenario_invalid_profile_rejected_before_spawn() {
                     "workspace": root.join("workspace").to_string_lossy(),
                     "target_environment": {},
                     "note": null,
-                    "source_plan": {"session": "stream", "turn": "stream", "message": "stream"},
+                    "source_plan": {"session": "stream", "turn": "stream", "message": "stream", "request": "stream"},
                     "source_state": null,
                     "resume_from": null,
                     "initial": null,
@@ -2655,33 +3292,449 @@ async fn scenario_resume_refuses_served_history_and_keeps_the_retained_id() {
     let _ = std::fs::remove_dir_all(&attempt.root);
 }
 
-async fn scenario_resume_with_pending_requests_is_refused() {
+/// A1: the resume late-joiner set no longer refuses. Both pointers name
+/// the retained (dead) turn, so the pull stashes them, the re-issued opens
+/// receipt-and-drop as orphans, and the new generation's turn runs cleanly
+/// with no gap and no stray request batches.
+async fn scenario_resume_with_pending_requests_adopts_and_proceeds() {
     let agent_id = ulid::Ulid::new().to_string();
     let (resume_from, source_state) = retained_resume_subject(&agent_id);
     let (pending, rx) = Scenario::setup_start(
         "resume-pending",
         muse_profile(),
-        agent_id,
+        agent_id.clone(),
         2,
         resume_from,
         source_state,
     )
     .await;
-    let mut attempt = pending.finish_expecting_error(rx, "unsupported").await;
+    let mut scenario = pending.finish(rx, Some(RETAINED_SESSION)).await;
+    assert_eq!(scenario.start_result["snapshot_pull"], json!("ok"));
+    assert_eq!(
+        scenario.report()["pending_pulls"],
+        json!(1),
+        "one guarded snapshot pull per resume"
+    );
 
-    // The refused resume wrote once and started no turn.
-    let report = attempt.report();
-    assert_eq!(report["session_resumes"], json!(1));
-    assert_eq!(report["turn_starts"], json!(0));
+    let (_send_id, _turn_id, committed) =
+        send_turn(&mut scenario.host, &agent_id, 2, "Say hello.").await;
+    assert_eq!(
+        committed
+            .iter()
+            .map(|(kind, _)| kind.as_str())
+            .collect::<Vec<_>>(),
+        ["turn.started", "message.completed", "turn.completed"]
+    );
 
-    attempt.retry("unsupported").await;
-    assert_eq!(attempt.report()["session_resumes"], json!(1));
+    // Both re-issued orphans were decided nowhere and never opened: no
+    // gap, no request batches.
+    let report = scenario.report();
+    assert_eq!(report["decides"], json!(0));
+    assert_eq!(report["answers"], json!(0));
+    assert_eq!(report["turn_starts"], json!(1));
 
-    attempt
+    stop_agent(&mut scenario.host, &agent_id, 2, false).await;
+    // Receipts are fire-and-forget: assert them only once the stop roundtrip
+    // has flushed the native lane.
+    assert_eq!(scenario.report()["receipts"], json!(2));
+    scenario
         .host
         .call("shutdown", json!({}))
         .await
         .expect("shutdown");
-    attempt.host.shutdown_child().await;
-    let _ = std::fs::remove_dir_all(&attempt.root);
+    scenario.host.shutdown_child().await;
+    let _ = std::fs::remove_dir_all(&scenario.root);
+}
+
+async fn scenario_approve_resolves_the_exact_offered_choice() {
+    let mut scenario = Scenario::start("request-approval", muse_profile()).await;
+    let agent_id = scenario.agent_id.clone();
+
+    let (send_id, turn_id, committed) =
+        send_parked(&mut scenario.host, &agent_id, 1, "List files.", 1).await;
+    assert_eq!(
+        committed
+            .iter()
+            .map(|(kind, _)| kind.as_str())
+            .collect::<Vec<_>>(),
+        ["turn.started", "request.opened"]
+    );
+    let opened = committed
+        .iter()
+        .find(|(kind, _)| kind == "request.opened")
+        .map(|(_, data)| data)
+        .expect("request.opened");
+    assert_eq!(opened["command_id"], json!(send_id));
+    assert_eq!(opened["turn_id"], json!(turn_id));
+    assert_eq!(opened["kind"], json!("approval"));
+    let request_id = opened["request_id"]
+        .as_str()
+        .expect("request id")
+        .to_owned();
+    assert!(request_id.starts_with("muse-request:"));
+    assert_eq!(opened["details"]["approval_id"], json!("fake-approval-1"));
+    assert_eq!(
+        opened["details"]["current_requirement"]["sourceIndex"],
+        json!(1)
+    );
+    let choices = opened["details"]["available_choices"]
+        .as_array()
+        .expect("offered choices");
+    assert_eq!(choices.len(), 2);
+    assert!(opened["details"].get("subagent_origin").is_none());
+
+    let (reply_id, result, in_flight) = reply(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "approve",
+        &request_id,
+        &turn_id,
+        json!({}),
+    )
+    .await;
+    assert_eq!(result["state"], json!("applied"));
+    assert_eq!(result["command_id"], json!(reply_id));
+    assert_eq!(result["request_id"], json!(request_id));
+    assert_eq!(result["turn_id"], json!(turn_id));
+    assert!(in_flight.is_empty(), "resolution lands after the reply");
+
+    let resolved = scenario
+        .host
+        .answer_events_put(&agent_id, 1, "request.resolved")
+        .await;
+    assert_eq!(resolved[0]["data"]["command_id"], json!(reply_id));
+    assert_eq!(resolved[0]["data"]["request_id"], json!(request_id));
+    assert_eq!(resolved[0]["data"]["turn_id"], json!(turn_id));
+    scenario
+        .host
+        .answer_events_put(&agent_id, 1, "message.completed")
+        .await;
+    scenario
+        .host
+        .answer_events_put(&agent_id, 1, "turn.completed")
+        .await;
+
+    assert_eq!(scenario.report()["decides"], json!(1));
+
+    stop_agent(&mut scenario.host, &agent_id, 1, false).await;
+    // The receipt is fire-and-forget: assert it only once the stop
+    // roundtrip has flushed the native lane.
+    assert_eq!(scenario.report()["receipts"], json!(1));
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+    let _ = std::fs::remove_dir_all(&scenario.root);
+}
+
+async fn scenario_answer_and_deny_settle_prompts() {
+    let mut scenario = Scenario::start("request-prompt", muse_profile()).await;
+    let agent_id = scenario.agent_id.clone();
+
+    let (_send_id, turn_id, committed) =
+        send_parked(&mut scenario.host, &agent_id, 1, "Ask me.", 2).await;
+    assert_eq!(
+        committed
+            .iter()
+            .map(|(kind, _)| kind.as_str())
+            .collect::<Vec<_>>(),
+        ["turn.started", "request.opened", "request.opened"]
+    );
+    let prompt_ids = committed
+        .iter()
+        .filter(|(kind, _)| kind == "request.opened")
+        .map(|(_, data)| {
+            assert_eq!(data["kind"], json!("user_input"));
+            assert_eq!(data["turn_id"], json!(turn_id));
+            data["request_id"].as_str().expect("request id").to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(prompt_ids.len(), 2);
+
+    let (answer_id, result, _) = reply(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "answer",
+        &prompt_ids[0],
+        &turn_id,
+        json!({"answers": {
+            "q1": {"selected_label": "staging"},
+            "q2": {"selected_labels": ["dry-run", "force"], "note": "careful"},
+        }}),
+    )
+    .await;
+    assert_eq!(result["state"], json!("applied"));
+    let resolved = scenario
+        .host
+        .answer_events_put(&agent_id, 1, "request.resolved")
+        .await;
+    assert_eq!(resolved[0]["data"]["command_id"], json!(answer_id));
+
+    let (deny_id, result, _) = reply(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "deny",
+        &prompt_ids[1],
+        &turn_id,
+        json!({"reason": "not now"}),
+    )
+    .await;
+    assert_eq!(result["state"], json!("applied"));
+    let resolved = scenario
+        .host
+        .answer_events_put(&agent_id, 1, "request.resolved")
+        .await;
+    assert_eq!(resolved[0]["data"]["command_id"], json!(deny_id));
+    scenario
+        .host
+        .answer_events_put(&agent_id, 1, "message.completed")
+        .await;
+    scenario
+        .host
+        .answer_events_put(&agent_id, 1, "turn.completed")
+        .await;
+
+    let report = scenario.report();
+    assert_eq!(report["answers"], json!(1));
+    assert_eq!(report["cancels"], json!(1));
+
+    stop_agent(&mut scenario.host, &agent_id, 1, false).await;
+    assert_eq!(scenario.report()["receipts"], json!(2));
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+    let _ = std::fs::remove_dir_all(&scenario.root);
+}
+
+/// Note-31a error rule on the decide lane: only schema-documented
+/// pre-admission/validation errors prove rejection; a `-32603` internal
+/// error after intake is unknown and the decision is never resubmitted.
+async fn scenario_decide_internal_error_is_unknown_without_rewrite() {
+    let mut scenario = Scenario::start("decide-internal-error", muse_profile()).await;
+    let agent_id = scenario.agent_id.clone();
+
+    let (_send_id, turn_id, committed) =
+        send_parked(&mut scenario.host, &agent_id, 1, "List files.", 1).await;
+    let opened = committed
+        .iter()
+        .find(|(kind, _)| kind == "request.opened")
+        .map(|(_, data)| data)
+        .expect("request.opened");
+    let request_id = opened["request_id"].as_str().expect("request id");
+
+    let (reply_id, result, _) = reply(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "approve",
+        request_id,
+        &turn_id,
+        json!({}),
+    )
+    .await;
+    assert_eq!(result["state"], json!("unknown"));
+    assert_eq!(scenario.report()["decides"], json!(1));
+
+    // The exact-command retry replays the retained unknown outcome without
+    // touching the native lane a second time.
+    let (_, retry, _) = reply_with_id(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        &reply_id,
+        ReplyTarget {
+            verb: "approve",
+            request_id,
+            turn_id: &turn_id,
+            args: json!({}),
+        },
+    )
+    .await;
+    assert_eq!(retry["state"], json!("unknown"));
+    assert_eq!(scenario.report()["decides"], json!(1));
+
+    stop_agent(&mut scenario.host, &agent_id, 1, false).await;
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+    let _ = std::fs::remove_dir_all(&scenario.root);
+}
+
+/// The caller's opened snapshot goes stale when the offer advances: a reply
+/// naming a stage-1 choice after the stage-2 update is rejected, while a
+/// reply against the current offer applies with the current requirement.
+async fn scenario_stale_choice_after_update_is_rejected() {
+    let mut scenario = Scenario::start("request-stale-choice", muse_profile()).await;
+    let agent_id = scenario.agent_id.clone();
+
+    let (_send_id, turn_id, committed) =
+        send_parked(&mut scenario.host, &agent_id, 1, "List files.", 1).await;
+    let opened = committed
+        .iter()
+        .find(|(kind, _)| kind == "request.opened")
+        .map(|(_, data)| data)
+        .expect("request.opened");
+    let request_id = opened["request_id"].as_str().expect("request id");
+    // The Store keeps the opened (stage-1) snapshot.
+    assert_eq!(
+        opened["details"]["current_requirement"]["sourceIndex"],
+        json!(1)
+    );
+
+    let (_, stale, _) = reply(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "approve",
+        request_id,
+        &turn_id,
+        json!({"choice_id": "allow"}),
+    )
+    .await;
+    assert_eq!(stale["state"], json!("rejected"));
+    assert_eq!(scenario.report()["decides"], json!(0));
+
+    let (reply_id, result, _) = reply(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "approve",
+        request_id,
+        &turn_id,
+        json!({}),
+    )
+    .await;
+    assert_eq!(result["state"], json!("applied"));
+    let resolved = scenario
+        .host
+        .answer_events_put(&agent_id, 1, "request.resolved")
+        .await;
+    assert_eq!(resolved[0]["data"]["command_id"], json!(reply_id));
+    scenario
+        .host
+        .answer_events_put(&agent_id, 1, "message.completed")
+        .await;
+    scenario
+        .host
+        .answer_events_put(&agent_id, 1, "turn.completed")
+        .await;
+
+    // Exactly the fresh decision wrote, carrying the stage-2 requirement
+    // (asserted by the fake at decide time).
+    let report = scenario.report();
+    assert_eq!(report["decides"], json!(1));
+
+    stop_agent(&mut scenario.host, &agent_id, 1, false).await;
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+    let _ = std::fs::remove_dir_all(&scenario.root);
+}
+
+/// Multi-stage approvals: the first decision applies with `terminal: false`,
+/// the update resets the consumed reply, and the second stage decides
+/// (here: a deny with feedback) to the terminal resolution.
+async fn scenario_multistage_approval_decides_each_stage() {
+    let mut scenario = Scenario::start("request-multistage", muse_profile()).await;
+    let agent_id = scenario.agent_id.clone();
+
+    let (_send_id, turn_id, committed) =
+        send_parked(&mut scenario.host, &agent_id, 1, "List files.", 1).await;
+    let opened = committed
+        .iter()
+        .find(|(kind, _)| kind == "request.opened")
+        .map(|(_, data)| data)
+        .expect("request.opened");
+    let request_id = opened["request_id"]
+        .as_str()
+        .expect("request id")
+        .to_owned();
+
+    let (_, first, _) = reply(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "approve",
+        &request_id,
+        &turn_id,
+        json!({}),
+    )
+    .await;
+    assert_eq!(first["state"], json!("applied"));
+    // The stage update commits nothing observable: give the processor's
+    // frame queue a beat to apply it before the second-stage reply. The
+    // scenario roundtrip alone already orders this in practice; the sleep
+    // covers pathological scheduling.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let (second_id, second, _) = reply(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "deny",
+        &request_id,
+        &turn_id,
+        json!({"feedback": "never touch prod"}),
+    )
+    .await;
+    assert_eq!(second["state"], json!("applied"));
+    let resolved = scenario
+        .host
+        .answer_events_put(&agent_id, 1, "request.resolved")
+        .await;
+    assert_eq!(resolved[0]["data"]["command_id"], json!(second_id));
+    assert_eq!(resolved[0]["data"]["request_id"], json!(request_id));
+    scenario
+        .host
+        .answer_events_put(&agent_id, 1, "message.completed")
+        .await;
+    scenario
+        .host
+        .answer_events_put(&agent_id, 1, "turn.completed")
+        .await;
+
+    let report = scenario.report();
+    assert_eq!(report["decides"], json!(2));
+
+    stop_agent(&mut scenario.host, &agent_id, 1, false).await;
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+    let _ = std::fs::remove_dir_all(&scenario.root);
+}
+
+async fn scenario_unknown_native_request_is_rejected_with_a_gap() {
+    let mut scenario = Scenario::start("request-unknown-method", muse_profile()).await;
+    let agent_id = scenario.agent_id.clone();
+    // The unpresentable request is rejected with a typed error and gaps the
+    // request family while the turn itself still completes.
+    send_turn_with_stale_replay(&mut scenario.host, &agent_id, 1, "Say hello.").await;
+    stop_agent(&mut scenario.host, &agent_id, 1, false).await;
+    // The typed rejection is fire-and-forget: assert it only once the stop
+    // roundtrip has flushed the native lane.
+    assert_eq!(scenario.report()["receipts"], json!(1));
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+    let _ = std::fs::remove_dir_all(&scenario.root);
 }

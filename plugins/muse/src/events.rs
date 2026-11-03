@@ -2,7 +2,10 @@ use eliot_core::{Error, NativeEvent, ProviderRestriction, Result, SecretPolicy, 
 use eliot_plugin::{CommitSink, MAX_EVENT_BYTES, PeerClient, protocol::MAX_COMMAND_ID_BYTES};
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::{collections::VecDeque, time::Duration};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    time::Duration,
+};
 use tokio::{
     sync::{mpsc, oneshot, watch},
     time::{Instant, timeout_at},
@@ -10,11 +13,16 @@ use tokio::{
 
 use crate::native::{
     NativeClient, NativeFrame, StreamState,
+    requests::{
+        CorePending, describe_request, refresh_offer_from_raw, reply_for, same_approval_offer,
+    },
     types::{
-        NativeItemCompletedNotification, NativeItemStartedNotification,
-        NativeSessionClosedNotification, NativeSessionStartedNotification,
-        NativeTurnCompletedNotification, NativeTurnError, NativeTurnStartedNotification,
-        NativeTurnTerminal,
+        NativeApprovalDecideResult, NativeApprovalResolvedNotification,
+        NativeApprovalUpdatedNotification, NativeItemCompletedNotification,
+        NativeItemStartedNotification, NativeSessionClosedNotification,
+        NativeSessionStartedNotification, NativeTurnCompletedNotification, NativeTurnError,
+        NativeTurnStartedNotification, NativeTurnTerminal, NativeUserInputAnswerResult,
+        NativeUserInputCancelResult, NativeUserInputSettledNotification,
     },
 };
 
@@ -22,6 +30,8 @@ const EVENT_DEADLINE: Duration = Duration::from_secs(30);
 const CONTROL_QUEUE: usize = 16;
 const EARLY_EVENT_LIMIT: usize = 128;
 const EARLY_EVENT_BYTES: usize = 256 * 1024;
+const MAX_PENDING_REQUESTS: usize = 128;
+const RESOLVED_REQUEST_HISTORY: usize = 128;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EventStatus {
@@ -34,6 +44,11 @@ pub(crate) struct EventStatus {
     pub batch_unknown: bool,
     pub source_unknown: bool,
     pub stopped: bool,
+    /// Local observation counter: bumped on every stream observation that
+    /// touches the pending-request set. An in-memory race guard for stale
+    /// request snapshots (resume pointers, listPending pulls), never a
+    /// persisted epoch.
+    pub observation: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -69,6 +84,20 @@ enum Control {
         turn_id: String,
         reply: oneshot::Sender<Result<()>>,
     },
+    ReplyRequest {
+        command_id: String,
+        request_id: String,
+        turn_id: String,
+        verb: String,
+        args: Value,
+        reply: oneshot::Sender<Result<Value>>,
+    },
+    AdoptPulled {
+        entries: Vec<CorePending>,
+        expected: Vec<String>,
+        capture: u64,
+        reply: oneshot::Sender<Result<()>>,
+    },
     BeginStop {
         reply: oneshot::Sender<Result<()>>,
     },
@@ -78,6 +107,22 @@ enum Control {
     Close {
         reply: oneshot::Sender<()>,
     },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeReplyState {
+    Available,
+    Writing,
+    Written,
+    Unknown,
+}
+
+struct PendingNativeRequest {
+    request: CorePending,
+    reply_command_id: Option<String>,
+    reply_state: NativeReplyState,
+    /// Observation counter at the last stream update of this entry.
+    observed_at: u64,
 }
 
 #[derive(Clone)]
@@ -119,6 +164,29 @@ struct EventProcessor {
     writes_blocked: bool,
     gap_reported: bool,
     final_text: Option<String>,
+    pending_requests: HashMap<String, PendingNativeRequest>,
+    /// Native approval/user-input id to public pending id.
+    native_index: HashMap<String, String>,
+    /// Terminal resolutions by native id: a resolved request is never
+    /// re-adopted from any snapshot, however new the snapshot claims to be.
+    resolved_native_ids: HashSet<String>,
+    resolved_native_order: VecDeque<String>,
+    /// Turn-end drops by native id with the observation counter at the drop:
+    /// a pulled snapshot entry is adopted only when no newer stream
+    /// observation touched its id.
+    dropped_native_at: HashMap<String, u64>,
+    dropped_native_order: VecDeque<String>,
+    /// Resume-pointer ids not yet seen on the stream: a re-issued request
+    /// for one that binds to a dead turn is receipted and dropped as an
+    /// orphan instead of gapping the source. Cleared silently at turn end.
+    expected_requests: HashSet<String>,
+    /// Pulled snapshot entries waiting for a live turn to bind to.
+    stashed_entries: Vec<StashedPending>,
+}
+
+struct StashedPending {
+    request: CorePending,
+    capture: u64,
 }
 
 pub(crate) fn spawn(
@@ -155,6 +223,50 @@ impl EventHandle {
         self.send(|reply| Control::AssociateTurn {
             command_id,
             turn_id,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn reply_request(
+        &self,
+        command_id: String,
+        request_id: String,
+        turn_id: String,
+        verb: String,
+        args: Value,
+    ) -> Result<Value> {
+        let (reply, response) = oneshot::channel();
+        timeout_at(
+            Instant::now() + EVENT_DEADLINE,
+            self.control.send(Control::ReplyRequest {
+                command_id,
+                request_id,
+                turn_id,
+                verb,
+                args,
+                reply,
+            }),
+        )
+        .await
+        .map_err(|_| Error::new("unknown", "Muse event-control queue deadline elapsed"))?
+        .map_err(|_| Error::new("unknown", "Muse event processor stopped"))?;
+        timeout_at(Instant::now() + EVENT_DEADLINE, response)
+            .await
+            .map_err(|_| Error::new("unknown", "Muse event-control outcome is unknown"))?
+            .map_err(|_| Error::new("unknown", "Muse event-control response was lost"))?
+    }
+
+    pub async fn adopt_pulled(
+        &self,
+        entries: Vec<CorePending>,
+        expected: Vec<String>,
+        capture: u64,
+    ) -> Result<()> {
+        self.send(|reply| Control::AdoptPulled {
+            entries,
+            expected,
+            capture,
             reply,
         })
         .await
@@ -218,7 +330,20 @@ impl EventProcessor {
             writes_blocked: false,
             gap_reported: false,
             final_text: None,
+            pending_requests: HashMap::new(),
+            native_index: HashMap::new(),
+            resolved_native_ids: HashSet::new(),
+            resolved_native_order: VecDeque::new(),
+            dropped_native_at: HashMap::new(),
+            dropped_native_order: VecDeque::new(),
+            expected_requests: HashSet::new(),
+            stashed_entries: Vec::new(),
         }
+    }
+
+    fn observe(&mut self) -> u64 {
+        self.status.observation = self.status.observation.saturating_add(1);
+        self.status.observation
     }
 
     async fn handle_control(&mut self, control: Control) -> bool {
@@ -239,6 +364,30 @@ impl EventProcessor {
                 reply,
             } => {
                 let result = self.associate_turn(command_id, turn_id).await;
+                let _ = reply.send(result);
+                true
+            }
+            Control::ReplyRequest {
+                command_id,
+                request_id,
+                turn_id,
+                verb,
+                args,
+                reply,
+            } => {
+                let result = self
+                    .reply_request(&command_id, &request_id, &turn_id, &verb, &args)
+                    .await;
+                let _ = reply.send(result);
+                true
+            }
+            Control::AdoptPulled {
+                entries,
+                expected,
+                capture,
+                reply,
+            } => {
+                let result = self.adopt_pulled(entries, expected, capture).await;
                 let _ = reply.send(result);
                 true
             }
@@ -332,6 +481,9 @@ impl EventProcessor {
                     self.buffer_bytes = 0;
                     self.defer_gap("Muse native events remained unassociated at stream end");
                 }
+                if !self.pending_requests.is_empty() {
+                    self.defer_gap("Muse native requests remained unresolved at stream end");
+                }
                 if !self.planned_stop && self.loss_reason.is_none() {
                     self.defer_gap("Muse native event reader closed");
                 }
@@ -360,7 +512,14 @@ impl EventProcessor {
     fn should_buffer(&self, method: &str) -> bool {
         matches!(
             method,
-            "turn/started" | "turn/completed" | "item/started" | "item/updated" | "item/completed"
+            "turn/started"
+                | "turn/completed"
+                | "item/started"
+                | "item/updated"
+                | "item/completed"
+                | "approval/resolved"
+                | "approval/updated"
+                | "userInput/settled"
         ) && (!self.status.ready || self.status.active_turn_id.is_none())
     }
 
@@ -482,7 +641,8 @@ impl EventProcessor {
             json!({"command_id": command_id, "turn_id": turn_id}),
         )
         .await?;
-        self.flush_buffer().await
+        self.flush_buffer().await?;
+        self.apply_stashed_entries().await
     }
 
     async fn flush_buffer(&mut self) -> Result<()> {
@@ -531,19 +691,431 @@ impl EventProcessor {
         Ok(())
     }
 
-    /// Server-initiated must-answer requests (`approval/request`,
-    /// `userInput/request`) are unconnected in PR1: reject them with a typed
-    /// error, never an invented default reply, and record that the native
-    /// turn may be waiting on an unanswered request.
+    /// Server-initiated must-answer requests. `approval/request` and
+    /// `userInput/request` are presented (transport receipt `{}`) and opened
+    /// durably; the decision/answer travels later as `approval/decide`,
+    /// `userInput/answer` or `userInput/cancel` on the command lane. Unknown
+    /// methods are rejected with a typed error, never an invented default
+    /// reply, and gap the source: the native turn may be waiting on a request
+    /// this slice cannot present.
     async fn process_request(&mut self, id: Value, method: String, params: Value) -> Result<()> {
+        let session_id = self
+            .status
+            .session_id
+            .as_deref()
+            .ok_or_else(|| Error::new("unknown", "Muse request has no owned session"))?;
+        let turn_id = self
+            .status
+            .active_turn_id
+            .as_deref()
+            .ok_or_else(|| Error::new("unknown", "Muse request has no associated turn"))?;
+        let request = match describe_request(&method, &params, session_id, turn_id) {
+            Ok(request) => request,
+            Err(error) if error.code == "source_integrity" => {
+                // A scope mismatch for a resume-expected id is a routine
+                // orphan (the dead generation's turn): receipt it and drop it
+                // instead of gapping the source for another generation's past.
+                if let Some(native_id) = orphan_request_id(&method, &params)
+                    && self.expected_requests.remove(native_id.as_str())
+                {
+                    // The receipt is fire-and-forget by protocol: a lost
+                    // write just means the host re-issues the orphan later,
+                    // which drops the same way.
+                    let _ = self
+                        .native
+                        .reply_server_request(id, json!({}), Instant::now() + EVENT_DEADLINE)
+                        .await;
+                    return Ok(());
+                }
+                return self.reject_request(id, &method, &params, error).await;
+            }
+            Err(error) => {
+                return self.reject_request(id, &method, &params, error).await;
+            }
+        };
+        // The receipt acknowledges presentation only (SS5.3.3): it changes no
+        // state and the decision travels as a command.
+        if self
+            .native
+            .reply_server_request(id.clone(), json!({}), Instant::now() + EVENT_DEADLINE)
+            .await
+            .is_err()
+        {
+            self.defer_gap("Muse native request receipt was not written");
+            return Ok(());
+        }
+        let request_id = request.id.clone();
+        if let Some(native_id) = pending_native_id(&request)
+            && self.resolved_native_ids.contains(native_id)
+        {
+            self.observe();
+            return self
+                .record_gap("Muse native request was re-issued after its resolution")
+                .await;
+        }
+        // Re-issue of a retained open: an identical offer is idempotent, a
+        // changed approval offer replaces the in-memory snapshot (the Store
+        // keeps the opened snapshot; replies always decide from the refreshed
+        // offer and its current requirement).
+        let reissued = self.pending_requests.contains_key(&request_id);
+        if reissued {
+            let same = request.kind != "approval"
+                || self
+                    .pending_requests
+                    .get(&request_id)
+                    .is_some_and(|existing| {
+                        same_approval_offer(&existing.request.details, &params)
+                    });
+            let observed = self.observe();
+            if let Some(existing) = self.pending_requests.get_mut(&request_id) {
+                existing.observed_at = observed;
+                if !same && refresh_offer_from_raw(&mut existing.request.details, &params).is_err()
+                {
+                    return self
+                        .record_gap("Muse re-issued approval omitted its refreshed offer")
+                        .await;
+                }
+            }
+            if let Some(native_id) = orphan_request_id(&method, &params) {
+                self.expected_requests.remove(native_id.as_str());
+            }
+            return Ok(());
+        }
+        if self.pending_requests.len() >= MAX_PENDING_REQUESTS {
+            self.defer_gap("Muse pending native request bound was exceeded");
+            return Ok(());
+        }
+        let command_id = self
+            .status
+            .active_command_id
+            .clone()
+            .ok_or_else(|| Error::new("unknown", "Muse request has no Eliot send command"))?;
+        let data = json!({
+            "command_id": command_id,
+            "request_id": request.id,
+            "turn_id": request.turn_id,
+            "kind": request.kind,
+            "details": request.details,
+        });
+        if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
+            self.defer_gap("Muse normalized request exceeded the persisted-event bound");
+            return Ok(());
+        }
+        let native_id = match request_event_id(&request_id, "request.opened") {
+            Ok(native_id) => native_id,
+            Err(_) => {
+                self.defer_gap("Muse native request event identity exceeded its bound");
+                return Ok(());
+            }
+        };
+        self.commit_event("request.opened", native_id, data).await?;
+        let observed = self.observe();
+        if let Some(native_id) = pending_native_id(&request) {
+            self.native_index
+                .insert(native_id.to_owned(), request_id.clone());
+            self.expected_requests.remove(native_id);
+        }
+        self.pending_requests.insert(
+            request_id.clone(),
+            PendingNativeRequest {
+                request,
+                reply_command_id: None,
+                reply_state: NativeReplyState::Available,
+                observed_at: observed,
+            },
+        );
+        Ok(())
+    }
+
+    async fn reject_request(
+        &mut self,
+        id: Value,
+        method: &str,
+        params: &Value,
+        error: Error,
+    ) -> Result<()> {
         let rejected = self
             .native
-            .reject_unsupported_request(id, &method, &params, Instant::now() + EVENT_DEADLINE)
+            .reject_unsupported_request(id, method, params, Instant::now() + EVENT_DEADLINE)
             .await;
-        if rejected.is_err() {
-            self.defer_gap("Muse unsupported native request could not be rejected");
+        if error.code == "unsupported" {
+            // Unknown request family: rejected with a typed error, and the
+            // source gaps — the native turn may be waiting on a request this
+            // slice cannot present.
+            self.defer_gap("Muse native request method is not connected");
+        } else if rejected.is_err() {
+            self.defer_gap("Muse native request rejection was not written");
         } else {
-            self.defer_gap("Muse native request type is unconnected in this slice");
+            self.defer_gap("Muse native request did not match its exact session/turn schema");
+        }
+        Ok(())
+    }
+
+    async fn reply_request(
+        &mut self,
+        command_id: &str,
+        request_id: &str,
+        turn_id: &str,
+        verb: &str,
+        args: &Value,
+    ) -> Result<Value> {
+        if command_id.trim().is_empty() || request_id.trim().is_empty() || turn_id.trim().is_empty()
+        {
+            return Err(Error::new(
+                "invalid",
+                "Muse request reply requires exact command, request, and turn ids",
+            ));
+        }
+        let Some(entry) = self.pending_requests.get_mut(request_id) else {
+            return Ok(rejected_control("Muse request is no longer pending"));
+        };
+        if entry.request.turn_id != turn_id {
+            return Ok(rejected_control(
+                "Muse request reply does not match the captured turn",
+            ));
+        }
+        if self.status.active_turn_id.as_deref() != Some(turn_id) {
+            return Ok(rejected_control(
+                "Muse request is no longer attached to the active turn",
+            ));
+        }
+        match entry.reply_state {
+            NativeReplyState::Writing | NativeReplyState::Unknown => {
+                return Ok(unknown_control(
+                    "Muse request reply outcome is unresolved and will not be repeated",
+                ));
+            }
+            NativeReplyState::Written => {
+                return Ok(rejected_control(
+                    "Muse request already has a native decision and awaits resolution",
+                ));
+            }
+            NativeReplyState::Available => {}
+        }
+        let Some(session_id) = self.status.session_id.clone() else {
+            return Ok(rejected_control(
+                "Muse request session is no longer writable",
+            ));
+        };
+        if self.status.stopped {
+            return Ok(rejected_control(
+                "Muse request session is no longer writable",
+            ));
+        }
+        // The native idempotency handle is minted here, before the write: a
+        // lost reply leaves the outcome unknown and the decision is never
+        // written a second time under another id.
+        let native_command_id = crate::host::new_command_id();
+        let reply = match reply_for(&entry.request, verb, args, &native_command_id, &session_id) {
+            Ok(reply) => reply,
+            Err(error) => return Ok(rejected_control(&error.message)),
+        };
+        let params = reply.params;
+        let expected_native_id = match reply.method {
+            "approval/decide" => params.get("approvalId").and_then(Value::as_str),
+            _ => params.get("userInputId").and_then(Value::as_str),
+        }
+        .unwrap_or_default()
+        .to_owned();
+        let request = entry.request.clone();
+        entry.reply_state = NativeReplyState::Writing;
+        let acknowledged = match self
+            .native
+            .call(reply.method, params, Instant::now() + EVENT_DEADLINE)
+            .await
+        {
+            Ok(ack) => ack,
+            Err(error)
+                if crate::native::native_no_write(&error.code)
+                    || error.code == "native_rejected" =>
+            {
+                // Proven not admitted (transport never wrote, or a
+                // schema-documented pre-admission/validation error): the
+                // request stays available for a later reply.
+                if let Some(entry) = self.pending_requests.get_mut(request_id) {
+                    entry.reply_state = NativeReplyState::Available;
+                    entry.reply_command_id = None;
+                }
+                return Ok(rejected_control("Muse request reply was not admitted"));
+            }
+            Err(_) => {
+                if let Some(entry) = self.pending_requests.get_mut(request_id) {
+                    entry.reply_state = NativeReplyState::Unknown;
+                    entry.reply_command_id = Some(command_id.to_owned());
+                }
+                return Ok(unknown_control(
+                    "Muse request reply may have been dispatched; it will not be repeated",
+                ));
+            }
+        };
+        // Admission proves nothing by itself (the ack echoes the command
+        // id, not the decision): the ack must echo the exact submitted
+        // command id, the acceptance status, and the exact decided request
+        // id. A malformed ack leaves the write unknown.
+        let acked = match reply.method {
+            "approval/decide" => serde_json::from_value::<NativeApprovalDecideResult>(acknowledged)
+                .ok()
+                .is_some_and(|ack| {
+                    ack.command_id == native_command_id
+                        && ack.status == "accepted"
+                        && ack.approval_id == expected_native_id
+                }),
+            "userInput/answer" => {
+                serde_json::from_value::<NativeUserInputAnswerResult>(acknowledged)
+                    .ok()
+                    .is_some_and(|ack| {
+                        ack.command_id == native_command_id
+                            && ack.status == "accepted"
+                            && ack.user_input_id == expected_native_id
+                    })
+            }
+            _ => serde_json::from_value::<NativeUserInputCancelResult>(acknowledged)
+                .ok()
+                .is_some_and(|ack| {
+                    ack.command_id == native_command_id
+                        && ack.status == "accepted"
+                        && ack.user_input_id == expected_native_id
+                }),
+        };
+        if !acked {
+            if let Some(entry) = self.pending_requests.get_mut(request_id) {
+                entry.reply_state = NativeReplyState::Unknown;
+                entry.reply_command_id = Some(command_id.to_owned());
+            }
+            return Ok(unknown_control(
+                "Muse request reply did not acknowledge the exact submitted command",
+            ));
+        }
+        if let Some(entry) = self.pending_requests.get_mut(request_id) {
+            entry.reply_state = NativeReplyState::Written;
+            entry.reply_command_id = Some(command_id.to_owned());
+        }
+        Ok(json!({
+            "state": "applied",
+            "command_id": command_id,
+            "request_id": request.id,
+            "turn_id": request.turn_id,
+        }))
+    }
+
+    /// Adopt pulled snapshot entries. Entries that bind to the live turn are
+    /// opened; entries for any other turn are stashed until a turn associates
+    /// (then adopted or dropped as orphans). A newer stream resolution always
+    /// wins over stale snapshot data: terminally resolved ids are never
+    /// re-adopted, and an id dropped after the snapshot capture stays dropped.
+    async fn adopt_pulled(
+        &mut self,
+        entries: Vec<CorePending>,
+        expected: Vec<String>,
+        capture: u64,
+    ) -> Result<()> {
+        for id in expected.into_iter().take(MAX_PENDING_REQUESTS) {
+            if !id.trim().is_empty() {
+                self.expected_requests.insert(id);
+            }
+        }
+        for entry in entries {
+            if self.pending_requests.contains_key(&entry.id)
+                || self.snapshot_superseded(&entry, capture)
+            {
+                continue;
+            }
+            if self
+                .status
+                .active_turn_id
+                .as_deref()
+                .is_some_and(|active| active == entry.turn_id)
+            {
+                self.open_pulled_entry(entry).await?;
+            } else if self.stashed_entries.len() < MAX_PENDING_REQUESTS {
+                self.stashed_entries.push(StashedPending {
+                    request: entry,
+                    capture,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a pulled snapshot entry lost to a newer stream observation: a
+    /// terminal resolution always wins, and a drop newer than the snapshot
+    /// capture wins too.
+    fn snapshot_superseded(&self, entry: &CorePending, capture: u64) -> bool {
+        pending_native_id(entry).is_some_and(|native_id| {
+            self.resolved_native_ids.contains(native_id)
+                || self
+                    .dropped_native_at
+                    .get(native_id)
+                    .is_some_and(|dropped_at| *dropped_at > capture)
+        })
+    }
+
+    async fn open_pulled_entry(&mut self, entry: CorePending) -> Result<()> {
+        if self.pending_requests.len() >= MAX_PENDING_REQUESTS {
+            self.defer_gap("Muse pending native request bound was exceeded");
+            return Ok(());
+        }
+        let Some(command_id) = self.status.active_command_id.clone() else {
+            return Ok(());
+        };
+        let data = json!({
+            "command_id": command_id,
+            "request_id": entry.id,
+            "turn_id": entry.turn_id,
+            "kind": entry.kind,
+            "details": entry.details,
+        });
+        if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
+            self.defer_gap("Muse pulled request exceeded the persisted-event bound");
+            return Ok(());
+        }
+        let native_id = match request_event_id(&entry.id, "request.opened") {
+            Ok(native_id) => native_id,
+            Err(_) => {
+                self.defer_gap("Muse native request event identity exceeded its bound");
+                return Ok(());
+            }
+        };
+        let request_id = entry.id.clone();
+        self.commit_event("request.opened", native_id, data).await?;
+        let observed = self.observe();
+        if let Some(native_id) = pending_native_id(&entry) {
+            self.native_index
+                .insert(native_id.to_owned(), request_id.clone());
+            self.expected_requests.remove(native_id);
+        }
+        self.pending_requests.insert(
+            request_id,
+            PendingNativeRequest {
+                request: entry,
+                reply_command_id: None,
+                reply_state: NativeReplyState::Available,
+                observed_at: observed,
+            },
+        );
+        Ok(())
+    }
+
+    /// Apply stashed snapshot entries once a turn associates: adopt what binds
+    /// to the new turn (guarded again — the stream may have adopted or settled
+    /// the id meanwhile), drop the rest as orphans of dead turns.
+    async fn apply_stashed_entries(&mut self) -> Result<()> {
+        let stashed = std::mem::take(&mut self.stashed_entries);
+        for stash in stashed {
+            let entry = stash.request;
+            if self.pending_requests.contains_key(&entry.id)
+                || self.snapshot_superseded(&entry, stash.capture)
+            {
+                continue;
+            }
+            if self
+                .status
+                .active_turn_id
+                .as_deref()
+                .is_some_and(|active| active == entry.turn_id)
+            {
+                self.open_pulled_entry(entry).await?;
+            }
         }
         Ok(())
     }
@@ -620,6 +1192,15 @@ impl EventProcessor {
             }
             "turn/completed" => {
                 self.complete_turn(params).await?;
+            }
+            "approval/resolved" => {
+                self.resolve_approval(params).await?;
+            }
+            "approval/updated" => {
+                self.refresh_approval(params).await?;
+            }
+            "userInput/settled" => {
+                self.settle_user_input(params).await?;
             }
             "session/started" => {
                 self.observe_session_started(&params).await?;
@@ -774,6 +1355,7 @@ impl EventProcessor {
             "turn.completed",
         )?;
         self.commit_event("turn.completed", native_id, data).await?;
+        let dead_turn_id = notification.turn_id.clone();
         self.status.last_turn = Some(TurnFacts {
             command_id,
             turn_id: notification.turn_id,
@@ -783,6 +1365,244 @@ impl EventProcessor {
         });
         self.status.active_turn_id = None;
         self.status.active_command_id = None;
+        // The turn's requests die with it: drop them locally (their Store
+        // rows stay bound to the dead turn, so no later reply can address
+        // them) and swallow their late resolutions. Resume orphans that never
+        // materialized clear silently — they belonged to a dead turn too.
+        let dropped = self
+            .pending_requests
+            .iter()
+            .filter(|(_, entry)| entry.request.turn_id == dead_turn_id)
+            .filter_map(|(id, entry)| {
+                pending_native_id(&entry.request).map(|native| (id.clone(), native.to_owned()))
+            })
+            .collect::<Vec<_>>();
+        if !dropped.is_empty() {
+            let observed = self.observe();
+            for (request_id, native_id) in dropped {
+                self.pending_requests.remove(&request_id);
+                self.native_index.remove(&native_id);
+                self.remember_dropped(native_id, observed);
+            }
+        }
+        self.expected_requests.clear();
+        Ok(())
+    }
+
+    fn remember_resolved(&mut self, native_id: String) {
+        self.resolved_native_ids.insert(native_id.clone());
+        self.resolved_native_order.push_back(native_id);
+        while self.resolved_native_order.len() > RESOLVED_REQUEST_HISTORY {
+            if let Some(expired) = self.resolved_native_order.pop_front() {
+                self.resolved_native_ids.remove(&expired);
+            }
+        }
+    }
+
+    fn remember_dropped(&mut self, native_id: String, observed: u64) {
+        self.dropped_native_at.insert(native_id.clone(), observed);
+        self.dropped_native_order.push_back(native_id);
+        while self.dropped_native_order.len() > RESOLVED_REQUEST_HISTORY {
+            if let Some(expired) = self.dropped_native_order.pop_front() {
+                self.dropped_native_at.remove(&expired);
+            }
+        }
+    }
+
+    async fn resolve_approval(&mut self, params: Value) -> Result<()> {
+        let notification: NativeApprovalResolvedNotification = serde_json::from_value(params)
+            .map_err(|_| {
+                Error::new(
+                    "native_protocol",
+                    "Muse approval/resolved did not match the 1.4 schema",
+                )
+            })?;
+        let session_id = self.status.session_id.as_deref().ok_or_else(|| {
+            Error::new("unknown", "Muse approval resolution has no owned session")
+        })?;
+        if notification.session_id != session_id {
+            return self
+                .record_gap("Muse approval resolution named another native session")
+                .await;
+        }
+        let native_id = notification.approval_id.as_str();
+        if self.resolved_native_ids.contains(native_id) {
+            return Ok(());
+        }
+        let Some(request_id) = self.native_index.get(native_id).cloned() else {
+            if self.expected_requests.remove(native_id) {
+                // A resume orphan settled before its re-issued open arrived:
+                // the stream won, nothing was ever opened, nothing is
+                // committed.
+                self.observe();
+                self.remember_resolved(native_id.to_owned());
+                return Ok(());
+            }
+            if self.dropped_native_at.contains_key(native_id) {
+                return Ok(());
+            }
+            return self
+                .record_gap("Muse approval resolution did not match a retained open")
+                .await;
+        };
+        let Some(entry) = self.pending_requests.get(&request_id) else {
+            return self
+                .record_gap("Muse approval resolution lost its pending request")
+                .await;
+        };
+        if entry.request.kind != "approval" {
+            return self
+                .record_gap("Muse approval resolution did not match a retained open")
+                .await;
+        }
+        let turn_id = entry.request.turn_id.clone();
+        // `request.resolved` binds the exact dispatched Eliot reply; anything
+        // else (policy/judge/timeout, or a reply this generation never wrote)
+        // closes without a command binding.
+        let (kind, data) = match (entry.reply_state, entry.reply_command_id.as_ref()) {
+            (NativeReplyState::Written, Some(command_id)) => (
+                "request.resolved",
+                json!({
+                    "command_id": command_id,
+                    "request_id": request_id,
+                    "turn_id": turn_id,
+                }),
+            ),
+            _ => (
+                "request.closed",
+                json!({
+                    "request_id": request_id,
+                    "turn_id": turn_id,
+                }),
+            ),
+        };
+        let commit_id = request_event_id(&request_id, kind)?;
+        self.commit_event(kind, commit_id, data).await?;
+        self.pending_requests.remove(&request_id);
+        self.native_index.remove(native_id);
+        self.observe();
+        self.remember_resolved(native_id.to_owned());
+        Ok(())
+    }
+
+    /// `approval/updated`: one stage was satisfied while further requirements
+    /// remain. The in-memory offer is replaced wholesale (the Store keeps the
+    /// opened snapshot and has no update event) and a consumed reply resets
+    /// to Available so the next stage can be decided; an uncertain reply is
+    /// never reset.
+    async fn refresh_approval(&mut self, params: Value) -> Result<()> {
+        let raw = params.clone();
+        let notification: NativeApprovalUpdatedNotification = serde_json::from_value(params)
+            .map_err(|_| {
+                Error::new(
+                    "native_protocol",
+                    "Muse approval/updated did not match the 1.4 schema",
+                )
+            })?;
+        let session_id =
+            self.status.session_id.as_deref().ok_or_else(|| {
+                Error::new("unknown", "Muse approval update has no owned session")
+            })?;
+        if notification.session_id != session_id {
+            return self
+                .record_gap("Muse approval update named another native session")
+                .await;
+        }
+        let native_id = notification.approval_id.as_str();
+        let Some(request_id) = self.native_index.get(native_id).cloned() else {
+            if self.resolved_native_ids.contains(native_id)
+                || self.expected_requests.contains(native_id)
+            {
+                return Ok(());
+            }
+            return self
+                .record_gap("Muse approval update arrived without its retained open")
+                .await;
+        };
+        let observed = self.observe();
+        let Some(entry) = self.pending_requests.get_mut(&request_id) else {
+            return Ok(());
+        };
+        entry.observed_at = observed;
+        if refresh_offer_from_raw(&mut entry.request.details, &raw).is_err() {
+            return self
+                .record_gap("Muse approval update omitted its refreshed offer")
+                .await;
+        }
+        if entry.reply_state == NativeReplyState::Written {
+            entry.reply_state = NativeReplyState::Available;
+            entry.reply_command_id = None;
+        }
+        Ok(())
+    }
+
+    async fn settle_user_input(&mut self, params: Value) -> Result<()> {
+        let notification: NativeUserInputSettledNotification = serde_json::from_value(params)
+            .map_err(|_| {
+                Error::new(
+                    "native_protocol",
+                    "Muse userInput/settled did not match the 1.4 schema",
+                )
+            })?;
+        let session_id =
+            self.status.session_id.as_deref().ok_or_else(|| {
+                Error::new("unknown", "Muse prompt settlement has no owned session")
+            })?;
+        if notification.session_id != session_id {
+            return self
+                .record_gap("Muse prompt settlement named another native session")
+                .await;
+        }
+        let native_id = notification.user_input_id.as_str();
+        if self.resolved_native_ids.contains(native_id) {
+            return Ok(());
+        }
+        let Some(request_id) = self.native_index.get(native_id).cloned() else {
+            if self.expected_requests.remove(native_id) {
+                self.observe();
+                return Ok(());
+            }
+            if self.dropped_native_at.contains_key(native_id) {
+                return Ok(());
+            }
+            return self
+                .record_gap("Muse prompt settlement did not match a retained open")
+                .await;
+        };
+        let Some(entry) = self.pending_requests.get(&request_id) else {
+            return self
+                .record_gap("Muse prompt settlement lost its pending request")
+                .await;
+        };
+        if entry.request.kind != "user_input" {
+            return self
+                .record_gap("Muse prompt settlement did not match a retained open")
+                .await;
+        }
+        let turn_id = entry.request.turn_id.clone();
+        let (kind, data) = match (entry.reply_state, entry.reply_command_id.as_ref()) {
+            (NativeReplyState::Written, Some(command_id)) => (
+                "request.resolved",
+                json!({
+                    "command_id": command_id,
+                    "request_id": request_id,
+                    "turn_id": turn_id,
+                }),
+            ),
+            _ => (
+                "request.closed",
+                json!({
+                    "request_id": request_id,
+                    "turn_id": turn_id,
+                }),
+            ),
+        };
+        let commit_id = request_event_id(&request_id, kind)?;
+        self.commit_event(kind, commit_id, data).await?;
+        self.pending_requests.remove(&request_id);
+        self.native_index.remove(native_id);
+        self.observe();
+        self.remember_resolved(native_id.to_owned());
         Ok(())
     }
 
@@ -937,7 +1757,7 @@ impl EventProcessor {
                     "generation": self.generation,
                     "source": "stream",
                     "gap_id": gap_id,
-                    "families": ["session", "turn", "message"],
+                    "families": ["session", "turn", "message", "request"],
                     "reason": reason,
                     "from": null,
                     "to": null,
@@ -1073,6 +1893,61 @@ fn event_id(session_id: &str, turn_id: &str, item_id: &str, kind: &str) -> Resul
         ));
     }
     Ok(native_id)
+}
+
+/// The native approval/user-input id carried by raw server-request params, if
+/// any. Used only to recognize resume-expected orphans; binding still goes
+/// through the typed describe path.
+fn orphan_request_id(method: &str, params: &Value) -> Option<String> {
+    let key = match method {
+        "approval/request" => "approvalId",
+        "userInput/request" => "userInputId",
+        _ => return None,
+    };
+    params
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+}
+
+/// The native approval/user-input id a described request answers to.
+fn pending_native_id(request: &CorePending) -> Option<&str> {
+    match request.kind.as_str() {
+        "approval" => request.details.get("approval_id").and_then(Value::as_str),
+        "user_input" => request.details.get("user_input_id").and_then(Value::as_str),
+        _ => None,
+    }
+}
+
+fn request_event_id(request_id: &str, kind: &str) -> Result<String> {
+    let prefix = match kind {
+        "request.opened" => "muse-o:",
+        "request.resolved" => "muse-r:",
+        "request.closed" => "muse-c:",
+        _ => {
+            return Err(Error::new(
+                "invalid",
+                "Muse request event kind is unsupported",
+            ));
+        }
+    };
+    let native_id = format!("{prefix}{request_id}");
+    if native_id.len() > MAX_COMMAND_ID_BYTES || request_id.trim().is_empty() {
+        return Err(Error::new(
+            "source_integrity",
+            "Muse native request event identity exceeded its bound",
+        ));
+    }
+    Ok(native_id)
+}
+
+pub(crate) fn rejected_control(reason: &str) -> Value {
+    json!({"state": "rejected", "reason": reason})
+}
+
+pub(crate) fn unknown_control(reason: &str) -> Value {
+    json!({"state": "unknown", "reason": reason})
 }
 
 /// Map the MSP terminal to the stored turn status. `cancelled` folds to
