@@ -405,7 +405,7 @@ carries `resolution_source=owner`, as does the emitted `command.resolved`
 event; no `command.applied`/`command.failed` receipt is emitted.
 Future turn-result metadata retains the planned `command_ids` and `usage` fields.
 
-`turn.resolve {id, agent, generation, turn, status: completed|failed|interrupted,
+`turn.resolve {id, agent, generation, turn_id, status: completed|failed|interrupted,
 reason}` requires the turn to be stored `unknown`; running and terminal turns
 are refused with `bad_state`. It further requires either a stored terminal
 generation (`Lost`, `Stopped`, or `Failed` — Eliot no longer controls it) or a

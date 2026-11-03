@@ -1,11 +1,12 @@
 //! Owner resolution of unknown commands and turns.
 //!
 //! Both RPCs validate once through a shared request gate, then resolve
-//! through the one Store writer. Turn resolution on a live generation first
-//! reads the exact native turn back through the owned plugin; only a
-//! readback proving the turn inactive becomes a resolution proof. Native I/O
-//! runs outside the Store lock; the resolving transaction re-checks the
-//! stored terminality and the proof binding.
+//! through the one Store writer. A replayed turn-resolution write id returns
+//! its stored response before any plugin readback. Otherwise turn resolution
+//! on a live generation first reads the exact native turn back through the
+//! owned plugin; only a readback proving the turn inactive becomes a
+//! resolution proof. Native I/O runs outside the Store lock; the resolving
+//! transaction re-checks the stored terminality and the proof binding.
 use super::{Principal, Router, contains_known_secret_including_keys, require_owner};
 use crate::{common::now_ms, plugin_host::SecretSet};
 use eliot_core::{
@@ -44,8 +45,8 @@ where
 
 /// Interpret one `agent.snapshot` response as proof that the exact requested
 /// turn is inactive: the snapshot must bind this Agent generation, name the
-/// turn as its last turn without marking it explicitly non-terminal, and not
-/// report it as still active. Anything else — including a failed or unknown
+/// turn as its last turn, mark that turn explicitly terminal, and not report
+/// it as still active. Anything else — including a failed or unknown
 /// readback — proves nothing.
 fn turn_inactive_proof(
     snapshot: &Value,
@@ -63,7 +64,15 @@ fn turn_inactive_proof(
     if last_turn.get("turn_id").and_then(Value::as_str) != Some(turn_id) {
         return None;
     }
-    if last_turn.get("terminal").and_then(Value::as_bool) == Some(false) {
+    // Explicit terminality only: Codex marks it with a terminal flag, the
+    // fake with a terminal status. A last turn that is merely not active
+    // (e.g. still in progress) proves nothing.
+    let terminal = last_turn.get("terminal").and_then(Value::as_bool) == Some(true)
+        || matches!(
+            last_turn.get("status").and_then(Value::as_str),
+            Some("completed" | "failed" | "interrupted")
+        );
+    if !terminal {
         return None;
     }
     if snapshot.get("active_turn").and_then(Value::as_str) == Some(turn_id) {
@@ -112,6 +121,19 @@ impl Router {
             "turn resolution",
             TurnResolveRequest::validate,
         )?;
+        // Replay first: a write id already bound to this exact assertion
+        // returns its stored response without any plugin readback. A
+        // conflicting binding fails here exactly as the resolving
+        // transaction would report it.
+        let replay = {
+            let store = self.inner.store.lock().await;
+            store.stored_turn_resolution("owner", &request)?
+        };
+        if let Some(value) = replay {
+            self.signal_progress();
+            return serde_json::to_value(value)
+                .map_err(|_| Error::new("internal", "turn resolution could not be encoded"));
+        }
         // Read the stored generation and the readback binding first; the
         // resolving transaction below re-checks terminality and the proof.
         let (agent, readback_command) = {
@@ -614,6 +636,7 @@ mod tests {
         }
         // No plugin runtime exists in this fixture, so the readback yields
         // no proof and the live generation stays fenced.
+        assert_eq!(router.inner.plugin_host.snapshot_turn_calls(), 0);
         let error = router
             .turn_resolve(
                 &json!({"id":ulid::Ulid::new().to_string(), "agent":agent, "generation":1,
@@ -624,6 +647,9 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code, "bad_state");
+        // The fixture observes readback attempts: a fresh live resolve
+        // performs exactly one.
+        assert_eq!(router.inner.plugin_host.snapshot_turn_calls(), 1);
     }
 
     #[tokio::test]
@@ -683,6 +709,68 @@ mod tests {
         assert_eq!(response["generation"], 1);
         assert_eq!(response["turn_id"], "turn-1");
         assert_eq!(response["status"], "failed");
+    }
+
+    #[tokio::test]
+    async fn turn_resolve_replay_returns_the_stored_response_without_a_readback() {
+        let router = router();
+        let now = now_ms();
+        let agent = ready_agent(&router, "resolve-replay-rpc", now).await;
+        let send_id = ulid::Ulid::new().to_string();
+        {
+            let mut store = router.inner.store.lock().await;
+            let mut send = SubmitCommand::new(send_id.clone(), "send");
+            send.target = Some(agent.clone());
+            send.expected_generation = Some(1);
+            send.args = json!({"text":"held input"});
+            store.submit("owner", send, now).unwrap();
+            store.dispatch(&send_id, now).unwrap();
+            store
+                .put_batch(
+                    SourceBatch {
+                        batch_id: ulid::Ulid::new().to_string(),
+                        agent_id: agent.clone(),
+                        generation: 1,
+                        source: "stream".to_owned(),
+                        events: vec![NativeEvent {
+                            ts: None,
+                            kind: "turn.started".to_owned(),
+                            native_id: ulid::Ulid::new().to_string(),
+                            data: json!({"command_id":send_id, "turn_id":"turn-1"}),
+                        }],
+                        cursor: None,
+                    },
+                    now,
+                )
+                .unwrap();
+            let mut stop = SubmitCommand::new(ulid::Ulid::new().to_string(), "stop");
+            stop.target = Some(agent.clone());
+            stop.expected_generation = Some(1);
+            let stop_id = stop.id.clone();
+            store.submit("owner", stop, now).unwrap();
+            store.dispatch(&stop_id, now).unwrap();
+            store
+                .settle(&stop_id, CommandState::Applied, None, now)
+                .unwrap();
+        }
+        let payload = json!({"id":ulid::Ulid::new().to_string(), "agent":agent,
+            "generation":1, "turn_id":"turn-1", "status":"failed",
+            "reason":"owner verified the held turn never completed"});
+        let first = router
+            .turn_resolve(&payload, &Principal::Owner)
+            .await
+            .unwrap();
+        assert_eq!(first["turn_id"], "turn-1");
+        assert_eq!(first["status"], "failed");
+        let mut events = router.inner.bus.subscribe();
+        let replay = router
+            .turn_resolve(&payload, &Principal::Owner)
+            .await
+            .unwrap();
+        assert_eq!(replay, first);
+        // The replay resolves nothing new and performs no native I/O.
+        assert!(events.try_recv().is_err());
+        assert_eq!(router.inner.plugin_host.snapshot_turn_calls(), 0);
     }
 
     #[tokio::test]
@@ -755,6 +843,26 @@ mod tests {
             "source_unknown": true, "result_known": false,
         });
         assert_eq!(turn_inactive_proof(&codex_unknown, "a1", 1, "turn-1"), None);
+        // A last turn that is merely not active is not proof: it must be
+        // explicitly terminal. Neither an in-progress status, an unknown
+        // status, nor a missing terminal marker proves inactivity.
+        for last_turn in [
+            json!({"command_id": "send-1", "turn_id": "turn-1",
+                "status": "inProgress", "final_text": null}),
+            json!({"command_id": "send-1", "turn_id": "turn-1",
+                "status": "running", "final_text": null}),
+            json!({"command_id": "send-1", "turn_id": "turn-1"}),
+        ] {
+            let snapshot = json!({
+                "agent_id": "a1", "generation": 1, "command_id": "send-1",
+                "state": "busy", "active_turn": null, "last_turn": last_turn,
+            });
+            assert_eq!(
+                turn_inactive_proof(&snapshot, "a1", 1, "turn-1"),
+                None,
+                "accepted non-terminal last turn {last_turn}"
+            );
+        }
 
         let fake_completed = json!({
             "agent_id": "a1", "generation": 1, "command_id": "send-1",
@@ -770,6 +878,13 @@ mod tests {
                 "status": "failed", "final_text": null},
         });
         assert!(turn_inactive_proof(&fake_failed, "a1", 1, "turn-1").is_some());
+        let interrupted = json!({
+            "agent_id": "a1", "generation": 1, "command_id": "send-1",
+            "state": "idle", "active_turn": null,
+            "last_turn": {"command_id": "send-1", "turn_id": "turn-1",
+                "status": "interrupted", "final_text": null},
+        });
+        assert!(turn_inactive_proof(&interrupted, "a1", 1, "turn-1").is_some());
         let fake_active = json!({
             "agent_id": "a1", "generation": 1, "command_id": "send-1",
             "state": "busy", "active_turn": "turn-1", "last_turn": null,

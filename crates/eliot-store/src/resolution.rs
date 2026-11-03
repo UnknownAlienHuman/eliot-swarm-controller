@@ -208,14 +208,7 @@ impl Store {
                 "turn resolution requires the owner principal",
             ));
         }
-        let semantic_payload = json!({
-            "agent": request.agent,
-            "generation": request.generation,
-            "turn_id": request.turn_id,
-            "status": request.status.as_str(),
-            "reason": request.reason,
-        });
-        let payload_digest = canonical::digest(&semantic_payload)?;
+        let payload_digest = turn_resolution_digest(request)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -320,6 +313,51 @@ impl Store {
         })
     }
 
+    /// Stored response for a turn-resolution write id already bound to this
+    /// exact assertion, without resolving anything. The Router calls this
+    /// before any plugin readback so a replay of a stored resolution does no
+    /// native I/O; the resolving transaction still re-checks the binding
+    /// before committing. `None` means the id is free; a binding to another
+    /// principal, method, or payload — or to a command — is `id_conflict`,
+    /// exactly as the resolving transaction would report it.
+    pub fn stored_turn_resolution(
+        &self,
+        principal: &str,
+        request: &TurnResolveRequest,
+    ) -> Result<Option<TurnResolveResponse>> {
+        request.validate()?;
+        if principal != "owner" {
+            return Err(Error::new(
+                "not_allowed",
+                "turn resolution requires the owner principal",
+            ));
+        }
+        if command_binding(&self.connection, &request.id)?.is_some() {
+            return Err(Error::new(
+                "id_conflict",
+                "resolution write id is already used by a command",
+            ));
+        }
+        if let Some((old_principal, old_method, old_digest, old_result)) =
+            write_binding(&self.connection, &request.id)?
+        {
+            if old_principal != principal
+                || old_method != RESOLVE_TURN_METHOD
+                || old_digest != turn_resolution_digest(request)?
+            {
+                return Err(Error::new(
+                    "id_conflict",
+                    "resolution write id is bound to another principal, method, or payload",
+                ));
+            }
+            let value = serde_json::from_value::<TurnResolveResponse>(decode_json(&old_result)?)
+                .map_err(|error| Error::new("internal", error.to_string()))?;
+            request.validate_response(&value)?;
+            return Ok(Some(value));
+        }
+        Ok(None)
+    }
+
     /// Latest send bound to one turn, for native turn readback. The Router
     /// passes this command id to the plugin's `agent.snapshot` so the plugin
     /// can prove the exact turn inactive. `None` means no send carries this
@@ -342,6 +380,19 @@ impl Store {
             .optional()
             .map_err(sql_error)
     }
+}
+
+/// Digest of one turn-resolution assertion payload, shared by the
+/// idempotency pre-check and the resolving transaction so both bind the
+/// same bytes.
+fn turn_resolution_digest(request: &TurnResolveRequest) -> Result<Vec<u8>> {
+    canonical::digest(&json!({
+        "agent": request.agent,
+        "generation": request.generation,
+        "turn_id": request.turn_id,
+        "status": request.status.as_str(),
+        "reason": request.reason,
+    }))
 }
 
 /// Move one unknown command to its asserted terminal state and record the

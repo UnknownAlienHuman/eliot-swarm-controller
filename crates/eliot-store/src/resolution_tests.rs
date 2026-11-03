@@ -1078,6 +1078,86 @@ fn resolve_turn_write_ids_replay_or_conflict() {
 }
 
 #[test]
+fn stored_turn_resolution_replays_without_resolving() {
+    let mut store = store();
+    let now = now_ms();
+    let agent = ready_agent(&mut store, "resolve-turn-precheck", now);
+
+    let send = send_request(&agent, "held input");
+    let send_id = send.id.clone();
+    store.submit("owner", send, now).expect("admit send");
+    store.dispatch(&send_id, now).expect("dispatch send");
+    store
+        .put_batch(
+            native_batch(
+                &agent,
+                1,
+                "turn.started",
+                json!({"command_id": send_id, "turn_id": "turn-1"}),
+            ),
+            now,
+        )
+        .expect("commit exact turn association");
+    let mut stop = SubmitCommand::new(Ulid::new().to_string(), "stop");
+    stop.target = Some(agent.clone());
+    stop.expected_generation = Some(1);
+    let stop_id = stop.id.clone();
+    store.submit("owner", stop, now).expect("admit stop");
+    store.dispatch(&stop_id, now).expect("dispatch stop");
+    store
+        .settle(&stop_id, CommandState::Applied, None, now)
+        .expect("settle applied stop");
+
+    let request = resolve_turn_request(&agent, 1, "turn-1", TurnResolveStatus::Failed);
+    // A free id reports no stored response and resolves nothing.
+    assert_eq!(
+        store.stored_turn_resolution("owner", &request).unwrap(),
+        None
+    );
+    assert_eq!(
+        store.get_turn(&agent, 1, "turn-1").unwrap().unwrap().state,
+        TurnState::Unknown
+    );
+
+    let first = store
+        .resolve_turn("owner", &request, None, now)
+        .expect("resolve unknown turn");
+    assert_eq!(first.events.len(), 1);
+    assert_eq!(
+        store.stored_turn_resolution("owner", &request).unwrap(),
+        Some(first.value)
+    );
+
+    // A conflicting payload, a command id, or another principal fails
+    // exactly as the resolving transaction would report it.
+    let mut conflict = request.clone();
+    conflict.status = TurnResolveStatus::Completed;
+    assert_eq!(
+        store
+            .stored_turn_resolution("owner", &conflict)
+            .unwrap_err()
+            .code,
+        "id_conflict"
+    );
+    let mut command_collision = request.clone();
+    command_collision.id = send_id;
+    assert_eq!(
+        store
+            .stored_turn_resolution("owner", &command_collision)
+            .unwrap_err()
+            .code,
+        "id_conflict"
+    );
+    assert_eq!(
+        store
+            .stored_turn_resolution("intruder", &request)
+            .unwrap_err()
+            .code,
+        "not_allowed"
+    );
+}
+
+#[test]
 fn resolve_turn_leaves_sibling_unknown_turn_untouched() {
     let mut store = store();
     let now = now_ms();

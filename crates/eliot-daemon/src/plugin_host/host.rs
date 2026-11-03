@@ -13,6 +13,8 @@ use eliot_core::{
 };
 use eliot_plugin::{PluginManifest, StderrCapture, StderrView, spawn_stderr, sync::LockExt};
 use serde_json::{Map, Value, json};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
@@ -140,6 +142,8 @@ struct HostState {
     observers: Mutex<HashMap<AgentKey, Arc<observation::ObserverEntry>>>,
     readers: Mutex<HashMap<String, discovery::Reader>>,
     discovery_closed: AtomicBool,
+    #[cfg(test)]
+    snapshot_turn_calls: AtomicUsize,
 }
 
 struct AgentActorConfig {
@@ -238,6 +242,8 @@ impl PluginHost {
                 observers: Mutex::new(HashMap::new()),
                 readers: Mutex::new(HashMap::new()),
                 discovery_closed: AtomicBool::new(false),
+                #[cfg(test)]
+                snapshot_turn_calls: AtomicUsize::new(0),
             }),
         }
     }
@@ -606,6 +612,10 @@ impl PluginHost {
         command_id: &str,
         turn_id: &str,
     ) -> Result<Value> {
+        #[cfg(test)]
+        self.state
+            .snapshot_turn_calls
+            .fetch_add(1, Ordering::Relaxed);
         let key = AgentKey {
             id: agent.id.clone(),
             generation: agent.generation,
@@ -637,6 +647,13 @@ impl PluginHost {
             )),
         };
         result.map_err(|error| diagnose_error(error, &stderr, &credentials))
+    }
+
+    /// Turn-snapshot attempts so far. Test-only: proves a replayed
+    /// resolution returns its stored response without native I/O.
+    #[cfg(test)]
+    pub(crate) fn snapshot_turn_calls(&self) -> usize {
+        self.state.snapshot_turn_calls.load(Ordering::Relaxed)
     }
 
     pub(crate) async fn force_all(&self) {
