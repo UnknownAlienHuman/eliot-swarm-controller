@@ -12,6 +12,43 @@ use std::{
 
 pub const CLI: &str = env!("CARGO_BIN_EXE_eliot");
 const WAIT: Duration = Duration::from_secs(20);
+// Bounded first-line CLI stderr snippets in failure diagnostics. Full outcome
+// text stays out; the daemon's timestamped log in the retained fixture has it.
+const MAX_ERROR_SNIPPET_CHARS: usize = 240;
+
+fn error_snippet(stderr: &str) -> String {
+    let line = stderr.lines().next().unwrap_or("").trim();
+    if line.chars().count() <= MAX_ERROR_SNIPPET_CHARS {
+        return line.to_owned();
+    }
+    let mut end: usize = line
+        .char_indices()
+        .take(MAX_ERROR_SNIPPET_CHARS + 1)
+        .map(|(index, _)| index)
+        .last()
+        .unwrap_or(0);
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}[truncated]", &line[..end])
+}
+
+/// Bounded readiness fact: whether the daemon published its endpoint record,
+/// without IPC or credentials. PIDs and endpoint lengths only.
+fn daemon_info_snippet(data: &Path) -> String {
+    let bytes = match fs::read(data.join("daemon.json")) {
+        Ok(bytes) => bytes,
+        Err(_) => return "absent".to_owned(),
+    };
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(info) => format!(
+            "present(pid={},endpoint_chars={})",
+            info["pid"].as_u64().unwrap_or(0),
+            info["endpoint"].as_str().map_or(0, str::len),
+        ),
+        Err(_) => "unparseable".to_owned(),
+    }
+}
 // Exact controller codes only; arbitrary outcome text stays out of CI logs.
 const GIT_FETCH_ERROR_CODES: &[&str] = &[
     "git_fetch_cancelled_before_cas",
@@ -206,6 +243,7 @@ pub struct Fixture {
     pub workspace: PathBuf,
     pub retain_data: bool,
     daemon: Option<Captured>,
+    starts: u32,
 }
 
 impl Fixture {
@@ -220,11 +258,13 @@ impl Fixture {
             root,
             daemon: None,
             retain_data: false,
+            starts: 0,
         }
     }
 
     pub fn start(&mut self) {
         assert!(self.daemon.is_none());
+        self.starts += 1;
         let mut data_argument = self.data.as_os_str().to_os_string();
         data_argument.push(std::path::MAIN_SEPARATOR_STR);
         let mut command = Command::new(CLI);
@@ -233,7 +273,11 @@ impl Fixture {
             .arg(data_argument)
             .args(["daemon", "--foreground"]);
         self.daemon = Some(Captured::spawn(command));
-        let deadline = Instant::now() + WAIT;
+        let child_id = self.daemon.as_ref().unwrap().child.id();
+        let started = Instant::now();
+        let deadline = started + WAIT;
+        let mut polls = 0u32;
+        let mut first_error: Option<String> = None;
         loop {
             if let Some(status) = self
                 .daemon
@@ -260,19 +304,32 @@ impl Fixture {
                 );
             }
             let response = cli(&self.data, &["status"]);
+            polls += 1;
+            if first_error.is_none() {
+                first_error = Some(error_snippet(&response.stderr));
+            }
             if response.status.success() {
                 assert_eq!(response.json()["state"], "running");
                 let info: Value = serde_json::from_slice(
                     &fs::read(self.data.join("daemon.json")).expect("published daemon info"),
                 )
                 .expect("daemon info JSON");
-                assert_eq!(info["pid"], self.daemon.as_ref().unwrap().child.id());
+                assert_eq!(info["pid"], child_id);
                 return;
             }
             assert!(
                 Instant::now() < deadline,
-                "daemon readiness deadline: {}",
-                response.stderr
+                "daemon readiness deadline (start #{}, {polls} status polls in {:?}): child={}; daemon.json={}; first_error={}; last_error={}",
+                self.starts,
+                started.elapsed(),
+                match self.daemon.as_mut().unwrap().child.try_wait() {
+                    Ok(None) => "alive".to_owned(),
+                    Ok(Some(status)) => format!("exited({status:?})"),
+                    Err(_) => "wait_error".to_owned(),
+                },
+                daemon_info_snippet(&self.data),
+                first_error.as_deref().unwrap_or("none"),
+                error_snippet(&response.stderr),
             );
             thread::sleep(Duration::from_millis(50));
         }
@@ -284,10 +341,13 @@ impl Fixture {
 
     #[track_caller]
     pub fn wait_command(&self, id: &str, expected: &str) -> Value {
-        let deadline = Instant::now() + WAIT;
+        let started = Instant::now();
+        let deadline = started + WAIT;
+        let mut polls = 0u32;
         loop {
             let command = self.json(&["cmd", "show", id]);
             let state = command["state"].as_str();
+            polls += 1;
             // Run tests use "terminal" to inspect any retained outcome, including unknown.
             let any_outcome = expected == "terminal"
                 && matches!(
@@ -366,7 +426,9 @@ impl Fixture {
             }
             assert!(
                 Instant::now() < deadline,
-                "command readback deadline; private outcome deliberately omitted"
+                "command readback deadline after {polls} polls in {:?}; last_state={}; private outcome deliberately omitted",
+                started.elapsed(),
+                state.unwrap_or("missing"),
             );
             thread::sleep(Duration::from_millis(25));
         }
@@ -539,5 +601,34 @@ impl Drop for Fixture {
         }
         // Only this create-new fixture path, after its exact owned child exited.
         let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_snippet_keeps_first_line_within_a_char_bound() {
+        assert_eq!(error_snippet(""), "");
+        assert_eq!(
+            error_snippet("error: unavailable: daemon is not running\nsecond line"),
+            "error: unavailable: daemon is not running"
+        );
+        let cyrillic = "Проба ".repeat(100);
+        let snippet = error_snippet(&cyrillic);
+        assert!(snippet.ends_with("[truncated]"));
+        assert!(snippet.chars().count() <= MAX_ERROR_SNIPPET_CHARS + "[truncated]".len());
+        assert_eq!(
+            snippet[..snippet.len() - "[truncated]".len()]
+                .chars()
+                .count(),
+            240
+        );
+        let ascii = "x".repeat(300);
+        assert_eq!(
+            error_snippet(&ascii),
+            format!("{}[truncated]", "x".repeat(240))
+        );
     }
 }
