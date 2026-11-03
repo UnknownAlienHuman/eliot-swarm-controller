@@ -1328,6 +1328,8 @@ impl Monitoring {
     /// targets attached mid-sweep wait for the next sweep. The scan is skipped
     /// when no captured leader is current; a failed scan is committed as
     /// unavailable to each captured target without rescanning per target.
+    /// All captured sampling locks are held across the shared scan; each is
+    /// released right after that target's own commit.
     /// Returns the host enumerations this sweep performed: 0 when skipped or
     /// failed, 1 when scanned. The count is scoped to the sweep's return
     /// value, never to a process-global counter.
@@ -1377,7 +1379,17 @@ impl Monitoring {
         let (leaders_before, sweep) = match scan {
             Ok((leaders, sweep)) => (leaders, sweep),
             Err(error) => {
-                self.commit_scan_failure(&targets, error, sampled_at).await;
+                // All locks were held across the shared scan above; release
+                // each target right after its own failure commit so a
+                // single-target sampler waits only for earlier commits.
+                let mut guards = guards.into_iter();
+                for target in &targets {
+                    let guard = guards.next();
+                    let _ = self
+                        .commit_snapshot(target, Err(error.clone()), sampled_at)
+                        .await;
+                    drop(guard);
+                }
                 return 0;
             }
         };
@@ -1404,22 +1416,15 @@ impl Monitoring {
         }
         // Release the shared sweep before touching the Store.
         drop(sweep);
+        // All locks were held across the shared scan and snapshot builds
+        // above; release each target right after its own commit.
+        let mut guards = guards.into_iter();
         for (target, result) in built {
+            let guard = guards.next();
             let _ = self.commit_snapshot(target, result, sampled_at).await;
+            drop(guard);
         }
         enumerations
-    }
-
-    /// Commit a shared-scan failure as unavailable to each captured target.
-    /// The captured scan error is the observation; there is no per-target
-    /// rescan.
-    #[cfg(target_os = "linux")]
-    async fn commit_scan_failure(&self, targets: &[Arc<Target>], error: Error, sampled_at: i64) {
-        for target in targets {
-            let _ = self
-                .commit_snapshot(target, Err(error.clone()), sampled_at)
-                .await;
-        }
     }
 
     async fn sample_target(&self, target: &Arc<Target>) -> Result<()> {

@@ -165,8 +165,9 @@ CREATE INDEX processes_owner ON processes(owner,state);
 
 ### Sampling work
 
-Each monitoring sweep shares one bounded host-process enumeration across its
-current targets. Capture the target set first;
+On Linux, each monitoring sweep shares one bounded host-process enumeration
+across its current targets; elsewhere each target still samples independently.
+Capture the target set first;
 validate each captured group leader before and after enumeration, and defer new targets
 to the next sweep. Retain full process identities, known-identity refresh and per-generation
 publication. Apply the scan cap once and member caps per owner, retaining known identities

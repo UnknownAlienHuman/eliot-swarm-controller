@@ -1057,9 +1057,8 @@ mod linux_process_stat_tests {
     }
 
     #[test]
-    fn shared_sweep_enumerates_host_once() {
-        let sweep =
-            enumerate_process_sweep().expect("a shared sweep enumerates host processes once");
+    fn sweep_observes_current_test_process() {
+        let sweep = enumerate_process_sweep().expect("enumerate host processes for the sweep");
         assert!(
             sweep
                 .entries
