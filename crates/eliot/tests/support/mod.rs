@@ -33,15 +33,6 @@ fn error_snippet(stderr: &str) -> String {
     format!("{}[truncated]", &line[..end])
 }
 
-/// PID named by the daemon's endpoint record, if it published one. The file
-/// appears only after the daemon bound IPC; a PID that is not this child's
-/// is a stale previous generation on restart.
-fn published_daemon_pid(data: &Path) -> Option<u32> {
-    let bytes = fs::read(data.join("daemon.json")).ok()?;
-    let info: Value = serde_json::from_slice(&bytes).ok()?;
-    info["pid"].as_u64()?.try_into().ok()
-}
-
 /// Bounded readiness fact: whether the daemon published its endpoint record,
 /// without IPC or credentials. PIDs and endpoint lengths only.
 fn daemon_info_snippet(data: &Path) -> String {
@@ -286,7 +277,6 @@ impl Fixture {
         let started = Instant::now();
         let deadline = started + WAIT;
         let mut polls = 0u32;
-        let mut status_polls = 0u32;
         let mut first_error: Option<String> = None;
         loop {
             if let Some(status) = self
@@ -313,49 +303,34 @@ impl Fixture {
                     truncated,
                 );
             }
-            // A status spawn before this child publishes its endpoint record is
-            // guaranteed futile ("daemon is not running") and only competes with
-            // the starting daemon, so wait on the file first within the same
-            // deadline. A stale record from a previous generation waits the same
-            // way until this child overwrites it.
+            let response = cli(&self.data, &["status"]);
             polls += 1;
-            let mut response = None;
-            if published_daemon_pid(&self.data) == Some(child_id) {
-                let reply = cli(&self.data, &["status"]);
-                status_polls += 1;
-                if first_error.is_none() {
-                    first_error = Some(error_snippet(&reply.stderr));
-                }
-                if reply.status.success() {
-                    assert_eq!(reply.json()["state"], "running");
-                    let info: Value = serde_json::from_slice(
-                        &fs::read(self.data.join("daemon.json")).expect("published daemon info"),
-                    )
-                    .expect("daemon info JSON");
-                    assert_eq!(info["pid"], child_id);
-                    return;
-                }
-                response = Some(reply);
+            if first_error.is_none() {
+                first_error = Some(error_snippet(&response.stderr));
             }
-            if Instant::now() >= deadline {
-                panic!(
-                    "daemon readiness deadline (start #{}, {polls} file polls, {status_polls} status polls in {:?}): child={}; daemon.json={}; first_error={}; last_error={}",
-                    self.starts,
-                    started.elapsed(),
-                    match self.daemon.as_mut().unwrap().child.try_wait() {
-                        Ok(None) => "alive".to_owned(),
-                        Ok(Some(status)) => format!("exited({status:?})"),
-                        Err(_) => "wait_error".to_owned(),
-                    },
-                    daemon_info_snippet(&self.data),
-                    first_error.as_deref().unwrap_or("none"),
-                    response
-                        .as_ref()
-                        .map(|reply| error_snippet(&reply.stderr))
-                        .as_deref()
-                        .unwrap_or("none"),
-                );
+            if response.status.success() {
+                assert_eq!(response.json()["state"], "running");
+                let info: Value = serde_json::from_slice(
+                    &fs::read(self.data.join("daemon.json")).expect("published daemon info"),
+                )
+                .expect("daemon info JSON");
+                assert_eq!(info["pid"], child_id);
+                return;
             }
+            assert!(
+                Instant::now() < deadline,
+                "daemon readiness deadline (start #{}, {polls} status polls in {:?}): child={}; daemon.json={}; first_error={}; last_error={}",
+                self.starts,
+                started.elapsed(),
+                match self.daemon.as_mut().unwrap().child.try_wait() {
+                    Ok(None) => "alive".to_owned(),
+                    Ok(Some(status)) => format!("exited({status:?})"),
+                    Err(_) => "wait_error".to_owned(),
+                },
+                daemon_info_snippet(&self.data),
+                first_error.as_deref().unwrap_or("none"),
+                error_snippet(&response.stderr),
+            );
             thread::sleep(Duration::from_millis(50));
         }
     }
@@ -610,21 +585,13 @@ impl Drop for Fixture {
             return;
         }
         if let Some(mut daemon) = self.daemon.take() {
-            // A child that never published its endpoint record has no IPC
-            // identity to shut down; a graceful stop cannot reach it, so reap
-            // it promptly instead of lingering a full wait on a congested box.
-            if published_daemon_pid(&self.data) != Some(daemon.child.id()) {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                cli(&self.data, &["daemon", "stop", "--force"])
+            }));
+            if daemon.wait(WAIT).is_err() {
                 let _ = daemon.child.kill();
-                let _ = daemon.wait(Duration::from_secs(5));
-            } else {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    cli(&self.data, &["daemon", "stop", "--force"])
-                }));
-                if daemon.wait(WAIT).is_err() {
-                    let _ = daemon.child.kill();
-                    if daemon.wait(Duration::from_secs(5)).is_err() {
-                        return;
-                    }
+                if daemon.wait(Duration::from_secs(5)).is_err() {
+                    return;
                 }
             }
         }
@@ -662,47 +629,6 @@ mod tests {
         assert_eq!(
             error_snippet(&ascii),
             format!("{}[truncated]", "x".repeat(240))
-        );
-    }
-
-    #[test]
-    fn published_daemon_pid_reads_only_matching_records() {
-        let root = std::env::temp_dir().join(format!("eliot pid probe {}", ulid::Ulid::new()));
-        fs::create_dir(&root).expect("create pid probe directory");
-        assert_eq!(published_daemon_pid(&root), None);
-        fs::write(root.join("daemon.json"), b"not json").expect("write invalid record");
-        assert_eq!(published_daemon_pid(&root), None);
-        fs::write(
-            root.join("daemon.json"),
-            r#"{"pid": 1234, "endpoint": "x"}"#,
-        )
-        .expect("write valid record");
-        assert_eq!(published_daemon_pid(&root), Some(1234));
-        fs::remove_dir_all(&root).expect("remove pid probe directory");
-    }
-
-    #[test]
-    fn drop_reaps_never_published_daemon_without_full_wait() {
-        let mut fixture = Fixture::new("unready drop");
-        let command = if cfg!(windows) {
-            let mut command = Command::new("powershell");
-            command.args(["-NoProfile", "-Command", "Start-Sleep 60"]);
-            command
-        } else {
-            let mut command = Command::new("sleep");
-            command.arg("60");
-            command
-        };
-        // No daemon.json is ever published for this child, matching a daemon
-        // stuck before its endpoint record. The old path waited the full
-        // 20-second shutdown budget here before killing it.
-        fixture.daemon = Some(Captured::spawn(command));
-        let started = Instant::now();
-        drop(fixture);
-        assert!(
-            started.elapsed() < Duration::from_secs(15),
-            "unready drop lingered {:?}",
-            started.elapsed()
         );
     }
 }
