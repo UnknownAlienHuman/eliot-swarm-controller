@@ -516,9 +516,9 @@ native event of a long-lived source never blocks pruning. An open source with
 no committed batch yet (`last_batch_first_seq IS NULL`) pins from its first
 native event. Native-bound events of closed sources may go. Retained gap
 events are pinned while live: pruning keeps every event at or after the
-oldest `gap_seq` of an open source whose `gap_from` still equals its cursor,
-so the Git coverage check can still re-read its gap event afterwards; a
-superseded gap pins nothing. A lagging rule
+oldest `gap_seq` of an open current-generation source whose `gap_from` still
+equals its cursor, so the Git coverage check can still re-read its gap event
+afterwards; a superseded gap pins nothing. A lagging rule
 releases its pin only through the ordinary atomic backlog skip/pause transition. Advance
 `rule_history_coverage.pruned_through` in the same transaction as deletion, so replay and
 explicit catch-up return `history_gap` instead of silently omitting events. Never reset
