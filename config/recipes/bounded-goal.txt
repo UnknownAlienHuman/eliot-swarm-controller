@@ -1,0 +1,10 @@
+# Recipe 3: bounded Eliot-mode goal with automatic on-idle driving.
+# Replace AGENT with the agent id, then run as one command (--check consumes
+# the rest of the line, so it goes last). The daemon rounds automatically on
+# the next idle event; no manual `goal round` is needed. `git --version` is a
+# portable exit-0 placeholder: replace it with your project's check command,
+# which must exit 0 when the goal holds. Verify with: goal show AGENT
+# CI runs this exact command against the Fake profile (agent launched with
+# the Fake profile instead of codex-luna, nothing else changed); the live
+# Codex demonstration is pending the owner's go-ahead.
+goal set AGENT --text keep-green --max-rounds 5 --check git --version

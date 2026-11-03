@@ -1,0 +1,26 @@
+# Recipe 1: scheduled git.fetch of a registered project (Codex profile).
+#
+# Copy this file to <data_dir>/rules/refresh-origin-main.toml, then add the
+# project registration below to <data_dir>/config.toml (replace the path and
+# the fetch endpoint with your own):
+#
+#   [projects.app]
+#   path = "C:/src/app"
+#   profiles = ["codex-luna"]
+#   actions = ["git.fetch"]
+#
+#   [projects.app.git]
+#   fetch_remotes = { origin = "https://github.com/example/app.git" }
+#
+# The timer fires hourly. Verify with:
+#   eliot timer show refresh-origin-main
+#   eliot timer run refresh-origin-main   # immediate manual firing, same action
+#
+# CI runs this exact file against the Fake profile (profile swapped, nothing
+# else changed); the live Codex demonstration is pending the owner's go-ahead.
+
+[[rule]]
+id = "refresh-origin-main"
+on = { every = "1h" }
+catch_up = "none"
+do = [{ action = "git.fetch", repository = "app", remote = "origin", source_ref = "refs/heads/main", tracking_ref = "refs/remotes/origin/main" }]

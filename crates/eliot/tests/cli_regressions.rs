@@ -13517,3 +13517,547 @@ fn cli_goal_auto_round_drives_idle_fake_agent() {
     );
     fixture.stop(false);
 }
+
+// L4.4 recipes: each test loads the exact recipe file/command shipped in
+// config/recipes/ and runs it end to end against the Fake profile (profile
+// swapped, nothing else changed), so CI proves the recipe text stays valid.
+// CI never calls a model; no live Codex session is run here.
+const RECIPE_TIMER_GIT_FETCH: &str = include_str!("../../../config/recipes/timer-git-fetch.toml");
+const RECIPE_EVENT_RESUME: &str =
+    include_str!("../../../config/recipes/event-resume-after-stop.toml");
+const RECIPE_BOUNDED_GOAL: &str = include_str!("../../../config/recipes/bounded-goal.txt");
+
+#[test]
+fn cli_recipe_timer_git_fetch_runs_exact_file_against_fake() {
+    const PROJECT_ID: &str = "app";
+    const RULE_ID: &str = "refresh-origin-main";
+    const TRACKING_REF: &str = "refs/remotes/origin/main";
+
+    assert!(
+        RECIPE_TIMER_GIT_FETCH.contains("id = \"refresh-origin-main\""),
+        "recipe file must still define the documented timer id"
+    );
+    assert!(
+        RECIPE_TIMER_GIT_FETCH.contains("action = \"git.fetch\""),
+        "recipe file must still use the git.fetch action"
+    );
+
+    let mut fixture = Fixture::new("recipe timer git fetch");
+    let git_output = |fixture: &Fixture, args: &[&str], context: &str| -> String {
+        let reply = fixture.git(args);
+        assert!(
+            reply.status.success(),
+            "{context}: stdout={:?}, stderr={:?}",
+            reply.stdout,
+            reply.stderr
+        );
+        reply.stdout.trim().to_owned()
+    };
+
+    git_output(
+        &fixture,
+        &["init", "--initial-branch=main"],
+        "initialize recipe fetch checkout",
+    );
+    fs::write(fixture.workspace.join("seed.txt"), "recipe fetch base\n")
+        .expect("write recipe fetch seed");
+    git_output(
+        &fixture,
+        &["add", "--", "seed.txt"],
+        "stage recipe fetch seed",
+    );
+    git_output(
+        &fixture,
+        &["commit", "-m", "Recipe fetch base"],
+        "commit recipe fetch seed",
+    );
+    let base_oid = git_output(
+        &fixture,
+        &["rev-parse", "--verify", "HEAD"],
+        "read recipe fetch base",
+    );
+
+    let remote_path = fixture.root.join("recipe fetch origin.git");
+    let remote_arg = remote_path.to_string_lossy().into_owned();
+    git_output(
+        &fixture,
+        &["init", "--bare", &remote_arg],
+        "initialize recipe fetch origin",
+    );
+    git_output(
+        &fixture,
+        &["remote", "add", "origin", &remote_arg],
+        "add recipe fetch origin",
+    );
+    git_output(
+        &fixture,
+        &["push", "origin", "main"],
+        "push recipe base to origin",
+    );
+    git_output(
+        &fixture,
+        &[
+            "fetch",
+            "origin",
+            "refs/heads/main:refs/remotes/origin/main",
+        ],
+        "seed recipe tracking ref",
+    );
+
+    let writer_path = fixture.root.join("recipe remote writer");
+    let writer_arg = writer_path.to_string_lossy().into_owned();
+    git_output(
+        &fixture,
+        &["clone", "--no-local", ".", &writer_arg],
+        "clone recipe remote writer",
+    );
+    git_output(
+        &fixture,
+        &[
+            "-C",
+            &writer_arg,
+            "remote",
+            "set-url",
+            "origin",
+            &remote_arg,
+        ],
+        "point recipe writer at the bare fetch origin",
+    );
+    git_output(
+        &fixture,
+        &["-C", &writer_arg, "switch", "-c", "remote-advance"],
+        "create recipe advancement branch",
+    );
+    fs::write(writer_path.join("seed.txt"), "recipe remote target\n")
+        .expect("write recipe remote advancement");
+    git_output(
+        &fixture,
+        &["-C", &writer_arg, "add", "--", "seed.txt"],
+        "stage recipe remote advancement",
+    );
+    git_output(
+        &fixture,
+        &["-C", &writer_arg, "commit", "-m", "Recipe remote target"],
+        "commit recipe remote advancement",
+    );
+    let advertised_oid = git_output(
+        &fixture,
+        &["-C", &writer_arg, "rev-parse", "--verify", "HEAD"],
+        "read recipe advertised OID",
+    );
+    git_output(
+        &fixture,
+        &[
+            "-C",
+            &writer_arg,
+            "push",
+            "origin",
+            "remote-advance:refs/heads/main",
+        ],
+        "advance recipe remote main",
+    );
+    let advertised_commit_spec = format!("{advertised_oid}^{{commit}}");
+    assert!(
+        !fixture
+            .git(&["cat-file", "-e", &advertised_commit_spec])
+            .status
+            .success(),
+        "advertised commit must not already exist locally"
+    );
+    let approved_endpoint = git_output(
+        &fixture,
+        &["config", "--get-all", "remote.origin.url"],
+        "read recipe origin fetch URL",
+    );
+    assert!(Path::new(&approved_endpoint).is_absolute());
+
+    // Let the daemon create and protect the Windows private data root before
+    // the fixture writes owner configuration.
+    fixture.start();
+    fixture.stop(false);
+
+    // The recipe's project registration, with the profile swapped to Fake and
+    // the checkout/endpoint paths pointed at this fixture; nothing else changed.
+    fs::write(
+        fixture.data.join("config.toml"),
+        format!(
+            concat!(
+                "[projects.{project_id}]\n",
+                "path = {workspace:?}\n",
+                "profiles = [\"fake\"]\n",
+                "actions = [\"git.fetch\"]\n\n",
+                "[projects.{project_id}.git]\n",
+                "fetch_remotes = {{ origin = {endpoint:?} }}\n",
+            ),
+            project_id = PROJECT_ID,
+            workspace = fixture.workspace.to_string_lossy(),
+            endpoint = approved_endpoint,
+        ),
+    )
+    .expect("write recipe project registration");
+    let owner_rules = fixture.data.join("rules");
+    fs::create_dir_all(&owner_rules).expect("create recipe rule directory");
+    fs::write(
+        owner_rules.join(format!("{RULE_ID}.toml")),
+        RECIPE_TIMER_GIT_FETCH,
+    )
+    .expect("write exact recipe timer file");
+
+    fixture.start();
+    let registration_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let registration: ProjectRegistrationView = loop {
+        let reply = cli(&fixture.data, &["project", "show", PROJECT_ID]);
+        if reply.status.success() {
+            break serde_json::from_str(&reply.stdout).expect("typed recipe project");
+        }
+        assert!(
+            std::time::Instant::now() < registration_deadline,
+            "recipe project registration deadline: {}",
+            reply.stderr
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    registration.validate().expect("valid recipe project");
+    assert_eq!(
+        registration
+            .git
+            .as_ref()
+            .expect("recipe project Git approvals")
+            .fetch_remotes
+            .get("origin"),
+        Some(&approved_endpoint)
+    );
+
+    let timer_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let timer_before: TimerStateView = loop {
+        let reply = cli(&fixture.data, &["timer", "show", RULE_ID]);
+        if reply.status.success() {
+            break serde_json::from_str(&reply.stdout).expect("typed recipe timer state");
+        }
+        assert!(
+            std::time::Instant::now() < timer_deadline,
+            "recipe timer load deadline: {}",
+            reply.stderr
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(timer_before.id, RULE_ID);
+    assert_eq!(timer_before.last_key, None);
+    assert!(timer_before.next_due_at.is_some());
+
+    let run_id = ulid::Ulid::new().to_string();
+    let parent: CoreCommand =
+        serde_json::from_value(fixture.json(&["--id", &run_id, "timer", "run", RULE_ID]))
+            .expect("typed recipe manual timer parent");
+    assert_eq!(parent.id, run_id);
+    assert_eq!(parent.verb, "timer.run");
+    assert_eq!(parent.principal, "owner");
+    let children: Vec<String> = serde_json::from_value(
+        parent.outcome.as_ref().expect("recipe timer child set")["children"].clone(),
+    )
+    .expect("typed recipe timer child IDs");
+    assert_eq!(children.len(), 1);
+    serde_json::from_value::<CoreCommand>(fixture.wait_command(&parent.id, "applied"))
+        .expect("applied recipe timer parent");
+    let action: CoreCommand = serde_json::from_value(fixture.wait_command(&children[0], "applied"))
+        .expect("applied recipe Git fetch action");
+    assert_eq!(action.verb, "git.fetch");
+    assert_eq!(action.principal, "owner");
+    assert_eq!(action.target, None);
+    let outcome = action
+        .outcome
+        .as_ref()
+        .expect("applied recipe fetch readback");
+    assert_eq!(outcome["tracking_ref"], TRACKING_REF);
+    assert_eq!(outcome["tracking_oid"], advertised_oid);
+    assert_eq!(
+        fault_dispatches(&fixture.events(), &action.id),
+        1,
+        "recipe fetch dispatched exactly once"
+    );
+
+    assert_eq!(
+        git_output(
+            &fixture,
+            &["rev-parse", "--verify", TRACKING_REF],
+            "read advanced recipe tracking ref",
+        ),
+        advertised_oid
+    );
+    assert_eq!(
+        git_output(
+            &fixture,
+            &["rev-parse", "--verify", "HEAD"],
+            "read recipe HEAD"
+        ),
+        base_oid,
+        "recipe fetch leaves HEAD alone"
+    );
+    assert_eq!(
+        git_output(
+            &fixture,
+            &["branch", "--show-current"],
+            "read recipe branch"
+        ),
+        "main"
+    );
+    fixture.stop(false);
+}
+
+#[test]
+fn cli_recipe_event_resume_runs_exact_file_against_fake() {
+    const RULE_ID: &str = "resume-after-known-stop";
+    const RESUME_TEXT: &str = "Continue after stop";
+
+    // The recipe matches one exact stop command and Codex agents; the test
+    // substitutes this run's stop id and swaps the harness to Fake.
+    let stop_id = ulid::Ulid::new().to_string();
+    assert!(
+        RECIPE_EVENT_RESUME.contains("YOUR_STOP_COMMAND_ID"),
+        "recipe file must still carry the documented stop-id placeholder"
+    );
+    assert!(
+        RECIPE_EVENT_RESUME.contains("\"subject.harness\" = \"codex\""),
+        "recipe file must still match Codex agents"
+    );
+    let rule_source = RECIPE_EVENT_RESUME
+        .replace("YOUR_STOP_COMMAND_ID", &stop_id)
+        .replace(
+            "\"subject.harness\" = \"codex\"",
+            "\"subject.harness\" = \"fake\"",
+        );
+    assert!(!rule_source.contains("YOUR_STOP_COMMAND_ID"));
+
+    let mut fixture = Fixture::new("recipe event resume");
+    fixture.start();
+    fixture.stop(false);
+
+    let owner_rules = fixture.data.join("rules");
+    fs::create_dir_all(&owner_rules).expect("create recipe rule directory");
+    fs::write(owner_rules.join(format!("{RULE_ID}.toml")), &rule_source)
+        .expect("write recipe event rule file");
+
+    fixture.start();
+    let rule_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let loaded: RuleStateView = loop {
+        let reply = cli(&fixture.data, &["rule", "show", RULE_ID]);
+        if reply.status.success() {
+            break serde_json::from_str(&reply.stdout).expect("typed recipe rule state");
+        }
+        assert!(
+            std::time::Instant::now() < rule_deadline,
+            "recipe rule load deadline: {}",
+            reply.stderr
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(loaded.id, RULE_ID);
+    assert!(loaded.enabled);
+
+    let launched = fixture.json(&[
+        "launch",
+        "--profile",
+        "fake",
+        "--workspace",
+        fixture.workspace.to_str().unwrap(),
+    ]);
+    assert_eq!(launched["state"], "applied");
+    let agent = launched["target"]
+        .as_str()
+        .expect("recipe Fake agent")
+        .to_owned();
+    wait_agent_ready(&fixture, &agent, 1, "recipe resume", "recipe resume");
+
+    let stop: CommandSubmitResponse = serde_json::from_value(fixture.json(&[
+        "--id",
+        &stop_id,
+        "stop",
+        &agent,
+        "--generation",
+        "1",
+    ]))
+    .expect("typed recipe stop submission");
+    assert_eq!(stop.command_id, stop_id);
+    fixture.wait_command(&stop_id, "applied");
+
+    let firing_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let firing = loop {
+        if let Some(event) = fixture
+            .events()
+            .into_iter()
+            .find(|event| event["kind"] == "rule.fired" && event["data"]["rule"] == RULE_ID)
+        {
+            break event;
+        }
+        assert!(
+            std::time::Instant::now() < firing_deadline,
+            "recipe resume firing deadline"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    let child_id = firing["data"]["child_command"]
+        .as_str()
+        .expect("recipe resume child command")
+        .to_owned();
+    let child: CoreCommand = serde_json::from_value(fixture.wait_command(&child_id, "applied"))
+        .expect("applied recipe resume child");
+    assert_eq!(child.verb, "resume");
+    assert_eq!(child.target.as_deref(), Some(agent.as_str()));
+    assert_eq!(child.expected_generation, Some(1));
+
+    let resumed = wait_agent_ready(&fixture, &agent, 2, "recipe resume", "recipe resume");
+    assert_eq!(resumed.agent.generation, 2);
+
+    // The recipe's linked text becomes generation 2's first input.
+    let send_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let linked = loop {
+        if let Some(event) = fixture.events().into_iter().find(|event| {
+            event["kind"] == "command.dispatched"
+                && event["agent"] == agent
+                && event["generation"] == 2
+                && event["data"]["verb"] == "send"
+        }) {
+            break event["data"]["command_id"]
+                .as_str()
+                .expect("recipe linked send command")
+                .to_owned();
+        }
+        assert!(
+            std::time::Instant::now() < send_deadline,
+            "recipe linked send deadline"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    let linked_send: CoreCommand = serde_json::from_value(fixture.wait_command(&linked, "applied"))
+        .expect("applied recipe linked send");
+    wait_fake_send_turn_result(&fixture, &agent, 2, &linked_send, RESUME_TEXT);
+
+    // Exactly one firing: the cleanup stop below must not refire the rule.
+    let cleanup: CommandSubmitResponse =
+        serde_json::from_value(fixture.json(&["stop", &agent, "--generation", "2"]))
+            .expect("typed recipe cleanup stop");
+    fixture.wait_command(&cleanup.command_id, "applied");
+    assert_eq!(
+        fixture
+            .events()
+            .iter()
+            .filter(|event| event["kind"] == "rule.fired" && event["data"]["rule"] == RULE_ID)
+            .count(),
+        1,
+        "recipe rule fires exactly once"
+    );
+    fixture.stop(false);
+}
+
+#[test]
+fn cli_recipe_bounded_goal_runs_exact_command_against_fake() {
+    // The recipe file carries exactly one command line plus comments; the
+    // test parses that line so CI proves the recipe text stays valid.
+    let command_lines: Vec<&str> = RECIPE_BOUNDED_GOAL
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    assert_eq!(
+        command_lines.len(),
+        1,
+        "bounded-goal recipe must carry exactly one command line"
+    );
+    let recipe_argv: Vec<&str> = command_lines[0].split_whitespace().collect();
+    assert!(
+        recipe_argv.starts_with(&["goal", "set", "AGENT"]),
+        "bounded-goal recipe must be a goal set command with an AGENT placeholder"
+    );
+
+    let mut fixture = Fixture::new("recipe bounded goal");
+    fixture.start();
+    let launched = fixture.json(&[
+        "launch",
+        "--profile",
+        "fake",
+        "--workspace",
+        fixture.workspace.to_str().unwrap(),
+    ]);
+    assert_eq!(launched["state"], "applied");
+    let agent = launched["target"]
+        .as_str()
+        .expect("recipe Fake agent")
+        .to_owned();
+    let generation = launched["generation"].as_i64().expect("recipe generation");
+    wait_agent_ready(
+        &fixture,
+        &agent,
+        generation,
+        "recipe bounded goal",
+        "recipe bounded goal",
+    );
+
+    // Only the documented AGENT placeholder is substituted; the flags, bound
+    // and check argv run exactly as written in the recipe.
+    let goal_args: Vec<String> = recipe_argv
+        .iter()
+        .map(|arg| {
+            if *arg == "AGENT" {
+                agent.clone()
+            } else {
+                (*arg).to_owned()
+            }
+        })
+        .collect();
+    let goal_refs = goal_args.iter().map(String::as_str).collect::<Vec<_>>();
+    let set = fixture.json(&goal_refs);
+    assert_eq!(set["revision"], 1);
+    assert_eq!(set["status"], "active");
+    assert_eq!(set["definition"]["check"], json!(["git", "--version"]));
+    assert_eq!(set["definition"]["max_rounds"], 5);
+
+    // One fake turn; its completion commits the idle event the automatic
+    // driver rounds on. No explicit `goal round` call follows.
+    let send_id = ulid::Ulid::new().to_string();
+    let send = cli(
+        &fixture.data,
+        &[
+            "--id",
+            &send_id,
+            "send",
+            &agent,
+            "--generation",
+            &generation.to_string(),
+            "--wait",
+            "--timeout-seconds",
+            "10",
+            "--",
+            "do some work",
+        ],
+    );
+    assert!(
+        send.status.success(),
+        "recipe fake send must complete: {}",
+        send.stderr.lines().next().unwrap_or("")
+    );
+    fixture.wait_command(&send_id, "applied");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let shown = loop {
+        let shown = fixture.json(&["goal", "show", &agent]);
+        if shown["status"] == "completed" {
+            break shown;
+        }
+        assert!(Instant::now() < deadline, "recipe auto round deadline");
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(shown["counters"]["rounds"], 1);
+    assert_eq!(shown["counters"]["last_exit_code"], 0);
+    assert!(
+        shown["last_round_key"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("idle:"),
+        "recipe auto round keys on the idle event"
+    );
+    let stop = fixture.json(&["stop", &agent]);
+    fixture.wait_command(
+        stop["command_id"].as_str().expect("stop command"),
+        "applied",
+    );
+    fixture.stop(false);
+}

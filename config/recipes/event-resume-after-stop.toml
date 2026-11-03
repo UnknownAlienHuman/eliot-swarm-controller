@@ -1,0 +1,19 @@
+# Recipe 2: resume the exact Codex agent/generation when its stop is applied.
+#
+# Copy this file to <data_dir>/rules/resume-after-known-stop.toml, then
+# replace YOUR_STOP_COMMAND_ID below with the ULID you will stop with:
+#
+#   eliot --id YOUR_STOP_COMMAND_ID stop <agent> --generation 1
+#
+# When that exact stop is applied, the rule resumes the agent into a new
+# generation with the text below as its linked first input. Verify with:
+#   eliot rule show resume-after-known-stop
+#
+# CI runs this exact file against the Fake profile (harness swapped to
+# "fake", stop id substituted, nothing else changed); the live Codex
+# demonstration is pending the owner's go-ahead.
+
+[[rule]]
+id = "resume-after-known-stop"
+on = { event = "command.applied", match = { "event.data.command_id" = "YOUR_STOP_COMMAND_ID", "event.data.state" = "applied", "subject.harness" = "codex" } }
+do = [{ action = "resume", target = "${event.agent}", expected_generation = "${event.generation}", text = "Continue after stop" }]

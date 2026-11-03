@@ -137,6 +137,46 @@ second callback above was cleared without being answered.
 The plugin uses `model/list` internally; a separate model-catalogue product/UI is not
 required. Keep the model choice in the profile, outside core types and tests.
 
+## Recipes
+
+Three copy-pasteable Codex-profile recipes live in
+[`config/recipes/`](../../config/recipes/). Each is Fake-tested in CI (profile
+swapped, nothing else changed); the live Codex demonstration is pending the
+owner's go-ahead.
+
+### 1. Hourly `git.fetch` of a registered project
+
+Copy `config/recipes/timer-git-fetch.toml` to `<data_dir>/rules/`, and register
+the project in `<data_dir>/config.toml` (the file header shows the exact
+`[projects.app]` snippet). Verify, then fire immediately with the same action:
+
+```powershell
+& $eliot --data-dir $dataDir timer show refresh-origin-main
+& $eliot --data-dir $dataDir timer run refresh-origin-main
+```
+
+### 2. Resume on an exact stop
+
+Copy `config/recipes/event-resume-after-stop.toml` to `<data_dir>/rules/`,
+replace `YOUR_STOP_COMMAND_ID` with a ULID, then stop with that id:
+
+```powershell
+& $eliot --data-dir $dataDir --id YOUR_STOP_COMMAND_ID stop $agent --generation 1
+```
+
+When that exact stop is applied, the rule resumes the agent into a new
+generation. Verify with `rule show resume-after-known-stop`.
+
+### 3. Bounded Eliot-mode Goal
+
+```powershell
+& $eliot --data-dir $dataDir goal set $agent --text keep-green --max-rounds 5 --check git --version
+```
+
+The daemon rounds automatically on the next idle event; `git --version` is an
+exit-0 placeholder — replace it with a check that exits 0 when the goal holds.
+Verify with `goal show $agent`.
+
 ## Identity, transport and ownership
 
 Native subject is `(canonical Codex store/account scope, exact thread id)`. The native
