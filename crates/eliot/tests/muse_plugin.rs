@@ -44,6 +44,16 @@ fn main() {
         println!("ok - failed turn reports its restriction");
         scenario_lost_reply_is_unknown_without_rewrite().await;
         println!("ok - lost reply is unknown without a second write");
+        scenario_turn_start_internal_error_is_unknown_without_rewrite().await;
+        println!("ok - turn/start -32603 is unknown without a second write");
+        scenario_turn_start_steered_latches_unknown().await;
+        println!("ok - steered turn/start latches unknown without a second write");
+        scenario_effort_mismatch_is_rejected_before_ready().await;
+        println!("ok - effort mismatch is rejected before session.ready");
+        scenario_model_mismatch_is_rejected_before_ready().await;
+        println!("ok - model mismatch is rejected before session.ready");
+        scenario_workspace_mismatch_is_rejected_before_ready().await;
+        println!("ok - workspace mismatch is rejected before session.ready");
         scenario_invalid_profile_rejected_before_spawn().await;
         println!("ok - invalid profile rejected before spawn");
     });
@@ -127,11 +137,21 @@ impl FakeMsp {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned();
+                let workspace = if self.script == "cwd-mismatch" {
+                    "C:\\other-workspace".to_owned()
+                } else {
+                    workspace
+                };
                 let model = params
                     .get("modelId")
                     .and_then(Value::as_str)
                     .unwrap_or(MODEL)
                     .to_owned();
+                let model = if self.script == "model-mismatch" {
+                    "other-model".to_owned()
+                } else {
+                    model
+                };
                 let cursor = self.next_cursor();
                 let session = self.session_object(&session_id, "idle", None, &model, &workspace);
                 self.reply(
@@ -151,12 +171,61 @@ impl FakeMsp {
                     &id,
                     json!({"commandId": command, "status": "accepted"}),
                 );
+                // The durable reconfigure record lands with the ack; serve its
+                // view event so the start path can read the standing default
+                // back through `view/page`.
+                let effort = params
+                    .get("reasoningEffort")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let effort = if self.script == "effort-mismatch" {
+                    "low".to_owned()
+                } else {
+                    effort
+                };
+                let session_id = self.session_id.clone().unwrap_or_default();
+                let cursor = self.next_cursor();
+                self.emit(
+                    stdout,
+                    "session/reasoningEffortChanged",
+                    json!({
+                        "reasoningEffort": effort,
+                        "sessionId": session_id,
+                        "source": "user",
+                        "sourceRange": Self::source_range(),
+                        "viewCursor": cursor,
+                    }),
+                );
             }
             "turn/start" => {
                 if self.script == "drop-turn-start" {
                     // Lost reply: exit without answering. The report already
                     // records this receipt.
                     std::process::exit(0);
+                }
+                if self.script == "turn-start-internal-error" {
+                    self.reply_error(stdout, &id, -32603, "Internal error");
+                    return true;
+                }
+                if self.script == "turn-start-steered" {
+                    let command = params
+                        .get("commandId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    self.reply(
+                        stdout,
+                        &id,
+                        json!({
+                            "commandId": command,
+                            "disposition": "steered",
+                            "startedNewTurn": false,
+                            "status": "accepted",
+                            "turnId": "fake-foreign-turn",
+                        }),
+                    );
+                    return true;
                 }
                 let command = params
                     .get("commandId")
@@ -1458,7 +1527,100 @@ async fn scenario_lost_reply_is_unknown_without_rewrite() {
     let _ = std::fs::remove_dir_all(&scenario.root);
 }
 
-async fn scenario_invalid_profile_rejected_before_spawn() {
+async fn scenario_turn_start_internal_error_is_unknown_without_rewrite() {
+    send_unknown_without_rewrite("turn-start-internal-error").await;
+}
+
+async fn scenario_turn_start_steered_latches_unknown() {
+    send_unknown_without_rewrite("turn-start-steered").await;
+}
+
+/// Drive one send against a script whose `turn/start` never applies the
+/// input: the send is unknown, a retained retry stays unknown without new
+/// native I/O, and a fresh send proves the session latched unknown.
+async fn send_unknown_without_rewrite(script: &str) {
+    let mut scenario = Scenario::start(script, muse_profile()).await;
+    let agent_id = scenario.agent_id.clone();
+    let send_id = ulid::Ulid::new().to_string();
+    let outcome = scenario
+        .host
+        .call(
+            "agent.command",
+            json!({
+                "agent_id": agent_id,
+                "generation": 1,
+                "command_id": send_id,
+                "verb": "send",
+                "args": {"text": "Into the disputed turn."},
+                "turn_id": null,
+                "request_id": null,
+            }),
+        )
+        .await;
+    assert_eq!(outcome, Err("unknown".to_owned()));
+    // A retained retry of the same command stays unknown without new I/O.
+    let retry = scenario
+        .host
+        .call(
+            "agent.command",
+            json!({
+                "agent_id": agent_id,
+                "generation": 1,
+                "command_id": send_id,
+                "verb": "send",
+                "args": {"text": "Into the disputed turn."},
+                "turn_id": null,
+                "request_id": null,
+            }),
+        )
+        .await;
+    assert_eq!(retry, Err("unknown".to_owned()));
+    // The session latched unknown: even a fresh command cannot proceed.
+    let fresh = scenario
+        .host
+        .call(
+            "agent.command",
+            json!({
+                "agent_id": agent_id,
+                "generation": 1,
+                "command_id": ulid::Ulid::new().to_string(),
+                "verb": "send",
+                "args": {"text": "After the latch."},
+                "turn_id": null,
+                "request_id": null,
+            }),
+        )
+        .await;
+    assert_eq!(fresh, Err("unknown".to_owned()));
+    assert_eq!(scenario.report()["turn_starts"], json!(1));
+    stop_agent(&mut scenario.host, &agent_id, false).await;
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+    assert_eq!(scenario.report()["turn_starts"], json!(1));
+    let _ = std::fs::remove_dir_all(&scenario.root);
+}
+
+async fn scenario_effort_mismatch_is_rejected_before_ready() {
+    start_mismatch_before_ready("effort-mismatch").await;
+}
+
+async fn scenario_model_mismatch_is_rejected_before_ready() {
+    start_mismatch_before_ready("model-mismatch").await;
+}
+
+async fn scenario_workspace_mismatch_is_rejected_before_ready() {
+    start_mismatch_before_ready("cwd-mismatch").await;
+}
+
+/// Drive `agent.start` against a script whose effective settings disagree
+/// with the frozen profile: the start fails `profile_error` with no
+/// `session.ready` batch, and a retained retry repeats the stored error
+/// without new native I/O.
+async fn start_mismatch_before_ready(script: &str) {
     let root: PathBuf = std::env::temp_dir().join(format!(
         "eliot-muse-plugin-test-{}",
         ulid::Ulid::new().to_string().to_lowercase()
@@ -1480,25 +1642,122 @@ async fn scenario_invalid_profile_rejected_before_spawn() {
     .await
     .expect("initialize");
     let start_id = ulid::Ulid::new().to_string();
-    let outcome = host
-        .call(
-            "agent.start",
-            json!({
-                "agent_id": agent_id,
-                "generation": 1,
-                "command_id": start_id,
-                "profile": {"harness": "muse"},
-                "workspace": root.join("workspace").to_string_lossy(),
-                "target_environment": {},
-                "note": null,
-                "source_plan": {"session": "stream", "turn": "stream", "message": "stream"},
-                "source_state": null,
-                "resume_from": null,
-                "initial": null,
-            }),
-        )
-        .await;
+    let self_exe = std::env::current_exe().expect("test executable");
+    let mut full_profile = muse_profile();
+    full_profile["cmd"] = Value::String(self_exe.to_string_lossy().into_owned());
+    let start_params = json!({
+        "agent_id": agent_id,
+        "generation": 1,
+        "command_id": start_id,
+        "profile": full_profile,
+        "workspace": root.join("workspace").to_string_lossy(),
+        "target_environment": {
+            "ELIOT_FAKE_MSP_SCRIPT": script,
+            "ELIOT_FAKE_MSP_REPORT": root.join("report.json").to_string_lossy(),
+        },
+        "note": null,
+        "source_plan": {"session": "stream", "turn": "stream", "message": "stream"},
+        "source_state": null,
+        "resume_from": null,
+        "initial": null,
+    });
+    let rx = host.begin_call("agent.start", start_params.clone()).await;
+    let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
+    let outcome = loop {
+        tokio::select! {
+            biased;
+            request = host.next_request() => {
+                match request.method.as_str() {
+                    "process.put" => {
+                        let pid = request.params.get("pid").and_then(Value::as_u64).unwrap_or(0);
+                        assert!(pid > 0);
+                        host.respond(&request.id, json!({
+                            "identity": {"host_boot_id": "test-boot", "pid": pid, "start_time": 1},
+                            "owner": format!("agent:{agent_id}#1"),
+                            "role": "harness",
+                            "state": "running",
+                            "exit_code": null,
+                            "updated_at": 1,
+                        })).await;
+                    }
+                    other => panic!("no session.ready or gap may publish before the settings check: {other}"),
+                }
+            }
+            result = &mut rx => break result,
+        }
+    };
+    let outcome = outcome
+        .expect("agent.start deadline")
+        .expect("agent.start response channel");
     assert_eq!(outcome, Err("profile_error".to_owned()));
+    // A retained retry of the same start repeats the stored error without
+    // new native I/O.
+    let retry = host.call("agent.start", start_params).await;
+    assert_eq!(retry, Err("profile_error".to_owned()));
+    host.call("shutdown", json!({})).await.expect("shutdown");
+    host.shutdown_child().await;
+    let report: Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("report.json")).expect("fake MSP report"),
+    )
+    .expect("fake MSP report JSON");
+    assert_eq!(report["session_starts"], json!(1));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+async fn scenario_invalid_profile_rejected_before_spawn() {
+    let root: PathBuf = std::env::temp_dir().join(format!(
+        "eliot-muse-plugin-test-{}",
+        ulid::Ulid::new().to_string().to_lowercase()
+    ));
+    std::fs::create_dir_all(root.join("data")).unwrap();
+    std::fs::create_dir_all(root.join("instance")).unwrap();
+    std::fs::create_dir_all(root.join("workspace")).unwrap();
+    let agent_id = ulid::Ulid::new().to_string();
+    let mut host = Host::spawn(&root).await;
+    host.call(
+        "initialize",
+        json!({
+            "protocol": "eliot-plugin/1",
+            "credential": format!("credential-{}", ulid::Ulid::new()),
+            "instance_dir": root.join("instance").to_string_lossy(),
+            "config": {},
+        }),
+    )
+    .await
+    .expect("initialize");
+    // Missing model, then missing explicit cmd: both fail before any spawn.
+    for profile in [
+        json!({"harness": "muse"}),
+        json!({
+            "harness": "muse",
+            "model": MODEL,
+            "effort": EFFORT,
+            "permissions": "workspace-write",
+            "approval_policy": "never",
+            "pass_env": [],
+        }),
+    ] {
+        let start_id = ulid::Ulid::new().to_string();
+        let outcome = host
+            .call(
+                "agent.start",
+                json!({
+                    "agent_id": agent_id,
+                    "generation": 1,
+                    "command_id": start_id,
+                    "profile": profile,
+                    "workspace": root.join("workspace").to_string_lossy(),
+                    "target_environment": {},
+                    "note": null,
+                    "source_plan": {"session": "stream", "turn": "stream", "message": "stream"},
+                    "source_state": null,
+                    "resume_from": null,
+                    "initial": null,
+                }),
+            )
+            .await;
+        assert_eq!(outcome, Err("profile_error".to_owned()));
+    }
     host.call("shutdown", json!({})).await.expect("shutdown");
     host.shutdown_child().await;
     let report = root.join("report.json");

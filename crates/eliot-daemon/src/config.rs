@@ -1024,10 +1024,12 @@ fn snapshot_from_entry(
     Ok(Value::Object(snapshot))
 }
 
-/// Freeze a Muse profile. The PR1 slice carries an explicit model id and an
-/// optional reasoning effort; collaboration presets, adopted routes and
-/// non-default permission/approval postures stay rejected until their native
-/// mappings land.
+/// Freeze a Muse profile. The PR1 slice carries an explicit model id, a
+/// required explicit native `cmd` (no PATH default: resolving `muse` would
+/// land on the launcher wrapper and orphan the host on stop) and an optional
+/// reasoning effort; collaboration presets, adopted routes and non-default
+/// permission/approval postures stay rejected until their native mappings
+/// land.
 fn muse_snapshot_from_entry(
     name: &str,
     entry: &ProfileEntry,
@@ -1108,8 +1110,17 @@ fn muse_snapshot_from_entry(
         None => Vec::new(),
     };
     let cmd = match entry.cmd.as_deref() {
-        Some(cmd) => Some(validate_cmd(name, cmd, source, table_offset)?),
-        None => None,
+        Some(cmd) => validate_cmd(name, cmd, source, table_offset)?,
+        None => {
+            return Err(profile_field_error(
+                source,
+                table_offset,
+                name,
+                "cmd",
+                "required explicit cmd is missing",
+                "profile_error",
+            ));
+        }
     };
     crate::setup::validate_entries(&entry.setup).map_err(|error| {
         profile_field_error(
@@ -1133,9 +1144,7 @@ fn muse_snapshot_from_entry(
     })?;
     let mut snapshot = serde_json::Map::new();
     snapshot.insert("harness".to_owned(), Value::String("muse".to_owned()));
-    if let Some(cmd) = cmd {
-        snapshot.insert("cmd".to_owned(), Value::String(cmd));
-    }
+    snapshot.insert("cmd".to_owned(), Value::String(cmd));
     snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
     if let Some(effort) = effort {
         snapshot.insert("effort".to_owned(), Value::String(effort.to_owned()));
@@ -1449,6 +1458,18 @@ fn validate_cmd(profile: &str, cmd: &str, source: &str, offset: usize) -> core::
     const BACKSLASH: char = '\\';
     let file = cmd.rsplit(['/', BACKSLASH]).next().unwrap_or(cmd);
     let lower = file.to_ascii_lowercase();
+    // Script wrappers resolve to a launcher PID that would orphan the real
+    // native host on stop; only a native binary keeps PID custody exact.
+    if lower.ends_with(".cmd") || lower.ends_with(".bat") || lower.ends_with(".ps1") {
+        return Err(profile_field_error(
+            source,
+            offset,
+            profile,
+            "cmd",
+            "must name one native executable path, not a .cmd/.bat/.ps1 wrapper",
+            "profile_error",
+        ));
+    }
     let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
     const SHELLS: &[&str] = &[
         "sh",
@@ -2494,6 +2515,35 @@ pass_env = ["EXAMPLE_API_KEY"]
         ] {
             assert!(resolve_text_profile(source, "muse").is_err(), "{source}");
         }
+        // No PATH default: an explicit native cmd is required, and script
+        // wrappers are rejected (their PID would orphan the host on stop).
+        for source in [
+            "[profiles.muse]\nharness='muse'\nmodel='muse-spark-1.3-contributor'\n",
+            "[profiles.muse]\nharness='muse'\nmodel='muse-spark-1.3-contributor'\ncmd='C:/Tools/MuseCode/muse.cmd'\n",
+            "[profiles.muse]\nharness='muse'\nmodel='muse-spark-1.3-contributor'\ncmd='C:/Tools/MuseCode/muse.bat'\n",
+            "[profiles.muse]\nharness='muse'\nmodel='muse-spark-1.3-contributor'\ncmd='C:/Tools/MuseCode/launch.ps1'\n",
+        ] {
+            let error = resolve_text_profile(source, "muse").expect_err("must reject");
+            assert_eq!(error.code, "profile_error", "{source}");
+        }
+    }
+
+    #[test]
+    fn script_wrapper_cmd_is_rejected_for_codex_too() {
+        for cmd in [
+            "C:/Tools/Codex/codex.cmd",
+            "codex.bat",
+            "C:/Tools/launch.ps1",
+        ] {
+            let source = format!(
+                "[profiles.codex-luna]\nharness='codex'\nmodel='gpt-6-luna'\ncmd='{cmd}'\n"
+            );
+            let error = resolve_text_profile(&source, "codex-luna").expect_err("must reject");
+            assert_eq!(error.code, "profile_error", "{source}");
+        }
+        let source = "[profiles.codex-luna]\nharness='codex'\nmodel='gpt-6-luna'\ncmd='C:/Tools/Codex/codex.exe'\n";
+        let snapshot = resolve_text_profile(source, "codex-luna").unwrap();
+        assert_eq!(snapshot["cmd"], "C:/Tools/Codex/codex.exe");
     }
 
     #[test]

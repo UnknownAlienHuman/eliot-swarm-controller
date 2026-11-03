@@ -14,9 +14,9 @@ use serde::{Deserialize, Serialize};
 // JSON-RPC envelope
 // ---------------------------------------------------------------------------
 
-/// Minimal JSON-RPC error body. PR1 maps `interrupted`/`cancelled` request
-/// errors to unknown (the write may have applied); every other request error
-/// proves the command was not admitted.
+/// Minimal JSON-RPC error body. Only pre-admission/validation errors prove
+/// the command was not admitted (`native_rejected`); `interrupted`/`cancelled`
+/// and every other request error leave the write outcome uncertain (unknown).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NativeJsonRpcErrorBody {
     pub code: i64,
@@ -26,10 +26,14 @@ pub struct NativeJsonRpcErrorBody {
 }
 
 impl NativeJsonRpcErrorBody {
-    /// Whether this request error leaves the write outcome uncertain.
-    /// Schema `errors` table: `-32013 interrupted`, `-32014 cancelled`.
-    pub fn is_uncertain_write(&self) -> bool {
-        matches!(self.code, -32013 | -32014)
+    /// Whether this request error proves the command was not admitted: the
+    /// JSON-RPC pre-admission/validation failures (`-32700` parse, `-32600`
+    /// invalid request, `-32601` method not found, `-32602` invalid params)
+    /// plus the MSP admission-failure kind `-32030 commandRejected` (the SS3.6
+    /// admission-failure table). Everything else — including `-32603`
+    /// internal and unknown future kinds — is unknown, never rejected.
+    pub fn is_not_admitted(&self) -> bool {
+        matches!(self.code, -32700 | -32600 | -32601 | -32602 | -32030)
     }
 }
 
@@ -349,6 +353,19 @@ pub struct NativeViewGapNotification {
     pub session_id: String,
 }
 
+/// `session/reasoningEffortChanged` params: a durable session-default
+/// reasoning-effort change took effect. The schema's `ReasoningEffortState`
+/// (the `ViewSnapshot.state.reasoningEffort` source of truth) is the fold of
+/// the same record — "the same pair this notification carries" — so folding
+/// the latest such view event reads back the standing default without a
+/// second lifecycle write. Only the compared fields are modelled.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeSessionReasoningEffortChangedNotification {
+    pub reasoning_effort: String,
+    pub session_id: String,
+}
+
 // ---------------------------------------------------------------------------
 // view/page readback (SS4.7.3)
 // ---------------------------------------------------------------------------
@@ -395,22 +412,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn uncertain_write_errors_are_only_interrupted_and_cancelled() {
-        for code in [-32013, -32014] {
+    fn only_pre_admission_errors_prove_no_write() {
+        for code in [-32700, -32600, -32601, -32602, -32030] {
             let body = NativeJsonRpcErrorBody {
                 code,
-                message: "interrupted".to_owned(),
+                message: "not admitted".to_owned(),
                 data: None,
             };
-            assert!(body.is_uncertain_write(), "code={code}");
+            assert!(body.is_not_admitted(), "code={code}");
         }
-        for code in [-32700, -32600, -32601, -32602, -32001, -32010, -32031] {
+        // Internal errors, uncertain writes, all other MSP kinds and unknown
+        // future codes never prove rejection; the caller maps them to unknown.
+        for code in [
+            -32603, -32001, -32002, -32010, -32011, -32013, -32014, -32020, -32021, -32022, -32024,
+            -32025, -32031, -32032, -32040, -32041, -32042, -32050, -32999, 0,
+        ] {
             let body = NativeJsonRpcErrorBody {
                 code,
-                message: "rejected".to_owned(),
+                message: "uncertain".to_owned(),
                 data: None,
             };
-            assert!(!body.is_uncertain_write(), "code={code}");
+            assert!(!body.is_not_admitted(), "code={code}");
         }
     }
 

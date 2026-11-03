@@ -607,15 +607,21 @@ async fn read_native_stream(
                 }
                 let result = match (response.result, response.error) {
                     (Some(result), None) => Ok(result),
-                    // Schema errors table: `interrupted`/`cancelled` request errors
-                    // mean the call itself was cut short, so an admitted write
-                    // cannot be ruled out. Every other request error proves the
-                    // command was not admitted.
-                    (None, Some(error)) if error.is_uncertain_write() => Err(Error::new(
+                    // Schema errors table: only pre-admission/validation
+                    // errors prove the command was not admitted. Anything
+                    // else — `interrupted`/`cancelled`, `-32603` internal,
+                    // all other MSP kinds, unknown codes — leaves an admitted
+                    // write unruled-out, so it is unknown, never rejected.
+                    (None, Some(error)) if error.is_not_admitted() => {
+                        Err(Error::new("native_rejected", error.message))
+                    }
+                    (None, Some(error)) => Err(Error::new(
                         "unknown",
-                        "Muse request error left its write outcome uncertain",
+                        format!(
+                            "Muse request error {} left its write outcome uncertain",
+                            error.code
+                        ),
                     )),
-                    (None, Some(error)) => Err(Error::new("native_rejected", error.message)),
                     _ => Err(Error::new(
                         "native_protocol",
                         "Muse response must contain exactly one result or error",

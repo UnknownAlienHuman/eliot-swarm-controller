@@ -7,9 +7,10 @@ use crate::{
             NativeInitializeResult, NativeItemCompletedNotification, NativeModelCatalogEntry,
             NativeModelEffortVariants, NativeModelListParams, NativeModelListResult, NativeSession,
             NativeSessionReadParams, NativeSessionReadResult,
-            NativeSessionSetReasoningEffortParams, NativeSessionSetReasoningEffortResult,
-            NativeSessionStartParams, NativeSessionStartResult, NativeTurnCompletedNotification,
-            NativeTurnInputPart, NativeTurnStartParams, NativeTurnStartResult, NativeTurnTerminal,
+            NativeSessionReasoningEffortChangedNotification, NativeSessionSetReasoningEffortParams,
+            NativeSessionSetReasoningEffortResult, NativeSessionStartParams,
+            NativeSessionStartResult, NativeTurnCompletedNotification, NativeTurnInputPart,
+            NativeTurnStartParams, NativeTurnStartResult, NativeTurnTerminal,
             NativeUnframedViewEvent, NativeViewPageParams, NativeViewPageResult,
             is_reasoning_effort_tier,
         },
@@ -306,22 +307,20 @@ impl MusePlugin {
                 "Muse workspace must be an existing directory",
             ));
         }
+        // No PATH default: resolving `muse` would land on the `muse.cmd`
+        // launcher wrapper, whose PID would orphan the real `muse serve`
+        // host on stop. The frozen profile must name the native binary.
         let program = profile
             .get("cmd")
-            .map(|value| {
-                value
-                    .as_str()
-                    .filter(|program| !program.trim().is_empty())
-                    .map(OsString::from)
-                    .ok_or_else(|| {
-                        Error::new(
-                            "profile_error",
-                            "Muse profile cmd must be one executable path",
-                        )
-                    })
-            })
-            .transpose()?
-            .unwrap_or_else(|| OsString::from("muse"));
+            .and_then(Value::as_str)
+            .filter(|program| !program.trim().is_empty())
+            .map(OsString::from)
+            .ok_or_else(|| {
+                Error::new(
+                    "profile_error",
+                    "Muse profile requires an explicit cmd naming one executable path",
+                )
+            })?;
         let TargetEnvironment {
             variables: environment,
             mut secrets,
@@ -507,7 +506,9 @@ impl MusePlugin {
             ));
         }
         // Apply the frozen profile effort as the session default before
-        // readiness; the ack echoes the exact admitted tier.
+        // readiness. The ack proves admission only (it echoes the command id,
+        // not the tier), so the standing default is read back from the durable
+        // view and compared; `effort_verified` holds only on an exact match.
         let mut effort_verified = false;
         if let Some(effort) = initialized_native.effort.as_deref() {
             let effort_command = new_command_id();
@@ -577,7 +578,7 @@ impl MusePlugin {
                     &mut session,
                     Error::new(
                         "profile_error",
-                        "Muse session/setReasoningEffort did not echo the exact admitted effort",
+                        "Muse session/setReasoningEffort did not acknowledge the exact submitted command",
                     ),
                 )
                 .await;
@@ -589,7 +590,25 @@ impl MusePlugin {
                 });
                 return Err(error);
             }
-            effort_verified = true;
+            let effective_effort = match read_effective_reasoning_effort(
+                &session.native_client,
+                &started.session.session_id,
+            )
+            .await
+            {
+                Ok(effort) => effort,
+                Err(error) => {
+                    let error = discard_failed_start(&mut session, error).await;
+                    self.failed_start = Some(FailedStart {
+                        agent_id: params.agent_id,
+                        generation: params.generation,
+                        command_id: params.command_id,
+                        error: error.clone(),
+                    });
+                    return Err(error);
+                }
+            };
+            effort_verified = effective_effort.as_deref() == Some(effort);
         }
         let effective = json!({
             "model": started.session.model_id.clone(),
@@ -599,12 +618,33 @@ impl MusePlugin {
             "effort_verified": effort_verified,
             "schema_fingerprint": initialized_native.fingerprint.clone(),
         });
-        let settings_match = started.session.model_id.as_deref() == Some(requested_model.as_str())
+        // The effective settings are checked BEFORE readiness: on any
+        // mismatch no `session.ready` is published and no session is kept.
+        let effort_match = initialized_native.effort.is_none() || effort_verified;
+        let settings_match = effort_match
+            && started.session.model_id.as_deref() == Some(requested_model.as_str())
             && started
                 .session
                 .workspace_root
                 .as_deref()
                 .is_some_and(|root| paths_equal(Path::new(root), &workspace));
+        if !settings_match {
+            let error = discard_failed_start(
+                &mut session,
+                Error::new(
+                    "profile_error",
+                    "Muse effective model, workspace root, or reasoning effort did not match the frozen profile",
+                ),
+            )
+            .await;
+            self.failed_start = Some(FailedStart {
+                agent_id: params.agent_id,
+                generation: params.generation,
+                command_id: params.command_id,
+                error: error.clone(),
+            });
+            return Err(error);
+        }
         if let Err(error) = session
             .events
             .ready(
@@ -622,20 +662,6 @@ impl MusePlugin {
                     "Muse session is known but session.ready was not acknowledged: {}",
                     error.message
                 ),
-            ));
-        }
-        if !settings_match {
-            session.phase = SessionPhase::Ready;
-            let stopped = terminate_session(&mut session, true).await.is_ok();
-            if stopped {
-                session.phase = SessionPhase::Stopped;
-            } else {
-                session.phase = SessionPhase::Unknown;
-            }
-            self.session = Some(session);
-            return Err(Error::new(
-                "profile_error",
-                "Muse effective model or workspace root did not match the frozen profile",
             ));
         }
         session.phase = SessionPhase::Ready;
@@ -869,8 +895,7 @@ impl MusePlugin {
         };
         // The ack is authoritative: take the turn id from it, verify it echoes
         // the exact submitted command, and accept only a started or queued
-        // disposition. A steered disposition would mean this input joined a
-        // turn it did not create, which PR1 cannot track.
+        // disposition.
         let started: NativeTurnStartResult =
             match serde_json::from_value::<NativeTurnStartResult>(response) {
                 Ok(started)
@@ -880,6 +905,21 @@ impl MusePlugin {
                         && started.status == "accepted" =>
                 {
                     started
+                }
+                Ok(steered)
+                    if steered.command_id == native_command_id
+                        && steered.disposition.as_str() == "steered" =>
+                {
+                    // A steered disposition means this input joined a live turn
+                    // it did not create. PR1 holds single-flight and cannot
+                    // associate that input exactly, so the command and the
+                    // session latch unknown; the input is never resubmitted.
+                    session.unknown_commands.insert(command_id);
+                    session.phase = SessionPhase::Unknown;
+                    return Err(Error::new(
+                        "unknown",
+                        "Muse turn/start steered the input into a turn it did not create",
+                    ));
                 }
                 _ => {
                     session.unknown_commands.insert(command_id);
@@ -1231,6 +1271,53 @@ async fn read_owned_session(client: &NativeClient, session_id: &str) -> Result<N
         ));
     }
     Ok(response.session)
+}
+
+/// Read back the standing session-default reasoning effort: the newest
+/// `session/reasoningEffortChanged` view event for the exact session. The set
+/// call's ack proves admission only, so the start path compares this readback
+/// against the requested tier before readiness.
+async fn read_effective_reasoning_effort(
+    client: &NativeClient,
+    session_id: &str,
+) -> Result<Option<String>> {
+    // The set just landed at the view head, so one backward page from the
+    // head holds it; anything else writing here would be a foreign host.
+    let params = NativeViewPageParams {
+        session_id: session_id.to_owned(),
+        limit: VIEW_PAGE_SIZE,
+        direction: Some("backward".to_owned()),
+        cursor: None,
+    };
+    let response: NativeViewPageResult = serde_json::from_value(
+        client
+            .call(
+                "view/page",
+                serde_json::to_value(params).map_err(|_| {
+                    Error::new("internal", "Muse view/page params could not be encoded")
+                })?,
+                Instant::now() + RPC_TIMEOUT,
+            )
+            .await?,
+    )
+    .map_err(|_| Error::new("native_readback", "Muse view/page response was invalid"))?;
+    for event in response.events.iter().rev() {
+        if event.method.as_str() != "session/reasoningEffortChanged" {
+            continue;
+        }
+        let changed: NativeSessionReasoningEffortChangedNotification =
+            serde_json::from_value(event.params.clone()).map_err(|_| {
+                Error::new(
+                    "native_readback",
+                    "Muse view session/reasoningEffortChanged did not match the 1.4 schema",
+                )
+            })?;
+        if changed.session_id != session_id {
+            continue;
+        }
+        return Ok(Some(changed.reasoning_effort));
+    }
+    Ok(None)
 }
 
 async fn read_owned_turn(
