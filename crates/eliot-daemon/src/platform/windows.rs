@@ -17,9 +17,9 @@ use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND,
-    ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, FILETIME, GetLastError, HANDLE, HLOCAL,
-    INVALID_HANDLE_VALUE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND,
+    ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, ERROR_SHARING_VIOLATION, FILETIME, GetLastError,
+    HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -410,24 +410,38 @@ pub(super) fn set_test_untrusted_file_acl(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// How long `replace_file` waits out readers that hold the target open.
+const REPLACE_CONTENTION: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Replace `target` with `source`. Any open handle on the target, even one that
+/// shares delete access, makes `MoveFileExW` fail with `ERROR_ACCESS_DENIED`, and
+/// CLI clients read `daemon.json` while a restarting daemon republishes it. Those
+/// reads are brief, so the local, idempotent rename is retried for a bounded time.
 pub(crate) fn replace_file(source: &Path, target: &Path) -> Result<()> {
     let source_wide = wide_path(source);
     let target_wide = wide_path(target);
-    // SAFETY: both paths are NUL-terminated UTF-16 strings for this call.
-    if unsafe {
-        MoveFileExW(
-            source_wide.as_ptr(),
-            target_wide.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    } == 0
-    {
-        Err(io_error(
-            "replace daemon metadata",
-            std::io::Error::last_os_error(),
-        ))
-    } else {
-        Ok(())
+    let deadline = std::time::Instant::now() + REPLACE_CONTENTION;
+    loop {
+        // SAFETY: both paths are NUL-terminated UTF-16 strings for this call.
+        if unsafe {
+            MoveFileExW(
+                source_wide.as_ptr(),
+                target_wide.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        } != 0
+        {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        let contended = matches!(
+            error.raw_os_error().map(|code| code as u32),
+            Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION)
+        );
+        if !contended || std::time::Instant::now() >= deadline {
+            return Err(io_error("replace daemon metadata", error));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 

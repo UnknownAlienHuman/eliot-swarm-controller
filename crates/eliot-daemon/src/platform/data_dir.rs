@@ -563,6 +563,33 @@ mod tests {
     }
 
     #[test]
+    fn republish_waits_out_a_reader_holding_daemon_metadata_open() {
+        let root = TestRoot::new();
+        let data = DataDir::open(&root.path).expect("initialize private data directory");
+        let lock = data.acquire_daemon_lock().expect("daemon lock");
+        data.publish_daemon(&lock, "first-endpoint", "test")
+            .expect("first publish");
+        // A CLI client reading daemon.json while a restarted daemon republishes it.
+        let reader = File::open(data.path().join(DAEMON_INFO_FILE)).expect("open metadata");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(reader);
+        });
+        let info = data
+            .publish_daemon(&lock, "second-endpoint", "test")
+            .expect("republish while a reader briefly holds the file");
+        release.join().expect("reader thread");
+        assert_eq!(info.endpoint, "second-endpoint");
+        assert_eq!(
+            data.read_daemon_info()
+                .expect("read metadata")
+                .expect("metadata present")
+                .endpoint,
+            "second-endpoint"
+        );
+    }
+
+    #[test]
     fn daemon_metadata_read_rejects_and_preserves_unsafe_acl() {
         let root = TestRoot::new();
         let data = DataDir::open(&root.path).expect("initialize private data directory");
