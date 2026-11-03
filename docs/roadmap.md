@@ -195,7 +195,7 @@ No second executor, workflow graph or acceptance engine.
       catch-up. Interval/cron/once/manual timers and action limits use ordinary command
       admission; connected timer and event-rule action support is defined in the
       [automation spec](spec/automation.md).
-- [ ] **L4.2 Actions/scripts.** Agent commands first, then bounded explicit scripts.
+- [x] **L4.2 Actions/scripts.** Agent commands first, then bounded explicit scripts.
       Frozen inputs, scoped principal, exit/output handling and unknown outcomes use
       normal commands. Add Git fetch/push wrappers only with their concrete recipe;
       direct harness Git remains harness work, not intercepted by Eliot.

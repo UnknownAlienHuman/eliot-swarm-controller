@@ -1,7 +1,8 @@
 //! Grammar for the implemented command/turn/result read calls. These identifiers
 //! select existing records; they never admit or retry an external effect.
 
-use crate::{Agent, Error, Result, Turn};
+use super::mutations::nullable;
+use crate::{Agent, Command, Error, Result, Turn};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -192,6 +193,54 @@ impl AgentResultRequest {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandChildrenRequest {
+    #[serde(deserialize_with = "required_id")]
+    pub id: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_id"
+    )]
+    pub after: Option<String>,
+    #[serde(
+        default = "super::default_limit",
+        deserialize_with = "super::event_limit"
+    )]
+    pub limit: usize,
+}
+
+impl CommandChildrenRequest {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            after: None,
+            limit: super::DEFAULT_LIMIT,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        validate_id(&self.id)?;
+        if let Some(after) = &self.after {
+            validate_id(after)?;
+        }
+        if !(1..=super::MAX_LIMIT).contains(&self.limit) {
+            return Err(Error::new("invalid", "limit must be between 1 and 1000"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandChildrenResponse {
+    #[serde(deserialize_with = "object_commands")]
+    pub children: Vec<Command>,
+    #[serde(deserialize_with = "nullable")]
+    pub next: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentResultResponse {
     pub agent: String,
@@ -270,6 +319,18 @@ fn object_agent<'de, D: serde::Deserializer<'de>>(
 fn object_turns<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<Vec<Turn>, D::Error> {
+    let objects = Vec::<Map<String, Value>>::deserialize(deserializer)?;
+    objects
+        .into_iter()
+        .map(|object| {
+            serde_json::from_value(Value::Object(object)).map_err(serde::de::Error::custom)
+        })
+        .collect()
+}
+
+fn object_commands<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<Command>, D::Error> {
     let objects = Vec::<Map<String, Value>>::deserialize(deserializer)?;
     objects
         .into_iter()
@@ -562,6 +623,95 @@ mod tests {
             let mut wire = result_wire();
             wire["turns"] = json!([entry]);
             assert!(serde_json::from_value::<AgentResultResponse>(wire).is_err());
+        }
+    }
+
+    #[test]
+    fn children_request_defaults_limit_and_keeps_ids_verbatim() {
+        let request: CommandChildrenRequest =
+            serde_json::from_value(json!({"id":"parent-1"})).unwrap();
+        assert_eq!(request, CommandChildrenRequest::new("parent-1"));
+        assert_eq!(request.after, None);
+        assert_eq!(request.limit, 100);
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            json!({"id":"parent-1","limit":100})
+        );
+        let cursor: CommandChildrenRequest =
+            serde_json::from_value(json!({"id":" parent ","after":" child ","limit":7})).unwrap();
+        assert_eq!(cursor.id, " parent ");
+        assert_eq!(cursor.after.as_deref(), Some(" child "));
+        assert_eq!(cursor.limit, 7);
+        cursor.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(&cursor).unwrap(),
+            json!({"id":" parent ","after":" child ","limit":7})
+        );
+    }
+
+    #[test]
+    fn children_request_rejects_null_wrong_types_and_bad_limits() {
+        for bad in [
+            json!({}),
+            json!({"id":null}),
+            json!({"id":1}),
+            json!({"id":""}),
+            json!({"id":" \t "}),
+            json!({"id":"parent-1","after":null}),
+            json!({"id":"parent-1","after":1}),
+            json!({"id":"parent-1","after":""}),
+            json!({"id":"parent-1","after":" \t "}),
+            json!({"id":"parent-1","limit":null}),
+            json!({"id":"parent-1","limit":0}),
+            json!({"id":"parent-1","limit":1001}),
+            json!({"id":"parent-1","limit":-1}),
+            json!({"id":"parent-1","limit":1.0}),
+            json!({"id":"parent-1","limit":"100"}),
+            json!({"id":"parent-1","extra":0}),
+        ] {
+            assert!(
+                serde_json::from_value::<CommandChildrenRequest>(bad.clone()).is_err(),
+                "accepted {bad}"
+            );
+        }
+        for limit in [1, 1000] {
+            let request: CommandChildrenRequest =
+                serde_json::from_value(json!({"id":"parent-1","limit":limit})).unwrap();
+            assert_eq!(request.limit, limit);
+            request.validate().unwrap();
+        }
+        let mut request = CommandChildrenRequest::new("parent-1");
+        request.limit = 0;
+        assert!(request.validate().is_err());
+        request.limit = 100;
+        request.after = Some(" ".to_owned());
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn children_response_requires_objects_and_an_explicit_next() {
+        let wire = json!({"children":[],"next":null});
+        let response: CommandChildrenResponse = serde_json::from_value(wire.clone()).unwrap();
+        assert!(response.children.is_empty());
+        assert_eq!(response.next, None);
+        assert_eq!(serde_json::to_value(response).unwrap(), wire);
+        for missing in ["children", "next"] {
+            let mut wire = wire.clone();
+            wire.as_object_mut().unwrap().remove(missing);
+            assert!(serde_json::from_value::<CommandChildrenResponse>(wire).is_err());
+        }
+        for bad in [Value::Null, json!(false), json!("bad")] {
+            let mut wire = wire.clone();
+            wire["children"] = bad;
+            assert!(serde_json::from_value::<CommandChildrenResponse>(wire).is_err());
+        }
+        let mut positional = wire.clone();
+        positional["children"] = json!([["parent-1/send"]]);
+        assert!(serde_json::from_value::<CommandChildrenResponse>(positional).is_err());
+        for entry in [Value::Null, json!([]), json!(1), json!("child")] {
+            let mut wire = wire.clone();
+            wire["children"] = json!([entry]);
+            assert!(serde_json::from_value::<CommandChildrenResponse>(wire).is_err());
         }
     }
 }

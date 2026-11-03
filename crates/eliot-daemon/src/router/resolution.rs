@@ -267,9 +267,12 @@ mod tests {
                 .code,
             "secret_in_payload"
         );
-        // Registered methods reject malformed params as invalid, not as
-        // unimplemented. command.children stays unsupported.
-        for (method, payload) in [("command.resolve", json!({})), ("turn.resolve", json!({}))] {
+        // Registered methods reject malformed params as invalid, not as unimplemented.
+        for (method, payload) in [
+            ("command.resolve", json!({})),
+            ("turn.resolve", json!({})),
+            ("command.children", json!({})),
+        ] {
             assert_eq!(
                 router
                     .handle(
@@ -285,20 +288,6 @@ mod tests {
                 "invalid"
             );
         }
-        assert_eq!(
-            router
-                .handle(
-                    "command.children",
-                    json!({
-                        "_auth":{"kind":"owner", "credential":"owner-credential"},
-                        "_payload":{}
-                    })
-                )
-                .await
-                .unwrap_err()
-                .code,
-            "unsupported"
-        );
     }
 
     #[tokio::test]

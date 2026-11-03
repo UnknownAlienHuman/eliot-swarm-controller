@@ -6,10 +6,11 @@ use eliot_core::{
         AgentDiscoverRequest, AgentEditsRequest, AgentEditsResponse, AgentGetRequest,
         AgentGetResponse, AgentGitRequest, AgentGitResponse, AgentHistoryRequest, AgentListRequest,
         AgentListResponse, AgentProcessesRequest, AgentProcessesResponse, AgentResultRequest,
-        AgentResultResponse, AgentStatsRequest, AgentStatsResponse, CommandGetRequest,
-        CommandResolution, CommandResolveRequest, CommandResolveResponse, CommandSubmitResponse,
-        DaemonShutdownRequest, DaemonShutdownResponse, DaemonStatusRequest, DaemonStatusResponse,
-        DiscoverPage, EventsFilter, EventsReadRequest, EventsReadResponse, EventsSubscribeRequest,
+        AgentResultResponse, AgentStatsRequest, AgentStatsResponse, CommandChildrenRequest,
+        CommandChildrenResponse, CommandGetRequest, CommandResolution, CommandResolveRequest,
+        CommandResolveResponse, CommandSubmitResponse, DaemonShutdownRequest,
+        DaemonShutdownResponse, DaemonStatusRequest, DaemonStatusResponse, DiscoverPage,
+        EventsFilter, EventsReadRequest, EventsReadResponse, EventsSubscribeRequest,
         EventsSubscribeResponse, ObservationPage, ProjectRegistrationView,
         ProviderClearHoldRequest, ProviderClearHoldResponse, ProviderCorrectiveEvidence,
         ProviderHoldsRequest, ProviderHoldsResponse, RuleCatchUpRequest, RuleGetRequest,
@@ -376,6 +377,14 @@ struct ShutdownArgs {
 enum CmdCommand {
     Show {
         id: String,
+    },
+    /// Read one bounded page of a retained command expansion.
+    Children {
+        id: String,
+        #[arg(long, value_name = "ID")]
+        after: Option<String>,
+        #[command(flatten)]
+        page: PageArgs,
     },
     /// Resolve an unknown command to its owner-asserted terminal state.
     Resolve {
@@ -1246,6 +1255,28 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                     .map_err(|error| Failure::from_core(error, false))?;
                 let result = command_value(response)?;
                 print_value(&result, json_output);
+                Ok(0)
+            }
+            CmdCommand::Children {
+                id,
+                after,
+                page: PageArgs { limit },
+            } => {
+                validate_limit(limit)?;
+                let request = CommandChildrenRequest { id, after, limit };
+                request
+                    .validate()
+                    .map_err(|error| Failure::from_core(error, false))?;
+                let response: CommandChildrenResponse =
+                    eliot_daemon::client_call_typed(&data_dir, "command.children", &request)
+                        .await
+                        .map_err(|error| Failure::from_core(error, false))?;
+                request
+                    .validate_response(&response)
+                    .map_err(|_| Failure::new(4, "command.children response is invalid"))?;
+                let value = serde_json::to_value(response)
+                    .map_err(|_| Failure::new(4, "command.children response is invalid"))?;
+                print_value(&value, json_output);
                 Ok(0)
             }
             CmdCommand::Resolve {

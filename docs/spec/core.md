@@ -537,4 +537,4 @@ partly pruned expansion. Keep any set containing accepted, queued, dispatched or
 work. Retain command bindings/results in `commands` and other mutation bindings/results
 in `writes` for at least the supported retry window plus the allowed clock-skew
 margin. Cleanup must not make an accepted id look new or replay an external effect.
-Once a complete expansion is gone, the target `command.children` API returns `history_gap`.
+Once a complete expansion is gone, `command.children` returns `history_gap`.

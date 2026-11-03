@@ -2,8 +2,8 @@
 //! These checks do not settle commands, repair replies, or interpret their state.
 
 use super::{
-    AgentResultRequest, AgentResultResponse, CommandGetRequest, RuleGetRequest, RuleStateView,
-    TurnGetRequest,
+    AgentResultRequest, AgentResultResponse, CommandChildrenRequest, CommandChildrenResponse,
+    CommandGetRequest, RuleGetRequest, RuleStateView, TurnGetRequest,
 };
 use crate::{Command, CommandState, Error, Result, Turn};
 
@@ -37,6 +37,22 @@ impl CommandGetRequest {
                     .is_none_or(|target| target.trim().is_empty())
                 || response.generation.is_none())
         {
+            return Err(binding_mismatch());
+        }
+        Ok(())
+    }
+}
+
+impl CommandChildrenRequest {
+    pub fn validate_response(&self, response: &CommandChildrenResponse) -> Result<()> {
+        if self.validate().is_err() || response.children.len() > self.limit {
+            return Err(binding_mismatch());
+        }
+        for child in &response.children {
+            CommandGetRequest::new(child.id.clone()).validate_response(child)?;
+        }
+        let expected_next = response.children.last().map(|child| child.id.as_str());
+        if response.next.as_deref() != expected_next {
             return Err(binding_mismatch());
         }
         Ok(())
@@ -273,6 +289,19 @@ mod tests {
         assert!(error.diagnostics.is_empty());
     }
 
+    fn child(id: &str) -> Command {
+        let mut child = command();
+        child.id = id.to_owned();
+        child
+    }
+
+    fn children_response(children: Vec<Command>, next: Option<&str>) -> CommandChildrenResponse {
+        CommandChildrenResponse {
+            children,
+            next: next.map(str::to_owned),
+        }
+    }
+
     #[test]
     fn command_binding_preserves_unknown_state_and_diagnostics() {
         let request = CommandGetRequest {
@@ -441,6 +470,46 @@ mod tests {
             };
             assert_unknown(invalid.validate_response(&response(2, vec![turn("a1", 2, "turn-1")])));
         }
+    }
+
+    #[test]
+    fn children_binding_checks_count_members_and_last_id_cursor() {
+        let request = CommandChildrenRequest::new("parent-1");
+        request
+            .validate_response(&children_response(vec![], None))
+            .unwrap();
+        let page = children_response(vec![child("child-1"), child("child-2")], Some("child-2"));
+        let before = page.clone();
+        request.validate_response(&page).unwrap();
+        assert_eq!(page, before);
+        for reply in [
+            children_response(vec![], Some("child-1")),
+            children_response(vec![child("child-1")], None),
+            children_response(vec![child("child-1")], Some("child-2")),
+            children_response(vec![child("child-1"), child("child-2")], Some("child-1")),
+        ] {
+            assert_unknown(request.validate_response(&reply));
+        }
+        let mut invalid_child = child("child-1");
+        invalid_child.generation = Some(-1);
+        assert_unknown(
+            request.validate_response(&children_response(vec![invalid_child], Some("child-1"))),
+        );
+        let mut unknown_with_turn = child("child-1");
+        unknown_with_turn.turn_id = Some("turn-1".to_owned());
+        assert_unknown(
+            request.validate_response(&children_response(vec![unknown_with_turn], Some("child-1"))),
+        );
+        let narrow = CommandChildrenRequest {
+            limit: 1,
+            ..request.clone()
+        };
+        assert_unknown(narrow.validate_response(&page));
+        let invalid = CommandChildrenRequest {
+            limit: 0,
+            ..request
+        };
+        assert_unknown(invalid.validate_response(&page));
     }
 
     #[test]

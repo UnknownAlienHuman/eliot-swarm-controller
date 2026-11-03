@@ -88,7 +88,7 @@ rule actions have bounded derived ids. No general receipt/floor framework.
 | `command.submit/get` | implemented immutable admission and command readback |
 | `turn.get` | implemented running/completed/unknown turn read |
 | `command.resolve`, `turn.resolve` | constrained owner resolution of unknown outcomes; owner-only |
-| `command.children` | later child readback; no current handler |
+| `command.children` | implemented scoped, paged child readback for a retained expansion |
 | `project.list/get` | owner-only read of registered project authority |
 | `rule.get/catch_up` | owner-only rule read and finite committed-history catch-up |
 | `timer.get/run` | owner-only timer read and idempotent manual firing |
@@ -105,11 +105,10 @@ Canonical public wire types are re-exported by
 define field names, JSON shapes and grammar; this spec owns behavior and authority. Principal
 authentication precedes method parameter validation.
 
-The method inventory includes later-layer methods. `command.children` is a target
-API only and is not registered by the current Router; calling it now returns
-`unsupported`. Its semantics below preserve the intended future contract, but do
-not imply current availability. The same rule applies to later methods identified
-in the Purpose column or by the roadmap.
+The method inventory includes later-layer methods. Later methods identified
+in the Purpose column or by the roadmap are target APIs only and are not registered
+by the current Router; calling one now returns `unsupported`. Their semantics below
+preserve the intended future contract, but do not imply current availability.
 
 | Surface | Canonical DTO definitions |
 | --- | --- |
@@ -325,6 +324,17 @@ caller never sees a partly pruned expansion; after removal return `history_gap`.
 rule actions reuse the same representation with a distinct link kind, not selector
 execution semantics.
 
+`command.children` is implemented for retained expansions through Core
+[`CommandChildrenRequest`/`CommandChildrenResponse`](../../crates/eliot-core/src/api/reads.rs).
+`id` names the parent and `after` names the last child of the previous page; both are
+kept verbatim and must be nonempty. `limit` defaults to 100 only when omitted and must
+be 1–1,000; explicit `null`, wrong types, out-of-range values and unknown fields are
+`invalid`. Children page in fixed ordinal order and `next` is the last returned child
+id, or null on an empty page. Reads use the same principal scope as `command.get`: the
+parent and every returned child must be readable by the caller, otherwise the whole
+read is `not_allowed`. An `after` naming no child of the requested parent is `invalid`.
+An unknown id is `not_found`; a pruned set is `history_gap`.
+
 ## Command, turn, and result reads
 
 These are read-only lookups using the canonical read DTOs and Core `Command`, `Turn`
@@ -363,12 +373,14 @@ the requested exact turn when present (exactly one matching turn). Every result 
 must match the response Agent and generation, and the response must respect the requested
 limit. A mismatch yields only the fixed `unknown` error
 `read response does not match the requested binding`, with no response data or
-diagnostics exposed.
+diagnostics exposed. A `command.children` response must hold at most `limit`
+well-formed commands with `next` equal to the last child id, or null when the
+page is empty; a mismatch is the same fixed `unknown` error.
 
-`eliot cmd show` and `eliot result` exit 0 after a valid read even if a returned command
-or turn is `unknown`; that state is not a successful task outcome. The `eliot wait`
-flow treats an `unknown` command or turn as exit 4. A binding mismatch is also unknown
-and must not print the mismatched response.
+`eliot cmd show`, `eliot cmd children` and `eliot result` exit 0 after a valid read
+even if a returned command or turn is `unknown`; that state is not a successful task
+outcome. The `eliot wait` flow treats an `unknown` command or turn as exit 4. A binding
+mismatch is also unknown and must not print the mismatched response.
 
 ## Input, turn and unknown gates
 
@@ -681,10 +693,9 @@ eliot provider clear-hold SCOPE --corrective-evidence credentials_updated|config
 eliot plugin NAME | plugin-test ... | hook ... | mcp
 ```
 
-In particular, `cmd children|cancel` are not implemented CLI forms. `cmd show`,
-`cmd resolve`, and `turn resolve` are available; `turn show` remains unavailable.
-The deferred child-read semantics above do not make that command form callable
-today.
+In particular, `cmd cancel` is not an implemented CLI form. `cmd show`,
+`cmd children`, `cmd resolve`, and `turn resolve` are available; `turn show`
+remains unavailable.
 
 Only current-layer commands appear in help and Agent guidance. Exit codes: 0 success/
 queued; 1 definite failure; 2 usage; 3 pre-effect rejection; 4 unknown; 5 wait timeout;

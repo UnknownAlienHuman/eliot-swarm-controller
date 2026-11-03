@@ -10,6 +10,7 @@ mod rules;
 mod scripts;
 
 pub use capacity::{RecordedProcess, RetainedGeneration};
+pub use command_children::CommandChildrenPage;
 pub use projects::ProjectRegistrationInput;
 pub use resolution::TurnInactiveProof;
 pub use retention::RetentionReport;
@@ -81,6 +82,7 @@ macro_rules! db {
 }
 
 mod admission;
+mod command_children;
 mod dispatch;
 mod observer;
 mod observer_live;

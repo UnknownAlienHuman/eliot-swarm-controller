@@ -47,8 +47,8 @@ pub use provider::{
     ProviderHoldsRequest, ProviderHoldsResponse,
 };
 pub use reads::{
-    AgentResultRequest, AgentResultResponse, CommandGetRequest, RuleGetRequest, RuleStateView,
-    TurnGetRequest,
+    AgentResultRequest, AgentResultResponse, CommandChildrenRequest, CommandChildrenResponse,
+    CommandGetRequest, RuleGetRequest, RuleStateView, TurnGetRequest,
 };
 pub use resolutions::{
     CommandResolution, CommandResolveRequest, CommandResolveResponse, TurnResolveRequest,

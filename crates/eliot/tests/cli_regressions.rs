@@ -9,13 +9,13 @@ use eliot_core::api::{
     AgentDiscoverRequest, AgentEditsRequest, AgentEditsResponse, AgentGetRequest, AgentGetResponse,
     AgentGitRequest, AgentGitResponse, AgentHistoryRequest, AgentListRequest, AgentListResponse,
     AgentProcessesRequest, AgentProcessesResponse, AgentResultRequest, AgentResultResponse,
-    AgentStatsRequest, AgentStatsResponse, CommandGetRequest, CommandSubmitRequest,
-    CommandSubmitResponse, DaemonShutdownRequest, DaemonShutdownResponse, DaemonStatusRequest,
-    DaemonStatusResponse, DiscoverPage, EventsFilter, EventsReadRequest, EventsReadResponse,
-    EventsSubscribeRequest, EventsSubscribeResponse, MAX_OBSERVATION_CURSOR_BYTES, ObservationPage,
-    PROCESS_CURSOR_MAX_BYTES, ProjectRegistrationView, ProviderClearHoldResponse,
-    ProviderHoldsResponse, RuleStateView, ShutdownMode, TimerSchedule, TimerStateView,
-    TurnGetRequest,
+    AgentStatsRequest, AgentStatsResponse, CommandChildrenRequest, CommandChildrenResponse,
+    CommandGetRequest, CommandSubmitRequest, CommandSubmitResponse, DaemonShutdownRequest,
+    DaemonShutdownResponse, DaemonStatusRequest, DaemonStatusResponse, DiscoverPage, EventsFilter,
+    EventsReadRequest, EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse,
+    MAX_OBSERVATION_CURSOR_BYTES, ObservationPage, PROCESS_CURSOR_MAX_BYTES,
+    ProjectRegistrationView, ProviderClearHoldResponse, ProviderHoldsResponse, RuleStateView,
+    ShutdownMode, TimerSchedule, TimerStateView, TurnGetRequest,
 };
 use eliot_core::{
     AgentState, Command as CoreCommand, CommandState, ProviderHoldState, ProviderRestrictionKind,
@@ -12967,5 +12967,58 @@ fn cli_turn_resolve_asserts_unknown_held_turn_after_force_restart() {
         ],
     );
     assert_eq!(terminal_refused.status.code(), Some(3));
+    fixture.stop(false);
+}
+
+#[test]
+fn cli_cmd_children_pages_a_retained_launch_expansion() {
+    let mut fixture = Fixture::new("cmd children");
+    fixture.start();
+    let launch_id = ulid::Ulid::new().to_string();
+    let launched = fixture.json(&[
+        "--id",
+        &launch_id,
+        "launch",
+        "--profile",
+        "fake",
+        "--workspace",
+        fixture.workspace.to_str().unwrap(),
+        "children-probe-prompt",
+    ]);
+    assert_eq!(
+        launched["id"].as_str(),
+        Some(launch_id.as_str()),
+        "launch did not retain the supplied mutation id"
+    );
+    let request = CommandChildrenRequest::new(&launch_id);
+    let page: CommandChildrenResponse =
+        serde_json::from_value(fixture.json(&["cmd", "children", &launch_id]))
+            .expect("typed children page");
+    request
+        .validate_response(&page)
+        .expect("matching children page");
+    assert_eq!(page.children.len(), 1);
+    assert_eq!(page.children[0].id, format!("{launch_id}/send"));
+    assert_eq!(page.next.as_deref(), Some(page.children[0].id.as_str()));
+    let child = page.children[0].id.clone();
+    let tail: CommandChildrenResponse =
+        serde_json::from_value(fixture.json(&["cmd", "children", &launch_id, "--after", &child]))
+            .expect("typed tail page");
+    assert!(tail.children.is_empty());
+    assert_eq!(tail.next, None);
+    let missing = cli(
+        &fixture.data,
+        &["cmd", "children", &ulid::Ulid::new().to_string()],
+    );
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(
+        missing.stderr.contains("not_found"),
+        "unknown id did not return not_found: {}",
+        missing.stderr
+    );
+    let agent = launched["target"].as_str().expect("fake Agent");
+    let stop: CommandSubmitResponse =
+        serde_json::from_value(fixture.json(&["stop", agent])).expect("typed stop submission");
+    fixture.wait_command(&stop.command_id, "applied");
     fixture.stop(false);
 }
