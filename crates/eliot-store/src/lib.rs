@@ -11,6 +11,10 @@ mod scripts;
 
 pub use capacity::{RecordedProcess, RetainedGeneration};
 pub use command_children::{CommandChildrenPage, command_history_expired};
+pub use goals::{
+    GoalCheckResult, GoalCommitOutcome, GoalContinuation, GoalRoundCommit, GoalRoundCommitResult,
+    GoalRoundProbe,
+};
 pub use projects::ProjectRegistrationInput;
 pub use resolution::TurnInactiveProof;
 pub use retention::RetentionReport;
@@ -84,6 +88,7 @@ macro_rules! db {
 mod admission;
 mod command_children;
 mod dispatch;
+mod goals;
 mod observer;
 mod observer_live;
 mod resolution;
@@ -145,6 +150,9 @@ pub struct WriteAdmission {
 pub struct Store {
     connection: Connection,
     write_faulted: Cell<bool>,
+    /// Opaque owner of this handle's Goal round markers. A `running` marker
+    /// from another holder is a crashed round: it reads as `unknown`.
+    goal_holder: String,
 }
 
 impl Store {
@@ -164,6 +172,7 @@ impl Store {
         let mut store = Self {
             connection,
             write_faulted: Cell::new(false),
+            goal_holder: Ulid::new().to_string(),
         };
         store.migrate()?;
         Ok(store)
@@ -6063,3 +6072,6 @@ mod git_fetch_tests;
 mod git_workspace_fence_tests;
 #[cfg(test)]
 mod resolution_tests;
+
+#[cfg(test)]
+mod goals_tests;

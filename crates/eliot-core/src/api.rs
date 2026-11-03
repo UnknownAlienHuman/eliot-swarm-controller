@@ -3,6 +3,7 @@
 
 mod agent_views;
 mod git;
+mod goals;
 mod monitor_views;
 mod mutation_validation;
 mod mutations;
@@ -26,6 +27,12 @@ pub use agent_views::{
 };
 pub use git::{
     DEFAULT_GIT_FETCH_TIMEOUT_MS, FrozenGitFetch, GitFetchDefinitionArgs, GitFetchOutcome,
+};
+pub use goals::{
+    DEFAULT_GOAL_CHECK_TIMEOUT_MS, GOAL_COST_UNSUPPORTED, GoalClearRequest, GoalCounters,
+    GoalDefinition, GoalGetRequest, GoalMarkerState, GoalMode, GoalPauseRequest, GoalResumeRequest,
+    GoalRoundMarker, GoalRoundOutcome, GoalRoundRequest, GoalRoundResponse, GoalSetRequest,
+    GoalStatus, GoalView, MAX_GOAL_LIMIT, MAX_GOAL_OBSERVATION_BYTES,
 };
 pub use monitor_views::{
     FilesystemInvalidationState, FilesystemInvalidationView, GitObservation, GitView,

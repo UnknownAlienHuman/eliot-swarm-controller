@@ -92,13 +92,14 @@ rule actions have bounded derived ids. No general receipt/floor framework.
 | `project.list/get` | owner-only read of registered project authority |
 | `rule.get/catch_up` | owner-only rule read and finite committed-history catch-up |
 | `timer.get/run` | owner-only timer read and idempotent manual firing |
+| `goal.set/get/pause/clear/resume/round` | owner-only Eliot-mode Goal and explicit stale-round-safe rounds |
 | `provider.holds/clear_hold` | owner-only provider hold readback and constrained correction |
 | `events.read/subscribe` | persisted replay plus bounded live delivery |
 | `agent.discover` | owner-only native metadata discovery, without creating Agents |
 | `agent.history` | owner-only bounded history of an exact observed subject |
 | `hook.event` | later exact request/deadline decision |
 | `mail.send/inbox/read/ack`, `var.*`, `who`, `claim.*` | later coordination |
-| `rule.*` except `rule.get/catch_up`, `goal.*` | later automation; effects remain commands |
+| `rule.*` except `rule.get/catch_up` | later automation; effects remain commands |
 
 Canonical public wire types are re-exported by
 [`eliot_core::api`](../../crates/eliot-core/src/api.rs). These DTOs and their validators
@@ -120,6 +121,7 @@ preserve the intended future contract, but do not imply current availability.
 | Rule reads and history catch-up | [reads.rs](../../crates/eliot-core/src/api/reads.rs), [rules.rs](../../crates/eliot-core/src/api/rules.rs) |
 | Command submission and shutdown | [mutations.rs](../../crates/eliot-core/src/api/mutations.rs) and [Core `SubmitCommand`](../../crates/eliot-core/src/lib.rs) |
 | Timer schedules and requests | [timers.rs](../../crates/eliot-core/src/api/timers.rs) |
+| Goal definitions, views and rounds | [goals.rs](../../crates/eliot-core/src/api/goals.rs) |
 | Discovery/history queries and pages | [native_requests.rs](../../crates/eliot-core/src/api/native_requests.rs), [native_pages.rs](../../crates/eliot-core/src/api/native_pages.rs) |
 | Event queries, filters and pages | [api.rs](../../crates/eliot-core/src/api.rs) |
 
@@ -680,7 +682,7 @@ eliot wait TARGET... [--for turn|idle|stopped|goal] [--after-command ID]
 eliot result A [--generation N] [--turns N]
 eliot turn show|resolve ...
 eliot approve|deny|answer ... [--request R]
-eliot configure ... | compact|fork|background ... | goal ...
+eliot configure ... | compact|fork|background ...
 eliot cmd show|children|cancel|resolve ...
 eliot events [--since SEQ] [--allow-gap]
 eliot msg send ... | inbox [--wait SECS] [--all]
@@ -689,6 +691,9 @@ eliot project list | show ID
 eliot rule show ID [--project PROJECT]
 eliot rule catch-up ID --after SEQ [--through SEQ] [--project PROJECT]
 eliot timer show ID [--project PROJECT] | run ID [--project PROJECT]
+eliot goal set A --text TEXT --check CMD [ARGS...] [--mode eliot|native] [--check-cwd PATH] [--check-timeout-ms MS] [--max-turns N] [--max-rounds N] [--max-without-progress N]
+eliot goal show|pause|clear|resume A [--mode eliot|native] [--reason R]
+eliot goal round A --idle-seq SEQ [--mode eliot|native]
 eliot discover --profile P [--harness H] [--scope S] [--cursor C] [--limit N]
 eliot attach --profile P --harness H --scope S --ref R [--project LABEL]
 eliot history A --view subject|turns|items [--source native|rollout] [--turn-id ID] [--cursor C] [--limit N]

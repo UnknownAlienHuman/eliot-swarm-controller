@@ -793,18 +793,51 @@ never enqueue a later approval. Build the shim only with a harness that needs it
 ## Goal loop
 
 A Goal is keyed by `(agent,generation,mode,revision)`; native and Eliot modes are
-independent. `set`, definition changes, pause, clear and resume advance revision.
-Generation change pauses the old Goal. `on_idle` waits while an active native Goal drives.
+independent. `set`, definition changes, pause, clear and resume advance revision;
+an identical `set` on the bound generation is a no-op. Generation change pauses
+the old Goal on its next round attempt, and `resume` on a drifted generation is
+refused. Native mode parses but is `unsupported`: the installed harness plugins
+expose no Goal protocol. Observe-only Agents take no Goals.
 
-Round key is an exact idle event seq or anchored cadence slot. Before work, read state,
-requests, source health and unknown gates. Perform the bounded check and read-only
-workspace fingerprint, then conditionally commit **all** results only if generation,
-revision and round still match: completion/block, counters, budget or one ordinary send.
-No stale round can publish a successful check or continuation. Incomplete fingerprints
-cannot prove no progress. Exact status/budgets and limits are visible in `goal show`.
+Rounds are explicit: `goal round` names the exact idle event seq the caller
+observed. Before work, the round reads Agent state, pending requests, source
+health and unknown gates, and refuses unless the Agent is cleanly idle at that
+key: idle state, no active turn, no pending requests, every open harness
+source healthy (`daemon`/`os`/`git`/`workspace_process` monitors stay
+advisory), no unknown command, no open command, and the key names an idle event
+of that Agent generation and is still its latest. A turn budget already spent
+outside any round blocks without running the check.
 
-Checks are arbitrary explicit commands, not magically read-only. Fingerprinting itself
-is read-only. Check outcomes use the same frozen inputs/custody/no-blind-retry rules.
+Before the check runs, the round claims a durable single-flight marker for
+`(agent,generation,mode,revision,round_key)` in the same Immediate transaction
+that re-validates the probe. A second `goal round` for the same Goal while a
+marker is running is refused without running anything. The final conditional
+commit requires that exact marker.
+
+The check is the frozen explicit argv from `goal set`, run through the shared
+owned-process custody outside the Store lock with a bounded timeout, a small
+round-context stdin and the daemon environment. Check output is secret-redacted
+and retained only as a bounded observation plus a digest. The commit then
+applies **all** results in one transaction only if generation, revision and
+round still match — the key unconsumed, no newer Agent event, sources still
+healthy, no open or unknown command, no active turn, no pending request —
+together with an optional ordinary `send` continuation admitted by
+the same transaction: completion on check exit 0, `round_budget`, `turn_limit`
+or `no_progress` block, or one continuation. Success always completes, even on
+a spent budget. An unknown check outcome (spawn/timeout/custody failure, or a
+check with no exit code such as a signal kill) commits nothing, and neither
+does a commit that finds the Agent left idle during the check: the marker goes
+`unknown` and that round key is never rerun — the operator starts a new
+explicit round with a new idle key. After a crash the marker stays `unknown`.
+Neither a failed check nor a missing terminal fact authorizes replay: a refused
+or unknown round admits no send. `goal show` reports the exact status,
+counters (with a live turn count), budgets, limits and the unresolved round
+marker if any; cost stays `unsupported` until a usage source exists.
+
+Checks are arbitrary explicit commands, not magically read-only. Check outcomes
+use the same frozen inputs/custody/no-blind-retry rules. Anchored cadence
+slots, the read-only workspace fingerprint and automatic `on_idle` driving are
+deferred; incomplete observations never prove no progress.
 
 ## Durable tables
 
@@ -828,9 +861,20 @@ CREATE TABLE goals (
   revision INTEGER NOT NULL, definition TEXT NOT NULL, state TEXT NOT NULL,
   last_round_key TEXT, updated_at INTEGER NOT NULL, PRIMARY KEY(agent,mode)
 );
+CREATE TABLE goal_markers (
+  agent INTEGER NOT NULL, mode TEXT NOT NULL, generation INTEGER NOT NULL,
+  revision INTEGER NOT NULL, round_key INTEGER NOT NULL, holder TEXT NOT NULL,
+  state TEXT NOT NULL, updated_at INTEGER NOT NULL,
+  PRIMARY KEY(agent,mode,generation,revision,round_key)
+);
 ```
 
-Goal definition/state retain text/check/cadence, budgets, counters and previous progress
+`goal_markers` holds one row per unresolved round: `running` while its check
+runs, `unknown` once the round ended without a commit. The final commit
+consumes its marker; an unknown marker burns its round key, which is never
+rerun. A `running` row whose holder is gone (crash) reads as `unknown`.
+
+Goal definition/state retain text/check, budgets, counters and previous progress
 observations. Action state lives in commands. Rate accounting counts already admitted
 ordinary action child command rows once; Store-only admission parents are excluded.
 
