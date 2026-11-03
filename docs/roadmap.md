@@ -40,7 +40,8 @@ per-task report packets or another status registry.
 
 ## Repairs to implemented paths
 
-**Next:** the remaining current-path repairs below, then L4.2. Checked layers record delivered increments, not full crash/load qualification.
+**Next:** the remaining current-path repairs below, then L4.2. Checked layers record
+delivered increments, not full crash/load qualification.
 Use the existing Store/router and small internal modules. Keep evidence in the PR/CI.
 
 - [x] **Restart capacity recovery.** Reconcile exact prior-generation custody and release
