@@ -550,6 +550,7 @@ const MAX_CONCURRENT_AUTO_ROUNDS: usize = 4;
 struct InFlightAutoRound {
     cancel: watch::Sender<bool>,
     seq: i64,
+    task: tokio::task::Id,
 }
 
 /// Drive active Eliot-mode Goals when their generation commits an idle
@@ -610,22 +611,12 @@ pub(crate) async fn run_goal_driver(
                     return Err(Error::new("unavailable", "event bus is closed"));
                 }
             },
-            joined = rounds.join_next(), if !rounds.is_empty() => {
-                match joined {
-                    Some(Ok((agent, _))) => {
-                        in_flight.remove(&agent);
-                        if let Some(follow) = pending.remove(&agent) {
-                            spawn_auto_round(
-                                &router,
-                                run_check,
-                                &mut rounds,
-                                &mut in_flight,
-                                &mut pending,
-                                follow,
-                            );
-                        }
-                    }
-                    Some(Err(_)) => {
+            Some(joined) = rounds.join_next(), if !rounds.is_empty() => {
+                let agent = match joined {
+                    Ok((agent, _)) => Some(agent),
+                    Err(error) => {
+                        // A panicked round must still free its Goal and cap
+                        // slot; its durable marker keeps the Goal fenced.
                         let policy = router.secret_policy_snapshot();
                         crate::logging::record(
                             &policy,
@@ -633,8 +624,24 @@ pub(crate) async fn run_goal_driver(
                             &[],
                             None,
                         );
+                        in_flight
+                            .iter()
+                            .find(|(_, running)| running.task == error.id())
+                            .map(|(agent, _)| agent.clone())
                     }
-                    None => {}
+                };
+                if let Some(agent) = agent {
+                    in_flight.remove(&agent);
+                    if let Some(follow) = pending.remove(&agent) {
+                        spawn_auto_round(
+                            &router,
+                            run_check,
+                            &mut rounds,
+                            &mut in_flight,
+                            &mut pending,
+                            follow,
+                        );
+                    }
                 }
             }
         }
@@ -685,12 +692,15 @@ fn spawn_auto_round(
     }
     let (cancel, cancellation) = watch::channel(false);
     let seq = event.seq;
-    in_flight.insert(agent.clone(), InFlightAutoRound { cancel, seq });
     let task_router = router.clone();
-    rounds.spawn(async move {
-        drive_goal_for_event(&task_router, run_check, event, cancellation).await;
-        (agent, seq)
-    });
+    let task_agent = agent.clone();
+    let task = rounds
+        .spawn(async move {
+            drive_goal_for_event(&task_router, run_check, event, cancellation).await;
+            (task_agent, seq)
+        })
+        .id();
+    in_flight.insert(agent, InFlightAutoRound { cancel, seq, task });
 }
 
 async fn drive_goal_for_event(
@@ -2013,6 +2023,71 @@ mod tests {
         })
         .await
         .expect("capped rounds finish after release");
+        shutdown_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(10), driver)
+            .await
+            .expect("driver joins")
+            .unwrap()
+            .unwrap();
+    }
+
+    static PANIC_STARTED: AtomicUsize = AtomicUsize::new(0);
+
+    /// The first `MAX_CONCURRENT_AUTO_ROUNDS` checks panic; later ones pass.
+    fn panicking_runner(
+        _: TokioCommand,
+        _: Vec<u8>,
+        _: Duration,
+        _: Arc<SecretPolicy>,
+        _: watch::Receiver<bool>,
+    ) -> Pin<Box<dyn Future<Output = ProcessOutcome> + Send>> {
+        Box::pin(async {
+            if PANIC_STARTED.fetch_add(1, Ordering::SeqCst) < MAX_CONCURRENT_AUTO_ROUNDS {
+                panic!("check runner panicked");
+            }
+            completed_outcome(0, b"all green", true)
+        })
+    }
+
+    #[tokio::test]
+    async fn goal_driver_frees_cap_slots_of_panicked_rounds() {
+        PANIC_STARTED.store(0, Ordering::SeqCst);
+        let router = router();
+        let mut agents = Vec::new();
+        for index in 0..=MAX_CONCURRENT_AUTO_ROUNDS {
+            let agent = ready_agent(&router, &format!("goal-panic-{index}")).await;
+            set_goal(&router, &agent, definition("panicking goal")).await;
+            agents.push((agent, high_water(&router).await));
+        }
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let driver = tokio::spawn(run_goal_driver(
+            router.clone(),
+            panicking_runner,
+            shutdown_rx,
+        ));
+        // Republish until each panicking check started: the driver may not
+        // have subscribed yet, and a fenced Goal never reruns its check.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while PANIC_STARTED.load(Ordering::SeqCst) < MAX_CONCURRENT_AUTO_ROUNDS {
+                for (agent, key) in &agents[..MAX_CONCURRENT_AUTO_ROUNDS] {
+                    router.inner.bus.publish(&[idle_event(agent, 1, *key)]);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("every capped round panics");
+        // Without freeing panicked slots the cap stays full and this round
+        // is dropped forever.
+        let (last, key) = &agents[MAX_CONCURRENT_AUTO_ROUNDS];
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while stored_goal(&router, last).await.counters.rounds != 1 {
+                router.inner.bus.publish(&[idle_event(last, 1, *key)]);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("a round after panicked rounds still runs");
         shutdown_tx.send_replace(true);
         tokio::time::timeout(Duration::from_secs(10), driver)
             .await
