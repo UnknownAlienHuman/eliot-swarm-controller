@@ -548,29 +548,30 @@ impl WorkspaceGit {
 
     async fn repository(&self, path: &str, deadline: Instant) -> Result<Repository> {
         let root = canonical_root(path)?;
-        let actual_root = self
-            .read_line(
+        // One rev-parse reports toplevel, git dir and common dir together. Each
+        // read costs two Git spawns (safe-overrides preflight plus the read),
+        // so three separate reads serialize six spawns on every repository
+        // identity check, including each project registration at daemon startup.
+        let bytes = self
+            .read(
                 &root,
-                &["rev-parse", "--path-format=absolute", "--show-toplevel"],
+                &[
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--show-toplevel",
+                    "--absolute-git-dir",
+                    "--git-common-dir",
+                ],
                 deadline,
             )
             .await?;
+        let (actual_root, git_dir, common_dir) = identity_lines(&bytes)?;
         if canonical_root(&actual_root)? != root {
             return Err(problem(
                 "source_integrity",
                 "workspace path is not the exact repository root",
             ));
         }
-        let git_dir = self
-            .read_line(&root, &["rev-parse", "--absolute-git-dir"], deadline)
-            .await?;
-        let common_dir = self
-            .read_line(
-                &root,
-                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-                deadline,
-            )
-            .await?;
         Ok(Repository {
             root,
             git_dir: canonical_root(&git_dir)?,
@@ -1032,6 +1033,35 @@ fn line(bytes: &[u8]) -> Result<String> {
     Ok(text.to_owned())
 }
 
+fn identity_lines(bytes: &[u8]) -> Result<(String, String, String)> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| problem("unavailable", "workspace Git readback is not UTF-8"))?;
+    let text = text.strip_suffix('\n').ok_or_else(|| {
+        problem(
+            "source_integrity",
+            "workspace Git readback omitted its exact record",
+        )
+    })?;
+    let mut lines = text.split('\n');
+    match (lines.next(), lines.next(), lines.next(), lines.next()) {
+        (Some(toplevel), Some(git_dir), Some(common_dir), None)
+            if [toplevel, git_dir, common_dir]
+                .iter()
+                .all(|line| !line.is_empty() && !line.contains('\0')) =>
+        {
+            Ok((
+                toplevel.to_owned(),
+                git_dir.to_owned(),
+                common_dir.to_owned(),
+            ))
+        }
+        _ => Err(problem(
+            "source_integrity",
+            "workspace Git readback omitted its exact record",
+        )),
+    }
+}
+
 fn path_text(path: &Path) -> Result<String> {
     path.to_str()
         .map(str::to_owned)
@@ -1040,4 +1070,144 @@ fn path_text(path: &Path) -> Result<String> {
 
 fn problem(code: &str, message: &str) -> Error {
     Error::new(code, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command as GitCommand;
+
+    struct TestRoot(PathBuf);
+
+    impl TestRoot {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "eliot-workspace-git-identity-{label}-{}",
+                ulid::Ulid::new().to_string().to_ascii_lowercase()
+            ));
+            fs::create_dir_all(&path).expect("create Git identity fixture root");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn git(checkout: &Path, args: &[&str]) {
+        let output = GitCommand::new("git")
+            .arg("-C")
+            .arg(checkout)
+            .args(args)
+            .output()
+            .expect("run local Git fixture command");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_repo(root: &Path) {
+        git(root, &["-c", "init.defaultBranch=main", "init"]);
+        git(root, &["config", "user.name", "EliotTest"]);
+        git(root, &["config", "user.email", "test@example.invalid"]);
+        git(root, &["commit", "--allow-empty", "-m", "root"]);
+    }
+
+    #[test]
+    fn identity_lines_accepts_exactly_three_nonempty_records() {
+        assert_eq!(
+            identity_lines(b"top\ngit\ncommon\n").expect("three records"),
+            ("top".to_owned(), "git".to_owned(), "common".to_owned())
+        );
+        for bytes in [
+            &b""[..],
+            &b"top\n"[..],
+            &b"top\ngit\n"[..],
+            &b"top\ngit\ncommon"[..],
+            &b"top\ngit\ncommon\nextra\n"[..],
+            &b"\ngit\ncommon\n"[..],
+            &b"top\n\0\ncommon\n"[..],
+        ] {
+            assert_eq!(
+                identity_lines(bytes)
+                    .expect_err("ragged identity must fail")
+                    .code,
+                "source_integrity"
+            );
+        }
+        assert_eq!(
+            identity_lines(&[0xff, b'\n', b'a', b'\n', b'b', b'\n'])
+                .expect_err("non-UTF-8 identity must fail")
+                .code,
+            "unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_identity_matches_repo_and_linked_worktree() {
+        let identity = WorkspaceGit::new().expect("resolve installed Git");
+        let root = TestRoot::new("repo");
+        init_repo(&root.0);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let repository = identity
+            .repository(
+                &path_text(&root.0).expect("fixture path is UTF-8"),
+                deadline,
+            )
+            .await
+            .expect("repository identity");
+        assert_eq!(
+            repository.root,
+            canonical_root(&path_text(&root.0).expect("fixture path is UTF-8"))
+                .expect("canonical fixture root")
+        );
+        assert_eq!(
+            repository.common_dir,
+            repository.root.join(".git"),
+            "plain repository common dir"
+        );
+        let worktree = root.0.join("linked");
+        git(
+            &root.0,
+            &[
+                "worktree",
+                "add",
+                worktree.to_str().expect("worktree path is UTF-8"),
+                "-b",
+                "linked-branch",
+            ],
+        );
+        let linked = identity
+            .repository(
+                &path_text(&worktree).expect("worktree path is UTF-8"),
+                deadline,
+            )
+            .await
+            .expect("linked worktree identity");
+        assert_eq!(
+            linked.root,
+            fs::canonicalize(&worktree).expect("canonical worktree")
+        );
+        assert_eq!(
+            linked.common_dir, repository.common_dir,
+            "linked worktree shares the main common dir"
+        );
+        assert!(
+            linked.git_dir.starts_with(&repository.common_dir),
+            "linked worktree git dir lives under the main repository"
+        );
+        let plain = TestRoot::new("plain");
+        let error = match identity
+            .repository(&path_text(&plain.0).expect("plain path is UTF-8"), deadline)
+            .await
+        {
+            Ok(_) => panic!("non-repository must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "unavailable");
+    }
 }
