@@ -3,9 +3,11 @@
 //! Owning contract: `command.children` in docs/spec/api.md. Retention prunes
 //! whole parent/child sets, children before parent (docs/spec/core.md#retention),
 //! so a retained parent always pages its complete fixed set in ordinal order.
-//! A missing parent whose id still appears in retained events, or whose ULID
-//! predates the minimum command retention, reads `history_gap`; any other
-//! unknown id reads `not_found`.
+//! The caller loads the parent and authorizes it (same as `command.get`)
+//! before paging, so cursor membership is never checked for an unauthorized
+//! caller. An absent parent id whose ULID time is older than the retry window
+//! plus the allowed clock skew may have been pruned (`command_history_expired`);
+//! any other absent id never existed.
 
 use super::*;
 
@@ -34,32 +36,26 @@ impl Store {
     /// Page the fixed child set of a retained expansion in ordinal order.
     /// `after` names the last child of the previous page; `next` echoes the
     /// last returned child id, or is `None` on an empty page.
+    ///
+    /// The caller passes the loaded parent row after authorizing it (same as
+    /// `command.get`); the parent is re-checked here so a set that vanished
+    /// since reads `not_found` rather than an empty page.
     pub fn list_command_children(
         &self,
-        parent_id: &str,
+        parent: &Command,
         after: Option<&str>,
         limit: usize,
-        now: i64,
     ) -> Result<CommandChildrenPage> {
         validate_limit(limit)?;
         if after.is_some_and(|cursor| cursor.trim().is_empty()) {
             return Err(Error::new("invalid", "child cursor must be a non-empty id"));
         }
-        let parent = match load_command_record(&self.connection, parent_id)? {
-            Some(record) => record.command,
-            None => {
-                return Err(
-                    if command_history_expired(&self.connection, parent_id, now)? {
-                        Error::new(
-                            "history_gap",
-                            format!("command {parent_id} children are no longer retained"),
-                        )
-                    } else {
-                        Error::new("not_found", format!("command {parent_id} was not found"))
-                    },
-                );
-            }
-        };
+        if load_command_record(&self.connection, &parent.id)?.is_none() {
+            return Err(Error::new(
+                "not_found",
+                format!("command {} was not found", parent.id),
+            ));
+        }
         let mut children = Vec::new();
         match after {
             None => {
@@ -68,21 +64,21 @@ impl Store {
                     .prepare(LIST_COMMAND_CHILDREN_FIRST_SQL)
                     .map_err(sql_error)?;
                 let rows = statement
-                    .query_map(params![parent_id, limit as i64], command_record_from_row)
+                    .query_map(params![parent.id, limit as i64], command_record_from_row)
                     .map_err(sql_error)?;
                 for row in rows {
                     children.push(command_from_raw(row.map_err(sql_error)?)?.command);
                 }
             }
             Some(cursor) => {
-                let floor = child_ordinal(&self.connection, parent_id, cursor)?;
+                let floor = child_ordinal(&self.connection, &parent.id, cursor)?;
                 let mut statement = self
                     .connection
                     .prepare(LIST_COMMAND_CHILDREN_CURSOR_SQL)
                     .map_err(sql_error)?;
                 let rows = statement
                     .query_map(
-                        params![parent_id, floor, limit as i64],
+                        params![parent.id, floor, limit as i64],
                         command_record_from_row,
                     )
                     .map_err(sql_error)?;
@@ -94,7 +90,7 @@ impl Store {
         enforce_page_bytes(&mut children)?;
         let next = children.last().map(|child| child.id.clone());
         Ok(CommandChildrenPage {
-            parent,
+            parent: parent.clone(),
             children,
             next,
         })
@@ -120,31 +116,15 @@ fn child_ordinal(connection: &Connection, parent_id: &str, cursor: &str) -> Resu
         })
 }
 
-/// Whether a missing parent id is (or may still be) a pruned expansion. A
-/// retained event keeps referencing the pruned id; otherwise only a ULID
-/// older than the minimum command retention may have been pruned, since
-/// commands are always kept past the retry window. This mirrors the
-/// `id_expired` age rule for absent mutation ids.
-fn command_history_expired(connection: &Connection, id: &str, now: i64) -> Result<bool> {
-    let referenced: bool = connection
-        .query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM events
-                 WHERE json_extract(data, '$.command_id') = ?1
-                    OR json_extract(cause, '$.command_id') = ?1
-             )",
-            [id],
-            |row| row.get(0),
-        )
-        .map_err(sql_error)?;
-    if referenced {
-        return Ok(true);
-    }
-    let Ok(ulid) = Ulid::from_string(id) else {
-        return Ok(false);
-    };
-    let created_at = i64::try_from(ulid.timestamp_ms()).unwrap_or(i64::MAX);
-    Ok(now.saturating_sub(created_at) > RETRY_WINDOW_MS)
+/// Whether an absent parent id may have been pruned: exactly the admission
+/// `id_expired` age rule, plus the allowed generator-clock skew. Retention
+/// keeps every younger command row, so only an absent ULID older than the
+/// retry window plus that skew may be gone; any other absent id never
+/// existed. Pure: no event scan, so no unindexed full-table read.
+pub fn command_history_expired(id: &str, now: i64) -> bool {
+    ulid_timestamp_ms(id).is_some_and(|created_at| {
+        now.saturating_sub(created_at) > RETRY_WINDOW_MS + RETRY_CLOCK_SKEW_MS
+    })
 }
 
 #[cfg(test)]
@@ -189,19 +169,6 @@ mod tests {
             .unwrap();
     }
 
-    fn insert_command_event(store: &mut Store, command_id: &str, ts: i64) {
-        let cause = json!({"command_id": command_id, "depth": 0}).to_string();
-        let data = json!({"command_id": command_id}).to_string();
-        store
-            .connection
-            .execute(
-                "INSERT INTO events(ts, kind, source, cause, data)
-                 VALUES (?1, 'command.applied', 'daemon', ?2, ?3)",
-                params![ts, cause, data],
-            )
-            .unwrap();
-    }
-
     fn seed_expansion(store: &mut Store, parent: &str, members: i64) -> Vec<String> {
         insert_command(store, parent, None, NOW);
         let mut children = Vec::new();
@@ -211,6 +178,10 @@ mod tests {
             children.push(child);
         }
         children
+    }
+
+    fn retained(store: &Store, id: &str) -> Command {
+        store.get_command(id).unwrap().unwrap()
     }
 
     #[test]
@@ -223,9 +194,8 @@ mod tests {
             Some((children[0].as_str(), "send", 0)),
             NOW,
         );
-        let first = store
-            .list_command_children("parent-1", None, 2, NOW)
-            .unwrap();
+        let parent = retained(&store, "parent-1");
+        let first = store.list_command_children(&parent, None, 2).unwrap();
         assert_eq!(first.parent.id, "parent-1");
         assert_eq!(
             first
@@ -237,13 +207,13 @@ mod tests {
         );
         assert_eq!(first.next.as_deref(), Some(children[1].as_str()));
         let second = store
-            .list_command_children("parent-1", Some(children[1].as_str()), 2, NOW)
+            .list_command_children(&parent, Some(children[1].as_str()), 2)
             .unwrap();
         assert_eq!(second.children.len(), 1);
         assert_eq!(second.children[0].id, children[2]);
         assert_eq!(second.next.as_deref(), Some(children[2].as_str()));
         let tail = store
-            .list_command_children("parent-1", Some(children[2].as_str()), 2, NOW)
+            .list_command_children(&parent, Some(children[2].as_str()), 2)
             .unwrap();
         assert!(tail.children.is_empty());
         assert_eq!(tail.next, None);
@@ -253,13 +223,12 @@ mod tests {
     fn childless_parent_pages_empty_and_rejects_any_cursor() {
         let mut store = store();
         insert_command(&mut store, "parent-1", None, NOW);
-        let page = store
-            .list_command_children("parent-1", None, 100, NOW)
-            .unwrap();
+        let parent = retained(&store, "parent-1");
+        let page = store.list_command_children(&parent, None, 100).unwrap();
         assert!(page.children.is_empty());
         assert_eq!(page.next, None);
         let error = store
-            .list_command_children("parent-1", Some("parent-1"), 100, NOW)
+            .list_command_children(&parent, Some("parent-1"), 100)
             .unwrap_err();
         assert_eq!(error.code, "invalid");
     }
@@ -269,6 +238,8 @@ mod tests {
         let mut store = store();
         let children = seed_expansion(&mut store, "parent-1", 1);
         seed_expansion(&mut store, "parent-2", 1);
+        let first = retained(&store, "parent-1");
+        let second = retained(&store, "parent-2");
         for after in [
             Some(children[0].as_str()),
             Some("missing"),
@@ -276,58 +247,61 @@ mod tests {
             Some(" \t "),
         ] {
             let error = store
-                .list_command_children("parent-2", after, 100, NOW)
+                .list_command_children(&second, after, 100)
                 .unwrap_err();
             assert_eq!(error.code, "invalid", "cursor {after:?}");
         }
-        let error = store
-            .list_command_children("parent-1", None, 0, NOW)
-            .unwrap_err();
+        let error = store.list_command_children(&first, None, 0).unwrap_err();
         assert_eq!(error.code, "invalid");
     }
 
     #[test]
-    fn unknown_ids_are_not_found() {
+    fn paging_a_vanished_parent_reads_not_found() {
         let mut store = store();
-        seed_expansion(&mut store, "parent-1", 1);
-        for id in ["missing", &ulid_at(NOW, 9)] {
-            let error = store.list_command_children(id, None, 100, NOW).unwrap_err();
-            assert_eq!(error.code, "not_found", "id {id}");
-        }
+        seed_expansion(&mut store, "parent-1", 0);
+        let parent = retained(&store, "parent-1");
+        store
+            .connection
+            .execute("DELETE FROM commands WHERE id = 'parent-1'", ())
+            .unwrap();
+        let error = store.list_command_children(&parent, None, 100).unwrap_err();
+        assert_eq!(error.code, "not_found");
     }
 
     #[test]
-    fn pruned_set_reads_history_gap_while_its_events_survive() {
+    fn pruned_expansion_id_classifies_as_history_gap() {
         let mut store = store();
         let old = NOW - 31 * DAY_MS;
         let parent = ulid_at(old, 1);
         let child = ulid_at(old, 2);
         insert_command(&mut store, &parent, None, old);
         insert_command(&mut store, &child, Some((&parent, "rule_action", 0)), old);
-        insert_command_event(&mut store, &parent, old);
-        insert_command_event(&mut store, &child, old);
         let report = store.prune_retention(None, Some(30), NOW).unwrap();
         assert_eq!(report.commands_deleted, 2);
         assert!(store.get_command(&parent).unwrap().is_none());
-        let error = store
-            .list_command_children(&parent, None, 100, NOW)
-            .unwrap_err();
-        assert_eq!(error.code, "history_gap");
+        assert!(command_history_expired(&parent, NOW));
     }
 
     #[test]
-    fn aged_ulid_without_events_may_be_pruned_but_a_young_one_never_existed() {
-        let store = store();
-        let old = ulid_at(NOW - RETRY_WINDOW_MS - 1, 3);
-        let error = store
-            .list_command_children(&old, None, 100, NOW)
-            .unwrap_err();
-        assert_eq!(error.code, "history_gap");
-        let young = ulid_at(NOW - RETRY_WINDOW_MS, 4);
-        let error = store
-            .list_command_children(&young, None, 100, NOW)
-            .unwrap_err();
-        assert_eq!(error.code, "not_found");
+    fn history_gap_uses_the_retry_window_plus_clock_skew() {
+        // Only an absent ULID strictly older than the retry window plus the
+        // allowed generator-clock skew may have been pruned.
+        let expired = NOW - RETRY_WINDOW_MS - RETRY_CLOCK_SKEW_MS - 1;
+        assert!(command_history_expired(&ulid_at(expired, 3), NOW));
+        for (label, id) in [
+            (
+                "boundary",
+                ulid_at(NOW - RETRY_WINDOW_MS - RETRY_CLOCK_SKEW_MS, 4),
+            ),
+            ("young", ulid_at(NOW, 5)),
+            ("skew_ahead", ulid_at(NOW + RETRY_CLOCK_SKEW_MS, 6)),
+            ("not_a_ulid", "missing".to_owned()),
+        ] {
+            assert!(
+                !command_history_expired(&id, NOW),
+                "{label} must never have existed"
+            );
+        }
     }
 
     fn plan_detail(row: &rusqlite::Row<'_>) -> rusqlite::Result<String> {

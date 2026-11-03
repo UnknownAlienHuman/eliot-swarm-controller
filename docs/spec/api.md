@@ -332,8 +332,13 @@ be 1–1,000; explicit `null`, wrong types, out-of-range values and unknown fiel
 `invalid`. Children page in fixed ordinal order and `next` is the last returned child
 id, or null on an empty page. Reads use the same principal scope as `command.get`: the
 parent and every returned child must be readable by the caller, otherwise the whole
-read is `not_allowed`. An `after` naming no child of the requested parent is `invalid`.
-An unknown id is `not_found`; a pruned set is `history_gap`.
+read is `not_allowed`. The parent is authorized before any history or cursor check.
+An `after` naming no child of the requested parent is `invalid`.
+An absent id whose ULID time is older than the retry window plus the allowed
+clock skew may have been pruned and reads `history_gap`; any other absent id
+reads `not_found`. An absent id has no parent row to authorize against, so only
+the Owner — authorized for every command — learns the gap; any other caller
+reads `not_found` for absent ids, whether pruned or never issued.
 
 ## Command, turn, and result reads
 

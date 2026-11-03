@@ -2637,16 +2637,29 @@ impl Router {
         let request: CommandChildrenRequest = serde_json::from_value(params.clone())
             .map_err(|_| Error::new("invalid", "command.children params are invalid"))?;
         request.validate()?;
+        let id = request.id.as_str();
         let mut page = {
             let store = self.inner.store.lock().await;
-            store.list_command_children(
-                request.id.as_str(),
-                request.after.as_deref(),
-                request.limit,
-                now_ms(),
-            )?
+            let Some(parent) = store.get_command(id)? else {
+                // No parent row to authorize against. Only the Owner, who is
+                // authorized for every command, may learn whether the id may
+                // have been pruned; anyone else reads `not_found`, so an
+                // unauthorized caller cannot tell pruned from absent or probe
+                // cursors.
+                let gap = matches!(principal, Principal::Owner)
+                    && eliot_store::command_history_expired(id, now_ms());
+                return Err(if gap {
+                    Error::new(
+                        "history_gap",
+                        format!("command {id} children are no longer retained"),
+                    )
+                } else {
+                    Error::new("not_found", format!("command {id} was not found"))
+                });
+            };
+            authorize_command_read(principal, &parent)?;
+            store.list_command_children(&parent, request.after.as_deref(), request.limit)?
         };
-        authorize_command_read(principal, &page.parent)?;
         for child in &mut page.children {
             authorize_command_read(principal, child)?;
             self.adjust_command_for_read(child);
@@ -11797,8 +11810,23 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         }
     }
 
-    fn launch_with_text_fixture(store: &mut eliot_store::Store, now: i64) -> (String, String) {
-        let launch_id = ulid::Ulid::new().to_string();
+    fn launch_fixture(
+        store: &mut eliot_store::Store,
+        now: i64,
+        text: Option<&str>,
+    ) -> (String, String) {
+        // The ULID timestamp follows the fixture clock so a launch admitted
+        // in the past classifies as pruned history once it is gone.
+        let launch_id =
+            ulid::Ulid::from_parts(u64::try_from(now).unwrap_or(0), ulid::Ulid::new().random())
+                .to_string();
+        let mut args = json!({
+            "project":"typed-children", "workspace":"synthetic-workspace",
+            "harness":"codex", "profile":"synthetic", "profile_snapshot":{},
+        });
+        if let Some(text) = text {
+            args["text"] = json!(text);
+        }
         let agent = store
             .submit(
                 "owner",
@@ -11806,11 +11834,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                     id: launch_id.clone(),
                     target: None,
                     verb: "launch".to_owned(),
-                    args: json!({
-                        "project":"typed-children", "workspace":"synthetic-workspace",
-                        "harness":"codex", "profile":"synthetic", "profile_snapshot":{},
-                        "text":"children-probe",
-                    }),
+                    args,
                     expected_generation: Some(0),
                     expected_turn_id: None,
                     request_id: None,
@@ -11825,12 +11849,38 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         (launch_id, agent)
     }
 
+    fn pruned_launch_id(store: &mut eliot_store::Store, now: i64) -> String {
+        let old = now - 31 * 24 * 60 * 60 * 1_000;
+        let (launch_id, agent) = launch_fixture(store, old, Some("children-probe"));
+        store.dispatch(&launch_id, old).unwrap();
+        read_fixture_event(
+            store,
+            &agent,
+            "session.ready",
+            json!({"native_scope":"fixture-scope", "native_ref":"fixture-ref"}),
+        );
+        store
+            .settle(&launch_id, CommandState::Applied, None, old)
+            .unwrap();
+        store
+            .settle(
+                &format!("{launch_id}/send"),
+                CommandState::Rejected,
+                None,
+                old,
+            )
+            .unwrap();
+        let report = store.prune_retention(None, Some(30), now).unwrap();
+        assert_eq!(report.commands_deleted, 2);
+        launch_id
+    }
+
     #[tokio::test]
     async fn command_children_pages_a_retained_launch_expansion() {
         let router = router();
         let launch_id = {
             let mut store = router.inner.store.lock().await;
-            launch_with_text_fixture(&mut store, now_ms()).0
+            launch_fixture(&mut store, now_ms(), Some("children-probe")).0
         };
         let page: CommandChildrenResponse = serde_json::from_value(
             router
@@ -11867,7 +11917,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         let router = router();
         let launch_id = {
             let mut store = router.inner.store.lock().await;
-            launch_with_text_fixture(&mut store, now_ms()).0
+            launch_fixture(&mut store, now_ms(), Some("children-probe")).0
         };
         for params in [
             json!({}),
@@ -11899,35 +11949,16 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         let router = router();
         let launch_id = {
             let mut store = router.inner.store.lock().await;
-            let old = now_ms() - 31 * 24 * 60 * 60 * 1_000;
-            let (launch_id, agent) = launch_with_text_fixture(&mut store, old);
-            store.dispatch(&launch_id, old).unwrap();
-            read_fixture_event(
-                &mut store,
-                &agent,
-                "session.ready",
-                json!({"native_scope":"fixture-scope", "native_ref":"fixture-ref"}),
-            );
-            store
-                .settle(&launch_id, CommandState::Applied, None, old)
-                .unwrap();
-            store
-                .settle(
-                    &format!("{launch_id}/send"),
-                    CommandState::Rejected,
-                    None,
-                    old,
-                )
-                .unwrap();
-            let report = store.prune_retention(None, Some(30), now_ms()).unwrap();
-            assert_eq!(report.commands_deleted, 2);
-            launch_id
+            pruned_launch_id(&mut store, now_ms())
         };
-        let error = router
-            .command_children(&json!({"id":launch_id}), &Principal::Owner)
-            .await
-            .unwrap_err();
-        assert_eq!(error.code, "history_gap");
+        let aged = ulid::Ulid::from_parts(1, 7).to_string();
+        for id in [&launch_id, &aged] {
+            let error = router
+                .command_children(&json!({"id":id}), &Principal::Owner)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "history_gap", "id: {id}");
+        }
         let error = router
             .command_children(
                 &json!({"id":ulid::Ulid::new().to_string()}),
@@ -11943,7 +11974,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         let router = router();
         let (launch_id, agent) = {
             let mut store = router.inner.store.lock().await;
-            launch_with_text_fixture(&mut store, now_ms())
+            launch_fixture(&mut store, now_ms(), Some("children-probe"))
         };
         let child_id = format!("{launch_id}/send");
         // A launch expansion spans generations: the parent is generation 0
@@ -11991,6 +12022,170 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         )
         .unwrap();
         assert_eq!(page.children.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn command_children_pages_a_catch_up_set_below_its_size() {
+        let root =
+            std::env::temp_dir().join(format!("eliot-children-catch-up-{}", ulid::Ulid::new()));
+        let rules_dir = root.join("rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        std::fs::write(
+            rules_dir.join("children-stops.toml"),
+            r#"
+[[rule]]
+id = "children-stops"
+on = { event = "agent.created" }
+do = [{ action = "stop", target = "${event.agent}", expected_generation = "${event.generation}" }]
+"#,
+        )
+        .unwrap();
+        let router = router_with_data_root(root.clone());
+        let policy = SecretPolicy::default();
+        crate::automation::initialize_global_rules(&router, &root, &policy)
+            .await
+            .unwrap();
+        let through = {
+            let mut store = router.inner.store.lock().await;
+            let now = now_ms();
+            launch_fixture(&mut store, now, None);
+            launch_fixture(&mut store, now, None);
+            let through = store.high_water().unwrap();
+            let state = store
+                .get_rule_state("owner", "children-stops")
+                .unwrap()
+                .unwrap();
+            store
+                .advance_rule_cursor(
+                    "owner",
+                    &state,
+                    through,
+                    eliot_store::RuleCursorOutcome::NoMatch,
+                    now,
+                )
+                .unwrap();
+            through
+        };
+        let parent: Command = serde_json::from_value(
+            router
+                .rule_catch_up(
+                    &json!({
+                        "id":ulid::Ulid::new().to_string(),
+                        "rule":"children-stops",
+                        "after_seq":0,
+                        "through_seq":through,
+                    }),
+                    &Principal::Owner,
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let expected: Vec<String> =
+            serde_json::from_value(parent.outcome.as_ref().unwrap()["children"].clone())
+                .expect("fixed catch-up child set");
+        assert_eq!(expected.len(), 2);
+        let mut after = None;
+        let mut seen = Vec::new();
+        for _ in 0..expected.len() {
+            let mut params = json!({"id":parent.id, "limit":1});
+            if let Some(cursor) = after.as_deref() {
+                params["after"] = json!(cursor);
+            }
+            let page: CommandChildrenResponse = serde_json::from_value(
+                router
+                    .command_children(&params, &Principal::Owner)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(page.children.len(), 1);
+            after = page.next.clone();
+            seen.push(page.children[0].id.clone());
+        }
+        assert_eq!(seen, expected);
+        let tail: CommandChildrenResponse = serde_json::from_value(
+            router
+                .command_children(
+                    &json!({"id":parent.id, "limit":1, "after":seen[1]}),
+                    &Principal::Owner,
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(tail.children.is_empty());
+        assert_eq!(tail.next, None);
+    }
+
+    #[tokio::test]
+    async fn command_children_agent_reads_own_children_but_not_absent_or_pruned() {
+        let router = router();
+        let (launch_id, agent) = {
+            let mut store = router.inner.store.lock().await;
+            launch_fixture(&mut store, now_ms(), None)
+        };
+        let own = Principal::Agent {
+            id: agent,
+            generation: 0,
+        };
+        let page: CommandChildrenResponse = serde_json::from_value(
+            router
+                .command_children(&json!({"id":launch_id}), &own)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(page.children.is_empty());
+        assert_eq!(page.next, None);
+
+        let pruned = {
+            let mut store = router.inner.store.lock().await;
+            pruned_launch_id(&mut store, now_ms())
+        };
+        let young = ulid::Ulid::new().to_string();
+        let aged = ulid::Ulid::from_parts(1, 9).to_string();
+        for id in [&aged, &pruned] {
+            let error = router
+                .command_children(&json!({"id":id}), &Principal::Owner)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "history_gap", "owner must see the gap for {id}");
+        }
+        let registration = ProjectRegistrationView {
+            id: "sample".to_owned(),
+            checkout: "C:\\work\\sample".to_owned(),
+            repo_common_dir: "C:\\work".to_owned(),
+            profiles: Vec::new(),
+            actions: vec!["run".to_owned()],
+            interpreters: Default::default(),
+            run_env: Vec::new(),
+            git: None,
+            revision: 1,
+        };
+        let foreign = Principal::Agent {
+            id: "a9999".to_owned(),
+            generation: 0,
+        };
+        let run = Principal::Run {
+            run_command_id: "run-1".to_owned(),
+        };
+        let project = Principal::ProjectRule { registration };
+        for principal in [&own, &foreign, &run, &project] {
+            for id in [&young, &aged, &pruned] {
+                let error = router
+                    .command_children(&json!({"id":id}), principal)
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.code, "not_found", "absent id {id}");
+            }
+            // A cursor probe against an absent parent leaks nothing either.
+            let error = router
+                .command_children(&json!({"id":aged, "after":pruned}), principal)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "not_found");
+        }
     }
 
     #[tokio::test]
