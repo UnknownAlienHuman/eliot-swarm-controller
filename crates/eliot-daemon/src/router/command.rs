@@ -336,6 +336,7 @@ impl Router {
                                             | "command.rejected"
                                             | "command.cancelled"
                                             | "command.unknown"
+                                            | "command.resolved"
                                     )
                                     || event.kind.starts_with("workspace.")
                                     || (event.agent == target

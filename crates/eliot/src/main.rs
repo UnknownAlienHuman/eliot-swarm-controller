@@ -7,13 +7,14 @@ use eliot_core::{
         AgentGetResponse, AgentGitRequest, AgentGitResponse, AgentHistoryRequest, AgentListRequest,
         AgentListResponse, AgentProcessesRequest, AgentProcessesResponse, AgentResultRequest,
         AgentResultResponse, AgentStatsRequest, AgentStatsResponse, CommandGetRequest,
-        CommandSubmitResponse, DaemonShutdownRequest, DaemonShutdownResponse, DaemonStatusRequest,
-        DaemonStatusResponse, DiscoverPage, EventsFilter, EventsReadRequest, EventsReadResponse,
-        EventsSubscribeRequest, EventsSubscribeResponse, ObservationPage, ProjectRegistrationView,
+        CommandResolution, CommandResolveRequest, CommandResolveResponse, CommandSubmitResponse,
+        DaemonShutdownRequest, DaemonShutdownResponse, DaemonStatusRequest, DaemonStatusResponse,
+        DiscoverPage, EventsFilter, EventsReadRequest, EventsReadResponse, EventsSubscribeRequest,
+        EventsSubscribeResponse, ObservationPage, ProjectRegistrationView,
         ProviderClearHoldRequest, ProviderClearHoldResponse, ProviderCorrectiveEvidence,
         ProviderHoldsRequest, ProviderHoldsResponse, RuleCatchUpRequest, RuleGetRequest,
         RuleStateView, ShutdownMode, TimerGetRequest, TimerRunRequest, TimerStateView,
-        TurnGetRequest,
+        TurnGetRequest, TurnResolveRequest, TurnResolveResponse, TurnResolveStatus,
     },
 };
 use serde_json::{Value, json};
@@ -329,6 +330,11 @@ enum CliCommand {
         #[command(subcommand)]
         command: CmdCommand,
     },
+    /// Resolve an unknown turn with an exact owner assertion.
+    Turn {
+        #[command(subcommand)]
+        command: TurnCommand,
+    },
     /// Read committed events after a sequence number.
     Events {
         #[arg(long, value_name = "SEQ")]
@@ -368,7 +374,33 @@ struct ShutdownArgs {
 
 #[derive(Subcommand)]
 enum CmdCommand {
-    Show { id: String },
+    Show {
+        id: String,
+    },
+    /// Resolve an unknown command to its owner-asserted terminal state.
+    Resolve {
+        command_id: String,
+        #[arg(long = "as", value_name = "STATE")]
+        resolution: String,
+        #[arg(long, value_name = "TEXT")]
+        reason: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum TurnCommand {
+    /// Resolve an unknown turn to its owner-asserted terminal status.
+    Resolve {
+        agent: String,
+        #[arg(long, value_name = "GENERATION", value_parser = clap::value_parser!(i64).range(0..))]
+        generation: i64,
+        #[arg(long, value_name = "TURN")]
+        turn_id: String,
+        #[arg(long, value_name = "STATUS")]
+        status: String,
+        #[arg(long, value_name = "TEXT")]
+        reason: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1214,6 +1246,69 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                     .map_err(|error| Failure::from_core(error, false))?;
                 let result = command_value(response)?;
                 print_value(&result, json_output);
+                Ok(0)
+            }
+            CmdCommand::Resolve {
+                command_id,
+                resolution,
+                reason,
+            } => {
+                let resolution = CommandResolution::parse(&resolution)
+                    .map_err(|_| Failure::new(2, "--as must be applied or failed"))?;
+                let request = CommandResolveRequest {
+                    id: mutation_id(id)?,
+                    command_id,
+                    resolution,
+                    reason,
+                };
+                request
+                    .validate()
+                    .map_err(|error| Failure::from_core(error, true))?;
+                let response: CommandResolveResponse =
+                    eliot_daemon::client_call_typed(&data_dir, "command.resolve", &request)
+                        .await
+                        .map_err(|error| Failure::from_core(error, true))?;
+                request
+                    .validate_response(&response)
+                    .map_err(|_| Failure::new(4, "command.resolve response is invalid"))?;
+                let value = serde_json::to_value(response)
+                    .map_err(|_| Failure::new(4, "command.resolve response is invalid"))?;
+                print_value(&value, json_output);
+                Ok(0)
+            }
+        },
+        CliCommand::Turn { command } => match command {
+            TurnCommand::Resolve {
+                agent,
+                generation,
+                turn_id,
+                status,
+                reason,
+            } => {
+                let status = TurnResolveStatus::parse(&status).map_err(|_| {
+                    Failure::new(2, "--status must be completed, failed, or interrupted")
+                })?;
+                let request = TurnResolveRequest {
+                    id: mutation_id(id)?,
+                    agent,
+                    generation,
+                    turn_id,
+                    status,
+                    reason,
+                };
+                request
+                    .validate()
+                    .map_err(|error| Failure::from_core(error, true))?;
+                let response: TurnResolveResponse =
+                    eliot_daemon::client_call_typed(&data_dir, "turn.resolve", &request)
+                        .await
+                        .map_err(|error| Failure::from_core(error, true))?;
+                request
+                    .validate_response(&response)
+                    .map_err(|_| Failure::new(4, "turn.resolve response is invalid"))?;
+                let value = serde_json::to_value(response)
+                    .map_err(|_| Failure::new(4, "turn.resolve response is invalid"))?;
+                print_value(&value, json_output);
                 Ok(0)
             }
         },

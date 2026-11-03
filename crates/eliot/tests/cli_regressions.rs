@@ -12666,3 +12666,306 @@ fn restart_releases_lost_generation_capacity_once_its_custody_closed() {
     // Drain would wait for the live resumed generation.
     fixture.stop(true);
 }
+
+#[test]
+fn cli_cmd_resolve_releases_unknown_send_gate() {
+    let mut fixture = Fixture::new("cmd resolve");
+    fixture.start();
+    let launched = fixture.json(&[
+        "launch",
+        "--profile",
+        "fake",
+        "--workspace",
+        fixture.workspace.to_str().unwrap(),
+    ]);
+    assert_eq!(launched["state"], "applied");
+    let agent = launched["target"].as_str().unwrap();
+    let generation = launched["generation"].as_i64().unwrap().to_string();
+
+    let fault_id = ulid::Ulid::new().to_string();
+    let fault = cli(
+        &fixture.data,
+        &[
+            "--id",
+            &fault_id,
+            "send",
+            "--generation",
+            &generation,
+            "--wait",
+            "--timeout-seconds",
+            "10",
+            agent,
+            "--",
+            "[fake:malformed-after-dispatch]",
+        ],
+    );
+    assert_eq!(fault.status.code(), Some(4), "unknown send must exit 4");
+    let unknown = fixture.json(&["cmd", "show", &fault_id]);
+    assert_eq!(unknown["state"], "unknown");
+    assert!(unknown["turn_id"].is_null());
+    // The dead fake fenced its Agent as lost, so later input is rejected
+    // before any gate; the daemon-level gate release is covered by the Router
+    // waiter test instead.
+    let blocked_id = assert_input_blocked(&fixture, agent, &generation);
+    assert_eq!(fault_dispatches(&fixture.events(), &blocked_id), 0);
+    let status_before = fixture.json(&["status"]);
+    assert!(
+        status_before["unsettled_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command["id"] == fault_id && command["state"] == "unknown")
+    );
+
+    let resolve_id = ulid::Ulid::new().to_string();
+    let resolved = fixture.json(&[
+        "--id",
+        &resolve_id,
+        "cmd",
+        "resolve",
+        &fault_id,
+        "--as",
+        "failed",
+        "--reason",
+        "owner verified the lost transport never delivered",
+    ]);
+    assert_eq!(resolved["id"], resolve_id);
+    assert_eq!(resolved["command_id"], fault_id);
+    assert_eq!(resolved["state"], "failed");
+
+    let read = fixture.json(&["cmd", "show", &fault_id]);
+    assert_eq!(read["state"], "failed");
+    assert_eq!(read["outcome"]["resolution_source"], "owner");
+    assert_eq!(
+        read["outcome"]["reason"],
+        "owner verified the lost transport never delivered"
+    );
+
+    let events = fixture.events();
+    let assertion = events
+        .iter()
+        .find(|event| {
+            event["kind"] == "command.resolved" && event["data"]["command_id"] == fault_id
+        })
+        .expect("owner assertion event");
+    assert_eq!(assertion["agent"], agent);
+    assert_eq!(assertion["data"]["state"], "failed");
+    assert_eq!(assertion["data"]["write_id"], resolve_id);
+    assert_eq!(assertion["data"]["resolution_source"], "owner");
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["data"]["command_id"] == fault_id
+                && (event["kind"] == "command.applied" || event["kind"] == "command.failed")),
+        "owner assertion emitted a native receipt"
+    );
+    assert_eq!(fault_dispatches(&events, &fault_id), 1);
+
+    // The resolved command leaves every unknown/statused view immediately.
+    let status_after = fixture.json(&["status"]);
+    assert!(
+        !status_after["unknown_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|id| id == &fault_id)
+    );
+    assert!(
+        !status_after["unsettled_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command["id"] == fault_id)
+    );
+
+    // Refusals: an applied command is not resolvable, and the retained write
+    // id conflicts with any different assertion.
+    let launch_id = launched["id"].as_str().unwrap();
+    let refused = cli(
+        &fixture.data,
+        &[
+            "cmd",
+            "resolve",
+            launch_id,
+            "--as",
+            "failed",
+            "--reason",
+            "must be refused",
+        ],
+    );
+    assert_eq!(refused.status.code(), Some(3));
+    let conflict = cli(
+        &fixture.data,
+        &[
+            "--id",
+            &resolve_id,
+            "cmd",
+            "resolve",
+            &fault_id,
+            "--as",
+            "applied",
+            "--reason",
+            "a different assertion",
+        ],
+    );
+    assert_eq!(conflict.status.code(), Some(3));
+    let replay = cli(
+        &fixture.data,
+        &[
+            "--id",
+            &resolve_id,
+            "cmd",
+            "resolve",
+            &fault_id,
+            "--as",
+            "failed",
+            "--reason",
+            "owner verified the lost transport never delivered",
+        ],
+    );
+    assert!(replay.status.success());
+    assert_eq!(replay.json()["state"], "failed");
+    fixture.stop(false);
+}
+
+#[test]
+fn cli_turn_resolve_asserts_unknown_held_turn_after_force_restart() {
+    const HOLD_TURN: &str = "[fake:hold-turn]";
+    let mut fixture = Fixture::new("turn resolve");
+    fixture.start();
+    let launched = fixture.json(&[
+        "launch",
+        "--profile",
+        "fake",
+        "--workspace",
+        fixture.workspace.to_str().unwrap(),
+    ]);
+    assert_eq!(launched["state"], "applied");
+    let agent = launched["target"].as_str().unwrap().to_owned();
+    let generation = launched["generation"].as_i64().unwrap();
+    let generation_arg = generation.to_string();
+
+    let hold_id = ulid::Ulid::new().to_string();
+    let held = cli(
+        &fixture.data,
+        &[
+            "--id",
+            &hold_id,
+            "send",
+            "--generation",
+            &generation_arg,
+            &agent,
+            "--",
+            HOLD_TURN,
+        ],
+    );
+    assert!(
+        held.status.success(),
+        "held Fake send was not admitted; bounded stderr={:?}",
+        held.stderr.chars().take(2048).collect::<String>()
+    );
+    let held_command = fixture.wait_command(&hold_id, "applied");
+    let turn_id = held_command["turn_id"]
+        .as_str()
+        .expect("held send turn association")
+        .to_owned();
+
+    // A still-active turn in a live generation cannot be owner-resolved.
+    let refused = cli(
+        &fixture.data,
+        &[
+            "turn",
+            "resolve",
+            &agent,
+            "--generation",
+            &generation_arg,
+            "--turn-id",
+            &turn_id,
+            "--status",
+            "failed",
+            "--reason",
+            "must be refused while active",
+        ],
+    );
+    assert_eq!(refused.status.code(), Some(3));
+
+    fixture.stop(true);
+    fixture.start();
+    assert_eq!(fixture.json(&["show", &agent])["state"], "lost");
+    let before: AgentResultResponse =
+        serde_json::from_value(fixture.json(&["result", &agent, "--generation", &generation_arg]))
+            .expect("typed pre-resolution result");
+    assert_eq!(before.turns.len(), 1);
+    assert_eq!(before.turns[0].turn_id, turn_id);
+    assert_eq!(before.turns[0].state, TurnState::Unknown);
+
+    let resolve_id = ulid::Ulid::new().to_string();
+    let resolved = fixture.json(&[
+        "--id",
+        &resolve_id,
+        "turn",
+        "resolve",
+        &agent,
+        "--generation",
+        &generation_arg,
+        "--turn-id",
+        &turn_id,
+        "--status",
+        "failed",
+        "--reason",
+        "owner verified the held turn never completed",
+    ]);
+    assert_eq!(resolved["id"], resolve_id);
+    assert_eq!(resolved["agent"], agent);
+    assert_eq!(resolved["generation"], generation);
+    assert_eq!(resolved["turn_id"], turn_id);
+    assert_eq!(resolved["status"], "failed");
+
+    let after: AgentResultResponse =
+        serde_json::from_value(fixture.json(&["result", &agent, "--generation", &generation_arg]))
+            .expect("typed resolved result");
+    assert_eq!(after.turns.len(), 1);
+    assert_eq!(after.turns[0].state, TurnState::Completed);
+    assert_eq!(after.turns[0].status.as_deref(), Some("failed"));
+
+    // Only the turn gate released: the associated send is untouched.
+    let send = fixture.json(&["cmd", "show", &hold_id]);
+    assert_eq!(send["state"], "applied");
+    assert_eq!(send["turn_id"], turn_id);
+
+    let events = fixture.events();
+    let assertion = events
+        .iter()
+        .find(|event| event["kind"] == "turn.resolved" && event["data"]["turn_id"] == turn_id)
+        .expect("owner turn assertion event");
+    assert_eq!(assertion["agent"], agent);
+    assert_eq!(assertion["generation"], generation);
+    assert_eq!(assertion["data"]["status"], "failed");
+    assert_eq!(assertion["data"]["write_id"], resolve_id);
+    assert_eq!(assertion["data"]["resolution_source"], "owner");
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["kind"] == "turn.completed" && event["data"]["turn_id"] == turn_id),
+        "owner assertion invented native completion"
+    );
+
+    let terminal_refused = cli(
+        &fixture.data,
+        &[
+            "turn",
+            "resolve",
+            &agent,
+            "--generation",
+            &generation_arg,
+            "--turn-id",
+            &turn_id,
+            "--status",
+            "completed",
+            "--reason",
+            "must be refused once terminal",
+        ],
+    );
+    assert_eq!(terminal_refused.status.code(), Some(3));
+    fixture.stop(false);
+}

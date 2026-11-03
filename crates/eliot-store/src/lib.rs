@@ -77,6 +77,7 @@ mod admission;
 mod dispatch;
 mod observer;
 mod observer_live;
+mod resolution;
 mod source_handoff;
 
 fn sql_error(error: rusqlite::Error) -> Error {
@@ -9019,3 +9020,5 @@ mod git_fetch_tests;
 
 #[cfg(test)]
 mod git_workspace_fence_tests;
+#[cfg(test)]
+mod resolution_tests;

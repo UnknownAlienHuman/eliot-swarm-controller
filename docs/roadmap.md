@@ -61,7 +61,7 @@ Use the existing Store/router and small internal modules. Keep evidence in the P
       now preserves fixed Git stage codes; capture bounded process/IPC readiness and
       progress facts for the other cases. Establish each cause before changing deadlines,
       concurrency or checks. A green rerun alone does not explain an earlier failure.
-- [ ] **Unknown-outcome readback/resolution.** Connect exact readback and constrained owner
+- [x] **Unknown-outcome readback/resolution.** Connect exact readback and constrained owner
       resolution under the [API contract](spec/api.md#input-turn-and-unknown-gates), including
       a send with a lost native turn association. Release only the resolved command/turn
       gate; never invent native completion or override capacity. Advertise the RPC/CLI
