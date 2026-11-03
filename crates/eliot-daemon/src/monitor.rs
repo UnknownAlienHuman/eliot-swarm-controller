@@ -1989,6 +1989,9 @@ mod tests {
 
         let (monitoring, store) = sweep_monitor();
         let group_a = TestSleepGroup::spawn().expect("spawn group A leader");
+        // The lock covers attaches too: attach samples immediately, so an
+        // attach outside the lock would pollute another test's window.
+        let _lock = SWEEP_TEST_LOCK.lock().await;
         let agent_a = attach_sweep_target(&monitoring, &store, "sweep-fail-a", group_a.pid()).await;
         // Capture before B exists: B must not be sampled by this sweep.
         let captured: Vec<Arc<Target>> = monitoring
@@ -2002,7 +2005,6 @@ mod tests {
         let group_b = TestSleepGroup::spawn().expect("spawn group B leader");
         let agent_b = attach_sweep_target(&monitoring, &store, "sweep-fail-b", group_b.pid()).await;
 
-        let _lock = SWEEP_TEST_LOCK.lock().await;
         test_reset_sweep_enumerations();
         let _forced = ForcedSweepFailure::arm();
         monitoring.sample_all_sweep(captured).await;
@@ -2045,6 +2047,9 @@ mod tests {
         let (monitoring, store) = sweep_monitor();
         let mut group_a = TestSleepGroup::spawn().expect("spawn group A leader");
         let mut group_b = TestSleepGroup::spawn().expect("spawn group B leader");
+        // The lock covers attaches too: attach samples immediately, so an
+        // attach outside the lock would pollute another test's window.
+        let _lock = SWEEP_TEST_LOCK.lock().await;
         attach_sweep_target(&monitoring, &store, "sweep-skip-a", group_a.pid()).await;
         attach_sweep_target(&monitoring, &store, "sweep-skip-b", group_b.pid()).await;
         group_a.kill_and_wait();
@@ -2065,7 +2070,6 @@ mod tests {
             );
         }
 
-        let _lock = SWEEP_TEST_LOCK.lock().await;
         test_reset_sweep_enumerations();
         monitoring.sample_all_sweep(all).await;
         assert_eq!(
@@ -2097,6 +2101,9 @@ mod tests {
         let (monitoring, store) = sweep_monitor();
         let group_a = TestSleepGroup::spawn().expect("spawn group A leader");
         let group_b = TestSleepGroup::spawn().expect("spawn group B leader");
+        // The lock covers attaches too: attach samples immediately, so an
+        // attach outside the lock would pollute another test's window.
+        let _lock = SWEEP_TEST_LOCK.lock().await;
         let agent_a =
             attach_sweep_target(&monitoring, &store, "sweep-share-a", group_a.pid()).await;
         let agent_b =
@@ -2111,7 +2118,6 @@ mod tests {
             .collect();
         assert_eq!(all.len(), 2);
 
-        let _lock = SWEEP_TEST_LOCK.lock().await;
         test_reset_sweep_enumerations();
         monitoring.sample_all_sweep(all).await;
         assert_eq!(
