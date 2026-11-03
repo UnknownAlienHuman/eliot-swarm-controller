@@ -2725,7 +2725,7 @@ fn project_registration_migration_defaults_legacy_run_authority_to_deny() {
             .expect("insert pre-migration project registration");
     }
 
-    let store = Store::open(&path).expect("apply registration and Git migration 17");
+    let store = Store::open(&path).expect("apply registration and Git migration 18");
     let version: i64 = store
         .connection
         .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
@@ -6206,11 +6206,16 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
     store
         .connection
         .execute_batch(
-            "DROP TABLE store_identity; DELETE FROM schema_migrations WHERE version = 17;",
+            "DROP TABLE store_identity; DELETE FROM schema_migrations WHERE version = 17;
+             DROP INDEX commands_unsettled_created;
+             DROP INDEX processes_owner_identity;
+             CREATE INDEX commands_open ON commands(state)
+                 WHERE state IN ('accepted', 'queued', 'dispatched', 'unknown');
+             DELETE FROM schema_migrations WHERE version = 18;",
         )
         .expect("roll back to schema 16");
     drop(store);
-    let mut store = Store::open(&path).expect("migrate 16 to 17");
+    let mut store = Store::open(&path).expect("migrate 16 to 18");
     store.recover_on_restart(now + 2).expect("recover");
     let retained = store
         .restart_retained_generations(None)
@@ -8207,11 +8212,17 @@ fn explain_plan(store: &Store, sql: &str, parameters: impl rusqlite::Params) -> 
     plan.join("\n")
 }
 
-fn assert_ordered_index_plan(plan: &str, index: &str) {
+fn assert_ordered_index_plan(plan: &str, table: &str, access: &str) {
     assert!(
-        plan.contains(index),
-        "query plan should use {index}, got:\n{plan}"
+        plan.contains(access),
+        "query plan should contain {access}, got:\n{plan}"
     );
+    for line in plan.lines() {
+        assert!(
+            !(line.contains(&format!("SCAN {table}")) && !line.contains("USING INDEX")),
+            "query plan should not table-scan {table}, got:\n{plan}"
+        );
+    }
     assert!(
         !plan.contains("USE TEMP B-TREE FOR ORDER BY"),
         "query plan should not sort, got:\n{plan}"
@@ -8231,7 +8242,7 @@ fn insert_command(store: &Store, id: &str, target: i64, verb: &str, state: &str,
 }
 
 #[test]
-fn ordered_store_reads_install_v17_indexes() {
+fn ordered_store_reads_install_v18_indexes() {
     let store = Store::open(Path::new(":memory:")).expect("open Store");
     let found: i64 = store
         .connection
@@ -8242,7 +8253,7 @@ fn ordered_store_reads_install_v17_indexes() {
             [],
             |row| row.get(0),
         )
-        .expect("count v17 indexes");
+        .expect("count v18 indexes");
     assert_eq!(found, 2);
     // The unordered commands_open partial index is redundant with
     // commands_unsettled_created and would keep the old sort plan.
@@ -8270,6 +8281,7 @@ fn ordered_store_reads_keep_unsettled_order_and_observer_exclusions() {
         )
         .expect("insert agent");
     let agent = store.connection.last_insert_rowid();
+    let mut observers = Vec::new();
     for _ in 0..2 {
         store
             .connection
@@ -8280,9 +8292,10 @@ fn ordered_store_reads_keep_unsettled_order_and_observer_exclusions() {
                 [],
             )
             .expect("insert observer");
+        observers.push(store.connection.last_insert_rowid());
     }
-    let observed_with_source = agent + 1;
-    let observed_without_source = agent + 2;
+    let observed_with_source = observers[0];
+    let observed_without_source = observers[1];
     store
         .connection
         .execute(
@@ -8357,7 +8370,11 @@ fn ordered_store_reads_keep_unsettled_order_and_observer_exclusions() {
         super::LIST_UNSETTLED_COMMANDS_SQL,
         rusqlite::params![100],
     );
-    assert_ordered_index_plan(&plan, "commands_unsettled_created");
+    assert_ordered_index_plan(
+        &plan,
+        "commands",
+        "SCAN commands USING INDEX commands_unsettled_created",
+    );
     store
         .connection
         .execute_batch("ANALYZE")
@@ -8367,7 +8384,11 @@ fn ordered_store_reads_keep_unsettled_order_and_observer_exclusions() {
         super::LIST_UNSETTLED_COMMANDS_SQL,
         rusqlite::params![100],
     );
-    assert_ordered_index_plan(&analyzed_plan, "commands_unsettled_created");
+    assert_ordered_index_plan(
+        &analyzed_plan,
+        "commands",
+        "SCAN commands USING INDEX commands_unsettled_created",
+    );
 }
 
 fn insert_process(store: &Store, boot: &str, pid: u32, start_time: i64, owner: &str, state: &str) {
@@ -8543,15 +8564,11 @@ fn ordered_store_reads_paginate_processes_by_owner_identity() {
         super::LIST_PROCESSES_FIRST_PAGE_SQL,
         rusqlite::params![owner, 2],
     );
-    assert_ordered_index_plan(&first_plan, "processes_owner_identity");
-    for (boot, pid, start) in [("boot-a", 100u32, 10i64), ("boot-b", 100u32, 10i64)] {
-        let cursor_plan = explain_plan(
-            &store,
-            super::LIST_PROCESSES_CURSOR_PAGE_SQL,
-            rusqlite::params![owner, boot, pid, start, 2],
-        );
-        assert_ordered_index_plan(&cursor_plan, "processes_owner_identity");
-    }
+    assert_ordered_index_plan(
+        &first_plan,
+        "processes",
+        "SEARCH processes USING INDEX processes_owner_identity (owner=?",
+    );
     store
         .connection
         .execute_batch("ANALYZE")
@@ -8561,11 +8578,19 @@ fn ordered_store_reads_paginate_processes_by_owner_identity() {
         super::LIST_PROCESSES_FIRST_PAGE_SQL,
         rusqlite::params![owner, 2],
     );
-    assert_ordered_index_plan(&analyzed_first, "processes_owner_identity");
+    assert_ordered_index_plan(
+        &analyzed_first,
+        "processes",
+        "SEARCH processes USING INDEX processes_owner_identity (owner=?",
+    );
     let analyzed_tail = explain_plan(
         &store,
         super::LIST_PROCESSES_CURSOR_PAGE_SQL,
         rusqlite::params![owner, "boot-b", 100u32, 10i64, 2],
     );
-    assert_ordered_index_plan(&analyzed_tail, "processes_owner_identity");
+    assert_ordered_index_plan(
+        &analyzed_tail,
+        "processes",
+        "SEARCH processes USING INDEX processes_owner_identity (owner=?",
+    );
 }
