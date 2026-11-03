@@ -1007,8 +1007,8 @@ fn goal_commit_blocks_on_turn_limit_and_no_progress_streaks() {
 
     let mut streaky = definition("green");
     streaky.max_without_progress = Some(1);
-    streaky.max_rounds = None;
-    streaky.max_turns = None;
+    // The default turn/round bounds stay: automatic Goals need one, and
+    // neither fires before the no-progress streak does.
     let agent = ready_agent(&mut store, "goal-no-progress", now + 5);
     let view = store.goal_set(&agent, "eliot", &streaky, now + 5).unwrap();
     let key = store.high_water().unwrap();
@@ -2453,4 +2453,264 @@ fn goal_native_driving_reports_an_active_native_goal() {
         )
         .expect("pause native goal");
     assert!(!store.goal_native_driving(&agent).unwrap());
+}
+
+#[test]
+fn goal_set_refuses_an_unbounded_automatic_goal() {
+    let mut store = store();
+    let now = now_ms();
+    let agent = ready_agent(&mut store, "goal-unbounded", now);
+    let mut unbounded = definition("green");
+    unbounded.max_turns = None;
+    unbounded.max_rounds = None;
+    unbounded.max_without_progress = None;
+    assert_eq!(
+        store
+            .goal_set(&agent, "eliot", &unbounded, now)
+            .unwrap_err()
+            .code,
+        "invalid"
+    );
+    // Either bound enables automatic driving; max_without_progress alone
+    // does not bound the driving itself.
+    for (max_turns, max_rounds) in [(Some(4), None), (None, Some(6))] {
+        let mut bounded = unbounded.clone();
+        bounded.max_turns = max_turns;
+        bounded.max_rounds = max_rounds;
+        store
+            .goal_set(&agent, "eliot", &bounded, now + 1)
+            .expect("bounded goal sets");
+    }
+    let mut progress_only = unbounded.clone();
+    progress_only.max_without_progress = Some(2);
+    assert_eq!(
+        store
+            .goal_set(&agent, "eliot", &progress_only, now + 2)
+            .unwrap_err()
+            .code,
+        "invalid"
+    );
+    // Cadenced Goals round only on explicit slots: no bound needed.
+    let mut cadenced = unbounded.clone();
+    cadenced.cadence_ms = Some(MIN_GOAL_CADENCE_MS);
+    store
+        .goal_set(&agent, "eliot", &cadenced, now + 3)
+        .expect("cadenced goal sets without a bound");
+}
+
+#[test]
+fn goal_committed_slots_are_monotonic() {
+    let mut store = store();
+    let base = now_ms();
+    let agent = ready_agent(&mut store, "goal-slot-monotonic", base);
+    let set = store
+        .goal_set(&agent, "eliot", &cadenced_definition("green"), base)
+        .unwrap();
+    let ninth_due = base + 9 * MIN_GOAL_CADENCE_MS;
+    store
+        .goal_round_probe(&agent, "eliot", GoalRoundKey::Slot(9), ninth_due)
+        .expect("slot 9 probes when due");
+    let claim_seq = store
+        .goal_claim_round(
+            &agent,
+            "eliot",
+            GoalRoundKey::Slot(9),
+            set.revision,
+            ninth_due,
+        )
+        .expect("claim slot 9");
+    let committed = store
+        .goal_commit_round(
+            &slot_commit_for(
+                &agent,
+                set.revision,
+                9,
+                claim_seq,
+                Some(failed_check("digest-9")),
+                None,
+                Some(continued_send("keep going")),
+            ),
+            ninth_due,
+        )
+        .unwrap();
+    assert!(matches!(
+        committed.outcome,
+        super::GoalCommitOutcome::Continued { .. }
+    ));
+    assert_eq!(committed.view.last_round_key.as_deref(), Some("slot:9"));
+    let send_id = match &committed.outcome {
+        super::GoalCommitOutcome::Continued { command_id } => command_id.clone(),
+        outcome => panic!("slot 9 must continue, got {outcome:?}"),
+    };
+    complete_send(&mut store, &agent, &send_id, "turn-slot-9", ninth_due + 1);
+    // Slot 1 is long due but not newer than the committed slot 9.
+    assert_eq!(
+        store
+            .goal_round_probe(&agent, "eliot", GoalRoundKey::Slot(1), ninth_due)
+            .unwrap_err()
+            .code,
+        "stale_round"
+    );
+    assert_eq!(
+        store
+            .goal_claim_round(
+                &agent,
+                "eliot",
+                GoalRoundKey::Slot(1),
+                committed.view.revision,
+                ninth_due,
+            )
+            .unwrap_err()
+            .code,
+        "stale_round"
+    );
+    // A newer slot still rounds.
+    let tenth_due = base + 10 * MIN_GOAL_CADENCE_MS;
+    store
+        .goal_round_probe(&agent, "eliot", GoalRoundKey::Slot(10), tenth_due)
+        .expect("newer slot probes");
+}
+
+#[test]
+fn goal_reopen_reads_idle_and_slot_markers_as_unknown() {
+    let path = goal_crash_store_path();
+    let base = now_ms();
+    let (idle_agent, idle_key, slot_agent) = {
+        let mut store = Store::open(&path).expect("open file Store");
+        let idle_agent = ready_agent(&mut store, "goal-reopen-idle", base);
+        let idle_key = store.high_water().unwrap();
+        let slot_agent = ready_agent(&mut store, "goal-reopen-slot", base);
+        let idle_view = store
+            .goal_set(&idle_agent, "eliot", &definition("green"), base)
+            .unwrap();
+        let slot_view = store
+            .goal_set(&slot_agent, "eliot", &cadenced_definition("green"), base)
+            .unwrap();
+        let first_due = base + MIN_GOAL_CADENCE_MS;
+        store
+            .goal_round_probe(
+                &idle_agent,
+                "eliot",
+                GoalRoundKey::Idle(idle_key),
+                first_due,
+            )
+            .expect("probe idle key");
+        claim(
+            &mut store,
+            &idle_agent,
+            idle_view.revision,
+            idle_key,
+            first_due,
+        );
+        store
+            .goal_round_probe(&slot_agent, "eliot", GoalRoundKey::Slot(1), first_due)
+            .expect("probe first slot");
+        store
+            .goal_claim_round(
+                &slot_agent,
+                "eliot",
+                GoalRoundKey::Slot(1),
+                slot_view.revision,
+                first_due,
+            )
+            .expect("claim first slot");
+        // Crash: the handle drops with both markers `running`.
+        (idle_agent, idle_key, slot_agent)
+    };
+    let mut store = Store::open(&path).expect("reopen file Store");
+    // Both key forms survived under the round_key_kind column.
+    let mut kinds: Vec<(i64, String)> = store
+        .connection
+        .prepare("SELECT round_key, round_key_kind FROM goal_markers ORDER BY agent")
+        .expect("prepare marker kinds")
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("read marker kinds")
+        .collect::<rusqlite::Result<Vec<(i64, String)>>>()
+        .expect("collect marker kinds");
+    kinds.sort();
+    assert_eq!(
+        kinds,
+        vec![(1, "slot".to_owned()), (idle_key, "idle".to_owned())]
+    );
+    // Both crashed keys stay burned at probe AND claim.
+    for (agent, key) in [
+        (idle_agent.as_str(), GoalRoundKey::Idle(idle_key)),
+        (slot_agent.as_str(), GoalRoundKey::Slot(1)),
+    ] {
+        let revision = store.goal_get(agent, "eliot").unwrap().unwrap().revision;
+        assert_eq!(
+            store
+                .goal_round_probe(agent, "eliot", key, base + MIN_GOAL_CADENCE_MS + 1)
+                .unwrap_err()
+                .code,
+            "stale_round"
+        );
+        assert_eq!(
+            store
+                .goal_claim_round(
+                    agent,
+                    "eliot",
+                    key,
+                    revision,
+                    base + MIN_GOAL_CADENCE_MS + 1
+                )
+                .unwrap_err()
+                .code,
+            "stale_round"
+        );
+        let shown = store.goal_get(agent, "eliot").unwrap().unwrap();
+        let marker = shown.round_marker.expect("crashed marker is visible");
+        assert_eq!(marker.state, GoalMarkerState::Unknown);
+        assert_eq!(marker.round_key, key.text());
+    }
+    // Fresh keys still claim, durably rewriting the crashed rows.
+    let send = send_request(&idle_agent, "after the crash");
+    let send_id = send.id.clone();
+    store.submit("owner", send, base + 2).expect("admit send");
+    complete_send(&mut store, &idle_agent, &send_id, "turn-reopen-1", base + 2);
+    let fresh = store.high_water().unwrap();
+    assert!(fresh > idle_key);
+    let current = store.goal_get(&idle_agent, "eliot").unwrap().unwrap();
+    store
+        .goal_round_probe(&idle_agent, "eliot", GoalRoundKey::Idle(fresh), base + 3)
+        .expect("probe the fresh idle key");
+    claim(&mut store, &idle_agent, current.revision, fresh, base + 3);
+    let second_due = base + 2 * MIN_GOAL_CADENCE_MS;
+    let current_slot = store.goal_get(&slot_agent, "eliot").unwrap().unwrap();
+    store
+        .goal_round_probe(&slot_agent, "eliot", GoalRoundKey::Slot(2), second_due)
+        .expect("probe the fresh slot");
+    store
+        .goal_claim_round(
+            &slot_agent,
+            "eliot",
+            GoalRoundKey::Slot(2),
+            current_slot.revision,
+            second_due,
+        )
+        .expect("claim the fresh slot");
+    let mut states: Vec<(String, String)> = store
+        .connection
+        .prepare(
+            "SELECT round_key_kind, state FROM goal_markers
+             WHERE (round_key_kind = 'idle' AND round_key = ?1)
+                OR (round_key_kind = 'slot' AND round_key = 1)
+             ORDER BY round_key_kind",
+        )
+        .expect("prepare crashed states")
+        .query_map(rusqlite::params![idle_key], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .expect("read crashed states")
+        .collect::<rusqlite::Result<Vec<(String, String)>>>()
+        .expect("collect crashed states");
+    states.sort();
+    assert_eq!(
+        states,
+        vec![
+            ("idle".to_owned(), "unknown".to_owned()),
+            ("slot".to_owned(), "unknown".to_owned()),
+        ]
+    );
+    remove_goal_crash_store_files(&path);
 }

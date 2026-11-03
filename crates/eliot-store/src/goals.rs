@@ -111,6 +111,11 @@ struct GoalStatePersist {
     /// pause/clear/resume. Absent without a cadence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cadence_anchor_ms: Option<i64>,
+    /// Last committed cadence slot. Slot keys are monotonic: any slot at
+    /// or below it is refused at probe, claim and commit. Fresh goals
+    /// start with none; idle rounds never touch it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_committed_slot: Option<i64>,
 }
 
 struct GoalRow {
@@ -382,6 +387,7 @@ impl Store {
         now: i64,
     ) -> Result<GoalView> {
         require_eliot_mode(mode)?;
+        definition.require_auto_bound()?;
         let agent_num = parse_agent_id(agent)?;
         let agent_row = load_agent_by_num(&self.connection, agent_num)?
             .ok_or_else(|| Error::new("not_found", "goal Agent was not found"))?;
@@ -416,6 +422,7 @@ impl Store {
                     ..GoalCounters::default()
                 },
                 cadence_anchor_ms: definition.cadence_ms.map(|_| now),
+                last_committed_slot: None,
             };
             let tx = self
                 .connection
@@ -449,6 +456,7 @@ impl Store {
                 ..GoalCounters::default()
             },
             cadence_anchor_ms: definition.cadence_ms.map(|_| now),
+            last_committed_slot: None,
         };
         let tx = self
             .connection
@@ -545,6 +553,7 @@ impl Store {
             blocked_reason: None,
             counters: row.state.counters,
             cadence_anchor_ms: row.state.cadence_anchor_ms,
+            last_committed_slot: row.state.last_committed_slot,
         };
         db!(tx.execute(
             "UPDATE goals SET revision = ?1, state = ?2, updated_at = ?3
@@ -636,6 +645,7 @@ impl Store {
             blocked_reason: row.state.blocked_reason.clone(),
             counters: row.state.counters.clone(),
             cadence_anchor_ms: row.state.cadence_anchor_ms,
+            last_committed_slot: row.state.last_committed_slot,
         };
         let state_text = encode_json(&state)?;
         db!(tx.execute(
@@ -690,6 +700,7 @@ impl Store {
                     blocked_reason: row.state.blocked_reason.clone(),
                     counters: row.state.counters.clone(),
                     cadence_anchor_ms: row.state.cadence_anchor_ms,
+                    last_committed_slot: row.state.last_committed_slot,
                 };
                 db!(tx.execute(
                     "UPDATE goals SET revision = ?1, state = ?2, updated_at = ?3
@@ -1049,6 +1060,9 @@ impl Store {
             GoalCommitOutcome::Continued { .. } => {}
         }
         state.counters = counters;
+        if let GoalRoundKey::Slot(slot) = commit.round_key {
+            state.last_committed_slot = Some(slot);
+        }
         let state_text = encode_json(&state)?;
         db!(tx.execute(
             "DELETE FROM goal_markers
@@ -1167,9 +1181,20 @@ fn slot_start_ms(anchor_ms: i64, period_ms: i64, slot: i64) -> Result<i64> {
         .map_err(|_| Error::new("invalid", "goal cadence slot overflows epoch millis"))
 }
 
-/// A slot round names a due slot: its start passed. Due slots never
-/// un-due, so the commit recheck only guards clock rollback.
+/// A slot round names a due slot newer than the last committed one.
+/// Due slots never un-due, so the commit recheck only guards clock
+/// rollback. Called at probe, claim and commit alike.
 fn require_slot_due(row: &GoalRow, slot: i64, now: i64) -> Result<()> {
+    if row
+        .state
+        .last_committed_slot
+        .is_some_and(|committed| slot <= committed)
+    {
+        return Err(Error::new(
+            "stale_round",
+            "goal cadence slot is not newer than the last committed slot",
+        ));
+    }
     let (Some(period_ms), Some(anchor_ms)) =
         (row.definition.cadence_ms, row.state.cadence_anchor_ms)
     else {

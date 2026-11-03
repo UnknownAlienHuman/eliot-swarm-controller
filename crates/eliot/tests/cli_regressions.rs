@@ -13036,6 +13036,25 @@ fn cli_goal_crud_pause_and_native_unsupported() {
     ]);
     assert_eq!(launched["state"], "applied");
     let agent = launched["target"].as_str().unwrap().to_owned();
+    // Automatic driving needs a bound: an unbounded set is refused.
+    let unbounded = cli(
+        &fixture.data,
+        &[
+            "goal",
+            "set",
+            &agent,
+            "--text",
+            "keep green",
+            "--check",
+            "check-goal",
+        ],
+    );
+    assert_eq!(unbounded.status.code(), Some(3));
+    assert!(
+        unbounded.stderr.contains("max_turns or max_rounds"),
+        "unbounded goal must name its missing bound: {}",
+        unbounded.stderr.lines().next().unwrap_or("")
+    );
     // --check consumes the remaining arguments, so it goes last.
     let set = fixture.json(&[
         "goal",
@@ -13349,6 +13368,8 @@ fn cli_goal_round_completes_idle_fake_agent() {
         &agent,
         "--text",
         "keep green",
+        "--max-rounds",
+        "6",
         "--check",
         CLI,
         "--version",
@@ -13439,6 +13460,8 @@ fn cli_goal_auto_round_drives_idle_fake_agent() {
         &agent,
         "--text",
         "keep green",
+        "--max-rounds",
+        "6",
         "--check",
         CLI,
         "--version",

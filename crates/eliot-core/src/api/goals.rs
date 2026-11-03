@@ -172,6 +172,20 @@ impl GoalDefinition {
         }
         Ok(())
     }
+
+    /// Automatic `on_idle` driving needs a bound: a Goal without a cadence
+    /// is driven on every idle event, so it must set `max_turns` or
+    /// `max_rounds`. Cadenced Goals round only on explicit slots and need
+    /// none. Checked at `set`, never on stored views.
+    pub fn require_auto_bound(&self) -> Result<()> {
+        if self.cadence_ms.is_none() && self.max_turns.is_none() && self.max_rounds.is_none() {
+            return Err(Error::new(
+                "invalid",
+                "goal without a cadence drives automatically on idle and needs max_turns or max_rounds",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -375,7 +389,13 @@ impl GoalSetRequest {
                 "goal cost limits need a usage source; usage is unsupported",
             ));
         }
-        self.definition.validate()
+        self.definition.validate()?;
+        // Native mode is refused as unsupported either way; only Eliot
+        // Goals drive automatically and need the bound.
+        if self.mode == GoalMode::Eliot {
+            self.definition.require_auto_bound()?;
+        }
+        Ok(())
     }
 
     pub fn validate_response(&self, response: &GoalView) -> Result<()> {
@@ -803,6 +823,55 @@ mod tests {
         let defaulted: GoalSetRequest =
             serde_json::from_value(json!({"agent":"a1","definition":definition()})).unwrap();
         assert_eq!(defaulted.mode, GoalMode::Eliot);
+    }
+
+    #[test]
+    fn goal_set_requires_a_bound_for_automatic_goals() {
+        let unbounded = GoalDefinition {
+            max_turns: None,
+            max_rounds: None,
+            max_without_progress: None,
+            cadence_ms: None,
+            ..definition()
+        };
+        let request = GoalSetRequest {
+            agent: "a1".to_owned(),
+            mode: GoalMode::Eliot,
+            definition: unbounded,
+            max_cost: None,
+        };
+        assert_eq!(request.validate().unwrap_err().code, "invalid");
+        // Either bound enables automatic driving.
+        for bounded in [
+            GoalDefinition {
+                max_turns: Some(4),
+                max_rounds: None,
+                ..request.definition.clone()
+            },
+            GoalDefinition {
+                max_turns: None,
+                max_rounds: Some(6),
+                ..request.definition.clone()
+            },
+        ] {
+            GoalSetRequest {
+                definition: bounded,
+                ..request.clone()
+            }
+            .validate()
+            .unwrap();
+        }
+        // Cadenced Goals round only on explicit slots: no bound needed.
+        let cadenced = GoalDefinition {
+            cadence_ms: Some(MIN_GOAL_CADENCE_MS),
+            ..request.definition.clone()
+        };
+        GoalSetRequest {
+            definition: cadenced,
+            ..request.clone()
+        }
+        .validate()
+        .unwrap();
     }
 
     #[test]

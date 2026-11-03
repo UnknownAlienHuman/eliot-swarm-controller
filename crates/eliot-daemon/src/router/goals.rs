@@ -25,10 +25,11 @@ use eliot_store::{
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Duration};
 use tokio::{
     process::Command as TokioCommand,
     sync::{broadcast, watch},
+    task::JoinSet,
 };
 
 /// Spawn one already-resolved check command. Production passes
@@ -231,6 +232,18 @@ impl Router {
         principal: &Principal,
         run_check: GoalCheckRunner,
     ) -> Result<Value> {
+        let cancellation = self.run_cancellation_receiver();
+        self.goal_round_with_cancellation(params, principal, run_check, cancellation)
+            .await
+    }
+
+    async fn goal_round_with_cancellation(
+        &self,
+        params: &Value,
+        principal: &Principal,
+        run_check: GoalCheckRunner,
+        cancellation: watch::Receiver<bool>,
+    ) -> Result<Value> {
         let request: GoalRoundRequest = decode_goal_request(
             params,
             principal,
@@ -303,14 +316,7 @@ impl Router {
             command.current_dir(cwd);
         }
         let timeout = Duration::from_millis(definition.check_timeout_ms.max(0) as u64);
-        let outcome = run_check(
-            command,
-            stdin,
-            timeout,
-            Arc::clone(&policy),
-            self.run_cancellation_receiver(),
-        )
-        .await;
+        let outcome = run_check(command, stdin, timeout, Arc::clone(&policy), cancellation).await;
         let check = match goal_check_result(outcome, &policy) {
             Ok(check) => check,
             Err(error) => {
@@ -533,38 +539,166 @@ fn goal_round_gates(probe: &eliot_store::GoalRoundProbe, key: GoalRoundKey) -> R
     Ok(())
 }
 
+/// Most automatic Goal rounds in flight at once. One slow check must
+/// not stall other Goals' rounds; past the cap extra idle events are
+/// dropped (logged) until a round finishes.
+const MAX_CONCURRENT_AUTO_ROUNDS: usize = 4;
+
+/// One automatic round in flight: its check cancellation plus the key
+/// it rounds on. A newer event for the same Goal dooms that key, so the
+/// driver remembers it for a follow-up instead of dropping it.
+struct InFlightAutoRound {
+    cancel: watch::Sender<bool>,
+    seq: i64,
+}
+
 /// Drive active Eliot-mode Goals when their generation commits an idle
-/// event. Each round goes through the same `goal_round` path as an
-/// explicit owner call — same probe, gates, check custody and conditional
-/// commit — with a fresh owner mutation id. Lost races stay silent; only
-/// unexpected failures are logged.
+/// event. Each round runs in its own task — at most one per Goal — through
+/// the same `goal_round` path as an explicit owner call: same probe, gates,
+/// check custody and conditional commit, with a fresh owner mutation id.
+/// A newer event for a Goal with a round in flight is remembered and
+/// driven as a follow-up when that round resolves, so the fresh key is
+/// never silently dropped. Bus lag, cap drops and stale rounds are logged;
+/// other lost races stay silent. Shutdown cancels every in-flight check
+/// through its custody cancellation and waits only for the rounds to
+/// resolve their markers (`unknown`, never rerun), never for a check to
+/// finish on its own.
 pub(crate) async fn run_goal_driver(
     router: Router,
     run_check: GoalCheckRunner,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut events = router.subscribe_rule_events();
+    let mut rounds: JoinSet<(String, i64)> = JoinSet::new();
+    let mut in_flight: HashMap<String, InFlightAutoRound> = HashMap::new();
+    // Newest event per Goal with a round in flight, driven as a follow-up
+    // when that round resolves. Never filled past shutdown: the drain
+    // below starts no new rounds.
+    let mut pending: HashMap<String, Event> = HashMap::new();
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
+                    for running in in_flight.values() {
+                        running.cancel.send_replace(true);
+                    }
+                    while rounds.join_next().await.is_some() {}
                     return Ok(());
                 }
             }
             received = events.recv() => match received {
                 Ok(event) => {
-                    drive_goal_for_event(&router, run_check, &event).await;
+                    spawn_auto_round(
+                        &router,
+                        run_check,
+                        &mut rounds,
+                        &mut in_flight,
+                        &mut pending,
+                        event,
+                    );
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    let policy = router.secret_policy_snapshot();
+                    crate::logging::record(
+                        &policy,
+                        "daemon.goal_auto_round_lagged",
+                        &[("skipped", &skipped.to_string())],
+                        None,
+                    );
+                }
                 Err(broadcast::error::RecvError::Closed) => {
                     return Err(Error::new("unavailable", "event bus is closed"));
                 }
             },
+            joined = rounds.join_next(), if !rounds.is_empty() => {
+                match joined {
+                    Some(Ok((agent, _))) => {
+                        in_flight.remove(&agent);
+                        if let Some(follow) = pending.remove(&agent) {
+                            spawn_auto_round(
+                                &router,
+                                run_check,
+                                &mut rounds,
+                                &mut in_flight,
+                                &mut pending,
+                                follow,
+                            );
+                        }
+                    }
+                    Some(Err(_)) => {
+                        let policy = router.secret_policy_snapshot();
+                        crate::logging::record(
+                            &policy,
+                            "daemon.goal_auto_round_task_failed",
+                            &[],
+                            None,
+                        );
+                    }
+                    None => {}
+                }
+            }
         }
     }
 }
 
-async fn drive_goal_for_event(router: &Router, run_check: GoalCheckRunner, event: &Event) {
+/// Start one automatic round for an idle event unless its Goal already
+/// has one in flight — then a newer event is remembered for a follow-up —
+/// or the global cap is reached (the event is dropped and logged).
+fn spawn_auto_round(
+    router: &Router,
+    run_check: GoalCheckRunner,
+    rounds: &mut JoinSet<(String, i64)>,
+    in_flight: &mut HashMap<String, InFlightAutoRound>,
+    pending: &mut HashMap<String, Event>,
+    event: Event,
+) {
+    let Some(agent) = event.agent.clone() else {
+        return;
+    };
+    if let Some(running) = in_flight.get(&agent) {
+        let newer = event.seq > running.seq
+            && pending
+                .get(&agent)
+                .is_none_or(|prior| event.seq > prior.seq);
+        if newer {
+            pending.insert(agent, event);
+        }
+        return;
+    }
+    if event.generation.is_none()
+        || !event
+            .subject
+            .as_ref()
+            .is_some_and(|subject| subject.state == AgentState::Idle)
+    {
+        return;
+    }
+    if in_flight.len() >= MAX_CONCURRENT_AUTO_ROUNDS {
+        let policy = router.secret_policy_snapshot();
+        crate::logging::record(
+            &policy,
+            "daemon.goal_auto_round_dropped",
+            &[("agent", &agent)],
+            None,
+        );
+        return;
+    }
+    let (cancel, cancellation) = watch::channel(false);
+    let seq = event.seq;
+    in_flight.insert(agent.clone(), InFlightAutoRound { cancel, seq });
+    let task_router = router.clone();
+    rounds.spawn(async move {
+        drive_goal_for_event(&task_router, run_check, event, cancellation).await;
+        (agent, seq)
+    });
+}
+
+async fn drive_goal_for_event(
+    router: &Router,
+    run_check: GoalCheckRunner,
+    event: Event,
+    cancellation: watch::Receiver<bool>,
+) {
     let Some(agent) = event.agent.as_deref() else {
         return;
     };
@@ -610,14 +744,26 @@ async fn drive_goal_for_event(router: &Router, run_check: GoalCheckRunner, event
         "idle_seq": event.seq,
     });
     match router
-        .goal_round_with(&params, &Principal::Owner, run_check)
+        .goal_round_with_cancellation(&params, &Principal::Owner, run_check, cancellation)
         .await
     {
         Ok(_) => {}
+        // A stale key means this Goal missed its round; the next idle
+        // event redrives it. Busy races, gate losses, shutdown cancels
+        // and vanished Goals stay silent.
+        Err(error) if error.code.as_str() == "stale_round" => {
+            let policy = router.secret_policy_snapshot();
+            crate::logging::record(
+                &policy,
+                "daemon.goal_auto_round_stale",
+                &[("agent", agent)],
+                Some(&error),
+            );
+        }
         Err(error)
             if matches!(
                 error.code.as_str(),
-                "busy" | "stale_round" | "bad_state" | "not_found" | "stale_generation"
+                "busy" | "bad_state" | "not_found" | "stale_generation" | "unavailable"
             ) => {}
         Err(error) => {
             let policy = router.secret_policy_snapshot();
@@ -1517,6 +1663,11 @@ mod tests {
             .unwrap()
     }
 
+    async fn drive_event(router: &Router, run_check: GoalCheckRunner, event: Event) {
+        let (_cancel, cancellation) = watch::channel(false);
+        drive_goal_for_event(router, run_check, event, cancellation).await;
+    }
+
     #[tokio::test]
     async fn goal_slot_round_refuses_future_slots_and_wrong_forms() {
         let router = router();
@@ -1583,7 +1734,7 @@ mod tests {
         let agent = ready_agent(&router, "goal-auto").await;
         set_goal(&router, &agent, definition("keep green")).await;
         let key = high_water(&router).await;
-        drive_goal_for_event(&router, passing_runner, &idle_event(&agent, 1, key)).await;
+        drive_event(&router, passing_runner, idle_event(&agent, 1, key)).await;
         let view = stored_goal(&router, &agent).await;
         assert_eq!(view.status, eliot_core::api::GoalStatus::Completed);
         assert_eq!(view.counters.rounds, 1);
@@ -1596,7 +1747,7 @@ mod tests {
         // No Goal at all.
         let bare = ready_agent(&router, "goal-auto-bare").await;
         let key = high_water(&router).await;
-        drive_goal_for_event(&router, passing_runner, &idle_event(&bare, 1, key)).await;
+        drive_event(&router, passing_runner, idle_event(&bare, 1, key)).await;
         assert!(
             router
                 .inner
@@ -1618,7 +1769,7 @@ mod tests {
             .await
             .unwrap();
         let key = high_water(&router).await;
-        drive_goal_for_event(&router, passing_runner, &idle_event(&paused, 1, key)).await;
+        drive_event(&router, passing_runner, idle_event(&paused, 1, key)).await;
         let view = stored_goal(&router, &paused).await;
         assert_eq!(view.status, eliot_core::api::GoalStatus::Paused);
         assert_eq!(view.counters.rounds, 0);
@@ -1628,7 +1779,7 @@ mod tests {
         cadenced_definition["cadence_ms"] = json!(60_000);
         set_goal(&router, &cadenced, cadenced_definition).await;
         let key = high_water(&router).await;
-        drive_goal_for_event(&router, passing_runner, &idle_event(&cadenced, 1, key)).await;
+        drive_event(&router, passing_runner, idle_event(&cadenced, 1, key)).await;
         let view = stored_goal(&router, &cadenced).await;
         assert_eq!(view.status, eliot_core::api::GoalStatus::Active);
         assert_eq!(view.counters.rounds, 0);
@@ -1636,13 +1787,13 @@ mod tests {
         let agent = ready_agent(&router, "goal-auto-gates").await;
         set_goal(&router, &agent, definition("keep green")).await;
         let key = high_water(&router).await;
-        drive_goal_for_event(
+        drive_event(
             &router,
             passing_runner,
-            &busy_event(&agent, 1, key, AgentState::Busy),
+            busy_event(&agent, 1, key, AgentState::Busy),
         )
         .await;
-        drive_goal_for_event(&router, passing_runner, &idle_event(&agent, 2, key)).await;
+        drive_event(&router, passing_runner, idle_event(&agent, 2, key)).await;
         let view = stored_goal(&router, &agent).await;
         assert_eq!(view.counters.rounds, 0);
         assert!(view.last_round_key.is_none());
@@ -1655,19 +1806,325 @@ mod tests {
         set_goal(&router, &agent, definition("keep green")).await;
         let key = high_water(&router).await;
         // A stale key and a second drive after completion both stay silent.
-        drive_goal_for_event(
+        drive_event(
             &router,
             passing_runner,
-            &idle_event(&agent, 1, key.saturating_sub(1)),
+            idle_event(&agent, 1, key.saturating_sub(1)),
         )
         .await;
         let view = stored_goal(&router, &agent).await;
         assert_eq!(view.counters.rounds, 0);
-        drive_goal_for_event(&router, passing_runner, &idle_event(&agent, 1, key)).await;
-        drive_goal_for_event(&router, passing_runner, &idle_event(&agent, 1, key)).await;
+        drive_event(&router, passing_runner, idle_event(&agent, 1, key)).await;
+        drive_event(&router, passing_runner, idle_event(&agent, 1, key)).await;
         let view = stored_goal(&router, &agent).await;
         assert_eq!(view.status, eliot_core::api::GoalStatus::Completed);
         assert_eq!(view.counters.rounds, 1);
+    }
+
+    static SPLIT_STARTED: AtomicUsize = AtomicUsize::new(0);
+    static SPLIT_RELEASE: OnceLock<Notify> = OnceLock::new();
+
+    /// The first check blocks until released; later checks pass at once.
+    /// Tests publish the slow Goal first and wait for its check to start,
+    /// so the blocking check is always the slow one.
+    fn split_runner(
+        _: TokioCommand,
+        _: Vec<u8>,
+        _: Duration,
+        _: Arc<SecretPolicy>,
+        _: watch::Receiver<bool>,
+    ) -> Pin<Box<dyn Future<Output = ProcessOutcome> + Send>> {
+        Box::pin(async {
+            if SPLIT_STARTED.fetch_add(1, Ordering::SeqCst) == 0 {
+                SPLIT_RELEASE.get_or_init(Notify::new).notified().await;
+            }
+            completed_outcome(0, b"all green", true)
+        })
+    }
+
+    static CAP_STARTED: AtomicUsize = AtomicUsize::new(0);
+    static CAP_RELEASE: OnceLock<Notify> = OnceLock::new();
+
+    fn cap_runner(
+        _: TokioCommand,
+        _: Vec<u8>,
+        _: Duration,
+        _: Arc<SecretPolicy>,
+        _: watch::Receiver<bool>,
+    ) -> Pin<Box<dyn Future<Output = ProcessOutcome> + Send>> {
+        Box::pin(async {
+            CAP_STARTED.fetch_add(1, Ordering::SeqCst);
+            CAP_RELEASE.get_or_init(Notify::new).notified().await;
+            completed_outcome(0, b"all green", true)
+        })
+    }
+
+    /// A check that runs until its custody cancellation fires, mirroring
+    /// `run_owned_process`: cancel means a `Cancelled` failure.
+    fn cancelling_runner(
+        _: TokioCommand,
+        _: Vec<u8>,
+        _: Duration,
+        _: Arc<SecretPolicy>,
+        mut cancellation: watch::Receiver<bool>,
+    ) -> Pin<Box<dyn Future<Output = ProcessOutcome> + Send>> {
+        Box::pin(async move {
+            CANCEL_STARTED.fetch_add(1, Ordering::SeqCst);
+            loop {
+                if *cancellation.borrow() {
+                    break;
+                }
+                if cancellation.changed().await.is_err() {
+                    break;
+                }
+            }
+            ProcessOutcome::Failed {
+                reason: ProcessFailure::Cancelled,
+                capture: None,
+            }
+        })
+    }
+
+    static CANCEL_STARTED: AtomicUsize = AtomicUsize::new(0);
+
+    /// Publish one idle event until `ready` holds. Repeats are harmless:
+    /// the driver dedupes a Goal that already has a round in flight.
+    async fn publish_until(
+        router: &Router,
+        agent: &str,
+        generation: i64,
+        seq: i64,
+        ready: &AtomicUsize,
+    ) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while ready.load(Ordering::SeqCst) == 0 {
+                router
+                    .inner
+                    .bus
+                    .publish(&[idle_event(agent, generation, seq)]);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("published event drives its round");
+    }
+
+    #[tokio::test]
+    async fn goal_driver_drives_a_second_goal_during_a_slow_check() {
+        SPLIT_STARTED.store(0, Ordering::SeqCst);
+        let router = router();
+        let slow = ready_agent(&router, "goal-slow").await;
+        set_goal(&router, &slow, definition("slow goal")).await;
+        let slow_key = high_water(&router).await;
+        let fast = ready_agent(&router, "goal-fast").await;
+        set_goal(&router, &fast, definition("fast goal")).await;
+        let fast_key = high_water(&router).await;
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let driver = tokio::spawn(run_goal_driver(router.clone(), split_runner, shutdown_rx));
+        publish_until(&router, &slow, 1, slow_key, &SPLIT_STARTED).await;
+        // The fast Goal rounds and completes while the slow check is
+        // still blocked: no stall, no silent drop.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                router.inner.bus.publish(&[idle_event(&fast, 1, fast_key)]);
+                if stored_goal(&router, &fast).await.counters.rounds == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fast goal rounds during the slow check");
+        let view = stored_goal(&router, &fast).await;
+        assert_eq!(view.status, eliot_core::api::GoalStatus::Completed);
+        SPLIT_RELEASE.get_or_init(Notify::new).notify_one();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if stored_goal(&router, &slow).await.counters.rounds == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("slow goal rounds after its release");
+        shutdown_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(10), driver)
+            .await
+            .expect("driver joins")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn goal_driver_drops_rounds_past_its_cap() {
+        CAP_STARTED.store(0, Ordering::SeqCst);
+        let router = router();
+        let mut agents = Vec::new();
+        for index in 0..5 {
+            let agent = ready_agent(&router, &format!("goal-cap-{index}")).await;
+            set_goal(&router, &agent, definition("capped goal")).await;
+            agents.push((agent, high_water(&router).await));
+        }
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let driver = tokio::spawn(run_goal_driver(router.clone(), cap_runner, shutdown_rx));
+        publish_until(&router, &agents[0].0, 1, agents[0].1, &CAP_STARTED).await;
+        for (agent, key) in &agents[1..] {
+            router.inner.bus.publish(&[idle_event(agent, 1, *key)]);
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while CAP_STARTED.load(Ordering::SeqCst) < MAX_CONCURRENT_AUTO_ROUNDS {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cap fills with running checks");
+        // The fifth event is dropped at the cap: no marker, no round.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            CAP_STARTED.load(Ordering::SeqCst),
+            MAX_CONCURRENT_AUTO_ROUNDS
+        );
+        for (agent, _) in &agents[..MAX_CONCURRENT_AUTO_ROUNDS] {
+            assert!(
+                stored_goal(&router, agent).await.round_marker.is_some(),
+                "capped round stays in flight"
+            );
+        }
+        let dropped = stored_goal(&router, &agents[MAX_CONCURRENT_AUTO_ROUNDS].0).await;
+        assert!(dropped.round_marker.is_none());
+        assert_eq!(dropped.counters.rounds, 0);
+        for _ in 0..MAX_CONCURRENT_AUTO_ROUNDS {
+            CAP_RELEASE.get_or_init(Notify::new).notify_one();
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let mut done = true;
+                for (agent, _) in &agents[..MAX_CONCURRENT_AUTO_ROUNDS] {
+                    if stored_goal(&router, agent).await.counters.rounds != 1 {
+                        done = false;
+                    }
+                }
+                if done {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("capped rounds finish after release");
+        shutdown_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(10), driver)
+            .await
+            .expect("driver joins")
+            .unwrap()
+            .unwrap();
+    }
+
+    static FOLLOW_STARTED: AtomicUsize = AtomicUsize::new(0);
+    static FOLLOW_RELEASE: OnceLock<Notify> = OnceLock::new();
+
+    fn follow_runner(
+        _: TokioCommand,
+        _: Vec<u8>,
+        _: Duration,
+        _: Arc<SecretPolicy>,
+        _: watch::Receiver<bool>,
+    ) -> Pin<Box<dyn Future<Output = ProcessOutcome> + Send>> {
+        Box::pin(async {
+            if FOLLOW_STARTED.fetch_add(1, Ordering::SeqCst) == 0 {
+                FOLLOW_RELEASE.get_or_init(Notify::new).notified().await;
+            }
+            completed_outcome(0, b"all green", true)
+        })
+    }
+
+    #[tokio::test]
+    async fn goal_driver_follows_a_newer_key_after_a_stale_round() {
+        FOLLOW_STARTED.store(0, Ordering::SeqCst);
+        let router = router();
+        let agent = ready_agent(&router, "goal-follow").await;
+        set_goal(&router, &agent, definition("keep green")).await;
+        let first_key = high_water(&router).await;
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let driver = tokio::spawn(run_goal_driver(router.clone(), follow_runner, shutdown_rx));
+        publish_until(&router, &agent, 1, first_key, &FOLLOW_STARTED).await;
+        // A newer idle event lands while the first round runs: the first
+        // key is doomed and the follow-up must round on the fresh key.
+        let send_id = ulid::Ulid::new().to_string();
+        {
+            let mut store = router.inner.store.lock().await;
+            let mut request = SubmitCommand::new(send_id.clone(), "send");
+            request.target = Some(agent.clone());
+            request.expected_generation = Some(1);
+            request.args = json!({"text": "operator input"});
+            store.submit("owner", request, now_ms()).unwrap();
+        }
+        complete_send(&router, &agent, &send_id, "turn-follow-1").await;
+        let fresh_key = high_water(&router).await;
+        assert!(fresh_key > first_key);
+        router
+            .inner
+            .bus
+            .publish(&[idle_event(&agent, 1, fresh_key)]);
+        FOLLOW_RELEASE.get_or_init(Notify::new).notify_one();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let view = stored_goal(&router, &agent).await;
+                if view.counters.rounds == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("follow-up rounds on the fresh key");
+        let view = stored_goal(&router, &agent).await;
+        assert_eq!(view.status, eliot_core::api::GoalStatus::Completed);
+        assert_eq!(view.last_round_key, Some(format!("idle:{fresh_key}")));
+        shutdown_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(10), driver)
+            .await
+            .expect("driver joins")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn goal_driver_cancels_its_round_on_shutdown() {
+        CANCEL_STARTED.store(0, Ordering::SeqCst);
+        let router = router();
+        let agent = ready_agent(&router, "goal-shutdown").await;
+        set_goal(&router, &agent, definition("keep green")).await;
+        let key = high_water(&router).await;
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let driver = tokio::spawn(run_goal_driver(
+            router.clone(),
+            cancelling_runner,
+            shutdown_rx,
+        ));
+        publish_until(&router, &agent, 1, key, &CANCEL_STARTED).await;
+        shutdown_tx.send_replace(true);
+        // Shutdown never waits for the check itself: the driver cancels
+        // it through custody cancellation and exits promptly.
+        tokio::time::timeout(Duration::from_secs(10), driver)
+            .await
+            .expect("driver exits without waiting for the check")
+            .unwrap()
+            .unwrap();
+        let view = stored_goal(&router, &agent).await;
+        let marker = view.round_marker.expect("cancelled round stays visible");
+        assert_eq!(marker.state, eliot_core::api::GoalMarkerState::Unknown);
+        assert_eq!(marker.round_key, format!("idle:{key}"));
+        // The cancelled key is burned: never rerun.
+        let error = router
+            .inner
+            .store
+            .lock()
+            .await
+            .goal_round_probe(&agent, "eliot", GoalRoundKey::Idle(key), now_ms())
+            .unwrap_err();
+        assert_eq!(error.code, "stale_round");
     }
 
     #[tokio::test]
@@ -1680,6 +2137,7 @@ mod tests {
             json!({
                 "text": "keep green",
                 "check": ["check-goal"],
+                "max_rounds": 6,
                 "max_without_progress": 1,
             }),
         )

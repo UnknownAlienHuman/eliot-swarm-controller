@@ -92,7 +92,7 @@ rule actions have bounded derived ids. No general receipt/floor framework.
 | `project.list/get` | owner-only read of registered project authority |
 | `rule.get/catch_up` | owner-only rule read and finite committed-history catch-up |
 | `timer.get/run` | owner-only timer read and idempotent manual firing |
-| `goal.set/get/pause/clear/resume/round` | owner-only Eliot-mode Goal with explicit and automatic idle rounds plus explicit cadence slot rounds; native mode and cost limits are `unsupported` |
+| `goal.set/get/pause/clear/resume/round` | owner-only Eliot-mode Goal with explicit and automatic idle rounds plus explicit cadence slot rounds; automatic driving needs `max_turns` or `max_rounds`, native mode and cost limits are `unsupported` |
 | `provider.holds/clear_hold` | owner-only provider hold readback and constrained correction |
 | `events.read/subscribe` | persisted replay plus bounded live delivery |
 | `agent.discover` | owner-only native metadata discovery, without creating Agents |

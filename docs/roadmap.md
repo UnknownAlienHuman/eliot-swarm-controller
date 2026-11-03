@@ -205,9 +205,10 @@ No second executor, workflow graph or acceptance engine.
       through the same Router/CLI, and that target API is advertised.
 - [x] **L4.3 Goals/requests.** Eliot continuation/checks with turn and
       no-progress limits run through explicit idle rounds, automatic `on_idle`
-      driving and explicit cadence slot rounds; the read-only workspace
-      fingerprint feeds no-progress and incomplete observations never prove it.
-      Native mode and cost limits stay unsupported as specified in
+      driving and explicit cadence slot rounds; cadence goals are manual-only
+      (no auto-fire) and the read-only workspace fingerprint feeds
+      no-progress while incomplete observations never prove it. Native mode
+      and cost limits stay unsupported as specified in
       [automation](spec/automation.md). No check runs under the Store lock.
       Neither a failed check nor a missing terminal fact authorizes replay.
 - [ ] **L4.4 Recipes.** One timer, one event action and one bounded Goal using Codex.

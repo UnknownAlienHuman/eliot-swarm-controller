@@ -797,7 +797,10 @@ independent. `set`, definition changes, pause, clear and resume advance revision
 an identical `set` on the bound generation is a no-op. Generation change pauses
 the old Goal on its next round attempt, and `resume` on a drifted generation is
 refused. Native mode parses but is `unsupported`: the installed harness plugins
-expose no Goal protocol. Observe-only Agents take no Goals.
+expose no Goal protocol. Observe-only Agents take no Goals. Automatic `on_idle`
+driving needs a bound: `set` refuses a Goal without a cadence unless `max_turns`
+or `max_rounds` is set. Cadenced Goals round only on explicit slots and need
+none; explicit manual rounds never need one either.
 
 Rounds name a key in one of two forms, and the form must match the Goal.
 Idle keys name the exact idle event seq the caller observed; slot keys name
@@ -842,9 +845,10 @@ only on anchored slots. The anchor is captured when the cadence is set, stays
 stable across pause and resume, and is re-captured by a new definition. Slots
 are 1-based: slot `k` starts at `anchor + k * cadence_ms`, so the first slot
 starts one period after the set. A slot round names a due slot (its start
-passed); future slots are refused, and each consumed or burned slot needs a
-newer key next time. Slot rounds are explicit; no time-based driver fires
-them.
+passed); future slots are refused, and the last committed slot is persisted:
+any slot at or below it is refused at probe, claim and commit, and each
+burned slot still needs a newer key next time. Slot rounds are explicit; no
+time-based driver fires them.
 
 The daemon also drives active Eliot-mode Goals automatically on idle: when a
 generation commits an idle event, the driver starts one round with the event
@@ -852,9 +856,15 @@ seq as an idle key through the same `goal round` path — same probe, gates,
 check custody and conditional commit — under a fresh owner mutation id. It
 skips cadenced Goals (slot-keyed), paused or terminal Goals, drifted
 generations, and anything while automation is draining; it waits while an
-active native Goal drives. Races against explicit rounds resolve through the
-single-flight marker and the burn: `busy` and `stale_round` losses stay
-silent.
+active native Goal drives. Each automatic round runs in its own task, at most
+one per Goal and four Goals at once, so a slow check never stalls another
+Goal's round; a newer event for a Goal with a round in flight is driven as
+a follow-up when that round resolves. Events dropped past the cap or to bus
+lag are logged, as are stale rounds. Other races against explicit rounds
+resolve through the
+single-flight marker and the burn and stay silent. Shutdown cancels every
+in-flight automatic check through its custody cancellation and waits only for
+the rounds to resolve their markers (`unknown`, never rerun).
 
 No-progress compares check output digests and the read-only workspace
 fingerprint together. The fingerprint digests the committed Git observation —
@@ -909,8 +919,8 @@ never blocks the same slot number. A `running` row whose holder is gone
 (crash) reads as `unknown`.
 
 Goal definition/state retain text/check, budgets, counters, the cadence
-anchor and the last workspace fingerprint alongside previous progress
-observations. Action state lives in commands. Rate accounting counts already admitted
+anchor, the last committed slot and the last workspace fingerprint alongside
+previous progress observations. Action state lives in commands. Rate accounting counts already admitted
 ordinary action child command rows once; Store-only admission parents are excluded.
 
 ## Guardrails
