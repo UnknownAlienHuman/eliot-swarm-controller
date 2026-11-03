@@ -2,7 +2,9 @@
 
 use super::process_observation::unknown_sample;
 #[cfg(target_os = "linux")]
-use super::process_observation::{MAX_PROCESS_SAMPLES, exited_sample};
+use super::process_observation::{
+    LinuxProcessStat, MAX_PROCESS_SAMPLES, SweepEntry, exited_sample, select_sweep_members,
+};
 use eliot_core::{Error, ProcessSample, ProcessSnapshot, Result};
 #[cfg(target_os = "linux")]
 use eliot_core::{ProcessIdentity, ProcessRecord, ProcessState};
@@ -275,6 +277,107 @@ pub(crate) struct ProcessGroupIdentity {
 #[cfg(target_os = "linux")]
 const MAX_PROC_SCAN_ENTRIES: usize = 65_536;
 
+/// One bounded host-process enumeration shared by a monitoring sweep.
+#[cfg(target_os = "linux")]
+pub(crate) struct LinuxProcessSweep {
+    pub(crate) entries: Vec<SweepEntry>,
+    pub(crate) complete: bool,
+}
+
+/// Test-only owned process-group leader (`sleep 30`) for sweep tests. Drop
+/// kills and reaps the child as a backstop; tests that assert on the dead
+/// group call [`TestSleepGroup::kill_and_wait`] explicitly first.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) struct TestSleepGroup {
+    child: std::process::Child,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl TestSleepGroup {
+    pub(crate) fn spawn() -> std::io::Result<Self> {
+        use std::os::unix::process::CommandExt;
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        Ok(Self { child })
+    }
+
+    pub(crate) fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    pub(crate) fn kill_and_wait(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for TestSleepGroup {
+    fn drop(&mut self) {
+        self.kill_and_wait();
+    }
+}
+
+/// Capture a test group leader, retrying briefly: `setpgid` runs in the child
+/// between fork and exec, so the first read may precede the new group.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn capture_group_retry(pid: u32) -> Result<ProcessGroupIdentity> {
+    for _ in 0..100 {
+        match capture_process_group_identity(pid) {
+            Ok(identity) => return Ok(identity),
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
+        }
+    }
+    capture_process_group_identity(pid)
+}
+
+/// Enumerate host processes once per sweep. `/proc` is host-wide: the scan
+/// cap applies to this single enumeration, never per owner. A failed scan is
+/// an error (unavailable); truncation or stat errors are incomplete coverage,
+/// and an omitted process is not proof of exit.
+#[cfg(target_os = "linux")]
+pub(crate) fn enumerate_process_sweep() -> Result<LinuxProcessSweep> {
+    let mut sweep = LinuxProcessSweep {
+        entries: Vec::new(),
+        complete: true,
+    };
+    let entries =
+        fs::read_dir("/proc").map_err(|error| io_error("enumerate host processes", error))?;
+    // /proc is host-wide: scanned directory entries are bounded once per
+    // sweep. This never limits spawning or signals a process.
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_PROC_SCAN_ENTRIES {
+            sweep.complete = false;
+            break;
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                sweep.complete = false;
+                continue;
+            }
+        };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        match read_linux_process_stat(pid) {
+            Ok(stat) => sweep.entries.push((pid, stat)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => sweep.complete = false,
+        }
+    }
+    Ok(sweep)
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn capture_process_group_identity(pid: u32) -> Result<ProcessGroupIdentity> {
     let (pgid, start_ticks) = read_linux_process_identity(pid)
@@ -516,15 +619,6 @@ fn process_group_empty(pgid: i32) -> Result<bool> {
 }
 
 #[cfg(target_os = "linux")]
-struct LinuxProcessStat {
-    pgid: i32,
-    start_ticks: u64,
-    state: ProcessState,
-    cpu_time_ns: Option<u64>,
-    rss_bytes: Option<u64>,
-}
-
-#[cfg(target_os = "linux")]
 fn read_linux_process_stat(pid: u32) -> std::io::Result<LinuxProcessStat> {
     use std::io::{Error as IoError, ErrorKind};
 
@@ -643,7 +737,7 @@ impl ProcessObserver {
         })
     }
 
-    fn group_is_current(&self) -> bool {
+    pub(crate) fn group_is_current(&self) -> bool {
         read_linux_process_identity(self.group.pid).ok()
             == Some((self.group.pgid, self.group.start_ticks))
     }
@@ -664,6 +758,37 @@ impl ProcessObserver {
     }
 
     pub(crate) fn snapshot(&self, owner: &str, now: i64) -> Result<ProcessSnapshot> {
+        self.snapshot_with(owner, now, enumerate_process_sweep)
+    }
+
+    /// Snapshot with the host enumeration injected: production passes
+    /// [`enumerate_process_sweep`], while tests inject a refusing enumerator
+    /// scoped to that snapshot instead of counting through a process global.
+    fn snapshot_with<E>(&self, owner: &str, now: i64, enumerate: E) -> Result<ProcessSnapshot>
+    where
+        E: FnOnce() -> Result<LinuxProcessSweep>,
+    {
+        let leader_before = self.group_is_current();
+        if !leader_before {
+            // A dead group pays no host-wide scan. The empty sweep is unused
+            // when the leader is gone; only the refreshed root is returned.
+            let empty = LinuxProcessSweep {
+                entries: Vec::new(),
+                complete: false,
+            };
+            return Ok(self.snapshot_from_sweep(owner, now, &empty, false));
+        }
+        let sweep = enumerate()?;
+        Ok(self.snapshot_from_sweep(owner, now, &sweep, true))
+    }
+
+    pub(crate) fn snapshot_from_sweep(
+        &self,
+        owner: &str,
+        now: i64,
+        sweep: &LinuxProcessSweep,
+        leader_before: bool,
+    ) -> ProcessSnapshot {
         let root = ProcessSample {
             record: ProcessRecord {
                 identity: self.root.clone(),
@@ -680,57 +805,32 @@ impl ProcessObserver {
             samples: vec![self.refresh(&root, now)],
             complete: false,
         };
-        if !self.group_is_current() {
-            return Ok(snapshot);
+        if !leader_before {
+            return snapshot;
         }
-        let entries = fs::read_dir("/proc")
-            .map_err(|error| io_error("enumerate owned process group", error))?;
-        snapshot.complete = true;
-        // /proc is host-wide: both scanned directory entries and returned group
-        // members are bounded. This never limits spawning or signals a process.
-        for (index, entry) in entries.enumerate() {
-            if index >= MAX_PROC_SCAN_ENTRIES {
-                snapshot.complete = false;
-                break;
-            }
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(_) => {
-                    snapshot.complete = false;
-                    continue;
-                }
-            };
-            let Some(pid) = entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse::<u32>().ok())
-            else {
-                continue;
-            };
-            if pid == self.root.pid {
-                continue;
-            }
-            match read_linux_process_stat(pid) {
-                Ok(stat) if stat.pgid == self.group.pgid => {
-                    if snapshot.samples.len() >= MAX_PROCESS_SAMPLES {
-                        snapshot.complete = false;
-                        break;
-                    }
-                    snapshot
-                        .samples
-                        .push(self.sample(pid, stat, "child", owner, now));
-                }
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => snapshot.complete = false,
-            }
+        // The shared scan cap was applied once during enumeration; the member
+        // cap below applies per owner. This never limits spawning or signals.
+        snapshot.complete = sweep.complete;
+        let (members, members_complete) = select_sweep_members(
+            &sweep.entries,
+            self.group.pgid,
+            self.root.pid,
+            MAX_PROCESS_SAMPLES.saturating_sub(1),
+        );
+        if !members_complete {
+            snapshot.complete = false;
+        }
+        for (pid, stat) in members {
+            snapshot
+                .samples
+                .push(self.sample(pid, stat, "child", owner, now));
         }
         if !self.group_is_current() {
             // The leader is no longer authority for newly discovered members.
             snapshot.samples.truncate(1);
             snapshot.complete = false;
         }
-        Ok(snapshot)
+        snapshot
     }
 
     pub(crate) fn register_pid(
@@ -954,5 +1054,158 @@ mod linux_process_stat_tests {
             Ok(_) => panic!("negative PGID is not a valid namespace process-group ID"),
         };
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn sweep_observes_current_test_process() {
+        let sweep = enumerate_process_sweep().expect("enumerate host processes for the sweep");
+        assert!(
+            sweep
+                .entries
+                .iter()
+                .any(|entry| entry.0 == std::process::id()),
+            "the sweep observes the test process itself"
+        );
+    }
+
+    const SWEEP_NOW: i64 = 1_700_000_000_000;
+
+    fn sweep_member(pid: u32, pgid: i32) -> SweepEntry {
+        (
+            pid,
+            LinuxProcessStat {
+                pgid,
+                start_ticks: 999,
+                state: ProcessState::Running,
+                cpu_time_ns: None,
+                rss_bytes: None,
+            },
+        )
+    }
+
+    fn observer_for(group: &TestSleepGroup) -> ProcessObserver {
+        let identity = capture_group_retry(group.pid()).expect("capture test group leader");
+        ProcessObserver::new(identity).expect("observe test group")
+    }
+
+    #[test]
+    fn shared_sweep_serves_two_groups_with_single_enumeration() {
+        let group_a = TestSleepGroup::spawn().expect("spawn group A leader");
+        let group_b = TestSleepGroup::spawn().expect("spawn group B leader");
+        let observer_a = observer_for(&group_a);
+        let observer_b = observer_for(&group_b);
+        let before_a = observer_a.group_is_current();
+        let before_b = observer_b.group_is_current();
+        assert!(before_a && before_b, "both test leaders are current");
+
+        // One enumeration serves both groups by construction; the snapshot
+        // builds take `&sweep`, so they structurally cannot rescan the host.
+        let sweep = enumerate_process_sweep().expect("shared sweep enumerates");
+        let snapshot_a = observer_a.snapshot_from_sweep("agent:a#1", SWEEP_NOW, &sweep, before_a);
+        let snapshot_b = observer_b.snapshot_from_sweep("agent:b#1", SWEEP_NOW, &sweep, before_b);
+
+        for (snapshot, own, other) in [
+            (&snapshot_a, group_a.pid(), group_b.pid()),
+            (&snapshot_b, group_b.pid(), group_a.pid()),
+        ] {
+            assert!(
+                snapshot
+                    .samples
+                    .iter()
+                    .any(|sample| sample.record.identity.pid == own),
+                "the snapshot attributes its own leader"
+            );
+            assert!(
+                !snapshot
+                    .samples
+                    .iter()
+                    .any(|sample| sample.record.identity.pid == other),
+                "the snapshot attributes no member of the other group"
+            );
+        }
+    }
+
+    #[test]
+    fn dead_group_pays_no_scan_and_keeps_no_members() {
+        let mut group = TestSleepGroup::spawn().expect("spawn group leader");
+        let pid = group.pid();
+        let observer = observer_for(&group);
+        let live = observer
+            .snapshot("agent:a#1", SWEEP_NOW)
+            .expect("live group snapshots");
+        assert!(
+            live.samples
+                .iter()
+                .any(|sample| sample.record.identity.pid == pid),
+            "the live snapshot attributes its leader"
+        );
+
+        group.kill_and_wait();
+        assert!(
+            !observer.group_is_current(),
+            "the reaped leader is no longer current"
+        );
+
+        // The injected enumerator refuses to run: a dead group must take
+        // the early return and never invoke it.
+        let dead = observer
+            .snapshot_with("agent:a#1", SWEEP_NOW, || {
+                panic!("a dead group must not pay a host-wide scan")
+            })
+            .expect("dead group snapshots without scanning");
+        assert_eq!(dead.samples.len(), 1, "only the refreshed root remains");
+        assert!(!dead.complete);
+
+        // A leader gone between the checks (stale leader_before) drops the
+        // swept members too instead of attributing them without authority.
+        let stale_sweep = LinuxProcessSweep {
+            entries: vec![sweep_member(pid.wrapping_add(1), pid as i32)],
+            complete: true,
+        };
+        let stale = observer.snapshot_from_sweep("agent:a#1", SWEEP_NOW, &stale_sweep, true);
+        assert_eq!(stale.samples.len(), 1, "no member without a live leader");
+        assert!(!stale.complete);
+    }
+
+    #[test]
+    fn incomplete_sweep_stays_incomplete_without_proving_exit() {
+        let group = TestSleepGroup::spawn().expect("spawn group leader");
+        let pid = group.pid();
+        let observer = observer_for(&group);
+        assert!(observer.group_is_current());
+
+        // Truncated coverage and stat errors both surface as an incomplete
+        // sweep: attributed members are kept, but nothing proves an omitted
+        // process exited.
+        let truncated = LinuxProcessSweep {
+            entries: vec![sweep_member(pid.wrapping_add(1), pid as i32)],
+            complete: false,
+        };
+        let snapshot = observer.snapshot_from_sweep("agent:a#1", SWEEP_NOW, &truncated, true);
+        assert!(!snapshot.complete);
+        assert!(
+            snapshot
+                .samples
+                .iter()
+                .any(|sample| sample.record.identity.pid == pid),
+            "truncation keeps the attributed leader"
+        );
+        assert_eq!(
+            snapshot.samples.len(),
+            2,
+            "truncation keeps attributed members without proving exit"
+        );
+
+        // Per-owner member-cap truncation also stays incomplete.
+        let overfull: Vec<SweepEntry> = (0..MAX_PROCESS_SAMPLES + 5)
+            .map(|index| sweep_member(10_000 + index as u32, pid as i32))
+            .collect();
+        let capped = LinuxProcessSweep {
+            entries: overfull,
+            complete: true,
+        };
+        let snapshot = observer.snapshot_from_sweep("agent:a#1", SWEEP_NOW, &capped, true);
+        assert!(!snapshot.complete);
+        assert_eq!(snapshot.samples.len(), MAX_PROCESS_SAMPLES);
     }
 }
