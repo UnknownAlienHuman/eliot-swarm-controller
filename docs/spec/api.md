@@ -92,7 +92,7 @@ rule actions have bounded derived ids. No general receipt/floor framework.
 | `project.list/get` | owner-only read of registered project authority |
 | `rule.get/catch_up` | owner-only rule read and finite committed-history catch-up |
 | `timer.get/run` | owner-only timer read and idempotent manual firing |
-| `goal.set/get/pause/clear/resume/round` | owner-only Eliot-mode Goal and explicit stale-round-safe rounds |
+| `goal.set/get/pause/clear/resume/round` | owner-only Eliot-mode Goal with explicit and automatic idle rounds plus explicit cadence slot rounds; native mode and cost limits are `unsupported` |
 | `provider.holds/clear_hold` | owner-only provider hold readback and constrained correction |
 | `events.read/subscribe` | persisted replay plus bounded live delivery |
 | `agent.discover` | owner-only native metadata discovery, without creating Agents |
@@ -691,9 +691,9 @@ eliot project list | show ID
 eliot rule show ID [--project PROJECT]
 eliot rule catch-up ID --after SEQ [--through SEQ] [--project PROJECT]
 eliot timer show ID [--project PROJECT] | run ID [--project PROJECT]
-eliot goal set A --text TEXT --check CMD [ARGS...] [--mode eliot|native] [--check-cwd PATH] [--check-timeout-ms MS] [--max-turns N] [--max-rounds N] [--max-without-progress N]
+eliot goal set A --text TEXT --check CMD [ARGS...] [--mode eliot|native] [--check-cwd PATH] [--check-timeout-ms MS] [--max-turns N] [--max-rounds N] [--max-without-progress N] [--cadence-ms MS]
 eliot goal show|pause|clear|resume A [--mode eliot|native] [--reason R]
-eliot goal round A --idle-seq SEQ [--mode eliot|native]
+eliot goal round A (--idle-seq SEQ | --slot N) [--mode eliot|native]
 eliot discover --profile P [--harness H] [--scope S] [--cursor C] [--limit N]
 eliot attach --profile P --harness H --scope S --ref R [--project LABEL]
 eliot history A --view subject|turns|items [--source native|rollout] [--turn-id ID] [--cursor C] [--limit N]

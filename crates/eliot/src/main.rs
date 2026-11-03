@@ -504,6 +504,10 @@ enum GoalCommand {
         max_rounds: Option<i64>,
         #[arg(long, value_name = "N")]
         max_without_progress: Option<i64>,
+        /// Cadence in milliseconds; a cadenced Goal rounds on anchored
+        /// time slots instead of idle events.
+        #[arg(long, value_name = "MS")]
+        cadence_ms: Option<i64>,
     },
     /// Show the Goal definition, counters, budgets and limits.
     Show {
@@ -535,14 +539,16 @@ enum GoalCommand {
         #[arg(long, value_parser = ["eliot", "native"], default_value = "eliot")]
         mode: String,
     },
-    /// Run one round keyed by the exact idle event seq.
+    /// Run one round keyed by the exact idle event seq or cadence slot.
     Round {
         #[arg(value_name = "AGENT")]
         agent: String,
         #[arg(long, value_parser = ["eliot", "native"], default_value = "eliot")]
         mode: String,
         #[arg(long, value_name = "SEQ", value_parser = clap::value_parser!(i64).range(0..))]
-        idle_seq: i64,
+        idle_seq: Option<i64>,
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(i64).range(1..))]
+        slot: Option<i64>,
     },
 }
 
@@ -945,6 +951,7 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 max_turns,
                 max_rounds,
                 max_without_progress,
+                cadence_ms,
             } => {
                 let request = GoalSetRequest {
                     agent,
@@ -957,6 +964,7 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                         max_turns,
                         max_rounds,
                         max_without_progress,
+                        cadence_ms,
                     },
                     max_cost: None,
                 };
@@ -1051,12 +1059,20 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 agent,
                 mode,
                 idle_seq,
+                slot,
             } => {
+                if idle_seq.is_none() == slot.is_none() {
+                    return Err(Failure::new(
+                        2,
+                        "goal round needs exactly one of --idle-seq, --slot",
+                    ));
+                }
                 let request = GoalRoundRequest {
                     id: mutation_id(id)?,
                     agent,
                     mode: goal_mode(&mode)?,
                     idle_seq,
+                    slot,
                 };
                 request
                     .validate()

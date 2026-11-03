@@ -40,13 +40,45 @@ pub struct GoalContinuation {
     pub text: String,
 }
 
+/// One round-key form. Idle keys name an exact idle event seq; slot keys
+/// name an anchored cadence slot index (first slot is 1). The form must
+/// match the Goal: cadenced Goals round on slots, the rest on idle seqs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GoalRoundKey {
+    Idle(i64),
+    Slot(i64),
+}
+
+impl GoalRoundKey {
+    pub fn value(self) -> i64 {
+        match self {
+            Self::Idle(value) | Self::Slot(value) => value,
+        }
+    }
+
+    pub fn kind(self) -> &'static str {
+        match self {
+            Self::Idle(_) => "idle",
+            Self::Slot(_) => "slot",
+        }
+    }
+
+    pub fn text(self) -> String {
+        format!("{}:{}", self.kind(), self.value())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct GoalRoundCommit {
     pub agent: String,
     pub mode: String,
     pub expected_generation: i64,
     pub expected_revision: i64,
-    pub round_key: i64,
+    pub round_key: GoalRoundKey,
+    /// Agent high-water observed by the claim. Slot commits require it
+    /// unchanged (no Agent event during the check); idle commits pin the
+    /// key itself instead.
+    pub claim_seq: i64,
     pub check: Option<GoalCheckResult>,
     pub blocked_reason: Option<String>,
     pub continuation: Option<GoalContinuation>,
@@ -75,6 +107,10 @@ struct GoalStatePersist {
     blocked_reason: Option<String>,
     #[serde(default)]
     counters: GoalCounters,
+    /// Slot-grid anchor captured when a cadence was set; stable across
+    /// pause/clear/resume. Absent without a cadence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cadence_anchor_ms: Option<i64>,
 }
 
 struct GoalRow {
@@ -138,6 +174,15 @@ impl Store {
         result
     }
 
+    /// Whether an active native-mode Goal owns the Agent. The automatic
+    /// Eliot driver waits while one drives. Native `set` is unsupported,
+    /// so no such row exists today; this stays the wait point.
+    pub fn goal_native_driving(&self, agent: &str) -> Result<bool> {
+        let agent_num = parse_agent_id(agent)?;
+        Ok(load_goal_row(&self.connection, agent_num, "native")?
+            .is_some_and(|row| row.state.status == GoalStatus::Active))
+    }
+
     /// Read round facts, pausing a generation-drifted Goal. Fails before any
     /// check runs when the Goal is missing, terminal, paused or drifted, when
     /// another round is in flight, or when the key is already consumed. Gate
@@ -148,17 +193,12 @@ impl Store {
         &mut self,
         agent: &str,
         mode: &str,
-        idle_seq: i64,
+        key: GoalRoundKey,
         now: i64,
     ) -> Result<GoalRoundProbe> {
         self.ensure_writer_healthy()?;
         require_eliot_mode(mode)?;
-        if idle_seq < 0 {
-            return Err(Error::new(
-                "invalid",
-                "goal round idle_seq must be nonnegative",
-            ));
-        }
+        require_key_range(key)?;
         let agent_num = parse_agent_id(agent)?;
         let agent_row = load_agent_by_num(&self.connection, agent_num)?
             .ok_or_else(|| Error::new("not_found", "goal Agent was not found"))?;
@@ -189,7 +229,7 @@ impl Store {
                 format!("goal is {} and takes no rounds", row.state.status.as_str()),
             ));
         }
-        if row.last_round_key.as_deref() == Some(&round_key_text(idle_seq)) {
+        if row.last_round_key.as_deref() == Some(&key.text()) {
             return Err(Error::new(
                 "stale_round",
                 "goal round was already committed",
@@ -203,20 +243,34 @@ impl Store {
             return Err(Error::new("busy", "goal round already in flight"));
         }
         // The burn ignores revision: pause/clear/resume bump it but never
-        // unburn an unknown round key of this generation.
+        // unburn an unknown round key of this generation. It still separates
+        // key forms: a burned idle seq never blocks the same slot number.
         if markers.iter().any(|marker| {
-            marker.round_key == idle_seq
+            marker.round_key == key.value()
+                && marker.kind == key.kind()
                 && marker.generation == row.generation
                 && !marker.is_live(&self.goal_holder)
         }) {
             return Err(Error::new("stale_round", "goal round key was already used"));
         }
-        if !round_key_names_generation_event(&self.connection, agent_num, row.generation, idle_seq)?
-        {
-            return Err(Error::new(
-                "stale_round",
-                "round key does not name an idle event of this Agent generation",
-            ));
+        require_key_form(&row, key)?;
+        match key {
+            GoalRoundKey::Idle(idle_seq) => {
+                if !round_key_names_generation_event(
+                    &self.connection,
+                    agent_num,
+                    row.generation,
+                    idle_seq,
+                )? {
+                    return Err(Error::new(
+                        "stale_round",
+                        "round key does not name an idle event of this Agent generation",
+                    ));
+                }
+            }
+            GoalRoundKey::Slot(slot) => {
+                require_slot_due(&row, slot, now)?;
+            }
         }
         let view = self.goal_view(row)?;
         let probe = GoalRoundProbe {
@@ -259,12 +313,12 @@ impl Store {
         &mut self,
         agent: &str,
         mode: &str,
-        idle_seq: i64,
+        key: GoalRoundKey,
         expected_revision: i64,
         now: i64,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         self.ensure_writer_healthy()?;
-        let result = self.goal_claim_round_inner(agent, mode, idle_seq, expected_revision, now);
+        let result = self.goal_claim_round_inner(agent, mode, key, expected_revision, now);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -277,15 +331,13 @@ impl Store {
         mode: &str,
         generation: i64,
         revision: i64,
-        round_key: i64,
+        key: GoalRoundKey,
         now: i64,
     ) -> Result<()> {
         self.ensure_writer_healthy()?;
         require_eliot_mode(mode)?;
         let agent_num = parse_agent_id(agent)?;
-        if round_key < 0 {
-            return Err(Error::new("invalid", "goal round key must be nonnegative"));
-        }
+        require_key_range(key)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -293,8 +345,16 @@ impl Store {
         db!(tx.execute(
             "UPDATE goal_markers SET state = 'unknown', updated_at = ?1
              WHERE agent = ?2 AND mode = ?3 AND generation = ?4 AND revision = ?5
-               AND round_key = ?6 AND state = 'running'",
-            params![now, agent_num, mode, generation, revision, round_key],
+               AND round_key = ?6 AND round_key_kind = ?7 AND state = 'running'",
+            params![
+                now,
+                agent_num,
+                mode,
+                generation,
+                revision,
+                key.value(),
+                key.kind()
+            ],
         ));
         commit_transaction(tx, &self.write_faulted)?;
         Ok(())
@@ -355,6 +415,7 @@ impl Store {
                     turns_at_set: turn_count,
                     ..GoalCounters::default()
                 },
+                cadence_anchor_ms: definition.cadence_ms.map(|_| now),
             };
             let tx = self
                 .connection
@@ -387,6 +448,7 @@ impl Store {
                 turns_at_set: turn_count,
                 ..GoalCounters::default()
             },
+            cadence_anchor_ms: definition.cadence_ms.map(|_| now),
         };
         let tx = self
             .connection
@@ -482,6 +544,7 @@ impl Store {
             paused_reason: None,
             blocked_reason: None,
             counters: row.state.counters,
+            cadence_anchor_ms: row.state.cadence_anchor_ms,
         };
         db!(tx.execute(
             "UPDATE goals SET revision = ?1, state = ?2, updated_at = ?3
@@ -572,6 +635,7 @@ impl Store {
             paused_reason: Some(reason.to_owned()),
             blocked_reason: row.state.blocked_reason.clone(),
             counters: row.state.counters.clone(),
+            cadence_anchor_ms: row.state.cadence_anchor_ms,
         };
         let state_text = encode_json(&state)?;
         db!(tx.execute(
@@ -596,17 +660,12 @@ impl Store {
         &mut self,
         agent: &str,
         mode: &str,
-        idle_seq: i64,
+        key: GoalRoundKey,
         expected_revision: i64,
         now: i64,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         require_eliot_mode(mode)?;
-        if idle_seq < 0 {
-            return Err(Error::new(
-                "invalid",
-                "goal round idle_seq must be nonnegative",
-            ));
-        }
+        require_key_range(key)?;
         let agent_num = parse_agent_id(agent)?;
         let tx = self
             .connection
@@ -630,6 +689,7 @@ impl Store {
                     paused_reason: Some("Agent generation advanced".to_owned()),
                     blocked_reason: row.state.blocked_reason.clone(),
                     counters: row.state.counters.clone(),
+                    cadence_anchor_ms: row.state.cadence_anchor_ms,
                 };
                 db!(tx.execute(
                     "UPDATE goals SET revision = ?1, state = ?2, updated_at = ?3
@@ -681,13 +741,16 @@ impl Store {
         }
         // The burn ignores revision: pause/clear/resume bump it but never
         // unburn an unknown round key of this generation.
-        if row.last_round_key.as_deref() == Some(&round_key_text(idle_seq))
-            || markers
-                .iter()
-                .any(|marker| marker.round_key == idle_seq && marker.generation == row.generation)
+        if row.last_round_key.as_deref() == Some(&key.text())
+            || markers.iter().any(|marker| {
+                marker.round_key == key.value()
+                    && marker.kind == key.kind()
+                    && marker.generation == row.generation
+            })
         {
             return Err(Error::new("stale_round", "goal round key was already used"));
         }
+        require_key_form(&row, key)?;
         if agent_row.state != AgentState::Idle {
             return Err(Error::new("bad_state", "goal round needs an idle Agent"));
         }
@@ -715,34 +778,43 @@ impl Store {
         if count_agent_commands(&tx, agent_num, row.generation, false)? > 0 {
             return Err(Error::new("busy", "Agent has open commands"));
         }
-        if !round_key_names_generation_event(&tx, agent_num, row.generation, idle_seq)? {
-            return Err(Error::new(
-                "stale_round",
-                "round key does not name an idle event of this Agent generation",
-            ));
-        }
-        if max_agent_seq_tx(&tx, agent_num, row.generation)? != idle_seq {
-            return Err(Error::new(
-                "stale_round",
-                "round key is not the latest Agent event",
-            ));
+        let claim_seq = max_agent_seq_tx(&tx, agent_num, row.generation)?;
+        match key {
+            GoalRoundKey::Idle(idle_seq) => {
+                if !round_key_names_generation_event(&tx, agent_num, row.generation, idle_seq)? {
+                    return Err(Error::new(
+                        "stale_round",
+                        "round key does not name an idle event of this Agent generation",
+                    ));
+                }
+                if claim_seq != idle_seq {
+                    return Err(Error::new(
+                        "stale_round",
+                        "round key is not the latest Agent event",
+                    ));
+                }
+            }
+            GoalRoundKey::Slot(slot) => {
+                require_slot_due(&row, slot, now)?;
+            }
         }
         db!(tx.execute(
             "INSERT INTO goal_markers(agent, mode, generation, revision, round_key,
-                 holder, state, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7)",
+                 round_key_kind, holder, state, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'running', ?8)",
             params![
                 agent_num,
                 mode,
                 row.generation,
                 row.revision,
-                idle_seq,
+                key.value(),
+                key.kind(),
                 self.goal_holder,
                 now,
             ],
         ));
         commit_transaction(tx, &self.write_faulted)?;
-        Ok(())
+        Ok(claim_seq)
     }
 
     fn goal_commit_round_inner(
@@ -752,8 +824,12 @@ impl Store {
     ) -> Result<GoalRoundCommitResult> {
         require_eliot_mode(&commit.mode)?;
         let agent_num = parse_agent_id(&commit.agent)?;
-        if commit.round_key < 0 {
-            return Err(Error::new("invalid", "goal round key must be nonnegative"));
+        require_key_range(commit.round_key)?;
+        if commit.claim_seq < 0 {
+            return Err(Error::new(
+                "invalid",
+                "goal round claim seq must be nonnegative",
+            ));
         }
         if let Some(continuation) = &commit.continuation {
             validate_ulid(&continuation.id)?;
@@ -807,7 +883,7 @@ impl Store {
                 "goal revision changed during the round",
             ));
         }
-        if row.last_round_key.as_deref() == Some(&round_key_text(commit.round_key)) {
+        if row.last_round_key.as_deref() == Some(&commit.round_key.text()) {
             return Err(Error::new(
                 "stale_round",
                 "goal round was already committed",
@@ -827,17 +903,30 @@ impl Store {
         {
             return Err(Error::new("stale_round", "goal round is not in flight"));
         }
-        if !round_key_names_generation_event(&tx, agent_num, row.generation, commit.round_key)? {
-            return Err(Error::new(
-                "stale_round",
-                "round key does not name an idle event of this Agent generation",
-            ));
-        }
-        if max_agent_seq_tx(&tx, agent_num, row.generation)? != commit.round_key {
-            return Err(Error::new(
-                "stale_round",
-                "Agent events advanced past the round key",
-            ));
+        match commit.round_key {
+            GoalRoundKey::Idle(idle_seq) => {
+                if !round_key_names_generation_event(&tx, agent_num, row.generation, idle_seq)? {
+                    return Err(Error::new(
+                        "stale_round",
+                        "round key does not name an idle event of this Agent generation",
+                    ));
+                }
+                if max_agent_seq_tx(&tx, agent_num, row.generation)? != idle_seq {
+                    return Err(Error::new(
+                        "stale_round",
+                        "Agent events advanced past the round key",
+                    ));
+                }
+            }
+            GoalRoundKey::Slot(slot) => {
+                require_slot_due(&row, slot, now)?;
+                if max_agent_seq_tx(&tx, agent_num, row.generation)? != commit.claim_seq {
+                    return Err(Error::new(
+                        "stale_round",
+                        "Agent events advanced during the round",
+                    ));
+                }
+            }
         }
         if let Some(source) = first_unhealthy_open_source_tx(&tx, agent_num, row.generation)? {
             return Err(Error::new(
@@ -882,10 +971,32 @@ impl Store {
             if check.output_complete
                 && let Some(digest) = &check.output_digest
             {
-                if counters.last_output_digest.as_deref() == Some(digest.as_str()) {
-                    counters.consecutive_same_output += 1;
-                } else {
-                    counters.consecutive_same_output = 0;
+                let same_output = counters.last_output_digest.as_deref() == Some(digest.as_str());
+                match goal_fingerprint_tx(&tx, agent_num, row.generation)? {
+                    GoalFingerprint::None => {
+                        // No Git observation exists for this generation;
+                        // check output alone decides the streak.
+                        if same_output {
+                            counters.consecutive_same_output += 1;
+                        } else {
+                            counters.consecutive_same_output = 0;
+                        }
+                    }
+                    GoalFingerprint::Incomplete => {
+                        // An incomplete fingerprint never proves no progress.
+                        counters.consecutive_same_output = 0;
+                        counters.last_fingerprint = None;
+                    }
+                    GoalFingerprint::Complete(fingerprint) => {
+                        let same_fingerprint =
+                            counters.last_fingerprint.as_deref() == Some(fingerprint.as_str());
+                        if same_output && same_fingerprint {
+                            counters.consecutive_same_output += 1;
+                        } else {
+                            counters.consecutive_same_output = 0;
+                        }
+                        counters.last_fingerprint = Some(fingerprint);
+                    }
                 }
                 counters.last_output_digest = Some(digest.clone());
             }
@@ -942,13 +1053,14 @@ impl Store {
         db!(tx.execute(
             "DELETE FROM goal_markers
              WHERE agent = ?1 AND mode = ?2 AND generation = ?3 AND revision = ?4
-               AND round_key = ?5",
+               AND round_key = ?5 AND round_key_kind = ?6",
             params![
                 agent_num,
                 commit.mode,
                 commit.expected_generation,
                 commit.expected_revision,
-                commit.round_key,
+                commit.round_key.value(),
+                commit.round_key.kind(),
             ],
         ));
         db!(tx.execute(
@@ -958,7 +1070,7 @@ impl Store {
             params![
                 row.revision + 1,
                 state_text,
-                round_key_text(commit.round_key),
+                commit.round_key.text(),
                 now,
                 agent_num,
                 commit.mode,
@@ -1012,14 +1124,71 @@ fn require_eliot_mode(mode: &str) -> Result<()> {
     Ok(())
 }
 
-fn round_key_text(seq: i64) -> String {
-    format!("idle:{seq}")
+fn require_key_range(key: GoalRoundKey) -> Result<()> {
+    match key {
+        GoalRoundKey::Idle(seq) => {
+            if seq < 0 {
+                return Err(Error::new(
+                    "invalid",
+                    "goal round idle_seq must be nonnegative",
+                ));
+            }
+        }
+        GoalRoundKey::Slot(slot) => {
+            if slot < 1 {
+                return Err(Error::new("invalid", "goal round slot must be at least 1"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The key form must match the Goal: cadenced Goals round on slots, the
+/// rest on idle seqs. A mismatch is a discipline refusal, not a stale key.
+fn require_key_form(row: &GoalRow, key: GoalRoundKey) -> Result<()> {
+    match (row.definition.cadence_ms, key) {
+        (Some(_), GoalRoundKey::Idle(_)) => Err(Error::new(
+            "bad_state",
+            "cadenced goal rounds name cadence slots, not idle events",
+        )),
+        (None, GoalRoundKey::Slot(_)) => Err(Error::new(
+            "bad_state",
+            "goal without a cadence rounds on idle events, not slots",
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Start of slot `slot` (1-based) on the Goal's anchored grid. Like timer
+/// intervals, the first slot starts one period after the anchor.
+fn slot_start_ms(anchor_ms: i64, period_ms: i64, slot: i64) -> Result<i64> {
+    let start = i128::from(anchor_ms) + i128::from(period_ms) * i128::from(slot);
+    i64::try_from(start)
+        .map_err(|_| Error::new("invalid", "goal cadence slot overflows epoch millis"))
+}
+
+/// A slot round names a due slot: its start passed. Due slots never
+/// un-due, so the commit recheck only guards clock rollback.
+fn require_slot_due(row: &GoalRow, slot: i64, now: i64) -> Result<()> {
+    let (Some(period_ms), Some(anchor_ms)) =
+        (row.definition.cadence_ms, row.state.cadence_anchor_ms)
+    else {
+        return Err(Error::new("internal", "cadenced goal lost its anchor"));
+    };
+    if slot_start_ms(anchor_ms, period_ms, slot)? > now {
+        return Err(Error::new(
+            "stale_round",
+            "goal cadence slot is not due yet",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
 struct GoalMarkerRow {
     generation: i64,
     round_key: i64,
+    kind: String,
     holder: String,
     state: String,
 }
@@ -1058,6 +1227,7 @@ impl Store {
             },
             generation: row.generation,
             revision: row.revision,
+            cadence_anchor_ms: row.state.cadence_anchor_ms,
             status: row.state.status,
             paused_reason: row.state.paused_reason,
             blocked_reason: row.state.blocked_reason,
@@ -1081,39 +1251,48 @@ fn display_goal_marker(
     mode: &str,
     generation: i64,
 ) -> Result<Option<GoalRoundMarker>> {
-    let live: Option<(i64, i64, i64, i64)> = connection
+    let live: Option<(i64, String, i64, i64, i64)> = connection
         .query_row(
-            "SELECT round_key, generation, revision, updated_at FROM goal_markers
+            "SELECT round_key, round_key_kind, generation, revision, updated_at
+             FROM goal_markers
              WHERE agent = ?1 AND mode = ?2 AND state = 'running' AND holder = ?3
              LIMIT 1",
             params![agent_num, mode, holder],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .optional()
         .map_err(sql_error)?;
-    if let Some((round_key, generation, revision, updated_at)) = live {
+    if let Some((round_key, kind, generation, revision, updated_at)) = live {
         return Ok(Some(GoalRoundMarker {
-            round_key: round_key_text(round_key),
+            round_key: format!("{kind}:{round_key}"),
             generation,
             revision,
             state: GoalMarkerState::Running,
             updated_at,
         }));
     }
-    let burned: Option<(i64, i64, i64)> = connection
+    let burned: Option<(i64, String, i64, i64)> = connection
         .query_row(
-            "SELECT round_key, revision, updated_at FROM goal_markers
+            "SELECT round_key, round_key_kind, revision, updated_at FROM goal_markers
              WHERE agent = ?1 AND mode = ?2 AND generation = ?3
                AND (state = 'unknown' OR holder <> ?4)
              ORDER BY updated_at DESC, round_key DESC LIMIT 1",
             params![agent_num, mode, generation, holder],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
         .map_err(sql_error)?;
     Ok(
-        burned.map(|(round_key, revision, updated_at)| GoalRoundMarker {
-            round_key: round_key_text(round_key),
+        burned.map(|(round_key, kind, revision, updated_at)| GoalRoundMarker {
+            round_key: format!("{kind}:{round_key}"),
             generation,
             revision,
             state: GoalMarkerState::Unknown,
@@ -1129,7 +1308,7 @@ fn load_goal_markers(
 ) -> Result<Vec<GoalMarkerRow>> {
     let mut statement = connection
         .prepare(
-            "SELECT generation, round_key, holder, state
+            "SELECT generation, round_key, round_key_kind, holder, state
              FROM goal_markers WHERE agent = ?1 AND mode = ?2",
         )
         .map_err(sql_error)?;
@@ -1138,8 +1317,9 @@ fn load_goal_markers(
             Ok(GoalMarkerRow {
                 generation: row.get(0)?,
                 round_key: row.get(1)?,
-                holder: row.get(2)?,
-                state: row.get(3)?,
+                kind: row.get(2)?,
+                holder: row.get(3)?,
+                state: row.get(4)?,
             })
         })
         .map_err(sql_error)?
@@ -1154,7 +1334,7 @@ fn load_goal_markers_tx(
 ) -> Result<Vec<GoalMarkerRow>> {
     let mut statement = tx
         .prepare(
-            "SELECT generation, round_key, holder, state
+            "SELECT generation, round_key, round_key_kind, holder, state
              FROM goal_markers WHERE agent = ?1 AND mode = ?2",
         )
         .map_err(sql_error)?;
@@ -1163,8 +1343,9 @@ fn load_goal_markers_tx(
             Ok(GoalMarkerRow {
                 generation: row.get(0)?,
                 round_key: row.get(1)?,
-                holder: row.get(2)?,
-                state: row.get(3)?,
+                kind: row.get(2)?,
+                holder: row.get(3)?,
+                state: row.get(4)?,
             })
         })
         .map_err(sql_error)?
@@ -1178,20 +1359,28 @@ fn load_goal_marker_tx(
     mode: &str,
     generation: i64,
     revision: i64,
-    round_key: i64,
+    key: GoalRoundKey,
 ) -> Result<Option<GoalMarkerRow>> {
     tx.query_row(
-        "SELECT generation, round_key, holder, state
+        "SELECT generation, round_key, round_key_kind, holder, state
          FROM goal_markers
          WHERE agent = ?1 AND mode = ?2 AND generation = ?3 AND revision = ?4
-           AND round_key = ?5",
-        params![agent_num, mode, generation, revision, round_key],
+           AND round_key = ?5 AND round_key_kind = ?6",
+        params![
+            agent_num,
+            mode,
+            generation,
+            revision,
+            key.value(),
+            key.kind()
+        ],
         |row| {
             Ok(GoalMarkerRow {
                 generation: row.get(0)?,
                 round_key: row.get(1)?,
-                holder: row.get(2)?,
-                state: row.get(3)?,
+                kind: row.get(2)?,
+                holder: row.get(3)?,
+                state: row.get(4)?,
             })
         },
     )
@@ -1239,6 +1428,97 @@ fn subject_is_idle(subject: Option<&str>) -> bool {
             .map(|subject| subject.state == AgentState::Idle)
             .unwrap_or(false)
     })
+}
+
+/// Read-only workspace fingerprint over committed Git observation: the
+/// latest complete `git.changed` HEAD plus dirty set, and the attributed
+/// edit paths. Pure read; it never touches the workspace.
+enum GoalFingerprint {
+    /// No Git observation exists for this generation: the streak falls
+    /// back to check output alone.
+    None,
+    /// A Git binding exists but its observation is missing, partial,
+    /// gapped, truncated or unhealthy. Never proves no progress.
+    Incomplete,
+    /// Canonical digest of HEAD, dirty set and attributed edit paths.
+    Complete(String),
+}
+
+fn goal_fingerprint_tx(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    generation: i64,
+) -> Result<GoalFingerprint> {
+    let owners: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM source_owners WHERE agent = ?1 AND generation = ?2
+             AND family IN ('git', 'file') AND source = 'git' AND mechanism = 'git'",
+            params![agent_num, generation],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if owners == 0 {
+        return Ok(GoalFingerprint::None);
+    }
+    if owners != 2 {
+        return Ok(GoalFingerprint::Incomplete);
+    }
+    let healthy: bool = tx
+        .query_row(
+            "SELECT state = 'open' AND health = 'ok' FROM source_state
+             WHERE agent = ?1 AND generation = ?2 AND source = 'git'",
+            params![agent_num, generation],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?
+        .unwrap_or(false);
+    if !healthy {
+        return Ok(GoalFingerprint::Incomplete);
+    }
+    let data: Option<String> = tx
+        .query_row(
+            "SELECT data FROM events WHERE agent = ?1 AND generation = ?2
+             AND source = 'git' AND kind = 'git.changed' ORDER BY seq DESC LIMIT 1",
+            params![agent_num, generation],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let Some(data) = data else {
+        return Ok(GoalFingerprint::Incomplete);
+    };
+    let data = decode_json(&data)?;
+    if data.get("complete").and_then(Value::as_bool) != Some(true)
+        || data.get("history_gap").and_then(Value::as_bool) == Some(true)
+    {
+        return Ok(GoalFingerprint::Incomplete);
+    }
+    let mut statement = tx
+        .prepare(
+            "SELECT path FROM agent_edits WHERE agent = ?1 AND generation = ?2
+             ORDER BY path LIMIT ?3",
+        )
+        .map_err(sql_error)?;
+    let paths = statement
+        .query_map(
+            params![agent_num, generation, MAX_PAGE_ENTRIES as i64 + 1],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(sql_error)?
+        .collect::<rusqlite::Result<Vec<String>>>()
+        .map_err(sql_error)?;
+    if paths.len() > MAX_PAGE_ENTRIES {
+        return Ok(GoalFingerprint::Incomplete);
+    }
+    let digest = canonical::digest(&json!({
+        "head": data.get("head").unwrap_or(&Value::Null),
+        "dirty": data.get("dirty").unwrap_or(&Value::Null),
+        "edits": paths,
+    }))?;
+    Ok(GoalFingerprint::Complete(
+        digest.iter().map(|byte| format!("{byte:02x}")).collect(),
+    ))
 }
 
 fn load_goal_row(connection: &Connection, agent_num: i64, mode: &str) -> Result<Option<GoalRow>> {

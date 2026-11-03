@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 19;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 20;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -494,7 +494,7 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
-        if current < CURRENT_SCHEMA_VERSION {
+        if current < 19 {
             let tx = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -523,6 +523,20 @@ impl Store {
                      PRIMARY KEY(agent, mode, generation, revision, round_key)
                  );
                  INSERT INTO schema_migrations(version) VALUES (19);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < CURRENT_SCHEMA_VERSION {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE goal_markers
+                     ADD COLUMN round_key_kind TEXT NOT NULL DEFAULT 'idle'
+                     CHECK(round_key_kind IN ('idle', 'slot'));
+                 INSERT INTO schema_migrations(version) VALUES (20);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

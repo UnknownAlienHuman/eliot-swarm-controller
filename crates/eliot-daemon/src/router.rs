@@ -2,6 +2,8 @@ mod command;
 mod goals;
 mod resolution;
 
+pub(crate) use goals::{real_goal_check, run_goal_driver};
+
 use crate::{
     automation::RuleDefinition,
     bus::Bus,

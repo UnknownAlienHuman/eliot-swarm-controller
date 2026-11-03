@@ -32,7 +32,8 @@ pub use goals::{
     DEFAULT_GOAL_CHECK_TIMEOUT_MS, GOAL_COST_UNSUPPORTED, GoalClearRequest, GoalCounters,
     GoalDefinition, GoalGetRequest, GoalMarkerState, GoalMode, GoalPauseRequest, GoalResumeRequest,
     GoalRoundMarker, GoalRoundOutcome, GoalRoundRequest, GoalRoundResponse, GoalSetRequest,
-    GoalStatus, GoalView, MAX_GOAL_LIMIT, MAX_GOAL_OBSERVATION_BYTES,
+    GoalStatus, GoalView, MAX_GOAL_CADENCE_MS, MAX_GOAL_LIMIT, MAX_GOAL_OBSERVATION_BYTES,
+    MIN_GOAL_CADENCE_MS,
 };
 pub use monitor_views::{
     FilesystemInvalidationState, FilesystemInvalidationView, GitObservation, GitView,

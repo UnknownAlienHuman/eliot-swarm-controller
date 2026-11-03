@@ -10,26 +10,31 @@ use crate::{
     scripts::process::{ProcessCapture, ProcessFailure, ProcessOutcome, run_owned_process},
 };
 use eliot_core::{
-    AgentState, Error, Result, SecretPolicy,
+    AgentState, Error, Event, Result, SecretPolicy,
     api::{
         GoalClearRequest, GoalGetRequest, GoalMode, GoalPauseRequest, GoalResumeRequest,
-        GoalRoundOutcome, GoalRoundRequest, GoalRoundResponse, GoalSetRequest,
+        GoalRoundOutcome, GoalRoundRequest, GoalRoundResponse, GoalSetRequest, GoalStatus,
         MAX_GOAL_OBSERVATION_BYTES,
     },
     limits::MAX_FRAME_BYTES,
 };
 use eliot_plugin::sync::LockExt;
-use eliot_store::{GoalCheckResult, GoalCommitOutcome, GoalContinuation, GoalRoundCommit};
+use eliot_store::{
+    GoalCheckResult, GoalCommitOutcome, GoalContinuation, GoalRoundCommit, GoalRoundKey,
+};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
-use tokio::{process::Command as TokioCommand, sync::watch};
+use tokio::{
+    process::Command as TokioCommand,
+    sync::{broadcast, watch},
+};
 
 /// Spawn one already-resolved check command. Production passes
 /// [`real_goal_check`]; tests inject a fake outcome. The future is boxed so
 /// the seam stays a plain function pointer.
-type GoalCheckRunner = fn(
+pub(crate) type GoalCheckRunner = fn(
     TokioCommand,
     Vec<u8>,
     Duration,
@@ -37,7 +42,7 @@ type GoalCheckRunner = fn(
     watch::Receiver<bool>,
 ) -> Pin<Box<dyn Future<Output = ProcessOutcome> + Send>>;
 
-fn real_goal_check(
+pub(crate) fn real_goal_check(
     command: TokioCommand,
     stdin: Vec<u8>,
     timeout: Duration,
@@ -236,21 +241,22 @@ impl Router {
         require_eliot_mode(request.mode)?;
         ulid::Ulid::from_string(&request.id)
             .map_err(|_| Error::new("invalid", "mutation id must be a ULID"))?;
+        let key = goal_round_key(&request)?;
         let probe = {
             self.inner.store.lock().await.goal_round_probe(
                 &request.agent,
                 request.mode.as_str(),
-                request.idle_seq,
+                key,
                 now_ms(),
             )?
         };
-        goal_round_gates(&probe, request.idle_seq)?;
+        goal_round_gates(&probe, key)?;
         let definition = probe.view.definition.clone();
         let stdin = serde_json::to_vec(&json!({
             "agent": request.agent,
             "generation": probe.view.generation,
             "revision": probe.view.revision,
-            "round_key": format!("idle:{}", request.idle_seq),
+            "round_key": key.text(),
         }))
         .map_err(|_| Error::new("internal", "goal check input could not be encoded"))?;
         if stdin.len() > MAX_FRAME_BYTES {
@@ -262,15 +268,15 @@ impl Router {
         // The claim re-validates the probe and commits the durable in-flight
         // marker. Everything after it resolves the marker exactly once: the
         // commit consumes it, every other exit abandons it to `unknown`.
-        {
+        let claim_seq = {
             self.inner.store.lock().await.goal_claim_round(
                 &request.agent,
                 request.mode.as_str(),
-                request.idle_seq,
+                key,
                 probe.view.revision,
                 now_ms(),
-            )?;
-        }
+            )?
+        };
         let turns_used = probe
             .turn_count
             .saturating_sub(probe.view.counters.turns_at_set);
@@ -282,7 +288,9 @@ impl Router {
             .max_turns
             .is_some_and(|max| turns_used >= max)
         {
-            return self.commit_goal_block(&request, &probe, "turn_limit").await;
+            return self
+                .commit_goal_block(&request, &probe, key, claim_seq, "turn_limit")
+                .await;
         }
         let policy = self.secret_policy_snapshot();
         let mut command = TokioCommand::new(&definition.check[0]);
@@ -317,7 +325,8 @@ impl Router {
                 mode: request.mode.as_str().to_owned(),
                 expected_generation: probe.view.generation,
                 expected_revision: probe.view.revision,
-                round_key: request.idle_seq,
+                round_key: key,
+                claim_seq,
                 check: Some(check),
                 blocked_reason: None,
                 continuation: Some(GoalContinuation {
@@ -332,7 +341,8 @@ impl Router {
             mode: request.mode.as_str().to_owned(),
             expected_generation: probe.view.generation,
             expected_revision: probe.view.revision,
-            round_key: request.idle_seq,
+            round_key: key,
+            claim_seq,
             check: Some(check),
             blocked_reason: None,
             continuation: None,
@@ -344,6 +354,8 @@ impl Router {
         &self,
         request: &GoalRoundRequest,
         probe: &eliot_store::GoalRoundProbe,
+        key: GoalRoundKey,
+        claim_seq: i64,
         reason: &str,
     ) -> Result<Value> {
         let commit = GoalRoundCommit {
@@ -351,7 +363,8 @@ impl Router {
             mode: request.mode.as_str().to_owned(),
             expected_generation: probe.view.generation,
             expected_revision: probe.view.revision,
-            round_key: request.idle_seq,
+            round_key: key,
+            claim_seq,
             check: None,
             blocked_reason: Some(reason.to_owned()),
             continuation: None,
@@ -368,12 +381,15 @@ impl Router {
         request: &GoalRoundRequest,
         probe: &eliot_store::GoalRoundProbe,
     ) {
+        let Ok(key) = goal_round_key(request) else {
+            return;
+        };
         if let Err(error) = self.inner.store.lock().await.goal_abandon_round(
             &request.agent,
             request.mode.as_str(),
             probe.view.generation,
             probe.view.revision,
-            request.idle_seq,
+            key,
             now_ms(),
         ) {
             let policy = self.secret_policy_snapshot();
@@ -462,8 +478,23 @@ impl Router {
     }
 }
 
-/// Refuse a round unless the Agent is cleanly idle at the round key.
-fn goal_round_gates(probe: &eliot_store::GoalRoundProbe, idle_seq: i64) -> Result<()> {
+/// Exactly one key form per round; request validation already enforces
+/// this, so the fallback only defends direct callers.
+fn goal_round_key(request: &GoalRoundRequest) -> Result<GoalRoundKey> {
+    match (request.idle_seq, request.slot) {
+        (Some(idle_seq), None) => Ok(GoalRoundKey::Idle(idle_seq)),
+        (None, Some(slot)) => Ok(GoalRoundKey::Slot(slot)),
+        _ => Err(Error::new(
+            "invalid",
+            "goal round needs exactly one of idle_seq, slot",
+        )),
+    }
+}
+
+/// Refuse a round unless the Agent is cleanly idle at the round key. Idle
+/// keys pin the latest event; slot keys pin time and enforce freshness at
+/// the claim and the commit instead.
+fn goal_round_gates(probe: &eliot_store::GoalRoundProbe, key: GoalRoundKey) -> Result<()> {
     if probe.agent_state != AgentState::Idle {
         return Err(Error::new("bad_state", "goal round needs an idle Agent"));
     }
@@ -491,13 +522,113 @@ fn goal_round_gates(probe: &eliot_store::GoalRoundProbe, idle_seq: i64) -> Resul
     if probe.open_commands > 0 {
         return Err(Error::new("busy", "Agent has open commands"));
     }
-    if probe.max_seq != idle_seq {
+    if let GoalRoundKey::Idle(idle_seq) = key
+        && probe.max_seq != idle_seq
+    {
         return Err(Error::new(
             "stale_round",
             "round key is not the latest Agent event",
         ));
     }
     Ok(())
+}
+
+/// Drive active Eliot-mode Goals when their generation commits an idle
+/// event. Each round goes through the same `goal_round` path as an
+/// explicit owner call — same probe, gates, check custody and conditional
+/// commit — with a fresh owner mutation id. Lost races stay silent; only
+/// unexpected failures are logged.
+pub(crate) async fn run_goal_driver(
+    router: Router,
+    run_check: GoalCheckRunner,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    let mut events = router.subscribe_rule_events();
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(());
+                }
+            }
+            received = events.recv() => match received {
+                Ok(event) => {
+                    drive_goal_for_event(&router, run_check, &event).await;
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => {
+                    return Err(Error::new("unavailable", "event bus is closed"));
+                }
+            },
+        }
+    }
+}
+
+async fn drive_goal_for_event(router: &Router, run_check: GoalCheckRunner, event: &Event) {
+    let Some(agent) = event.agent.as_deref() else {
+        return;
+    };
+    let Some(generation) = event.generation else {
+        return;
+    };
+    if !event
+        .subject
+        .as_ref()
+        .is_some_and(|subject| subject.state == AgentState::Idle)
+    {
+        return;
+    }
+    if !router.rule_firings_open() {
+        return;
+    }
+    let view = {
+        let store = router.inner.store.lock().await;
+        // Native wait point: an actively driving native Goal owns the
+        // Agent, so Eliot rounds wait. None exists today.
+        match store.goal_native_driving(agent) {
+            Ok(false) => {}
+            _ => return,
+        }
+        match store.goal_get(agent, "eliot") {
+            Ok(view) => view,
+            Err(_) => return,
+        }
+    };
+    let Some(view) = view else {
+        return;
+    };
+    if view.status != GoalStatus::Active || view.generation != generation {
+        return;
+    }
+    if view.definition.cadence_ms.is_some() {
+        return;
+    }
+    let params = json!({
+        "id": ulid::Ulid::new().to_string(),
+        "agent": agent,
+        "mode": "eliot",
+        "idle_seq": event.seq,
+    });
+    match router
+        .goal_round_with(&params, &Principal::Owner, run_check)
+        .await
+    {
+        Ok(_) => {}
+        Err(error)
+            if matches!(
+                error.code.as_str(),
+                "busy" | "stale_round" | "bad_state" | "not_found" | "stale_generation"
+            ) => {}
+        Err(error) => {
+            let policy = router.secret_policy_snapshot();
+            crate::logging::record(
+                &policy,
+                "daemon.goal_auto_round_failed",
+                &[("agent", agent)],
+                Some(&error),
+            );
+        }
+    }
 }
 
 /// Interpret one owned check completion. Only a definite direct exit with
@@ -594,7 +725,7 @@ fn goal_continuation_text(
 mod tests {
     use super::*;
     use crate::bus::Bus;
-    use eliot_core::{NativeEvent, SourceBatch, StderrSnapshot, SubmitCommand};
+    use eliot_core::{EventSubject, NativeEvent, SourceBatch, StderrSnapshot, SubmitCommand};
     use std::{
         path::PathBuf,
         sync::{
@@ -1348,6 +1479,195 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    fn idle_event(agent: &str, generation: i64, seq: i64) -> Event {
+        busy_event(agent, generation, seq, AgentState::Idle)
+    }
+
+    fn busy_event(agent: &str, generation: i64, seq: i64, state: AgentState) -> Event {
+        Event {
+            seq,
+            ts: 0,
+            kind: "turn.completed".to_owned(),
+            agent: Some(agent.to_owned()),
+            subject: Some(EventSubject {
+                project: "goal-driver".to_owned(),
+                harness: "fake".to_owned(),
+                profile: "fake".to_owned(),
+                state,
+                workspace: None,
+            }),
+            generation: Some(generation),
+            source: "stream".to_owned(),
+            native_id: None,
+            data: json!({}),
+            cause: None,
+        }
+    }
+
+    async fn stored_goal(router: &Router, agent: &str) -> eliot_core::api::GoalView {
+        router
+            .inner
+            .store
+            .lock()
+            .await
+            .goal_get(agent, "eliot")
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn goal_slot_round_refuses_future_slots_and_wrong_forms() {
+        let router = router();
+        let agent = ready_agent(&router, "goal-slot-refuse").await;
+        let mut cadenced = definition("keep green");
+        cadenced["cadence_ms"] = json!(60_000);
+        set_goal(&router, &agent, cadenced).await;
+        // The first slot starts one period after the set anchor: not due yet.
+        let error = router
+            .goal_round_with(
+                &json!({"id":ulid::Ulid::new().to_string(),"agent":agent,
+                    "mode":"eliot","slot":1}),
+                &Principal::Owner,
+                exploding_runner,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "stale_round");
+        // A cadenced Goal refuses idle keys.
+        let key = high_water(&router).await;
+        let error = router
+            .goal_round_with(
+                &json!({"id":ulid::Ulid::new().to_string(),"agent":agent,
+                    "mode":"eliot","idle_seq":key}),
+                &Principal::Owner,
+                exploding_runner,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "bad_state");
+        // A Goal without a cadence refuses slots.
+        let plain = ready_agent(&router, "goal-slot-plain").await;
+        set_goal(&router, &plain, definition("keep green")).await;
+        let error = router
+            .goal_round_with(
+                &json!({"id":ulid::Ulid::new().to_string(),"agent":plain,
+                    "mode":"eliot","slot":1}),
+                &Principal::Owner,
+                exploding_runner,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "bad_state");
+        // Malformed key pairs never reach the Store.
+        for params in [
+            json!({"id":ulid::Ulid::new().to_string(),"agent":plain,
+                "mode":"eliot","slot":0}),
+            json!({"id":ulid::Ulid::new().to_string(),"agent":plain,
+                "mode":"eliot","idle_seq":key,"slot":1}),
+            json!({"id":ulid::Ulid::new().to_string(),"agent":plain,
+                "mode":"eliot"}),
+        ] {
+            let error = router
+                .goal_round_with(&params, &Principal::Owner, exploding_runner)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "invalid");
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_driver_rounds_an_idle_agent_automatically() {
+        let router = router();
+        let agent = ready_agent(&router, "goal-auto").await;
+        set_goal(&router, &agent, definition("keep green")).await;
+        let key = high_water(&router).await;
+        drive_goal_for_event(&router, passing_runner, &idle_event(&agent, 1, key)).await;
+        let view = stored_goal(&router, &agent).await;
+        assert_eq!(view.status, eliot_core::api::GoalStatus::Completed);
+        assert_eq!(view.counters.rounds, 1);
+        assert_eq!(view.last_round_key, Some(format!("idle:{key}")));
+    }
+
+    #[tokio::test]
+    async fn goal_driver_skips_without_a_driving_goal() {
+        let router = router();
+        // No Goal at all.
+        let bare = ready_agent(&router, "goal-auto-bare").await;
+        let key = high_water(&router).await;
+        drive_goal_for_event(&router, passing_runner, &idle_event(&bare, 1, key)).await;
+        assert!(
+            router
+                .inner
+                .store
+                .lock()
+                .await
+                .goal_get(&bare, "eliot")
+                .unwrap()
+                .is_none()
+        );
+        // A paused Goal takes no rounds.
+        let paused = ready_agent(&router, "goal-auto-paused").await;
+        set_goal(&router, &paused, definition("keep green")).await;
+        router
+            .goal_pause(
+                &json!({"agent":paused, "mode":"eliot", "reason":"waiting"}),
+                &Principal::Owner,
+            )
+            .await
+            .unwrap();
+        let key = high_water(&router).await;
+        drive_goal_for_event(&router, passing_runner, &idle_event(&paused, 1, key)).await;
+        let view = stored_goal(&router, &paused).await;
+        assert_eq!(view.status, eliot_core::api::GoalStatus::Paused);
+        assert_eq!(view.counters.rounds, 0);
+        // A cadenced Goal rounds on slots, never on idle events.
+        let cadenced = ready_agent(&router, "goal-auto-slot").await;
+        let mut cadenced_definition = definition("keep green");
+        cadenced_definition["cadence_ms"] = json!(60_000);
+        set_goal(&router, &cadenced, cadenced_definition).await;
+        let key = high_water(&router).await;
+        drive_goal_for_event(&router, passing_runner, &idle_event(&cadenced, 1, key)).await;
+        let view = stored_goal(&router, &cadenced).await;
+        assert_eq!(view.status, eliot_core::api::GoalStatus::Active);
+        assert_eq!(view.counters.rounds, 0);
+        // A busy event or a drifted generation never drives.
+        let agent = ready_agent(&router, "goal-auto-gates").await;
+        set_goal(&router, &agent, definition("keep green")).await;
+        let key = high_water(&router).await;
+        drive_goal_for_event(
+            &router,
+            passing_runner,
+            &busy_event(&agent, 1, key, AgentState::Busy),
+        )
+        .await;
+        drive_goal_for_event(&router, passing_runner, &idle_event(&agent, 2, key)).await;
+        let view = stored_goal(&router, &agent).await;
+        assert_eq!(view.counters.rounds, 0);
+        assert!(view.last_round_key.is_none());
+    }
+
+    #[tokio::test]
+    async fn goal_driver_tolerates_a_lost_race() {
+        let router = router();
+        let agent = ready_agent(&router, "goal-auto-race").await;
+        set_goal(&router, &agent, definition("keep green")).await;
+        let key = high_water(&router).await;
+        // A stale key and a second drive after completion both stay silent.
+        drive_goal_for_event(
+            &router,
+            passing_runner,
+            &idle_event(&agent, 1, key.saturating_sub(1)),
+        )
+        .await;
+        let view = stored_goal(&router, &agent).await;
+        assert_eq!(view.counters.rounds, 0);
+        drive_goal_for_event(&router, passing_runner, &idle_event(&agent, 1, key)).await;
+        drive_goal_for_event(&router, passing_runner, &idle_event(&agent, 1, key)).await;
+        let view = stored_goal(&router, &agent).await;
+        assert_eq!(view.status, eliot_core::api::GoalStatus::Completed);
+        assert_eq!(view.counters.rounds, 1);
     }
 
     #[tokio::test]
