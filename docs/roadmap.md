@@ -195,14 +195,14 @@ No second executor, workflow graph or acceptance engine.
       catch-up. Interval/cron/once/manual timers and action limits use ordinary command
       admission; connected timer and event-rule action support is defined in the
       [automation spec](spec/automation.md).
-- [ ] **L4.2 Actions/scripts.** Agent commands first, then bounded explicit scripts.
+- [x] **L4.2 Actions/scripts.** Agent commands first, then bounded explicit scripts.
       Frozen inputs, scoped principal, exit/output handling and unknown outcomes use
       normal commands. Add Git fetch/push wrappers only with their concrete recipe;
       direct harness Git remains harness work, not intercepted by Eliot.
       Agent actions, bounded Run scripts and `git.fetch` are connected; the remaining
       wrappers stay unsupported as specified in [automation](spec/automation.md).
-      Add bounded `command.children` readback for retained expansions through the same
-      Router/CLI before advertising that target API.
+      Bounded `command.children` readback for retained expansions is connected
+      through the same Router/CLI, and that target API is advertised.
 - [ ] **L4.3 Goals/requests.** Native Goal where installed Codex supports it; Eliot
       continuation/checks with turn/cost/no-progress limits. No check runs under the
       Store lock. Neither a failed check nor a missing terminal fact authorizes replay.

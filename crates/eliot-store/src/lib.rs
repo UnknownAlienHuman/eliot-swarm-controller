@@ -10,6 +10,7 @@ mod rules;
 mod scripts;
 
 pub use capacity::{RecordedProcess, RetainedGeneration};
+pub use command_children::{CommandChildrenPage, command_history_expired};
 pub use projects::ProjectRegistrationInput;
 pub use resolution::TurnInactiveProof;
 pub use retention::RetentionReport;
@@ -81,6 +82,7 @@ macro_rules! db {
 }
 
 mod admission;
+mod command_children;
 mod dispatch;
 mod observer;
 mod observer_live;
@@ -5992,9 +5994,18 @@ fn validate_ulid(id: &str) -> Result<Ulid> {
     Ulid::from_string(id).map_err(|_| Error::new("invalid", "mutation id must be a ULID"))
 }
 
+/// ULID timestamp of `id` in commit-clock milliseconds, or `None` when the
+/// id is not a ULID. Shared by the admission `id_expired` check and the
+/// `command.children` pruned-history classification so both read one clock.
+fn ulid_timestamp_ms(id: &str) -> Option<i64> {
+    let parsed = Ulid::from_string(id).ok()?;
+    Some(i64::try_from(parsed.timestamp_ms()).unwrap_or(i64::MAX))
+}
+
 fn validate_id_age(id: &str, now: i64) -> Result<()> {
-    let parsed = validate_ulid(id)?;
-    let created_at = i64::try_from(parsed.timestamp_ms()).unwrap_or(i64::MAX);
+    validate_ulid(id)?;
+    // `validate_ulid` just accepted this id, so the timestamp parse cannot fail.
+    let created_at = ulid_timestamp_ms(id).unwrap_or(i64::MAX);
     if now.saturating_sub(created_at) > RETRY_WINDOW_MS {
         return Err(Error::new(
             "id_expired",

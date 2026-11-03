@@ -9,13 +9,13 @@ use eliot_core::api::{
     AgentDiscoverRequest, AgentEditsRequest, AgentEditsResponse, AgentGetRequest, AgentGetResponse,
     AgentGitRequest, AgentGitResponse, AgentHistoryRequest, AgentListRequest, AgentListResponse,
     AgentProcessesRequest, AgentProcessesResponse, AgentResultRequest, AgentResultResponse,
-    AgentStatsRequest, AgentStatsResponse, CommandGetRequest, CommandSubmitRequest,
-    CommandSubmitResponse, DaemonShutdownRequest, DaemonShutdownResponse, DaemonStatusRequest,
-    DaemonStatusResponse, DiscoverPage, EventsFilter, EventsReadRequest, EventsReadResponse,
-    EventsSubscribeRequest, EventsSubscribeResponse, MAX_OBSERVATION_CURSOR_BYTES, ObservationPage,
-    PROCESS_CURSOR_MAX_BYTES, ProjectRegistrationView, ProviderClearHoldResponse,
-    ProviderHoldsResponse, RuleStateView, ShutdownMode, TimerSchedule, TimerStateView,
-    TurnGetRequest,
+    AgentStatsRequest, AgentStatsResponse, CommandChildrenRequest, CommandChildrenResponse,
+    CommandGetRequest, CommandSubmitRequest, CommandSubmitResponse, DaemonShutdownRequest,
+    DaemonShutdownResponse, DaemonStatusRequest, DaemonStatusResponse, DiscoverPage, EventsFilter,
+    EventsReadRequest, EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse,
+    MAX_OBSERVATION_CURSOR_BYTES, ObservationPage, PROCESS_CURSOR_MAX_BYTES,
+    ProjectRegistrationView, ProviderClearHoldResponse, ProviderHoldsResponse, RuleStateView,
+    ShutdownMode, TimerSchedule, TimerStateView, TurnGetRequest,
 };
 use eliot_core::{
     AgentState, Command as CoreCommand, CommandState, ProviderHoldState, ProviderRestrictionKind,
@@ -12967,5 +12967,235 @@ fn cli_turn_resolve_asserts_unknown_held_turn_after_force_restart() {
         ],
     );
     assert_eq!(terminal_refused.status.code(), Some(3));
+    fixture.stop(false);
+}
+
+#[test]
+fn cli_cmd_children_pages_a_retained_launch_expansion() {
+    let mut fixture = Fixture::new("cmd children");
+    fixture.start();
+    let launch_id = ulid::Ulid::new().to_string();
+    let launched = fixture.json(&[
+        "--id",
+        &launch_id,
+        "launch",
+        "--profile",
+        "fake",
+        "--workspace",
+        fixture.workspace.to_str().unwrap(),
+        "children-probe-prompt",
+    ]);
+    assert_eq!(
+        launched["id"].as_str(),
+        Some(launch_id.as_str()),
+        "launch did not retain the supplied mutation id"
+    );
+    let request = CommandChildrenRequest::new(&launch_id);
+    let page: CommandChildrenResponse =
+        serde_json::from_value(fixture.json(&["cmd", "children", &launch_id]))
+            .expect("typed children page");
+    request
+        .validate_response(&page)
+        .expect("matching children page");
+    assert_eq!(page.children.len(), 1);
+    assert_eq!(page.children[0].id, format!("{launch_id}/send"));
+    assert_eq!(page.next.as_deref(), Some(page.children[0].id.as_str()));
+    let child = page.children[0].id.clone();
+    let tail: CommandChildrenResponse =
+        serde_json::from_value(fixture.json(&["cmd", "children", &launch_id, "--after", &child]))
+            .expect("typed tail page");
+    assert!(tail.children.is_empty());
+    assert_eq!(tail.next, None);
+    let missing = cli(
+        &fixture.data,
+        &["cmd", "children", &ulid::Ulid::new().to_string()],
+    );
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(
+        missing.stderr.contains("not_found"),
+        "unknown id did not return not_found: {}",
+        missing.stderr
+    );
+    let agent = launched["target"].as_str().expect("fake Agent");
+    let stop: CommandSubmitResponse =
+        serde_json::from_value(fixture.json(&["stop", agent])).expect("typed stop submission");
+    fixture.wait_command(&stop.command_id, "applied");
+    fixture.stop(false);
+}
+
+#[test]
+fn cli_cmd_children_pages_a_multi_child_catch_up_and_reports_history_gap() {
+    let mut fixture = Fixture::new("cmd children multi-page");
+    fixture.start();
+    fixture.stop(false);
+
+    let rules = fixture.data.join("rules");
+    fs::create_dir_all(&rules).expect("create global rule directory");
+    let second_workspace = fixture.root.join("second workspace");
+    fs::create_dir(&second_workspace).expect("create second Fake workspace");
+    fixture.start();
+
+    let workspaces = [fixture.workspace.clone(), second_workspace];
+    let mut agents = Vec::new();
+    for workspace in &workspaces {
+        let launched = fixture.json(&[
+            "launch",
+            "--profile",
+            "fake",
+            "--workspace",
+            workspace.to_str().unwrap(),
+        ]);
+        agents.push((
+            launched["target"].as_str().expect("Fake Agent").to_owned(),
+            launched["generation"].as_i64().expect("Fake generation"),
+        ));
+    }
+    assert_ne!(agents[0].0, agents[1].0);
+    let after_seq = fixture
+        .events()
+        .last()
+        .and_then(|event| event["seq"].as_i64())
+        .unwrap_or(0);
+
+    let send_ids = [ulid::Ulid::new().to_string(), ulid::Ulid::new().to_string()];
+    for (index, (agent, generation)) in agents.iter().enumerate() {
+        let text = format!("children-history-{index}");
+        let turn: CoreTurn = serde_json::from_value(fixture.json(&[
+            "--id",
+            &send_ids[index],
+            "send",
+            agent,
+            "--generation",
+            &generation.to_string(),
+            "--wait",
+            "--timeout-seconds",
+            "10",
+            "--",
+            &text,
+        ]))
+        .expect("typed children-history Fake turn");
+        assert_eq!(turn.state, TurnState::Completed);
+    }
+    let through_seq = fixture
+        .events()
+        .iter()
+        .filter_map(|event| event["seq"].as_i64())
+        .max()
+        .expect("finite children-history range end");
+    assert!(through_seq > after_seq);
+
+    let command_values = send_ids
+        .iter()
+        .map(|id| format!("\"{id}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let agent_values = agents
+        .iter()
+        .map(|(agent, _)| format!("\"{agent}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let source = format!(
+        concat!(
+            "[[rule]]\n",
+            "id = \"children-stops\"\n",
+            "on = {{ event = \"command.applied\", match = {{ ",
+            "\"event.data.command_id\" = {{ one_of = [{commands}] }}, ",
+            "\"event.agent\" = {{ one_of = [{agents}] }}, ",
+            "\"event.generation\" = {{ exists = true }}, ",
+            "\"subject.harness\" = \"fake\" }} }}\n",
+            "limit = {{ max = 2, per = \"rule\", window = \"1h\" }}\n",
+            "do = [{{ action = \"stop\", target = \"${{event.agent}}\", ",
+            "expected_generation = \"${{event.generation}}\" }}]\n",
+        ),
+        commands = command_values,
+        agents = agent_values,
+    );
+    fs::write(rules.join("children-stops.toml"), source).expect("write children catch-up rule");
+
+    let load_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let reply = cli(&fixture.data, &["rule", "show", "children-stops"]);
+        if reply.status.success() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < load_deadline,
+            "children rule load deadline; stderr: {}",
+            reply.stderr
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let after_arg = after_seq.to_string();
+    let through_arg = through_seq.to_string();
+    let catchup_id = ulid::Ulid::new().to_string();
+    let catchup_reply = cli(
+        &fixture.data,
+        &[
+            "--id",
+            catchup_id.as_str(),
+            "rule",
+            "catch-up",
+            "children-stops",
+            "--after",
+            after_arg.as_str(),
+            "--through",
+            through_arg.as_str(),
+        ],
+    );
+    assert!(
+        catchup_reply.status.success(),
+        "children catch-up failed; stderr: {}",
+        catchup_reply.stderr.chars().take(4096).collect::<String>()
+    );
+    let catchup: CoreCommand =
+        serde_json::from_str(&catchup_reply.stdout).expect("typed children catch-up parent");
+    let child_ids: Vec<String> =
+        serde_json::from_value(catchup.outcome.as_ref().unwrap()["children"].clone())
+            .expect("fixed children catch-up child IDs");
+    assert_eq!(child_ids.len(), 2, "both stops were admitted");
+
+    let first: CommandChildrenResponse =
+        serde_json::from_value(fixture.json(&["cmd", "children", &catchup_id, "--limit", "1"]))
+            .expect("typed first children page");
+    assert_eq!(first.children.len(), 1);
+    assert_eq!(first.children[0].id, child_ids[0]);
+    assert_eq!(first.next.as_deref(), Some(child_ids[0].as_str()));
+    let second: CommandChildrenResponse = serde_json::from_value(fixture.json(&[
+        "cmd",
+        "children",
+        &catchup_id,
+        "--limit",
+        "1",
+        "--after",
+        &child_ids[0],
+    ]))
+    .expect("typed second children page");
+    assert_eq!(second.children.len(), 1);
+    assert_eq!(second.children[0].id, child_ids[1]);
+    assert_eq!(second.next.as_deref(), Some(child_ids[1].as_str()));
+
+    let aged = ulid::Ulid::from_parts(1, 11).to_string();
+    let gap = cli(&fixture.data, &["cmd", "children", &aged]);
+    assert_eq!(gap.status.code(), Some(1));
+    assert!(
+        gap.stderr.contains("history_gap"),
+        "aged absent id did not return history_gap: {}",
+        gap.stderr
+    );
+    let missing = cli(
+        &fixture.data,
+        &["cmd", "children", &ulid::Ulid::new().to_string()],
+    );
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(
+        missing.stderr.contains("not_found"),
+        "young unknown id did not return not_found: {}",
+        missing.stderr
+    );
+
+    for child_id in &child_ids {
+        fixture.wait_command(child_id, "applied");
+    }
     fixture.stop(false);
 }
