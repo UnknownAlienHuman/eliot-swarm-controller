@@ -505,7 +505,9 @@ is pending. The following is its contract; bounded read pages alone do not bound
 history.
 
 Cleanup uses bounded batches through the existing Store writer. Delete only an expired,
-contiguous event prefix below every enabled current/retiring rule cursor. A lagging rule
+contiguous event prefix below every enabled current/retiring rule cursor. Open
+current-generation Git hint cursors pin the same prefix, so hint scans never skip
+unconsumed history silently. A lagging rule
 releases its pin only through the ordinary atomic backlog skip/pause transition. Advance
 `rule_history_coverage.pruned_through` in the same transaction as deletion, so replay and
 explicit catch-up return `history_gap` instead of silently omitting events. Never reset

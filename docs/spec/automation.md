@@ -92,7 +92,8 @@ more than the configured limit, atomically record the skipped range, advance to 
 high-water, clear retirement and pause the rule with `backlog_exceeded`. Existing
 commands continue. Explicit catch-up fails `history_gap`
 when its requested history has already been pruned. Once pruning is connected, a lagging
-rule cannot pin expired storage indefinitely.
+rule cannot pin expired storage indefinitely. Rate-limit windows longer than
+command retention count only retained history.
 
 During explicit history catch-up, project Run actions use the same freeze path as live firing,
 capturing each matching event and the validated current rule revision. Project authorization

@@ -12,6 +12,7 @@ mod scripts;
 pub use capacity::{RecordedProcess, RetainedGeneration};
 pub use projects::ProjectRegistrationInput;
 pub use resolution::TurnInactiveProof;
+pub use retention::RetentionReport;
 pub use rules::{
     RuleCatchUpAction, RuleCatchUpActionOutcome, RuleCatchUpAdmission, RuleCursorOutcome,
     RuleDefinitionInput, RuleEventAdmission, RuleProcessingState, TimerDefinitionInput,
@@ -79,6 +80,7 @@ mod dispatch;
 mod observer;
 mod observer_live;
 mod resolution;
+mod retention;
 mod source_handoff;
 
 fn sql_error(error: rusqlite::Error) -> Error {
@@ -1610,6 +1612,25 @@ impl Store {
         validate_limit(limit)?;
         if after < 0 || through.is_some_and(|bound| bound < after) {
             return Err(Error::new("invalid", "invalid event sequence bounds"));
+        }
+        // Replay must report pruned history instead of silently omitting it.
+        // Live rule cursors always stay above this floor, so the rule worker
+        // never trips here; client-supplied replay cursors do.
+        let retained: i64 = self
+            .connection
+            .query_row(
+                "SELECT pruned_through FROM rule_history_coverage WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?
+            .ok_or_else(|| Error::new("source_integrity", "rule history coverage is absent"))?;
+        if after < retained {
+            return Err(Error::new(
+                "history_gap",
+                "requested event history is no longer fully retained",
+            ));
         }
         let mut statement = self
             .connection
