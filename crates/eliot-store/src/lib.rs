@@ -150,6 +150,9 @@ pub struct WriteAdmission {
 pub struct Store {
     connection: Connection,
     write_faulted: Cell<bool>,
+    /// Opaque owner of this handle's Goal round markers. A `running` marker
+    /// from another holder is a crashed round: it reads as `unknown`.
+    goal_holder: String,
 }
 
 impl Store {
@@ -169,6 +172,7 @@ impl Store {
         let mut store = Self {
             connection,
             write_faulted: Cell::new(false),
+            goal_holder: Ulid::new().to_string(),
         };
         store.migrate()?;
         Ok(store)

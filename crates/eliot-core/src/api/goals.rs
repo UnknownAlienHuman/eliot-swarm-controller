@@ -203,6 +203,68 @@ impl GoalCounters {
     }
 }
 
+/// Durable single-flight marker for one round: `running` while its check
+/// runs, `unknown` when the round ended without a commit (check unknown,
+/// interference, crash). An unknown marker burns its round key: the next
+/// round needs a new idle key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalMarkerState {
+    Running,
+    Unknown,
+}
+
+impl GoalMarkerState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "running" => Ok(Self::Running),
+            "unknown" => Ok(Self::Unknown),
+            _ => Err(Error::new("internal", "invalid stored goal marker state")),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoalRoundMarker {
+    pub round_key: String,
+    pub generation: i64,
+    pub revision: i64,
+    pub state: GoalMarkerState,
+    pub updated_at: i64,
+}
+
+impl GoalRoundMarker {
+    pub fn validate(&self) -> Result<()> {
+        if self.round_key.trim().is_empty() {
+            return Err(Error::new(
+                "invalid",
+                "goal round marker key must be nonempty",
+            ));
+        }
+        if self.generation < 0 {
+            return Err(Error::new(
+                "invalid",
+                "goal round marker generation must be nonnegative",
+            ));
+        }
+        if self.revision < 0 {
+            return Err(Error::new(
+                "invalid",
+                "goal round marker revision must be nonnegative",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GoalView {
@@ -220,6 +282,10 @@ pub struct GoalView {
     pub cost_status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_round_key: Option<String>,
+    /// Live in-flight round if any, else the latest unknown marker of this
+    /// revision. Absent when no round is unresolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round_marker: Option<GoalRoundMarker>,
     pub updated_at: i64,
 }
 
@@ -236,6 +302,9 @@ impl GoalView {
         self.counters.validate()?;
         if self.cost_status != GOAL_COST_UNSUPPORTED {
             return Err(Error::new("invalid", "goal cost status is not recognized"));
+        }
+        if let Some(marker) = &self.round_marker {
+            marker.validate()?;
         }
         Ok(())
     }
@@ -562,6 +631,7 @@ mod tests {
             counters: GoalCounters::default(),
             cost_status: GOAL_COST_UNSUPPORTED.to_owned(),
             last_round_key: None,
+            round_marker: None,
             updated_at: 7,
         }
     }
@@ -709,6 +779,47 @@ mod tests {
         }
         .validate_response(&view())
         .unwrap();
+    }
+
+    #[test]
+    fn goal_round_markers_validate_and_round_trip() {
+        assert_eq!(
+            GoalMarkerState::parse("running").unwrap(),
+            GoalMarkerState::Running
+        );
+        assert_eq!(
+            GoalMarkerState::parse("unknown").unwrap(),
+            GoalMarkerState::Unknown
+        );
+        assert!(GoalMarkerState::parse("driving").is_err());
+        let marker = GoalRoundMarker {
+            round_key: "idle:9".to_owned(),
+            generation: 2,
+            revision: 1,
+            state: GoalMarkerState::Unknown,
+            updated_at: 7,
+        };
+        marker.validate().unwrap();
+        let wire = serde_json::to_value(&marker).unwrap();
+        assert_eq!(
+            serde_json::from_value::<GoalRoundMarker>(wire).unwrap(),
+            marker
+        );
+        let mut marked = view();
+        marked.round_marker = Some(marker);
+        marked.validate().unwrap();
+        let mut blank = marked.clone();
+        blank.round_marker.as_mut().unwrap().round_key = " ".to_owned();
+        assert!(blank.validate().is_err());
+        // Old daemons omit the marker; it defaults to absent.
+        let unmarked: GoalView = serde_json::from_value(json!({
+            "agent": "a1", "mode": "eliot", "generation": 2, "revision": 1,
+            "status": "active", "definition": definition(),
+            "counters": GoalCounters::default(),
+            "cost_status": GOAL_COST_UNSUPPORTED, "updated_at": 7,
+        }))
+        .unwrap();
+        assert!(unmarked.round_marker.is_none());
     }
 
     #[test]

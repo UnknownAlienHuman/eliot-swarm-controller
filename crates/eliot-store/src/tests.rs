@@ -6212,7 +6212,8 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
              CREATE INDEX commands_open ON commands(state)
                  WHERE state IN ('accepted', 'queued', 'dispatched', 'unknown');
              DELETE FROM schema_migrations WHERE version = 18;
-             DROP TABLE goals; DELETE FROM schema_migrations WHERE version = 19;",
+             DROP TABLE goals; DROP TABLE goal_markers;
+             DELETE FROM schema_migrations WHERE version = 19;",
         )
         .expect("roll back to schema 16");
     drop(store);

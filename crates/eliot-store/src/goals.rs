@@ -3,8 +3,8 @@
 
 use super::*;
 use eliot_core::api::{
-    GOAL_COST_UNSUPPORTED, GoalCounters, GoalDefinition, GoalMode, GoalStatus, GoalView,
-    MAX_GOAL_OBSERVATION_BYTES,
+    GOAL_COST_UNSUPPORTED, GoalCounters, GoalDefinition, GoalMarkerState, GoalMode,
+    GoalRoundMarker, GoalStatus, GoalView, MAX_GOAL_OBSERVATION_BYTES,
 };
 use serde::{Deserialize, Serialize};
 
@@ -106,7 +106,9 @@ impl Store {
     pub fn goal_get(&self, agent: &str, mode: &str) -> Result<Option<GoalView>> {
         require_eliot_mode(mode)?;
         let agent_num = parse_agent_id(agent)?;
-        Ok(load_goal_row(&self.connection, agent_num, mode)?.map(goal_view_for_agent))
+        load_goal_row(&self.connection, agent_num, mode)?
+            .map(|row| self.goal_view(row))
+            .transpose()
     }
 
     pub fn goal_pause(
@@ -137,7 +139,11 @@ impl Store {
     }
 
     /// Read round facts, pausing a generation-drifted Goal. Fails before any
-    /// check runs when the Goal is missing, terminal, paused or drifted.
+    /// check runs when the Goal is missing, terminal, paused or drifted, when
+    /// another round is in flight, or when the key is already consumed. Gate
+    /// facts (idle state, turns, commands, sources) are only reported here;
+    /// the Router evaluates them and `goal_claim_round` re-validates them
+    /// atomically before anything runs.
     pub fn goal_round_probe(
         &mut self,
         agent: &str,
@@ -189,6 +195,29 @@ impl Store {
                 "goal round was already committed",
             ));
         }
+        let markers = load_goal_markers(&self.connection, agent_num, mode)?;
+        if markers
+            .iter()
+            .any(|marker| marker.is_live(&self.goal_holder))
+        {
+            return Err(Error::new("busy", "goal round already in flight"));
+        }
+        if markers.iter().any(|marker| {
+            marker.round_key == idle_seq
+                && marker.generation == row.generation
+                && marker.revision == row.revision
+                && !marker.is_live(&self.goal_holder)
+        }) {
+            return Err(Error::new("stale_round", "goal round key was already used"));
+        }
+        if !round_key_names_generation_event(&self.connection, agent_num, row.generation, idle_seq)?
+        {
+            return Err(Error::new(
+                "stale_round",
+                "round key does not name an event of this Agent generation",
+            ));
+        }
+        let view = self.goal_view(row)?;
         let probe = GoalRoundProbe {
             agent_state: agent_row.state,
             active_turn: agent_row.active_turn.clone(),
@@ -213,9 +242,61 @@ impl Store {
             max_seq: max_agent_seq(&self.connection, agent_num, agent_row.generation)?,
             turn_count: count_turns(&self.connection, agent_num, agent_row.generation)?,
             workspace: agent_row.workspace.clone(),
-            view: goal_view_for_agent(row),
+            view,
         };
         Ok(probe)
+    }
+
+    /// Commit the durable in-flight marker for one round, re-validating the
+    /// whole probe (Goal binding, single flight, idle gates, round key) in
+    /// the same Immediate transaction. A second claim while a marker is
+    /// running is refused without running anything. Every claim resolves
+    /// exactly once: the final commit consumes its marker, anything else
+    /// (unknown check, interference, crash) leaves it `unknown` and burns
+    /// the key.
+    pub fn goal_claim_round(
+        &mut self,
+        agent: &str,
+        mode: &str,
+        idle_seq: i64,
+        expected_revision: i64,
+        now: i64,
+    ) -> Result<()> {
+        self.ensure_writer_healthy()?;
+        let result = self.goal_claim_round_inner(agent, mode, idle_seq, expected_revision, now);
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    /// Mark one claimed round `unknown` without committing any outcome. The
+    /// key stays burned: it is never rerun. Idempotent.
+    pub fn goal_abandon_round(
+        &mut self,
+        agent: &str,
+        mode: &str,
+        generation: i64,
+        revision: i64,
+        round_key: i64,
+        now: i64,
+    ) -> Result<()> {
+        self.ensure_writer_healthy()?;
+        require_eliot_mode(mode)?;
+        let agent_num = parse_agent_id(agent)?;
+        if round_key < 0 {
+            return Err(Error::new("invalid", "goal round key must be nonnegative"));
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        db!(tx.execute(
+            "UPDATE goal_markers SET state = 'unknown', updated_at = ?1
+             WHERE agent = ?2 AND mode = ?3 AND generation = ?4 AND revision = ?5
+               AND round_key = ?6 AND state = 'running'",
+            params![now, agent_num, mode, generation, revision, round_key],
+        ));
+        commit_transaction(tx, &self.write_faulted)?;
+        Ok(())
     }
 
     /// Apply one round outcome only if generation, revision and round still
@@ -262,7 +343,7 @@ impl Store {
                 && row.state.status == GoalStatus::Active
                 && encode_json(&row.definition)? == encoded
             {
-                return Ok(goal_view_for_agent(row));
+                return self.goal_view(row);
             }
             let revision = row.revision + 1;
             let state = GoalStatePersist {
@@ -295,7 +376,7 @@ impl Store {
             commit_transaction(tx, &self.write_faulted)?;
             let row = load_goal_row(&self.connection, agent_num, mode)?
                 .ok_or_else(|| Error::new("internal", "goal disappeared after set"))?;
-            return Ok(goal_view_for_agent(row));
+            return self.goal_view(row);
         }
         let state = GoalStatePersist {
             status: GoalStatus::Active,
@@ -326,7 +407,7 @@ impl Store {
         commit_transaction(tx, &self.write_faulted)?;
         let row = load_goal_row(&self.connection, agent_num, mode)?
             .ok_or_else(|| Error::new("internal", "goal disappeared after set"))?;
-        Ok(goal_view_for_agent(row))
+        self.goal_view(row)
     }
 
     fn goal_pause_inner(
@@ -350,7 +431,7 @@ impl Store {
             return Err(Error::new("not_found", "goal was not found"));
         };
         if row.state.status == GoalStatus::Paused {
-            return Ok(goal_view_for_agent(row));
+            return self.goal_view(row);
         }
         if row.state.status != GoalStatus::Active {
             return Err(Error::new(
@@ -389,7 +470,7 @@ impl Store {
             return Err(Error::new("not_found", "goal was not found"));
         };
         if row.state.status == GoalStatus::Cleared {
-            return Ok(goal_view_for_agent(row));
+            return self.goal_view(row);
         }
         let tx = self
             .connection
@@ -425,7 +506,7 @@ impl Store {
             return Err(Error::new("not_found", "goal was not found"));
         };
         if row.state.status == GoalStatus::Active {
-            return Ok(goal_view_for_agent(row));
+            return self.goal_view(row);
         }
         if row.state.status != GoalStatus::Paused {
             return Err(Error::new(
@@ -505,9 +586,162 @@ impl Store {
             ],
         ));
         commit_transaction(tx, &self.write_faulted)?;
-        load_goal_row(&self.connection, agent_num, &row.mode)?
-            .map(goal_view_for_agent)
-            .ok_or_else(|| Error::new("internal", "goal disappeared after pause"))
+        let row = load_goal_row(&self.connection, agent_num, &row.mode)?
+            .ok_or_else(|| Error::new("internal", "goal disappeared after pause"))?;
+        self.goal_view(row)
+    }
+
+    fn goal_claim_round_inner(
+        &mut self,
+        agent: &str,
+        mode: &str,
+        idle_seq: i64,
+        expected_revision: i64,
+        now: i64,
+    ) -> Result<()> {
+        require_eliot_mode(mode)?;
+        if idle_seq < 0 {
+            return Err(Error::new(
+                "invalid",
+                "goal round idle_seq must be nonnegative",
+            ));
+        }
+        let agent_num = parse_agent_id(agent)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let agent_row = load_agent_by_num(&tx, agent_num)?
+            .ok_or_else(|| Error::new("not_found", "goal Agent was not found"))?;
+        if agent_row.observe_only {
+            return Err(Error::new(
+                "not_allowed",
+                "observe-only Agents take no Goal rounds",
+            ));
+        }
+        let Some(row) = load_goal_row_tx(&tx, agent_num, mode)? else {
+            return Err(Error::new("not_found", "goal was not found"));
+        };
+        if row.generation != agent_row.generation {
+            if row.state.status == GoalStatus::Active {
+                let state = GoalStatePersist {
+                    status: GoalStatus::Paused,
+                    paused_reason: Some("Agent generation advanced".to_owned()),
+                    blocked_reason: row.state.blocked_reason.clone(),
+                    counters: row.state.counters.clone(),
+                };
+                db!(tx.execute(
+                    "UPDATE goals SET revision = ?1, state = ?2, updated_at = ?3
+                     WHERE agent = ?4 AND mode = ?5 AND revision = ?6",
+                    params![
+                        row.revision + 1,
+                        encode_json(&state)?,
+                        now,
+                        agent_num,
+                        mode,
+                        row.revision,
+                    ],
+                ));
+                commit_transaction(tx, &self.write_faulted)?;
+            }
+            return Err(Error::new(
+                "stale_generation",
+                format!(
+                    "goal binds generation {} but Agent {} is at generation {}",
+                    row.generation, agent, agent_row.generation
+                ),
+            ));
+        }
+        if row.state.status != GoalStatus::Active {
+            return Err(Error::new(
+                "bad_state",
+                format!("goal is {} and takes no rounds", row.state.status.as_str()),
+            ));
+        }
+        if row.revision != expected_revision {
+            return Err(Error::new(
+                "stale_round",
+                "goal revision changed since the probe",
+            ));
+        }
+        // A crashed holder's `running` rows read as `unknown`; rewrite them
+        // durably so later readers need no holder comparison.
+        db!(tx.execute(
+            "UPDATE goal_markers SET state = 'unknown', updated_at = ?1
+             WHERE agent = ?2 AND mode = ?3 AND state = 'running' AND holder <> ?4",
+            params![now, agent_num, mode, self.goal_holder],
+        ));
+        let markers = load_goal_markers_tx(&tx, agent_num, mode)?;
+        if markers
+            .iter()
+            .any(|marker| marker.is_live(&self.goal_holder))
+        {
+            return Err(Error::new("busy", "goal round already in flight"));
+        }
+        if row.last_round_key.as_deref() == Some(&round_key_text(idle_seq))
+            || markers.iter().any(|marker| {
+                marker.round_key == idle_seq
+                    && marker.generation == row.generation
+                    && marker.revision == row.revision
+            })
+        {
+            return Err(Error::new("stale_round", "goal round key was already used"));
+        }
+        if agent_row.state != AgentState::Idle {
+            return Err(Error::new("bad_state", "goal round needs an idle Agent"));
+        }
+        if agent_row.active_turn.is_some() {
+            return Err(Error::new("bad_state", "goal round needs no active turn"));
+        }
+        if !agent_row.pending.is_empty() {
+            return Err(Error::new(
+                "bad_state",
+                "goal round needs no pending requests",
+            ));
+        }
+        if let Some(source) = first_unhealthy_open_source_tx(&tx, agent_num, row.generation)? {
+            return Err(Error::new(
+                "bad_state",
+                format!("goal round needs healthy harness sources; {source} is not healthy"),
+            ));
+        }
+        if count_agent_commands(&tx, agent_num, row.generation, true)? > 0 {
+            return Err(Error::new(
+                "bad_state",
+                "resolve unknown commands before the goal round",
+            ));
+        }
+        if count_agent_commands(&tx, agent_num, row.generation, false)? > 0 {
+            return Err(Error::new("busy", "Agent has open commands"));
+        }
+        if !round_key_names_generation_event(&tx, agent_num, row.generation, idle_seq)? {
+            return Err(Error::new(
+                "stale_round",
+                "round key does not name an event of this Agent generation",
+            ));
+        }
+        if max_agent_seq_tx(&tx, agent_num, row.generation)? != idle_seq {
+            return Err(Error::new(
+                "stale_round",
+                "round key is not the latest Agent event",
+            ));
+        }
+        db!(tx.execute(
+            "INSERT INTO goal_markers(agent, mode, generation, revision, round_key,
+                 holder, state, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7)",
+            params![
+                agent_num,
+                mode,
+                row.generation,
+                row.revision,
+                idle_seq,
+                self.goal_holder,
+                now,
+            ],
+        ));
+        commit_transaction(tx, &self.write_faulted)?;
+        Ok(())
     }
 
     fn goal_commit_round_inner(
@@ -535,6 +769,16 @@ impl Store {
             return Err(Error::new(
                 "internal",
                 "checked goal rounds decide their own block",
+            ));
+        }
+        if commit
+            .check
+            .as_ref()
+            .is_some_and(|check| check.exit_code.is_none())
+        {
+            return Err(Error::new(
+                "unknown",
+                "goal check without an exit code has no committable outcome",
             ));
         }
         let tx = self
@@ -568,6 +812,26 @@ impl Store {
                 "goal round was already committed",
             ));
         }
+        let marker = load_goal_marker_tx(
+            &tx,
+            agent_num,
+            &commit.mode,
+            commit.expected_generation,
+            commit.expected_revision,
+            commit.round_key,
+        )?;
+        if marker
+            .as_ref()
+            .is_none_or(|marker| !marker.is_live(&self.goal_holder))
+        {
+            return Err(Error::new("stale_round", "goal round is not in flight"));
+        }
+        if !round_key_names_generation_event(&tx, agent_num, row.generation, commit.round_key)? {
+            return Err(Error::new(
+                "stale_round",
+                "round key does not name an event of this Agent generation",
+            ));
+        }
         if max_agent_seq_tx(&tx, agent_num, row.generation)? != commit.round_key {
             return Err(Error::new(
                 "stale_round",
@@ -578,6 +842,29 @@ impl Store {
             return Err(Error::new(
                 "stale_round",
                 format!("source {source} left healthy during the round"),
+            ));
+        }
+        let agent_row = load_agent_by_num(&tx, agent_num)?
+            .ok_or_else(|| Error::new("not_found", "goal Agent was not found"))?;
+        if count_agent_commands(&tx, agent_num, row.generation, true)? > 0 {
+            return Err(Error::new(
+                "stale_round",
+                "an unknown command appeared during the round",
+            ));
+        }
+        if count_agent_commands(&tx, agent_num, row.generation, false)? > 0 {
+            return Err(Error::new(
+                "stale_round",
+                "a command opened during the round",
+            ));
+        }
+        if agent_row.active_turn.is_some() {
+            return Err(Error::new("stale_round", "a turn started during the round"));
+        }
+        if !agent_row.pending.is_empty() {
+            return Err(Error::new(
+                "stale_round",
+                "a request opened during the round",
             ));
         }
         let turn_count = count_turns_tx(&tx, agent_num, row.generation)?;
@@ -652,6 +939,18 @@ impl Store {
         state.counters = counters;
         let state_text = encode_json(&state)?;
         db!(tx.execute(
+            "DELETE FROM goal_markers
+             WHERE agent = ?1 AND mode = ?2 AND generation = ?3 AND revision = ?4
+               AND round_key = ?5",
+            params![
+                agent_num,
+                commit.mode,
+                commit.expected_generation,
+                commit.expected_revision,
+                commit.round_key,
+            ],
+        ));
+        db!(tx.execute(
             "UPDATE goals SET revision = ?1, state = ?2, last_round_key = ?3,
                  updated_at = ?4
              WHERE agent = ?5 AND mode = ?6 AND revision = ?7",
@@ -666,9 +965,9 @@ impl Store {
             ],
         ));
         commit_transaction(tx, &self.write_faulted)?;
-        let view = load_goal_row(&self.connection, agent_num, &commit.mode)?
-            .map(goal_view_for_agent)
+        let row = load_goal_row(&self.connection, agent_num, &commit.mode)?
             .ok_or_else(|| Error::new("internal", "goal disappeared after round"))?;
+        let view = self.goal_view(row)?;
         Ok(GoalRoundCommitResult {
             outcome,
             view,
@@ -716,25 +1015,213 @@ fn round_key_text(seq: i64) -> String {
     format!("idle:{seq}")
 }
 
-fn goal_view_for_agent(row: GoalRow) -> GoalView {
-    GoalView {
-        agent: format!("a{}", row.agent_num),
-        mode: if row.mode == "eliot" {
-            GoalMode::Eliot
-        } else {
-            GoalMode::Native
-        },
-        generation: row.generation,
-        revision: row.revision,
-        status: row.state.status,
-        paused_reason: row.state.paused_reason,
-        blocked_reason: row.state.blocked_reason,
-        definition: row.definition,
-        counters: row.state.counters,
-        cost_status: GOAL_COST_UNSUPPORTED.to_owned(),
-        last_round_key: row.last_round_key,
-        updated_at: row.updated_at,
+#[derive(Clone, Debug)]
+struct GoalMarkerRow {
+    generation: i64,
+    revision: i64,
+    round_key: i64,
+    holder: String,
+    state: String,
+}
+
+impl GoalMarkerRow {
+    /// Live only for the holder that claimed it. A `running` row from a
+    /// crashed holder reads as `unknown` everywhere.
+    fn is_live(&self, holder: &str) -> bool {
+        self.state == "running" && self.holder == holder
     }
+}
+
+impl Store {
+    /// Render one Goal row with a live turn count and its unresolved round
+    /// marker (the live in-flight round if any, else this revision's latest
+    /// unknown marker).
+    fn goal_view(&self, row: GoalRow) -> Result<GoalView> {
+        let turn_count = count_turns(&self.connection, row.agent_num, row.generation)?;
+        let mut counters = row.state.counters.clone();
+        counters.turns_used = counters
+            .turns_used
+            .max(turn_count.saturating_sub(counters.turns_at_set));
+        let round_marker = display_goal_marker(
+            &self.connection,
+            &self.goal_holder,
+            row.agent_num,
+            &row.mode,
+            row.generation,
+            row.revision,
+        )?;
+        Ok(GoalView {
+            agent: format!("a{}", row.agent_num),
+            mode: if row.mode == "eliot" {
+                GoalMode::Eliot
+            } else {
+                GoalMode::Native
+            },
+            generation: row.generation,
+            revision: row.revision,
+            status: row.state.status,
+            paused_reason: row.state.paused_reason,
+            blocked_reason: row.state.blocked_reason,
+            definition: row.definition,
+            counters,
+            cost_status: GOAL_COST_UNSUPPORTED.to_owned(),
+            last_round_key: row.last_round_key,
+            round_marker,
+            updated_at: row.updated_at,
+        })
+    }
+}
+
+/// The live in-flight marker if one exists, else this revision's latest
+/// unknown marker (crashed `running` rows read as `unknown`).
+fn display_goal_marker(
+    connection: &Connection,
+    holder: &str,
+    agent_num: i64,
+    mode: &str,
+    generation: i64,
+    revision: i64,
+) -> Result<Option<GoalRoundMarker>> {
+    let live: Option<(i64, i64, i64, i64)> = connection
+        .query_row(
+            "SELECT round_key, generation, revision, updated_at FROM goal_markers
+             WHERE agent = ?1 AND mode = ?2 AND state = 'running' AND holder = ?3
+             LIMIT 1",
+            params![agent_num, mode, holder],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    if let Some((round_key, generation, revision, updated_at)) = live {
+        return Ok(Some(GoalRoundMarker {
+            round_key: round_key_text(round_key),
+            generation,
+            revision,
+            state: GoalMarkerState::Running,
+            updated_at,
+        }));
+    }
+    let burned: Option<(i64, i64)> = connection
+        .query_row(
+            "SELECT round_key, updated_at FROM goal_markers
+             WHERE agent = ?1 AND mode = ?2 AND generation = ?3 AND revision = ?4
+               AND (state = 'unknown' OR holder <> ?5)
+             ORDER BY updated_at DESC, round_key DESC LIMIT 1",
+            params![agent_num, mode, generation, revision, holder],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    Ok(burned.map(|(round_key, updated_at)| GoalRoundMarker {
+        round_key: round_key_text(round_key),
+        generation,
+        revision,
+        state: GoalMarkerState::Unknown,
+        updated_at,
+    }))
+}
+
+fn load_goal_markers(
+    connection: &Connection,
+    agent_num: i64,
+    mode: &str,
+) -> Result<Vec<GoalMarkerRow>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT generation, revision, round_key, holder, state
+             FROM goal_markers WHERE agent = ?1 AND mode = ?2",
+        )
+        .map_err(sql_error)?;
+    statement
+        .query_map(params![agent_num, mode], |row| {
+            Ok(GoalMarkerRow {
+                generation: row.get(0)?,
+                revision: row.get(1)?,
+                round_key: row.get(2)?,
+                holder: row.get(3)?,
+                state: row.get(4)?,
+            })
+        })
+        .map_err(sql_error)?
+        .collect::<rusqlite::Result<Vec<GoalMarkerRow>>>()
+        .map_err(sql_error)
+}
+
+fn load_goal_markers_tx(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    mode: &str,
+) -> Result<Vec<GoalMarkerRow>> {
+    let mut statement = tx
+        .prepare(
+            "SELECT generation, revision, round_key, holder, state
+             FROM goal_markers WHERE agent = ?1 AND mode = ?2",
+        )
+        .map_err(sql_error)?;
+    statement
+        .query_map(params![agent_num, mode], |row| {
+            Ok(GoalMarkerRow {
+                generation: row.get(0)?,
+                revision: row.get(1)?,
+                round_key: row.get(2)?,
+                holder: row.get(3)?,
+                state: row.get(4)?,
+            })
+        })
+        .map_err(sql_error)?
+        .collect::<rusqlite::Result<Vec<GoalMarkerRow>>>()
+        .map_err(sql_error)
+}
+
+fn load_goal_marker_tx(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    mode: &str,
+    generation: i64,
+    revision: i64,
+    round_key: i64,
+) -> Result<Option<GoalMarkerRow>> {
+    tx.query_row(
+        "SELECT generation, revision, round_key, holder, state
+         FROM goal_markers
+         WHERE agent = ?1 AND mode = ?2 AND generation = ?3 AND revision = ?4
+           AND round_key = ?5",
+        params![agent_num, mode, generation, revision, round_key],
+        |row| {
+            Ok(GoalMarkerRow {
+                generation: row.get(0)?,
+                revision: row.get(1)?,
+                round_key: row.get(2)?,
+                holder: row.get(3)?,
+                state: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(sql_error)
+}
+
+/// The round key must name a real event of this Agent generation, not just
+/// equal its latest seq (which is vacuously true at 0 with no events).
+fn round_key_names_generation_event(
+    connection: &Connection,
+    agent_num: i64,
+    generation: i64,
+    seq: i64,
+) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT agent, generation FROM events WHERE seq = ?1",
+            params![seq],
+            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()
+        .map_err(sql_error)
+        .map(|found| {
+            found.is_some_and(|(agent, row_generation)| {
+                agent == Some(agent_num) && row_generation == Some(generation)
+            })
+        })
 }
 
 fn load_goal_row(connection: &Connection, agent_num: i64, mode: &str) -> Result<Option<GoalRow>> {

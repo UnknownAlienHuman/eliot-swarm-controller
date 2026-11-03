@@ -511,6 +511,17 @@ impl Store {
                      updated_at INTEGER NOT NULL,
                      PRIMARY KEY(agent, mode)
                  );
+                 CREATE TABLE goal_markers (
+                     agent INTEGER NOT NULL,
+                     mode TEXT NOT NULL,
+                     generation INTEGER NOT NULL,
+                     revision INTEGER NOT NULL,
+                     round_key INTEGER NOT NULL,
+                     holder TEXT NOT NULL,
+                     state TEXT NOT NULL CHECK(state IN ('running', 'unknown')),
+                     updated_at INTEGER NOT NULL,
+                     PRIMARY KEY(agent, mode, generation, revision, round_key)
+                 );
                  INSERT INTO schema_migrations(version) VALUES (19);",
             )
             .map_err(sql_error)?;

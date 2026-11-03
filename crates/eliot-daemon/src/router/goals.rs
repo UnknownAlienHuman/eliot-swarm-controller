@@ -246,6 +246,31 @@ impl Router {
         };
         goal_round_gates(&probe, request.idle_seq)?;
         let definition = probe.view.definition.clone();
+        let stdin = serde_json::to_vec(&json!({
+            "agent": request.agent,
+            "generation": probe.view.generation,
+            "revision": probe.view.revision,
+            "round_key": format!("idle:{}", request.idle_seq),
+        }))
+        .map_err(|_| Error::new("internal", "goal check input could not be encoded"))?;
+        if stdin.len() > MAX_FRAME_BYTES {
+            return Err(Error::new(
+                "frame_too_large",
+                "goal check input exceeds 1 MiB",
+            ));
+        }
+        // The claim re-validates the probe and commits the durable in-flight
+        // marker. Everything after it resolves the marker exactly once: the
+        // commit consumes it, every other exit abandons it to `unknown`.
+        {
+            self.inner.store.lock().await.goal_claim_round(
+                &request.agent,
+                request.mode.as_str(),
+                request.idle_seq,
+                probe.view.revision,
+                now_ms(),
+            )?;
+        }
         let turns_used = probe
             .turn_count
             .saturating_sub(probe.view.counters.turns_at_set);
@@ -269,19 +294,6 @@ impl Router {
         {
             command.current_dir(cwd);
         }
-        let stdin = serde_json::to_vec(&json!({
-            "agent": request.agent,
-            "generation": probe.view.generation,
-            "revision": probe.view.revision,
-            "round_key": format!("idle:{}", request.idle_seq),
-        }))
-        .map_err(|_| Error::new("internal", "goal check input could not be encoded"))?;
-        if stdin.len() > MAX_FRAME_BYTES {
-            return Err(Error::new(
-                "frame_too_large",
-                "goal check input exceeds 1 MiB",
-            ));
-        }
         let timeout = Duration::from_millis(definition.check_timeout_ms.max(0) as u64);
         let outcome = run_check(
             command,
@@ -291,7 +303,13 @@ impl Router {
             self.run_cancellation_receiver(),
         )
         .await;
-        let check = goal_check_result(outcome, &policy)?;
+        let check = match goal_check_result(outcome, &policy) {
+            Ok(check) => check,
+            Err(error) => {
+                self.abandon_goal_round(&request, &probe).await;
+                return Err(error);
+            }
+        };
         if check.exit_code != Some(0) {
             let text = goal_continuation_text(&definition.text, &definition.check, &check, &policy);
             let commit = GoalRoundCommit {
@@ -341,6 +359,24 @@ impl Router {
         self.commit_goal_round(request, commit).await
     }
 
+    /// Burn a claimed round key without committing any outcome. Best
+    /// effort: abandon only fails when the Store writer is already faulted,
+    /// which fails loudly on the next use either way.
+    async fn abandon_goal_round(
+        &self,
+        request: &GoalRoundRequest,
+        probe: &eliot_store::GoalRoundProbe,
+    ) {
+        let _ = self.inner.store.lock().await.goal_abandon_round(
+            &request.agent,
+            request.mode.as_str(),
+            probe.view.generation,
+            probe.view.revision,
+            request.idle_seq,
+            now_ms(),
+        );
+    }
+
     async fn commit_goal_round(
         &self,
         request: &GoalRoundRequest,
@@ -348,7 +384,20 @@ impl Router {
     ) -> Result<Value> {
         let result = {
             let mut store = self.inner.store.lock().await;
-            let result = store.goal_commit_round(&commit, now_ms())?;
+            let result = match store.goal_commit_round(&commit, now_ms()) {
+                Ok(result) => result,
+                Err(error) => {
+                    let _ = store.goal_abandon_round(
+                        &commit.agent,
+                        &commit.mode,
+                        commit.expected_generation,
+                        commit.expected_revision,
+                        commit.round_key,
+                        now_ms(),
+                    );
+                    return Err(error);
+                }
+            };
             if let Some(admission) = &result.admission {
                 self.publish_locked(&admission.events);
             }
@@ -443,19 +492,12 @@ fn goal_check_result(outcome: ProcessOutcome, policy: &SecretPolicy) -> Result<G
             if !custody_proven_for_capture(&capture) {
                 return Err(Error::new("unknown", "goal check custody is unproven"));
             }
-            let digest = check_output_digest(&capture.stdout);
-            let text = String::from_utf8_lossy(&capture.stdout);
-            let observation = if text.is_empty() {
-                None
-            } else {
-                Some(policy.redact_text(truncate_observation(text.as_ref())))
-            };
-            Ok(GoalCheckResult {
-                exit_code: capture.status.code(),
-                output_complete: capture.stdout_complete,
-                output_digest: Some(digest),
-                observation,
-            })
+            goal_completed_check_result(
+                &capture.stdout,
+                capture.stdout_complete,
+                capture.status.code(),
+                policy,
+            )
         }
         ProcessOutcome::Failed { reason, .. } => {
             if reason == ProcessFailure::Cancelled {
@@ -468,6 +510,36 @@ fn goal_check_result(outcome: ProcessOutcome, policy: &SecretPolicy) -> Result<G
             format!("goal check outcome is unknown: {}", reason.stable_code()),
         )),
     }
+}
+
+/// A completed capture is a result only with a definite exit code. A
+/// check killed by a signal (Unix exit code `None`) is an unknown outcome:
+/// it commits nothing, same as timeout/cancel.
+fn goal_completed_check_result(
+    stdout: &[u8],
+    stdout_complete: bool,
+    exit_code: Option<i32>,
+    policy: &SecretPolicy,
+) -> Result<GoalCheckResult> {
+    let Some(exit_code) = exit_code else {
+        return Err(Error::new(
+            "unknown",
+            "goal check has no exit code; its outcome is unknown",
+        ));
+    };
+    let digest = check_output_digest(stdout);
+    let text = String::from_utf8_lossy(stdout);
+    let observation = if text.is_empty() {
+        None
+    } else {
+        Some(policy.redact_text(truncate_observation(text.as_ref())))
+    };
+    Ok(GoalCheckResult {
+        exit_code: Some(exit_code),
+        output_complete: stdout_complete,
+        output_digest: Some(digest),
+        observation,
+    })
 }
 
 #[cfg(windows)]
@@ -506,8 +578,15 @@ mod tests {
     use super::*;
     use crate::bus::Bus;
     use eliot_core::{NativeEvent, SourceBatch, StderrSnapshot, SubmitCommand};
-    use std::path::PathBuf;
-    use tokio::sync::Mutex as AsyncMutex;
+    use std::{
+        path::PathBuf,
+        sync::{
+            OnceLock,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::Poll,
+    };
+    use tokio::sync::{Mutex as AsyncMutex, Notify};
 
     #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
@@ -676,6 +755,106 @@ mod tests {
         _: watch::Receiver<bool>,
     ) -> Pin<Box<dyn Future<Output = ProcessOutcome> + Send>> {
         panic!("goal check must not run for a refused round")
+    }
+
+    /// Drive one continuation send through a full turn so the Agent is
+    /// cleanly idle again and a later round can claim a fresh key.
+    async fn complete_send(router: &Router, agent: &str, send_id: &str, turn_id: &str) {
+        let mut store = router.inner.store.lock().await;
+        let now = now_ms();
+        store.dispatch(send_id, now).unwrap();
+        for (kind, data) in [
+            (
+                "turn.started",
+                json!({"command_id": send_id, "turn_id": turn_id}),
+            ),
+            (
+                "turn.completed",
+                json!({"command_id": send_id, "turn_id": turn_id, "status": "completed"}),
+            ),
+        ] {
+            store
+                .put_batch(
+                    SourceBatch {
+                        batch_id: ulid::Ulid::new().to_string(),
+                        agent_id: agent.to_owned(),
+                        generation: 1,
+                        source: "stream".to_owned(),
+                        events: vec![NativeEvent {
+                            ts: None,
+                            kind: kind.to_owned(),
+                            native_id: ulid::Ulid::new().to_string(),
+                            data,
+                        }],
+                        cursor: None,
+                    },
+                    now,
+                )
+                .unwrap();
+        }
+        store
+            .settle(send_id, eliot_core::CommandState::Applied, None, now)
+            .unwrap();
+    }
+
+    static CONCURRENT_RUNS: AtomicUsize = AtomicUsize::new(0);
+    static CONCURRENT_RELEASE: OnceLock<Notify> = OnceLock::new();
+
+    fn blocking_runner(
+        _: TokioCommand,
+        _: Vec<u8>,
+        _: Duration,
+        _: Arc<SecretPolicy>,
+        _: watch::Receiver<bool>,
+    ) -> Pin<Box<dyn Future<Output = ProcessOutcome> + Send>> {
+        Box::pin(async {
+            let release = CONCURRENT_RELEASE.get_or_init(Notify::new).notified();
+            CONCURRENT_RUNS.fetch_add(1, Ordering::SeqCst);
+            release.await;
+            completed_outcome(0, b"all green", true)
+        })
+    }
+
+    static RACE_STARTED: AtomicUsize = AtomicUsize::new(0);
+    static RACE_RELEASE: OnceLock<Notify> = OnceLock::new();
+
+    fn race_runner(
+        _: TokioCommand,
+        _: Vec<u8>,
+        _: Duration,
+        _: Arc<SecretPolicy>,
+        _: watch::Receiver<bool>,
+    ) -> Pin<Box<dyn Future<Output = ProcessOutcome> + Send>> {
+        Box::pin(async {
+            let release = RACE_RELEASE.get_or_init(Notify::new).notified();
+            RACE_STARTED.fetch_add(1, Ordering::SeqCst);
+            release.await;
+            completed_outcome(0, b"all green", true)
+        })
+    }
+
+    /// Poll a round future on this task until its check starts running.
+    async fn run_until_check_starts<F>(round: &mut Pin<Box<F>>, started: &AtomicUsize)
+    where
+        F: Future<Output = Result<Value>>,
+    {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            std::future::poll_fn(|cx| {
+                if started.load(Ordering::SeqCst) == 0
+                    && round.as_mut().poll(cx).is_ready()
+                {
+                    panic!("round finished without running its check");
+                }
+                if started.load(Ordering::SeqCst) > 0 {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }),
+        )
+        .await
+        .expect("check starts");
     }
 
     #[test]
@@ -952,13 +1131,20 @@ mod tests {
     #[tokio::test]
     async fn goal_round_commits_nothing_for_unknown_check_outcomes() {
         let router = router();
-        let agent = ready_agent(&router, "goal-unknown").await;
-        set_goal(&router, &agent, definition("keep green")).await;
-        let key = high_water(&router).await;
-        for runner in [
-            unknown_runner as GoalCheckRunner,
-            timeout_runner as GoalCheckRunner,
+        // Each unknown outcome burns its round key, so each runner gets a
+        // fresh Agent and Goal.
+        for (project, runner, code) in [
+            ("goal-unknown", unknown_runner as GoalCheckRunner, "unknown"),
+            ("goal-timeout", timeout_runner as GoalCheckRunner, "unknown"),
+            (
+                "goal-cancelled",
+                cancelled_runner as GoalCheckRunner,
+                "unavailable",
+            ),
         ] {
+            let agent = ready_agent(&router, project).await;
+            set_goal(&router, &agent, definition("keep green")).await;
+            let key = high_water(&router).await;
             let error = router
                 .goal_round_with(
                     &json!({"id":ulid::Ulid::new().to_string(),"agent":agent,
@@ -968,18 +1154,73 @@ mod tests {
                 )
                 .await
                 .unwrap_err();
-            assert_eq!(error.code, "unknown");
+            assert_eq!(error.code, code);
+            let view = router
+                .inner
+                .store
+                .lock()
+                .await
+                .goal_get(&agent, "eliot")
+                .unwrap()
+                .unwrap();
+            assert_eq!(view.counters.rounds, 0);
+            assert!(view.last_round_key.is_none());
+            assert_eq!(view.status, eliot_core::api::GoalStatus::Active);
+            let marker = view.round_marker.expect("burned key stays visible");
+            assert_eq!(marker.state, eliot_core::api::GoalMarkerState::Unknown);
+            assert_eq!(marker.round_key, format!("idle:{key}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_completed_check_needs_a_definite_exit_code() {
+        let policy = SecretPolicy::new(Vec::<String>::new());
+        let error = goal_completed_check_result(b"output", true, None, &policy).unwrap_err();
+        assert_eq!(error.code, "unknown");
+        let check = goal_completed_check_result(b"output", true, Some(3), &policy).unwrap();
+        assert_eq!(check.exit_code, Some(3));
+        assert_eq!(check.observation.as_deref(), Some("output"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_signal_killed_check_is_an_unknown_outcome() {
+        let router = router();
+        let agent = ready_agent(&router, "goal-signal").await;
+        set_goal(&router, &agent, definition("keep green")).await;
+        let key = high_water(&router).await;
+        fn signal_runner(
+            _: TokioCommand,
+            _: Vec<u8>,
+            _: Duration,
+            _: Arc<SecretPolicy>,
+            _: watch::Receiver<bool>,
+        ) -> Pin<Box<dyn Future<Output = ProcessOutcome> + Send>> {
+            Box::pin(async {
+                ProcessOutcome::Completed(ProcessCapture {
+                    stdout: b"partial".to_vec(),
+                    stdout_complete: true,
+                    stderr: StderrSnapshot {
+                        text: String::new(),
+                        truncated: false,
+                        eof: true,
+                        read_error: false,
+                    },
+                    status: std::process::ExitStatus::from_raw(9),
+                    custody: crate::platform::CustodyGuarantee::Degraded,
+                })
+            })
         }
         let error = router
             .goal_round_with(
                 &json!({"id":ulid::Ulid::new().to_string(),"agent":agent,
                     "mode":"eliot","idle_seq":key}),
                 &Principal::Owner,
-                cancelled_runner,
+                signal_runner,
             )
             .await
             .unwrap_err();
-        assert_eq!(error.code, "unavailable");
+        assert_eq!(error.code, "unknown");
         let view = router
             .inner
             .store
@@ -990,6 +1231,148 @@ mod tests {
             .unwrap();
         assert_eq!(view.counters.rounds, 0);
         assert!(view.last_round_key.is_none());
-        assert_eq!(view.status, eliot_core::api::GoalStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn goal_round_refuses_a_second_concurrent_round() {
+        CONCURRENT_RUNS.store(0, Ordering::SeqCst);
+        let router = router();
+        let agent = ready_agent(&router, "goal-concurrent").await;
+        set_goal(&router, &agent, definition("keep green")).await;
+        let key = high_water(&router).await;
+        let first_params = json!({"id":ulid::Ulid::new().to_string(),"agent":agent,
+            "mode":"eliot","idle_seq":key});
+        let second_params = json!({"id":ulid::Ulid::new().to_string(),"agent":agent,
+            "mode":"eliot","idle_seq":key});
+        let mut first =
+            Box::pin(router.goal_round_with(&first_params, &Principal::Owner, blocking_runner));
+        run_until_check_starts(&mut first, &CONCURRENT_RUNS).await;
+        let error = router
+            .goal_round_with(&second_params, &Principal::Owner, exploding_runner)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "busy");
+        assert_eq!(CONCURRENT_RUNS.load(Ordering::SeqCst), 1);
+        CONCURRENT_RELEASE.get_or_init(Notify::new).notify_one();
+        let response = first.await.unwrap();
+        assert_eq!(response["outcome"], "completed");
+        assert_eq!(CONCURRENT_RUNS.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn goal_round_commits_nothing_for_a_send_admitted_during_the_check() {
+        RACE_STARTED.store(0, Ordering::SeqCst);
+        let router = router();
+        let agent = ready_agent(&router, "goal-race").await;
+        set_goal(&router, &agent, definition("keep green")).await;
+        let key = high_water(&router).await;
+        let round_id = ulid::Ulid::new().to_string();
+        let params = json!({"id":round_id,"agent":agent,"mode":"eliot","idle_seq":key});
+        let mut round = Box::pin(router.goal_round_with(&params, &Principal::Owner, race_runner));
+        run_until_check_starts(&mut round, &RACE_STARTED).await;
+        {
+            let mut store = router.inner.store.lock().await;
+            let mut request = SubmitCommand::new(ulid::Ulid::new().to_string(), "send");
+            request.target = Some(agent.clone());
+            request.expected_generation = Some(1);
+            request.args = json!({"text": "operator input"});
+            store.submit("owner", request, now_ms()).unwrap();
+        }
+        RACE_RELEASE.get_or_init(Notify::new).notify_one();
+        let error = round.await.unwrap_err();
+        assert_eq!(error.code, "stale_round");
+        let view = router
+            .inner
+            .store
+            .lock()
+            .await
+            .goal_get(&agent, "eliot")
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.counters.rounds, 0);
+        assert!(view.last_round_key.is_none());
+        let marker = view.round_marker.expect("raced key stays visible");
+        assert_eq!(marker.state, eliot_core::api::GoalMarkerState::Unknown);
+        assert_eq!(marker.round_key, format!("idle:{key}"));
+    }
+
+    #[tokio::test]
+    async fn goal_round_blocks_on_its_round_budget() {
+        let router = router();
+        let agent = ready_agent(&router, "goal-round-budget").await;
+        set_goal(
+            &router,
+            &agent,
+            json!({
+                "text": "keep green",
+                "check": ["check-goal"],
+                "max_rounds": 1,
+            }),
+        )
+        .await;
+        let key = high_water(&router).await;
+        let round_id = ulid::Ulid::new().to_string();
+        let response = router
+            .goal_round_with(
+                &json!({"id":round_id,"agent":agent,"mode":"eliot","idle_seq":key}),
+                &Principal::Owner,
+                failing_runner,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response["outcome"], "blocked");
+        assert_eq!(response["reason"], "round_budget");
+        assert_eq!(response["view"]["status"], "blocked");
+        assert!(
+            router
+                .inner
+                .store
+                .lock()
+                .await
+                .get_command(&round_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_round_blocks_on_a_no_progress_streak() {
+        let router = router();
+        let agent = ready_agent(&router, "goal-no-progress").await;
+        set_goal(
+            &router,
+            &agent,
+            json!({
+                "text": "keep green",
+                "check": ["check-goal"],
+                "max_without_progress": 1,
+            }),
+        )
+        .await;
+        let key = high_water(&router).await;
+        let first_id = ulid::Ulid::new().to_string();
+        let first = router
+            .goal_round_with(
+                &json!({"id":first_id,"agent":agent,"mode":"eliot","idle_seq":key}),
+                &Principal::Owner,
+                failing_runner,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first["outcome"], "continued");
+        complete_send(&router, &agent, &first_id, "turn-np-1").await;
+        let key = high_water(&router).await;
+        let second = router
+            .goal_round_with(
+                &json!({"id":ulid::Ulid::new().to_string(),"agent":agent,
+                    "mode":"eliot","idle_seq":key}),
+                &Principal::Owner,
+                failing_runner,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second["outcome"], "blocked");
+        assert_eq!(second["reason"], "no_progress");
+        assert_eq!(second["view"]["status"], "blocked");
     }
 }
