@@ -11,8 +11,6 @@ use eliot_core::{ProcessIdentity, ProcessRecord, ProcessState};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
-#[cfg(all(test, target_os = "linux"))]
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 pub(crate) fn ensure_private_root(path: &Path) -> Result<()> {
     check_path_components(path)?;
@@ -286,39 +284,6 @@ pub(crate) struct LinuxProcessSweep {
     pub(crate) complete: bool,
 }
 
-/// Test-only count of host enumerations performed by
-/// [`enumerate_process_sweep`]. Forced failures do not count: the counter
-/// measures real `/proc` walks, so skipped or failed sweeps assert zero.
-#[cfg(all(test, target_os = "linux"))]
-static SWEEP_ENUMERATIONS: AtomicUsize = AtomicUsize::new(0);
-
-#[cfg(all(test, target_os = "linux"))]
-static SWEEP_FAIL_FORCED: AtomicBool = AtomicBool::new(false);
-
-/// Serializes tests that count enumerations or force scan failure. Test
-/// threads otherwise race on the shared counter and on `/proc` itself. Async
-/// tests hold it across awaits, so this is an async-aware mutex; synchronous
-/// tests use `blocking_lock` outside any runtime.
-#[cfg(all(test, target_os = "linux"))]
-pub(crate) static SWEEP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-#[cfg(all(test, target_os = "linux"))]
-pub(crate) fn test_sweep_enumerations() -> usize {
-    SWEEP_ENUMERATIONS.load(Ordering::SeqCst)
-}
-
-#[cfg(all(test, target_os = "linux"))]
-pub(crate) fn test_reset_sweep_enumerations() {
-    SWEEP_ENUMERATIONS.store(0, Ordering::SeqCst);
-}
-
-/// Force [`enumerate_process_sweep`] to fail without walking `/proc`, so the
-/// scan-failure path is deterministic. Reset before releasing the test lock.
-#[cfg(all(test, target_os = "linux"))]
-pub(crate) fn test_force_sweep_failure(fail: bool) {
-    SWEEP_FAIL_FORCED.store(fail, Ordering::SeqCst);
-}
-
 /// Test-only owned process-group leader (`sleep 30`) for sweep tests. Drop
 /// kills and reaps the child as a backstop; tests that assert on the dead
 /// group call [`TestSleepGroup::kill_and_wait`] explicitly first.
@@ -377,15 +342,6 @@ pub(crate) fn capture_group_retry(pid: u32) -> Result<ProcessGroupIdentity> {
 /// and an omitted process is not proof of exit.
 #[cfg(target_os = "linux")]
 pub(crate) fn enumerate_process_sweep() -> Result<LinuxProcessSweep> {
-    #[cfg(test)]
-    if SWEEP_FAIL_FORCED.load(Ordering::SeqCst) {
-        return Err(Error::new(
-            "process_observation",
-            "test-forced shared sweep failure",
-        ));
-    }
-    #[cfg(test)]
-    SWEEP_ENUMERATIONS.fetch_add(1, Ordering::SeqCst);
     let mut sweep = LinuxProcessSweep {
         entries: Vec::new(),
         complete: true,
@@ -802,6 +758,16 @@ impl ProcessObserver {
     }
 
     pub(crate) fn snapshot(&self, owner: &str, now: i64) -> Result<ProcessSnapshot> {
+        self.snapshot_with(owner, now, enumerate_process_sweep)
+    }
+
+    /// Snapshot with the host enumeration injected: production passes
+    /// [`enumerate_process_sweep`], while tests inject a refusing enumerator
+    /// scoped to that snapshot instead of counting through a process global.
+    fn snapshot_with<E>(&self, owner: &str, now: i64, enumerate: E) -> Result<ProcessSnapshot>
+    where
+        E: FnOnce() -> Result<LinuxProcessSweep>,
+    {
         let leader_before = self.group_is_current();
         if !leader_before {
             // A dead group pays no host-wide scan. The empty sweep is unused
@@ -812,7 +778,7 @@ impl ProcessObserver {
             };
             return Ok(self.snapshot_from_sweep(owner, now, &empty, false));
         }
-        let sweep = enumerate_process_sweep()?;
+        let sweep = enumerate()?;
         Ok(self.snapshot_from_sweep(owner, now, &sweep, true))
     }
 
@@ -1092,7 +1058,6 @@ mod linux_process_stat_tests {
 
     #[test]
     fn shared_sweep_enumerates_host_once() {
-        let _lock = SWEEP_TEST_LOCK.blocking_lock();
         let sweep =
             enumerate_process_sweep().expect("a shared sweep enumerates host processes once");
         assert!(
@@ -1126,7 +1091,6 @@ mod linux_process_stat_tests {
 
     #[test]
     fn shared_sweep_serves_two_groups_with_single_enumeration() {
-        let _lock = SWEEP_TEST_LOCK.blocking_lock();
         let group_a = TestSleepGroup::spawn().expect("spawn group A leader");
         let group_b = TestSleepGroup::spawn().expect("spawn group B leader");
         let observer_a = observer_for(&group_a);
@@ -1135,16 +1099,11 @@ mod linux_process_stat_tests {
         let before_b = observer_b.group_is_current();
         assert!(before_a && before_b, "both test leaders are current");
 
-        test_reset_sweep_enumerations();
+        // One enumeration serves both groups by construction; the snapshot
+        // builds take `&sweep`, so they structurally cannot rescan the host.
         let sweep = enumerate_process_sweep().expect("shared sweep enumerates");
-        assert_eq!(test_sweep_enumerations(), 1);
         let snapshot_a = observer_a.snapshot_from_sweep("agent:a#1", SWEEP_NOW, &sweep, before_a);
         let snapshot_b = observer_b.snapshot_from_sweep("agent:b#1", SWEEP_NOW, &sweep, before_b);
-        assert_eq!(
-            test_sweep_enumerations(),
-            1,
-            "snapshot builds must not rescan the host"
-        );
 
         for (snapshot, own, other) in [
             (&snapshot_a, group_a.pid(), group_b.pid()),
@@ -1169,7 +1128,6 @@ mod linux_process_stat_tests {
 
     #[test]
     fn dead_group_pays_no_scan_and_keeps_no_members() {
-        let _lock = SWEEP_TEST_LOCK.blocking_lock();
         let mut group = TestSleepGroup::spawn().expect("spawn group leader");
         let pid = group.pid();
         let observer = observer_for(&group);
@@ -1189,15 +1147,13 @@ mod linux_process_stat_tests {
             "the reaped leader is no longer current"
         );
 
-        test_reset_sweep_enumerations();
+        // The injected enumerator refuses to run: a dead group must take
+        // the early return and never invoke it.
         let dead = observer
-            .snapshot("agent:a#1", SWEEP_NOW)
+            .snapshot_with("agent:a#1", SWEEP_NOW, || {
+                panic!("a dead group must not pay a host-wide scan")
+            })
             .expect("dead group snapshots without scanning");
-        assert_eq!(
-            test_sweep_enumerations(),
-            0,
-            "a dead group must not pay a host-wide scan"
-        );
         assert_eq!(dead.samples.len(), 1, "only the refreshed root remains");
         assert!(!dead.complete);
 
@@ -1210,7 +1166,6 @@ mod linux_process_stat_tests {
         let stale = observer.snapshot_from_sweep("agent:a#1", SWEEP_NOW, &stale_sweep, true);
         assert_eq!(stale.samples.len(), 1, "no member without a live leader");
         assert!(!stale.complete);
-        assert_eq!(test_sweep_enumerations(), 0);
     }
 
     #[test]

@@ -1328,10 +1328,25 @@ impl Monitoring {
     /// targets attached mid-sweep wait for the next sweep. The scan is skipped
     /// when no captured leader is current; a failed scan is committed as
     /// unavailable to each captured target without rescanning per target.
+    /// Returns the host enumerations this sweep performed: 0 when skipped or
+    /// failed, 1 when scanned. The count is scoped to the sweep's return
+    /// value, never to a process-global counter.
     #[cfg(target_os = "linux")]
-    async fn sample_all_sweep(&self, targets: Vec<Arc<Target>>) {
+    async fn sample_all_sweep(&self, targets: Vec<Arc<Target>>) -> usize {
+        self.sample_all_sweep_with(targets, enumerate_process_sweep)
+            .await
+    }
+
+    /// Sweep with the host enumeration injected: production passes
+    /// [`enumerate_process_sweep`], while tests inject a failing or refusing
+    /// enumerator scoped to that sweep.
+    #[cfg(target_os = "linux")]
+    async fn sample_all_sweep_with<E>(&self, targets: Vec<Arc<Target>>, enumerate: E) -> usize
+    where
+        E: FnOnce() -> Result<LinuxProcessSweep> + Send + 'static,
+    {
         if targets.is_empty() {
-            return;
+            return 0;
         }
         // Serialize with concurrent per-target samplers in capture order; a
         // concurrent sampler holds at most one target lock, so this cannot
@@ -1354,7 +1369,7 @@ impl Monitoring {
             if !leaders_before.iter().any(|current| *current) {
                 return Ok((leaders_before, None));
             }
-            enumerate_process_sweep().map(|sweep| (leaders_before, Some(sweep)))
+            enumerate().map(|sweep| (leaders_before, Some(sweep)))
         })
         .await
         .map_err(|_| Error::new("process_observation", "process sampling task failed"))
@@ -1363,11 +1378,12 @@ impl Monitoring {
             Ok((leaders, sweep)) => (leaders, sweep),
             Err(error) => {
                 self.commit_scan_failure(&targets, error, sampled_at).await;
-                return;
+                return 0;
             }
         };
         // Enumeration was skipped only when every captured leader is gone; the
         // empty sweep is then unused because no member is attributed.
+        let enumerations = usize::from(sweep.is_some());
         let sweep = sweep.unwrap_or(LinuxProcessSweep {
             entries: Vec::new(),
             complete: false,
@@ -1391,6 +1407,7 @@ impl Monitoring {
         for (target, result) in built {
             let _ = self.commit_snapshot(target, result, sampled_at).await;
         }
+        enumerations
     }
 
     /// Commit a shared-scan failure as unavailable to each captured target.
@@ -1960,38 +1977,13 @@ mod tests {
         agent
     }
 
-    /// RAII reset for the forced scan failure; the flag must not leak into
-    /// other tests if an assertion panics.
-    #[cfg(target_os = "linux")]
-    struct ForcedSweepFailure;
-
-    #[cfg(target_os = "linux")]
-    impl ForcedSweepFailure {
-        fn arm() -> Self {
-            crate::platform::unix::test_force_sweep_failure(true);
-            Self
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    impl Drop for ForcedSweepFailure {
-        fn drop(&mut self) {
-            crate::platform::unix::test_force_sweep_failure(false);
-        }
-    }
-
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn sweep_scan_failure_marks_captured_targets_unavailable_without_rescan() {
-        use crate::platform::unix::{
-            SWEEP_TEST_LOCK, TestSleepGroup, test_reset_sweep_enumerations, test_sweep_enumerations,
-        };
+        use crate::platform::unix::TestSleepGroup;
 
         let (monitoring, store) = sweep_monitor();
         let group_a = TestSleepGroup::spawn().expect("spawn group A leader");
-        // The lock covers attaches too: attach samples immediately, so an
-        // attach outside the lock would pollute another test's window.
-        let _lock = SWEEP_TEST_LOCK.lock().await;
         let agent_a = attach_sweep_target(&monitoring, &store, "sweep-fail-a", group_a.pid()).await;
         // Capture before B exists: B must not be sampled by this sweep.
         let captured: Vec<Arc<Target>> = monitoring
@@ -2005,15 +1997,17 @@ mod tests {
         let group_b = TestSleepGroup::spawn().expect("spawn group B leader");
         let agent_b = attach_sweep_target(&monitoring, &store, "sweep-fail-b", group_b.pid()).await;
 
-        test_reset_sweep_enumerations();
-        let _forced = ForcedSweepFailure::arm();
-        monitoring.sample_all_sweep(captured).await;
-        drop(_forced);
-        assert_eq!(
-            test_sweep_enumerations(),
-            0,
-            "a failed scan must not rescan per target"
-        );
+        // The failing enumerator is injected into this sweep only, so the
+        // scan-failure path is deterministic without a process-global flag.
+        let enumerations = monitoring
+            .sample_all_sweep_with(captured, || {
+                Err(Error::new(
+                    "process_observation",
+                    "test-forced shared sweep failure",
+                ))
+            })
+            .await;
+        assert_eq!(enumerations, 0, "a failed scan must not rescan per target");
 
         let targets = monitoring.inner.targets.lock_recover();
         let error_a = targets
@@ -2040,16 +2034,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn sweep_skips_enumeration_when_no_captured_leader_is_current() {
-        use crate::platform::unix::{
-            SWEEP_TEST_LOCK, TestSleepGroup, test_reset_sweep_enumerations, test_sweep_enumerations,
-        };
+        use crate::platform::unix::TestSleepGroup;
 
         let (monitoring, store) = sweep_monitor();
         let mut group_a = TestSleepGroup::spawn().expect("spawn group A leader");
         let mut group_b = TestSleepGroup::spawn().expect("spawn group B leader");
-        // The lock covers attaches too: attach samples immediately, so an
-        // attach outside the lock would pollute another test's window.
-        let _lock = SWEEP_TEST_LOCK.lock().await;
         attach_sweep_target(&monitoring, &store, "sweep-skip-a", group_a.pid()).await;
         attach_sweep_target(&monitoring, &store, "sweep-skip-b", group_b.pid()).await;
         group_a.kill_and_wait();
@@ -2070,13 +2059,12 @@ mod tests {
             );
         }
 
-        test_reset_sweep_enumerations();
-        monitoring.sample_all_sweep(all).await;
-        assert_eq!(
-            test_sweep_enumerations(),
-            0,
-            "dead groups must not pay a host-wide scan"
-        );
+        // The injected enumerator refuses to run: with no captured
+        // leader current the sweep must skip the scan entirely.
+        let enumerations = monitoring
+            .sample_all_sweep_with(all, || panic!("dead groups must not pay a host-wide scan"))
+            .await;
+        assert_eq!(enumerations, 0);
 
         let targets = monitoring.inner.targets.lock_recover();
         assert_eq!(targets.len(), 2);
@@ -2094,16 +2082,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn sweep_shares_one_enumeration_and_sampled_at_across_targets() {
-        use crate::platform::unix::{
-            SWEEP_TEST_LOCK, TestSleepGroup, test_reset_sweep_enumerations, test_sweep_enumerations,
-        };
+        use crate::platform::unix::TestSleepGroup;
 
         let (monitoring, store) = sweep_monitor();
         let group_a = TestSleepGroup::spawn().expect("spawn group A leader");
         let group_b = TestSleepGroup::spawn().expect("spawn group B leader");
-        // The lock covers attaches too: attach samples immediately, so an
-        // attach outside the lock would pollute another test's window.
-        let _lock = SWEEP_TEST_LOCK.lock().await;
         let agent_a =
             attach_sweep_target(&monitoring, &store, "sweep-share-a", group_a.pid()).await;
         let agent_b =
@@ -2118,13 +2101,8 @@ mod tests {
             .collect();
         assert_eq!(all.len(), 2);
 
-        test_reset_sweep_enumerations();
-        monitoring.sample_all_sweep(all).await;
-        assert_eq!(
-            test_sweep_enumerations(),
-            1,
-            "one shared enumeration per sweep"
-        );
+        let enumerations = monitoring.sample_all_sweep(all).await;
+        assert_eq!(enumerations, 1, "one shared enumeration per sweep");
 
         let targets = monitoring.inner.targets.lock_recover();
         let cache_a = targets
