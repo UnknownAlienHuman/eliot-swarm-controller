@@ -64,6 +64,10 @@ fn main() {
         println!("ok - lost resume reply is unknown with exactly one write");
         scenario_resume_with_pending_requests_is_refused().await;
         println!("ok - resume with pending requests is refused");
+        scenario_resume_rejects_stale_generation_1_output().await;
+        println!("ok - resume rejects stale generation-1 output");
+        scenario_resume_refuses_served_history_and_keeps_the_retained_id().await;
+        println!("ok - resume refuses served history and keeps the retained id");
     });
     println!("muse_plugin: all scenarios passed");
 }
@@ -105,7 +109,11 @@ fn fake_msp_main(script: &str) {
     };
     if matches!(
         fake.script.as_str(),
-        "resume-happy" | "resume-pending" | "drop-session-resume"
+        "resume-happy"
+            | "resume-pending"
+            | "drop-session-resume"
+            | "resume-stale-replay"
+            | "resume-inline-history"
     ) {
         fake.seed_retained_session();
     }
@@ -311,11 +319,30 @@ impl FakeMsp {
                 } else {
                     json!([])
                 };
+                // `resume-inline-history` serves retained history despite
+                // `excludeItems: true`: the plugin must refuse the resume
+                // instead of republishing it.
+                let history = if self.script == "resume-inline-history" {
+                    json!({
+                        "items": [{
+                            "itemId": "fake-item-retained-1",
+                            "kind": "agentMessage",
+                            "revision": 2,
+                            "status": "completed",
+                            "text": "Retained reply from the previous generation.",
+                            "turnId": RETAINED_TURN,
+                        }],
+                        "mode": "inline",
+                        "snapshot": null,
+                    })
+                } else {
+                    json!({"items": null, "mode": "none", "noneReason": "excluded", "snapshot": null})
+                };
                 self.reply(
                     stdout,
                     &id,
                     json!({
-                        "history": {"items": null, "mode": "none", "noneReason": "excluded", "snapshot": null},
+                        "history": history,
                         "pendingRequests": pending,
                         "session": session,
                         "viewCursor": self.head_cursor(),
@@ -351,6 +378,24 @@ impl FakeMsp {
                         }),
                     );
                     return true;
+                }
+                if self.script == "resume-stale-replay" {
+                    // Old-host output redelivered on the new generation's
+                    // stream: the retained generation-1 turn completion.
+                    // Stream-only — it is not in the durable view — and the
+                    // plugin must gap it, never apply it to generation 2.
+                    let stale = json!({
+                        "jsonrpc": "2.0",
+                        "method": "turn/completed",
+                        "params": {
+                            "sessionId": RETAINED_SESSION,
+                            "sourceRange": Self::source_range(),
+                            "terminal": "completed",
+                            "turnId": RETAINED_TURN,
+                            "viewCursor": "fake-stale-cursor-1",
+                        },
+                    });
+                    writeln!(stdout, "{stale}").expect("fixture stale event");
                 }
                 let command = params
                     .get("commandId")
@@ -1405,6 +1450,164 @@ async fn send_turn(
     (send_id, turn_id, committed)
 }
 
+/// Like `send_turn`, but tolerates exactly one `source.gap` interleaved with
+/// the turn batches in arrival order: stale generation-1 output is gapped,
+/// never applied. Returns the send id, the applied turn id, every committed
+/// `(kind, data)` in order, and the recorded gap reason.
+async fn send_turn_with_stale_replay(
+    host: &mut Host,
+    agent_id: &str,
+    generation: i64,
+    text: &str,
+) -> (String, String, Vec<(String, Value)>, String) {
+    async fn answer_batch(
+        host: &mut Host,
+        request: &HostRequest,
+        committed: &mut Vec<(String, Value)>,
+        gap_reason: &mut Option<String>,
+        agent_id: &str,
+        generation: i64,
+    ) {
+        match request.method.as_str() {
+            "events.put" => {
+                let events = request
+                    .params
+                    .get("events")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                assert_eq!(events.len(), 1, "one native record per batch");
+                committed.push((
+                    events[0]
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    events[0].get("data").cloned().unwrap_or(Value::Null),
+                ));
+                let first = host.next_seq;
+                host.next_seq += 1;
+                host.respond(
+                    &request.id,
+                    json!({
+                        "first_seq": first, "last_seq": first,
+                        "cursor": request.params.get("cursor").cloned().unwrap_or(Value::Null),
+                    }),
+                )
+                .await;
+            }
+            "source.gap" => {
+                assert!(gap_reason.is_none(), "stale output records exactly one gap");
+                assert_eq!(
+                    request.params.get("agent_id").and_then(Value::as_str),
+                    Some(agent_id)
+                );
+                assert_eq!(
+                    request.params.get("generation").and_then(Value::as_i64),
+                    Some(generation)
+                );
+                assert_eq!(
+                    request.params.get("source").and_then(Value::as_str),
+                    Some("stream")
+                );
+                *gap_reason = Some(
+                    request
+                        .params
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                );
+                let gap_id = request
+                    .params
+                    .get("gap_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let seq = host.next_seq;
+                host.next_seq += 1;
+                host.respond(&request.id, json!({"gap_id": gap_id, "seq": seq}))
+                    .await;
+            }
+            other => panic!("unexpected host request during stale-replay send: {other}"),
+        }
+    }
+
+    let send_id = ulid::Ulid::new().to_string();
+    let rx = host
+        .begin_call(
+            "agent.command",
+            json!({
+                "agent_id": agent_id,
+                "generation": generation,
+                "command_id": send_id,
+                "verb": "send",
+                "args": {"text": text},
+                "turn_id": null,
+                "request_id": null,
+            }),
+        )
+        .await;
+    let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
+    let mut committed: Vec<(String, Value)> = Vec::new();
+    let mut gap_reason: Option<String> = None;
+    let applied = loop {
+        tokio::select! {
+            biased;
+            request = host.next_request() => {
+                answer_batch(host, &request, &mut committed, &mut gap_reason, agent_id, generation).await;
+            }
+            result = &mut rx => break result,
+        }
+    };
+    let applied = applied
+        .expect("send deadline")
+        .expect("send response channel")
+        .expect("send applied");
+    assert_eq!(
+        applied.get("state").and_then(Value::as_str),
+        Some("applied")
+    );
+    let turn_id = applied
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .expect("applied turn id")
+        .to_owned();
+    assert!(!turn_id.is_empty());
+    while committed.last().map(|(kind, _)| kind.as_str()) != Some("turn.completed")
+        || gap_reason.is_none()
+    {
+        let request = host.next_request().await;
+        answer_batch(
+            host,
+            &request,
+            &mut committed,
+            &mut gap_reason,
+            agent_id,
+            generation,
+        )
+        .await;
+    }
+    for (kind, data) in &committed {
+        assert_eq!(
+            data.get("turn_id").and_then(Value::as_str),
+            Some(turn_id.as_str()),
+            "turn binding of {kind}"
+        );
+        assert_eq!(
+            data.get("command_id").and_then(Value::as_str),
+            Some(send_id.as_str()),
+            "command binding of {kind}"
+        );
+    }
+    (
+        send_id,
+        turn_id,
+        committed,
+        gap_reason.expect("stale output gap"),
+    )
+}
+
 /// Like `send_turn`, but the turn may commit any number of `message.completed`
 /// batches (routine once tools are involved) before `turn.completed`.
 async fn send_multi_message_turn(
@@ -2265,6 +2468,183 @@ async fn scenario_lost_resume_reply_is_unknown_with_one_write() {
     // ended batch are acknowledged, then the plugin exits cleanly.
     let agent_id = attempt.agent_id.clone();
     stop_agent(&mut attempt.host, &agent_id, 2, true).await;
+    attempt
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    attempt.host.shutdown_child().await;
+    assert_eq!(attempt.report()["session_resumes"], json!(1));
+    let _ = std::fs::remove_dir_all(&attempt.root);
+}
+
+async fn scenario_resume_rejects_stale_generation_1_output() {
+    let agent_id = ulid::Ulid::new().to_string();
+    let (resume_from, source_state) = retained_resume_subject(&agent_id);
+    let mut scenario = Scenario::start_resume(
+        "resume-stale-replay",
+        muse_profile(),
+        agent_id,
+        resume_from,
+        source_state,
+        RETAINED_SESSION,
+    )
+    .await;
+    let agent_id = scenario.agent_id.clone();
+
+    // The old host's generation-1 turn completion is redelivered on the new
+    // generation's stream during the first send: exactly one gap records the
+    // rejection, and the new turn still commits its exact facts.
+    let (send_id, turn_id, committed, gap_reason) =
+        send_turn_with_stale_replay(&mut scenario.host, &agent_id, 2, "Continue the work.").await;
+    assert_eq!(
+        gap_reason,
+        "Muse terminal notification did not match the exact active turn"
+    );
+    assert_ne!(turn_id, RETAINED_TURN);
+    assert_eq!(
+        committed
+            .iter()
+            .map(|(kind, _)| kind.as_str())
+            .collect::<Vec<_>>(),
+        ["turn.started", "message.completed", "turn.completed"]
+    );
+    for (kind, data) in &committed {
+        assert_ne!(
+            data.get("turn_id").and_then(Value::as_str),
+            Some(RETAINED_TURN),
+            "stale turn is never applied to generation 2: {kind}"
+        );
+        assert!(
+            !data
+                .to_string()
+                .contains("Retained reply from the previous generation"),
+            "stale text is never applied to generation 2: {kind}"
+        );
+    }
+    assert_eq!(
+        committed[1].1.get("text").and_then(Value::as_str),
+        Some("Hello from the fake MSP host.")
+    );
+    assert_eq!(
+        committed[2].1.get("status").and_then(Value::as_str),
+        Some("completed")
+    );
+
+    // Readback over the resumed session still proves the exact new terminal
+    // turn; the retained turn never surfaces as a generation-2 fact.
+    let snapshot = scenario
+        .host
+        .call(
+            "agent.snapshot",
+            json!({
+                "agent_id": agent_id,
+                "generation": 2,
+                "command_id": send_id,
+                "turn_id": Value::Null,
+            }),
+        )
+        .await
+        .expect("snapshot");
+    assert_eq!(snapshot.get("state").and_then(Value::as_str), Some("idle"));
+    assert_eq!(
+        snapshot["last_turn"].get("turn_id").and_then(Value::as_str),
+        Some(turn_id.as_str())
+    );
+    assert_eq!(
+        snapshot.get("result_known").and_then(Value::as_bool),
+        Some(true)
+    );
+
+    // The gap latches the session fail-closed: no further input is accepted
+    // on the disputed stream.
+    let fresh = scenario
+        .host
+        .call(
+            "agent.command",
+            json!({
+                "agent_id": agent_id,
+                "generation": 2,
+                "command_id": ulid::Ulid::new().to_string(),
+                "verb": "send",
+                "args": {"text": "After the stale replay."},
+                "turn_id": null,
+                "request_id": null,
+            }),
+        )
+        .await;
+    assert_eq!(fresh, Err("unknown".to_owned()));
+
+    stop_agent(&mut scenario.host, &agent_id, 2, false).await;
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    let stderr = scenario.host.shutdown_child().await;
+    assert!(!stderr.contains("panicked"), "plugin stderr: {stderr}");
+
+    let report = scenario.report();
+    assert_eq!(report["session_starts"], json!(0));
+    assert_eq!(report["session_resumes"], json!(1));
+    assert_eq!(report["turn_starts"], json!(1));
+    let _ = std::fs::remove_dir_all(&scenario.root);
+}
+
+async fn scenario_resume_refuses_served_history_and_keeps_the_retained_id() {
+    let agent_id = ulid::Ulid::new().to_string();
+    let (resume_from, source_state) = retained_resume_subject(&agent_id);
+    let (pending, rx) = Scenario::setup_start(
+        "resume-inline-history",
+        muse_profile(),
+        agent_id,
+        2,
+        resume_from,
+        source_state,
+    )
+    .await;
+    let mut attempt = pending.finish_expecting_error(rx, "unknown").await;
+
+    // `excludeItems: true` was requested but the host served `history.mode:
+    // "inline"`: the resume fails without adopting anything served, exactly
+    // one write happened, and no turn started.
+    let report = attempt.report();
+    assert_eq!(report["session_resumes"], json!(1));
+    assert_eq!(report["turn_starts"], json!(0));
+
+    // The unknown resume is never dispatched again.
+    attempt.retry("unknown").await;
+    assert_eq!(attempt.report()["session_resumes"], json!(1));
+
+    // The retained session id is kept: readback still addresses the exact
+    // retained session, never a served foreign identity.
+    let start_id = attempt
+        .params
+        .get("command_id")
+        .and_then(Value::as_str)
+        .expect("start command id")
+        .to_owned();
+    let agent_id = attempt.agent_id.clone();
+    let snapshot = attempt
+        .host
+        .call(
+            "agent.snapshot",
+            json!({
+                "agent_id": agent_id,
+                "generation": 2,
+                "command_id": start_id,
+                "turn_id": Value::Null,
+            }),
+        )
+        .await
+        .expect("snapshot");
+    assert_eq!(snapshot.get("state").and_then(Value::as_str), Some("idle"));
+    assert_eq!(
+        snapshot.get("native_ref").and_then(Value::as_str),
+        Some(RETAINED_SESSION)
+    );
+
+    stop_agent(&mut attempt.host, &agent_id, 2, false).await;
     attempt
         .host
         .call("shutdown", json!({}))

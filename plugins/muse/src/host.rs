@@ -220,6 +220,18 @@ impl MusePlugin {
             .map_err(|_| Error::new("internal", "Muse plugin manifest could not be encoded"))
     }
 
+    /// Retain a failed start exactly once: the same start command replays the
+    /// stored error without new native I/O, and any other start is refused.
+    fn retain_failed_start(&mut self, params: &AgentStartParams, error: Error) -> Error {
+        self.failed_start = Some(FailedStart {
+            agent_id: params.agent_id.clone(),
+            generation: params.generation,
+            command_id: params.command_id.clone(),
+            error: error.clone(),
+        });
+        error
+    }
+
     async fn start(&mut self, raw: &Value, peer: &PeerClient) -> Result<Value> {
         let params: AgentStartParams = decode(raw, "Muse agent.start params are invalid")?;
         validate_identity(&params.agent_id, params.generation, &params.command_id)?;
@@ -416,13 +428,7 @@ impl MusePlugin {
                 return Err(contextual_error(error, "unknown", message));
             }
             let error = session.native_client.diagnostic_error(error);
-            self.failed_start = Some(FailedStart {
-                agent_id: params.agent_id,
-                generation: params.generation,
-                command_id: params.command_id,
-                error: error.clone(),
-            });
-            return Err(error);
+            return Err(self.retain_failed_start(&params, error));
         }
 
         let initialized_native = match Self::initialize_native(
@@ -435,13 +441,7 @@ impl MusePlugin {
             Ok(initialized) => initialized,
             Err(error) => {
                 let error = discard_failed_start(&mut session, error).await;
-                self.failed_start = Some(FailedStart {
-                    agent_id: params.agent_id,
-                    generation: params.generation,
-                    command_id: params.command_id,
-                    error: error.clone(),
-                });
-                return Err(error);
+                return Err(self.retain_failed_start(&params, error));
             }
         };
         session.selected_effort = initialized_native.effort.clone();
@@ -457,13 +457,7 @@ impl MusePlugin {
                     ),
                 )
                 .await;
-                self.failed_start = Some(FailedStart {
-                    agent_id: params.agent_id,
-                    generation: params.generation,
-                    command_id: params.command_id,
-                    error: error.clone(),
-                });
-                return Err(error);
+                return Err(self.retain_failed_start(&params, error));
             }
             session.session_id = Some(subject.native_ref.clone());
             if let Err(error) = verify_resume_preflight(
@@ -479,13 +473,7 @@ impl MusePlugin {
                 );
                 let error = contextual_error(error, "native_readback", message);
                 let error = discard_failed_start(&mut session, error).await;
-                self.failed_start = Some(FailedStart {
-                    agent_id: params.agent_id,
-                    generation: params.generation,
-                    command_id: params.command_id,
-                    error: error.clone(),
-                });
-                return Err(error);
+                return Err(self.retain_failed_start(&params, error));
             }
         }
 
@@ -537,26 +525,14 @@ impl MusePlugin {
                 };
                 let error = contextual_error(error, code, message);
                 let error = discard_failed_start(&mut session, error).await;
-                self.failed_start = Some(FailedStart {
-                    agent_id: params.agent_id,
-                    generation: params.generation,
-                    command_id: params.command_id,
-                    error: error.clone(),
-                });
-                return Err(error);
+                return Err(self.retain_failed_start(&params, error));
             }
             Err(error) if native_no_write(&error.code) => {
                 let message = format!("Muse {session_method} was not dispatched");
                 let code = error.code.clone();
                 let error = contextual_error(error, code, message);
                 let error = discard_failed_start(&mut session, error).await;
-                self.failed_start = Some(FailedStart {
-                    agent_id: params.agent_id,
-                    generation: params.generation,
-                    command_id: params.command_id,
-                    error: error.clone(),
-                });
-                return Err(error);
+                return Err(self.retain_failed_start(&params, error));
             }
             Err(error) => {
                 self.session = Some(session);
@@ -579,23 +555,22 @@ impl MusePlugin {
                     if !resumed.session.session_id.trim().is_empty()
                         && resume_subject.as_ref().is_some_and(|subject| {
                             subject.native_ref == resumed.session.session_id
-                        }) =>
+                        })
+                        // excludeItems=true was requested: the served history
+                        // must be excluded (mode "none"), never republished.
+                        && resumed.history.mode == "none" =>
                 {
                     resumed
                 }
                 _ => {
-                    if let Some(session_id) = response_value
-                        .get("session")
-                        .and_then(|session| session.get("sessionId"))
-                        .and_then(Value::as_str)
-                    {
-                        session.session_id = Some(session_id.to_owned());
-                    }
+                    // The retained session id stays: a mismatched host
+                    // identity (or served history) fails the resume without
+                    // adopting the foreign identity.
                     self.session = Some(session);
                     return Err(Error::new(
                         "unknown",
                         format!(
-                            "Muse {session_method} returned without the exact expected session identity"
+                            "Muse {session_method} returned without the exact retained session identity and excluded history"
                         ),
                     ));
                 }
@@ -609,13 +584,7 @@ impl MusePlugin {
                     ),
                 )
                 .await;
-                self.failed_start = Some(FailedStart {
-                    agent_id: params.agent_id,
-                    generation: params.generation,
-                    command_id: params.command_id,
-                    error: error.clone(),
-                });
-                return Err(error);
+                return Err(self.retain_failed_start(&params, error));
             }
             if resumed.session.status != "idle" {
                 self.session = Some(session);
@@ -696,13 +665,7 @@ impl MusePlugin {
                         ),
                     )
                     .await;
-                    self.failed_start = Some(FailedStart {
-                        agent_id: params.agent_id,
-                        generation: params.generation,
-                        command_id: params.command_id,
-                        error: error.clone(),
-                    });
-                    return Err(error);
+                    return Err(self.retain_failed_start(&params, error));
                 }
             };
             let effort_ack: NativeSessionSetReasoningEffortResult =
@@ -717,13 +680,7 @@ impl MusePlugin {
                             ),
                         )
                         .await;
-                        self.failed_start = Some(FailedStart {
-                            agent_id: params.agent_id,
-                            generation: params.generation,
-                            command_id: params.command_id,
-                            error: error.clone(),
-                        });
-                        return Err(error);
+                        return Err(self.retain_failed_start(&params, error));
                     }
                 };
             if effort_ack.command_id != effort_command || effort_ack.status != "accepted" {
@@ -735,13 +692,7 @@ impl MusePlugin {
                     ),
                 )
                 .await;
-                self.failed_start = Some(FailedStart {
-                    agent_id: params.agent_id,
-                    generation: params.generation,
-                    command_id: params.command_id,
-                    error: error.clone(),
-                });
-                return Err(error);
+                return Err(self.retain_failed_start(&params, error));
             }
             let effective_effort = match read_effective_reasoning_effort(
                 &session.native_client,
@@ -752,13 +703,7 @@ impl MusePlugin {
                 Ok(effort) => effort,
                 Err(error) => {
                     let error = discard_failed_start(&mut session, error).await;
-                    self.failed_start = Some(FailedStart {
-                        agent_id: params.agent_id,
-                        generation: params.generation,
-                        command_id: params.command_id,
-                        error: error.clone(),
-                    });
-                    return Err(error);
+                    return Err(self.retain_failed_start(&params, error));
                 }
             };
             effort_verified = effective_effort.as_deref() == Some(effort);
@@ -789,13 +734,7 @@ impl MusePlugin {
                 ),
             )
             .await;
-            self.failed_start = Some(FailedStart {
-                agent_id: params.agent_id,
-                generation: params.generation,
-                command_id: params.command_id,
-                error: error.clone(),
-            });
-            return Err(error);
+            return Err(self.retain_failed_start(&params, error));
         }
         if let Err(error) = session
             .events
@@ -1425,23 +1364,22 @@ async fn read_owned_session(client: &NativeClient, session_id: &str) -> Result<N
     Ok(response.session)
 }
 
-/// Read back the standing session-default reasoning effort: the newest
-/// `session/reasoningEffortChanged` view event for the exact session. The set
-/// call's ack proves admission only, so the start path compares this readback
-/// against the requested tier before readiness.
-async fn read_effective_reasoning_effort(
+/// One backward `view/page` fetch, newest records first. Every durable-view
+/// scan in this file pages through this helper; callers fold their own
+/// records from the page and loop on `next_cursor` when one page cannot
+/// prove enough.
+async fn read_backward_page(
     client: &NativeClient,
     session_id: &str,
-) -> Result<Option<String>> {
-    // The set just landed at the view head, so one backward page from the
-    // head holds it; anything else writing here would be a foreign host.
+    cursor: Option<String>,
+) -> Result<NativeViewPageResult> {
     let params = NativeViewPageParams {
         session_id: session_id.to_owned(),
         limit: VIEW_PAGE_SIZE,
         direction: Some("backward".to_owned()),
-        cursor: None,
+        cursor,
     };
-    let response: NativeViewPageResult = serde_json::from_value(
+    serde_json::from_value(
         client
             .call(
                 "view/page",
@@ -1452,7 +1390,20 @@ async fn read_effective_reasoning_effort(
             )
             .await?,
     )
-    .map_err(|_| Error::new("native_readback", "Muse view/page response was invalid"))?;
+    .map_err(|_| Error::new("native_readback", "Muse view/page response was invalid"))
+}
+
+/// Read back the standing session-default reasoning effort: the newest
+/// `session/reasoningEffortChanged` view event for the exact session. The set
+/// call's ack proves admission only, so the start path compares this readback
+/// against the requested tier before readiness.
+async fn read_effective_reasoning_effort(
+    client: &NativeClient,
+    session_id: &str,
+) -> Result<Option<String>> {
+    // The set just landed at the view head, so one backward page from the
+    // head holds it; anything else writing here would be a foreign host.
+    let response = read_backward_page(client, session_id, None).await?;
     for event in response.events.iter().rev() {
         if event.method.as_str() != "session/reasoningEffortChanged" {
             continue;
@@ -1626,6 +1577,14 @@ async fn verify_resume_preflight(
     )
 }
 
+/// Accepting `idle`/`notLoaded` here is NOT proof the generation-1 host is
+/// gone (muse.md: "`notLoaded` alone does not prove session closure"). Eliot
+/// guarantees the old generation is terminal before this plugin ever runs:
+/// the Store admits resume only for a Stopped/Failed/Lost generation with no
+/// active turn (`crates/eliot-store/src/admission.rs`, resume arm), rechecks
+/// that gate at dispatch (`crates/eliot-store/src/dispatch.rs`, resume arm),
+/// and refuses while a stop is still in flight. The preflight only checks the
+/// retained session is resumable by this new generation.
 fn validate_resume_preflight(
     session: &NativeSession,
     retained_turn: Option<&str>,
@@ -1672,24 +1631,7 @@ async fn read_latest_native_turn_status(
     client: &NativeClient,
     session_id: &str,
 ) -> Result<Option<(String, String)>> {
-    let params = NativeViewPageParams {
-        session_id: session_id.to_owned(),
-        limit: VIEW_PAGE_SIZE,
-        direction: Some("backward".to_owned()),
-        cursor: None,
-    };
-    let response: NativeViewPageResult = serde_json::from_value(
-        client
-            .call(
-                "view/page",
-                serde_json::to_value(params).map_err(|_| {
-                    Error::new("internal", "Muse view/page params could not be encoded")
-                })?,
-                Instant::now() + RPC_TIMEOUT,
-            )
-            .await?,
-    )
-    .map_err(|_| Error::new("native_readback", "Muse view/page response was invalid"))?;
+    let response = read_backward_page(client, session_id, None).await?;
     for event in response.events.iter().rev() {
         match event.method.as_str() {
             "turn/completed" => {
@@ -1764,24 +1706,7 @@ async fn read_owned_turn(
     let mut terminal: Option<String> = None;
     let mut final_text: Option<String> = None;
     for _ in 0..MAX_VIEW_PAGES {
-        let params = NativeViewPageParams {
-            session_id: session_id.to_owned(),
-            limit: VIEW_PAGE_SIZE,
-            direction: Some("backward".to_owned()),
-            cursor: cursor.clone(),
-        };
-        let response: NativeViewPageResult = serde_json::from_value(
-            client
-                .call(
-                    "view/page",
-                    serde_json::to_value(params).map_err(|_| {
-                        Error::new("internal", "Muse view/page params could not be encoded")
-                    })?,
-                    Instant::now() + RPC_TIMEOUT,
-                )
-                .await?,
-        )
-        .map_err(|_| Error::new("native_readback", "Muse view/page response was invalid"))?;
+        let response = read_backward_page(client, session_id, cursor.clone()).await?;
         for event in response.events.iter().rev() {
             observe_view_event(
                 event,
