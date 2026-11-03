@@ -601,15 +601,24 @@ impl FakeMsp {
                             self.prompts_opened = 2;
                         }
                         "request-stale-choice" => {
+                            // The open carries the stage-2 offer and the
+                            // update repeats it: the stage-1 choice id the
+                            // scenario names is unknown to the current offer
+                            // whether the update has applied yet or not, so
+                            // the first reply is rejected locally without a
+                            // write under both interleavings. (An update
+                            // that *changes* the choices cannot
+                            // synchronize with the reply — it commits
+                            // nothing observable — so the offer-advance path
+                            // is covered by the multistage and stale-decide
+                            // scenarios instead.)
                             let open = self.approval_request_params(
                                 &session_id,
                                 &command,
                                 "fake-approval-1",
-                                1,
+                                2,
                             );
                             self.emit_request(stdout, "approval/request", open);
-                            // The offer advances before any reply: stage-1
-                            // choice ids go stale.
                             self.approval_stage = 2;
                             let updated =
                                 self.approval_updated_params(&session_id, "fake-approval-1", 2);
@@ -3876,9 +3885,10 @@ async fn scenario_decide_internal_error_is_unknown_without_rewrite() {
     let _ = std::fs::remove_dir_all(&scenario.root);
 }
 
-/// The caller's opened snapshot goes stale when the offer advances: a reply
-/// naming a stage-1 choice after the stage-2 update is rejected, while a
-/// reply against the current offer applies with the current requirement.
+/// A reply naming a choice id the current offer never carried is rejected
+/// locally without a write, while a reply against the current offer applies
+/// with the current requirement. The update repeats the opened offer, so the
+/// first reply behaves identically whether the update has applied yet or not.
 async fn scenario_stale_choice_after_update_is_rejected() {
     let mut scenario = Scenario::start("request-stale-choice", muse_profile()).await;
     let agent_id = scenario.agent_id.clone();
@@ -3891,10 +3901,10 @@ async fn scenario_stale_choice_after_update_is_rejected() {
         .map(|(_, data)| data)
         .expect("request.opened");
     let request_id = opened["request_id"].as_str().expect("request id");
-    // The Store keeps the opened (stage-1) snapshot.
+    // The Store keeps the opened snapshot.
     assert_eq!(
         opened["details"]["current_requirement"]["sourceIndex"],
-        json!(1)
+        json!(2)
     );
 
     let (_, stale, _) = reply(
