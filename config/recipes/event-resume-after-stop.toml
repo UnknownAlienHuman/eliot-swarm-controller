@@ -10,8 +10,7 @@
 #   eliot rule show resume-after-known-stop
 #
 # CI runs this exact file against the Fake profile (harness swapped to
-# "fake", stop id substituted, nothing else changed); the live Codex
-# demonstration is pending the owner's go-ahead.
+# "fake", stop id substituted, nothing else changed).
 
 [[rule]]
 id = "resume-after-known-stop"

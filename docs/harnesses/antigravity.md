@@ -40,7 +40,8 @@ The stdout stream owns supplied session/turn/message/tool/child/usage families. 
 terminal result can settle its single outstanding prompt even if no intermediate update
 was emitted. SUCCESS/ERROR/INVALID/CANCELED/INTERRUPTED map from the installed schema;
 WAITING/RUNNING are nonterminal. A soft-denied tool remains visible even under a successful
-final result. Cumulative usage replaces the previous session counter.
+final result. Cumulative usage replaces the previous session counter. Requested,
+effective and served model are separate facts; one never stands in for another.
 
 There is no assumed replay cursor/history API. Loss means explicit gap and only available
 exact current-state readback. Do not replay conversation history or infer success from

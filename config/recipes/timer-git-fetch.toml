@@ -18,7 +18,6 @@
 #
 # CI runs this exact rule file against the Fake profile; its registration swaps
 # the profile, the checkout path and the fetch endpoint for a local test remote.
-# The live Codex demonstration is pending the owner's go-ahead.
 
 [[rule]]
 id = "refresh-origin-main"
