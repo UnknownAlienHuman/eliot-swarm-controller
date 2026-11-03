@@ -1324,10 +1324,27 @@ impl MusePlugin {
         if let Some(result) = control_replay(session, &params)? {
             return Ok(result);
         }
-        if session.phase != SessionPhase::Ready
-            || session.events.status().active_turn_id.as_deref() != Some(turn_id)
-            || session.events.status().source_unknown
-        {
+        if session.phase != SessionPhase::Ready || session.events.status().source_unknown {
+            let result = rejected_control("Muse steer does not match a healthy active turn");
+            settle_control(
+                session,
+                &params.command_id,
+                ControlOutcome::Rejected(result.clone()),
+            );
+            return Ok(result);
+        }
+        // The turn itself is gated authoritatively: the event task owns the
+        // active turn and answers behind the terminal commit, so a steer
+        // that arrives after the terminal batch never writes to a dead turn.
+        let live = match session.events.check_turn(turn_id).await {
+            Ok(live) => live,
+            Err(error) => {
+                let result = unknown_control(&error.message);
+                settle_control(session, &params.command_id, ControlOutcome::Unknown);
+                return Ok(result);
+            }
+        };
+        if !live {
             let result = rejected_control("Muse steer does not match a healthy active turn");
             settle_control(
                 session,
@@ -1431,7 +1448,19 @@ impl MusePlugin {
                 "Muse plugin is stopping; no further input is accepted",
             ));
         }
-        if session.events.status().active_turn_id.as_deref() != Some(turn_id) {
+        // The turn itself is gated authoritatively: the event task owns the
+        // active turn and answers behind the terminal commit, so an interrupt
+        // that arrives after the terminal batch sees `stale_turn` instead of
+        // sending a second native cancel.
+        let live = match session.events.check_turn(turn_id).await {
+            Ok(live) => live,
+            Err(error) => {
+                let result = unknown_control(&error.message);
+                settle_control(session, &params.command_id, ControlOutcome::Unknown);
+                return Ok(result);
+            }
+        };
+        if !live {
             return Err(Error::new(
                 "stale_turn",
                 "Muse turn/cancel does not match the exact active turn",

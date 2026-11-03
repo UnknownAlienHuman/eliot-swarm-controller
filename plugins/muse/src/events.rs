@@ -92,6 +92,10 @@ enum Control {
         args: Value,
         reply: oneshot::Sender<Result<Value>>,
     },
+    CheckTurn {
+        turn_id: String,
+        reply: oneshot::Sender<bool>,
+    },
     AdoptPulled {
         entries: Vec<CorePending>,
         expected: Vec<String>,
@@ -258,6 +262,28 @@ impl EventHandle {
             .map_err(|_| Error::new("unknown", "Muse event-control response was lost"))?
     }
 
+    /// Authoritative exact-turn gate for steer/interrupt: the check runs
+    /// on the event task, serialized behind the terminal commit, so a
+    /// control that arrives after the terminal batch always sees the
+    /// finished turn even though the watch snapshot still lags it.
+    pub async fn check_turn(&self, turn_id: &str) -> Result<bool> {
+        let (reply, response) = oneshot::channel();
+        timeout_at(
+            Instant::now() + EVENT_DEADLINE,
+            self.control.send(Control::CheckTurn {
+                turn_id: turn_id.to_owned(),
+                reply,
+            }),
+        )
+        .await
+        .map_err(|_| Error::new("unknown", "Muse event-control queue deadline elapsed"))?
+        .map_err(|_| Error::new("unknown", "Muse event processor stopped"))?;
+        timeout_at(Instant::now() + EVENT_DEADLINE, response)
+            .await
+            .map_err(|_| Error::new("unknown", "Muse event-control outcome is unknown"))?
+            .map_err(|_| Error::new("unknown", "Muse event-control response was lost"))
+    }
+
     pub async fn adopt_pulled(
         &self,
         entries: Vec<CorePending>,
@@ -382,6 +408,10 @@ impl EventProcessor {
                     .reply_request(&command_id, &request_id, &turn_id, &verb, &args)
                     .await;
                 let _ = reply.send(result);
+                true
+            }
+            Control::CheckTurn { turn_id, reply } => {
+                let _ = reply.send(self.status.active_turn_id.as_deref() == Some(turn_id.as_str()));
                 true
             }
             Control::AdoptPulled {
