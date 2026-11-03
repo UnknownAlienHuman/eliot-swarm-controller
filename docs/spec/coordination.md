@@ -29,8 +29,10 @@ Message {
 
 Direct delivery uses the write id; selector expansion captures concrete recipients and
 creates `<write-id>/<recipient-agent>` rows in one bounded transaction. The selector is
-not reevaluated later. Same id with different identity/mode/body rejects; unknown
-recipient never creates an Agent. Text is at most 32 KiB, known secrets rejected.
+not reevaluated later. One admission names 1–100 concrete recipients. Same id with
+different identity/mode/body rejects; unknown recipient never creates an Agent. Text
+is at most 32 KiB, known secrets rejected. Only `queue` mode is connected; `send`,
+`steer` and `inject` presentation return `unsupported`.
 
 `recipient_generation` records the addressee's incarnation at admission and binds any
 native presentation command. It does **not** make queued correspondence disappear when
@@ -47,10 +49,14 @@ conversation. Native turn success is separate from message delivery/read state.
 `queue` stores text only. `send`, `steer`, and `inject` use ordinary generation/turn-bound
 commands and report their actual application point. Presented is not read or understood.
 
-With `wake_on_mail=true`, a routed recipient may receive one generic coalesced notice
+With `wake_on_mail=true` (read from the recipient's frozen profile snapshot,
+default true), a routed recipient may receive one generic coalesced notice
 per minute, with at most one open notice command: `N unread messages; run eliot inbox`.
-It never contains the body or marks it read. Unknown notice is not blindly retried;
+The notice is an ordinary owner `send` bound to the recipient's current
+generation and carrying only the unread count at claim time. It never contains
+the body or marks it read. Unknown notice is not blindly retried;
 provider hold, pending request, current unknown gate and drain suppress new wake.
+A recipient with no live plugin owner for a dispatched generation stays queue-only.
 
 Without independent recipient identity, route only a generic notice to a live routed
 parent/manager, otherwise stay queue-only. Parent notifications follow the same policy.
@@ -94,8 +100,11 @@ CREATE INDEX messages_thread ON messages(thread,id);
 
 ## Shared variables
 
-Scopes: project, tree, global. JSON/string values are at most 16 KiB, known secrets
-rejected. Each write increments version; `expect_version` is CAS, not last-writer guess.
+Scopes encode as `global` or `project:<name>`; tree scopes need hierarchy
+membership and return `unsupported`. JSON values are at most 16 KiB encoded,
+known secrets rejected. Each write increments version; `expect_version` is CAS,
+not last-writer guess: an omitted expectation writes unconditionally, while a
+supplied one must equal the current version, where an absent row reads as 0.
 `set_by` records the current principal. Changes emit `var.changed`.
 
 ```sql

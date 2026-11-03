@@ -2,6 +2,7 @@
 //! admission and effect handling remain in the Router and Store.
 
 mod agent_views;
+mod coordination;
 mod git;
 mod goals;
 mod monitor_views;
@@ -24,6 +25,14 @@ pub use agent_views::{
     DaemonStatusResponse, GitCredentialHelper, PROCESS_CURSOR_MAX_BYTES, ProcessPageCursor,
     ProjectGitView, ProjectRegistrationView, SourceOwner, SourceState, StatusBlocker,
     UnsettledCommandSummary, WorkspaceCustodyView,
+};
+pub use coordination::{
+    MAIL_NOTICE_COOLDOWN_MS, MAX_MAIL_ACK_IDS, MAX_MAIL_INBOX_ROWS, MAX_MAIL_RECIPIENTS,
+    MAX_MAIL_TEXT_BYTES, MAX_MAIL_THREAD_BYTES, MAX_VAR_KEY_BYTES, MAX_VAR_NOTE_BYTES,
+    MAX_VAR_SCOPE_BYTES, MAX_VAR_VALUE_BYTES, MailAckRequest, MailAckResponse, MailDelivery,
+    MailDeliverySummary, MailInboxRequest, MailInboxResponse, MailMode, MailReadRequest,
+    MailSendRequest, MailSendResponse, VarGetRequest, VarGetResponse, VarScope, VarSetRequest,
+    VarSetResponse, parse_var_scope,
 };
 pub use git::{
     DEFAULT_GIT_FETCH_TIMEOUT_MS, FrozenGitFetch, GitFetchDefinitionArgs, GitFetchOutcome,

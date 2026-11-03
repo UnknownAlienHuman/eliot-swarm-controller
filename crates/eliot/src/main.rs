@@ -13,11 +13,14 @@ use eliot_core::{
         DiscoverPage, EventsFilter, EventsReadRequest, EventsReadResponse, EventsSubscribeRequest,
         EventsSubscribeResponse, GoalClearRequest, GoalDefinition, GoalGetRequest, GoalMode,
         GoalPauseRequest, GoalResumeRequest, GoalRoundRequest, GoalRoundResponse, GoalSetRequest,
-        GoalView, ObservationPage, ProjectRegistrationView, ProviderClearHoldRequest,
+        GoalView, MailAckRequest, MailAckResponse, MailDelivery, MailInboxRequest,
+        MailInboxResponse, MailMode, MailReadRequest, MailSendRequest, MailSendResponse,
+        ObservationPage, ProjectRegistrationView, ProviderClearHoldRequest,
         ProviderClearHoldResponse, ProviderCorrectiveEvidence, ProviderHoldsRequest,
         ProviderHoldsResponse, RuleCatchUpRequest, RuleGetRequest, RuleStateView, ShutdownMode,
         TimerGetRequest, TimerRunRequest, TimerStateView, TurnGetRequest, TurnResolveRequest,
-        TurnResolveResponse, TurnResolveStatus,
+        TurnResolveResponse, TurnResolveStatus, VarGetRequest, VarGetResponse, VarSetRequest,
+        VarSetResponse,
     },
 };
 use serde_json::{Value, json};
@@ -350,6 +353,27 @@ enum CliCommand {
         #[command(flatten)]
         page: PageArgs,
     },
+    /// Send, read or acknowledge addressed Agent mail.
+    Msg {
+        #[command(subcommand)]
+        command: MsgCommand,
+    },
+    /// Read one page of unread mail for a mailbox.
+    Inbox {
+        #[arg(value_name = "AGENT")]
+        agent: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long, value_name = "DELIVERY")]
+        after: Option<String>,
+        #[arg(long, value_name = "SECS")]
+        wait: Option<u64>,
+    },
+    /// Read or compare-and-swap shared variables.
+    Var {
+        #[command(subcommand)]
+        command: VarCommand,
+    },
     /// Internal plugin entry point used by the daemon.
     #[command(hide = true)]
     Plugin {
@@ -416,6 +440,64 @@ enum TurnCommand {
         status: String,
         #[arg(long, value_name = "TEXT")]
         reason: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum MsgCommand {
+    /// Queue one message to the named recipients.
+    Send {
+        #[arg(long, value_name = "AGENT")]
+        to: Vec<String>,
+        #[arg(value_name = "TEXT", allow_hyphen_values = true)]
+        text: String,
+        #[arg(long, value_name = "LABEL")]
+        thread: Option<String>,
+        #[arg(long, value_name = "DELIVERY")]
+        reply_to: Option<String>,
+        #[arg(long, value_parser = ["queue", "send", "steer", "inject"], default_value = "queue")]
+        mode: String,
+    },
+    /// Read one exact delivery without marking it.
+    Show {
+        #[arg(value_name = "DELIVERY")]
+        delivery: String,
+        #[arg(long, value_name = "AGENT")]
+        agent: Option<String>,
+    },
+    /// Acknowledge exact delivery ids.
+    Ack {
+        #[arg(long, value_name = "DELIVERY")]
+        delivery: Vec<String>,
+        #[arg(long, value_name = "AGENT")]
+        agent: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum VarCommand {
+    /// Write one variable, optionally guarded by its expected version.
+    Set {
+        #[arg(value_name = "KEY")]
+        key: String,
+        #[arg(value_name = "VALUE", allow_hyphen_values = true)]
+        value: String,
+        #[arg(long, value_name = "SCOPE")]
+        scope: Option<String>,
+        /// Parse VALUE as JSON instead of storing it as a string.
+        #[arg(long)]
+        as_json: bool,
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(i64).range(0..))]
+        expect_version: Option<i64>,
+        #[arg(long, value_name = "TEXT")]
+        note: Option<String>,
+    },
+    /// Read one variable value with its version and writer.
+    Get {
+        #[arg(value_name = "KEY")]
+        key: String,
+        #[arg(long, value_name = "SCOPE")]
+        scope: Option<String>,
     },
 }
 
@@ -615,6 +697,8 @@ impl Failure {
                 | "provider_held"
                 | "frame_too_large"
                 | "secret_in_payload"
+                | "mailbox_full"
+                | "version_conflict"
                 | "id_conflict"
                 | "id_expired"
                 | "profile_error" => 3,
@@ -1601,6 +1685,177 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             print_value(&result, json_output);
             Ok(0)
         }
+        CliCommand::Msg { command } => match command {
+            MsgCommand::Send {
+                to,
+                text,
+                thread,
+                reply_to,
+                mode,
+            } => {
+                let mode: MailMode = serde_json::from_value(Value::String(mode)).map_err(|_| {
+                    Failure::new(2, "mail mode must be queue, send, steer or inject")
+                })?;
+                let request = MailSendRequest {
+                    id: mutation_id(id)?,
+                    to,
+                    mode,
+                    text,
+                    thread,
+                    reply_to_delivery: reply_to,
+                };
+                request
+                    .validate()
+                    .map_err(|error| Failure::from_core(error, true))?;
+                let response: MailSendResponse =
+                    eliot_daemon::client_call_typed(&data_dir, "mail.send", &request)
+                        .await
+                        .map_err(|error| Failure::from_core(error, true))?;
+                request
+                    .validate_response(&response)
+                    .map_err(|_| Failure::new(4, "mail.send response is invalid"))?;
+                let value = serde_json::to_value(response)
+                    .map_err(|_| Failure::new(4, "mail.send response is invalid"))?;
+                print_value(&value, json_output);
+                Ok(0)
+            }
+            MsgCommand::Show { delivery, agent } => {
+                let request = MailReadRequest {
+                    agent,
+                    delivery_id: delivery,
+                };
+                request
+                    .validate()
+                    .map_err(|error| Failure::from_core(error, false))?;
+                let response: MailDelivery =
+                    eliot_daemon::client_call_typed(&data_dir, "mail.read", &request)
+                        .await
+                        .map_err(|error| Failure::from_core(error, false))?;
+                request
+                    .validate_response(&response)
+                    .map_err(|_| Failure::new(4, "mail.read response is invalid"))?;
+                let value = serde_json::to_value(response)
+                    .map_err(|_| Failure::new(4, "mail.read response is invalid"))?;
+                print_value(&value, json_output);
+                Ok(0)
+            }
+            MsgCommand::Ack { delivery, agent } => {
+                let request = MailAckRequest {
+                    id: mutation_id(id)?,
+                    agent,
+                    deliveries: delivery,
+                };
+                request
+                    .validate()
+                    .map_err(|error| Failure::from_core(error, true))?;
+                let response: MailAckResponse =
+                    eliot_daemon::client_call_typed(&data_dir, "mail.ack", &request)
+                        .await
+                        .map_err(|error| Failure::from_core(error, true))?;
+                request
+                    .validate_response(&response)
+                    .map_err(|_| Failure::new(4, "mail.ack response is invalid"))?;
+                let value = serde_json::to_value(response)
+                    .map_err(|_| Failure::new(4, "mail.ack response is invalid"))?;
+                print_value(&value, json_output);
+                Ok(0)
+            }
+        },
+        CliCommand::Inbox {
+            agent,
+            limit,
+            after,
+            wait,
+        } => {
+            let request = MailInboxRequest {
+                agent,
+                limit,
+                after,
+            };
+            request
+                .validate()
+                .map_err(|error| Failure::from_core(error, false))?;
+            let deadline = wait.map(|secs| Instant::now() + Duration::from_secs(secs));
+            loop {
+                let response: MailInboxResponse =
+                    eliot_daemon::client_call_typed(&data_dir, "mail.inbox", &request)
+                        .await
+                        .map_err(|error| Failure::from_core(error, false))?;
+                request
+                    .validate_response(&response)
+                    .map_err(|_| Failure::new(4, "mail.inbox response is invalid"))?;
+                let done = match deadline {
+                    None => true,
+                    Some(end) => !response.deliveries.is_empty() || Instant::now() >= end,
+                };
+                if done {
+                    let value = serde_json::to_value(&response)
+                        .map_err(|_| Failure::new(4, "mail.inbox response is invalid"))?;
+                    print_value(&value, json_output);
+                    if deadline.is_some() && response.deliveries.is_empty() {
+                        return Ok(5);
+                    }
+                    return Ok(0);
+                }
+                sleep(WAIT_POLL_INTERVAL).await;
+            }
+        }
+        CliCommand::Var { command } => match command {
+            VarCommand::Set {
+                key,
+                value,
+                scope,
+                as_json,
+                expect_version,
+                note,
+            } => {
+                let value = if as_json {
+                    serde_json::from_str(&value)
+                        .map_err(|_| Failure::new(2, "--as-json value must be valid JSON"))?
+                } else {
+                    Value::String(value)
+                };
+                let request = VarSetRequest {
+                    id: mutation_id(id)?,
+                    scope,
+                    key,
+                    value,
+                    expect_version,
+                    note,
+                };
+                request
+                    .validate()
+                    .map_err(|error| Failure::from_core(error, true))?;
+                let response: VarSetResponse =
+                    eliot_daemon::client_call_typed(&data_dir, "var.set", &request)
+                        .await
+                        .map_err(|error| Failure::from_core(error, true))?;
+                request
+                    .validate_response(&response)
+                    .map_err(|_| Failure::new(4, "var.set response is invalid"))?;
+                let value = serde_json::to_value(response)
+                    .map_err(|_| Failure::new(4, "var.set response is invalid"))?;
+                print_value(&value, json_output);
+                Ok(0)
+            }
+            VarCommand::Get { key, scope } => {
+                let request = VarGetRequest { scope, key };
+                request
+                    .validate()
+                    .map_err(|error| Failure::from_core(error, false))?;
+                let response: VarGetResponse =
+                    eliot_daemon::client_call_typed(&data_dir, "var.get", &request)
+                        .await
+                        .map_err(|error| Failure::from_core(error, false))?;
+                request
+                    .validate_response(&response)
+                    .map_err(|_| Failure::new(4, "var.get response is invalid"))?;
+                let value = serde_json::to_value(response)
+                    .map_err(|_| Failure::new(4, "var.get response is invalid"))?;
+                print_value(&value, json_output);
+                Ok(0)
+            }
+        },
         CliCommand::Plugin { command } => match command {
             PluginCommand::Fake => {
                 eliot_plugin::run_fake()

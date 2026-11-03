@@ -98,7 +98,8 @@ rule actions have bounded derived ids. No general receipt/floor framework.
 | `agent.discover` | owner-only native metadata discovery, without creating Agents |
 | `agent.history` | owner-only bounded history of an exact observed subject |
 | `hook.event` | later exact request/deadline decision |
-| `mail.send/inbox/read/ack`, `var.*`, `who`, `claim.*` | later coordination |
+| `mail.send/inbox/read/ack`, `var.set/get` | addressed queued mail with separate acknowledgement, shared variables with CAS |
+| `who`, `claim.*` | later coordination |
 | `rule.*` except `rule.get/catch_up` | later automation; effects remain commands |
 
 Canonical public wire types are re-exported by
@@ -123,12 +124,13 @@ preserve the intended future contract, but do not imply current availability.
 | Timer schedules and requests | [timers.rs](../../crates/eliot-core/src/api/timers.rs) |
 | Goal definitions, views and rounds | [goals.rs](../../crates/eliot-core/src/api/goals.rs) |
 | Discovery/history queries and pages | [native_requests.rs](../../crates/eliot-core/src/api/native_requests.rs), [native_pages.rs](../../crates/eliot-core/src/api/native_pages.rs) |
+| Mail and variable requests, deliveries and pages | [coordination.rs](../../crates/eliot-core/src/api/coordination.rs) |
 | Event queries, filters and pages | [api.rs](../../crates/eliot-core/src/api.rs) |
 
 Errors include
 `not_found`, `unsupported`, `not_allowed`, `bad_state`, `stale_generation`, `invalid`,
 `busy`, `unavailable`, `capacity_unavailable`, `provider_held`, `history_gap`, `source_integrity`,
-`secret_in_payload`, `frame_too_large`, `mailbox_full`, `internal`.
+`secret_in_payload`, `frame_too_large`, `mailbox_full`, `version_conflict`, `internal`.
 
 `capacity_unavailable` is a pre-effect rejection from a retained prior-generation
 reservation or a configured Eliot `max_live` scope, not a vendor quota or entitlement
@@ -633,6 +635,49 @@ Authorize the current caller for that stable mailbox and acknowledge only those 
 A lost response may redisplay mail, not lose it or acknowledge newly arrived messages.
 See [coordination](coordination.md#mailbox) for bounds and presentation policy.
 
+## Mail and variables
+
+`mail.send` queues one message to 1–100 concrete Agents in a single bounded
+transaction, snapshotting each recipient's current generation; unknown ids
+never create Agents. Only `queue` mode is connected; `send`, `steer` and
+`inject` presentation modes return `unsupported`. The owner may mail any
+Agent; an Agent principal may mail only Agents in its own project, and its
+generation must still be current. A reply names the exact delivery being
+answered and addresses only the original participants; the sender must be
+one of them unless it is the owner. Mail text is at most 32 KiB and, like
+every other coordination payload, rejects known credentials with
+`secret_in_payload`.
+
+`mail.inbox` pages unread rows oldest-first with a limit of 1–100 (default
+100) and an `after` delivery cursor, truncated to the encoded response
+bound; `next` is the last returned delivery id, or null on an empty page.
+`mail.read` returns one exact row. Both are read-only. An Agent caller reads
+only its own stable mailbox and may omit `agent`; the owner must name the
+mailbox explicitly. `mail.ack` acknowledges only the listed exact delivery
+ids, idempotently; an unknown or foreign id rejects the whole
+acknowledgement with `not_found` and marks nothing. All three writes bind
+their ULID idempotently to principal, method and semantic payload.
+
+`var.set` and `var.get` address scopes encoded as `global` or
+`project:<name>`; tree scopes are `unsupported` until hierarchy membership
+exists. An omitted scope resolves to the Agent caller's project; the owner
+must name the scope explicitly. Only the owner writes global variables;
+Agents write only their own project's variables and read their project's
+plus global ones. Values are JSON of at most 16 KiB encoded. An omitted
+`expect_version` writes unconditionally; a supplied one must equal the
+current version, where an absent row reads as 0, otherwise the write is
+rejected with `version_conflict` and nothing changes. Every write
+increments the version, records `set_by`, and emits `var.changed`.
+
+A routed recipient with `wake_on_mail` (profile snapshot, default true) may
+receive one generic coalesced wake per minute with at most one open notice
+command: `N unread messages; run eliot inbox`. The notice never contains
+the body, is sent through the ordinary owner `send` path bound to the
+recipient's current generation, and is skipped — never retried — while a
+notice command is open or unknown, a provider hold, pending request or
+unknown command/turn stands, the daemon is draining, or no live plugin
+owner exists. See [coordination](coordination.md#modes-and-wake).
+
 ## Drain and shutdown
 
 `daemon.shutdown` uses the canonical `DaemonShutdownRequest`/`DaemonShutdownResponse`.
@@ -685,8 +730,8 @@ eliot approve|deny|answer ... [--request R]
 eliot configure ... | compact|fork|background ...
 eliot cmd show|children|cancel|resolve ...
 eliot events [--since SEQ] [--allow-gap]
-eliot msg send ... | inbox [--wait SECS] [--all]
-eliot var ... | who ... | claim ... | release ...
+eliot msg send ... | msg show ... | msg ack ... | inbox [AGENT] [--wait SECS]
+eliot var set ... | var get ... | who ... | claim ... | release ...
 eliot project list | show ID
 eliot rule show ID [--project PROJECT]
 eliot rule catch-up ID --after SEQ [--through SEQ] [--project PROJECT]
