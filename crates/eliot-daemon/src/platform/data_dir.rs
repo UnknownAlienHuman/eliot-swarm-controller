@@ -563,6 +563,42 @@ mod tests {
     }
 
     #[test]
+    fn republish_waits_out_a_reader_holding_daemon_metadata_open() {
+        let root = TestRoot::new();
+        let data = DataDir::open(&root.path).expect("initialize private data directory");
+        let lock = data.acquire_daemon_lock().expect("daemon lock");
+        data.publish_daemon(&lock, "first-endpoint", "test")
+            .expect("first publish");
+        // A CLI client reading daemon.json while a restarted daemon republishes it.
+        let target = data.path().join(DAEMON_INFO_FILE);
+        let reader = File::open(&target).expect("open metadata");
+        // Pin the premise: while the reader holds the file, a single replace fails
+        // with the error CI saw, so the publish below must go through the retry.
+        let probe = data.path().join(".replace-probe.tmp");
+        fs::write(&probe, b"{}").expect("write probe");
+        let single = super::super::windows::replace_file_once(&probe, &target)
+            .expect_err("a held target refuses a single replace");
+        assert_eq!(single.raw_os_error(), Some(5), "{single}");
+        fs::remove_file(&probe).expect("remove probe");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(reader);
+        });
+        let info = data
+            .publish_daemon(&lock, "second-endpoint", "test")
+            .expect("republish while a reader briefly holds the file");
+        release.join().expect("reader thread");
+        assert_eq!(info.endpoint, "second-endpoint");
+        assert_eq!(
+            data.read_daemon_info()
+                .expect("read metadata")
+                .expect("metadata present")
+                .endpoint,
+            "second-endpoint"
+        );
+    }
+
+    #[test]
     fn daemon_metadata_read_rejects_and_preserves_unsafe_acl() {
         let root = TestRoot::new();
         let data = DataDir::open(&root.path).expect("initialize private data directory");
