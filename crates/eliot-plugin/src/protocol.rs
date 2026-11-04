@@ -111,6 +111,22 @@ pub fn valid_private_id(id: &Value) -> bool {
     id.is_null() || id.is_string() || id.is_number()
 }
 
+/// Encoding failures, mapped to errors by each end of the private connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EncodeErrorKind {
+    Unencodable,
+    TooLarge,
+}
+
+/// Encode the private protocol grammar, without transport or error policy.
+pub fn encode_private_frame<T: Serialize>(message: &T) -> Result<String, EncodeErrorKind> {
+    let encoded = serde_json::to_string(message).map_err(|_| EncodeErrorKind::Unencodable)?;
+    if encoded.len().saturating_add(1) > MAX_FRAME_BYTES {
+        return Err(EncodeErrorKind::TooLarge);
+    }
+    Ok(encoded)
+}
+
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct PluginManifest {
     pub name: String,

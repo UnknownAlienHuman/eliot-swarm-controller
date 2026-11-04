@@ -465,6 +465,7 @@ impl OpenCodePlugin {
             session.server.pid(),
             "OpenCode",
             "server",
+            "session",
             RPC_TIMEOUT,
         )
         .await

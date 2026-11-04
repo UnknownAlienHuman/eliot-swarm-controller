@@ -1,6 +1,7 @@
 use crate::protocol::{
-    DecodeErrorKind, MAX_EVENT_BYTES, MAX_FRAME_BYTES, PrivateIncoming as Incoming, RpcError,
-    RpcRequest, RpcResponse, decode_private_frame,
+    DecodeErrorKind, EncodeErrorKind, MAX_EVENT_BYTES, MAX_FRAME_BYTES,
+    PrivateIncoming as Incoming, RpcError, RpcRequest, RpcResponse, decode_private_frame,
+    encode_private_frame,
 };
 use crate::sync::LockExt;
 use eliot_core::{
@@ -478,15 +479,14 @@ fn decode_frame(line: &str) -> std::result::Result<Incoming, RpcError> {
 }
 
 fn encode_frame<T: Serialize>(message: &T) -> Result<String> {
-    let encoded = serde_json::to_string(message)
-        .map_err(|_| Error::new("internal", "JSON-RPC frame could not be encoded"))?;
-    if encoded.len().saturating_add(1) > MAX_FRAME_BYTES {
-        return Err(Error::new(
-            "frame_too_large",
-            "encoded JSON-RPC frame exceeds 1 MiB",
-        ));
-    }
-    Ok(encoded)
+    encode_private_frame(message).map_err(|kind| match kind {
+        EncodeErrorKind::Unencodable => {
+            Error::new("internal", "JSON-RPC frame could not be encoded")
+        }
+        EncodeErrorKind::TooLarge => {
+            Error::new("frame_too_large", "encoded JSON-RPC frame exceeds 1 MiB")
+        }
+    })
 }
 
 fn response_error(error: Error) -> RpcError {
