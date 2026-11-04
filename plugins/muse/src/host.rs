@@ -519,8 +519,17 @@ impl MusePlugin {
                     "Muse resume preflight failed before session/resume dispatch: {}",
                     error.message
                 );
-                let error = contextual_error(error, "native_readback", message);
+                // Only prerequisite reads ran; native session effects were not dispatched.
+                let error = error.with_code("native_readback").with_message(message);
                 let error = discard_failed_start(&mut session, error).await;
+                if session.phase == SessionPhase::Unknown {
+                    let message = format!(
+                        "{}; owned session host cleanup is unconfirmed; no session/resume or input was sent",
+                        error.message
+                    );
+                    self.session = Some(session);
+                    return Err(error.with_code("unknown").with_message(message));
+                }
                 return Err(self.retain_failed_start(&params, error));
             }
         }
@@ -1975,11 +1984,14 @@ async fn terminate_session(session: &mut AgentSession, force: bool) -> Result<()
 
 async fn discard_unstarted(session: &mut AgentSession) {
     session.events.close().await;
-    let _ = session
+    session.phase = match session
         .native
         .terminate(true, Instant::now() + RPC_TIMEOUT)
-        .await;
-    session.phase = SessionPhase::Stopped;
+        .await
+    {
+        Ok(_) => SessionPhase::Stopped,
+        Err(_) => SessionPhase::Unknown,
+    };
 }
 
 async fn discard_failed_start(session: &mut AgentSession, error: Error) -> Error {
