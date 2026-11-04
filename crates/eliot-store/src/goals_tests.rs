@@ -34,6 +34,7 @@ fn ready_agent(store: &mut Store, project: &str, now: i64) -> String {
             SubmitCommand {
                 id: launch_id.clone(),
                 target: None,
+                selector: None,
                 verb: "launch".to_owned(),
                 args: json!({"project":project, "workspace":"synthetic-workspace"}),
                 expected_generation: Some(0),
@@ -100,6 +101,7 @@ fn attach_observer(store: &mut Store, now: i64) -> String {
     let request = SubmitCommand {
         id: Ulid::new().to_string(),
         target: None,
+        selector: None,
         verb: "attach".to_owned(),
         args: json!({"mode":"observe","profile":"fake","harness":"fake",
             "native_scope":"fixture:scope","native_ref":"fixture-native",
@@ -208,7 +210,7 @@ fn goal_migration_installs_v20_round_key_kind() {
         })
         .expect("read Store migration version");
     assert_eq!(version, super::schema::CURRENT_SCHEMA_VERSION);
-    assert_eq!(version, 22);
+    assert_eq!(version, 23);
     let found: i64 = store
         .connection
         .query_row(
@@ -605,6 +607,7 @@ fn goal_generation_drift_pauses_on_probe() {
     let resume = SubmitCommand {
         id: Ulid::new().to_string(),
         target: Some(agent.clone()),
+        selector: None,
         verb: "resume".to_owned(),
         args: json!({}),
         expected_generation: Some(1),

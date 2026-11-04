@@ -8,6 +8,11 @@ pub(super) fn command_semantic_payload(request: &SubmitCommand, args: Value) -> 
         "expected_generation": request.expected_generation,
         "expected_turn_id": request.expected_turn_id,
     });
+    // Optional bindings join the digest only when present, so legacy
+    // requests keep their retained bytes and bindings.
+    if let Some(selector) = request.selector.as_deref() {
+        payload["selector"] = Value::String(selector.to_owned());
+    }
     if request.probe {
         payload["probe"] = Value::Bool(true);
     }
@@ -23,6 +28,156 @@ pub(super) fn command_semantic_payload(request: &SubmitCommand, args: Value) -> 
     Ok(payload)
 }
 
+/// Admit one tree-selector expansion: snapshot members once, admit one
+/// concrete child per member with the ordinary per-target gates, then the
+/// Store-only applied parent. Any failure rejects the whole expansion.
+fn submit_selector_tx(
+    tx: &Transaction<'_>,
+    principal: &str,
+    request: SubmitCommand,
+    payload_digest: &[u8],
+    now: i64,
+    derived_rule: bool,
+    limits: core::api::HierarchyLimits,
+) -> Result<Admission> {
+    let selector = request.selector.as_deref().unwrap_or_default();
+    if derived_rule {
+        return Err(Error::new(
+            "unsupported",
+            "rule actions do not support selectors",
+        ));
+    }
+    if request.target.is_some() {
+        return Err(Error::new("invalid", "a selector command takes no target"));
+    }
+    if request.expected_generation.is_some()
+        || request.expected_turn_id.is_some()
+        || request.request_id.is_some()
+        || request.probe
+    {
+        return Err(Error::new(
+            "invalid",
+            "a selector command takes no generation, turn, request, or probe binding",
+        ));
+    }
+    if !matches!(request.verb.as_str(), "send" | "stop") {
+        return Err(Error::new(
+            "unsupported",
+            "selectors are supported only for send and stop",
+        ));
+    }
+    if selector.trim().is_empty() {
+        return Err(Error::new("invalid", "selector must not be empty"));
+    }
+    hierarchy::admit_selector_expansion(tx, principal, &request, payload_digest, limits, now)
+}
+
+/// Admit one `send` to its exact target, shared by the single-target path
+/// and selector members (linked to their expansion parent afterwards).
+pub(super) fn admit_send_member(
+    tx: &Transaction<'_>,
+    principal: &str,
+    request: &SubmitCommand,
+    payload_digest: &[u8],
+    agent: &Agent,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    let agent_num = parse_agent_id(&agent.id)?;
+    if agent.generation == 0 || agent.state == AgentState::Created {
+        return Err(Error::new(
+            "bad_state",
+            "dispatch launch before submitting Agent input",
+        ));
+    }
+    if agent.is_terminal() {
+        return Err(Error::new("bad_state", "cannot send to a terminal Agent"));
+    }
+    let text = required_string(&request.args, "text")?;
+    check_input(&text)?;
+    check_rpc_frame(
+        "agent.command",
+        &json!({
+            "agent_id": agent.id,
+            "generation": agent.generation,
+            "command_id": request.id,
+            "verb": "send",
+            "args": request.args,
+        }),
+    )?;
+    let ready = send_gate_open(tx, agent_num, agent.generation)?
+        && earliest_pending_send(tx, agent_num, agent.generation)?.is_none();
+    let state = if ready {
+        CommandState::Accepted
+    } else {
+        CommandState::Queued
+    };
+    events.push(admit_command(
+        tx,
+        &CommandInsert {
+            state,
+            ..CommandInsert::admitted(
+                principal,
+                request,
+                payload_digest,
+                (agent_num, agent.generation),
+                now,
+            )
+        },
+        json!({"command_id": request.id, "verb": "send"}),
+    )?);
+    if let Some(event) = provider_holds::admit_send_tx(tx, agent, &request.id, request.probe, now)?
+    {
+        events.push(event);
+    }
+    Ok(())
+}
+
+/// Admit one `stop` to its exact target, shared by the single-target path
+/// and selector members (linked to their expansion parent afterwards).
+pub(super) fn admit_stop_member(
+    tx: &Transaction<'_>,
+    principal: &str,
+    request: &SubmitCommand,
+    payload_digest: &[u8],
+    agent: &Agent,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    let agent_num = parse_agent_id(&agent.id)?;
+    if request
+        .args
+        .get("force")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err(Error::new("invalid", "stop force must be a boolean"));
+    }
+    check_rpc_frame(
+        "agent.stop",
+        &json!({
+            "agent_id": agent.id,
+            "generation": agent.generation,
+            "command_id": request.id,
+            "force": request.args.get("force").and_then(Value::as_bool).unwrap_or(false),
+        }),
+    )?;
+    events.push(admit_command(
+        tx,
+        &CommandInsert {
+            turn_id: request.expected_turn_id.as_deref(),
+            ..CommandInsert::admitted(
+                principal,
+                request,
+                payload_digest,
+                (agent_num, agent.generation),
+                now,
+            )
+        },
+        json!({"command_id": request.id, "verb": "stop"}),
+    )?);
+    Ok(())
+}
+
 pub(super) fn submit_tx(
     tx: &Transaction<'_>,
     principal: &str,
@@ -30,6 +185,7 @@ pub(super) fn submit_tx(
     preparation: Option<WorkspacePreparationInput>,
     now: i64,
     derived_rule: bool,
+    limits: core::api::HierarchyLimits,
 ) -> Result<Admission> {
     require_nonempty(principal, "principal")?;
     if request.verb == "run" && !derived_rule {
@@ -111,6 +267,17 @@ pub(super) fn submit_tx(
     }
     if !derived_rule {
         validate_id_age(&request.id, now)?;
+    }
+    if request.selector.is_some() {
+        return submit_selector_tx(
+            tx,
+            principal,
+            request,
+            &payload_digest,
+            now,
+            derived_rule,
+            limits,
+        );
     }
     if !matches!(request.verb.as_str(), "attach" | "detach")
         && let Some(target) = request.target.as_deref()
@@ -207,7 +374,16 @@ pub(super) fn submit_tx(
                     "a new launch starts from generation 0",
                 ));
             }
-            let project = required_string(&request.args, "project")?;
+            let parent_link = hierarchy::resolve_launch_parent(tx, principal, &request.args)?;
+            if let Some(parent) = parent_link.as_ref() {
+                hierarchy::check_child_fanout(tx, parent, limits)?;
+            }
+            let project = match parent_link.as_ref() {
+                // A child inherits its parent's project label; the caller
+                // value is descriptive input, not authority.
+                Some(parent) => parent.project.clone(),
+                None => required_string(&request.args, "project")?,
+            };
             let harness = if request.args.get("harness").is_none() {
                 "fake".to_owned()
             } else {
@@ -272,21 +448,37 @@ pub(super) fn submit_tx(
                 require_nonempty(text, "args.text")?;
                 check_input(text)?;
             }
+            let control = hierarchy::control_from_snapshot(&profile_snapshot)?;
+            let (parent_num, depth) = match parent_link.as_ref() {
+                Some(parent) => (Some(parent.num), parent.depth.saturating_add(1)),
+                None => (None, 0),
+            };
             db!(tx.execute(
                 "INSERT INTO agents(generation, project, harness, profile,
                                         profile_snapshot, workspace, state,
+                                        parent, depth, control,
                                         created_at, updated_at)
-                     VALUES (0, ?1, ?2, ?3, ?4, ?5, 'created', ?6, ?6)",
+                     VALUES (0, ?1, ?2, ?3, ?4, ?5, 'created', ?6, ?7, ?8, ?9, ?9)",
                 params![
                     project,
                     harness,
                     profile,
                     encoded_profile_snapshot,
                     workspace,
+                    parent_num,
+                    depth,
+                    control,
                     now
                 ],
             ));
             let agent_num = tx.last_insert_rowid();
+            let root_num = parent_link
+                .as_ref()
+                .map_or(agent_num, |parent| parent.root_num);
+            db!(tx.execute(
+                "UPDATE agents SET root = ?1 WHERE id = ?2",
+                params![root_num, agent_num],
+            ));
             let agent_id = format_agent_id(agent_num);
             let agent = load_agent_by_num(tx, agent_num)?
                 .ok_or_else(|| Error::new("internal", "new launch Agent disappeared"))?;
@@ -363,85 +555,26 @@ pub(super) fn submit_tx(
                 ));
             }
             if request.verb == "send" {
-                if agent.generation == 0 || agent.state == AgentState::Created {
-                    return Err(Error::new(
-                        "bad_state",
-                        "dispatch launch before submitting Agent input",
-                    ));
-                }
-                if agent.is_terminal() {
-                    return Err(Error::new("bad_state", "cannot send to a terminal Agent"));
-                }
-                let text = required_string(&request.args, "text")?;
-                check_input(&text)?;
-                check_rpc_frame(
-                    "agent.command",
-                    &json!({
-                        "agent_id": agent.id,
-                        "generation": agent.generation,
-                        "command_id": request.id,
-                        "verb": "send",
-                        "args": request.args,
-                    }),
-                )?;
-                let ready = send_gate_open(tx, agent_num, agent.generation)?
-                    && earliest_pending_send(tx, agent_num, agent.generation)?.is_none();
-                let state = if ready {
-                    CommandState::Accepted
-                } else {
-                    CommandState::Queued
-                };
-                events.push(admit_command(
+                admit_send_member(
                     tx,
-                    &CommandInsert {
-                        state,
-                        ..CommandInsert::admitted(
-                            principal,
-                            &request,
-                            &payload_digest,
-                            (agent_num, agent.generation),
-                            now,
-                        )
-                    },
-                    json!({"command_id": request.id, "verb": "send"}),
-                )?);
-                if let Some(event) =
-                    provider_holds::admit_send_tx(tx, &agent, &request.id, request.probe, now)?
-                {
-                    events.push(event);
-                }
+                    principal,
+                    &request,
+                    &payload_digest,
+                    &agent,
+                    now,
+                    &mut events,
+                )?;
                 None
             } else {
-                if request
-                    .args
-                    .get("force")
-                    .is_some_and(|value| !value.is_boolean())
-                {
-                    return Err(Error::new("invalid", "stop force must be a boolean"));
-                }
-                check_rpc_frame(
-                    "agent.stop",
-                    &json!({
-                        "agent_id": agent.id,
-                        "generation": agent.generation,
-                        "command_id": request.id,
-                        "force": request.args.get("force").and_then(Value::as_bool).unwrap_or(false),
-                    }),
-                )?;
-                events.push(admit_command(
+                admit_stop_member(
                     tx,
-                    &CommandInsert {
-                        turn_id: request.expected_turn_id.as_deref(),
-                        ..CommandInsert::admitted(
-                            principal,
-                            &request,
-                            &payload_digest,
-                            (agent_num, agent.generation),
-                            now,
-                        )
-                    },
-                    json!({"command_id": request.id, "verb": "stop"}),
-                )?);
+                    principal,
+                    &request,
+                    &payload_digest,
+                    &agent,
+                    now,
+                    &mut events,
+                )?;
                 None
             }
         }

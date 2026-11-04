@@ -6,11 +6,13 @@ and advisory claims reuse the existing API/router/Store; no second scheduler.
 ## Authority
 
 Principals are owner, current `agent:<id>#<generation>` and scoped automation. Missing/
-revoked identity rejects. Self/tree/project control governs commands; Agents and project
-rules access their project coordination. Only owner/global automation writes global vars.
-Children cannot widen parental authority. A native child without isolated environment
-has no independent Eliot principal; calls from its parent environment are attributed to
-that parent and this limitation is shown.
+revoked identity rejects. An Agent's frozen profile `control` (self/tree/project,
+default self) governs its commands and reads: self reaches only itself, tree reaches
+its own subtree, project reaches its project label; the owner is unrestricted. Agents
+and project rules access their project coordination. Only owner/global automation writes
+global vars. Children cannot widen parental authority. A native child without isolated
+environment has no independent Eliot principal; calls from its parent environment are
+attributed to that parent and this limitation is shown.
 
 Queue mail is communication, not control. Full-text `send|steer|inject` presentation
 requires ordinary command rights. No message content is executed as a router instruction.
@@ -143,9 +145,31 @@ CREATE TABLE claims (
 );
 ```
 
-Controller-launched children inherit project/root. Fanout limits prevent accidental new
-work but never hide a child already created natively. Above-limit children remain visible
-with no widened identity/control. Tree selectors snapshot membership at admission.
+Controller-launched children inherit project/root. An Agent principal or the owner
+launches a child through the ordinary launch path with `args.parent`; an Agent
+launches only its own children. The child takes the parent's project label and tree
+root at one deeper depth; the parent link is durable. A launch parent must be a
+controlled Agent: observe-only and unknown Agents cannot take children. Per
+Authority above, an Agent's child cannot widen parental authority: it reuses the
+parent's frozen profile snapshot with control narrowed or equal (never widened),
+shares the parent's workspace, and mints no worktree; owner launches are
+unrestricted. Fanout limits (`[daemon.limits]`, checked at launch admission)
+prevent accidental new work but never hide an Agent row that already exists.
+Above-limit children remain visible with no widened identity/control; over-limit
+admission reads `fanout_limit` and persists nothing. Terminal Agents (stopped,
+failed, lost) count toward neither fanout bound. Tree selectors (`tree:<agent>`,
+the Agent plus its descendants in Agent-id order) expand once at admission for
+`send` and `stop` only, using the Store-only parent plus ordered concrete children
+representation with `<id>/<agent>` child ids; parent applied means expansion, not
+children finished, and children settle independently with the same gates as targeted
+commands. Any live-member failure rejects the whole expansion. `send` skips
+terminal members instead of failing on them (an all-terminal send applies with no
+children); `stop` still names every member. A plain `stop` affects only its target:
+parent completion or stop never marks children complete and sends nothing to them.
+`stop --tree` is the only stop that names a subtree, as an explicit expansion, not
+a cascade. Native child discovery stays a later increment, as do tree forms for mail
+recipients (non-Agent ids stay `invalid`) and watch filters (a tree value matches
+no events today).
 
 ## Prompt guidance
 

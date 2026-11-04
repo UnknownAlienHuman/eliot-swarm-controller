@@ -435,6 +435,7 @@ mod tests {
                 SubmitCommand {
                     id: ulid::Ulid::new().to_string(),
                     target: None,
+                    selector: None,
                     verb: "attach".to_owned(),
                     args: json!({"mode":"observe","profile":"fake","harness":"fake",
                         "native_scope":"fixture:scope","native_ref":"fixture-native",

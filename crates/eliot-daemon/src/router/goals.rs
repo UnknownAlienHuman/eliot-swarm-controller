@@ -918,6 +918,7 @@ mod tests {
                 SubmitCommand {
                     id: launch_id.clone(),
                     target: None,
+                    selector: None,
                     verb: "launch".to_owned(),
                     args: json!({"project":project, "workspace":"synthetic-workspace"}),
                     expected_generation: Some(0),

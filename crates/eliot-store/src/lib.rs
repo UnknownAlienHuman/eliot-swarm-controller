@@ -27,9 +27,9 @@ pub use rules::{
 pub use scripts::ScriptRunAdmission;
 
 use eliot_core::{
-    self as core, Agent, AgentEdit, AgentState, BatchAck, Command, CommandState, Effect, Event,
-    EventSubject, FileChangeHint, FrozenSetupFile, GitBaseline, GitHintPage, GitSnapshot,
-    NativeEvent, NativeStoreBinding, PendingRequest, ProcessIdentity, ProcessRecord,
+    self as core, Agent, AgentControl, AgentEdit, AgentState, BatchAck, Command, CommandState,
+    Effect, Event, EventSubject, FileChangeHint, FrozenSetupFile, GitBaseline, GitHintPage,
+    GitSnapshot, NativeEvent, NativeStoreBinding, PendingRequest, ProcessIdentity, ProcessRecord,
     ProcessSnapshot, ProcessState, SourceBatch, SourceGap, SourceGapAck, SubmitCommand, Turn,
     TurnState, WorkspaceCancelOutcome, WorkspaceCreationOutcome, WorkspacePhase,
     WorkspacePreparation, WorkspacePreparationInput, WorkspaceRemovalOutcome, WorkspaceSetupArg,
@@ -63,7 +63,7 @@ const WORKSPACE_PROCESS_SOURCE: &str = "workspace_process";
 const GIT_SOURCE: &str = "git";
 const LIST_UNSETTLED_COMMANDS_SQL: &str = "SELECT id, principal, method, target, expected_generation, generation,
                         expected_turn_id, turn_id, request_id, verb, args, state, outcome,
-                        created_at, updated_at, probe
+                        created_at, updated_at, probe, selector
                  FROM commands
                  WHERE state IN ('accepted', 'queued', 'dispatched', 'unknown')
                    AND NOT (state = 'unknown' AND verb IN ('attach','detach')
@@ -92,6 +92,7 @@ mod command_children;
 mod coordination;
 mod dispatch;
 mod goals;
+mod hierarchy;
 mod observer;
 mod observer_live;
 mod resolution;
@@ -156,6 +157,7 @@ pub struct Store {
     /// Opaque owner of this handle's Goal round markers. A `running` marker
     /// from another holder is a crashed round: it reads as `unknown`.
     goal_holder: String,
+    hierarchy_limits: core::api::HierarchyLimits,
 }
 
 impl Store {
@@ -176,9 +178,19 @@ impl Store {
             connection,
             write_faulted: Cell::new(false),
             goal_holder: Ulid::new().to_string(),
+            hierarchy_limits: core::api::HierarchyLimits::default(),
         };
         store.migrate()?;
         Ok(store)
+    }
+
+    /// Install the owner `[daemon.limits]` fanout bounds loaded once at daemon
+    /// startup. Until then (and in tests) the coordination-contract defaults
+    /// apply. Limits gate launch/selector admission only, never reads.
+    pub fn set_hierarchy_limits(&mut self, limits: core::api::HierarchyLimits) -> Result<()> {
+        limits.validate()?;
+        self.hierarchy_limits = limits;
+        Ok(())
     }
 
     fn ensure_writer_healthy(&self) -> Result<()> {
@@ -317,7 +329,9 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
-        let admission = admission::submit_tx(&tx, principal, request, preparation, now, false)?;
+        let limits = self.hierarchy_limits;
+        let admission =
+            admission::submit_tx(&tx, principal, request, preparation, now, false, limits)?;
         commit_transaction(tx, &self.write_faulted)?;
         Ok(admission)
     }
@@ -1019,7 +1033,8 @@ impl Store {
             .prepare(
                 "SELECT id, generation, name, project, harness, profile,
                         profile_snapshot, native_scope, native_ref, workspace, effective,
-                        pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0)
+                        pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0),
+                        parent, root, depth, control
                  FROM agents WHERE id > ?1 ORDER BY id LIMIT ?2",
             )
             .map_err(sql_error)?;
@@ -1045,7 +1060,8 @@ impl Store {
             .prepare(
                 "SELECT id, generation, name, project, harness, profile,
                         profile_snapshot, native_scope, native_ref, workspace, effective,
-                        pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0)
+                        pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0),
+                        parent, root, depth, control
                  FROM agents
                  WHERE observe_only = 0 AND state IN ('created', 'starting', 'idle', 'busy', 'waiting')
                  ORDER BY id LIMIT ?1",
@@ -3183,6 +3199,10 @@ struct AgentRecord {
     origin: String,
     observe_only: bool,
     own_identity: bool,
+    parent: Option<i64>,
+    root: Option<i64>,
+    depth: i64,
+    control: String,
 }
 
 struct CommandRecord {
@@ -3227,6 +3247,7 @@ struct CommandInsert<'a> {
     method: &'a str,
     payload_digest: &'a [u8],
     target: Option<i64>,
+    selector: Option<&'a str>,
     expected_generation: Option<i64>,
     generation: Option<i64>,
     expected_turn_id: Option<&'a str>,
@@ -3258,6 +3279,7 @@ impl<'a> CommandInsert<'a> {
             method: COMMAND_METHOD,
             payload_digest,
             target: Some(target.0),
+            selector: None,
             expected_generation: request.expected_generation,
             generation: Some(target.1),
             expected_turn_id: request.expected_turn_id.as_deref(),
@@ -3288,6 +3310,7 @@ impl<'a> CommandInsert<'a> {
             method: COMMAND_METHOD,
             payload_digest,
             target: None,
+            selector: None,
             expected_generation: None,
             generation: None,
             expected_turn_id: None,
@@ -3421,6 +3444,10 @@ fn agent_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecor
         origin: row.get(16)?,
         observe_only: row.get(17)?,
         own_identity: row.get(18)?,
+        parent: row.get(19)?,
+        root: row.get(20)?,
+        depth: row.get(21)?,
+        control: row.get(22)?,
     })
 }
 
@@ -3441,6 +3468,12 @@ fn agent_from_record(connection: &Connection, record: AgentRecord) -> Result<Age
         origin: parse_enum(&record.origin, "Agent origin")?,
         observe_only: record.observe_only,
         own_identity: record.own_identity,
+        parent: record.parent.map(format_agent_id),
+        // Production launch/attach always write root; a NULL root only arises
+        // from raw test rows without hierarchy metadata and reads self-rooted.
+        root: format_agent_id(record.root.unwrap_or(record.id)),
+        depth: record.depth,
+        control: AgentControl::parse(&record.control)?,
         name: record.name,
         project: record.project,
         harness: record.harness,
@@ -3476,7 +3509,8 @@ fn load_agent_by_num(connection: &Connection, id: i64) -> Result<Option<Agent>> 
         .query_row(
             "SELECT id, generation, name, project, harness, profile,
                     profile_snapshot, native_scope, native_ref, workspace, effective,
-                    pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0)
+                    pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0),
+                    parent, root, depth, control
              FROM agents WHERE id = ?1",
             [id],
             agent_record_from_row,
@@ -3506,6 +3540,7 @@ fn command_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandR
         created_at: row.get(13)?,
         updated_at: row.get(14)?,
         probe: row.get(15)?,
+        selector: row.get(16)?,
     })
 }
 
@@ -3526,6 +3561,7 @@ struct CommandRecordRaw {
     created_at: i64,
     updated_at: i64,
     probe: bool,
+    selector: Option<String>,
 }
 
 fn command_from_raw(raw: CommandRecordRaw) -> Result<CommandRecord> {
@@ -3538,6 +3574,7 @@ fn command_from_raw(raw: CommandRecordRaw) -> Result<CommandRecord> {
             method: raw.method,
             verb: raw.verb,
             target: target.map(format_agent_id),
+            selector: raw.selector,
             expected_generation: raw.expected_generation,
             generation: raw.generation,
             args: decode_json(&raw.args)?,
@@ -3560,7 +3597,7 @@ fn load_command_record(connection: &Connection, id: &str) -> Result<Option<Comma
         .query_row(
             "SELECT id, principal, method, target, expected_generation,
                     generation, expected_turn_id, turn_id, request_id, verb, args,
-                    state, outcome, created_at, updated_at, probe
+                    state, outcome, created_at, updated_at, probe, selector
              FROM commands WHERE id = ?1",
             [id],
             command_record_from_row,
@@ -3990,9 +4027,9 @@ fn insert_command(
              id, principal, method, payload_digest, target, expected_generation,
              generation, expected_turn_id, parent_command, link_kind, ordinal,
              turn_id, request_id, verb, args, state, outcome, created_at, updated_at, probe, cause,
-             project_binding
+             project_binding, selector
          ) VALUES (
-             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22
+             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
          )",
         params![
             command.id,
@@ -4017,6 +4054,7 @@ fn insert_command(
             command.probe,
             cause,
             project_binding,
+            command.selector,
         ],
     ));
     Ok(())

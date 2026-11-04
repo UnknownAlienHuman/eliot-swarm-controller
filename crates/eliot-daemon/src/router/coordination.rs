@@ -258,6 +258,7 @@ mod tests {
                 SubmitCommand {
                     id: launch_id.clone(),
                     target: None,
+                    selector: None,
                     verb: "launch".to_owned(),
                     args: json!({
                         "project": project,
@@ -541,6 +542,7 @@ mod tests {
                     SubmitCommand {
                         id: ulid::Ulid::new().to_string(),
                         target: None,
+                        selector: None,
                         verb: "launch".to_owned(),
                         args: json!({"project":"app", "workspace":"synthetic-workspace"}),
                         expected_generation: Some(0),

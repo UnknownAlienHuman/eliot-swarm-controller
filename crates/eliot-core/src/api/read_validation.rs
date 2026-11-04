@@ -133,6 +133,7 @@ mod tests {
             method: "command.submit".to_owned(),
             verb: "send".to_owned(),
             target: Some("a1".to_owned()),
+            selector: None,
             expected_generation: Some(2),
             generation: Some(2),
             args: json!({"text": "dummy input"}),

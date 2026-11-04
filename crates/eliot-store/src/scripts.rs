@@ -109,8 +109,9 @@ impl Store {
             action.id = derived_script_action_id(run_id, ordinal)?;
             rules::validate_script_output_rate_tx(&tx, &origin, action.target.as_deref(), now)?;
 
+            let limits = self.hierarchy_limits;
             let admission =
-                admission::submit_tx(&tx, &run.command.principal, action, None, now, true)?;
+                admission::submit_tx(&tx, &run.command.principal, action, None, now, true, limits)?;
             if !admission.is_new {
                 return Err(Error::new(
                     "source_integrity",
@@ -430,6 +431,7 @@ mod tests {
                 SubmitCommand {
                     id: launch_id.clone(),
                     target: None,
+                    selector: None,
                     verb: "launch".to_owned(),
                     args: json!({"project":project, "workspace":"synthetic-workspace"}),
                     expected_generation: Some(0),

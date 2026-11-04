@@ -784,6 +784,7 @@ mod tests {
             method: "resume".to_owned(),
             verb: "resume".to_owned(),
             target: Some(agent.id.clone()),
+            selector: None,
             expected_generation: Some(agent.generation),
             generation: Some(agent.generation),
             args: serde_json::json!({}),

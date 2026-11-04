@@ -1,6 +1,7 @@
 mod command;
 mod coordination;
 mod goals;
+mod hierarchy;
 mod resolution;
 
 pub(crate) use goals::{real_goal_check, run_goal_driver};
@@ -597,12 +598,7 @@ impl Router {
         }
 
         if admission.is_new {
-            let command_id = admission.command.id.clone();
-            let linked_id = admission
-                .linked_command
-                .as_ref()
-                .map(|command| command.id.clone());
-            self.schedule_command(command_id, linked_id);
+            self.schedule_admission(&admission);
         }
         self.signal_progress();
         serde_json::to_value(submit_result(
@@ -1286,6 +1282,10 @@ impl Router {
         if request.verb == "worktree.remove" {
             require_owner(principal)?;
         }
+        {
+            let store = self.inner.store.lock().await;
+            hierarchy::authorize_agent_submit_scope(&store, principal, &mut request)?;
+        }
         if !project_authority_preverified {
             self.verify_native_control_target(&request).await?;
         }
@@ -1314,7 +1314,11 @@ impl Router {
             } else {
                 let frozen = async {
                     normalize_launch(&mut request)?;
-                    self.freeze_launch_admission(&mut request).await
+                    {
+                        let store = self.inner.store.lock().await;
+                        hierarchy::inherit_launch_project(&store, &mut request)?;
+                    }
+                    self.freeze_launch_admission(principal, &mut request).await
                 }
                 .await;
                 workspace = match frozen {
@@ -1456,9 +1460,10 @@ impl Router {
 
     async fn freeze_launch_admission(
         &self,
+        principal: &Principal,
         request: &mut SubmitCommand,
     ) -> Result<Option<WorkspacePreparationInput>> {
-        if self.freeze_launch_profile(request).await? {
+        if self.freeze_launch_profile(principal, request).await? {
             return retained_preparation(&request.args);
         }
         let Some(branch) = request.args.get("worktree").and_then(Value::as_str) else {
@@ -1505,7 +1510,11 @@ impl Router {
         Ok(Some(input))
     }
 
-    async fn freeze_launch_profile(&self, request: &mut SubmitCommand) -> Result<bool> {
+    async fn freeze_launch_profile(
+        &self,
+        principal: &Principal,
+        request: &mut SubmitCommand,
+    ) -> Result<bool> {
         if self.hydrate_retained_launch(request).await? {
             return Ok(true);
         }
@@ -1520,6 +1529,10 @@ impl Router {
             .ok_or_else(|| Error::new("invalid", "resolved profile must name its harness"))?
             .to_owned();
         install_frozen_profile(request, &harness, snapshot, true)?;
+        {
+            let store = self.inner.store.lock().await;
+            hierarchy::check_agent_launch_authority(&store, principal, request)?;
+        }
         Ok(false)
     }
 
@@ -2663,52 +2676,15 @@ impl Router {
         let id = request.id.as_str();
         let mut command = {
             let store = self.inner.store.lock().await;
-            store.get_command(id)?
-        }
-        .ok_or_else(|| Error::new("not_found", format!("command {id} was not found")))?;
-        authorize_command_read(principal, &command)?;
+            let command = store
+                .get_command(id)?
+                .ok_or_else(|| Error::new("not_found", format!("command {id} was not found")))?;
+            hierarchy::authorize_command_read(&store, principal, &command)?;
+            command
+        };
         self.adjust_command_for_read(&mut command);
         serde_json::to_value(command)
             .map_err(|error| Error::new("internal", format!("encode command: {error}")))
-    }
-
-    async fn command_children(&self, params: &Value, principal: &Principal) -> Result<Value> {
-        let request: CommandChildrenRequest = serde_json::from_value(params.clone())
-            .map_err(|_| Error::new("invalid", "command.children params are invalid"))?;
-        request.validate()?;
-        let id = request.id.as_str();
-        let mut page = {
-            let store = self.inner.store.lock().await;
-            let Some(parent) = store.get_command(id)? else {
-                // No parent row to authorize against. Only the Owner, who is
-                // authorized for every command, may learn whether the id may
-                // have been pruned; anyone else reads `not_found`, so an
-                // unauthorized caller cannot tell pruned from absent or probe
-                // cursors.
-                let gap = matches!(principal, Principal::Owner)
-                    && eliot_store::history_expired(id, now_ms());
-                return Err(if gap {
-                    Error::new(
-                        "history_gap",
-                        format!("command {id} children are no longer retained"),
-                    )
-                } else {
-                    Error::new("not_found", format!("command {id} was not found"))
-                });
-            };
-            authorize_command_read(principal, &parent)?;
-            store.list_command_children(&parent, request.after.as_deref(), request.limit)?
-        };
-        for child in &mut page.children {
-            authorize_command_read(principal, child)?;
-            self.adjust_command_for_read(child);
-        }
-        let response = CommandChildrenResponse {
-            children: page.children,
-            next: page.next,
-        };
-        serde_json::to_value(response)
-            .map_err(|error| Error::new("internal", format!("encode command children: {error}")))
     }
 
     fn adjust_command_for_read(&self, command: &mut Command) {
@@ -2892,9 +2868,9 @@ impl Router {
             .map_err(|_| Error::new("invalid", "agent.get params are invalid"))?;
         request.validate()?;
         let id = request.id.as_str();
-        authorize_agent_read(principal, id, None)?;
         let (agent, source_states, observer_active) = {
             let store = self.inner.store.lock().await;
+            hierarchy::authorize_agent_read(&store, principal, id, None)?;
             let agent = store
                 .get_agent(id)?
                 .ok_or_else(|| Error::new("not_found", format!("Agent {id} was not found")))?;
@@ -2957,12 +2933,12 @@ impl Router {
         request.validate()?;
         let id = request.id.as_str();
         let generation = request.generation;
-        authorize_agent_read(principal, id, generation)?;
         let scope = request.effective_scope();
         let after = request.cursor()?;
         let limit = request.limit;
         let (generation, processes) = {
             let store = self.inner.store.lock().await;
+            hierarchy::authorize_agent_read(&store, principal, id, generation)?;
             let agent = store
                 .get_agent(id)?
                 .ok_or_else(|| Error::new("not_found", format!("Agent {id} was not found")))?;
@@ -2991,7 +2967,7 @@ impl Router {
                 ));
             }
             if scope == "workspace" {
-                authorize_agent_read(principal, id, Some(generation))?;
+                hierarchy::authorize_agent_read(&store, principal, id, Some(generation))?;
             }
             if let Some(cursor) = &after {
                 cursor.validate_binding(id, generation, scope)?;
@@ -3034,9 +3010,9 @@ impl Router {
         request.validate()?;
         let id = request.id.as_str();
         let expected = request.generation;
-        authorize_agent_read(principal, id, expected)?;
         let agent = {
             let store = self.inner.store.lock().await;
+            hierarchy::authorize_agent_read(&store, principal, id, expected)?;
             store.get_agent(id)?
         }
         .ok_or_else(|| Error::new("not_found", format!("Agent {id} was not found")))?;
@@ -3064,11 +3040,11 @@ impl Router {
         request.validate()?;
         let id = request.id.as_str();
         let generation = request.generation;
-        authorize_agent_read(principal, id, generation)?;
         let after = request.after.as_deref();
         let limit = request.limit;
         let (generation, edits) = {
             let store = self.inner.store.lock().await;
+            hierarchy::authorize_agent_read(&store, principal, id, generation)?;
             let agent = store
                 .get_agent(id)?
                 .ok_or_else(|| Error::new("not_found", format!("Agent {id} was not found")))?;
@@ -3100,9 +3076,9 @@ impl Router {
         request.validate()?;
         let id = request.id.as_str();
         let expected = request.generation;
-        authorize_agent_read(principal, id, expected)?;
         let agent = {
             let store = self.inner.store.lock().await;
+            hierarchy::authorize_agent_read(&store, principal, id, expected)?;
             store.get_agent(id)?
         }
         .ok_or_else(|| Error::new("not_found", format!("Agent {id} was not found")))?;
@@ -3206,9 +3182,9 @@ impl Router {
             .map_err(|_| Error::new("invalid", "agent.result params are invalid"))?;
         request.validate()?;
         let id = request.id.as_str();
-        authorize_agent_read(principal, id, request.generation)?;
         let (agent_metadata, generation, mut turns) = {
             let store = self.inner.store.lock().await;
+            hierarchy::authorize_agent_read(&store, principal, id, request.generation)?;
             let agent = store
                 .get_agent(id)?
                 .ok_or_else(|| Error::new("not_found", format!("Agent {id} was not found")))?;
@@ -3238,10 +3214,10 @@ impl Router {
         request.validate()?;
         let agent = request.agent.as_str();
         let generation = request.generation;
-        authorize_agent_read(principal, agent, Some(generation))?;
         let turn_id = request.turn_id.as_str();
         let mut turn = {
             let store = self.inner.store.lock().await;
+            hierarchy::authorize_agent_read(&store, principal, agent, Some(generation))?;
             store.get_turn(agent, generation, turn_id)?
         }
         .ok_or_else(|| Error::new("not_found", format!("turn {turn_id} was not found")))?;
@@ -5221,36 +5197,10 @@ fn authorize_command(principal: &Principal, request: &mut SubmitCommand) -> Resu
     let Principal::Agent { id, generation } = principal else {
         return Ok(());
     };
-    if !matches!(
-        request.verb.as_str(),
-        "send" | "stop" | "steer" | "interrupt" | "approve" | "deny" | "answer"
-    ) {
-        return Err(Error::new(
-            "not_allowed",
-            "managed Agent credentials cannot launch another Agent",
-        ));
-    }
-    if request.target.as_deref().is_some_and(|target| target != id) {
-        return Err(Error::new(
-            "not_allowed",
-            "managed Agent credentials are scoped to their own Agent",
-        ));
-    }
-    request.target = Some(id.clone());
-    if request
-        .expected_generation
-        .is_some_and(|expected| expected != *generation)
-    {
-        return Err(Error::new(
-            "stale_generation",
-            "command generation does not match the caller",
-        ));
-    }
-    request.expected_generation = Some(*generation);
-    Ok(())
+    hierarchy::authorize_agent_submit(id, *generation, request)
 }
 
-fn authorize_command_read(principal: &Principal, command: &Command) -> Result<()> {
+fn authorize_command_read_self(principal: &Principal, command: &Command) -> Result<()> {
     if matches!(principal, Principal::ProjectRule { .. }) {
         return Err(Error::new(
             "not_allowed",
@@ -5278,7 +5228,11 @@ fn authorize_command_read(principal: &Principal, command: &Command) -> Result<()
     }
     Ok(())
 }
-fn authorize_agent_read(principal: &Principal, id: &str, generation: Option<i64>) -> Result<()> {
+fn authorize_agent_read_self(
+    principal: &Principal,
+    id: &str,
+    generation: Option<i64>,
+) -> Result<()> {
     if matches!(principal, Principal::Run { .. }) {
         return Err(Error::new(
             "not_allowed",
@@ -5600,6 +5554,7 @@ mod tests {
             method: "command.submit".to_owned(),
             verb: verb.to_owned(),
             target: None,
+            selector: None,
             expected_generation: (verb == "launch").then_some(0),
             generation: None,
             args: json!({}),
@@ -6407,6 +6362,7 @@ do = [{ action = 'interrupt', target = '${event.agent}', expected_generation = '
                     SubmitCommand {
                         id: launch_id.clone(),
                         target: None,
+                        selector: None,
                         verb: "launch".to_owned(),
                         args: json!({
                             "project":"stale-catch-up-fixture",
@@ -6527,6 +6483,7 @@ do = [{ action = 'interrupt', target = '${event.agent}', expected_generation = '
                     SubmitCommand {
                         id: launch_id.clone(),
                         target: None,
+                        selector: None,
                         verb: "launch".to_owned(),
                         args: json!({
                             "project":checkout,
@@ -7311,7 +7268,12 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 .unwrap()
                 .remove("profile_snapshot");
             // A retained ID must return before current config or selector capture.
-            assert!(router.freeze_launch_profile(&mut retry).await.unwrap());
+            assert!(
+                router
+                    .freeze_launch_profile(&Principal::Owner, &mut retry)
+                    .await
+                    .unwrap()
+            );
             assert_eq!(retry.args, original.args);
             assert!(
                 retry.args["profile_snapshot"]
@@ -7396,6 +7358,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 SubmitCommand {
                     id: ulid::Ulid::new().to_string(),
                     target: None,
+                    selector: None,
                     verb: "launch".to_owned(),
                     args: json!({"project":"typed-events", "workspace":"synthetic-workspace"}),
                     expected_generation: Some(0),
@@ -7420,6 +7383,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             let request = SubmitCommand {
                 id: ulid::Ulid::new().to_string().to_ascii_lowercase(),
                 target: Some(agent.clone()),
+                selector: None,
                 verb: "interrupt".to_owned(),
                 args: json!({}),
                 expected_generation: Some(1),
@@ -7473,8 +7437,54 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             assert_eq!(store.read_events(0, 1000, None).unwrap(), before_events);
         }
         wire["target"] = json!("a999");
+        // Non-self targets now pass authorization to the Store, where the
+        // retained id binding reports the changed target as a conflict.
         assert_eq!(
             router.submit(&wire, &principal).await.unwrap_err().code,
+            "id_conflict"
+        );
+        // With a fresh id there is no retained binding: a self-scoped Agent
+        // targeting another live Agent is outside its scope.
+        let other = {
+            let mut store = router.inner.store.lock().await;
+            store
+                .submit(
+                    "owner",
+                    SubmitCommand {
+                        id: ulid::Ulid::new().to_string(),
+                        target: None,
+                        selector: None,
+                        verb: "launch".to_owned(),
+                        args: json!({
+                            "project":"typed-events", "workspace":"synthetic-workspace",
+                            "harness":"codex", "profile":"synthetic", "profile_snapshot":{},
+                        }),
+                        expected_generation: Some(0),
+                        expected_turn_id: None,
+                        request_id: None,
+                        probe: false,
+                    },
+                    now_ms(),
+                )
+                .unwrap()
+                .command
+                .target
+                .unwrap()
+        };
+        assert_eq!(
+            router
+                .submit(
+                    &json!({
+                        "id": ulid::Ulid::new().to_string(),
+                        "verb": "send",
+                        "target": other,
+                        "args": {"text": "out of scope"},
+                    }),
+                    &principal,
+                )
+                .await
+                .unwrap_err()
+                .code,
             "not_allowed"
         );
     }
@@ -7498,6 +7508,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                             SubmitCommand {
                                 id: launch_id.clone(),
                                 target: None,
+                                selector: None,
                                 verb: "launch".to_owned(),
                                 args: json!({
                                     "project":"typed-results", "workspace":"synthetic-workspace",
@@ -7532,6 +7543,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                             SubmitCommand {
                                 id: send_id.clone(),
                                 target: Some(agent.clone()),
+                                selector: None,
                                 verb: "send".to_owned(),
                                 args: json!({"text":"fixture input"}),
                                 expected_generation: Some(1),
@@ -7615,6 +7627,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                     SubmitCommand {
                         id: ulid::Ulid::new().to_string(),
                         target: Some(first_agent.clone()),
+                        selector: None,
                         verb: "stop".to_owned(),
                         args: json!({}),
                         expected_generation: Some(1),
@@ -7628,6 +7641,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                     SubmitCommand {
                         id: ulid::Ulid::new().to_string(),
                         target: Some(second_agent.clone()),
+                        selector: None,
                         verb: "stop".to_owned(),
                         args: json!({}),
                         expected_generation: Some(1),
@@ -8008,13 +8022,26 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         assert_eq!(
             router
                 .submit(
-                    &json!({"id":"literal-id", "verb":"launch", "args":null}),
+                    &json!({"id":"literal-id", "verb":"resume", "args":null}),
                     &principal
                 )
                 .await
                 .unwrap_err()
                 .code,
             "not_allowed"
+        );
+        // Agents may launch their own children, so a malformed launch now
+        // reaches downstream shape validation instead of the old policy.
+        assert_eq!(
+            router
+                .submit(
+                    &json!({"id":"literal-id", "verb":"launch", "args":null}),
+                    &principal
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "invalid"
         );
         // The unchanged Store boundary rejects supplied null args rather than defaulting them.
         let error = router
@@ -8161,6 +8188,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 SubmitCommand {
                     id: id.clone(),
                     target: None,
+                    selector: None,
                     verb: "launch".to_owned(),
                     args: json!({"project":"provider-held", "workspace":"synthetic-workspace"}),
                     expected_generation: Some(0),
@@ -8703,6 +8731,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                     SubmitCommand {
                         id: id.clone(),
                         target: Some(agent),
+                        selector: None,
                         verb: "interrupt".to_owned(),
                         args: json!({}),
                         expected_generation: Some(1),
@@ -9559,6 +9588,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                     SubmitCommand {
                         id: dispatched_id.clone(),
                         target: Some(agent.clone()),
+                        selector: None,
                         verb: "interrupt".to_owned(),
                         args: json!({}),
                         expected_generation: Some(1),
@@ -9613,6 +9643,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                         SubmitCommand {
                             id: ulid::Ulid::new().to_string(),
                             target: Some(agent.clone()),
+                            selector: None,
                             verb: "stop".to_owned(),
                             args: json!({}),
                             expected_generation: Some(1),
@@ -9810,6 +9841,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                     SubmitCommand {
                         id: trigger_id.clone(),
                         target: Some(agent.clone()),
+                        selector: None,
                         verb: "send".to_owned(),
                         args: json!({"text":"source input"}),
                         expected_generation: Some(1),
@@ -9866,6 +9898,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         let action = SubmitCommand {
             id: String::new(),
             target: event.agent.clone(),
+            selector: None,
             verb: "send".to_owned(),
             args: json!({"text":"follow-up"}),
             expected_generation: event.generation,
@@ -10675,6 +10708,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             method: "command.submit".to_owned(),
             verb: "launch".to_owned(),
             target: None,
+            selector: None,
             expected_generation: Some(0),
             generation: None,
             args: json!({
@@ -11284,7 +11318,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 frozen_setup: Vec::new(),
             };
             let id = store.submit_with_workspace("owner", SubmitCommand {
-                id:ulid::Ulid::new().to_string(), target:None, verb:"launch".to_owned(),
+                id:ulid::Ulid::new().to_string(), target:None, selector:None, verb:"launch".to_owned(),
                 args:json!({"project":input.project, "workspace":input.repo_path, "worktree":input.requested_branch}),
                 expected_generation:Some(0), expected_turn_id:None, request_id:None, probe:false,
             }, input, now_ms()).unwrap().command.target.unwrap();
@@ -11597,7 +11631,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         let (agent, before_events, before_source, before_command) = {
             let mut store = router.inner.store.lock().await;
             let agent = store.submit("owner", SubmitCommand {
-                id:attach_id.clone(), target:None, verb:"attach".to_owned(),
+                id:attach_id.clone(), target:None, selector:None, verb:"attach".to_owned(),
                 args:json!({"profile":"fixture", "harness":"fake", "mode":"observe",
                     "native_scope":"fixture-scope", "native_ref":"fixture-ref", "profile_snapshot":{}}),
                 expected_generation:Some(0), expected_turn_id:None, request_id:None, probe:false,
@@ -11714,6 +11748,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 SubmitCommand {
                     id: launch_id.clone(),
                     target: None,
+                    selector: None,
                     verb: "launch".to_owned(),
                     args: json!({
                         "project":"typed-results", "workspace":"synthetic-workspace",
@@ -11747,6 +11782,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 SubmitCommand {
                     id: send_id.clone(),
                     target: Some(agent.clone()),
+                    selector: None,
                     verb: "send".to_owned(),
                     args: json!({"text":"fixture input"}),
                     expected_generation: Some(1),
@@ -11872,6 +11908,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 SubmitCommand {
                     id: launch_id.clone(),
                     target: None,
+                    selector: None,
                     verb: "launch".to_owned(),
                     args,
                     expected_generation: Some(0),
@@ -12247,6 +12284,7 @@ do = [{ action = "stop", target = "${event.agent}", expected_generation = "${eve
                     SubmitCommand {
                         id: resume_id.clone(),
                         target: Some(agent.clone()),
+                        selector: None,
                         verb: "resume".to_owned(),
                         args: json!({}),
                         expected_generation: Some(1),
@@ -12367,6 +12405,7 @@ do = [{ action = "stop", target = "${event.agent}", expected_generation = "${eve
                     SubmitCommand {
                         id: interrupt_id.clone(),
                         target: Some(agent.clone()),
+                        selector: None,
                         verb: "interrupt".to_owned(),
                         args: json!({}),
                         expected_generation: Some(1),
@@ -12840,6 +12879,7 @@ mod run_authorization_tests {
             method: "command.submit".to_owned(),
             verb: "run".to_owned(),
             target: None,
+            selector: None,
             expected_generation: None,
             generation: None,
             args: json!({}),
@@ -13014,7 +13054,7 @@ mod run_authorization_tests {
         assert!(authorize_rpc_method(&principal, "command.get").is_ok());
         assert!(authorize_rpc_method(&principal, "command.submit").is_err());
         assert!(authorize_rpc_method(&principal, "command.children").is_err());
-        assert!(authorize_command_read(&principal, &command("run-1")).is_ok());
-        assert!(authorize_command_read(&principal, &command("run-2")).is_err());
+        assert!(authorize_command_read_self(&principal, &command("run-1")).is_ok());
+        assert!(authorize_command_read_self(&principal, &command("run-2")).is_err());
     }
 }

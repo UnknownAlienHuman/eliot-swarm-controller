@@ -13,6 +13,7 @@ impl CommandSubmitRequest {
         Self {
             id: id.into(),
             target: None,
+            selector: None,
             verb: verb.into(),
             args: Value::Object(Map::new()),
             expected_generation: None,
@@ -262,7 +263,7 @@ mod tests {
                 assert!(serde_json::from_value::<CommandSubmitRequest>(request).is_err());
             }
         }
-        for field in ["target", "expected_turn_id", "request_id"] {
+        for field in ["target", "selector", "expected_turn_id", "request_id"] {
             for bad in [json!(true), json!(1), json!([]), json!({})] {
                 assert!(
                     serde_json::from_value::<CommandSubmitRequest>(
@@ -295,7 +296,7 @@ mod tests {
                 .is_err()
             );
         }
-        for field in ["selector", "probe", "wait_ms", "extra"] {
+        for field in ["probe", "wait_ms", "extra"] {
             assert!(
                 serde_json::from_value::<CommandSubmitRequest>(
                     json!({"id":"id","verb":"send",(field):null})
@@ -303,6 +304,26 @@ mod tests {
                 .is_err()
             );
         }
+        // A tree selector is an accepted optional binding; its grammar and
+        // verb rules are enforced downstream at admission.
+        let request: CommandSubmitRequest = serde_json::from_value(json!({
+            "id":"id","verb":"stop","selector":"tree:a1"
+        }))
+        .unwrap();
+        assert_eq!(request.selector.as_deref(), Some("tree:a1"));
+        assert_eq!(request.target, None);
+        let nullable: CommandSubmitRequest = serde_json::from_value(json!({
+            "id":"id","verb":"stop","selector":null
+        }))
+        .unwrap();
+        assert_eq!(nullable.selector, None);
+        assert_eq!(
+            serde_json::to_value(CommandSubmitRequest::new("id", "stop")).unwrap(),
+            json!({
+                "id":"id","target":null,"verb":"stop","args":{},
+                "expected_generation":null,"expected_turn_id":null,"request_id":null
+            })
+        );
     }
 
     #[test]

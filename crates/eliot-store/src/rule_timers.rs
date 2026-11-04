@@ -385,7 +385,8 @@ impl Store {
                 parent = Some(rejected_parent);
                 events.extend(event);
             } else {
-                match admit_rule_action_tx(&tx, &key, action, now) {
+                let limits = self.hierarchy_limits;
+                match admit_rule_action_tx(&tx, &key, action, now, limits) {
                     Ok((admitted_parent, admitted_child, admitted_events)) => {
                         parent = Some(admitted_parent);
                         child = Some(admitted_child);
@@ -591,7 +592,8 @@ impl Store {
 
         let mut key = RuleFiringKey::manual(principal, &rule.view, &request.id, digest)?;
         key.script_context = timer_context;
-        match admit_rule_action_tx(&tx, &key, action, now) {
+        let limits = self.hierarchy_limits;
+        match admit_rule_action_tx(&tx, &key, action, now, limits) {
             Ok((parent, child, events)) => {
                 commit_transaction(tx, &self.write_faulted)?;
                 Ok(TimerSlotAdmission {

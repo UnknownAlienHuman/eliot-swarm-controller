@@ -269,6 +269,7 @@ mod tests {
             method: "command.submit".to_owned(),
             verb: "timer.run".to_owned(),
             target: None,
+            selector: None,
             expected_generation: None,
             generation: None,
             args: json!({"rule":rule}),

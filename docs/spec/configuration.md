@@ -61,9 +61,11 @@ workspace and owner login suffice; no proxy/account registry is mandatory.
 The first native profile also accepts `cmd` (one executable, not a shell command),
 `effort`, and `approval_policy` (`never`, the default, or `on-request`). `permissions`
 selects the explicitly requested native sandbox: `read-only`, `workspace-write`, or
-`danger-full-access`; the default remains `workspace-write`. These values are frozen
-at admission. The supported approval and question callbacks are handled through exact
-pending request IDs; an unsupported callback receives an error, never a default choice.
+`danger-full-access`; the default remains `workspace-write`. `control` selects the
+frozen command scope of launched Agents: `self` (the default), `tree`, or `project`.
+These values are frozen at admission. The supported approval and question callbacks
+are handled through exact pending request IDs; an unsupported callback receives an
+error, never a default choice.
 
 An optional `collaboration_mode` selects Codex's `default` or `plan` preset for each
 turn. The selected mode is frozen with the profile; omission preserves the native
@@ -219,6 +221,22 @@ Both bounds are positive signed 64-bit integers; each defaults to its
 [coordination](coordination.md#mailbox) contract value when unset (10 MiB of
 message text, 10,000 messages), and unlike retention windows they always
 apply. Zero, negative, wrong-type and unknown mail values are invalid.
+
+The implemented hierarchy fanout bounds are a `[daemon]` limits table:
+
+```toml
+[daemon]
+limits.max_depth = 8
+limits.max_children_per_agent = 20
+limits.max_tree_agents = 100
+limits.max_selector_targets = 1000
+```
+
+All four are positive signed 64-bit integers; each defaults to its
+[coordination](coordination.md#claims-and-hierarchy) contract value when
+unset, and like the mail bounds they always apply. The daemon loads them once
+at startup before IPC binds. Zero, negative, wrong-type and unknown limit
+values are invalid.
 
 Inspection dated 2026-10-29 of installed OpenCodex 2.92.0 source
 src/server/index/serve-options.ts shows an anonymous literal GET /readyz: readiness

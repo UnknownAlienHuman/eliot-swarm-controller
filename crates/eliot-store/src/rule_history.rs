@@ -296,25 +296,33 @@ impl Store {
             };
             tx.execute_batch("SAVEPOINT rule_catch_up_action")
                 .map_err(sql_error)?;
-            let mut admission =
-                match admission::submit_tx(&tx, principal, child_request, None, now, true) {
-                    Ok(admission) if admission.is_new => admission,
-                    Ok(_) => {
-                        return Err(Error::new(
-                            "source_integrity",
-                            "new rule catch-up child already exists",
-                        ));
-                    }
-                    Err(error) if core::is_deterministic_pre_admission_rejection(&error.code) => {
-                        tx.execute_batch(
-                            "ROLLBACK TO rule_catch_up_action; RELEASE rule_catch_up_action",
-                        )
-                        .map_err(sql_error)?;
-                        rejected.push((action.event_seq, error.code));
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                };
+            let limits = self.hierarchy_limits;
+            let mut admission = match admission::submit_tx(
+                &tx,
+                principal,
+                child_request,
+                None,
+                now,
+                true,
+                limits,
+            ) {
+                Ok(admission) if admission.is_new => admission,
+                Ok(_) => {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "new rule catch-up child already exists",
+                    ));
+                }
+                Err(error) if core::is_deterministic_pre_admission_rejection(&error.code) => {
+                    tx.execute_batch(
+                        "ROLLBACK TO rule_catch_up_action; RELEASE rule_catch_up_action",
+                    )
+                    .map_err(sql_error)?;
+                    rejected.push((action.event_seq, error.code));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             annotate_rule_command_event(&tx, &child_id, &mut admission.events, cause.clone())?;
             if let Some(linked_command) = &admission.linked_command {
                 annotate_rule_command_event(
@@ -512,6 +520,7 @@ fn insert_catch_up_parent(
         method: COMMAND_METHOD,
         payload_digest,
         target: None,
+        selector: None,
         expected_generation: None,
         generation: None,
         expected_turn_id: None,
@@ -539,6 +548,7 @@ fn insert_catch_up_parent(
             method: COMMAND_METHOD.to_owned(),
             verb: "rule.catch_up".to_owned(),
             target: None,
+            selector: None,
             expected_generation: None,
             generation: None,
             args,
@@ -612,7 +622,7 @@ fn load_catch_up_children(connection: &Connection, parent_id: &str) -> Result<Ve
         .prepare(
             "SELECT id, principal, method, target, expected_generation, generation,
                     expected_turn_id, turn_id, request_id, verb, args, state, outcome,
-                    created_at, updated_at, probe
+                    created_at, updated_at, probe, selector
              FROM commands
              WHERE parent_command = ?1 AND link_kind = 'rule_action' AND ordinal IS NOT NULL
              ORDER BY ordinal",

@@ -5,6 +5,7 @@ mod agent_views;
 mod coordination;
 mod git;
 mod goals;
+mod hierarchy;
 mod monitor_views;
 mod mutation_validation;
 mod mutations;
@@ -44,6 +45,10 @@ pub use goals::{
     GoalRoundMarker, GoalRoundOutcome, GoalRoundRequest, GoalRoundResponse, GoalSetRequest,
     GoalStatus, GoalView, MAX_GOAL_CADENCE_MS, MAX_GOAL_LIMIT, MAX_GOAL_OBSERVATION_BYTES,
     MIN_GOAL_CADENCE_MS,
+};
+pub use hierarchy::{
+    DEFAULT_MAX_CHILDREN_PER_AGENT, DEFAULT_MAX_DEPTH, DEFAULT_MAX_SELECTOR_TARGETS,
+    DEFAULT_MAX_TREE_AGENTS, HierarchyLimits, parse_tree_selector, selector_child_id,
 };
 pub use monitor_views::{
     FilesystemInvalidationState, FilesystemInvalidationView, GitObservation, GitView,

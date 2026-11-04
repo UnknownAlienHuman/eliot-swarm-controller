@@ -91,6 +91,12 @@ async fn run_owned(
     let retained = restart_capacity::reconcile(&capacity, retained, true).await;
     let automation_config = crate::config::load_automation_config(data_dir.path())?;
     let daemon_config = crate::config::load_daemon_config(data_dir.path())?;
+    // Install `[daemon.limits]` once, before IPC binds: every launch and
+    // selector admission in this run checks these bounds.
+    {
+        let mut store = store.lock().await;
+        store.set_hierarchy_limits(daemon_config.limits)?;
+    }
     // Parse global definitions and seed only new rules before publishing ready.
     let (global_rules, initial_deferred_notice) =
         automation::initialize_global_rules(&router, data_dir.path(), &policy).await?;

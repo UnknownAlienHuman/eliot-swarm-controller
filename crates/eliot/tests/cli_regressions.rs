@@ -14297,3 +14297,180 @@ fn mail_wake_notice_coalesces_to_one_generic_command() {
     }
     fixture.stop(false);
 }
+
+#[test]
+fn cli_hierarchy_launches_children_and_stops_subtrees() {
+    let mut fixture = Fixture::new("hierarchy children");
+    fixture.start();
+    let workspace = fixture.workspace.to_str().unwrap().to_owned();
+    let launch_child = |fixture: &Fixture, parent: Option<&str>| {
+        let mut argv = vec![
+            "launch",
+            "--profile",
+            "fake",
+            "--workspace",
+            workspace.as_str(),
+        ];
+        if let Some(parent) = parent {
+            argv.extend(["--parent", parent]);
+        }
+        fixture.json(&argv).as_object().unwrap()["target"]
+            .as_str()
+            .expect("launched Agent")
+            .to_owned()
+    };
+    // --tree stops a live subtree as one fixed set.
+    let parent = launch_child(&fixture, None);
+    wait_agent_ready(&fixture, &parent, 1, "hierarchy parent", "hierarchy parent");
+    let child = launch_child(&fixture, Some(&parent));
+    wait_agent_ready(&fixture, &child, 1, "hierarchy child", "hierarchy child");
+    let shown: AgentGetResponse =
+        serde_json::from_value(fixture.json(&["show", &child])).expect("typed child");
+    assert_eq!(shown.agent.parent.as_deref(), Some(parent.as_str()));
+    assert_eq!(shown.agent.root, parent);
+    assert_eq!(shown.agent.depth, 1);
+    let parent_view: AgentGetResponse =
+        serde_json::from_value(fixture.json(&["show", &parent])).expect("typed parent");
+    assert_eq!(shown.agent.project, parent_view.agent.project);
+    let tree_stop = fixture.json(&["stop", &parent, "--tree"]);
+    assert_eq!(tree_stop["state"], "applied");
+    let tree_id = tree_stop["command_id"]
+        .as_str()
+        .expect("tree stop command")
+        .to_owned();
+    let children: CommandChildrenResponse =
+        serde_json::from_value(fixture.json(&["cmd", "children", &tree_id]))
+            .expect("typed children");
+    assert_eq!(
+        children
+            .children
+            .iter()
+            .map(|child| child.target.clone().unwrap())
+            .collect::<Vec<_>>(),
+        vec![parent.clone(), child.clone()]
+    );
+    for agent in [&parent, &child] {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let view: AgentGetResponse =
+                serde_json::from_value(fixture.json(&["show", agent])).expect("typed agent");
+            if view.agent.state == AgentState::Stopped {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "hierarchy tree stop deadline for {agent}; last state: {:?}",
+                view.agent.state
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    // A plain stop of a parent leaves its child running with its link.
+    let lone_parent = launch_child(&fixture, None);
+    wait_agent_ready(
+        &fixture,
+        &lone_parent,
+        1,
+        "hierarchy lone parent",
+        "hierarchy lone parent",
+    );
+    let lone_child = launch_child(&fixture, Some(&lone_parent));
+    wait_agent_ready(
+        &fixture,
+        &lone_child,
+        1,
+        "hierarchy lone child",
+        "hierarchy lone child",
+    );
+    let stop = fixture.json(&["stop", &lone_parent, "--generation", "1"]);
+    fixture.wait_command(
+        stop["command_id"].as_str().expect("stop command"),
+        "applied",
+    );
+    let running: AgentGetResponse =
+        serde_json::from_value(fixture.json(&["show", &lone_child])).expect("typed running child");
+    assert!(
+        matches!(
+            running.agent.state,
+            AgentState::Idle | AgentState::Busy | AgentState::Waiting
+        ),
+        "child state after parent stop: {:?}",
+        running.agent.state
+    );
+    assert_eq!(running.agent.parent.as_deref(), Some(lone_parent.as_str()));
+    let stop = fixture.json(&["stop", &lone_child]);
+    fixture.wait_command(
+        stop["command_id"].as_str().expect("stop command"),
+        "applied",
+    );
+    fixture.stop(false);
+}
+
+#[test]
+fn cli_hierarchy_fanout_limit_rejects_extra_children() {
+    let mut fixture = Fixture::new("hierarchy fanout");
+    // Let the daemon create and protect the Windows private data root before
+    // the fixture writes owner configuration.
+    fixture.start();
+    fixture.stop(false);
+    fs::write(
+        fixture.data.join("config.toml"),
+        "[daemon]\nlimits.max_children_per_agent = 1\n",
+    )
+    .unwrap();
+    fixture.start();
+    let launched = fixture.json(&[
+        "launch",
+        "--profile",
+        "fake",
+        "--workspace",
+        fixture.workspace.to_str().unwrap(),
+    ]);
+    let parent = launched["target"]
+        .as_str()
+        .expect("parent Agent")
+        .to_owned();
+    wait_agent_ready(&fixture, &parent, 1, "fanout parent", "fanout parent");
+    let workspace = fixture.workspace.to_str().unwrap().to_owned();
+    let first = fixture.json(&[
+        "launch",
+        "--profile",
+        "fake",
+        "--workspace",
+        &workspace,
+        "--parent",
+        &parent,
+    ]);
+    assert!(first["target"].as_str().is_some());
+    let reply = cli(
+        &fixture.data,
+        &[
+            "launch",
+            "--profile",
+            "fake",
+            "--workspace",
+            &workspace,
+            "--parent",
+            &parent,
+        ],
+    );
+    assert_eq!(reply.status.code(), Some(3), "fanout rejection exit");
+    assert!(
+        reply.stderr.contains("fanout_limit"),
+        "fanout rejection code: {}",
+        reply.stderr.lines().next().unwrap_or("")
+    );
+    assert_eq!(fixture.json(&["status"])["agents"], 2);
+    for agent in [
+        parent.as_str(),
+        first["target"].as_str().expect("first child"),
+    ] {
+        let stop = fixture.json(&["stop", agent]);
+        fixture.wait_command(
+            stop["command_id"].as_str().expect("stop command"),
+            "applied",
+        );
+    }
+    fixture.stop(false);
+}
