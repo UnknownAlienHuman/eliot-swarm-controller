@@ -72,6 +72,10 @@ enum Control {
         registered: oneshot::Sender<Result<()>>,
         outcome: oneshot::Sender<TurnOutcome>,
     },
+    CancelTurn {
+        command_id: String,
+        reply: oneshot::Sender<()>,
+    },
     CheckTurn {
         turn_id: String,
         reply: oneshot::Sender<bool>,
@@ -204,6 +208,26 @@ impl EventHandle {
         Ok(outcome_rx)
     }
 
+    /// Withdraw a pending turn whose input was proven never dispatched
+    /// (rejected), so the session never wedges `busy` behind it. Only the
+    /// exact pending command is cleared; an associated turn is untouched.
+    /// The ack is awaited so a following send cannot race the clear.
+    pub async fn cancel_turn(&self, command_id: String) {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .control
+            .send(Control::CancelTurn {
+                command_id,
+                reply: reply_tx,
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let _ = reply_rx.await;
+    }
+
     /// Whether `turn_id` is the exact live turn, answered behind any queued
     /// terminal frame so a control never targets a finished turn.
     pub async fn check_turn(&self, turn_id: &str) -> bool {
@@ -310,6 +334,11 @@ async fn run(
                         let result = processor.register_turn(command_id, turn_id, outcome);
                         publish(&processor, &status);
                         let _ = registered.send(result);
+                    }
+                    Control::CancelTurn { command_id, reply } => {
+                        processor.cancel_turn(&command_id);
+                        publish(&processor, &status);
+                        let _ = reply.send(());
                     }
                     Control::CheckTurn { turn_id, reply } => {
                         let live = processor.status.active_turn_id.as_deref() == Some(turn_id.as_str())
@@ -497,6 +526,19 @@ impl EventProcessor {
             outcome: Some(outcome),
         });
         Ok(())
+    }
+
+    fn cancel_turn(&mut self, command_id: &str) {
+        let pending_matches = self
+            .pending_turn
+            .as_ref()
+            .is_some_and(|pending| pending.command_id == command_id);
+        if pending_matches {
+            // The input was proven never dispatched, so no lifecycle for its
+            // turn can ever arrive; dropping the waiter unwedges the session.
+            // The caller already answered, so the dropped outcome is unheard.
+            self.pending_turn = None;
+        }
     }
 
     fn buffer_record(&mut self, record: Value) {
@@ -1077,5 +1119,54 @@ fn attach_final_text(data: &mut Value, text: &str, secrets: &SecretPolicy) {
     });
     if serde_json::to_vec(&marker).map_or(usize::MAX, |bytes| bytes.len()) <= MAX_EVENT_BYTES {
         data["final_text_unavailable"] = Value::String("event_budget".to_owned());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eliot_plugin::Peer;
+
+    fn ready_processor() -> EventProcessor {
+        // The writer task pends unwritten; registration and cancel never
+        // touch the host, so no fixture I/O is needed.
+        let peer = Peer::stdio();
+        let (status_tx, _status) = watch::channel(EventStatus::default());
+        let mut processor = EventProcessor::new(
+            peer.client(),
+            EventConfig {
+                credential: "test-credential".to_owned(),
+                agent_id: "test-agent".to_owned(),
+                generation: 1,
+                secrets: Vec::new(),
+            },
+            status_tx,
+        );
+        processor.status.ready = true;
+        processor.status.session_id = Some("test-session".to_owned());
+        processor
+    }
+
+    #[tokio::test]
+    async fn cancelled_pending_turn_unwedges_the_session() {
+        let mut processor = ready_processor();
+        let (outcome_tx, _outcome_rx) = oneshot::channel();
+        processor
+            .register_turn("cmd-1".to_owned(), "turn-1".to_owned(), outcome_tx)
+            .expect("first registration");
+        let (outcome_tx, _outcome_rx) = oneshot::channel();
+        let busy = processor
+            .register_turn("cmd-2".to_owned(), "turn-2".to_owned(), outcome_tx)
+            .expect_err("pending turn wedges the next send");
+        assert_eq!(busy.code, "busy");
+        // A foreign cancel is a noop; the exact cancel unwedges.
+        processor.cancel_turn("cmd-unknown");
+        assert!(processor.pending_turn.is_some());
+        processor.cancel_turn("cmd-1");
+        assert!(processor.pending_turn.is_none());
+        let (outcome_tx, _outcome_rx) = oneshot::channel();
+        processor
+            .register_turn("cmd-2".to_owned(), "turn-2".to_owned(), outcome_tx)
+            .expect("registration works after the cancel");
     }
 }

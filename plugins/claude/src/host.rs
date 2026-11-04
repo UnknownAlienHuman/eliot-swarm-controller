@@ -627,6 +627,9 @@ impl ClaudePlugin {
             .await
         {
             if native_no_write(&error.code) {
+                // Proven never dispatched: withdraw the pending turn before
+                // answering, or every later send wedges `busy` behind it.
+                session.events.cancel_turn(command_id.clone()).await;
                 session.rejected_commands.insert(command_id);
                 return Ok(json!({
                     "state": "rejected",
