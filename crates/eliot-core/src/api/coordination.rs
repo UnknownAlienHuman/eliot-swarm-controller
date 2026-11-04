@@ -643,6 +643,11 @@ fn unproven() -> Error {
 
 /// Project-relative claim globs stay small enough for list output.
 pub const MAX_CLAIM_GLOB_BYTES: usize = 1024;
+/// `**` segments per claim glob. One `claim.set` runs the overlap DP
+/// against every live claim under the Store lock, and the DP grows with
+/// the `**` count on both sides — this cap keeps every production
+/// comparison tiny no matter how the 1024 bytes are shaped.
+pub const MAX_CLAIM_DOUBLE_STAR_SEGMENTS: usize = 8;
 /// Optional claim notes stay small.
 pub const MAX_CLAIM_NOTE_BYTES: usize = 1024;
 /// Live claims per Agent generation stay bounded.
@@ -659,7 +664,8 @@ pub const MAX_WHO_PATHS: usize = 100;
 /// Normalize a project-relative claim glob: collapse duplicate slashes, drop
 /// leading `./` segments and one trailing slash. Absolute paths, `..`
 /// segments, NUL, backslashes and bracket/brace metacharacters are rejected:
-/// globs use `/` separators with `*`, `**` and `?` only.
+/// globs use `/` separators with `*`, `**` and `?` only, and at most
+/// [`MAX_CLAIM_DOUBLE_STAR_SEGMENTS`] `**` segments.
 pub fn normalize_claim_glob(glob: &str) -> Result<String> {
     if glob.len() > MAX_CLAIM_GLOB_BYTES || glob.contains('\0') || glob.trim().is_empty() {
         return Err(Error::new("invalid", "claim glob is invalid"));
@@ -698,6 +704,13 @@ pub fn normalize_claim_glob(glob: &str) -> Result<String> {
     }
     if segments.is_empty() {
         return Err(Error::new("invalid", "claim glob is invalid"));
+    }
+    if segments.iter().filter(|segment| **segment == "**").count() > MAX_CLAIM_DOUBLE_STAR_SEGMENTS
+    {
+        return Err(Error::new(
+            "invalid",
+            format!("claim globs hold at most {MAX_CLAIM_DOUBLE_STAR_SEGMENTS} `**` segments"),
+        ));
     }
     Ok(segments.join("/"))
 }
@@ -753,7 +766,11 @@ pub fn claim_globs_overlap(left: &str, right: &str) -> Result<bool> {
 
 /// `claim_globs_overlap` for already-normalized globs. The Store's
 /// conflict scan holds normalized globs on both sides, so it calls this
-/// once per candidate instead of re-normalizing per comparison.
+/// once per candidate instead of re-normalizing per comparison. Both
+/// inputs must be `normalize_claim_glob` output (as stored at admission):
+/// unnormalized input — duplicate slashes, `.` segments, absolute paths —
+/// may compare wrong, so callers with raw input must use
+/// `claim_globs_overlap` instead.
 pub fn claim_globs_overlap_normalized(left: &str, right: &str) -> bool {
     if left == right {
         return true;
@@ -788,7 +805,9 @@ fn segment_may_overlap(left: &str, right: &str) -> bool {
 /// instead of the exponential re-recursion of naive skip loops. The bound
 /// is load-bearing: globs may be 1024 bytes and this runs under the Store
 /// lock against every live claim, so one adversarial `(**/*)^k` pair must
-/// not stall the daemon.
+/// not stall the daemon. Admission additionally caps `**` segments at
+/// [`MAX_CLAIM_DOUBLE_STAR_SEGMENTS`], so production pairs stay far below
+/// the worst case; the DP stays bounded regardless.
 fn segments_may_overlap(left: &[&str], right: &[&str]) -> bool {
     let (n, m) = (left.len(), right.len());
     let stride = m + 1;
@@ -1727,18 +1746,40 @@ mod tests {
         // states exponentially (~13.7M calls for the 8-repetition pair),
         // while a bounded DP visits each state once. No path ends in both
         // `x` and `y`, so the pair is disjoint — and the call must return
-        // instead of stalling the Store lock it runs under.
+        // instead of stalling the Store lock it runs under. Admission
+        // rejects this shape (>8 `**` segments), so the DP is exercised
+        // directly through the normalized entry point; both inputs are
+        // already in normalized form.
         let left = format!("{}x", "**/*/".repeat(204));
         let right = format!("{}y", "**/*/".repeat(204));
         assert!(left.len() <= MAX_CLAIM_GLOB_BYTES);
         assert!(right.len() <= MAX_CLAIM_GLOB_BYTES);
+        assert!(normalize_claim_glob(&left).is_err());
+        assert!(normalize_claim_glob(&right).is_err());
         let started = std::time::Instant::now();
-        assert!(!claim_globs_overlap(&left, &right).unwrap());
+        assert!(!claim_globs_overlap_normalized(&left, &right));
         assert!(
             started.elapsed() < std::time::Duration::from_secs(10),
             "overlap took {:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn claim_globs_cap_double_star_segments_at_eight() {
+        let capped = format!("{}tail", "**/".repeat(MAX_CLAIM_DOUBLE_STAR_SEGMENTS));
+        assert_eq!(normalize_claim_glob(&capped).unwrap(), capped);
+        let over = format!("{}tail", "**/".repeat(MAX_CLAIM_DOUBLE_STAR_SEGMENTS + 1));
+        let error = normalize_claim_glob(&over).unwrap_err();
+        assert_eq!(error.code, "invalid");
+        // The `claim.set` validator rejects the same glob as `invalid`.
+        let error = ClaimSetRequest {
+            glob: over,
+            ..claim_set_request()
+        }
+        .validate()
+        .unwrap_err();
+        assert_eq!(error.code, "invalid");
     }
 
     #[test]

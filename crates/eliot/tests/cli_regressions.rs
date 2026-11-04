@@ -14619,7 +14619,7 @@ fn attribution_claim_conflict_reports_inband_and_notifies_once() {
             continue;
         }
         let text = command["args"]["text"].as_str().unwrap_or("");
-        if text.contains("overlapping work claims; run swarm who") {
+        if text.contains("overlapping work claim") {
             assert!(
                 !text.contains("docs/"),
                 "notice must never contain claimed paths"
@@ -14634,7 +14634,7 @@ fn attribution_claim_conflict_reports_inband_and_notifies_once() {
         notices,
         vec![(
             a.clone(),
-            "1 overlapping work claims; run swarm who".to_owned()
+            "1 overlapping work claim; run swarm who".to_owned()
         )]
     );
 

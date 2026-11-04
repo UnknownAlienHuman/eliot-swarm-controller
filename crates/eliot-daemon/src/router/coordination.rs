@@ -51,6 +51,7 @@ fn wake_enabled(snapshot: &Value) -> bool {
 fn notice_text(kind: NoticeKind, count: i64) -> String {
     match kind {
         NoticeKind::Mail => format!("{count} unread messages; run swarm inbox"),
+        NoticeKind::Claim if count == 1 => "1 overlapping work claim; run swarm who".to_owned(),
         NoticeKind::Claim => format!("{count} overlapping work claims; run swarm who"),
     }
 }

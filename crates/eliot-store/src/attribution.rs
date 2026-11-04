@@ -238,20 +238,14 @@ impl Store {
                 num, generation, ..
             } => {
                 let current = load_current_claim_agent(&self.connection, num, generation)?;
-                if request
+                let project_mismatch = request
                     .project
                     .as_deref()
                     .is_some_and(|project| project != current.project)
-                {
-                    return Err(Error::new(
-                        "not_allowed",
-                        "Agents list only their own project claims",
-                    ));
-                }
-                if agent
-                    .as_ref()
-                    .is_some_and(|(_, project)| project != &current.project)
-                {
+                    || agent
+                        .as_ref()
+                        .is_some_and(|(_, project)| project != &current.project);
+                if project_mismatch {
                     return Err(Error::new(
                         "not_allowed",
                         "Agents list only their own project claims",

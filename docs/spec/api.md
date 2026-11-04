@@ -704,8 +704,10 @@ owner exists. See [coordination](coordination.md#modes-and-wake).
 
 `claim.set` records one advisory claim — a project-relative glob with an
 optional note and a TTL — owned by an Agent generation. Globs use `/`
-separators with `*`, `**` and `?` only, at most 1024 bytes; absolute
-paths, `..` segments and bracket/brace metacharacters are `invalid`. The
+separators with `*`, `**` and `?` only, at most 1024 bytes and at most 8
+`**` segments (the cap keeps the overlap scan against every live claim
+cheap); absolute paths, `..` segments, bracket/brace metacharacters and
+a ninth `**` segment are `invalid`. The
 TTL is 1 second to one day (default one hour). An Agent caller claims
 only its own current generation; the owner names the Agent explicitly and
 cannot claim for a terminal Agent (`bad_state`). One generation holds at
@@ -724,8 +726,9 @@ by the next claim write. A conflict — two globs that may overlap after
 normalization (segments are compatible when equal or either side carries
 a wildcard, with `**` realigning across directories), in the same project
 — is reported in-band in the `claim.set` response and routes at most one
-coalesced generic notice per holder: `N overlapping work claims; run
-swarm who`. Detection is conservative: a false positive only adds an
+coalesced generic notice per holder: `1 overlapping work claim` /
+`N overlapping work claims`, plus `; run swarm who`. Detection is
+conservative: a false positive only adds an
 advisory notice. The in-band list holds at most 100 conflicts;
 `truncated` signals the scan or report cap engaged. The notice shares the
 mail-wake gate (one per minute, at most one open notice command per

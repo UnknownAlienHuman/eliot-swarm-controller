@@ -748,7 +748,7 @@ mod tests {
 
         // Each holder got exactly one generic notice through the ordinary
         // send path; the text carries the overlap count, never paths.
-        let store = router.inner.store.lock().await;
+        let mut store = router.inner.store.lock().await;
         for holder in [&a, &b] {
             let state = store
                 .notice_state(holder)
@@ -763,13 +763,29 @@ mod tests {
             assert_eq!(command.target.as_deref(), Some(holder.as_str()));
             assert_eq!(
                 command.args["text"],
-                json!("1 overlapping work claims; run swarm who")
+                json!("1 overlapping work claim; run swarm who")
             );
         }
         assert_eq!(
             holder_notice_sends(&store, &a, &b).expect("count notices"),
             2
         );
+
+        // Free both holders' notice gates before replaying: without this
+        // the shared cooldown would suppress a second notify on its own
+        // and the replay assertion below would pass even with the router's
+        // replay guard removed. With the gates free, only the guard — no
+        // events, no notify — keeps the send count at two.
+        for holder in [&a, &b] {
+            let open = store
+                .notice_state(holder)
+                .expect("read notice state")
+                .and_then(|state| state.open_notice_command)
+                .expect("open notice recorded");
+            store
+                .notice_release(holder, &open)
+                .expect("free the notice gate");
+        }
         drop(store);
 
         // A replayed claim.set returns the retained response and routes no
