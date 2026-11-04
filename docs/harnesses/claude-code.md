@@ -14,13 +14,16 @@ Claude Code 2.1.278): [headless](https://code.claude.com/docs/en/headless),
 [CLI](https://code.claude.com/docs/en/cli-reference).
 The TypeScript Agent SDK is not used.
 These notes do not establish runtime support or a current license approval.
+Verified live on Claude Code 2.1.278 (2026-11-04): with
+`--permission-prompt-tool stdio` a tool use arrives as a `control_request`
+`{"subtype":"can_use_tool","tool_name","display_name","input","description",
+"permission_suggestions","tool_use_id"}`; a `control_response` with
+`{"behavior":"allow","updatedInput":<input>}` runs the tool and
+`{"behavior":"deny","message":…}` refuses it, each on the same `request_id`.
 Unverified live (fake-only until a live run): the `set_model` /
 `set_permission_mode` calls on a resumed session (their success shape was
-observed once on a fresh CLI, but the resume-realign flow never ran live),
-the resumed CLI's session re-announcement, and the `can_use_tool` ask with
-its allow/deny reply. The ask follows the documented SDK `PermissionResult`
-shape; live verification on the installed CLI is pending the owner login,
-and the adapter marks that unverified until then.
+observed once on a fresh CLI, but the resume-realign flow never ran live) and
+the resumed CLI's session re-announcement.
 
 ## Native identity and generation
 
@@ -71,7 +74,7 @@ covers their fate.
 | interrupt | stdin `control_request interrupt` for the bound active turn uuid, with the `still_queued` readback; the terminal follows and unknown is not repeated |
 | stop | drop stdin (the CLI exits on EOF) and kill only the direct CLI child by handle; does not merely detach observation; grandchildren are reaped by the generation Job on Windows / process group on Unix, not the plugin (see Transport) |
 | resume | new plugin/CLI with `--resume` and the exact retained session id; never resend prior prompt; the frozen model is re-applied via `set_model` and a drifted permission mode via `set_permission_mode` on the idle preflight (both fake-only, unverified live) |
-| approve/deny | exact `can_use_tool` native request id; allow echoes the asked `input` as `updatedInput`, deny sends the fixed message (documented SDK shape; live verification pending owner login) |
+| approve/deny | exact `can_use_tool` native request id; allow echoes the asked `input` as `updatedInput`, deny sends the fixed message (verified live, 2.1.278) |
 | answer | unsupported: the AskUserQuestion shape on the installed CLI is unverified |
 | configure | applied at start, not a runtime verb: `--model` / `--permission-mode` argv on a fresh start, `set_model` / `set_permission_mode` realign on resume; requested vs effective settings are reported before readiness, with `effective.model` always null (the CLI never reads the active model back; `models[]` membership is the only proof) |
 | goal | no native goal mechanism; goal selection stays in Eliot |
@@ -91,6 +94,17 @@ Transcript JSONL is later observe/recovery data with file identity/offset where 
 not a parallel live producer. No proven replay cursor means gap + exact current
 readback, never full-history republishing. Child completion needs exact tool/task
 provenance, not parent idle. Resumed cumulative cost is session scope, not a turn delta.
+
+## Login
+
+The CLI keeps its own login in its config directory; the Claude desktop app's
+session is host-managed and is not shared with other processes. Before every
+launch or resume the plugin runs `claude auth status` with the frozen
+environment. When the CLI is logged out it runs the CLI's own
+`claude auth login --claudeai` (the owner completes it in the browser) and waits
+up to five minutes; an unfinished login rejects the start with
+`native_not_dispatched` before any session exists. The plugin never sees or
+stores credentials.
 
 ## Proxy and qualification
 
