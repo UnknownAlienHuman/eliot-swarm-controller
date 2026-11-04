@@ -37,20 +37,67 @@ pub(super) fn persist_effects(
     let mut provider_events = Vec::new();
     for effect in effects {
         match effect {
-            Effect::CommandTurnAssociated { .. } => {
-                command_events.push(persist_turn_associated(scope, effect)?);
+            Effect::CommandTurnAssociated {
+                command_id,
+                turn_id,
+            } => {
+                command_events.push(persist_turn_associated(scope, command_id, turn_id)?);
             }
-            Effect::RequestPending { .. } => {
-                persist_request_effect(scope, effect)?;
+            Effect::RequestPending {
+                request_id,
+                turn_id,
+                pending,
+                kind,
+                details,
+            } => {
+                persist_request_effect(
+                    scope,
+                    request_id,
+                    turn_id,
+                    *pending,
+                    kind.as_deref(),
+                    details.as_ref(),
+                )?;
             }
-            Effect::RequestClosed { .. } => {
-                persist_request_closed(scope, effect)?;
+            Effect::RequestClosed {
+                request_id,
+                turn_id,
+            } => {
+                persist_request_closed(scope, request_id, turn_id)?;
             }
-            Effect::MessageCompleted { .. } => {
-                persist_message_completed(scope, effect)?;
+            Effect::MessageCompleted {
+                command_id,
+                turn_id,
+                text,
+            } => {
+                persist_message_completed(scope, command_id, turn_id, text)?;
             }
-            Effect::TurnTerminal { .. } => {
-                persist_turn_terminal(scope, effect, &mut provider_events)?;
+            Effect::TurnTerminal {
+                command_id,
+                turn_id,
+                state,
+                status,
+                final_text,
+                completed_at,
+            } => {
+                persist_turn_terminal(
+                    scope,
+                    command_id.as_deref(),
+                    turn_id,
+                    *state,
+                    status.as_deref(),
+                    final_text.as_deref(),
+                    *completed_at,
+                )?;
+                if command_id.is_some() {
+                    provider_events.extend(provider_holds::terminal_tx(
+                        scope.tx,
+                        scope.next_agent,
+                        effect,
+                        scope.native_event,
+                        scope.now,
+                    )?);
+                }
             }
         }
     }
@@ -59,7 +106,8 @@ pub(super) fn persist_effects(
 
 fn persist_turn_associated(
     scope: EffectScope<'_, '_>,
-    effect: &Effect,
+    command_id: &str,
+    turn_id: &str,
 ) -> Result<PendingCommandEvent> {
     let EffectScope {
         tx,
@@ -68,13 +116,6 @@ fn persist_turn_associated(
         now,
         ..
     } = scope;
-    let Effect::CommandTurnAssociated {
-        command_id,
-        turn_id,
-    } = effect
-    else {
-        unreachable!("persist_turn_associated called for another effect");
-    };
     let command = load_command_record(tx, command_id)?.ok_or_else(|| {
         Error::new(
             "source_integrity",
@@ -90,7 +131,7 @@ fn persist_turn_associated(
         || command
             .expected_turn_id
             .as_deref()
-            .is_some_and(|expected| expected != turn_id.as_str())
+            .is_some_and(|expected| expected != turn_id)
     {
         return Err(Error::new(
             "source_integrity",
@@ -123,14 +164,21 @@ fn persist_turn_associated(
         params![turn_id, encode_json(&outcome)?, now, command_id],
     ));
     Ok(PendingCommandEvent {
-        command_id: command_id.clone(),
+        command_id: command_id.to_owned(),
         data: json!({
             "command_id": command_id, "state": "applied", "outcome": outcome,
         }),
     })
 }
 
-fn persist_request_effect(scope: EffectScope<'_, '_>, effect: &Effect) -> Result<()> {
+fn persist_request_effect(
+    scope: EffectScope<'_, '_>,
+    request_id: &str,
+    turn_id: &str,
+    pending: bool,
+    kind: Option<&str>,
+    details: Option<&Value>,
+) -> Result<()> {
     let EffectScope {
         tx,
         agent_num,
@@ -138,24 +186,14 @@ fn persist_request_effect(scope: EffectScope<'_, '_>, effect: &Effect) -> Result
         native_event,
         ..
     } = scope;
-    let Effect::RequestPending {
-        request_id,
-        turn_id,
-        pending,
-        kind,
-        details,
-    } = effect
-    else {
-        unreachable!("persist_request_effect called for another effect");
-    };
-    let expected_kind = if *pending {
+    let expected_kind = if pending {
         "request.opened"
     } else {
         "request.resolved"
     };
     if native_event.kind != expected_kind
-        || required_string(&native_event.data, "request_id")?.as_str() != request_id.as_str()
-        || required_string(&native_event.data, "turn_id")?.as_str() != turn_id.as_str()
+        || required_string(&native_event.data, "request_id")?.as_str() != request_id
+        || required_string(&native_event.data, "turn_id")?.as_str() != turn_id
     {
         return Err(Error::new(
             "source_integrity",
@@ -175,25 +213,18 @@ fn persist_request_effect(scope: EffectScope<'_, '_>, effect: &Effect) -> Result
             "request event command is bound to another Agent or generation",
         ));
     }
-    if *pending {
+    if pending {
         persist_request_opened(
             scope,
             &command,
             &command_id,
             request_id,
             turn_id,
-            kind.as_deref(),
-            details.as_ref(),
+            kind,
+            details,
         )
     } else {
-        persist_request_resolved(
-            scope,
-            &command,
-            request_id,
-            turn_id,
-            kind.as_deref(),
-            details.as_ref(),
-        )
+        persist_request_resolved(scope, &command, request_id, turn_id, kind, details)
     }
 }
 
@@ -343,7 +374,11 @@ fn persist_request_resolved(
     Ok(())
 }
 
-fn persist_request_closed(scope: EffectScope<'_, '_>, effect: &Effect) -> Result<()> {
+fn persist_request_closed(
+    scope: EffectScope<'_, '_>,
+    request_id: &str,
+    turn_id: &str,
+) -> Result<()> {
     let EffectScope {
         tx,
         agent_num,
@@ -352,21 +387,14 @@ fn persist_request_closed(scope: EffectScope<'_, '_>, effect: &Effect) -> Result
         next_agent,
         ..
     } = scope;
-    let Effect::RequestClosed {
-        request_id,
-        turn_id,
-    } = effect
-    else {
-        unreachable!("persist_request_closed called for another effect");
-    };
     if native_event.kind != "request.closed"
         || native_event.data.get("command_id").is_some()
-        || required_string(&native_event.data, "request_id")?.as_str() != request_id.as_str()
-        || required_string(&native_event.data, "turn_id")?.as_str() != turn_id.as_str()
+        || required_string(&native_event.data, "request_id")?.as_str() != request_id
+        || required_string(&native_event.data, "turn_id")?.as_str() != turn_id
         || next_agent
             .pending
             .iter()
-            .any(|request| request.id == *request_id)
+            .any(|request| request.id.as_str() == request_id)
     {
         return Err(Error::new(
             "source_integrity",
@@ -380,7 +408,7 @@ fn persist_request_closed(scope: EffectScope<'_, '_>, effect: &Effect) -> Result
             "request.closed references no durable pending request",
         ));
     };
-    if state != "pending" || existing.turn_id.as_str() != turn_id.as_str() {
+    if state != "pending" || existing.turn_id.as_str() != turn_id {
         return Err(Error::new(
             "source_integrity",
             "request.closed does not match its durable pending binding",
@@ -403,21 +431,18 @@ fn persist_request_closed(scope: EffectScope<'_, '_>, effect: &Effect) -> Result
     Ok(())
 }
 
-fn persist_message_completed(scope: EffectScope<'_, '_>, effect: &Effect) -> Result<()> {
+fn persist_message_completed(
+    scope: EffectScope<'_, '_>,
+    command_id: &str,
+    turn_id: &str,
+    text: &str,
+) -> Result<()> {
     let EffectScope {
         tx,
         agent_num,
         generation,
         ..
     } = scope;
-    let Effect::MessageCompleted {
-        command_id,
-        turn_id,
-        text,
-    } = effect
-    else {
-        unreachable!("persist_message_completed called for another effect");
-    };
     if text.len() > MAX_EVENT_BYTES {
         return Err(Error::new(
             "frame_too_large",
@@ -458,28 +483,20 @@ fn persist_message_completed(scope: EffectScope<'_, '_>, effect: &Effect) -> Res
 
 fn persist_turn_terminal(
     scope: EffectScope<'_, '_>,
-    effect: &Effect,
-    provider_events: &mut Vec<Event>,
+    command_id: Option<&str>,
+    turn_id: &str,
+    state: TurnState,
+    status: Option<&str>,
+    final_text: Option<&str>,
+    completed_at: i64,
 ) -> Result<()> {
     let EffectScope {
         tx,
         agent_num,
         generation,
-        now,
-        native_event,
         next_agent,
+        ..
     } = scope;
-    let Effect::TurnTerminal {
-        command_id,
-        turn_id,
-        state,
-        status,
-        final_text,
-        completed_at,
-    } = effect
-    else {
-        unreachable!("persist_turn_terminal called for another effect");
-    };
     if let Some(text) = final_text
         && text.len() > MAX_EVENT_BYTES
     {
@@ -509,7 +526,7 @@ fn persist_turn_terminal(
                               final_text = COALESCE(?3, final_text), completed_at = ?4
              WHERE agent = ?5 AND generation = ?6 AND turn_id = ?7",
             params![
-                turn_state_name(*state),
+                turn_state_name(state),
                 status,
                 final_text,
                 completed_at,
@@ -534,21 +551,12 @@ fn persist_turn_terminal(
     if next_agent
         .pending
         .iter()
-        .any(|request| request.turn_id == *turn_id)
+        .any(|request| request.turn_id.as_str() == turn_id)
     {
         return Err(Error::new(
             "source_integrity",
             "terminal turn retains pending requests in the Agent projection",
         ));
-    }
-    if command_id.is_some() {
-        provider_events.extend(provider_holds::terminal_tx(
-            tx,
-            next_agent,
-            effect,
-            native_event,
-            now,
-        )?);
     }
     Ok(())
 }
