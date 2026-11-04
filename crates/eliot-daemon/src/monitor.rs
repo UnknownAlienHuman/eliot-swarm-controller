@@ -1921,10 +1921,13 @@ mod tests {
         now: i64,
     ) -> Agent {
         // The sweep clock is fixed, so the id carries that timestamp:
-        // admission refuses ULIDs ahead of the commit clock.
+        // admission refuses ULIDs ahead of the commit clock. The random
+        // part is unique per call: one sweep admits several launches at
+        // the same fixed clock.
+        static SWEEP_ID_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = ulid::Ulid::from_parts(
             u64::try_from(now).expect("sweep fixture clock is non-negative"),
-            1,
+            u128::from(SWEEP_ID_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
         )
         .to_string();
         let mut request = eliot_core::SubmitCommand::new(id, "launch");
