@@ -460,8 +460,9 @@ pub fn unknown_control(reason: &str) -> Value {
 
 /// Register the owned native process as the `harness` role under this
 /// Agent generation. `harness` is the display name (`"Muse"`,
-/// `"OpenCode"`, `"Codex"`); `process_noun` is the owned child
-/// (`"session host"`, `"server"`, `"app-server"`); `scope_noun` is the
+/// `"OpenCode"`, `"Codex"`, `"Claude"`); `process_noun` is the owned
+/// child (`"session host"`, `"server"`, `"app-server"`, `"CLI"`);
+/// `scope_noun` is the
 /// native scope no input was sent to (`"session"`, or `"thread"` for
 /// Codex). The caller resolves the pid through its own child handle; a
 /// missing or zero pid fails before any session or input is sent.
