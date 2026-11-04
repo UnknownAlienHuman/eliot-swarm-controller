@@ -1920,7 +1920,14 @@ mod tests {
         project: &str,
         now: i64,
     ) -> Agent {
-        let mut request = eliot_core::SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+        // The sweep clock is fixed, so the id carries that timestamp:
+        // admission refuses ULIDs ahead of the commit clock.
+        let id = ulid::Ulid::from_parts(
+            u64::try_from(now).expect("sweep fixture clock is non-negative"),
+            1,
+        )
+        .to_string();
+        let mut request = eliot_core::SubmitCommand::new(id, "launch");
         request.args = serde_json::json!({
             "project": project, "workspace": project, "harness": "fake",
         });
