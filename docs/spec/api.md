@@ -26,7 +26,7 @@ saved scope. It is never persisted in command/event data or logs. The child rece
 only `command.get` for that exact command id while the token is registered, and may make
 that its first RPC. That read returns the standard Core `Command` DTO for that id, as the
 ordinary API/CLI `command.get` path does, including its usual secret-free semantic args.
-This preserves the existing typed `eliot cmd show` response validation. The Run token and
+This preserves the existing typed `swarm cmd show` response validation. The Run token and
 secret environment values are never stored in command data. It cannot
 submit commands or read its parent, siblings or another command. This is a scoped variant of the existing
 auth envelope and Router, not a separate security platform.
@@ -387,9 +387,9 @@ diagnostics exposed. A `command.children` response must hold at most `limit`
 well-formed commands with `next` equal to the last child id, or null when the
 page is empty; a mismatch is the same fixed `unknown` error.
 
-`eliot cmd show`, `eliot cmd children` and `eliot result` exit 0 after a valid read
+`swarm cmd show`, `swarm cmd children` and `swarm result` exit 0 after a valid read
 even if a returned command or turn is `unknown`; that state is not a successful task
-outcome. The `eliot wait` flow treats an `unknown` command or turn as exit 4. A binding
+outcome. The `swarm wait` flow treats an `unknown` command or turn as exit 4. A binding
 mismatch is also unknown and must not print the mismatched response.
 
 ## Input, turn and unknown gates
@@ -677,7 +677,7 @@ increments the version, records `set_by`, and emits `var.changed`.
 
 A routed recipient with `wake_on_mail` (profile snapshot, default true) may
 receive one generic coalesced wake per minute with at most one open notice
-command: `N unread messages; run eliot inbox`. The notice never contains
+command: `N unread messages; run swarm inbox`. The notice never contains
 the body, is sent through the ordinary owner `send` path bound to the
 recipient's current generation, and is skipped — never retried — while a
 notice command is open or unknown, a provider hold, pending request or
@@ -714,44 +714,44 @@ Generation/turn/request flags are optional for immediate calls, explicit for del
 The synopsis is target grammar; later-layer forms are not an inventory of current help.
 
 ```text
-eliot daemon [--foreground]
-eliot daemon stop [--drain|--force]
-eliot status
-eliot launch --profile P --workspace PATH [--worktree BRANCH [--base REF]] [PROMPT] [--wait]
-eliot worktree remove AGENT [--generation N]
-eliot ls | show A | watch [A|SELECTOR] | top
-eliot processes A [--scope agent|workspace] [--generation N] [--after CURSOR] [--limit N]
-eliot stats A [--generation N]
-eliot git-status A [--generation N]
-eliot edits A [--generation N] [--after PATH] [--limit N]
-eliot send A TEXT [--probe] [--wait] [--generation N]
-eliot steer|inject A TEXT [--generation N] [--turn ID]
-eliot interrupt|abort A [--generation N] [--turn ID]
-eliot stop A [--force] [--tree] [--generation N]
-eliot resume A [PROMPT] [--wait]
-eliot wait TARGET... [--for turn|idle|stopped|goal] [--after-command ID]
-eliot result A [--generation N] [--turns N]
-eliot turn show|resolve ...
-eliot approve|deny|answer ... [--request R]
-eliot configure ... | compact|fork|background ...
-eliot cmd show|children|cancel|resolve ...
-eliot events [--since SEQ] [--allow-gap]
-eliot msg send ... | msg show ... | msg ack ... | inbox [AGENT] [--wait SECS]
-eliot var set ... | var get ... | who ... | claim ... | release ...
-eliot project list | show ID
-eliot rule show ID [--project PROJECT]
-eliot rule catch-up ID --after SEQ [--through SEQ] [--project PROJECT]
-eliot timer show ID [--project PROJECT] | run ID [--project PROJECT]
-eliot goal set A --text TEXT --check CMD [ARGS...] [--mode eliot|native] [--check-cwd PATH] [--check-timeout-ms MS] [--max-turns N] [--max-rounds N] [--max-without-progress N] [--cadence-ms MS]
-eliot goal show|pause|clear|resume A [--mode eliot|native] [--reason R]
-eliot goal round A (--idle-seq SEQ | --slot N) [--mode eliot|native]
-eliot discover --profile P [--harness H] [--scope S] [--cursor C] [--limit N]
-eliot attach --profile P --harness H --scope S --ref R [--project LABEL]
-eliot history A --view subject|turns|items [--source native|rollout] [--turn-id ID] [--cursor C] [--limit N]
-eliot detach A [--generation N]
-eliot provider holds [--after SCOPE] [--limit N]
-eliot provider clear-hold SCOPE --corrective-evidence credentials_updated|configuration_updated|owner_verified [--expected-probe-command ID]
-eliot plugin NAME | plugin-test ... | hook ... | mcp
+swarm daemon [--foreground]
+swarm daemon stop [--drain|--force]
+swarm status
+swarm launch --profile P --workspace PATH [--worktree BRANCH [--base REF]] [PROMPT] [--wait]
+swarm worktree remove AGENT [--generation N]
+swarm ls | show A | watch [A|SELECTOR] | top
+swarm processes A [--scope agent|workspace] [--generation N] [--after CURSOR] [--limit N]
+swarm stats A [--generation N]
+swarm git-status A [--generation N]
+swarm edits A [--generation N] [--after PATH] [--limit N]
+swarm send A TEXT [--probe] [--wait] [--generation N]
+swarm steer|inject A TEXT [--generation N] [--turn ID]
+swarm interrupt|abort A [--generation N] [--turn ID]
+swarm stop A [--force] [--tree] [--generation N]
+swarm resume A [PROMPT] [--wait]
+swarm wait TARGET... [--for turn|idle|stopped|goal] [--after-command ID]
+swarm result A [--generation N] [--turns N]
+swarm turn show|resolve ...
+swarm approve|deny|answer ... [--request R]
+swarm configure ... | compact|fork|background ...
+swarm cmd show|children|cancel|resolve ...
+swarm events [--since SEQ] [--allow-gap]
+swarm msg send ... | msg show ... | msg ack ... | inbox [AGENT] [--wait SECS]
+swarm var set ... | var get ... | who ... | claim ... | release ...
+swarm project list | show ID
+swarm rule show ID [--project PROJECT]
+swarm rule catch-up ID --after SEQ [--through SEQ] [--project PROJECT]
+swarm timer show ID [--project PROJECT] | run ID [--project PROJECT]
+swarm goal set A --text TEXT --check CMD [ARGS...] [--mode eliot|native] [--check-cwd PATH] [--check-timeout-ms MS] [--max-turns N] [--max-rounds N] [--max-without-progress N] [--cadence-ms MS]
+swarm goal show|pause|clear|resume A [--mode eliot|native] [--reason R]
+swarm goal round A (--idle-seq SEQ | --slot N) [--mode eliot|native]
+swarm discover --profile P [--harness H] [--scope S] [--cursor C] [--limit N]
+swarm attach --profile P --harness H --scope S --ref R [--project LABEL]
+swarm history A --view subject|turns|items [--source native|rollout] [--turn-id ID] [--cursor C] [--limit N]
+swarm detach A [--generation N]
+swarm provider holds [--after SCOPE] [--limit N]
+swarm provider clear-hold SCOPE --corrective-evidence credentials_updated|configuration_updated|owner_verified [--expected-probe-command ID]
+swarm plugin NAME | plugin-test ... | hook ... | mcp
 ```
 
 In particular, `cmd cancel` is not an implemented CLI form. `cmd show`,

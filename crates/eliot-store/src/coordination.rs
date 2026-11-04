@@ -2542,7 +2542,7 @@ mod tests {
         let mut send = SubmitCommand::new(notice.clone(), "send");
         send.target = Some(a.clone());
         send.expected_generation = Some(1);
-        send.args = json!({"text": "1 unread messages; run eliot inbox"});
+        send.args = json!({"text": "1 unread messages; run swarm inbox"});
         store.submit("owner", send, now).expect("admit notice");
         assert_eq!(
             store
@@ -2734,7 +2734,7 @@ mod tests {
         let mut send = SubmitCommand::new(notice.clone(), "send");
         send.target = Some(a.clone());
         send.expected_generation = Some(1);
-        send.args = json!({"text": "1 unread messages; run eliot inbox"});
+        send.args = json!({"text": "1 unread messages; run swarm inbox"});
         let admitted = store.submit("owner", send, now).expect("admit notice send");
         assert_eq!(admitted.command.state, CommandState::Queued);
         // The cooldown stands: a second wake is suppressed by the open command.

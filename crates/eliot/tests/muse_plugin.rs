@@ -7,7 +7,7 @@
 //! fixture loop instead of the scenarios.
 //!
 //! Fixture payloads follow the installed stable MSP schema (Muse Code 1.4.0);
-//! the plugin under test is the real `eliot plugin muse` binary driven over
+//! the plugin under test is the real `swarm plugin muse` binary driven over
 //! the Eliot plugin protocol, with this file emulating the host side
 //! (`process.put`, `events.put`, `source.gap`).
 
@@ -22,7 +22,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
-const CLI: &str = env!("CARGO_BIN_EXE_eliot");
+const CLI: &str = env!("CARGO_BIN_EXE_swarm");
 const MODEL: &str = "muse-spark-1.3-contributor";
 const EFFORT: &str = "medium";
 const OP_TIMEOUT: Duration = Duration::from_secs(15);
@@ -1638,7 +1638,7 @@ impl FakeMsp {
 }
 
 // ---------------------------------------------------------------------------
-// Host-side emulator: drives `eliot plugin muse` over the plugin protocol
+// Host-side emulator: drives `swarm plugin muse` over the plugin protocol
 // ---------------------------------------------------------------------------
 
 /// A call response plus its consumption signal: the reader holds back later

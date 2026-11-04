@@ -3,11 +3,11 @@
 # Copy this file to <data_dir>/rules/resume-after-known-stop.toml, then
 # replace YOUR_STOP_COMMAND_ID below with the ULID you will stop with:
 #
-#   eliot --id YOUR_STOP_COMMAND_ID stop <agent> --generation 1
+#   swarm --id YOUR_STOP_COMMAND_ID stop <agent> --generation 1
 #
 # When that exact stop is applied, the rule resumes the agent into a new
 # generation with the text below as its linked first input. Verify with:
-#   eliot rule show resume-after-known-stop
+#   swarm rule show resume-after-known-stop
 #
 # CI runs this exact file against the Fake profile (harness swapped to
 # "fake", stop id substituted, nothing else changed).
