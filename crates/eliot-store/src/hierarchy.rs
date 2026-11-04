@@ -104,18 +104,24 @@ pub(super) fn subtree_member_nums(
     Ok(members)
 }
 
+/// Live children of one parent: terminal Agents (stopped, failed, lost)
+/// no longer occupy fanout. Unknown Agents still count: they may recover.
 pub(super) fn count_children_tx(tx: &Transaction<'_>, parent_num: i64) -> Result<i64> {
     tx.query_row(
-        "SELECT COUNT(*) FROM agents WHERE parent = ?1",
+        "SELECT COUNT(*) FROM agents
+         WHERE parent = ?1 AND state NOT IN ('stopped', 'failed', 'lost')",
         [parent_num],
         |row| row.get(0),
     )
     .map_err(sql_error)
 }
 
+/// Live Agents of one tree: terminal members no longer occupy fanout.
 pub(super) fn count_tree_tx(tx: &Transaction<'_>, root_num: i64) -> Result<i64> {
     tx.query_row(
-        "SELECT COUNT(*) FROM agents WHERE root = ?1 OR (root IS NULL AND id = ?1)",
+        "SELECT COUNT(*) FROM agents
+         WHERE (root = ?1 OR (root IS NULL AND id = ?1))
+           AND state NOT IN ('stopped', 'failed', 'lost')",
         [root_num],
         |row| row.get(0),
     )
@@ -147,6 +153,47 @@ fn is_in_subtree_of(connection: &Connection, member_num: i64, ancestor_num: i64)
     Ok(false)
 }
 
+/// The one frozen-scope walk: itself, its subtree for tree control, or its
+/// project label for project control. Shared by Store admission
+/// (`caller_may_command`) and Router reads (`Store::agent_in_scope`).
+fn scope_allows(
+    connection: &Connection,
+    caller_id: &str,
+    caller_num: i64,
+    control: AgentControl,
+    project: &str,
+    target_id: &str,
+) -> Result<bool> {
+    if target_id == caller_id {
+        return Ok(true);
+    }
+    match control {
+        AgentControl::Slf => Ok(false),
+        AgentControl::Project => {
+            let target = load_agent_by_num(connection, parse_agent_id(target_id)?)?;
+            Ok(target.is_some_and(|agent| agent.project == project))
+        }
+        AgentControl::Tree => {
+            let member_num = parse_agent_id(target_id)?;
+            is_in_subtree_of(connection, member_num, caller_num)
+        }
+    }
+}
+
+impl Store {
+    /// Whether `target_id` is in `caller`'s frozen scope, for Router reads.
+    pub fn agent_in_scope(&self, caller: &Agent, target_id: &str) -> Result<bool> {
+        scope_allows(
+            &self.connection,
+            &caller.id,
+            parse_agent_id(&caller.id)?,
+            caller.control,
+            &caller.project,
+            target_id,
+        )
+    }
+}
+
 /// Scope check for one hierarchy member: the owner commands everything; an
 /// Agent commands itself, its subtree, or its project per its frozen control.
 pub(super) fn caller_may_command(
@@ -156,6 +203,7 @@ pub(super) fn caller_may_command(
 ) -> Result<()> {
     let Caller::Agent {
         num: caller_num,
+        id: caller_id,
         control,
         project,
         ..
@@ -163,13 +211,14 @@ pub(super) fn caller_may_command(
     else {
         return Ok(());
     };
-    let member_num = parse_agent_id(&member.id)?;
-    let allowed = match control {
-        AgentControl::Slf => member_num == *caller_num,
-        AgentControl::Tree => is_in_subtree_of(connection, member_num, *caller_num)?,
-        AgentControl::Project => member.project == *project,
-    };
-    if allowed {
+    if scope_allows(
+        connection,
+        caller_id,
+        *caller_num,
+        *control,
+        project,
+        &member.id,
+    )? {
         Ok(())
     } else {
         Err(Error::new(
@@ -186,8 +235,9 @@ pub(super) struct ParentLink {
     pub(super) depth: i64,
 }
 
-/// Resolve `args.parent` for a launch: the parent must exist, an Agent caller
-/// launches only its own children, and the child inherits project and root.
+/// Resolve `args.parent` for a launch: the parent must exist and be
+/// controlled (not observe-only or unknown), an Agent caller launches only
+/// its own children, and the child inherits project and root.
 pub(super) fn resolve_launch_parent(
     tx: &Transaction<'_>,
     principal: &str,
@@ -219,6 +269,9 @@ pub(super) fn resolve_launch_parent(
     }
     let parent_agent = load_agent_by_num(tx, parent_num)?
         .ok_or_else(|| Error::new("not_found", format!("Agent {parent_id} was not found")))?;
+    // A child needs a controlled parent: observe-only and unknown Agents
+    // have no native control authority to parent new work.
+    observer::require_controlled(&parent_agent)?;
     let root_num = parse_agent_id(&parent_agent.root)?;
     Ok(Some(ParentLink {
         num: parent_num,
@@ -257,13 +310,18 @@ pub(super) fn check_child_fanout(
 }
 
 /// Frozen `control` of a launch from its profile snapshot: absent reads
-/// `self`, any other value must be a valid scope.
+/// `self`, any other value parses through the one scope parser.
 pub(super) fn control_from_snapshot(snapshot: &Value) -> Result<String> {
     match snapshot.get("control") {
-        None => Ok("self".to_owned()),
-        Some(Value::String(control)) if matches!(control.as_str(), "self" | "tree" | "project") => {
-            Ok(control.clone())
-        }
+        None => Ok(AgentControl::Slf.as_str().to_owned()),
+        Some(Value::String(control)) => AgentControl::parse(control)
+            .map(|_| control.clone())
+            .map_err(|_| {
+                Error::new(
+                    "invalid",
+                    "profile_snapshot.control must be self, tree, or project",
+                )
+            }),
         Some(_) => Err(Error::new(
             "invalid",
             "profile_snapshot.control must be self, tree, or project",
@@ -309,8 +367,8 @@ pub(super) fn selector_child_command_id(parent_id: &str, member: &Agent) -> Stri
 
 /// Admit one validated selector expansion: one concrete child per snapshotted
 /// member with the ordinary per-target gates, then the Store-only applied
-/// parent. Any member failure rejects the whole expansion with nothing
-/// persisted.
+/// parent. Any live-member failure rejects the whole expansion with nothing
+/// persisted; `send` skips terminal members instead of failing on them.
 pub(super) fn admit_selector_expansion(
     tx: &Transaction<'_>,
     principal: &str,
@@ -330,6 +388,12 @@ pub(super) fn admit_selector_expansion(
     // the commands.parent_command foreign key), then link them once the
     // parent is inserted, mirroring rule-action expansion.
     for member in members.iter() {
+        // `send` skips terminal members instead of failing the expansion;
+        // `stop` still names them (stopping a terminal Agent is a no-op row,
+        // not an error). An all-terminal send applies with no children.
+        if request.verb == "send" && member.state.is_terminal() {
+            continue;
+        }
         observer::require_controlled(member)?;
         let child_id = selector_child_command_id(&request.id, member);
         let mut member_request = SubmitCommand::new(child_id.clone(), request.verb.clone());
@@ -547,6 +611,51 @@ mod tests {
             .iter()
             .map(|child| child.id.clone())
             .collect()
+    }
+
+    fn stop_agent(store: &mut Store, agent: &str, generation: i64, now: i64) {
+        let mut stop = SubmitCommand::new(Ulid::new().to_string(), "stop");
+        stop.target = Some(agent.to_owned());
+        stop.expected_generation = Some(generation);
+        let stop_id = stop.id.clone();
+        store.submit("owner", stop, now).expect("admit stop");
+        store.dispatch(&stop_id, now).expect("dispatch stop");
+        store
+            .settle(&stop_id, CommandState::Applied, None, now)
+            .expect("settle stop");
+    }
+
+    fn ready_launched_agent(store: &mut Store, agent: &str, now: i64) {
+        let launch_id: String = store
+            .connection
+            .query_row(
+                "SELECT id FROM commands WHERE target = ?1 AND verb = 'launch'",
+                params![parse_agent_id(agent).unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        store.dispatch(&launch_id, now).expect("dispatch launch");
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: Ulid::new().to_string(),
+                    agent_id: agent.to_owned(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "session.ready".to_owned(),
+                        native_id: Ulid::new().to_string(),
+                        data: json!({"command_id":launch_id}),
+                    }],
+                    cursor: None,
+                },
+                now,
+            )
+            .expect("commit session ready");
+        store
+            .settle(&launch_id, CommandState::Applied, None, now)
+            .expect("settle launch");
     }
 
     #[test]
@@ -1045,17 +1154,192 @@ mod tests {
     }
 
     #[test]
+    fn launch_parent_must_be_controlled() {
+        let mut store = store();
+        let now = now_ms();
+        let admission = store
+            .submit("owner", launch_request("controlled-parent", None), now)
+            .expect("admit parent launch");
+        let parent = admission.command.target.expect("parent Agent");
+        let parent_num = parse_agent_id(&parent).unwrap();
+        let token: Option<String> = store
+            .connection
+            .query_row(
+                "SELECT token FROM agents WHERE id = ?1",
+                params![parent_num],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // An observe-only (unknown) parent cannot take children.
+        store
+            .connection
+            .execute(
+                "UPDATE agents SET observe_only = 1, state = 'unknown', token = NULL WHERE id = ?1",
+                params![parent_num],
+            )
+            .unwrap();
+        let observed = launch_request("controlled-parent", Some(&parent));
+        assert_eq!(
+            store.submit("owner", observed, now + 1).unwrap_err().code,
+            "not_allowed"
+        );
+        assert_eq!(agent_count(&store), 1);
+        // The same parent controlled again takes children.
+        store
+            .connection
+            .execute(
+                "UPDATE agents SET observe_only = 0, state = 'created', token = ?1 WHERE id = ?2",
+                params![token, parent_num],
+            )
+            .unwrap();
+        let child = launch_child(&mut store, "owner", &parent, json!({}), now + 2);
+        assert_eq!(
+            store
+                .get_agent(&child)
+                .unwrap()
+                .expect("child row")
+                .parent
+                .as_deref(),
+            Some(parent.as_str())
+        );
+    }
+
+    #[test]
+    fn terminal_children_do_not_occupy_fanout() {
+        let mut store = store();
+        store
+            .set_hierarchy_limits(HierarchyLimits {
+                max_children_per_agent: 1,
+                max_tree_agents: 3,
+                ..HierarchyLimits::default()
+            })
+            .unwrap();
+        let now = now_ms();
+        let parent = ready_agent(&mut store, "fanout-terminal", now);
+        let first = launch_child(&mut store, "owner", &parent, json!({}), now + 1);
+        stop_agent(&mut store, &first, 0, now + 2);
+        assert!(
+            store
+                .get_agent(&first)
+                .unwrap()
+                .expect("child row")
+                .state
+                .is_terminal()
+        );
+        // The stopped child leaves both counts: a replacement fits under the
+        // per-parent bound, and a grandchild fits under the tree bound.
+        let second = launch_child(&mut store, "owner", &parent, json!({}), now + 3);
+        let grandchild = launch_child(&mut store, "owner", &second, json!({}), now + 4);
+        let _ = grandchild;
+        // Live children still count: a further direct child is rejected.
+        let overflow = launch_request("fanout-terminal", Some(&parent));
+        assert_eq!(
+            store.submit("owner", overflow, now + 5).unwrap_err().code,
+            "fanout_limit"
+        );
+    }
+
+    #[test]
+    fn selector_send_skips_terminal_members_but_stop_names_them() {
+        let mut store = store();
+        let now = now_ms();
+        let parent = ready_agent(&mut store, "skip-terminal", now);
+        let child = launch_child(&mut store, "owner", &parent, json!({}), now + 1);
+        ready_launched_agent(&mut store, &child, now + 2);
+        stop_agent(&mut store, &child, 1, now + 3);
+        // `send` expands over the live parent only.
+        let mut send = SubmitCommand::new(Ulid::new().to_string(), "send");
+        send.selector = Some(format!("tree:{parent}"));
+        send.args = json!({"text": "hello live tree"});
+        let send_id = send.id.clone();
+        store.submit("owner", send, now + 4).expect("expand send");
+        assert_eq!(
+            child_ids(&store, &send_id),
+            vec![format!("{send_id}/{parent}")]
+        );
+        // `stop` still names every member including the stopped child.
+        let mut stop = SubmitCommand::new(Ulid::new().to_string(), "stop");
+        stop.selector = Some(format!("tree:{parent}"));
+        let stop_id = stop.id.clone();
+        store.submit("owner", stop, now + 5).expect("expand stop");
+        assert_eq!(
+            child_ids(&store, &stop_id),
+            vec![
+                format!("{stop_id}/{parent}"),
+                format!("{stop_id}/{child}")
+            ]
+        );
+    }
+
+    #[test]
+    fn migration_23_backfills_root_for_legacy_agents() {
+        let path = std::env::temp_dir().join(format!(
+            "eliot-hierarchy-backfill-{}",
+            Ulid::new().to_string()
+        ));
+        {
+            let legacy_store = Store::open(&path).unwrap();
+            assert_eq!(super::super::schema::CURRENT_SCHEMA_VERSION, 23);
+            drop(legacy_store);
+            // Downgrade to the v22 shape with two legacy rows, then reopen so
+            // the v23 block backfills them exactly as it would on upgrade.
+            let legacy = rusqlite::Connection::open(&path).unwrap();
+            legacy
+                .execute_batch(
+                    "DROP INDEX agents_parent;
+                     DROP INDEX agents_root;
+                     ALTER TABLE agents DROP COLUMN parent;
+                     ALTER TABLE agents DROP COLUMN root;
+                     ALTER TABLE agents DROP COLUMN depth;
+                     ALTER TABLE agents DROP COLUMN control;
+                     ALTER TABLE commands DROP COLUMN selector;
+                     DELETE FROM schema_migrations WHERE version = 23;
+                     INSERT INTO agents(generation, project, harness, profile,
+                                        workspace, state, created_at, updated_at)
+                     VALUES (1, 'legacy', 'fake', 'fake',
+                             'synthetic-workspace', 'idle', 1, 1),
+                            (0, 'legacy', 'fake', 'fake',
+                             'synthetic-workspace', 'created', 1, 1);",
+                )
+                .unwrap();
+            let version: i64 = legacy
+                .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(version, 22);
+        }
+        let store = Store::open(&path).unwrap();
+        let version: i64 = store
+            .connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 23);
+        for id in ["a1", "a2"] {
+            let agent = store.get_agent(id).unwrap().expect("legacy row");
+            assert_eq!(agent.root, id);
+            assert_eq!(agent.parent, None);
+            assert_eq!(agent.depth, 0);
+            assert_eq!(agent.control, AgentControl::Slf);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn parent_terminal_leaves_child_running_without_expansion() {
         let mut store = store();
         let now = now_ms();
         let parent = ready_agent(&mut store, "settle", now);
         let child = launch_child(&mut store, "owner", &parent, json!({}), now + 1);
+        ready_launched_agent(&mut store, &child, now + 2);
         let mut stop = SubmitCommand::new(Ulid::new().to_string(), "stop");
         stop.target = Some(parent.clone());
         stop.expected_generation = Some(1);
         let stop_id = stop.id.clone();
         store
-            .submit("owner", stop, now + 2)
+            .submit("owner", stop, now + 3)
             .expect("admit parent stop");
         // A targeted stop expands to nothing: no children, no widened effect.
         let parent_row = store.get_command(&stop_id).unwrap().expect("stop row");
@@ -1068,15 +1352,15 @@ mod tests {
             0
         );
         store
-            .dispatch(&stop_id, now + 3)
+            .dispatch(&stop_id, now + 4)
             .expect("dispatch parent stop");
         store
-            .settle(&stop_id, CommandState::Applied, None, now + 4)
+            .settle(&stop_id, CommandState::Applied, None, now + 5)
             .expect("settle parent stop");
         let settled = store.get_agent(&parent).unwrap().expect("parent row");
         assert_eq!(settled.state, AgentState::Stopped);
         let running = store.get_agent(&child).unwrap().expect("child row");
-        assert_eq!(running.state, AgentState::Created);
+        assert_eq!(running.state, AgentState::Idle);
         assert_eq!(running.parent.as_deref(), Some(parent.as_str()));
         assert_eq!(running.root, parent);
     }

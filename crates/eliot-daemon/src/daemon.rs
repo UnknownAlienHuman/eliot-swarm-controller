@@ -95,7 +95,7 @@ async fn run_owned(
     // selector admission in this run checks these bounds.
     {
         let mut store = store.lock().await;
-        store.set_hierarchy_limits(daemon_config.limits.limits())?;
+        store.set_hierarchy_limits(daemon_config.limits)?;
     }
     // Parse global definitions and seed only new rules before publishing ready.
     let (global_rules, initial_deferred_notice) =

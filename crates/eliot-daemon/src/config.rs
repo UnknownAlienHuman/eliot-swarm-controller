@@ -293,92 +293,27 @@ fn default_max_unread_messages_per_agent() -> i64 {
     core::api::DEFAULT_MAX_UNREAD_MESSAGES_PER_AGENT
 }
 
-/// Hierarchy fanout bounds consumed by launch/selector admission. See
-/// docs/spec/configuration.md: daemon limits. Unlike retention windows,
-/// these always apply: an unset value keeps its coordination-contract
-/// default.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct LimitsConfig {
-    #[serde(default = "default_max_depth")]
-    pub(crate) max_depth: i64,
-    #[serde(default = "default_max_children_per_agent")]
-    pub(crate) max_children_per_agent: i64,
-    #[serde(default = "default_max_tree_agents")]
-    pub(crate) max_tree_agents: i64,
-    #[serde(default = "default_max_selector_targets")]
-    pub(crate) max_selector_targets: i64,
-}
-
-impl Default for LimitsConfig {
-    fn default() -> Self {
-        Self {
-            max_depth: default_max_depth(),
-            max_children_per_agent: default_max_children_per_agent(),
-            max_tree_agents: default_max_tree_agents(),
-            max_selector_targets: default_max_selector_targets(),
-        }
-    }
-}
-
-impl LimitsConfig {
-    fn validate(self) -> core::Result<Self> {
-        for (name, value) in [
-            ("max_depth", self.max_depth),
-            ("max_children_per_agent", self.max_children_per_agent),
-            ("max_tree_agents", self.max_tree_agents),
-            ("max_selector_targets", self.max_selector_targets),
-        ] {
-            if value <= 0 {
-                return Err(core::Error::new(
-                    "profile_error",
-                    format!("config.toml: daemon.limits.{name} must be a positive integer"),
-                ));
-            }
-        }
-        Ok(self)
-    }
-
-    pub(crate) fn limits(&self) -> core::api::HierarchyLimits {
-        core::api::HierarchyLimits {
-            max_depth: self.max_depth,
-            max_children_per_agent: self.max_children_per_agent,
-            max_tree_agents: self.max_tree_agents,
-            max_selector_targets: self.max_selector_targets,
-        }
-    }
-}
-
-fn default_max_depth() -> i64 {
-    core::api::DEFAULT_MAX_DEPTH
-}
-
-fn default_max_children_per_agent() -> i64 {
-    core::api::DEFAULT_MAX_CHILDREN_PER_AGENT
-}
-
-fn default_max_tree_agents() -> i64 {
-    core::api::DEFAULT_MAX_TREE_AGENTS
-}
-
-fn default_max_selector_targets() -> i64 {
-    core::api::DEFAULT_MAX_SELECTOR_TARGETS
-}
-
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DaemonConfig {
     #[serde(default)]
     pub(crate) retention: RetentionConfig,
+    /// Hierarchy fanout bounds consumed by launch/selector admission. See
+    /// docs/spec/configuration.md: daemon limits. Deserialized directly as
+    /// the core type: unlike retention windows these always apply, so an
+    /// unset value keeps its coordination-contract default.
     #[serde(default)]
-    pub(crate) limits: LimitsConfig,
+    pub(crate) limits: core::api::HierarchyLimits,
 }
 
 impl DaemonConfig {
     fn validate(self) -> core::Result<Self> {
+        self.limits.validate().map_err(|error| {
+            core::Error::new("profile_error", format!("config.toml: {}", error.message))
+        })?;
         Ok(Self {
             retention: self.retention.validate()?,
-            limits: self.limits.validate()?,
+            limits: self.limits,
         })
     }
 }
@@ -1111,7 +1046,6 @@ fn snapshot_from_entry(
             "profile_error",
         ));
     }
-    let control = validated_control(name, entry.control.as_deref(), source, table_offset)?;
     let pass_env = match entry.pass_env.as_deref() {
         Some(names) => validate_pass_env(name, names, source, table_offset)?,
         None => Vec::new(),
@@ -1163,7 +1097,13 @@ fn snapshot_from_entry(
         "approval_policy".to_owned(),
         Value::String(approval_policy.to_owned()),
     );
-    snapshot.insert("control".to_owned(), Value::String(control.to_owned()));
+    insert_control(
+        &mut snapshot,
+        name,
+        entry.control.as_deref(),
+        source,
+        table_offset,
+    )?;
     snapshot.insert(
         "pass_env".to_owned(),
         Value::Array(pass_env.into_iter().map(Value::String).collect()),
@@ -1276,7 +1216,6 @@ fn muse_snapshot_from_entry(
             "unsupported",
         ));
     }
-    let control = validated_control(name, entry.control.as_deref(), source, table_offset)?;
     let pass_env = match entry.pass_env.as_deref() {
         Some(names) => validate_pass_env(name, names, source, table_offset)?,
         None => Vec::new(),
@@ -1337,7 +1276,13 @@ fn muse_snapshot_from_entry(
         "approval_policy".to_owned(),
         Value::String(APPROVAL_POLICY_NEVER.to_owned()),
     );
-    snapshot.insert("control".to_owned(), Value::String(control.to_owned()));
+    insert_control(
+        &mut snapshot,
+        name,
+        entry.control.as_deref(),
+        source,
+        table_offset,
+    )?;
     snapshot.insert(
         "pass_env".to_owned(),
         Value::Array(pass_env.into_iter().map(Value::String).collect()),
@@ -1626,6 +1571,7 @@ fn validate_pass_env(
 }
 /// Frozen command scope of Agents launched from this profile: `self`
 /// (default), `tree`, or `project`. Stored on the Agent row at launch.
+/// The valid values live only in `AgentControl::parse`.
 fn validated_control<'a>(
     profile: &str,
     control: Option<&'a str>,
@@ -1633,7 +1579,7 @@ fn validated_control<'a>(
     offset: usize,
 ) -> core::Result<&'a str> {
     let control = control.map(str::trim).unwrap_or("self");
-    if !matches!(control, "self" | "tree" | "project") {
+    if core::AgentControl::parse(control).is_err() {
         return Err(profile_field_error(
             source,
             offset,
@@ -1644,6 +1590,19 @@ fn validated_control<'a>(
         ));
     }
     Ok(control)
+}
+
+/// The one frozen `control` insert for resolved profile snapshots.
+fn insert_control(
+    snapshot: &mut serde_json::Map<String, Value>,
+    profile: &str,
+    control: Option<&str>,
+    source: &str,
+    offset: usize,
+) -> core::Result<()> {
+    let control = validated_control(profile, control, source, offset)?;
+    snapshot.insert("control".to_owned(), Value::String(control.to_owned()));
+    Ok(())
 }
 
 /// The Muse plugin stops its host by PID, so a script wrapper would leave the
@@ -1980,7 +1939,7 @@ mod tests {
                     commands_days: Some(14),
                     mail_days: Some(21),
                 },
-                limits: LimitsConfig::default(),
+                limits: core::api::HierarchyLimits::default(),
             }
         );
 
@@ -1993,7 +1952,7 @@ mod tests {
                     commands_days: None,
                     mail_days: None,
                 },
-                limits: LimitsConfig::default(),
+                limits: core::api::HierarchyLimits::default(),
             }
         );
     }
@@ -2003,9 +1962,9 @@ mod tests {
         let fixture = AutomationConfigFixture::new();
         fixture.write("[daemon]\nretention.events_days = 7\n");
         let config = load_daemon_config(&fixture.root).unwrap();
-        assert_eq!(config.limits, LimitsConfig::default());
+        assert_eq!(config.limits, core::api::HierarchyLimits::default());
         assert_eq!(
-            config.limits.limits(),
+            config.limits,
             core::api::HierarchyLimits {
                 max_depth: 8,
                 max_children_per_agent: 20,
@@ -2019,7 +1978,7 @@ mod tests {
         );
         let config = load_daemon_config(&fixture.root).unwrap();
         assert_eq!(
-            config.limits.limits(),
+            config.limits,
             core::api::HierarchyLimits {
                 max_depth: 4,
                 max_children_per_agent: 5,

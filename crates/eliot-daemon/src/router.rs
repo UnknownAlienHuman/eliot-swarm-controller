@@ -598,18 +598,7 @@ impl Router {
         }
 
         if admission.is_new {
-            if admission.command.selector.is_some() {
-                for child in hierarchy::selector_child_ids(&admission.command) {
-                    self.schedule_command(child, None);
-                }
-            } else {
-                let command_id = admission.command.id.clone();
-                let linked_id = admission
-                    .linked_command
-                    .as_ref()
-                    .map(|command| command.id.clone());
-                self.schedule_command(command_id, linked_id);
-            }
+            self.schedule_admission(&admission);
         }
         self.signal_progress();
         serde_json::to_value(submit_result(
@@ -1329,7 +1318,7 @@ impl Router {
                         let store = self.inner.store.lock().await;
                         hierarchy::inherit_launch_project(&store, &mut request)?;
                     }
-                    self.freeze_launch_admission(&mut request).await
+                    self.freeze_launch_admission(principal, &mut request).await
                 }
                 .await;
                 workspace = match frozen {
@@ -1471,9 +1460,10 @@ impl Router {
 
     async fn freeze_launch_admission(
         &self,
+        principal: &Principal,
         request: &mut SubmitCommand,
     ) -> Result<Option<WorkspacePreparationInput>> {
-        if self.freeze_launch_profile(request).await? {
+        if self.freeze_launch_profile(principal, request).await? {
             return retained_preparation(&request.args);
         }
         let Some(branch) = request.args.get("worktree").and_then(Value::as_str) else {
@@ -1520,7 +1510,11 @@ impl Router {
         Ok(Some(input))
     }
 
-    async fn freeze_launch_profile(&self, request: &mut SubmitCommand) -> Result<bool> {
+    async fn freeze_launch_profile(
+        &self,
+        principal: &Principal,
+        request: &mut SubmitCommand,
+    ) -> Result<bool> {
         if self.hydrate_retained_launch(request).await? {
             return Ok(true);
         }
@@ -1535,6 +1529,10 @@ impl Router {
             .ok_or_else(|| Error::new("invalid", "resolved profile must name its harness"))?
             .to_owned();
         install_frozen_profile(request, &harness, snapshot, true)?;
+        {
+            let store = self.inner.store.lock().await;
+            hierarchy::check_agent_launch_authority(&store, principal, request)?;
+        }
         Ok(false)
     }
 
@@ -2678,57 +2676,15 @@ impl Router {
         let id = request.id.as_str();
         let mut command = {
             let store = self.inner.store.lock().await;
-            store.get_command(id)?
-        }
-        .ok_or_else(|| Error::new("not_found", format!("command {id} was not found")))?;
-        self.authorize_command_read_scoped(principal, &command)
-            .await?;
+            let command = store
+                .get_command(id)?
+                .ok_or_else(|| Error::new("not_found", format!("command {id} was not found")))?;
+            hierarchy::authorize_command_read(&store, principal, &command)?;
+            command
+        };
         self.adjust_command_for_read(&mut command);
         serde_json::to_value(command)
             .map_err(|error| Error::new("internal", format!("encode command: {error}")))
-    }
-
-    async fn command_children(&self, params: &Value, principal: &Principal) -> Result<Value> {
-        let request: CommandChildrenRequest = serde_json::from_value(params.clone())
-            .map_err(|_| Error::new("invalid", "command.children params are invalid"))?;
-        request.validate()?;
-        let id = request.id.as_str();
-        let (parent, mut page) = {
-            let store = self.inner.store.lock().await;
-            let Some(parent) = store.get_command(id)? else {
-                // No parent row to authorize against. Only the Owner, who is
-                // authorized for every command, may learn whether the id may
-                // have been pruned; anyone else reads `not_found`, so an
-                // unauthorized caller cannot tell pruned from absent or probe
-                // cursors.
-                let gap = matches!(principal, Principal::Owner)
-                    && eliot_store::history_expired(id, now_ms());
-                return Err(if gap {
-                    Error::new(
-                        "history_gap",
-                        format!("command {id} children are no longer retained"),
-                    )
-                } else {
-                    Error::new("not_found", format!("command {id} was not found"))
-                });
-            };
-            // Authorized after the lock releases: scoped reads re-lock.
-            let page =
-                store.list_command_children(&parent, request.after.as_deref(), request.limit)?;
-            (parent, page)
-        };
-        self.authorize_command_read_scoped(principal, &parent)
-            .await?;
-        for child in &mut page.children {
-            self.authorize_command_read_scoped(principal, child).await?;
-            self.adjust_command_for_read(child);
-        }
-        let response = CommandChildrenResponse {
-            children: page.children,
-            next: page.next,
-        };
-        serde_json::to_value(response)
-            .map_err(|error| Error::new("internal", format!("encode command children: {error}")))
     }
 
     fn adjust_command_for_read(&self, command: &mut Command) {
@@ -2912,10 +2868,9 @@ impl Router {
             .map_err(|_| Error::new("invalid", "agent.get params are invalid"))?;
         request.validate()?;
         let id = request.id.as_str();
-        self.authorize_agent_read_scoped(principal, id, None)
-            .await?;
         let (agent, source_states, observer_active) = {
             let store = self.inner.store.lock().await;
+            hierarchy::authorize_agent_read(&store, principal, id, None)?;
             let agent = store
                 .get_agent(id)?
                 .ok_or_else(|| Error::new("not_found", format!("Agent {id} was not found")))?;
@@ -2978,13 +2933,12 @@ impl Router {
         request.validate()?;
         let id = request.id.as_str();
         let generation = request.generation;
-        self.authorize_agent_read_scoped(principal, id, generation)
-            .await?;
         let scope = request.effective_scope();
         let after = request.cursor()?;
         let limit = request.limit;
         let (generation, processes) = {
             let store = self.inner.store.lock().await;
+            hierarchy::authorize_agent_read(&store, principal, id, generation)?;
             let agent = store
                 .get_agent(id)?
                 .ok_or_else(|| Error::new("not_found", format!("Agent {id} was not found")))?;
@@ -3012,6 +2966,9 @@ impl Router {
                     "process generation does not exist",
                 ));
             }
+            if scope == "workspace" {
+                hierarchy::authorize_agent_read(&store, principal, id, Some(generation))?;
+            }
             if let Some(cursor) = &after {
                 cursor.validate_binding(id, generation, scope)?;
             }
@@ -3025,11 +2982,6 @@ impl Router {
                 )?,
             )
         };
-        if scope == "workspace" {
-            // Checked after the lock releases: scoped reads re-lock.
-            self.authorize_agent_read_scoped(principal, id, Some(generation))
-                .await?;
-        }
         let next = processes
             .last()
             .map(|process| {
@@ -3058,10 +3010,9 @@ impl Router {
         request.validate()?;
         let id = request.id.as_str();
         let expected = request.generation;
-        self.authorize_agent_read_scoped(principal, id, expected)
-            .await?;
         let agent = {
             let store = self.inner.store.lock().await;
+            hierarchy::authorize_agent_read(&store, principal, id, expected)?;
             store.get_agent(id)?
         }
         .ok_or_else(|| Error::new("not_found", format!("Agent {id} was not found")))?;
@@ -3089,12 +3040,11 @@ impl Router {
         request.validate()?;
         let id = request.id.as_str();
         let generation = request.generation;
-        self.authorize_agent_read_scoped(principal, id, generation)
-            .await?;
         let after = request.after.as_deref();
         let limit = request.limit;
         let (generation, edits) = {
             let store = self.inner.store.lock().await;
+            hierarchy::authorize_agent_read(&store, principal, id, generation)?;
             let agent = store
                 .get_agent(id)?
                 .ok_or_else(|| Error::new("not_found", format!("Agent {id} was not found")))?;
@@ -3126,10 +3076,9 @@ impl Router {
         request.validate()?;
         let id = request.id.as_str();
         let expected = request.generation;
-        self.authorize_agent_read_scoped(principal, id, expected)
-            .await?;
         let agent = {
             let store = self.inner.store.lock().await;
+            hierarchy::authorize_agent_read(&store, principal, id, expected)?;
             store.get_agent(id)?
         }
         .ok_or_else(|| Error::new("not_found", format!("Agent {id} was not found")))?;
@@ -3233,10 +3182,9 @@ impl Router {
             .map_err(|_| Error::new("invalid", "agent.result params are invalid"))?;
         request.validate()?;
         let id = request.id.as_str();
-        self.authorize_agent_read_scoped(principal, id, request.generation)
-            .await?;
         let (agent_metadata, generation, mut turns) = {
             let store = self.inner.store.lock().await;
+            hierarchy::authorize_agent_read(&store, principal, id, request.generation)?;
             let agent = store
                 .get_agent(id)?
                 .ok_or_else(|| Error::new("not_found", format!("Agent {id} was not found")))?;
@@ -3266,11 +3214,10 @@ impl Router {
         request.validate()?;
         let agent = request.agent.as_str();
         let generation = request.generation;
-        self.authorize_agent_read_scoped(principal, agent, Some(generation))
-            .await?;
         let turn_id = request.turn_id.as_str();
         let mut turn = {
             let store = self.inner.store.lock().await;
+            hierarchy::authorize_agent_read(&store, principal, agent, Some(generation))?;
             store.get_turn(agent, generation, turn_id)?
         }
         .ok_or_else(|| Error::new("not_found", format!("turn {turn_id} was not found")))?;
@@ -5250,60 +5197,10 @@ fn authorize_command(principal: &Principal, request: &mut SubmitCommand) -> Resu
     let Principal::Agent { id, generation } = principal else {
         return Ok(());
     };
-    if request.verb == "launch" {
-        // Agents launch only their own children: default the parent to
-        // self and reject any other parent. The Store re-checks.
-        if !request.args.is_object() && !request.args.is_null() {
-            return Err(Error::new("invalid", "launch args must be an object"));
-        }
-        match request.args.get("parent") {
-            None => {
-                request.args["parent"] = Value::String(id.clone());
-            }
-            Some(Value::String(parent)) if parent == id => {}
-            Some(_) => {
-                return Err(Error::new(
-                    "not_allowed",
-                    "Agents launch only their own children",
-                ));
-            }
-        }
-        return Ok(());
-    }
-    if !matches!(
-        request.verb.as_str(),
-        "send" | "stop" | "steer" | "interrupt" | "approve" | "deny" | "answer"
-    ) {
-        return Err(Error::new(
-            "not_allowed",
-            "managed Agent credentials cannot launch another Agent",
-        ));
-    }
-    if request.selector.is_some() {
-        // Selector member scope is enforced transactionally at Store
-        // admission against the snapshotted members.
-        return Ok(());
-    }
-    if request.target.as_deref().is_some_and(|target| target != id) {
-        // Non-self targets honor frozen control; scope is checked against
-        // the Store later in preparation.
-        return Ok(());
-    }
-    request.target = Some(id.clone());
-    if request
-        .expected_generation
-        .is_some_and(|expected| expected != *generation)
-    {
-        return Err(Error::new(
-            "stale_generation",
-            "command generation does not match the caller",
-        ));
-    }
-    request.expected_generation = Some(*generation);
-    Ok(())
+    hierarchy::authorize_agent_submit(id, *generation, request)
 }
 
-fn authorize_command_read(principal: &Principal, command: &Command) -> Result<()> {
+fn authorize_command_read_self(principal: &Principal, command: &Command) -> Result<()> {
     if matches!(principal, Principal::ProjectRule { .. }) {
         return Err(Error::new(
             "not_allowed",
@@ -5331,7 +5228,11 @@ fn authorize_command_read(principal: &Principal, command: &Command) -> Result<()
     }
     Ok(())
 }
-fn authorize_agent_read(principal: &Principal, id: &str, generation: Option<i64>) -> Result<()> {
+fn authorize_agent_read_self(
+    principal: &Principal,
+    id: &str,
+    generation: Option<i64>,
+) -> Result<()> {
     if matches!(principal, Principal::Run { .. }) {
         return Err(Error::new(
             "not_allowed",
@@ -7367,7 +7268,12 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 .unwrap()
                 .remove("profile_snapshot");
             // A retained ID must return before current config or selector capture.
-            assert!(router.freeze_launch_profile(&mut retry).await.unwrap());
+            assert!(
+                router
+                    .freeze_launch_profile(&Principal::Owner, &mut retry)
+                    .await
+                    .unwrap()
+            );
             assert_eq!(retry.args, original.args);
             assert!(
                 retry.args["profile_snapshot"]
@@ -7536,6 +7442,50 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         assert_eq!(
             router.submit(&wire, &principal).await.unwrap_err().code,
             "id_conflict"
+        );
+        // With a fresh id there is no retained binding: a self-scoped Agent
+        // targeting another live Agent is outside its scope.
+        let other = {
+            let mut store = router.inner.store.lock().await;
+            store
+                .submit(
+                    "owner",
+                    SubmitCommand {
+                        id: ulid::Ulid::new().to_string(),
+                        target: None,
+                        selector: None,
+                        verb: "launch".to_owned(),
+                        args: json!({
+                            "project":"typed-events", "workspace":"synthetic-workspace",
+                            "harness":"codex", "profile":"synthetic", "profile_snapshot":{},
+                        }),
+                        expected_generation: Some(0),
+                        expected_turn_id: None,
+                        request_id: None,
+                        probe: false,
+                    },
+                    now_ms(),
+                )
+                .unwrap()
+                .command
+                .target
+                .unwrap()
+        };
+        assert_eq!(
+            router
+                .submit(
+                    &json!({
+                        "id": ulid::Ulid::new().to_string(),
+                        "verb": "send",
+                        "target": other,
+                        "args": {"text": "out of scope"},
+                    }),
+                    &principal,
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "not_allowed"
         );
     }
 
@@ -13104,7 +13054,7 @@ mod run_authorization_tests {
         assert!(authorize_rpc_method(&principal, "command.get").is_ok());
         assert!(authorize_rpc_method(&principal, "command.submit").is_err());
         assert!(authorize_rpc_method(&principal, "command.children").is_err());
-        assert!(authorize_command_read(&principal, &command("run-1")).is_ok());
-        assert!(authorize_command_read(&principal, &command("run-2")).is_err());
+        assert!(authorize_command_read_self(&principal, &command("run-1")).is_ok());
+        assert!(authorize_command_read_self(&principal, &command("run-2")).is_err());
     }
 }

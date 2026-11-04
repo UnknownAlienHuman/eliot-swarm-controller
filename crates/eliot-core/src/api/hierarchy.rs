@@ -18,7 +18,10 @@ pub const DEFAULT_MAX_TREE_AGENTS: i64 = 100;
 pub const DEFAULT_MAX_SELECTOR_TARGETS: i64 = 1000;
 
 /// Owner-configured fanout bounds (`[daemon.limits]` config).
+/// Deserialized directly from the config table: absent fields keep their
+/// coordination-contract defaults, unknown fields are rejected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
 pub struct HierarchyLimits {
     pub max_depth: i64,
     pub max_children_per_agent: i64,
@@ -140,5 +143,24 @@ mod tests {
     #[test]
     fn selector_child_ids_mirror_mail_deliveries() {
         assert_eq!(selector_child_id("parent-1", "a2"), "parent-1/a2");
+    }
+
+    #[test]
+    fn limits_deserialize_directly_with_contract_defaults() {
+        let empty: HierarchyLimits = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(empty, HierarchyLimits::default());
+        let partial: HierarchyLimits =
+            serde_json::from_value(serde_json::json!({"max_depth": 4})).unwrap();
+        assert_eq!(
+            partial,
+            HierarchyLimits {
+                max_depth: 4,
+                ..HierarchyLimits::default()
+            }
+        );
+        assert!(serde_json::from_value::<HierarchyLimits>(
+            serde_json::json!({"max_depth": 4, "unknown": 1})
+        )
+        .is_err());
     }
 }
