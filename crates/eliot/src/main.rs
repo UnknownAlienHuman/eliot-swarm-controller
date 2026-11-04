@@ -798,9 +798,11 @@ impl Failure {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    // The derived CLI parser outgrew the 1 MiB Windows main-thread stack;
-    // parse on a roomy thread instead so the next subcommand cannot
-    // reintroduce the overflow. Help/version still exit from the parser.
+    // The derived CLI parser overflows the 1 MiB Windows main-thread stack
+    // once the `who`/`claim` subcommands are added (established: the pre-PR
+    // parser fits, with them the daemon dies in `Cli::parse` before any
+    // output), so parse on a roomy thread instead. Help/version still exit
+    // from the parser.
     let cli = std::thread::Builder::new()
         .name("cli-parse".to_owned())
         .stack_size(8 * 1024 * 1024)
@@ -1928,92 +1930,11 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             }
         },
         CliCommand::Who { project, history } => {
-            let request = WhoRequest {
-                project,
-                history: Some(history),
-            };
-            request
-                .validate()
-                .map_err(|error| Failure::from_core(error, false))?;
-            let response: WhoResponse = eliot_daemon::client_call_typed(&data_dir, "who", &request)
-                .await
-                .map_err(|error| Failure::from_core(error, false))?;
-            request
-                .validate_response(&response)
-                .map_err(|_| Failure::new(4, "who response is invalid"))?;
-            let value = serde_json::to_value(response)
-                .map_err(|_| Failure::new(4, "who response is invalid"))?;
-            print_value(&value, json_output);
-            Ok(0)
+            run_who_command(&data_dir, json_output, project, history).await
         }
-        CliCommand::Claim { command } => match command {
-            ClaimCommand::Set {
-                glob,
-                agent,
-                note,
-                ttl_secs,
-            } => {
-                let request = ClaimSetRequest {
-                    id: mutation_id(id)?,
-                    agent,
-                    glob,
-                    note,
-                    ttl_secs,
-                };
-                request
-                    .validate()
-                    .map_err(|error| Failure::from_core(error, true))?;
-                let response: ClaimSetResponse =
-                    eliot_daemon::client_call_typed(&data_dir, "claim.set", &request)
-                        .await
-                        .map_err(|error| Failure::from_core(error, true))?;
-                request
-                    .validate_response(&response)
-                    .map_err(|_| Failure::new(4, "claim.set response is invalid"))?;
-                let value = serde_json::to_value(response)
-                    .map_err(|_| Failure::new(4, "claim.set response is invalid"))?;
-                print_value(&value, json_output);
-                Ok(0)
-            }
-            ClaimCommand::List { project, agent } => {
-                let request = ClaimListRequest { project, agent };
-                request
-                    .validate()
-                    .map_err(|error| Failure::from_core(error, false))?;
-                let response: ClaimListResponse =
-                    eliot_daemon::client_call_typed(&data_dir, "claim.list", &request)
-                        .await
-                        .map_err(|error| Failure::from_core(error, false))?;
-                request
-                    .validate_response(&response)
-                    .map_err(|_| Failure::new(4, "claim.list response is invalid"))?;
-                let value = serde_json::to_value(response)
-                    .map_err(|_| Failure::new(4, "claim.list response is invalid"))?;
-                print_value(&value, json_output);
-                Ok(0)
-            }
-            ClaimCommand::Release { glob, agent } => {
-                let request = ClaimReleaseRequest {
-                    id: mutation_id(id)?,
-                    agent,
-                    glob,
-                };
-                request
-                    .validate()
-                    .map_err(|error| Failure::from_core(error, true))?;
-                let response: ClaimReleaseResponse =
-                    eliot_daemon::client_call_typed(&data_dir, "claim.release", &request)
-                        .await
-                        .map_err(|error| Failure::from_core(error, true))?;
-                request
-                    .validate_response(&response)
-                    .map_err(|_| Failure::new(4, "claim.release response is invalid"))?;
-                let value = serde_json::to_value(response)
-                    .map_err(|_| Failure::new(4, "claim.release response is invalid"))?;
-                print_value(&value, json_output);
-                Ok(0)
-            }
-        },
+        CliCommand::Claim { command } => {
+            run_claim_command(&data_dir, json_output, id, command).await
+        }
         CliCommand::Plugin { command } => match command {
             PluginCommand::Fake => {
                 eliot_plugin::run_fake()
@@ -2034,6 +1955,107 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 Ok(0)
             }
         },
+    }
+}
+
+async fn run_who_command(
+    data_dir: &Path,
+    json_output: bool,
+    project: Option<String>,
+    history: bool,
+) -> Result<u8, Failure> {
+    let request = WhoRequest {
+        project,
+        history: Some(history),
+    };
+    request
+        .validate()
+        .map_err(|error| Failure::from_core(error, false))?;
+    let response: WhoResponse = eliot_daemon::client_call_typed(data_dir, "who", &request)
+        .await
+        .map_err(|error| Failure::from_core(error, false))?;
+    request
+        .validate_response(&response)
+        .map_err(|_| Failure::new(4, "who response is invalid"))?;
+    let value =
+        serde_json::to_value(response).map_err(|_| Failure::new(4, "who response is invalid"))?;
+    print_value(&value, json_output);
+    Ok(0)
+}
+
+async fn run_claim_command(
+    data_dir: &Path,
+    json_output: bool,
+    id: Option<String>,
+    command: ClaimCommand,
+) -> Result<u8, Failure> {
+    match command {
+        ClaimCommand::Set {
+            glob,
+            agent,
+            note,
+            ttl_secs,
+        } => {
+            let request = ClaimSetRequest {
+                id: mutation_id(id)?,
+                agent,
+                glob,
+                note,
+                ttl_secs,
+            };
+            request
+                .validate()
+                .map_err(|error| Failure::from_core(error, true))?;
+            let response: ClaimSetResponse =
+                eliot_daemon::client_call_typed(data_dir, "claim.set", &request)
+                    .await
+                    .map_err(|error| Failure::from_core(error, true))?;
+            request
+                .validate_response(&response)
+                .map_err(|_| Failure::new(4, "claim.set response is invalid"))?;
+            let value = serde_json::to_value(response)
+                .map_err(|_| Failure::new(4, "claim.set response is invalid"))?;
+            print_value(&value, json_output);
+            Ok(0)
+        }
+        ClaimCommand::List { project, agent } => {
+            let request = ClaimListRequest { project, agent };
+            request
+                .validate()
+                .map_err(|error| Failure::from_core(error, false))?;
+            let response: ClaimListResponse =
+                eliot_daemon::client_call_typed(data_dir, "claim.list", &request)
+                    .await
+                    .map_err(|error| Failure::from_core(error, false))?;
+            request
+                .validate_response(&response)
+                .map_err(|_| Failure::new(4, "claim.list response is invalid"))?;
+            let value = serde_json::to_value(response)
+                .map_err(|_| Failure::new(4, "claim.list response is invalid"))?;
+            print_value(&value, json_output);
+            Ok(0)
+        }
+        ClaimCommand::Release { glob, agent } => {
+            let request = ClaimReleaseRequest {
+                id: mutation_id(id)?,
+                agent,
+                glob,
+            };
+            request
+                .validate()
+                .map_err(|error| Failure::from_core(error, true))?;
+            let response: ClaimReleaseResponse =
+                eliot_daemon::client_call_typed(data_dir, "claim.release", &request)
+                    .await
+                    .map_err(|error| Failure::from_core(error, true))?;
+            request
+                .validate_response(&response)
+                .map_err(|_| Failure::new(4, "claim.release response is invalid"))?;
+            let value = serde_json::to_value(response)
+                .map_err(|_| Failure::new(4, "claim.release response is invalid"))?;
+            print_value(&value, json_output);
+            Ok(0)
+        }
     }
 }
 

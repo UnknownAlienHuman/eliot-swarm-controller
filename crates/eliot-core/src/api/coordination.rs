@@ -29,7 +29,8 @@ pub const MAX_VAR_KEY_BYTES: usize = 256;
 pub const MAX_VAR_NOTE_BYTES: usize = 1024;
 /// Variable scopes encode as `global` or `project:<name>`.
 pub const MAX_VAR_SCOPE_BYTES: usize = 1024;
-/// A routed recipient receives at most one generic wake notice per minute.
+/// A routed recipient receives at most one generic notice per minute through
+/// the shared mail/claim notice gate.
 pub const MAIL_NOTICE_COOLDOWN_MS: i64 = 60 * 1000;
 /// Default unread-text bound per Agent mailbox: 10 MiB.
 pub const DEFAULT_MAX_UNREAD_BYTES_PER_AGENT: i64 = 10 * 1024 * 1024;
@@ -650,8 +651,6 @@ pub const MAX_CLAIMS_PER_AGENT: usize = 100;
 pub const DEFAULT_CLAIM_TTL_SECS: u64 = 3_600;
 /// Claims live at most one day; refresh explicitly instead.
 pub const MAX_CLAIM_TTL_SECS: u64 = 24 * 3_600;
-/// One holder receives at most one generic claim-conflict notice per minute.
-pub const CLAIM_NOTICE_COOLDOWN_MS: i64 = 60 * 1000;
 /// `who` returns at most this many current workers.
 pub const MAX_WHO_WORKERS: usize = 100;
 /// Each `who` path list is truncated to this many entries.
@@ -707,29 +706,6 @@ fn is_literal_glob(normalized: &str) -> bool {
     !normalized.contains(['*', '?'])
 }
 
-fn segment_matches(pattern: &str, text: &str) -> bool {
-    let pattern: Vec<char> = pattern.chars().collect();
-    let text: Vec<char> = text.chars().collect();
-    let mut states = vec![false; text.len() + 1];
-    states[0] = true;
-    for token in pattern {
-        let mut next = vec![false; text.len() + 1];
-        if token == '*' {
-            let mut run = false;
-            for (index, slot) in next.iter_mut().enumerate() {
-                run = run || states[index];
-                *slot = run;
-            }
-        } else {
-            for (index, slot) in next.iter_mut().enumerate().skip(1) {
-                *slot = states[index - 1] && (token == '?' || token == text[index - 1]);
-            }
-        }
-        states = next;
-    }
-    states[text.len()]
-}
-
 /// Match a normalized glob against a normalized project-relative path. A
 /// `**` segment crosses directories; a trailing `/**` also matches the
 /// directory itself. Inputs that fail normalization never match.
@@ -743,52 +719,72 @@ pub fn claim_glob_matches(pattern: &str, path: &str) -> bool {
     if is_literal_glob(&pattern) {
         return pattern == path;
     }
-    let mut segments: Vec<&str> = Vec::new();
-    for segment in pattern.split('/') {
-        if segment == "**" && segments.last() == Some(&"**") {
-            continue;
-        }
-        segments.push(segment);
+    let Ok(glob) = globset::GlobBuilder::new(&pattern)
+        .literal_separator(true)
+        .build()
+    else {
+        return false;
+    };
+    if glob.compile_matcher().is_match(&path) {
+        return true;
     }
-    let parts: Vec<&str> = path.split('/').collect();
-    match_segments(&segments, &parts)
+    // A trailing `/**` also covers the directory itself.
+    pattern
+        .strip_suffix("/**")
+        .is_some_and(|directory| directory == path)
 }
 
-fn match_segments(pattern: &[&str], path: &[&str]) -> bool {
-    if pattern.is_empty() {
-        return path.is_empty();
-    }
-    if pattern[0] == "**" {
-        for skip in 0..=path.len() {
-            if match_segments(&pattern[1..], &path[skip..]) {
-                return true;
-            }
-        }
-        return false;
-    }
-    if path.is_empty() {
-        return false;
-    }
-    segment_matches(pattern[0], path[0]) && match_segments(&pattern[1..], &path[1..])
-}
-
-/// Whether two claim globs overlap: equal after normalization, or one side
-/// is a literal path matched by the other's glob. Two different wildcards
-/// whose languages merely intersect are not detected; both claims stay
-/// visible in `who`, so the overlap is still advisory-visible to a reader.
+/// Whether two claim globs may overlap. Conservative: segments are
+/// compatible when equal or either side carries a wildcard, and `**`
+/// realigns either side across directories — so `src/**` overlaps both
+/// `src/*.rs` and `src/lib/**`. A false positive only adds an advisory
+/// notice; a false negative would hide one.
 pub fn claim_globs_overlap(left: &str, right: &str) -> Result<bool> {
     let left = normalize_claim_glob(left)?;
     let right = normalize_claim_glob(right)?;
     if left == right {
         return Ok(true);
     }
-    if is_literal_glob(&left) && claim_glob_matches(&right, &left) {
-        return Ok(true);
+    Ok(segments_may_overlap(
+        &collapsed_segments(&left),
+        &collapsed_segments(&right),
+    ))
+}
+
+fn collapsed_segments(normalized: &str) -> Vec<&str> {
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in normalized.split('/') {
+        if segment == "**" && segments.last() == Some(&"**") {
+            continue;
+        }
+        segments.push(segment);
     }
-    if is_literal_glob(&right) && claim_glob_matches(&left, &right) {
-        return Ok(true);
+    segments
+}
+
+fn segment_may_overlap(left: &str, right: &str) -> bool {
+    left == right || left.contains(['*', '?']) || right.contains(['*', '?'])
+}
+
+fn segments_may_overlap(left: &[&str], right: &[&str]) -> bool {
+    match (left.first(), right.first()) {
+        (None, None) => true,
+        (None, Some(_)) => right.iter().all(|segment| *segment == "**"),
+        (Some(_), None) => left.iter().all(|segment| *segment == "**"),
+        (Some(first), Some(second)) => {
+            if *first == "**" && *second == "**" {
+                segments_may_overlap(&left[1..], &right[1..])
+                    || segments_may_overlap(&left[1..], right)
+                    || segments_may_overlap(left, &right[1..])
+            } else if *first == "**" {
+                (0..=right.len()).any(|skip| segments_may_overlap(&left[1..], &right[skip..]))
+            } else if *second == "**" {
+                (0..=left.len()).any(|skip| segments_may_overlap(&left[skip..], &right[1..]))
+            } else {
+                segment_may_overlap(first, second) && segments_may_overlap(&left[1..], &right[1..])
+            }
+        }
     }
-    Ok(false)
 }
 
 fn validate_claim_note(note: &str) -> Result<()> {
@@ -904,6 +900,7 @@ pub struct ClaimSetResponse {
     pub expires_at: i64,
     pub admitted_at: i64,
     pub conflicts: Vec<ClaimConflict>,
+    pub truncated: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1678,9 +1675,14 @@ mod tests {
         assert!(claim_globs_overlap("src/**", "src/main.rs").unwrap());
         assert!(claim_globs_overlap("src/main.rs", "src/**").unwrap());
         assert!(!claim_globs_overlap("src/**", "other/**").unwrap());
-        // Two different wildcards with intersecting languages stay
-        // undetected; both remain visible in `who`.
-        assert!(!claim_globs_overlap("src/*.rs", "src/m*").unwrap());
+        // Wildcard-vs-wildcard overlap is conservative: `**` covers any
+        // segment shape below it, and two wildcard segments in the same
+        // position may intersect.
+        assert!(claim_globs_overlap("src/**", "src/*.rs").unwrap());
+        assert!(claim_globs_overlap("src/*.rs", "src/**").unwrap());
+        assert!(claim_globs_overlap("src/**", "src/lib/**").unwrap());
+        assert!(claim_globs_overlap("src/*.rs", "src/m*").unwrap());
+        assert!(!claim_globs_overlap("src/*.rs", "other/*.rs").unwrap());
         assert!(claim_globs_overlap("src/**", "../escape").is_err());
     }
 
@@ -1702,6 +1704,7 @@ mod tests {
                     generation: 1,
                     glob: "src/main.rs".to_owned(),
                 }],
+                truncated: false,
             })
             .unwrap();
         assert!(
@@ -1714,6 +1717,7 @@ mod tests {
                     expires_at: 3_601_000,
                     admitted_at: 1_000,
                     conflicts: Vec::new(),
+                    truncated: false,
                 })
                 .is_err()
         );
@@ -1732,6 +1736,7 @@ mod tests {
                         generation: 1,
                         glob: "src/**".to_owned(),
                     }],
+                    truncated: false,
                 })
                 .is_err()
         );

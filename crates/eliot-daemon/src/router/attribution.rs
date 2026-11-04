@@ -16,23 +16,30 @@ use super::{
 };
 use crate::common::now_ms;
 use eliot_core::{
-    Error, Result,
+    Agent, Error, Result,
     api::{
         ClaimListRequest, ClaimListResponse, ClaimReleaseRequest, ClaimSetRequest,
         ClaimSetResponse, ClaimView, GitView, MAX_WHO_PATHS, WhoRequest, WhoResponse,
         WhoSharedWorkspace, WhoWorker,
     },
 };
-use serde_json::{Value, json};
+use eliot_store::{NoticePending, WhoWorkerRow};
+use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
-
-fn claim_notice_text(overlapping: i64) -> String {
-    format!("{overlapping} overlapping work claims; run eliot who")
-}
 
 fn truncate_paths(mut paths: Vec<String>) -> Vec<String> {
     paths.truncate(MAX_WHO_PATHS);
     paths
+}
+
+/// Store-locked inputs for one `who` read: the roster, the project's live
+/// claims, workspace ownership counts and the worker Agents.
+struct WhoInputs {
+    rows: Vec<WhoWorkerRow>,
+    truncated: bool,
+    claims: ClaimListResponse,
+    counts: HashMap<String, i64>,
+    agents: HashMap<String, Agent>,
 }
 
 impl Router {
@@ -51,8 +58,12 @@ impl Router {
             change
         };
         self.signal_progress();
-        request.validate_response(&change.value)?;
-        self.notify_conflict_holders(&change.value).await;
+        // The Store proves the response binding before retaining it. Only a
+        // fresh admission notifies holders; a replay carries no events and
+        // must not re-notify.
+        if !change.events.is_empty() {
+            self.notify_conflict_holders(&change.value).await;
+        }
         serde_json::to_value(change.value)
             .map_err(|_| Error::new("internal", "claim could not be encoded"))
     }
@@ -65,13 +76,13 @@ impl Router {
             ClaimListRequest::validate,
         )?;
         let name = principal_name(principal);
+        // The Store proves the response binding before returning it.
         let response: ClaimListResponse =
             self.inner
                 .store
                 .lock()
                 .await
                 .claim_list(&name, &request, now_ms())?;
-        request.validate_response(&response)?;
         serde_json::to_value(response)
             .map_err(|_| Error::new("internal", "claim list could not be encoded"))
     }
@@ -95,7 +106,7 @@ impl Router {
             change
         };
         self.signal_progress();
-        request.validate_response(&change.value)?;
+        // The Store proves the response binding before retaining it.
         serde_json::to_value(change.value)
             .map_err(|_| Error::new("internal", "claim release could not be encoded"))
     }
@@ -104,41 +115,21 @@ impl Router {
         let request: WhoRequest =
             decode_coordination_request(params, &self.inner.secrets, "who", WhoRequest::validate)?;
         let name = principal_name(principal);
-        let now = now_ms();
-        let gathered = {
-            let store = self.inner.store.lock().await;
-            let (rows, truncated) = store.who_workers(&name, request.project.as_deref())?;
-            let claims = store.claim_list(
-                &name,
-                &ClaimListRequest {
-                    project: request.project.clone(),
-                    agent: None,
-                },
-                now,
-            )?;
-            let counts = store.workspace_owner_counts()?;
-            let mut agents = HashMap::new();
-            let mut edits = HashMap::new();
-            for row in &rows {
-                agents.insert(
-                    row.id.clone(),
-                    store
-                        .get_agent(&row.id)?
-                        .ok_or_else(|| Error::new("internal", "who worker vanished"))?,
-                );
-                edits.insert(
-                    row.id.clone(),
-                    store.list_agent_edits(&row.id, row.generation, None, MAX_WHO_PATHS + 1)?,
-                );
-            }
-            (rows, truncated, claims, counts, agents, edits)
-        };
-        let (rows, mut truncated, claims, counts, agents, edits) = gathered;
+        let inputs = self
+            .gather_who_inputs(&name, request.project.as_deref(), now_ms())
+            .await?;
+        let WhoInputs {
+            rows,
+            truncated: roster_truncated,
+            claims,
+            counts,
+            agents,
+        } = inputs;
         let mut by_agent: HashMap<String, Vec<ClaimView>> = HashMap::new();
         for claim in claims.claims {
             by_agent.entry(claim.agent.clone()).or_default().push(claim);
         }
-        truncated = truncated || claims.truncated;
+        let mut truncated = roster_truncated || claims.truncated;
 
         let mut workers = Vec::new();
         let mut encoded_bytes = 0_usize;
@@ -151,79 +142,14 @@ impl Router {
                 Ok(value) => value,
                 Err(error) => GitView::unavailable(error.code),
             };
-            let (available, dirty, complete, committed, base_oid, commits) = match &git {
-                GitView::Data(observation) => (
-                    observation.available,
-                    observation.dirty.as_ref().map(|dirty| {
-                        dirty
-                            .iter()
-                            .map(|path| path.path.clone())
-                            .collect::<Vec<_>>()
-                    }),
-                    observation.complete,
-                    observation.committed_paths.clone().unwrap_or_default(),
-                    observation.base_oid.clone(),
-                    observation.commits.clone().unwrap_or_default(),
-                ),
-                GitView::Unavailable { .. } | GitView::Error { .. } => {
-                    (false, None, None, Vec::new(), None, Vec::new())
-                }
-            };
-            let singly_owned = row
-                .workspace
-                .as_ref()
-                .is_some_and(|workspace| counts.get(workspace) == Some(&1));
-            if let (Some(workspace), Some(dirty)) = (row.workspace.as_ref(), dirty.as_ref()) {
-                workspace_dirty
-                    .entry(workspace.clone())
-                    .or_insert_with(|| truncate_paths(dirty.clone()));
-            }
-            let dirty_set: HashSet<&str> = dirty
-                .as_ref()
-                .map(|dirty| dirty.iter().map(String::as_str).collect())
-                .unwrap_or_default();
-            let mut attributed: Vec<String> = edits
-                .get(&row.id)
-                .map(|edits| {
-                    edits
-                        .iter()
-                        .filter(|edit| available && dirty_set.contains(edit.path.as_str()))
-                        .map(|edit| edit.path.clone())
-                        .collect()
-                })
-                .unwrap_or_default();
-            attributed.sort();
-            attributed.dedup();
-            let worker_edits_truncated = edits
-                .get(&row.id)
-                .is_some_and(|edits| edits.len() > MAX_WHO_PATHS);
-            attributed.truncate(MAX_WHO_PATHS);
-            let worker = WhoWorker {
-                agent: row.id.clone(),
-                generation: row.generation,
-                state: row.state,
-                project: row.project.clone(),
-                workspace: row.workspace.clone(),
-                singly_owned,
-                git_available: available,
-                attribution_complete: available && dirty.is_some() && complete == Some(true),
-                edits_truncated: worker_edits_truncated,
-                attributed_edits: attributed,
-                dirty: if singly_owned {
-                    truncate_paths(dirty.unwrap_or_default())
-                } else {
-                    Vec::new()
-                },
-                committed_paths: truncate_paths(committed),
-                base_oid,
-                claims: by_agent.remove(row.id.as_str()).unwrap_or_default(),
-                recent_history: if request.want_history() {
-                    commits
-                } else {
-                    Vec::new()
-                },
-            };
-            worker.validate()?;
+            record_workspace_dirty(&mut workspace_dirty, row.workspace.as_deref(), &git);
+            let worker = build_who_worker(
+                row,
+                &git,
+                by_agent.remove(row.id.as_str()).unwrap_or_default(),
+                &counts,
+                request.want_history(),
+            )?;
             let row_bytes = serde_json::to_vec(&worker)
                 .map_err(|_| Error::new("internal", "cannot encode who worker"))?
                 .len();
@@ -241,39 +167,9 @@ impl Router {
             workers.push(worker);
         }
 
-        let mut shared = Vec::new();
-        let mut groups: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-        for worker in &workers {
-            let Some(workspace) = worker.workspace.as_deref() else {
-                continue;
-            };
-            if counts.get(workspace).is_some_and(|owners| *owners > 1) {
-                groups
-                    .entry(workspace)
-                    .or_default()
-                    .push(worker.agent.as_str());
-            }
-        }
-        for (workspace, agents) in groups {
-            if agents.len() < 2 {
-                continue;
-            }
-            let entry = WhoSharedWorkspace {
-                workspace: workspace.to_owned(),
-                agents: agents.into_iter().map(str::to_owned).collect(),
-                dirty: workspace_dirty.remove(workspace).unwrap_or_default(),
-            };
-            entry.validate()?;
-            let row_bytes = serde_json::to_vec(&entry)
-                .map_err(|_| Error::new("internal", "cannot encode shared workspace"))?
-                .len();
-            if encoded_bytes.saturating_add(row_bytes + 1) > EVENT_RESPONSE_ENTRIES_MAX_BYTES {
-                truncated = true;
-                break;
-            }
-            encoded_bytes += row_bytes + 1;
-            shared.push(entry);
-        }
+        let (shared, shared_truncated) =
+            build_shared_workspaces(&workers, &counts, &mut workspace_dirty, &mut encoded_bytes)?;
+        truncated = truncated || shared_truncated;
 
         let response = WhoResponse {
             workers,
@@ -285,62 +181,206 @@ impl Router {
             .map_err(|_| Error::new("internal", "who response could not be encoded"))
     }
 
+    /// Roster, live claims, ownership counts and worker Agents under one
+    /// Store lock. Verified edits are not re-read here: each worker's Git
+    /// observation already carries them.
+    async fn gather_who_inputs(
+        &self,
+        principal: &str,
+        project: Option<&str>,
+        now: i64,
+    ) -> Result<WhoInputs> {
+        let store = self.inner.store.lock().await;
+        let (rows, truncated) = store.who_workers(principal, project)?;
+        let claims = store.claim_list(
+            principal,
+            &ClaimListRequest {
+                project: project.map(str::to_owned),
+                agent: None,
+            },
+            now,
+        )?;
+        let counts = store.workspace_owner_counts()?;
+        let mut agents = HashMap::new();
+        for row in &rows {
+            agents.insert(
+                row.id.clone(),
+                store
+                    .get_agent(&row.id)?
+                    .ok_or_else(|| Error::new("internal", "who worker vanished"))?,
+            );
+        }
+        Ok(WhoInputs {
+            rows,
+            truncated,
+            claims,
+            counts,
+            agents,
+        })
+    }
+
     async fn notify_conflict_holders(&self, response: &ClaimSetResponse) {
         let mut holders: BTreeMap<&str, i64> = BTreeMap::new();
         for conflict in &response.conflicts {
             *holders.entry(conflict.agent.as_str()).or_insert(0) += 1;
         }
         for (holder, overlapping) in holders {
-            self.notify_conflict_holder(holder, overlapping).await;
+            self.offer_notice(holder, NoticePending::Claim { overlapping })
+                .await;
         }
     }
+}
 
-    /// Offer one generic conflict notice to a holder. Every gate — no live
-    /// plugin owner, the Store's atomic claim, or the ordinary send
-    /// admission (provider hold, drain, unknown gates) — skips the notice;
-    /// a skipped notice never fails the admitted claim. When the claimed
-    /// `send` is not admitted, the claim is released so the failure does
-    /// not consume the notice cooldown.
-    async fn notify_conflict_holder(&self, holder: &str, overlapping: i64) {
-        let generation = {
-            let store = self.inner.store.lock().await;
-            match store.get_agent(holder) {
-                Ok(Some(agent)) if !agent.state.is_terminal() && agent.generation >= 1 => {
-                    agent.generation
-                }
-                _ => return,
-            }
-        };
-        if !self
-            .inner
-            .plugin_host
-            .controls_generation(holder, generation)
-        {
-            return;
+/// One roster row: verified current-generation edits still dirty in the
+/// cached Git view, singly-owned dirty files, frozen-base committed paths,
+/// live claims and optional bounded history.
+fn build_who_worker(
+    row: &WhoWorkerRow,
+    git: &GitView,
+    claims: Vec<ClaimView>,
+    counts: &HashMap<String, i64>,
+    want_history: bool,
+) -> Result<WhoWorker> {
+    let (available, dirty, complete, committed, base_oid, commits) = match git {
+        GitView::Data(observation) => (
+            observation.available,
+            observation.dirty.as_ref().map(|dirty| {
+                dirty
+                    .iter()
+                    .map(|path| path.path.clone())
+                    .collect::<Vec<_>>()
+            }),
+            observation.complete,
+            observation.committed_paths.clone().unwrap_or_default(),
+            observation.base_oid.clone(),
+            observation.commits.clone().unwrap_or_default(),
+        ),
+        GitView::Unavailable { .. } | GitView::Error { .. } => {
+            (false, None, None, Vec::new(), None, Vec::new())
         }
-        let notice_id = ulid::Ulid::new().to_string();
-        let claim = {
-            let mut store = self.inner.store.lock().await;
-            match store.claim_notice_claim(holder, &notice_id, overlapping, now_ms()) {
-                Ok(claim) => claim,
-                Err(_) => return,
-            }
-        };
-        let Some(claim) = claim else {
-            return;
-        };
-        let params = json!({
-            "id": notice_id,
-            "target": holder,
-            "verb": "send",
-            "expected_generation": claim.generation,
-            "args": {"text": claim_notice_text(claim.overlapping)},
+    };
+    let singly_owned = row
+        .workspace
+        .as_ref()
+        .is_some_and(|workspace| counts.get(workspace) == Some(&1));
+    let (attributed_edits, edits_truncated) = attributed_edits(git);
+    let worker = WhoWorker {
+        agent: row.id.clone(),
+        generation: row.generation,
+        state: row.state,
+        project: row.project.clone(),
+        workspace: row.workspace.clone(),
+        singly_owned,
+        git_available: available,
+        attribution_complete: available && dirty.is_some() && complete == Some(true),
+        edits_truncated,
+        attributed_edits,
+        dirty: if singly_owned {
+            truncate_paths(dirty.unwrap_or_default())
+        } else {
+            Vec::new()
+        },
+        committed_paths: truncate_paths(committed),
+        base_oid,
+        claims,
+        recent_history: if want_history { commits } else { Vec::new() },
+    };
+    worker.validate()?;
+    Ok(worker)
+}
+
+/// Verified edits of the observation's generation whose paths are still
+/// dirty, with a truncation flag when the observation or the `who` bound
+/// cut the list.
+fn attributed_edits(git: &GitView) -> (Vec<String>, bool) {
+    let GitView::Data(observation) = git else {
+        return (Vec::new(), false);
+    };
+    let dirty: HashSet<&str> = observation
+        .dirty
+        .as_ref()
+        .map(|dirty| dirty.iter().map(|path| path.path.as_str()).collect())
+        .unwrap_or_default();
+    let mut attributed: Vec<String> = observation
+        .edits
+        .iter()
+        .filter(|edit| observation.available && dirty.contains(edit.path.as_str()))
+        .map(|edit| edit.path.clone())
+        .collect();
+    attributed.sort();
+    attributed.dedup();
+    let truncated = observation.edits_truncated || observation.edits.len() > MAX_WHO_PATHS;
+    attributed.truncate(MAX_WHO_PATHS);
+    (attributed, truncated)
+}
+
+/// Raw dirty files of one workspace for the shared section, first worker
+/// wins: every in-scope owner sees the same cached snapshot.
+fn record_workspace_dirty(
+    workspace_dirty: &mut HashMap<String, Vec<String>>,
+    workspace: Option<&str>,
+    git: &GitView,
+) {
+    let GitView::Data(observation) = git else {
+        return;
+    };
+    let (Some(workspace), Some(dirty)) = (workspace, observation.dirty.as_ref()) else {
+        return;
+    };
+    workspace_dirty
+        .entry(workspace.to_owned())
+        .or_insert_with(|| {
+            truncate_paths(
+                dirty
+                    .iter()
+                    .map(|path| path.path.clone())
+                    .collect::<Vec<_>>(),
+            )
         });
-        if self.submit(&params, &Principal::Owner).await.is_err() {
-            let mut store = self.inner.store.lock().await;
-            let _ = store.claim_notice_release(holder, &notice_id);
+}
+
+/// Unattributed dirty files of shared checkouts with two or more in-scope
+/// owners, under the shared response byte budget. Returns the entries and
+/// whether the budget cut the list.
+fn build_shared_workspaces(
+    workers: &[WhoWorker],
+    counts: &HashMap<String, i64>,
+    workspace_dirty: &mut HashMap<String, Vec<String>>,
+    encoded_bytes: &mut usize,
+) -> Result<(Vec<WhoSharedWorkspace>, bool)> {
+    let mut shared = Vec::new();
+    let mut groups: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for worker in workers {
+        let Some(workspace) = worker.workspace.as_deref() else {
+            continue;
+        };
+        if counts.get(workspace).is_some_and(|owners| *owners > 1) {
+            groups
+                .entry(workspace)
+                .or_default()
+                .push(worker.agent.as_str());
         }
     }
+    for (workspace, agents) in groups {
+        if agents.len() < 2 {
+            continue;
+        }
+        let entry = WhoSharedWorkspace {
+            workspace: workspace.to_owned(),
+            agents: agents.into_iter().map(str::to_owned).collect(),
+            dirty: workspace_dirty.remove(workspace).unwrap_or_default(),
+        };
+        entry.validate()?;
+        let row_bytes = serde_json::to_vec(&entry)
+            .map_err(|_| Error::new("internal", "cannot encode shared workspace"))?
+            .len();
+        if encoded_bytes.saturating_add(row_bytes + 1) > EVENT_RESPONSE_ENTRIES_MAX_BYTES {
+            return Ok((shared, true));
+        }
+        *encoded_bytes += row_bytes + 1;
+        shared.push(entry);
+    }
+    Ok((shared, false))
 }
 
 #[cfg(test)]
@@ -352,6 +392,7 @@ mod tests {
         SubmitCommand,
         api::{ClaimListResponse, ClaimReleaseResponse, ClaimSetResponse},
     };
+    use serde_json::json;
     use std::path::PathBuf;
     use tokio::sync::Mutex as AsyncMutex;
 
@@ -611,7 +652,7 @@ mod tests {
         // No live plugin owner exists in this harness, so the conflict
         // notice is skipped and nothing is recorded.
         let store = router.inner.store.lock().await;
-        assert_eq!(store.claim_notice_state(&a).unwrap(), None);
+        assert_eq!(store.notice_state(&a).unwrap(), None);
         drop(store);
 
         let released: ClaimReleaseResponse = serde_json::from_value(

@@ -692,7 +692,8 @@ increments the version, records `set_by`, and emits `var.changed`.
 
 A routed recipient with `wake_on_mail` (profile snapshot, default true) may
 receive one generic coalesced wake per minute with at most one open notice
-command: `N unread messages; run swarm inbox`. The notice never contains
+command per recipient across mail and claims: `N unread messages; run swarm inbox`.
+The notice never contains
 the body, is sent through the ordinary owner `send` path bound to the
 recipient's current generation, and is skipped — never retried — while a
 notice command is open or unknown, a provider hold, pending request or
@@ -719,18 +720,21 @@ A claim is live only while its generation still matches the holder's
 current generation, the holder is not terminal, and the TTL has not
 passed. Generation change, terminal state and detach therefore release
 by construction; expiry filters on read and is purged in a bounded batch
-by the next claim write. A conflict — equal globs after normalization,
-or a literal path matched by the other side's glob, in the same project
+by the next claim write. A conflict — two globs that may overlap after
+normalization (segments are compatible when equal or either side carries
+a wildcard, with `**` realigning across directories), in the same project
 — is reported in-band in the `claim.set` response and routes at most one
 coalesced generic notice per holder: `N overlapping work claims; run
-eliot who`. Two different wildcards whose languages merely intersect are
-not detected; both claims stay visible in `who`. The notice reuses the
-mail-wake pattern (one per minute, at most one open notice command,
-same unknown/hold/request suppression, ordinary owner `send` bound to
-the holder's current generation); there is no `wake_on_mail` flag for
-claims. A conflict is never a lock, a reassignment, or a second
-ownership database. `claim.list` pages live claims, optionally filtered
-by project and Agent; an Agent caller reads only its own project.
+eliot who`. Detection is conservative: a false positive only adds an
+advisory notice. The in-band list holds at most 100 conflicts;
+`truncated` signals the scan or report cap engaged. The notice shares the
+mail-wake gate (one per minute, at most one open notice command per
+recipient across mail and claims, same unknown/hold/request suppression,
+ordinary owner `send` bound to the holder's current generation); there is
+no `wake_on_mail` flag for claims, and a replayed `claim.set` (no new
+event) never re-notifies. A conflict is never a lock, a reassignment, or
+a second ownership database. `claim.list` pages live claims, optionally
+filtered by project and Agent; an Agent caller reads only its own project.
 
 `who` composes existing L3 projections per current worker: the roster
 holds every non-terminal Agent in scope (at most 100, oldest first, with

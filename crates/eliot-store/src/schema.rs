@@ -621,11 +621,6 @@ impl Store {
                      PRIMARY KEY(agent,generation,glob)
                  );
                  CREATE INDEX claims_expiry ON claims(expires_at);
-                 CREATE TABLE claim_notices (
-                     recipient INTEGER PRIMARY KEY REFERENCES agents(id),
-                     last_notice_at INTEGER NOT NULL,
-                     open_notice_command TEXT
-                 );
                  INSERT INTO schema_migrations(version) VALUES (24);",
             )
             .map_err(sql_error)?;

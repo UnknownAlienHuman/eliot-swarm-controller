@@ -422,6 +422,7 @@ dependencies = [
 name = "eliot-core"
 version = "0.2.0-dev"
 dependencies = [
+ "globset",
  "serde",
  "serde_json",
  "sha2",

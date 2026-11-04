@@ -3,8 +3,8 @@
 //! Claims are project-relative globs with note/TTL, owned by an Agent
 //! generation. They are advisory: a conflict never locks or reassigns work,
 //! it only reports the overlapping holders in-band and routes one coalesced
-//! generic notice to each holder through the same claim/suppression pattern
-//! as the L5.1 mail wake. Liveness is computed, never a second ownership
+//! generic notice to each holder through the shared L5.1 notice gate.
+//! Liveness is computed, never a second ownership
 //! database: a claim reads live only while its generation still matches the
 //! Agent's current generation, the Agent is not terminal, and the TTL has
 //! not passed. Generation change, terminal state and detach therefore
@@ -14,19 +14,19 @@
 use super::coordination::{Sender, parse_sender, retain_write_tx};
 use super::{
     Change, Error, Result, Store, canonical, command_binding, commit_transaction, decode_json,
-    enforce_page_bytes, insert_daemon_event, load_agent_by_num, load_command_record, parse_enum,
-    provider_holds, sql_error, turn_state_name, validate_id_age, write_binding,
+    enforce_page_bytes, insert_daemon_event, load_agent_by_num, parse_enum, sql_error,
+    validate_id_age, write_binding,
 };
 use eliot_core::{
-    AgentState, CommandState, TurnState,
+    AgentState,
     api::{
-        CLAIM_NOTICE_COOLDOWN_MS, ClaimConflict, ClaimListRequest, ClaimListResponse,
-        ClaimReleaseRequest, ClaimReleaseResponse, ClaimSetRequest, ClaimSetResponse, ClaimView,
-        MAX_CLAIMS_PER_AGENT, MAX_WHO_WORKERS, claim_globs_overlap, normalize_claim_glob,
+        ClaimConflict, ClaimListRequest, ClaimListResponse, ClaimReleaseRequest,
+        ClaimReleaseResponse, ClaimSetRequest, ClaimSetResponse, ClaimView, MAX_CLAIMS_PER_AGENT,
+        MAX_WHO_WORKERS, claim_globs_overlap, normalize_claim_glob,
     },
     parse_agent_id,
 };
-use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Transaction, TransactionBehavior, params};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -37,21 +37,6 @@ const CLAIM_RELEASE_METHOD: &str = "claim.release";
 const CLAIM_EXPIRY_PURGE_ROWS: i64 = 1_000;
 /// Conflict and list scans stop here; responses truncate honestly above it.
 const CLAIM_SCAN_ROWS: i64 = 1_001;
-
-/// A claimed conflict notice: the overlapping live-claim count for the
-/// generic notice text and the holder generation the notice binds.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ClaimNoticeClaim {
-    pub overlapping: i64,
-    pub generation: i64,
-}
-
-/// Durable conflict-notice state for one holder.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ClaimNoticeState {
-    pub last_notice_at: i64,
-    pub open_notice_command: Option<String>,
-}
 
 /// One current non-terminal Agent in `who` scope.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,9 +51,10 @@ pub struct WhoWorkerRow {
 
 impl Store {
     /// Set (or refresh) one advisory claim for the caller's Agent generation.
-    /// The response names every live overlapping claim held by other Agents
-    /// in the same project; the Router routes at most one coalesced generic
-    /// notice to each holder.
+    /// The response names live overlapping claims held by other Agents in
+    /// the same project, with `truncated` when the scan or report cap
+    /// engaged; the Router routes at most one coalesced generic notice to
+    /// each holder.
     pub fn claim_set(
         &mut self,
         principal: &str,
@@ -187,59 +173,12 @@ impl Store {
         Ok(rows.into_iter().collect())
     }
 
-    /// Atomically claim one generic conflict notice for a holder, or
-    /// suppress it. Suppression (cooldown, an open or unknown notice
-    /// command, an unknown command or turn, a pending request, or a
-    /// provider hold) returns `Ok(None)` and records nothing.
-    pub fn claim_notice_claim(
-        &mut self,
-        recipient: &str,
-        notice_command: &str,
-        overlapping: i64,
-        now: i64,
-    ) -> Result<Option<ClaimNoticeClaim>> {
-        self.ensure_writer_healthy()?;
-        let result = self.claim_notice_claim_inner(recipient, notice_command, overlapping, now);
-        self.fault_on_persistence_error(&result);
-        result
-    }
-
-    /// Read durable conflict-notice state for one holder.
-    pub fn claim_notice_state(&self, recipient: &str) -> Result<Option<ClaimNoticeState>> {
-        let num = parse_agent_id(recipient)?;
-        let row: Option<(i64, Option<String>)> = self
-            .connection
-            .query_row(
-                "SELECT last_notice_at, open_notice_command FROM claim_notices WHERE recipient = ?1",
-                params![num],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(sql_error)?;
-        Ok(
-            row.map(|(last_notice_at, open_notice_command)| ClaimNoticeState {
-                last_notice_at,
-                open_notice_command,
-            }),
-        )
-    }
-
-    /// Release a claimed notice whose notice command was never admitted, so
-    /// a failed `send` does not consume the notice cooldown. Only clears
-    /// when the stored open command still names this notice.
-    pub fn claim_notice_release(&mut self, recipient: &str, notice_command: &str) -> Result<()> {
-        self.ensure_writer_healthy()?;
-        let result = self.claim_notice_release_inner(recipient, notice_command);
-        self.fault_on_persistence_error(&result);
-        result
-    }
-
     fn resolve_claim_agent(
         &self,
         principal: &str,
         agent: Option<&str>,
     ) -> Result<eliot_core::Agent> {
-        match parse_sender(principal)? {
+        match parse_sender(principal, "coordination")? {
             Sender::Owner => {
                 let Some(agent) = agent else {
                     return Err(Error::new(
@@ -291,7 +230,7 @@ impl Store {
                 Some((num, row.project))
             }
         };
-        match parse_sender(principal)? {
+        match parse_sender(principal, "coordination")? {
             Sender::Owner => {
                 if let (Some(filter), Some((_, project))) = (request.project.as_deref(), &agent)
                     && filter != project
@@ -343,7 +282,7 @@ impl Store {
         if project.is_some_and(|project| project.trim().is_empty()) {
             return Err(Error::new("invalid", "who project filter is invalid"));
         }
-        match parse_sender(principal)? {
+        match parse_sender(principal, "coordination")? {
             Sender::Owner => Ok(project.map(str::to_owned)),
             Sender::Agent {
                 num, generation, ..
@@ -423,40 +362,26 @@ impl Store {
                 "claims release on terminal state and cannot start there",
             ));
         }
-        let target_num = parse_agent_id(&target.id)?;
-        let ttl_ms = i64::try_from(request.effective_ttl_secs())
-            .unwrap_or(i64::MAX)
-            .saturating_mul(1_000);
+        let ttl_secs = request.effective_ttl_secs();
         let semantic_payload = json!({
             "agent": target.id,
             "glob": glob,
             "note": request.note,
-            "ttl_secs": request.effective_ttl_secs(),
+            "ttl_secs": ttl_secs,
         });
         let payload_digest = canonical::digest(&semantic_payload)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
-        if command_binding(&tx, &request.id)?.is_some() {
-            return Err(Error::new(
-                "id_conflict",
-                "claim write id is already used by a command",
-            ));
-        }
-        if let Some((old_principal, old_method, old_digest, old_result)) =
-            write_binding(&tx, &request.id)?
-        {
-            if old_principal != principal
-                || old_method != CLAIM_SET_METHOD
-                || old_digest != payload_digest
-            {
-                return Err(Error::new(
-                    "id_conflict",
-                    "claim write id is bound to another principal, method, or payload",
-                ));
-            }
-            let value = serde_json::from_value::<ClaimSetResponse>(decode_json(&old_result)?)
+        if let Some(stored) = replay_claim_write(
+            &tx,
+            &request.id,
+            principal,
+            CLAIM_SET_METHOD,
+            &payload_digest,
+        )? {
+            let value = serde_json::from_value::<ClaimSetResponse>(decode_json(&stored)?)
                 .map_err(|error| Error::new("internal", error.to_string()))?;
             request.validate_response(&value)?;
             commit_transaction(tx, &self.write_faulted)?;
@@ -467,57 +392,10 @@ impl Store {
         }
         validate_id_age(&request.id, now)?;
 
-        purge_expired_claims_tx(&tx, now)?;
-        db!(tx.execute(
-            "DELETE FROM claims WHERE agent = ?1 AND generation != ?2",
-            params![target_num, target.generation],
-        ));
-        let live: i64 = tx
-            .query_row(
-                "SELECT COUNT(*) FROM claims
-                 WHERE agent = ?1 AND generation = ?2 AND expires_at > ?3 AND glob != ?4",
-                params![target_num, target.generation, now, glob],
-                |row| row.get(0),
-            )
-            .map_err(sql_error)?;
-        if live >= i64::try_from(MAX_CLAIMS_PER_AGENT).unwrap_or(i64::MAX) {
-            return Err(Error::new(
-                "claim_limit",
-                format!(
-                    "Agent {} already holds {MAX_CLAIMS_PER_AGENT} live claims",
-                    target.id
-                ),
-            ));
-        }
-        let expires_at = now.saturating_add(ttl_ms);
-        db!(tx.execute(
-            "INSERT INTO claims(agent, generation, glob, note, expires_at, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(agent, generation, glob) DO UPDATE SET
-                 note = excluded.note, expires_at = excluded.expires_at",
-            params![
-                target_num,
-                target.generation,
-                glob,
-                request.note,
-                expires_at,
-                now
-            ],
-        ));
-        let mut conflicts = Vec::new();
-        let candidates = Self::live_claims_tx(&tx, &target.project, now)?;
-        for candidate in candidates {
-            if candidate.agent == target.id {
-                continue;
-            }
-            if claim_globs_overlap(&glob, &candidate.glob)? && conflicts.len() < MAX_WHO_WORKERS {
-                conflicts.push(ClaimConflict {
-                    agent: candidate.agent,
-                    generation: candidate.generation,
-                    glob: candidate.glob,
-                });
-            }
-        }
+        let (target_num, expires_at) =
+            Self::admit_claim_row(&tx, &target, &glob, request.note.as_deref(), ttl_secs, now)?;
+        let (conflicts, truncated) =
+            Self::scan_claim_conflicts(&tx, &target.project, &target.id, &glob, now)?;
         let event = insert_daemon_event(
             &tx,
             now,
@@ -540,6 +418,7 @@ impl Store {
             expires_at,
             admitted_at: now,
             conflicts,
+            truncated,
         };
         request.validate_response(&value)?;
         retain_write_tx(
@@ -557,6 +436,88 @@ impl Store {
             value,
             events: vec![event],
         })
+    }
+
+    /// Insert or refresh one live claim row after purging expired rows,
+    /// dropping the holder's prior-generation rows and enforcing the
+    /// per-generation cap. Returns the holder number and the new expiry.
+    fn admit_claim_row(
+        tx: &Transaction<'_>,
+        target: &eliot_core::Agent,
+        glob: &str,
+        note: Option<&str>,
+        ttl_secs: u64,
+        now: i64,
+    ) -> Result<(i64, i64)> {
+        let target_num = parse_agent_id(&target.id)?;
+        purge_expired_claims_tx(tx, now)?;
+        db!(tx.execute(
+            "DELETE FROM claims WHERE agent = ?1 AND generation != ?2",
+            params![target_num, target.generation],
+        ));
+        let live: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM claims
+                 WHERE agent = ?1 AND generation = ?2 AND expires_at > ?3 AND glob != ?4",
+                params![target_num, target.generation, now, glob],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        if live >= i64::try_from(MAX_CLAIMS_PER_AGENT).unwrap_or(i64::MAX) {
+            return Err(Error::new(
+                "claim_limit",
+                format!(
+                    "Agent {} already holds {MAX_CLAIMS_PER_AGENT} live claims",
+                    target.id
+                ),
+            ));
+        }
+        let ttl_ms = i64::try_from(ttl_secs)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(1_000);
+        let expires_at = now.saturating_add(ttl_ms);
+        db!(tx.execute(
+            "INSERT INTO claims(agent, generation, glob, note, expires_at, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(agent, generation, glob) DO UPDATE SET
+                 note = excluded.note, expires_at = excluded.expires_at",
+            params![target_num, target.generation, glob, note, expires_at, now],
+        ));
+        Ok((target_num, expires_at))
+    }
+
+    /// Live claims of other Agents in the project that overlap `glob`. The
+    /// scan stops at `CLAIM_SCAN_ROWS` rows and the report at
+    /// `MAX_WHO_WORKERS` entries; `truncated` tells the caller a cap
+    /// engaged instead of silently dropping holders.
+    fn scan_claim_conflicts(
+        tx: &Transaction<'_>,
+        project: &str,
+        holder: &str,
+        glob: &str,
+        now: i64,
+    ) -> Result<(Vec<ClaimConflict>, bool)> {
+        let candidates = Self::live_claims_tx(tx, project, now)?;
+        let mut truncated = candidates.len() >= CLAIM_SCAN_ROWS as usize;
+        let mut conflicts = Vec::new();
+        for candidate in candidates {
+            if candidate.agent == holder {
+                continue;
+            }
+            if !claim_globs_overlap(glob, &candidate.glob)? {
+                continue;
+            }
+            if conflicts.len() >= MAX_WHO_WORKERS {
+                truncated = true;
+                break;
+            }
+            conflicts.push(ClaimConflict {
+                agent: candidate.agent,
+                generation: candidate.generation,
+                glob: candidate.glob,
+            });
+        }
+        Ok((conflicts, truncated))
     }
 
     fn live_claims_tx(tx: &Transaction<'_>, project: &str, now: i64) -> Result<Vec<ClaimView>> {
@@ -610,25 +571,14 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
-        if command_binding(&tx, &request.id)?.is_some() {
-            return Err(Error::new(
-                "id_conflict",
-                "claim write id is already used by a command",
-            ));
-        }
-        if let Some((old_principal, old_method, old_digest, old_result)) =
-            write_binding(&tx, &request.id)?
-        {
-            if old_principal != principal
-                || old_method != CLAIM_RELEASE_METHOD
-                || old_digest != payload_digest
-            {
-                return Err(Error::new(
-                    "id_conflict",
-                    "claim write id is bound to another principal, method, or payload",
-                ));
-            }
-            let value = serde_json::from_value::<ClaimReleaseResponse>(decode_json(&old_result)?)
+        if let Some(stored) = replay_claim_write(
+            &tx,
+            &request.id,
+            principal,
+            CLAIM_RELEASE_METHOD,
+            &payload_digest,
+        )? {
+            let value = serde_json::from_value::<ClaimReleaseResponse>(decode_json(&stored)?)
                 .map_err(|error| Error::new("internal", error.to_string()))?;
             request.validate_response(&value)?;
             commit_transaction(tx, &self.write_faulted)?;
@@ -687,136 +637,35 @@ impl Store {
             events: vec![event],
         })
     }
+}
 
-    fn claim_notice_claim_inner(
-        &mut self,
-        recipient: &str,
-        notice_command: &str,
-        overlapping: i64,
-        now: i64,
-    ) -> Result<Option<ClaimNoticeClaim>> {
-        let num = parse_agent_id(recipient)?;
-        if notice_command.trim().is_empty() || overlapping < 1 {
-            return Err(Error::new(
-                "invalid",
-                "claim notice needs a command id and a conflict",
-            ));
-        }
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sql_error)?;
-        let agent = load_agent_by_num(&tx, num)?;
-        let Some(agent) = agent else {
-            commit_transaction(tx, &self.write_faulted)?;
-            return Ok(None);
-        };
-        let notice: Option<(i64, Option<String>)> = tx
-            .query_row(
-                "SELECT last_notice_at, open_notice_command FROM claim_notices WHERE recipient = ?1",
-                params![num],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(sql_error)?;
-        if notice
-            .as_ref()
-            .is_some_and(|(last, _)| now.saturating_sub(*last) < CLAIM_NOTICE_COOLDOWN_MS)
-        {
-            commit_transaction(tx, &self.write_faulted)?;
-            return Ok(None);
-        }
-        if let Some((_, Some(open))) = notice.as_ref() {
-            let blocking = load_command_record(&tx, open)?.is_some_and(|record| {
-                matches!(
-                    record.state,
-                    CommandState::Accepted
-                        | CommandState::Queued
-                        | CommandState::Dispatched
-                        | CommandState::Unknown
-                )
-            });
-            if blocking {
-                commit_transaction(tx, &self.write_faulted)?;
-                return Ok(None);
-            }
-        }
-        let unknown_command: bool = tx
-            .query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM commands WHERE target = ?1 AND state = 'unknown'
-                 )",
-                params![num],
-                |row| row.get(0),
-            )
-            .map_err(sql_error)?;
-        if unknown_command {
-            commit_transaction(tx, &self.write_faulted)?;
-            return Ok(None);
-        }
-        let unknown_turn: bool = tx
-            .query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM turns WHERE agent = ?1 AND state = ?2
-                 )",
-                params![num, turn_state_name(TurnState::Unknown)],
-                |row| row.get(0),
-            )
-            .map_err(sql_error)?;
-        if unknown_turn {
-            commit_transaction(tx, &self.write_faulted)?;
-            return Ok(None);
-        }
-        let pending_request: bool = tx
-            .query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM pending_requests
-                     WHERE agent = ?1 AND generation = ?2 AND state = 'pending'
-                 )",
-                params![num, agent.generation],
-                |row| row.get(0),
-            )
-            .map_err(sql_error)?;
-        if pending_request {
-            commit_transaction(tx, &self.write_faulted)?;
-            return Ok(None);
-        }
-        match provider_holds::require_unheld_tx(&tx, &agent) {
-            Ok(()) => {}
-            Err(error) if error.code == "provider_held" => {
-                commit_transaction(tx, &self.write_faulted)?;
-                return Ok(None);
-            }
-            Err(error) => return Err(error),
-        }
-        db!(tx.execute(
-            "INSERT INTO claim_notices(recipient, last_notice_at, open_notice_command)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(recipient) DO UPDATE SET
-                 last_notice_at = excluded.last_notice_at,
-                 open_notice_command = excluded.open_notice_command",
-            params![num, now, notice_command],
+/// Stored result of an exact idempotent replay, or `None` for a fresh id. A
+/// reused command id, or a write id bound to another principal, method or
+/// payload, is `id_conflict`.
+fn replay_claim_write(
+    tx: &Transaction<'_>,
+    id: &str,
+    principal: &str,
+    method: &str,
+    payload_digest: &[u8],
+) -> Result<Option<String>> {
+    if command_binding(tx, id)?.is_some() {
+        return Err(Error::new(
+            "id_conflict",
+            "claim write id is already used by a command",
         ));
-        commit_transaction(tx, &self.write_faulted)?;
-        Ok(Some(ClaimNoticeClaim {
-            overlapping,
-            generation: agent.generation,
-        }))
     }
-
-    fn claim_notice_release_inner(&mut self, recipient: &str, notice_command: &str) -> Result<()> {
-        let num = parse_agent_id(recipient)?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sql_error)?;
-        db!(tx.execute(
-            "DELETE FROM claim_notices WHERE recipient = ?1 AND open_notice_command = ?2",
-            params![num, notice_command],
+    let Some((old_principal, old_method, old_digest, old_result)) = write_binding(tx, id)? else {
+        return Ok(None);
+    };
+    if old_principal != principal || old_method != method || old_digest.as_slice() != payload_digest
+    {
+        return Err(Error::new(
+            "id_conflict",
+            "claim write id is bound to another principal, method, or payload",
         ));
-        commit_transaction(tx, &self.write_faulted)?;
-        Ok(())
     }
+    Ok(Some(old_result))
 }
 
 /// Delete expired claims, at most one bounded batch per write. Reads filter
@@ -834,7 +683,8 @@ fn purge_expired_claims_tx(tx: &Transaction<'_>, now: i64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eliot_core::{NativeEvent, SourceBatch, SubmitCommand};
+    use crate::coordination::{NoticeKind, NoticePending};
+    use eliot_core::{CommandState, NativeEvent, SourceBatch, SubmitCommand};
     use std::{
         path::Path,
         time::{SystemTime, UNIX_EPOCH},
@@ -1459,50 +1309,57 @@ mod tests {
 
         let first = Ulid::new().to_string();
         let claim = store
-            .claim_notice_claim(&a, &first, 2, now)
-            .expect("first notice claim");
+            .notice_claim(&a, &first, NoticePending::Claim { overlapping: 2 }, now)
+            .expect("first notice claim")
+            .expect("first conflict wakes");
+        assert_eq!(claim.kind, NoticeKind::Claim);
+        assert_eq!(claim.count, 2);
+        assert_eq!(claim.generation, 1);
+        let state = store.notice_state(&a).expect("read notice state");
         assert_eq!(
-            claim,
-            Some(ClaimNoticeClaim {
-                overlapping: 2,
-                generation: 1,
-            })
+            state
+                .as_ref()
+                .and_then(|state| state.open_notice_command.clone()),
+            Some(first.clone())
         );
-        let state = store.claim_notice_state(&a).expect("read notice state");
-        assert_eq!(
-            state,
-            Some(ClaimNoticeState {
-                last_notice_at: now,
-                open_notice_command: Some(first.clone()),
-            })
-        );
+        assert_eq!(state.map(|state| state.last_notice_at), Some(now));
         // The cooldown coalesces the immediate second conflict.
         let suppressed = store
-            .claim_notice_claim(&a, &Ulid::new().to_string(), 1, now + 1)
+            .notice_claim(
+                &a,
+                &Ulid::new().to_string(),
+                NoticePending::Claim { overlapping: 1 },
+                now + 1,
+            )
             .expect("coalesced notice claim");
         assert_eq!(suppressed, None);
 
         // Releasing the wrong command disturbs nothing; releasing the
         // recorded one frees the next conflict after the cooldown.
         store
-            .claim_notice_release(&a, &Ulid::new().to_string())
+            .notice_release(&a, &Ulid::new().to_string())
             .expect("release of a foreign command is a no-op");
         assert_eq!(
-            store.claim_notice_state(&a).expect("state kept"),
-            Some(ClaimNoticeState {
-                last_notice_at: now,
-                open_notice_command: Some(first.clone()),
-            })
+            store
+                .notice_state(&a)
+                .expect("state kept")
+                .and_then(|state| state.open_notice_command),
+            Some(first.clone())
         );
         store
-            .claim_notice_release(&a, &first)
+            .notice_release(&a, &first)
             .expect("release the failed notice");
-        assert_eq!(store.claim_notice_state(&a).expect("state gone"), None);
-        let later = now + CLAIM_NOTICE_COOLDOWN_MS;
+        assert_eq!(store.notice_state(&a).expect("state gone"), None);
+        let later = now + eliot_core::api::MAIL_NOTICE_COOLDOWN_MS;
         let claim = store
-            .claim_notice_claim(&a, &Ulid::new().to_string(), 1, later)
+            .notice_claim(
+                &a,
+                &Ulid::new().to_string(),
+                NoticePending::Claim { overlapping: 1 },
+                later,
+            )
             .expect("notice after cooldown");
-        assert_eq!(claim.map(|claim| claim.overlapping), Some(1));
+        assert_eq!(claim.map(|claim| claim.count), Some(1));
     }
 
     #[test]
@@ -1534,13 +1391,140 @@ mod tests {
             .settle(&send_id, CommandState::Unknown, None, now)
             .expect("settle unknown");
         let suppressed = store
-            .claim_notice_claim(&a, &Ulid::new().to_string(), 1, now)
+            .notice_claim(
+                &a,
+                &Ulid::new().to_string(),
+                NoticePending::Claim { overlapping: 1 },
+                now,
+            )
             .expect("unknown gate suppresses");
         assert_eq!(suppressed, None);
-        assert_eq!(
-            store.claim_notice_state(&a).expect("nothing recorded"),
-            None
-        );
+        assert_eq!(store.notice_state(&a).expect("nothing recorded"), None);
+    }
+
+    #[test]
+    fn claim_conflicts_signal_truncation_at_either_cap() {
+        let mut store = store();
+        let now = now_ms();
+        store
+            .connection
+            .execute(
+                "INSERT INTO agents(project, harness, profile, state, created_at, updated_at)
+                 VALUES ('app', 'fake', 'fake', 'idle', ?1, ?1)",
+                params![now],
+            )
+            .unwrap();
+        let holder: i64 = store.connection.last_insert_rowid();
+        for index in 0..(CLAIM_SCAN_ROWS as usize + 4) {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO claims(agent, generation, glob, expires_at, created_at)
+                     VALUES (?1, 0, ?2, ?3, ?4)",
+                    params![holder, format!("area-{index}/**"), now + 3_600_000, now],
+                )
+                .unwrap();
+        }
+        let tx = store.connection.transaction().unwrap();
+        let (conflicts, truncated) =
+            Store::scan_claim_conflicts(&tx, "app", "a999", "**", now).expect("scan caps");
+        assert!(truncated, "capped scans must surface truncation");
+        assert_eq!(conflicts.len(), MAX_WHO_WORKERS);
+    }
+
+    #[test]
+    fn mail_and_claim_notices_share_one_gate_per_recipient() {
+        let mut store = store();
+        let now = now_ms();
+        let a = ready_agent(&mut store, "app", "ws-a", now);
+        store
+            .mail_send(
+                "owner",
+                &eliot_core::api::MailSendRequest {
+                    id: Ulid::new().to_string(),
+                    to: vec![a.clone()],
+                    mode: eliot_core::api::MailMode::Queue,
+                    text: "hello".to_owned(),
+                    thread: None,
+                    reply_to_delivery: None,
+                },
+                eliot_core::api::MailLimits::default(),
+                now,
+            )
+            .expect("queue mail");
+
+        // A mail wake consumes the shared cooldown: an immediate claim
+        // conflict for the same recipient is suppressed, and vice versa.
+        let mail_notice = Ulid::new().to_string();
+        let claim = store
+            .notice_claim(&a, &mail_notice, NoticePending::Mail, now)
+            .expect("mail wake claims")
+            .expect("first notice");
+        assert_eq!(claim.kind, NoticeKind::Mail);
+        let suppressed = store
+            .notice_claim(
+                &a,
+                &Ulid::new().to_string(),
+                NoticePending::Claim { overlapping: 1 },
+                now + 1,
+            )
+            .expect("cross-kind suppression");
+        assert_eq!(suppressed, None);
+
+        // After the cooldown the open mail command still blocks the claim
+        // notice: at most one open notice command per recipient.
+        let mut send = SubmitCommand::new(mail_notice.clone(), "send");
+        send.target = Some(a.clone());
+        send.expected_generation = Some(1);
+        send.args = json!({"text": "1 unread messages; run eliot inbox"});
+        store.submit("owner", send, now).expect("admit mail notice");
+        let suppressed = store
+            .notice_claim(
+                &a,
+                &Ulid::new().to_string(),
+                NoticePending::Claim { overlapping: 1 },
+                now + eliot_core::api::MAIL_NOTICE_COOLDOWN_MS + 1,
+            )
+            .expect("open command suppresses across kinds");
+        assert_eq!(suppressed, None);
+    }
+
+    #[test]
+    fn two_directory_claims_conflict_and_produce_one_notice() {
+        let mut store = store();
+        let now = now_ms();
+        let a = ready_agent(&mut store, "app", "ws-a", now);
+        let b = ready_agent(&mut store, "app", "ws-b", now);
+        store
+            .claim_set(&agent_principal(&a, 1), &set_request("src/**"), now)
+            .expect("A claims its directory");
+
+        // `src/**` vs `src/lib/**` overlaps, so B's set reports A in-band.
+        let change = store
+            .claim_set(&agent_principal(&b, 1), &set_request("src/lib/**"), now)
+            .expect("B claims a nested directory");
+        assert!(!change.value.truncated);
+        assert_eq!(change.value.conflicts.len(), 1);
+        assert_eq!(change.value.conflicts[0].agent, a);
+        assert_eq!(change.value.conflicts[0].glob, "src/**");
+
+        // One notice per holder: the first conflict wakes A, the immediate
+        // second is coalesced by the shared gate.
+        let first = Ulid::new().to_string();
+        let claim = store
+            .notice_claim(&a, &first, NoticePending::Claim { overlapping: 1 }, now)
+            .expect("first conflict notice")
+            .expect("holder wakes once");
+        assert_eq!(claim.count, 1);
+        let suppressed = store
+            .notice_claim(
+                &a,
+                &Ulid::new().to_string(),
+                NoticePending::Claim { overlapping: 2 },
+                now + 1,
+            )
+            .expect("second conflict coalesces");
+        assert_eq!(suppressed, None);
     }
 
     #[test]

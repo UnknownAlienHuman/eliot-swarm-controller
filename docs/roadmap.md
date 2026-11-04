@@ -230,11 +230,6 @@ Read [coordination](spec/coordination.md). Use two Codex Agents initially.
       `history_gap`).
 - [x] **L5.2 Work attribution.** `who` reads L3 Git/edit projections; claims are
       advisory. No second ownership database or file-lock promise.
-      `who`/`claim.set/list/release` are connected through the Router/CLI:
-      current-generation edits still dirty, singly-owned dirty files,
-      frozen-base committed paths, live claims and optional bounded history;
-      overlapping claims report in-band and route one coalesced generic
-      notice per holder with no lock or reassignment.
 - [ ] **L5.3 Hierarchy.** Controller-launched children and tree selectors, then native
       child discovery/control where supported. An existing child is never hidden by a
       fanout limit. Parent completion is not child completion.

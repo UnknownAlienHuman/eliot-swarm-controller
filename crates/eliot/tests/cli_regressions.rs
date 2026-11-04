@@ -14475,9 +14475,8 @@ fn cli_hierarchy_fanout_limit_rejects_extra_children() {
     fixture.stop(false);
 }
 
-#[test]
-fn attribution_who_claims_and_conflict_notice() {
-    let mut fixture = Fixture::new("attribution who");
+fn started_attribution_fixture(name: &str) -> Fixture {
+    let mut fixture = Fixture::new(name);
     assert!(
         fixture
             .git(&["init", "--initial-branch=main"])
@@ -14494,33 +14493,53 @@ fn attribution_who_claims_and_conflict_notice() {
             .success()
     );
     fixture.start();
-    let workspace = fixture.workspace.to_str().unwrap().to_owned();
-    let first = fixture.json(&[
+    fixture
+}
+
+fn launch_attribution_agent(fixture: &Fixture, workspace: &str) -> String {
+    let launched = fixture.json(&[
         "launch",
         "--profile",
         "fake",
         "--workspace",
-        &workspace,
+        workspace,
         "--wait",
     ]);
-    let a = first["target"].as_str().expect("fake Agent").to_owned();
+    launched["target"].as_str().expect("fake Agent").to_owned()
+}
 
-    // A edits: the dirty file has no native authorship hint, so it shows
-    // only through single ownership of the checkout.
-    fs::write(fixture.workspace.join("note.txt"), "a's draft\n").expect("dirty the checkout");
-    let seen = {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let status = fixture.json(&["git-status", &a]);
-            let dirty = status["dirty"].as_array().cloned().unwrap_or_default();
-            if status["available"] == true && dirty.iter().any(|path| path["path"] == "note.txt") {
-                break status;
-            }
-            assert!(Instant::now() < deadline, "git monitor dirty deadline");
-            thread::sleep(Duration::from_millis(100));
+fn wait_attribution_dirty(fixture: &Fixture, agent: &str, path: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = fixture.json(&["git-status", agent]);
+        let dirty = status["dirty"].as_array().cloned().unwrap_or_default();
+        if status["available"] == true && dirty.iter().any(|entry| entry["path"] == path) {
+            assert_eq!(status["complete"], true);
+            return;
         }
-    };
-    assert_eq!(seen["complete"], true);
+        assert!(Instant::now() < deadline, "git monitor dirty deadline");
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn stop_attribution_agent(fixture: &Fixture, agent: &str) {
+    let stop = fixture.json(&["stop", agent]);
+    fixture.wait_command(
+        stop["command_id"].as_str().expect("stop command"),
+        "applied",
+    );
+}
+
+#[test]
+fn attribution_who_shows_single_then_shared_ownership() {
+    let mut fixture = started_attribution_fixture("attribution who");
+    let workspace = fixture.workspace.to_str().unwrap().to_owned();
+    let a = launch_attribution_agent(&fixture, &workspace);
+
+    // The dirty file has no native authorship hint, so it shows only
+    // through single ownership of the checkout.
+    fs::write(fixture.workspace.join("note.txt"), "a's draft\n").expect("dirty the checkout");
+    wait_attribution_dirty(&fixture, &a, "note.txt");
 
     let set = fixture.json(&[
         "claim", "set", "--agent", &a, "--note", "drafting", "docs/**",
@@ -14530,8 +14549,7 @@ fn attribution_who_claims_and_conflict_notice() {
     assert_eq!(set["glob"], "docs/**");
     assert!(set["conflicts"].as_array().expect("conflicts").is_empty());
 
-    // B reads who and sees A's area: the singly owned dirty file plus the
-    // advisory claim.
+    // `who` shows A's area: the singly owned dirty file plus the claim.
     let who = fixture.json(&["who"]);
     let workers = who["workers"].as_array().expect("who workers");
     assert_eq!(workers.len(), 1);
@@ -14546,15 +14564,7 @@ fn attribution_who_claims_and_conflict_notice() {
 
     // A second Agent in the same checkout shares it: raw dirty files stay
     // unattributed but visible, while claims still show their holders.
-    let second = fixture.json(&[
-        "launch",
-        "--profile",
-        "fake",
-        "--workspace",
-        &workspace,
-        "--wait",
-    ]);
-    let b = second["target"].as_str().expect("fake Agent").to_owned();
+    let b = launch_attribution_agent(&fixture, &workspace);
     let who = fixture.json(&["who"]);
     let workers = who["workers"].as_array().expect("who workers");
     assert_eq!(workers.len(), 2);
@@ -14573,13 +14583,27 @@ fn attribution_who_claims_and_conflict_notice() {
             .any(|path| path == "note.txt")
     );
 
+    stop_attribution_agent(&fixture, &a);
+    stop_attribution_agent(&fixture, &b);
+    fixture.stop(false);
+}
+
+#[test]
+fn attribution_claim_conflict_reports_inband_and_notifies_once() {
+    let mut fixture = started_attribution_fixture("attribution conflict");
+    let workspace = fixture.workspace.to_str().unwrap().to_owned();
+    let a = launch_attribution_agent(&fixture, &workspace);
+    let b = launch_attribution_agent(&fixture, &workspace);
+    fixture.json(&["claim", "set", "--agent", &a, "docs/**"]);
+
     // B's overlapping claim reports A's area in-band and routes exactly one
     // coalesced generic notice to A; the immediate second overlap is
-    // suppressed by the cooldown.
+    // suppressed by the shared gate.
     let overlap = fixture.json(&["claim", "set", "--agent", &b, "docs/guide.md"]);
     let conflicts = overlap["conflicts"].as_array().expect("conflicts");
     assert_eq!(conflicts.len(), 1);
     assert_eq!(conflicts[0]["agent"], a);
+    assert_eq!(overlap["truncated"], false);
     fixture.json(&["claim", "set", "--agent", &b, "docs/other.md"]);
     let events = fixture.events();
     let mut notices = Vec::new();
@@ -14614,26 +14638,21 @@ fn attribution_who_claims_and_conflict_notice() {
         )]
     );
 
-    // A one-second claim expires out of reads without any explicit release.
-    fixture.json(&["claim", "set", "--agent", &b, "--ttl-secs", "1", "tmp/**"]);
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        let listed = fixture.json(&["claim", "list"]);
-        let live: Vec<_> = listed["claims"]
-            .as_array()
-            .expect("claims")
-            .iter()
-            .filter(|claim| claim["glob"] == "tmp/**")
-            .collect();
-        if live.is_empty() {
-            break;
-        }
-        assert!(Instant::now() < deadline, "claim expiry deadline");
-        thread::sleep(Duration::from_millis(100));
-    }
+    stop_attribution_agent(&fixture, &a);
+    stop_attribution_agent(&fixture, &b);
+    fixture.stop(false);
+}
 
-    // Explicit release clears the holder; stop and resume move B to a new
-    // generation whose roster row carries no old claim.
+#[test]
+fn attribution_claim_release_and_generation_drop_claims() {
+    let mut fixture = started_attribution_fixture("attribution release");
+    let workspace = fixture.workspace.to_str().unwrap().to_owned();
+    let a = launch_attribution_agent(&fixture, &workspace);
+    let b = launch_attribution_agent(&fixture, &workspace);
+    fixture.json(&["claim", "set", "--agent", &a, "docs/**"]);
+    fixture.json(&["claim", "set", "--agent", &b, "src/**"]);
+
+    // Explicit release clears the holder; the project filter still rosters A.
     fixture.json(&["claim", "release", "--agent", &a, "docs/**"]);
     let project = fixture.json(&["who"])["workers"]
         .as_array()
@@ -14655,11 +14674,11 @@ fn attribution_who_claims_and_conflict_notice() {
         .expect("A still rostered")
         .clone();
     assert!(worker_a["claims"].as_array().expect("claims").is_empty());
-    let stop = fixture.json(&["stop", &b]);
-    fixture.wait_command(
-        stop["command_id"].as_str().expect("stop command"),
-        "applied",
-    );
+
+    // Stop and resume move B to a new generation whose roster row carries
+    // no old claim. TTL expiry itself is covered by Store tests with
+    // injected time, not by polling here.
+    stop_attribution_agent(&fixture, &b);
     let resume_id = ulid::Ulid::new().to_string();
     let resume = cli(&fixture.data, &["--id", &resume_id, "resume", &b]);
     assert!(resume.status.success(), "resume B: {}", resume.stderr);
@@ -14676,12 +14695,7 @@ fn attribution_who_claims_and_conflict_notice() {
     assert_eq!(worker_b["generation"], 2);
     assert!(worker_b["claims"].as_array().expect("claims").is_empty());
 
-    for agent in [&a, &b] {
-        let stop = fixture.json(&["stop", agent]);
-        fixture.wait_command(
-            stop["command_id"].as_str().expect("stop command"),
-            "applied",
-        );
-    }
+    stop_attribution_agent(&fixture, &a);
+    stop_attribution_agent(&fixture, &b);
     fixture.stop(false);
 }
