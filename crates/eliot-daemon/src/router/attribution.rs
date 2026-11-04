@@ -16,7 +16,7 @@ use super::{
 };
 use crate::common::now_ms;
 use eliot_core::{
-    Agent, Error, Result,
+    Agent, Error, GitPathStatus, Result,
     api::{
         ClaimListRequest, ClaimListResponse, ClaimReleaseRequest, ClaimSetRequest,
         ClaimSetResponse, ClaimView, GitView, MAX_WHO_PATHS, WhoRequest, WhoResponse,
@@ -30,6 +30,16 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 fn truncate_paths(mut paths: Vec<String>) -> Vec<String> {
     paths.truncate(MAX_WHO_PATHS);
     paths
+}
+
+/// Project-relative paths of one dirty set, in observation order.
+fn dirty_paths(dirty: &[GitPathStatus]) -> Vec<String> {
+    dirty.iter().map(|path| path.path.clone()).collect()
+}
+
+/// Dirty paths of one dirty set as a lookup set, for edit attribution.
+fn dirty_path_set(dirty: &[GitPathStatus]) -> HashSet<&str> {
+    dirty.iter().map(|path| path.path.as_str()).collect()
 }
 
 /// Store-locked inputs for one `who` read: the roster, the project's live
@@ -244,12 +254,7 @@ fn build_who_worker(
     let (available, dirty, complete, committed, base_oid, commits) = match git {
         GitView::Data(observation) => (
             observation.available,
-            observation.dirty.as_ref().map(|dirty| {
-                dirty
-                    .iter()
-                    .map(|path| path.path.clone())
-                    .collect::<Vec<_>>()
-            }),
+            observation.dirty.as_ref().map(|dirty| dirty_paths(dirty)),
             observation.complete,
             observation.committed_paths.clone().unwrap_or_default(),
             observation.base_oid.clone(),
@@ -299,7 +304,7 @@ fn attributed_edits(git: &GitView) -> (Vec<String>, bool) {
     let dirty: HashSet<&str> = observation
         .dirty
         .as_ref()
-        .map(|dirty| dirty.iter().map(|path| path.path.as_str()).collect())
+        .map(|dirty| dirty_path_set(dirty))
         .unwrap_or_default();
     let mut attributed: Vec<String> = observation
         .edits
@@ -329,14 +334,7 @@ fn record_workspace_dirty(
     };
     workspace_dirty
         .entry(workspace.to_owned())
-        .or_insert_with(|| {
-            truncate_paths(
-                dirty
-                    .iter()
-                    .map(|path| path.path.clone())
-                    .collect::<Vec<_>>(),
-            )
-        });
+        .or_insert_with(|| truncate_paths(dirty_paths(dirty)));
 }
 
 /// Unattributed dirty files of shared checkouts with two or more in-scope
@@ -468,6 +466,23 @@ mod tests {
             id: agent.to_owned(),
             generation,
         }
+    }
+
+    /// Admitted `send` commands still unsettled for either holder. The
+    /// harness never dispatches, so every routed notice stays counted here;
+    /// settled launches never appear.
+    fn holder_notice_sends(store: &eliot_store::Store, a: &str, b: &str) -> Result<usize> {
+        Ok(store
+            .list_unsettled_commands(100)?
+            .into_iter()
+            .filter(|command| {
+                command.verb == "send"
+                    && command
+                        .target
+                        .as_deref()
+                        .is_some_and(|target| target == a || target == b)
+            })
+            .count())
     }
 
     /// Seed one verified native edit through the real ingestion path: an
@@ -678,6 +693,91 @@ mod tests {
         .expect("decode claim list");
         assert_eq!(listed.claims.len(), 1);
         assert_eq!(listed.claims[0].agent, b);
+    }
+
+    #[tokio::test]
+    async fn claim_set_notifies_each_conflict_holder_once_and_replay_sends_none() {
+        let router = router();
+        let a = ready_agent(&router, "app", "ws-a").await;
+        let b = ready_agent(&router, "app", "ws-b").await;
+        let c = ready_agent(&router, "app", "ws-c").await;
+        // Both holders route notices; the claimant needs no live owner.
+        router
+            .inner
+            .plugin_host
+            .mark_generation_controlled_for_test(&a, 1);
+        router
+            .inner
+            .plugin_host
+            .mark_generation_controlled_for_test(&b, 1);
+
+        router
+            .claim_set(
+                &json!({
+                    "id": ulid::Ulid::new().to_string(),
+                    "glob": "src/a/**",
+                }),
+                &agent_principal(&a, 1),
+            )
+            .await
+            .expect("A claims its area");
+        router
+            .claim_set(
+                &json!({
+                    "id": ulid::Ulid::new().to_string(),
+                    "glob": "src/b/**",
+                }),
+                &agent_principal(&b, 1),
+            )
+            .await
+            .expect("B claims its area");
+
+        // C's broad claim conflicts with both holders in-band.
+        let id = ulid::Ulid::new().to_string();
+        let first: ClaimSetResponse = serde_json::from_value(
+            router
+                .claim_set(&json!({ "id": id, "glob": "src/**" }), &agent_principal(&c, 1))
+                .await
+                .expect("C claims the broad area"),
+        )
+        .expect("decode claim response");
+        assert_eq!(first.conflicts.len(), 2);
+
+        // Each holder got exactly one generic notice through the ordinary
+        // send path; the text carries the overlap count, never paths.
+        let store = router.inner.store.lock().await;
+        for holder in [&a, &b] {
+            let state = store
+                .notice_state(holder)
+                .expect("read notice state")
+                .expect("holder notified");
+            let open = state.open_notice_command.expect("open notice recorded");
+            let command = store
+                .get_command(&open)
+                .expect("read notice command")
+                .expect("notice command admitted");
+            assert_eq!(command.verb, "send");
+            assert_eq!(command.target.as_deref(), Some(holder.as_str()));
+            assert_eq!(
+                command.args["text"],
+                json!("1 overlapping work claims; run eliot who")
+            );
+        }
+        assert_eq!(holder_notice_sends(&store, &a, &b).expect("count notices"), 2);
+        drop(store);
+
+        // A replayed claim.set returns the retained response and routes no
+        // further notice: the same two sends, nothing new.
+        let replay: ClaimSetResponse = serde_json::from_value(
+            router
+                .claim_set(&json!({ "id": id, "glob": "src/**" }), &agent_principal(&c, 1))
+                .await
+                .expect("replay returns the retained response"),
+        )
+        .expect("decode replay response");
+        assert_eq!(replay, first);
+        let store = router.inner.store.lock().await;
+        assert_eq!(holder_notice_sends(&store, &a, &b).expect("count notices"), 2);
     }
 
     #[tokio::test]

@@ -18,7 +18,7 @@ use super::{
     validate_id_age, write_binding,
 };
 use eliot_core::{
-    CommandState, TurnState,
+    Agent, CommandState, TurnState,
     api::{
         MAIL_NOTICE_COOLDOWN_MS, MailAckRequest, MailAckResponse, MailDelivery,
         MailDeliverySummary, MailInboxRequest, MailInboxResponse, MailLimits, MailMode,
@@ -989,100 +989,16 @@ impl Store {
             commit_transaction(tx, &self.write_faulted)?;
             return Ok(None);
         };
-        let count = match pending {
-            NoticePending::Mail => {
-                let unread: i64 = tx
-                    .query_row(
-                        "SELECT COUNT(*) FROM messages WHERE recipient = ?1 AND read_at IS NULL",
-                        params![num],
-                        |row| row.get(0),
-                    )
-                    .map_err(sql_error)?;
-                if unread == 0 {
-                    commit_transaction(tx, &self.write_faulted)?;
-                    return Ok(None);
-                }
-                unread
+        let count = match notice_pending_count_tx(&tx, pending, num)? {
+            Some(count) => count,
+            None => {
+                commit_transaction(tx, &self.write_faulted)?;
+                return Ok(None);
             }
-            NoticePending::Claim { overlapping } => overlapping,
         };
-        let notice: Option<(i64, Option<String>)> = tx
-            .query_row(
-                "SELECT last_notice_at, open_notice_command FROM mail_notices WHERE recipient = ?1",
-                params![num],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(sql_error)?;
-        if notice
-            .as_ref()
-            .is_some_and(|(last, _)| now.saturating_sub(*last) < MAIL_NOTICE_COOLDOWN_MS)
-        {
+        if notice_suppressed_tx(&tx, num, &agent, now)? {
             commit_transaction(tx, &self.write_faulted)?;
             return Ok(None);
-        }
-        if let Some((_, Some(open))) = notice.as_ref() {
-            let blocking = load_command_record(&tx, open)?.is_some_and(|record| {
-                matches!(
-                    record.state,
-                    CommandState::Accepted
-                        | CommandState::Queued
-                        | CommandState::Dispatched
-                        | CommandState::Unknown
-                )
-            });
-            if blocking {
-                commit_transaction(tx, &self.write_faulted)?;
-                return Ok(None);
-            }
-        }
-        let unknown_command: bool = tx
-            .query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM commands WHERE target = ?1 AND state = 'unknown'
-                 )",
-                params![num],
-                |row| row.get(0),
-            )
-            .map_err(sql_error)?;
-        if unknown_command {
-            commit_transaction(tx, &self.write_faulted)?;
-            return Ok(None);
-        }
-        let unknown_turn: bool = tx
-            .query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM turns WHERE agent = ?1 AND state = ?2
-                 )",
-                params![num, turn_state_name(TurnState::Unknown)],
-                |row| row.get(0),
-            )
-            .map_err(sql_error)?;
-        if unknown_turn {
-            commit_transaction(tx, &self.write_faulted)?;
-            return Ok(None);
-        }
-        let pending_request: bool = tx
-            .query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM pending_requests
-                     WHERE agent = ?1 AND generation = ?2 AND state = 'pending'
-                 )",
-                params![num, agent.generation],
-                |row| row.get(0),
-            )
-            .map_err(sql_error)?;
-        if pending_request {
-            commit_transaction(tx, &self.write_faulted)?;
-            return Ok(None);
-        }
-        match provider_holds::require_unheld_tx(&tx, &agent) {
-            Ok(()) => {}
-            Err(error) if error.code == "provider_held" => {
-                commit_transaction(tx, &self.write_faulted)?;
-                return Ok(None);
-            }
-            Err(error) => return Err(error),
         }
         db!(tx.execute(
             "INSERT INTO mail_notices(recipient, last_notice_at, open_notice_command)
@@ -1112,6 +1028,110 @@ impl Store {
         ));
         commit_transaction(tx, &self.write_faulted)?;
         Ok(())
+    }
+}
+
+/// Resolve the pending proof inside the claim transaction: mail counts
+/// its unread rows, claims arrive with their overlap count. `None`
+/// suppresses the notice without recording anything.
+fn notice_pending_count_tx(
+    tx: &Transaction<'_>,
+    pending: NoticePending,
+    num: i64,
+) -> Result<Option<i64>> {
+    match pending {
+        NoticePending::Mail => {
+            let unread: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM messages WHERE recipient = ?1 AND read_at IS NULL",
+                    params![num],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?;
+            Ok((unread != 0).then_some(unread))
+        }
+        NoticePending::Claim { overlapping } => Ok(Some(overlapping)),
+    }
+}
+
+/// Whether the shared suppression gates skip this notice: the cooldown, an
+/// open or unknown notice command, an unknown command or turn, a pending
+/// request, or a provider hold. A suppression records nothing.
+fn notice_suppressed_tx(
+    tx: &Transaction<'_>,
+    num: i64,
+    agent: &Agent,
+    now: i64,
+) -> Result<bool> {
+    let notice: Option<(i64, Option<String>)> = tx
+        .query_row(
+            "SELECT last_notice_at, open_notice_command FROM mail_notices WHERE recipient = ?1",
+            params![num],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    if notice
+        .as_ref()
+        .is_some_and(|(last, _)| now.saturating_sub(*last) < MAIL_NOTICE_COOLDOWN_MS)
+    {
+        return Ok(true);
+    }
+    if let Some((_, Some(open))) = notice.as_ref() {
+        let blocking = load_command_record(tx, open)?.is_some_and(|record| {
+            matches!(
+                record.state,
+                CommandState::Accepted
+                    | CommandState::Queued
+                    | CommandState::Dispatched
+                    | CommandState::Unknown
+            )
+        });
+        if blocking {
+            return Ok(true);
+        }
+    }
+    let unknown_command: bool = tx
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM commands WHERE target = ?1 AND state = 'unknown'
+             )",
+            params![num],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if unknown_command {
+        return Ok(true);
+    }
+    let unknown_turn: bool = tx
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM turns WHERE agent = ?1 AND state = ?2
+             )",
+            params![num, turn_state_name(TurnState::Unknown)],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if unknown_turn {
+        return Ok(true);
+    }
+    let pending_request: bool = tx
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pending_requests
+                 WHERE agent = ?1 AND generation = ?2 AND state = 'pending'
+             )",
+            params![num, agent.generation],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if pending_request {
+        return Ok(true);
+    }
+    match provider_holds::require_unheld_tx(tx, agent) {
+        Ok(()) => Ok(false),
+        Err(error) if error.code == "provider_held" => Ok(true),
+        Err(error) => Err(error),
     }
 }
 

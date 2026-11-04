@@ -144,6 +144,8 @@ struct HostState {
     discovery_closed: AtomicBool,
     #[cfg(test)]
     snapshot_turn_calls: AtomicUsize,
+    #[cfg(test)]
+    test_controlled: Mutex<HashSet<AgentKey>>,
 }
 
 struct AgentActorConfig {
@@ -244,6 +246,8 @@ impl PluginHost {
                 discovery_closed: AtomicBool::new(false),
                 #[cfg(test)]
                 snapshot_turn_calls: AtomicUsize::new(0),
+                #[cfg(test)]
+                test_controlled: Mutex::new(HashSet::new()),
             }),
         }
     }
@@ -696,10 +700,26 @@ impl PluginHost {
     }
 
     pub(crate) fn controls_generation(&self, agent: &str, generation: i64) -> bool {
-        self.state.running.lock_recover().contains_key(&AgentKey {
+        let key = AgentKey {
             id: agent.to_owned(),
             generation,
-        })
+        };
+        #[cfg(test)]
+        if self.state.test_controlled.lock_recover().contains(&key) {
+            return true;
+        }
+        self.state.running.lock_recover().contains_key(&key)
+    }
+
+    /// Mark one generation as plugin-controlled without starting a runtime.
+    /// Test-only: lets notice tests drive `offer_notice` end to end through
+    /// the ordinary `send` admission.
+    #[cfg(test)]
+    pub(crate) fn mark_generation_controlled_for_test(&self, agent: &str, generation: i64) {
+        self.state.test_controlled.lock_recover().insert(AgentKey {
+            id: agent.to_owned(),
+            generation,
+        });
     }
 
     pub(crate) fn take_late_batch_cause(&self, agent: &str, generation: i64) -> Option<String> {

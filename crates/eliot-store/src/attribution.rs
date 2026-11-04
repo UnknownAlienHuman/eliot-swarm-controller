@@ -22,7 +22,7 @@ use eliot_core::{
     api::{
         ClaimConflict, ClaimListRequest, ClaimListResponse, ClaimReleaseRequest,
         ClaimReleaseResponse, ClaimSetRequest, ClaimSetResponse, ClaimView, MAX_CLAIMS_PER_AGENT,
-        MAX_WHO_WORKERS, claim_globs_overlap, normalize_claim_glob,
+        MAX_WHO_WORKERS, claim_globs_overlap_normalized, normalize_claim_glob,
     },
     parse_agent_id,
 };
@@ -201,15 +201,7 @@ impl Store {
                         "Agents claim only their own work area",
                     ));
                 }
-                let current = load_agent_by_num(&self.connection, num)?.ok_or_else(|| {
-                    Error::new("stale_generation", "Agent generation is no longer current")
-                })?;
-                if current.generation != generation {
-                    return Err(Error::new(
-                        "stale_generation",
-                        "Agent generation is no longer current",
-                    ));
-                }
+                let current = load_current_claim_agent(&self.connection, num, generation)?;
                 Ok(current)
             }
         }
@@ -245,15 +237,7 @@ impl Store {
             Sender::Agent {
                 num, generation, ..
             } => {
-                let current = load_agent_by_num(&self.connection, num)?.ok_or_else(|| {
-                    Error::new("stale_generation", "Agent generation is no longer current")
-                })?;
-                if current.generation != generation {
-                    return Err(Error::new(
-                        "stale_generation",
-                        "Agent generation is no longer current",
-                    ));
-                }
+                let current = load_current_claim_agent(&self.connection, num, generation)?;
                 if request
                     .project
                     .as_deref()
@@ -287,15 +271,7 @@ impl Store {
             Sender::Agent {
                 num, generation, ..
             } => {
-                let current = load_agent_by_num(&self.connection, num)?.ok_or_else(|| {
-                    Error::new("stale_generation", "Agent generation is no longer current")
-                })?;
-                if current.generation != generation {
-                    return Err(Error::new(
-                        "stale_generation",
-                        "Agent generation is no longer current",
-                    ));
-                }
+                let current = load_current_claim_agent(&self.connection, num, generation)?;
                 if project.is_some_and(|project| project != current.project) {
                     return Err(Error::new(
                         "not_allowed",
@@ -489,7 +465,9 @@ impl Store {
     /// Live claims of other Agents in the project that overlap `glob`. The
     /// scan stops at `CLAIM_SCAN_ROWS` rows and the report at
     /// `MAX_WHO_WORKERS` entries; `truncated` tells the caller a cap
-    /// engaged instead of silently dropping holders.
+    /// engaged instead of silently dropping holders. Both sides are already
+    /// normalized — `glob` at admission, candidates at their admission —
+    /// so the overlap check skips re-normalization per candidate.
     fn scan_claim_conflicts(
         tx: &Transaction<'_>,
         project: &str,
@@ -497,14 +475,14 @@ impl Store {
         glob: &str,
         now: i64,
     ) -> Result<(Vec<ClaimConflict>, bool)> {
-        let candidates = Self::live_claims_tx(tx, project, now)?;
+        let candidates = Self::live_claims(tx, Some(project), None, now, CLAIM_SCAN_ROWS)?;
         let mut truncated = candidates.len() >= CLAIM_SCAN_ROWS as usize;
         let mut conflicts = Vec::new();
         for candidate in candidates {
             if candidate.agent == holder {
                 continue;
             }
-            if !claim_globs_overlap(glob, &candidate.glob)? {
+            if !claim_globs_overlap_normalized(glob, &candidate.glob) {
                 continue;
             }
             if conflicts.len() >= MAX_WHO_WORKERS {
@@ -518,38 +496,6 @@ impl Store {
             });
         }
         Ok((conflicts, truncated))
-    }
-
-    fn live_claims_tx(tx: &Transaction<'_>, project: &str, now: i64) -> Result<Vec<ClaimView>> {
-        let mut statement = tx
-            .prepare(
-                "SELECT c.agent, c.generation, c.glob, c.note, c.expires_at, c.created_at
-                 FROM claims c JOIN agents a ON a.id = c.agent
-                 WHERE a.project = ?1 AND c.expires_at > ?2
-                   AND c.generation = a.generation
-                   AND a.state NOT IN ('stopped','failed','lost')
-                 ORDER BY c.agent ASC, c.glob ASC LIMIT ?3",
-            )
-            .map_err(sql_error)?;
-        let rows = statement
-            .query_map(params![project, now, CLAIM_SCAN_ROWS], |row| {
-                let num: i64 = row.get(0)?;
-                Ok(ClaimView {
-                    agent: format!("a{num}"),
-                    generation: row.get(1)?,
-                    glob: row.get(2)?,
-                    note: row.get(3)?,
-                    expires_at: row.get(4)?,
-                    created_at: row.get(5)?,
-                })
-            })
-            .map_err(sql_error)?
-            .collect::<rusqlite::Result<Vec<ClaimView>>>()
-            .map_err(sql_error)?;
-        for claim in &rows {
-            claim.validate()?;
-        }
-        Ok(rows)
     }
 
     fn claim_release_inner(
@@ -637,6 +583,25 @@ impl Store {
             events: vec![event],
         })
     }
+}
+
+/// Load one Agent row and prove the caller's generation is still
+/// current; a missing row or a moved generation reads stale.
+fn load_current_claim_agent(
+    connection: &rusqlite::Connection,
+    num: i64,
+    generation: i64,
+) -> Result<eliot_core::Agent> {
+    let current = load_agent_by_num(connection, num)?.ok_or_else(|| {
+        Error::new("stale_generation", "Agent generation is no longer current")
+    })?;
+    if current.generation != generation {
+        return Err(Error::new(
+            "stale_generation",
+            "Agent generation is no longer current",
+        ));
+    }
+    Ok(current)
 }
 
 /// Stored result of an exact idempotent replay, or `None` for a fresh id. A

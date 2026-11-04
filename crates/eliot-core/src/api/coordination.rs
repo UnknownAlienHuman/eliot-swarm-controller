@@ -716,16 +716,21 @@ pub fn claim_glob_matches(pattern: &str, path: &str) -> bool {
     let Ok(path) = normalize_claim_glob(path) else {
         return false;
     };
-    if is_literal_glob(&pattern) {
+    claim_glob_matches_normalized(&pattern, &path)
+}
+
+/// `claim_glob_matches` for already-normalized inputs.
+fn claim_glob_matches_normalized(pattern: &str, path: &str) -> bool {
+    if is_literal_glob(pattern) {
         return pattern == path;
     }
-    let Ok(glob) = globset::GlobBuilder::new(&pattern)
+    let Ok(glob) = globset::GlobBuilder::new(pattern)
         .literal_separator(true)
         .build()
     else {
         return false;
     };
-    if glob.compile_matcher().is_match(&path) {
+    if glob.compile_matcher().is_match(path) {
         return true;
     }
     // A trailing `/**` also covers the directory itself.
@@ -734,21 +739,32 @@ pub fn claim_glob_matches(pattern: &str, path: &str) -> bool {
         .is_some_and(|directory| directory == path)
 }
 
-/// Whether two claim globs may overlap. Conservative: segments are
-/// compatible when equal or either side carries a wildcard, and `**`
-/// realigns either side across directories — so `src/**` overlaps both
-/// `src/*.rs` and `src/lib/**`. A false positive only adds an advisory
-/// notice; a false negative would hide one.
+/// Whether two claim globs may overlap. A literal side reduces to exact
+/// matching against the other side; two wildcard sides stay conservative:
+/// segments are compatible when equal or either side carries a wildcard,
+/// and `**` realigns either side across directories — so `src/**` overlaps
+/// both `src/*.rs` and `src/lib/**`. A false positive only adds an
+/// advisory notice; a false negative would hide one.
 pub fn claim_globs_overlap(left: &str, right: &str) -> Result<bool> {
     let left = normalize_claim_glob(left)?;
     let right = normalize_claim_glob(right)?;
+    Ok(claim_globs_overlap_normalized(&left, &right))
+}
+
+/// `claim_globs_overlap` for already-normalized globs. The Store's
+/// conflict scan holds normalized globs on both sides, so it calls this
+/// once per candidate instead of re-normalizing per comparison.
+pub fn claim_globs_overlap_normalized(left: &str, right: &str) -> bool {
     if left == right {
-        return Ok(true);
+        return true;
     }
-    Ok(segments_may_overlap(
-        &collapsed_segments(&left),
-        &collapsed_segments(&right),
-    ))
+    if is_literal_glob(left) {
+        return claim_glob_matches_normalized(right, left);
+    }
+    if is_literal_glob(right) {
+        return claim_glob_matches_normalized(left, right);
+    }
+    segments_may_overlap(&collapsed_segments(left), &collapsed_segments(right))
 }
 
 fn collapsed_segments(normalized: &str) -> Vec<&str> {
@@ -766,25 +782,43 @@ fn segment_may_overlap(left: &str, right: &str) -> bool {
     left == right || left.contains(['*', '?']) || right.contains(['*', '?'])
 }
 
+/// Bounded segment-overlap DP over (left index, right index): each cell
+/// is computed once into a memo table, and a `**` cell scans at most one
+/// row or column, so the worst case is O(n·m·(n+m)) for n×m segments
+/// instead of the exponential re-recursion of naive skip loops. The bound
+/// is load-bearing: globs may be 1024 bytes and this runs under the Store
+/// lock against every live claim, so one adversarial `(**/*)^k` pair must
+/// not stall the daemon.
 fn segments_may_overlap(left: &[&str], right: &[&str]) -> bool {
-    match (left.first(), right.first()) {
-        (None, None) => true,
-        (None, Some(_)) => right.iter().all(|segment| *segment == "**"),
-        (Some(_), None) => left.iter().all(|segment| *segment == "**"),
-        (Some(first), Some(second)) => {
-            if *first == "**" && *second == "**" {
-                segments_may_overlap(&left[1..], &right[1..])
-                    || segments_may_overlap(&left[1..], right)
-                    || segments_may_overlap(left, &right[1..])
-            } else if *first == "**" {
-                (0..=right.len()).any(|skip| segments_may_overlap(&left[1..], &right[skip..]))
-            } else if *second == "**" {
-                (0..=left.len()).any(|skip| segments_may_overlap(&left[skip..], &right[1..]))
-            } else {
-                segment_may_overlap(first, second) && segments_may_overlap(&left[1..], &right[1..])
-            }
+    let (n, m) = (left.len(), right.len());
+    let stride = m + 1;
+    // dp[i][j]: segments left[i..] may overlap right[j..].
+    let mut dp = vec![false; (n + 1) * stride];
+    for i in (0..=n).rev() {
+        for j in (0..=m).rev() {
+            let cell = match (left.get(i), right.get(j)) {
+                (None, None) => true,
+                (None, Some(_)) => right[j] == "**" && dp[i * stride + j + 1],
+                (Some(_), None) => left[i] == "**" && dp[(i + 1) * stride + j],
+                (Some(first), Some(second)) => {
+                    if *first == "**" && *second == "**" {
+                        dp[(i + 1) * stride + j + 1]
+                            || dp[(i + 1) * stride + j]
+                            || dp[i * stride + j + 1]
+                    } else if *first == "**" {
+                        // `**` absorbs any run of right segments.
+                        (j..=m).any(|skip| dp[(i + 1) * stride + skip])
+                    } else if *second == "**" {
+                        (i..=n).any(|skip| dp[skip * stride + j + 1])
+                    } else {
+                        segment_may_overlap(first, second) && dp[(i + 1) * stride + j + 1]
+                    }
+                }
+            };
+            dp[i * stride + j] = cell;
         }
     }
+    dp[0]
 }
 
 fn validate_claim_note(note: &str) -> Result<()> {
@@ -1684,6 +1718,27 @@ mod tests {
         assert!(claim_globs_overlap("src/*.rs", "src/m*").unwrap());
         assert!(!claim_globs_overlap("src/*.rs", "other/*.rs").unwrap());
         assert!(claim_globs_overlap("src/**", "../escape").is_err());
+    }
+
+    #[test]
+    fn claim_overlap_stays_fast_on_maximal_alternating_globs() {
+        // Two ~1024-byte alternating `**/*` runs with disjoint literal
+        // tails: the naive skip-loop recursion re-solves the same (i, j)
+        // states exponentially (~13.7M calls for the 8-repetition pair),
+        // while a bounded DP visits each state once. No path ends in both
+        // `x` and `y`, so the pair is disjoint — and the call must return
+        // instead of stalling the Store lock it runs under.
+        let left = format!("{}x", "**/*/".repeat(204));
+        let right = format!("{}y", "**/*/".repeat(204));
+        assert!(left.len() <= MAX_CLAIM_GLOB_BYTES);
+        assert!(right.len() <= MAX_CLAIM_GLOB_BYTES);
+        let started = std::time::Instant::now();
+        assert!(!claim_globs_overlap(&left, &right).unwrap());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "overlap took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
