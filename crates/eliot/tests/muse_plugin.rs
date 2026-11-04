@@ -12,7 +12,7 @@
 //! (`process.put`, `events.put`, `source.gap`).
 
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -1657,6 +1657,9 @@ struct Host {
     next_seq: i64,
     child: tokio::process::Child,
     stderr: Option<tokio::task::JoinHandle<String>>,
+    /// Batches a reply pump already acked while the reply was in flight,
+    /// checked in commit order by `answer_events_put`.
+    early: VecDeque<HostRequest>,
 }
 
 struct HostRequest {
@@ -1782,6 +1785,7 @@ impl Host {
             next_seq: 1,
             child,
             stderr: Some(stderr_task),
+            early: VecDeque::new(),
         }
     }
 
@@ -1834,7 +1838,10 @@ impl Host {
         generation: i64,
         expected_kind: &str,
     ) -> Vec<Value> {
-        let request = self.next_request().await;
+        let (request, acked) = match self.early.pop_front() {
+            Some(request) => (request, true),
+            None => (self.next_request().await, false),
+        };
         assert_eq!(
             request.method, "events.put",
             "expected {expected_kind}, plugin asked {}",
@@ -1863,6 +1870,9 @@ impl Host {
             events[0].get("kind").and_then(Value::as_str),
             Some(expected_kind)
         );
+        if acked {
+            return events;
+        }
         let first = self.next_seq;
         self.next_seq += events.len() as i64;
         self.respond(
@@ -1881,6 +1891,11 @@ impl Host {
         // Like the daemon, close the plugin's stdin after shutdown: the
         // plugin's reader teardown completes on EOF.
         drop(self.writes.take());
+        assert!(
+            self.early.is_empty(),
+            "{} batch(es) committed during a reply were never checked",
+            self.early.len()
+        );
         let status = tokio::time::timeout(OP_TIMEOUT, self.child.wait())
             .await
             .expect("plugin exit deadline")
@@ -2964,6 +2979,7 @@ async fn reply_with_id(
                     "first_seq": first, "last_seq": first,
                     "cursor": request.params.get("cursor").cloned().unwrap_or(Value::Null),
                 })).await;
+                host.early.push_back(request);
             }
             result = &mut rx => break result,
         }
@@ -3001,13 +3017,10 @@ async fn reply_until_applied(
         )
         .await;
         match result.get("state").and_then(Value::as_str) {
-            Some("applied") => {
-                // The resolution lands after the reply: the processor is
-                // busy inside this control call when the decide ack arrives,
-                // so no stream frame can commit while it is in flight.
-                assert!(in_flight.is_empty(), "resolution lands after the reply");
-                return (command_id, result);
-            }
+            // The resolution may commit before or after the reply's own
+            // response (the Store binds it to the dispatched command);
+            // callers check it through `answer_events_put` either way.
+            Some("applied") => return (command_id, result),
             // Any other non-rejected outcome (unknown, an RPC error shape)
             // is a real failure, not a not-yet-applied update.
             Some("rejected") => {
@@ -4977,7 +4990,7 @@ async fn scenario_approve_resolves_the_exact_offered_choice() {
     assert_eq!(choices.len(), 2);
     assert!(opened["details"].get("subagent_origin").is_none());
 
-    let (reply_id, result, in_flight) = reply(
+    let (reply_id, result, _) = reply(
         &mut scenario.host,
         &agent_id,
         1,
@@ -4991,7 +5004,6 @@ async fn scenario_approve_resolves_the_exact_offered_choice() {
     assert_eq!(result["command_id"], json!(reply_id));
     assert_eq!(result["request_id"], json!(request_id));
     assert_eq!(result["turn_id"], json!(turn_id));
-    assert!(in_flight.is_empty(), "resolution lands after the reply");
 
     let resolved = scenario
         .host
