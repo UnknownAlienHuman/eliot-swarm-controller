@@ -6,7 +6,7 @@
 //! The caller loads the parent and authorizes it (same as `command.get`)
 //! before paging, so cursor membership is never checked for an unauthorized
 //! caller. An absent parent id whose ULID time is older than the retry window
-//! plus the allowed clock skew may have been pruned (`command_history_expired`);
+//! plus the allowed clock skew may have been pruned (`history_expired`);
 //! any other absent id never existed.
 
 use super::*;
@@ -116,12 +116,13 @@ fn child_ordinal(connection: &Connection, parent_id: &str, cursor: &str) -> Resu
         })
 }
 
-/// Whether an absent parent id may have been pruned: exactly the admission
+/// Whether an absent id may have been pruned: exactly the admission
 /// `id_expired` age rule, plus the allowed generator-clock skew. Retention
-/// keeps every younger command row, so only an absent ULID older than the
-/// retry window plus that skew may be gone; any other absent id never
-/// existed. Pure: no event scan, so no unindexed full-table read.
-pub fn command_history_expired(id: &str, now: i64) -> bool {
+/// keeps every younger command and mail row, so only an absent ULID older
+/// than the retry window plus that skew may be gone; any other absent id
+/// never existed. Mail passes the delivery's write-id head. Pure: no table
+/// scan, so no unindexed full-table read.
+pub fn history_expired(id: &str, now: i64) -> bool {
     ulid_timestamp_ms(id).is_some_and(|created_at| {
         now.saturating_sub(created_at) > RETRY_WINDOW_MS + RETRY_CLOCK_SKEW_MS
     })
@@ -276,10 +277,10 @@ mod tests {
         let child = ulid_at(old, 2);
         insert_command(&mut store, &parent, None, old);
         insert_command(&mut store, &child, Some((&parent, "rule_action", 0)), old);
-        let report = store.prune_retention(None, Some(30), NOW).unwrap();
+        let report = store.prune_retention(None, Some(30), None, NOW).unwrap();
         assert_eq!(report.commands_deleted, 2);
         assert!(store.get_command(&parent).unwrap().is_none());
-        assert!(command_history_expired(&parent, NOW));
+        assert!(history_expired(&parent, NOW));
     }
 
     #[test]
@@ -287,7 +288,7 @@ mod tests {
         // Only an absent ULID strictly older than the retry window plus the
         // allowed generator-clock skew may have been pruned.
         let expired = NOW - RETRY_WINDOW_MS - RETRY_CLOCK_SKEW_MS - 1;
-        assert!(command_history_expired(&ulid_at(expired, 3), NOW));
+        assert!(history_expired(&ulid_at(expired, 3), NOW));
         for (label, id) in [
             (
                 "boundary",
@@ -298,7 +299,7 @@ mod tests {
             ("not_a_ulid", "missing".to_owned()),
         ] {
             assert!(
-                !command_history_expired(&id, NOW),
+                !history_expired(&id, NOW),
                 "{label} must never have existed"
             );
         }

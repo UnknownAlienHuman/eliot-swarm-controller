@@ -62,11 +62,15 @@ async fn run_owned(
     let store = eliot_store::Store::open(&store_path)?;
     let store = std::sync::Arc::new(Mutex::new(store));
     let bus = Bus::new(1_024);
-    let router = Router::new(
+    // Invalid `[mail]` fails startup like invalid retention; the Router keeps
+    // the loaded limits for the run instead of re-reading the file per send.
+    let mail_config = crate::config::load_mail_config(data_dir.path())?;
+    let router = Router::new_with_mail_config(
         data_dir.path().to_path_buf(),
         data_dir.owner_token().to_owned(),
         std::sync::Arc::clone(&store),
         bus.clone(),
+        mail_config,
     );
 
     let recovered = {

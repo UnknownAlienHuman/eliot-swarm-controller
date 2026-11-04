@@ -1716,7 +1716,10 @@ mod tests {
 
     fn handoff_health_fixture(families: &[&str]) -> (eliot_store::Store, String) {
         let mut store = eliot_store::Store::open(std::path::Path::new(":memory:")).unwrap();
-        let mut request = eliot_core::SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+        // The fixture clock is fixed at 1000, so the id carries that
+        // timestamp: admission refuses ULIDs ahead of the commit clock.
+        let id = ulid::Ulid::from_parts(1000, 1).to_string();
+        let mut request = eliot_core::SubmitCommand::new(id, "launch");
         request.args = serde_json::json!({
             "project":"source-health", "workspace":"synthetic-workspace", "harness":"fake",
         });
@@ -1917,7 +1920,17 @@ mod tests {
         project: &str,
         now: i64,
     ) -> Agent {
-        let mut request = eliot_core::SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+        // The sweep clock is fixed, so the id carries that timestamp:
+        // admission refuses ULIDs ahead of the commit clock. The random
+        // part is unique per call: one sweep admits several launches at
+        // the same fixed clock.
+        static SWEEP_ID_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = ulid::Ulid::from_parts(
+            u64::try_from(now).expect("sweep fixture clock is non-negative"),
+            u128::from(SWEEP_ID_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
+        )
+        .to_string();
+        let mut request = eliot_core::SubmitCommand::new(id, "launch");
         request.args = serde_json::json!({
             "project": project, "workspace": project, "harness": "fake",
         });

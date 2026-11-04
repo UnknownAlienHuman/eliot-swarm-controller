@@ -27,12 +27,13 @@ pub use agent_views::{
     UnsettledCommandSummary, WorkspaceCustodyView,
 };
 pub use coordination::{
+    DEFAULT_MAX_UNREAD_BYTES_PER_AGENT, DEFAULT_MAX_UNREAD_MESSAGES_PER_AGENT,
     MAIL_NOTICE_COOLDOWN_MS, MAX_MAIL_ACK_IDS, MAX_MAIL_INBOX_ROWS, MAX_MAIL_RECIPIENTS,
     MAX_MAIL_TEXT_BYTES, MAX_MAIL_THREAD_BYTES, MAX_VAR_KEY_BYTES, MAX_VAR_NOTE_BYTES,
     MAX_VAR_SCOPE_BYTES, MAX_VAR_VALUE_BYTES, MailAckRequest, MailAckResponse, MailDelivery,
-    MailDeliverySummary, MailInboxRequest, MailInboxResponse, MailMode, MailReadRequest,
-    MailSendRequest, MailSendResponse, VarGetRequest, VarGetResponse, VarScope, VarSetRequest,
-    VarSetResponse, parse_var_scope,
+    MailDeliverySummary, MailInboxRequest, MailInboxResponse, MailLimits, MailMode,
+    MailReadRequest, MailSendRequest, MailSendResponse, VarGetRequest, VarGetResponse, VarScope,
+    VarSetRequest, VarSetResponse, parse_var_scope,
 };
 pub use git::{
     DEFAULT_GIT_FETCH_TIMEOUT_MS, FrozenGitFetch, GitFetchDefinitionArgs, GitFetchOutcome,

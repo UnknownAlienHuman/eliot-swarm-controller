@@ -52,7 +52,8 @@ owned plugin/workspace custody establish subsequent authority.
 External writes carry a ULID generated/printed before send. Bind it to principal,
 method and canonical semantic payload. Exclude JSON-RPC id, output format, paging and
 wait timeout. Same binding returns the retained result; different binding is
-`id_conflict`; absent expired id is `id_expired`. Retry a lost client reply with the
+`id_conflict`; absent expired id is `id_expired`. A ULID more than the allowed
+clock skew ahead of the daemon clock is `invalid`. Retry a lost client reply with the
 same id, never a new native effect.
 
 The CLI validates supplied ULIDs and sends them in uppercase. A direct RPC ID is used
@@ -654,8 +655,13 @@ bound; `next` is the last returned delivery id, or null on an empty page.
 `mail.read` returns one exact row. Both are read-only. An Agent caller reads
 only its own stable mailbox and may omit `agent`; the owner must name the
 mailbox explicitly. `mail.ack` acknowledges only the listed exact delivery
-ids, idempotently; an unknown or foreign id rejects the whole
-acknowledgement with `not_found` and marks nothing. All three writes bind
+ids, idempotently; an absent id that may have been pruned succeeds as
+already acked, while any other unknown or foreign id rejects the whole
+acknowledgement with `not_found` and marks nothing. An absent delivery whose
+write-id ULID time is older than the retry window plus the allowed clock
+skew may have been pruned and reads `history_gap` on read, inbox cursor
+and reply reference; any other absent delivery reads `not_found` (`invalid`
+for an inbox cursor). All three writes bind
 their ULID idempotently to principal, method and semantic payload.
 
 `var.set` and `var.get` address scopes encoded as `global` or

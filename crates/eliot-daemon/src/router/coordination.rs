@@ -60,9 +60,10 @@ impl Router {
             MailSendRequest::validate,
         )?;
         let name = principal_name(principal);
+        let limits = self.inner.mail.limits();
         let change = {
             let mut store = self.inner.store.lock().await;
-            let change = store.mail_send(&name, &request, now_ms())?;
+            let change = store.mail_send(&name, &request, limits, now_ms())?;
             self.publish_locked(&change.events);
             change
         };
@@ -82,7 +83,11 @@ impl Router {
         )?;
         let name = principal_name(principal);
         let response: MailInboxResponse =
-            self.inner.store.lock().await.mail_inbox(&name, &request)?;
+            self.inner
+                .store
+                .lock()
+                .await
+                .mail_inbox(&name, &request, now_ms())?;
         request.validate_response(&response)?;
         serde_json::to_value(response)
             .map_err(|_| Error::new("internal", "mail inbox could not be encoded"))
@@ -96,7 +101,12 @@ impl Router {
             MailReadRequest::validate,
         )?;
         let name = principal_name(principal);
-        let response: MailDelivery = self.inner.store.lock().await.mail_read(&name, &request)?;
+        let response: MailDelivery =
+            self.inner
+                .store
+                .lock()
+                .await
+                .mail_read(&name, &request, now_ms())?;
         request.validate_response(&response)?;
         serde_json::to_value(response)
             .map_err(|_| Error::new("internal", "mail delivery could not be encoded"))
@@ -293,6 +303,51 @@ mod tests {
             id: agent.to_owned(),
             generation: 1,
         }
+    }
+
+    fn router_with_config(root: &std::path::Path, source: &str) -> Router {
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(root.join("config.toml"), source).unwrap();
+        // Loaded once at construction, like daemon startup: sends never
+        // re-read the file.
+        let mail = crate::config::load_mail_config(root).unwrap();
+        let store = eliot_store::Store::open(std::path::Path::new(":memory:")).unwrap();
+        Router::new_with_mail_config(
+            PathBuf::from(root),
+            "owner-credential".to_owned(),
+            std::sync::Arc::new(AsyncMutex::new(store)),
+            Bus::new(16),
+            mail,
+        )
+    }
+
+    #[tokio::test]
+    async fn router_mail_send_honors_configured_mail_limits() {
+        let root = std::env::temp_dir().join(format!("eliot-mail-limits-{}", ulid::Ulid::new()));
+        let router = router_with_config(&root, "[mail]\nmax_unread_messages_per_agent = 1\n");
+        let a = ready_agent(&router, "app").await;
+        let first = json!({
+            "id": ulid::Ulid::new().to_string(),
+            "to": [a.clone()],
+            "mode": "queue",
+            "text": "hi",
+        });
+        router
+            .mail_send(&first, &Principal::Owner)
+            .await
+            .expect("first send fits the configured bound");
+        let second = json!({
+            "id": ulid::Ulid::new().to_string(),
+            "to": [a.clone()],
+            "mode": "queue",
+            "text": "overflow",
+        });
+        let error = router
+            .mail_send(&second, &Principal::Owner)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "mailbox_full");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -528,6 +583,7 @@ mod tests {
                         limit: None,
                         after: None,
                     },
+                    now_ms(),
                 )
                 .expect("owner reads queued mail");
             assert_eq!(inbox.deliveries.len(), 1);

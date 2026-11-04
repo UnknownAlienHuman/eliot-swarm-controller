@@ -538,3 +538,12 @@ work. Retain command bindings/results in `commands` and other mutation bindings/
 in `writes` for at least the supported retry window plus the allowed clock-skew
 margin. Cleanup must not make an accepted id look new or replay an external effect.
 Once a complete expansion is gone, `command.children` returns `history_gap`.
+
+Prune acknowledged mail only: one bounded batch per pass of rows with
+`read_at` older than the `mail_days` window, oldest acknowledgement first.
+Never prune unread mail, however old. Mail rows always outlive the retry
+window plus twice the allowed clock-skew margin regardless of `mail_days`,
+so a removed delivery admitted with a skew-bounded write id reads
+`history_gap` through the shared absent-id age rule on its own mailbox's
+read paths; a retried ack over it succeeds as already acked. An unset
+`mail_days` disables mail pruning.

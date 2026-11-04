@@ -55,12 +55,17 @@ pub(crate) async fn run(
         }
         match run_once(&store, &config.retention, now_ms()).await {
             Ok(report)
-                if report.events_deleted + report.commands_deleted + report.writes_deleted > 0 =>
+                if report.events_deleted
+                    + report.commands_deleted
+                    + report.writes_deleted
+                    + report.mail_deleted
+                    > 0 =>
             {
                 let events = report.events_deleted.to_string();
                 let pruned_through = report.pruned_through.to_string();
                 let commands = report.commands_deleted.to_string();
                 let writes = report.writes_deleted.to_string();
+                let mail = report.mail_deleted.to_string();
                 logging::record(
                     &policy,
                     "daemon.retention_pruned",
@@ -69,6 +74,7 @@ pub(crate) async fn run(
                         ("pruned_through", pruned_through.as_str()),
                         ("commands", commands.as_str()),
                         ("writes", writes.as_str()),
+                        ("mail", mail.as_str()),
                     ],
                     None,
                 );
@@ -117,21 +123,32 @@ pub(crate) async fn run_once_with_budgets(
         pruned_through: 0,
         commands_deleted: 0,
         writes_deleted: 0,
+        mail_deleted: 0,
     };
     loop {
         let pass = {
             let mut guard = store.lock().await;
-            guard.prune_retention(retention.events_days, retention.commands_days, now)?
+            guard.prune_retention(
+                retention.events_days,
+                retention.commands_days,
+                retention.mail_days,
+                now,
+            )?
         };
         total.events_deleted += pass.events_deleted;
         total.pruned_through = pass.pruned_through;
         total.commands_deleted += pass.commands_deleted;
         total.writes_deleted += pass.writes_deleted;
-        let pass_rows = pass.events_deleted + pass.commands_deleted + pass.writes_deleted;
+        total.mail_deleted += pass.mail_deleted;
+        let pass_rows =
+            pass.events_deleted + pass.commands_deleted + pass.writes_deleted + pass.mail_deleted;
         if pass_rows == 0 {
             break;
         }
-        let total_rows = total.events_deleted + total.commands_deleted + total.writes_deleted;
+        let total_rows = total.events_deleted
+            + total.commands_deleted
+            + total.writes_deleted
+            + total.mail_deleted;
         if total_rows >= row_budget || start.elapsed() >= time_budget {
             break;
         }
@@ -143,7 +160,10 @@ pub(crate) async fn run_once_with_budgets(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eliot_core::{NativeEvent, SourceBatch, SubmitCommand};
+    use eliot_core::{
+        NativeEvent, SourceBatch, SubmitCommand,
+        api::{MailAckRequest, MailInboxRequest, MailLimits, MailMode, MailSendRequest},
+    };
     use serde_json::json;
 
     async fn seed_settled_launches(
@@ -175,6 +195,7 @@ mod tests {
         config::RetentionConfig {
             events_days: None,
             commands_days: Some(30),
+            mail_days: None,
         }
     }
 
@@ -371,6 +392,196 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn maintenance_prunes_acked_mail_and_reports_history_gap() {
+        let root =
+            std::env::temp_dir().join(format!("eliot-mail-maintenance-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("config.toml"),
+            "[daemon]\nretention.mail_days = 30\n",
+        )
+        .unwrap();
+        let config = config::load_daemon_config(&root).unwrap();
+        assert_eq!(config.retention.mail_days, Some(30));
+        let store = Mutex::new(Store::open(std::path::Path::new(":memory:")).unwrap());
+        let admitted_at = now_ms();
+        let pruned_at = admitted_at + 31 * 24 * 60 * 60 * 1_000;
+        let (principal, acked, unacked) = {
+            let mut store = store.lock().await;
+            let mut launch = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+            launch.args = json!({
+                "project": "mail-retention-project",
+                "workspace": "mail-retention-workspace",
+            });
+            launch.expected_generation = Some(0);
+            let agent = store
+                .submit("owner", launch.clone(), admitted_at)
+                .unwrap()
+                .command
+                .target
+                .unwrap();
+            store.dispatch(&launch.id, admitted_at).unwrap();
+            let mut acked = Vec::new();
+            for _ in 0..3 {
+                let sent = store
+                    .mail_send(
+                        "owner",
+                        &MailSendRequest {
+                            id: ulid::Ulid::new().to_string(),
+                            to: vec![agent.clone()],
+                            mode: MailMode::Queue,
+                            text: "old".to_owned(),
+                            thread: None,
+                            reply_to_delivery: None,
+                        },
+                        MailLimits::default(),
+                        admitted_at,
+                    )
+                    .unwrap()
+                    .value;
+                acked.push(sent.deliveries[0].delivery_id.clone());
+            }
+            let unacked = store
+                .mail_send(
+                    "owner",
+                    &MailSendRequest {
+                        id: ulid::Ulid::new().to_string(),
+                        to: vec![agent.clone()],
+                        mode: MailMode::Queue,
+                        text: "keep".to_owned(),
+                        thread: None,
+                        reply_to_delivery: None,
+                    },
+                    MailLimits::default(),
+                    admitted_at,
+                )
+                .unwrap()
+                .value
+                .deliveries[0]
+                .delivery_id
+                .clone();
+            store
+                .mail_ack(
+                    &format!("agent:{agent}:1"),
+                    &MailAckRequest {
+                        id: ulid::Ulid::new().to_string(),
+                        agent: None,
+                        deliveries: acked.clone(),
+                    },
+                    admitted_at,
+                )
+                .unwrap();
+            (format!("agent:{agent}:1"), acked, unacked)
+        };
+
+        let report = run_once(&store, &config.retention, pruned_at)
+            .await
+            .unwrap();
+        assert_eq!(report.mail_deleted, 3);
+        assert_eq!(report.events_deleted, 0);
+        assert_eq!(report.commands_deleted, 0);
+        assert_eq!(report.writes_deleted, 0);
+
+        let store = store.lock().await;
+        let inbox = store
+            .mail_inbox(
+                &principal,
+                &MailInboxRequest {
+                    agent: None,
+                    limit: None,
+                    after: None,
+                },
+                pruned_at,
+            )
+            .unwrap();
+        assert_eq!(inbox.deliveries.len(), 1);
+        assert_eq!(inbox.deliveries[0].delivery_id, unacked);
+        for delivery in &acked {
+            let error = store
+                .mail_read(
+                    &principal,
+                    &eliot_core::api::MailReadRequest {
+                        agent: None,
+                        delivery_id: delivery.clone(),
+                    },
+                    pruned_at,
+                )
+                .unwrap_err();
+            assert_eq!(error.code, "history_gap");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn tick_counts_mail_rows_against_the_row_budget() {
+        let store = Mutex::new(Store::open(std::path::Path::new(":memory:")).unwrap());
+        let admitted_at = now_ms();
+        let pruned_at = admitted_at + 31 * 24 * 60 * 60 * 1_000;
+        seed_settled_launches(&store, 60, admitted_at).await;
+        {
+            let mut store = store.lock().await;
+            let mut launch = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+            launch.args = json!({
+                "project": "mail-budget-project",
+                "workspace": "mail-budget-workspace",
+            });
+            launch.expected_generation = Some(0);
+            let agent = store
+                .submit("owner", launch.clone(), admitted_at)
+                .unwrap()
+                .command
+                .target
+                .unwrap();
+            store.dispatch(&launch.id, admitted_at).unwrap();
+            let principal = format!("agent:{agent}:1");
+            for _ in 0..60 {
+                let sent = store
+                    .mail_send(
+                        "owner",
+                        &MailSendRequest {
+                            id: ulid::Ulid::new().to_string(),
+                            to: vec![agent.clone()],
+                            mode: MailMode::Queue,
+                            text: "old".to_owned(),
+                            thread: None,
+                            reply_to_delivery: None,
+                        },
+                        MailLimits::default(),
+                        admitted_at,
+                    )
+                    .unwrap()
+                    .value;
+                store
+                    .mail_ack(
+                        &principal,
+                        &MailAckRequest {
+                            id: ulid::Ulid::new().to_string(),
+                            agent: None,
+                            deliveries: vec![sent.deliveries[0].delivery_id.clone()],
+                        },
+                        admitted_at,
+                    )
+                    .unwrap();
+            }
+        }
+        // The first whole pass deletes 50 command roots and all 60 acked
+        // rows: 110 counted rows reach the 75-row budget, so the tick stops
+        // with 10 command roots left. Without mail in the budget the tick
+        // would run a second pass and delete all 60 commands.
+        let retention = config::RetentionConfig {
+            events_days: None,
+            commands_days: Some(30),
+            mail_days: Some(30),
+        };
+        let report =
+            run_once_with_budgets(&store, &retention, pruned_at, 75, Duration::from_secs(60))
+                .await
+                .unwrap();
+        assert_eq!(report.commands_deleted, 50);
+        assert_eq!(report.mail_deleted, 60);
+    }
+
+    #[tokio::test]
     async fn maintenance_without_windows_deletes_nothing() {
         let store = Mutex::new(Store::open(std::path::Path::new(":memory:")).unwrap());
         let admitted_at = now_ms();
@@ -438,6 +649,7 @@ mod tests {
         let enabled = config::RetentionConfig {
             events_days: None,
             commands_days: Some(30),
+            mail_days: None,
         };
         let report = run_once(&store, &enabled, pruned_at).await.unwrap();
         assert_eq!(report.commands_deleted, 1);
