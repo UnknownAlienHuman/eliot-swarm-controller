@@ -1,5 +1,5 @@
 use crate::{
-    events::{self, EventConfig, EventHandle, TurnFacts, rejected_control, unknown_control},
+    events::{self, EventConfig, EventHandle, TurnFacts},
     native::{
         NativeClient, NativeLaunch, NativeProcess,
         requests::describe_request,
@@ -28,8 +28,9 @@ use eliot_plugin::{
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
     protocol::MAX_CREDENTIAL_BYTES,
     session::{
-        TargetEnvironment, decode, known_command, native_no_write, not_initialized, paths_equal,
-        register_native_process, target_environment, unknown_snapshot, validate_binding,
+        TargetEnvironment, decode, known_command, native_no_write, not_initialized,
+        optional_profile_text, parse_resume_subject, paths_equal, register_native_process,
+        rejected_control, target_environment, unknown_control, unknown_snapshot, validate_binding,
         validate_identity, validate_source_plan,
     },
 };
@@ -106,12 +107,6 @@ enum ControlOutcome {
     Applied(Value),
     Rejected(Value),
     Unknown,
-}
-
-struct ResumeSubject {
-    native_scope: String,
-    native_ref: String,
-    retained_turn: Option<String>,
 }
 
 struct InitializedNative {
@@ -318,6 +313,7 @@ impl MusePlugin {
                     params.source_state.as_ref(),
                     &params.agent_id,
                     params.generation,
+                    "Muse",
                 )
             })
             .transpose()
@@ -351,7 +347,7 @@ impl MusePlugin {
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| Error::new("profile_error", "Muse profile requires an exact model id"))?
             .to_owned();
-        let requested_effort = optional_profile_text(profile, "effort")?;
+        let requested_effort = optional_profile_text(profile, "effort", "Muse")?;
         if let Some(effort) = requested_effort.as_deref()
             && !is_reasoning_effort_tier(effort)
         {
@@ -360,7 +356,7 @@ impl MusePlugin {
                 "Muse profile effort is not a supported reasoning tier",
             ));
         }
-        let requested_approval = optional_profile_text(profile, "approval")?;
+        let requested_approval = optional_profile_text(profile, "approval", "Muse")?;
         if let Some(mode) = requested_approval.as_deref()
             && !is_approval_mode(mode)
         {
@@ -2116,138 +2112,6 @@ async fn read_effective_reasoning_effort(
     Ok(None)
 }
 
-fn parse_resume_subject(
-    resume: &Value,
-    source_state: Option<&Value>,
-    agent_id: &str,
-    generation: i64,
-) -> Result<ResumeSubject> {
-    let resume = resume
-        .as_object()
-        .ok_or_else(|| Error::new("invalid", "Muse resume_from must be an object"))?;
-    if resume.len() != 2
-        || !resume.contains_key("native_scope")
-        || !resume.contains_key("native_ref")
-    {
-        return Err(Error::new(
-            "invalid",
-            "Muse resume_from must contain only native_scope and native_ref",
-        ));
-    }
-    let native_scope = resume
-        .get("native_scope")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| Error::new("invalid", "Muse resume_from requires native_scope"))?
-        .to_owned();
-    let native_ref = resume
-        .get("native_ref")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| Error::new("invalid", "Muse resume_from requires native_ref"))?
-        .to_owned();
-    let source_state = source_state
-        .and_then(Value::as_object)
-        .ok_or_else(|| Error::new("unknown", "Muse resume requires retained native readback"))?;
-    let retained_generation = source_state
-        .get("retained_generation")
-        .and_then(Value::as_i64)
-        .ok_or_else(|| {
-            Error::new(
-                "unknown",
-                "Muse resume readback omitted its retained generation",
-            )
-        })?;
-    if retained_generation.checked_add(1) != Some(generation) {
-        return Err(Error::new(
-            "stale_generation",
-            "Muse resume generation does not follow the retained source generation",
-        ));
-    }
-    let retained_source = source_state
-        .get("retained_source")
-        .and_then(Value::as_object)
-        .ok_or_else(|| Error::new("unknown", "Muse resume omitted retained source state"))?;
-    if retained_source.get("agent_id").and_then(Value::as_str) != Some(agent_id)
-        || retained_source.get("generation").and_then(Value::as_i64) != Some(retained_generation)
-        || retained_source.get("source").and_then(Value::as_str) != Some("stream")
-    {
-        return Err(Error::new(
-            "stale_generation",
-            "Muse resume source state does not match the retained Agent generation",
-        ));
-    }
-    let families = retained_source
-        .get("families")
-        .and_then(Value::as_array)
-        .ok_or_else(|| Error::new("unknown", "Muse resume source state omitted its families"))?;
-    if ["session", "turn", "message"]
-        .iter()
-        .any(|family| !families.iter().any(|value| value.as_str() == Some(family)))
-    {
-        return Err(Error::new(
-            "unknown",
-            "Muse retained source did not own the required event families",
-        ));
-    }
-    let current_turn = source_state
-        .get("current_turn")
-        .ok_or_else(|| Error::new("unknown", "Muse resume readback omitted current_turn"))?;
-    let retained_turn = match current_turn {
-        Value::Null => None,
-        Value::Object(turn) => {
-            if !["state", "status", "started_at", "completed_at"]
-                .iter()
-                .all(|field| turn.contains_key(*field))
-                || !matches!(
-                    turn.get("state").and_then(Value::as_str),
-                    Some("running" | "completed" | "unknown")
-                )
-                || !matches!(
-                    turn.get("status"),
-                    Some(value) if value.is_null() || value.as_str().is_some()
-                )
-                || !matches!(
-                    turn.get("started_at"),
-                    Some(value) if value.is_null() || value.as_i64().is_some()
-                )
-                || !matches!(
-                    turn.get("completed_at"),
-                    Some(value) if value.is_null() || value.as_i64().is_some()
-                )
-            {
-                return Err(Error::new(
-                    "unknown",
-                    "Muse resume current_turn summary is incomplete",
-                ));
-            }
-            Some(
-                turn.get("turn_id")
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.trim().is_empty())
-                    .ok_or_else(|| {
-                        Error::new(
-                            "unknown",
-                            "Muse resume current_turn omitted its exact turn id",
-                        )
-                    })?
-                    .to_owned(),
-            )
-        }
-        _ => {
-            return Err(Error::new(
-                "unknown",
-                "Muse resume current_turn readback is malformed",
-            ));
-        }
-    };
-    Ok(ResumeSubject {
-        native_scope,
-        native_ref,
-        retained_turn,
-    })
-}
-
 async fn verify_resume_preflight(
     client: &NativeClient,
     session_id: &str,
@@ -2647,20 +2511,6 @@ pub(crate) fn contextual_error(
     message: impl Into<String>,
 ) -> Error {
     eliot_plugin::session::contextual_error(error, code, message)
-}
-
-fn optional_profile_text(
-    profile: &serde_json::Map<String, Value>,
-    key: &str,
-) -> Result<Option<String>> {
-    match profile.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(value.clone())),
-        Some(_) => Err(Error::new(
-            "profile_error",
-            format!("Muse profile field {key} must be a non-empty string"),
-        )),
-    }
 }
 
 pub(crate) fn muse_scope(muse_home: &str) -> String {

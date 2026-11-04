@@ -2,8 +2,10 @@ use eliot_core::{Error, Result, SecretPolicy};
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
     native_stdio::StreamState,
-    protocol::MAX_COMMAND_ID_BYTES,
-    session::{EVENT_DEADLINE, StreamSource, attach_final_text},
+    session::{
+        EVENT_DEADLINE, StreamSource, attach_final_text, rejected_control, request_event_id,
+        unknown_control,
+    },
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -70,6 +72,7 @@ enum Control {
         native_scope: String,
         session_id: String,
         effective: Value,
+        native: ClaudeClient,
         reply: oneshot::Sender<Result<()>>,
     },
     ExpectTurn {
@@ -159,6 +162,7 @@ struct EventProcessor {
     gap_reported: bool,
     final_text: Option<String>,
     closed: bool,
+    native: Option<ClaudeClient>,
     status_tx: watch::Sender<EventStatus>,
 }
 
@@ -178,12 +182,15 @@ pub(crate) fn spawn(
 impl EventHandle {
     /// Commit readiness only after the SessionStart proof is observed: the
     /// initialize reply and the session_start record race, and readiness
-    /// must compare against the observed session, never assume it.
+    /// must compare against the observed session, never assume it. The
+    /// native client travels with readiness so a permission ask outside the
+    /// exact active turn still gets its explicit deny.
     pub async fn ready(
         &mut self,
         native_scope: String,
         session_id: String,
         effective: Value,
+        native: ClaudeClient,
     ) -> Result<()> {
         let deadline = Instant::now() + EVENT_DEADLINE;
         loop {
@@ -213,6 +220,7 @@ impl EventHandle {
             native_scope,
             session_id,
             effective,
+            native,
             reply,
         })
         .await
@@ -390,76 +398,8 @@ async fn run(
             }
             request = control.recv() => {
                 let Some(request) = request else { break };
-                match request {
-                    Control::Ready { native_scope, session_id, effective, reply } => {
-                        let result = processor.ready(native_scope, session_id, effective).await;
-                        publish(&processor, &status);
-                        let _ = reply.send(result);
-                    }
-                    Control::ExpectTurn { command_id, turn_id, registered, outcome } => {
-                        let result = processor.register_turn(command_id, turn_id, outcome);
-                        publish(&processor, &status);
-                        let _ = registered.send(result);
-                    }
-                    Control::CancelTurn { command_id, reply } => {
-                        processor.cancel_turn(&command_id);
-                        publish(&processor, &status);
-                        let _ = reply.send(());
-                    }
-                    Control::CheckTurn { turn_id, reply } => {
-                        let live = processor.status.active_turn_id.as_deref() == Some(turn_id.as_str())
-                            && processor.status.failure.is_none()
-                            && !processor.status.stopped;
-                        let _ = reply.send(live);
-                    }
-                    Control::ReplyRequest {
-                        command_id,
-                        request_id,
-                        turn_id,
-                        verb,
-                        args,
-                        native,
-                        reply,
-                    } => {
-                        let result = processor
-                            .reply_request(
-                                &command_id,
-                                &request_id,
-                                &turn_id,
-                                &verb,
-                                &args,
-                                &native,
-                            )
-                            .await;
-                        publish(&processor, &status);
-                        let _ = reply.send(result);
-                    }
-                    Control::BeginStop { reply } => {
-                        processor.planned_stop = true;
-                        processor.accept_frames = false;
-                        publish(&processor, &status);
-                        let _ = reply.send(Ok(()));
-                    }
-                    Control::EndStop { reply } => {
-                        if processor.frames_drained {
-                            let result = processor.finish_stop().await;
-                            publish(&processor, &status);
-                            let _ = reply.send(result);
-                        } else if processor.pending_end_stop.is_some() {
-                            let _ = reply.send(Err(Error::new(
-                                "unknown",
-                                "Claude stop settlement is already pending",
-                            )));
-                        } else {
-                            processor.pending_end_stop = Some(reply);
-                        }
-                    }
-                    Control::Close { reply } => {
-                        processor.closed = true;
-                        processor.finish_pending_end_stop().await;
-                        let _ = reply.send(());
-                        break;
-                    }
+                if dispatch_control(&mut processor, &status, request).await {
+                    break;
                 }
             }
         }
@@ -470,6 +410,92 @@ async fn run(
 
 fn publish(processor: &EventProcessor, status: &watch::Sender<EventStatus>) {
     let _ = status.send_replace(processor.status.clone());
+}
+
+/// Serve one control behind any queued frame. True ends the run loop.
+async fn dispatch_control(
+    processor: &mut EventProcessor,
+    status: &watch::Sender<EventStatus>,
+    request: Control,
+) -> bool {
+    match request {
+        Control::Ready {
+            native_scope,
+            session_id,
+            effective,
+            native,
+            reply,
+        } => {
+            let result = processor
+                .ready(native_scope, session_id, effective, native)
+                .await;
+            publish(processor, status);
+            let _ = reply.send(result);
+        }
+        Control::ExpectTurn {
+            command_id,
+            turn_id,
+            registered,
+            outcome,
+        } => {
+            let result = processor.register_turn(command_id, turn_id, outcome);
+            publish(processor, status);
+            let _ = registered.send(result);
+        }
+        Control::CancelTurn { command_id, reply } => {
+            processor.cancel_turn(&command_id);
+            publish(processor, status);
+            let _ = reply.send(());
+        }
+        Control::CheckTurn { turn_id, reply } => {
+            let live = processor.status.active_turn_id.as_deref() == Some(turn_id.as_str())
+                && processor.status.failure.is_none()
+                && !processor.status.stopped;
+            let _ = reply.send(live);
+        }
+        Control::ReplyRequest {
+            command_id,
+            request_id,
+            turn_id,
+            verb,
+            args,
+            native,
+            reply,
+        } => {
+            let result = processor
+                .reply_request(&command_id, &request_id, &turn_id, &verb, &args, &native)
+                .await;
+            publish(processor, status);
+            let _ = reply.send(result);
+        }
+        Control::BeginStop { reply } => {
+            processor.planned_stop = true;
+            processor.accept_frames = false;
+            publish(processor, status);
+            let _ = reply.send(Ok(()));
+        }
+        Control::EndStop { reply } => {
+            if processor.frames_drained {
+                let result = processor.finish_stop().await;
+                publish(processor, status);
+                let _ = reply.send(result);
+            } else if processor.pending_end_stop.is_some() {
+                let _ = reply.send(Err(Error::new(
+                    "unknown",
+                    "Claude stop settlement is already pending",
+                )));
+            } else {
+                processor.pending_end_stop = Some(reply);
+            }
+        }
+        Control::Close { reply } => {
+            processor.closed = true;
+            processor.finish_pending_end_stop().await;
+            let _ = reply.send(());
+            return true;
+        }
+    }
+    false
 }
 
 impl EventProcessor {
@@ -497,6 +523,7 @@ impl EventProcessor {
             gap_reported: false,
             final_text: None,
             closed: false,
+            native: None,
             status_tx,
         }
     }
@@ -514,6 +541,7 @@ impl EventProcessor {
         native_scope: String,
         session_id: String,
         effective: Value,
+        native: ClaudeClient,
     ) -> Result<()> {
         if self.status.ready || session_id.trim().is_empty() || !effective.is_object() {
             return Err(Error::new(
@@ -546,6 +574,7 @@ impl EventProcessor {
                 format!("Claude event source failed before readiness: {failure}"),
             ));
         }
+        self.native = Some(native);
         self.status.session_id = Some(session_id.clone());
         let native_id = format!("claude:{session_id}:session.ready");
         self.commit_event(
@@ -927,6 +956,28 @@ impl EventProcessor {
             .await
     }
 
+    /// Deny a permission ask that has no exact active turn to bind to.
+    /// The CLI unblocks on the explicit deny; the uncommitted ask is still a
+    /// stream gap (recorded by the caller). Best-effort before readiness or
+    /// after stop, when no client or live session remains.
+    async fn deny_stray_request(&self, request_id: &str) {
+        let Some(native) = self.native.as_ref() else {
+            return;
+        };
+        if self.status.session_id.is_none() || self.status.stopped {
+            return;
+        }
+        let _ = native
+            .respond_control(
+                request_id,
+                PermissionResult::Deny {
+                    message: DENY_MESSAGE.to_owned(),
+                },
+                Instant::now() + EVENT_DEADLINE,
+            )
+            .await;
+    }
+
     /// One CLI `control_request`: only the `can_use_tool` permission ask is
     /// connected. It binds to the exact active turn and opens a retained
     /// request under the CLI's exact native `request_id`; any other subtype
@@ -991,6 +1042,7 @@ impl EventProcessor {
             self.status.active_command_id.clone(),
             self.status.active_turn_id.clone(),
         ) else {
+            self.deny_stray_request(request_id).await;
             return self
                 .record_gap("Claude permission ask arrived outside the exact active turn")
                 .await;
@@ -1014,7 +1066,7 @@ impl EventProcessor {
                 .record_gap("Claude normalized request exceeded the persisted-event bound")
                 .await;
         }
-        let native_id = match request_event_id(request_id, "request.opened") {
+        let native_id = match request_event_id(request_id, "request.opened", "claude", "Claude") {
             Ok(native_id) => native_id,
             Err(_) => {
                 return self
@@ -1037,6 +1089,62 @@ impl EventProcessor {
         Ok(())
     }
 
+    /// Refuse a stale, unbound, or malformed request reply before any
+    /// native write, else plan the exact `control_response` decision. `Err`
+    /// is the early outcome value to answer with.
+    fn check_request_reply(
+        &self,
+        request_id: &str,
+        turn_id: &str,
+        verb: &str,
+        args: &Value,
+    ) -> std::result::Result<PermissionResult, Value> {
+        let Some(entry) = self.pending_requests.get(request_id) else {
+            return Err(rejected_control("Claude request is no longer pending"));
+        };
+        if entry.turn_id != turn_id {
+            return Err(rejected_control(
+                "Claude request reply does not match the captured turn",
+            ));
+        }
+        if self.status.active_turn_id.as_deref() != Some(turn_id) {
+            return Err(rejected_control(
+                "Claude request is no longer attached to the active turn",
+            ));
+        }
+        match entry.reply_state {
+            NativeReplyState::Writing | NativeReplyState::Unknown => {
+                return Err(unknown_control(
+                    "Claude request reply outcome is unresolved and will not be repeated",
+                ));
+            }
+            NativeReplyState::Available => {}
+        }
+        if self.status.session_id.is_none() || self.status.stopped {
+            return Err(rejected_control(
+                "Claude request session is no longer writable",
+            ));
+        }
+        if !matches!(verb, "approve" | "deny") {
+            return Err(rejected_control(
+                "Claude request reply verb is not implemented",
+            ));
+        }
+        if !args.as_object().is_some_and(|args| args.is_empty()) {
+            return Err(rejected_control(
+                "Claude approval replies accept only empty arguments",
+            ));
+        }
+        Ok(match verb {
+            "approve" => PermissionResult::Allow {
+                updated_input: entry.input.clone(),
+            },
+            _ => PermissionResult::Deny {
+                message: DENY_MESSAGE.to_owned(),
+            },
+        })
+    }
+
     /// Decide one open permission: write the exact `control_response`, then
     /// commit the exact `request.resolved`. The write has no transport ack,
     /// so a queued write is the delivery; only a proven no-write keeps the
@@ -1057,49 +1165,12 @@ impl EventProcessor {
                 "Claude request reply requires exact command, request, and turn ids",
             ));
         }
+        let result = match self.check_request_reply(request_id, turn_id, verb, args) {
+            Ok(result) => result,
+            Err(outcome) => return Ok(outcome),
+        };
         let Some(entry) = self.pending_requests.get_mut(request_id) else {
             return Ok(rejected_control("Claude request is no longer pending"));
-        };
-        if entry.turn_id != turn_id {
-            return Ok(rejected_control(
-                "Claude request reply does not match the captured turn",
-            ));
-        }
-        if self.status.active_turn_id.as_deref() != Some(turn_id) {
-            return Ok(rejected_control(
-                "Claude request is no longer attached to the active turn",
-            ));
-        }
-        match entry.reply_state {
-            NativeReplyState::Writing | NativeReplyState::Unknown => {
-                return Ok(unknown_control(
-                    "Claude request reply outcome is unresolved and will not be repeated",
-                ));
-            }
-            NativeReplyState::Available => {}
-        }
-        if self.status.session_id.is_none() || self.status.stopped {
-            return Ok(rejected_control(
-                "Claude request session is no longer writable",
-            ));
-        }
-        if !matches!(verb, "approve" | "deny") {
-            return Ok(rejected_control(
-                "Claude request reply verb is not implemented",
-            ));
-        }
-        if !args.as_object().is_some_and(|args| args.is_empty()) {
-            return Ok(rejected_control(
-                "Claude approval replies accept only empty arguments",
-            ));
-        }
-        let result = match verb {
-            "approve" => PermissionResult::Allow {
-                updated_input: entry.input.clone(),
-            },
-            _ => PermissionResult::Deny {
-                message: DENY_MESSAGE.to_owned(),
-            },
         };
         entry.reply_state = NativeReplyState::Writing;
         if let Err(error) = native
@@ -1134,7 +1205,7 @@ impl EventProcessor {
             "request_id": request_id,
             "turn_id": turn_id,
         });
-        let native_id = match request_event_id(request_id, "request.resolved") {
+        let native_id = match request_event_id(request_id, "request.resolved", "claude", "Claude") {
             Ok(native_id) => native_id,
             Err(_) => {
                 if let Some(entry) = self.pending_requests.get_mut(request_id) {
@@ -1186,7 +1257,7 @@ impl EventProcessor {
                 "request_id": request_id,
                 "turn_id": entry.turn_id,
             });
-            let native_id = request_event_id(&request_id, "request.closed")?;
+            let native_id = request_event_id(&request_id, "request.closed", "claude", "Claude")?;
             self.commit_event("request.closed", native_id, data).await?;
             self.pending_requests.remove(&request_id);
         }
@@ -1406,38 +1477,6 @@ impl EventProcessor {
             failure: &mut self.status.failure,
         }
     }
-}
-
-/// Native identity for one request event under the CLI's exact native
-/// `request_id`, bounded like every command identity.
-fn request_event_id(request_id: &str, kind: &str) -> Result<String> {
-    let prefix = match kind {
-        "request.opened" => "claude-o:",
-        "request.resolved" => "claude-r:",
-        "request.closed" => "claude-c:",
-        _ => {
-            return Err(Error::new(
-                "invalid",
-                "Claude request event kind is unsupported",
-            ));
-        }
-    };
-    let native_id = format!("{prefix}{request_id}");
-    if native_id.len() > MAX_COMMAND_ID_BYTES || request_id.trim().is_empty() {
-        return Err(Error::new(
-            "source_integrity",
-            "Claude native request event identity exceeded its bound",
-        ));
-    }
-    Ok(native_id)
-}
-
-pub(crate) fn rejected_control(reason: &str) -> Value {
-    json!({"state": "rejected", "reason": reason})
-}
-
-pub(crate) fn unknown_control(reason: &str) -> Value {
-    json!({"state": "unknown", "reason": reason})
 }
 
 #[cfg(test)]

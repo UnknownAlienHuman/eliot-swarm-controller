@@ -1339,10 +1339,13 @@ fn muse_snapshot_from_entry(
     Ok(Value::Object(snapshot))
 }
 
-/// Freeze a Claude profile. The PR1 slice carries an exact model id and a
+/// Freeze a Claude profile. The PR2 slice carries an exact model id, a
 /// required explicit native `cmd` (no PATH default: a resolved wrapper would
-/// orphan the real CLI on stop). Permission modes, approvals and reasoning
-/// effort stay rejected until their native mappings land.
+/// orphan the real CLI on stop), the CLI permission modes mapped from
+/// `approval`, and approve/deny replies through the stdio permission
+/// callback. Reasoning effort, collaboration presets, non-default
+/// permissions, and a non-`never` Eliot-side `approval_policy` stay rejected
+/// until their mappings land.
 fn claude_snapshot_from_entry(
     name: &str,
     entry: &ProfileEntry,

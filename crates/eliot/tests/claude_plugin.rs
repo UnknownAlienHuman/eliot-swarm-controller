@@ -191,6 +191,42 @@ fn main() {
             scenario_lost_reply_is_unknown_without_rewrite,
         )
         .await;
+        run_scenario(
+            "refused initialize is unknown without a rewrite",
+            OwnedChildren::default(),
+            scenario_initialize_error_is_unknown_without_rewrite,
+        )
+        .await;
+        run_scenario(
+            "setter echo mismatch is unknown",
+            OwnedChildren::default(),
+            scenario_setter_echo_mismatch_is_unknown,
+        )
+        .await;
+        run_scenario(
+            "missing retained session is unknown",
+            OwnedChildren::default(),
+            scenario_retained_session_missing_is_unknown,
+        )
+        .await;
+        run_scenario(
+            "stale-generation resume is rejected before spawn",
+            OwnedChildren::default(),
+            scenario_stale_generation_resume_rejected_before_spawn,
+        )
+        .await;
+        run_scenario(
+            "late old-generation frames gap without applying",
+            OwnedChildren::default(),
+            scenario_late_old_generation_frames_gap_without_applying,
+        )
+        .await;
+        run_scenario(
+            "stray permission ask gets an explicit deny",
+            OwnedChildren::default(),
+            scenario_stray_permission_ask_gets_explicit_deny,
+        )
+        .await;
     });
     println!("claude_plugin: all scenarios passed");
 }
@@ -334,253 +370,299 @@ impl FakeClaude {
     /// False ends the fixture (clean exit or scripted drop).
     fn handle_frame(&mut self, frame: &Value, stdout: &mut std::io::StdoutLock) -> bool {
         match frame.get("type").and_then(Value::as_str) {
-            Some("control_request") => {
-                let request_id = frame
-                    .get("request_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned();
-                let subtype = frame
-                    .get("request")
-                    .and_then(|request| request.get("subtype"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned();
-                *self.controls.entry(subtype.clone()).or_insert(0) += 1;
-                self.write_report();
-                match subtype.as_str() {
-                    "initialize" => {
-                        self.emit(
-                            stdout,
-                            json!({
-                                "type": "control_response",
-                                "response": {
-                                    "subtype": "success",
-                                    "request_id": request_id,
-                                    "response": self.initialize_response(),
-                                },
-                            }),
-                        );
-                        // SessionStart hook lines carry the session id before
-                        // any input, exactly like the installed CLI. A resumed
-                        // CLI re-announces the same retained id.
-                        let session_id = if self.script == "session-mismatch" {
-                            "00000000-0000-0000-0000-000000000000".to_owned()
-                        } else {
-                            self.session_id()
-                        };
-                        self.emit(
-                            stdout,
-                            json!({
-                                "type": "system",
-                                "subtype": "session_start",
-                                "session_id": session_id,
-                            }),
-                        );
-                    }
-                    "interrupt" => {
-                        let still_queued = if self.script == "interrupt-queued" {
-                            json!(["queued-turn-1"])
-                        } else {
-                            json!([])
-                        };
-                        self.emit(
-                            stdout,
-                            json!({
-                                "type": "control_response",
-                                "response": {
-                                    "subtype": "success",
-                                    "request_id": request_id,
-                                    "response": {"still_queued": still_queued},
-                                },
-                            }),
-                        );
-                        if self.script == "interrupt-race" || self.script == "interrupt-queued" {
-                            // The CLI flushes partial text as it interrupts;
-                            // the adapter must keep it before the terminal.
-                            self.emit_assistant(stdout, "fake partial text. ");
-                            self.emit_turn_result(stdout, "interrupted");
-                        }
-                    }
-                    "set_model" => {
-                        // Success with no readback payload, like the CLI.
-                        self.emit(
-                            stdout,
-                            json!({
-                                "type": "control_response",
-                                "response": {
-                                    "subtype": "success",
-                                    "request_id": request_id,
-                                    "response": {},
-                                },
-                            }),
-                        );
-                    }
-                    "set_permission_mode" => {
-                        // Success echoing the applied mode, like the CLI.
-                        let mode = frame
-                            .get("request")
-                            .and_then(|request| request.get("mode"))
-                            .cloned()
-                            .unwrap_or(Value::Null);
-                        self.emit(
-                            stdout,
-                            json!({
-                                "type": "control_response",
-                                "response": {
-                                    "subtype": "success",
-                                    "request_id": request_id,
-                                    "response": {"mode": mode},
-                                },
-                            }),
-                        );
-                    }
-                    _ => {
-                        self.emit(
-                            stdout,
-                            json!({
-                                "type": "control_response",
-                                "response": {
-                                    "subtype": "success",
-                                    "request_id": request_id,
-                                    "response": {},
-                                },
-                            }),
-                        );
-                    }
-                }
-                true
-            }
-            Some("control_response") => {
-                // A permission decision for one asked `can_use_tool`.
-                let body = frame.get("response").cloned().unwrap_or(Value::Null);
-                self.permission_replies.push(json!({
-                    "request_id": body.get("request_id").cloned().unwrap_or(Value::Null),
-                    "subtype": body.get("subtype").cloned().unwrap_or(Value::Null),
-                    "result": body.get("response").cloned().unwrap_or(Value::Null),
-                }));
-                self.write_report();
-                if matches!(self.script.as_str(), "approve" | "approve-secret" | "deny") {
-                    // The decided turn runs to its terminal once the reply
-                    // lands, like the CLI continuing past the prompt.
-                    let allowed = body
-                        .get("response")
-                        .and_then(|result| result.get("behavior"))
-                        .and_then(Value::as_str)
-                        == Some("allow");
-                    let text = if allowed {
-                        "fake reply after decision. "
-                    } else {
-                        "fake reply after denial. "
-                    };
-                    self.emit_assistant(stdout, text);
-                    self.emit_turn_result(stdout, "completed");
-                }
-                true
-            }
-            Some("user") => {
-                self.user_inputs += 1;
-                self.write_report();
-                if self.script == "drop-input" {
-                    self.exit = Some("scripted-drop".to_owned());
-                    self.write_report();
-                    std::process::exit(0);
-                }
-                let uuid = frame
-                    .get("uuid")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned();
-                if self.script == "cancelled-turn" {
-                    self.emit(
-                        stdout,
-                        json!({
-                            "type": "command_lifecycle",
-                            "command_uuid": uuid,
-                            "state": "cancelled",
-                        }),
-                    );
-                    return true;
-                }
+            Some("control_request") => self.handle_control_request(frame, stdout),
+            Some("control_response") => self.handle_control_response(frame, stdout),
+            Some("user") => self.handle_user_input(frame, stdout),
+            _ => {}
+        }
+        true
+    }
+
+    fn handle_control_request(&mut self, frame: &Value, stdout: &mut std::io::StdoutLock) {
+        let request_id = frame
+            .get("request_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let subtype = frame
+            .get("request")
+            .and_then(|request| request.get("subtype"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        *self.controls.entry(subtype.clone()).or_insert(0) += 1;
+        self.write_report();
+        match subtype.as_str() {
+            "initialize" => self.handle_initialize(stdout, &request_id),
+            "interrupt" => {
+                let still_queued = if self.script == "interrupt-queued" {
+                    json!(["queued-turn-1"])
+                } else {
+                    json!([])
+                };
                 self.emit(
                     stdout,
                     json!({
-                        "type": "system",
-                        "subtype": "init",
-                        "session_id": self.session_id(),
-                    }),
-                );
-                self.emit(
-                    stdout,
-                    json!({
-                        "type": "command_lifecycle",
-                        "command_uuid": uuid,
-                        "state": "started",
+                        "type": "control_response",
+                        "response": {
+                            "subtype": "success",
+                            "request_id": request_id,
+                            "response": {"still_queued": still_queued},
+                        },
                     }),
                 );
                 if self.script == "interrupt-race" || self.script == "interrupt-queued" {
-                    // Park the turn: no assistant text and no terminal
-                    // record until the interrupt arrives.
-                    return true;
+                    // The CLI flushes partial text as it interrupts;
+                    // the adapter must keep it before the terminal.
+                    self.emit_assistant(stdout, "fake partial text. ");
+                    self.emit_turn_result(stdout, "interrupted");
                 }
-                if self.script == "cancel-active" {
-                    // The queued turn is cancelled after association; no
-                    // result record follows, the cancellation is terminal.
-                    self.emit(
-                        stdout,
-                        json!({
-                            "type": "command_lifecycle",
-                            "command_uuid": uuid,
-                            "state": "cancelled",
-                        }),
-                    );
-                    return true;
-                }
-                if matches!(
-                    self.script.as_str(),
-                    "approve" | "approve-secret" | "deny" | "drop-reply"
-                ) {
-                    // Park the turn on its permission ask: the terminal only
-                    // follows the decision (or never, for the dropped reply).
-                    self.emit_permission_request(stdout);
-                    if self.script == "drop-reply" {
-                        stdout.flush().expect("fixture stdout");
-                        self.exit = Some("scripted-drop".to_owned());
-                        self.write_report();
-                        std::process::exit(0);
-                    }
-                    return true;
-                }
-                if self.script == "request-close" {
-                    // The turn ends with its ask unanswered: opened, then the
-                    // terminal with no decision in between.
-                    self.emit_permission_request(stdout);
-                    self.emit_assistant(stdout, "fake reply with an open ask. ");
-                    self.emit_turn_result(stdout, "completed");
-                    return true;
-                }
-                let texts: Vec<String> = match self.script.as_str() {
-                    "two-messages" => {
-                        vec!["fake part one. ".to_owned(), "fake part two.".to_owned()]
-                    }
-                    _ => vec!["fake reply to the turn.".to_owned()],
-                };
-                for text in texts {
-                    self.emit_assistant(stdout, &text);
-                }
-                let terminal_reason = if self.script == "failed-turn" {
-                    "failed".to_owned()
-                } else if self.script == "secret-reason" {
-                    // The report path is a pass_env secret: the committed
-                    // status must carry the redaction marker, never the path.
-                    format!("completed {}", self.report_path.to_string_lossy())
-                } else {
-                    "completed".to_owned()
-                };
-                self.emit_turn_result(stdout, &terminal_reason);
-                true
             }
-            _ => true,
+            "set_model" => {
+                // Success with no readback payload, like the CLI.
+                self.emit(
+                    stdout,
+                    json!({
+                        "type": "control_response",
+                        "response": {
+                            "subtype": "success",
+                            "request_id": request_id,
+                            "response": {},
+                        },
+                    }),
+                );
+            }
+            "set_permission_mode" => {
+                // Success echoing the applied mode, like the CLI — except the
+                // drift script answers with the CLI's own mode instead of the
+                // requested one, like the installed manual→default quirk.
+                let mode = if self.script == "setter-drift" {
+                    Value::String("default".to_owned())
+                } else {
+                    frame
+                        .get("request")
+                        .and_then(|request| request.get("mode"))
+                        .cloned()
+                        .unwrap_or(Value::Null)
+                };
+                self.emit(
+                    stdout,
+                    json!({
+                        "type": "control_response",
+                        "response": {
+                            "subtype": "success",
+                            "request_id": request_id,
+                            "response": {"mode": mode},
+                        },
+                    }),
+                );
+            }
+            _ => {
+                self.emit(
+                    stdout,
+                    json!({
+                        "type": "control_response",
+                        "response": {
+                            "subtype": "success",
+                            "request_id": request_id,
+                            "response": {},
+                        },
+                    }),
+                );
+            }
+        }
+    }
+
+    fn handle_initialize(&mut self, stdout: &mut std::io::StdoutLock, request_id: &str) {
+        if self.script == "initialize-error" {
+            // The CLI refuses the call outright: the reply leaves the
+            // outcome uncertain, never rejected.
+            self.emit(
+                stdout,
+                json!({
+                    "type": "control_response",
+                    "response": {
+                        "subtype": "error",
+                        "request_id": request_id,
+                        "response": {"message": "fake initialize refused"},
+                    },
+                }),
+            );
+            return;
+        }
+        self.emit(
+            stdout,
+            json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": request_id,
+                    "response": self.initialize_response(),
+                },
+            }),
+        );
+        // SessionStart hook lines carry the session id before
+        // any input, exactly like the installed CLI. A resumed
+        // CLI re-announces the same retained id; the missing
+        // script announces a fresh one instead.
+        let session_id = if self.script == "session-mismatch" || self.script == "resume-missing" {
+            "00000000-0000-0000-0000-000000000000".to_owned()
+        } else {
+            self.session_id()
+        };
+        self.emit(
+            stdout,
+            json!({
+                "type": "system",
+                "subtype": "session_start",
+                "session_id": session_id,
+            }),
+        );
+    }
+
+    fn handle_control_response(&mut self, frame: &Value, stdout: &mut std::io::StdoutLock) {
+        // A permission decision for one asked `can_use_tool`.
+        let body = frame.get("response").cloned().unwrap_or(Value::Null);
+        self.permission_replies.push(json!({
+            "request_id": body.get("request_id").cloned().unwrap_or(Value::Null),
+            "subtype": body.get("subtype").cloned().unwrap_or(Value::Null),
+            "result": body.get("response").cloned().unwrap_or(Value::Null),
+        }));
+        self.write_report();
+        if matches!(self.script.as_str(), "approve" | "approve-secret" | "deny") {
+            // The decided turn runs to its terminal once the reply
+            // lands, like the CLI continuing past the prompt.
+            let allowed = body
+                .get("response")
+                .and_then(|result| result.get("behavior"))
+                .and_then(Value::as_str)
+                == Some("allow");
+            let text = if allowed {
+                "fake reply after decision. "
+            } else {
+                "fake reply after denial. "
+            };
+            self.emit_assistant(stdout, text);
+            self.emit_turn_result(stdout, "completed");
+        }
+    }
+
+    fn handle_user_input(&mut self, frame: &Value, stdout: &mut std::io::StdoutLock) {
+        self.user_inputs += 1;
+        self.write_report();
+        if self.script == "drop-input" {
+            self.exit = Some("scripted-drop".to_owned());
+            self.write_report();
+            std::process::exit(0);
+        }
+        let uuid = frame
+            .get("uuid")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        if self.script == "cancelled-turn" {
+            self.emit(
+                stdout,
+                json!({
+                    "type": "command_lifecycle",
+                    "command_uuid": uuid,
+                    "state": "cancelled",
+                }),
+            );
+            return;
+        }
+        if self.script == "stale-frame" {
+            // A late generation-1 frame: this generation never submitted
+            // that turn, so it gaps instead of applying.
+            self.emit(
+                stdout,
+                json!({
+                    "type": "command_lifecycle",
+                    "command_uuid": "00000000-0000-0000-0000-000000000001",
+                    "state": "started",
+                }),
+            );
+        }
+        self.emit(
+            stdout,
+            json!({
+                "type": "system",
+                "subtype": "init",
+                "session_id": self.session_id(),
+            }),
+        );
+        self.emit(
+            stdout,
+            json!({
+                "type": "command_lifecycle",
+                "command_uuid": uuid,
+                "state": "started",
+            }),
+        );
+        if self.script == "interrupt-race" || self.script == "interrupt-queued" {
+            // Park the turn: no assistant text and no terminal
+            // record until the interrupt arrives.
+            return;
+        }
+        if self.script == "cancel-active" {
+            // The queued turn is cancelled after association; no
+            // result record follows, the cancellation is terminal.
+            self.emit(
+                stdout,
+                json!({
+                    "type": "command_lifecycle",
+                    "command_uuid": uuid,
+                    "state": "cancelled",
+                }),
+            );
+            return;
+        }
+        if matches!(
+            self.script.as_str(),
+            "approve" | "approve-secret" | "deny" | "drop-reply"
+        ) {
+            // Park the turn on its permission ask: the terminal only
+            // follows the decision (or never, for the dropped reply).
+            self.emit_permission_request(stdout);
+            if self.script == "drop-reply" {
+                stdout.flush().expect("fixture stdout");
+                self.exit = Some("scripted-drop".to_owned());
+                self.write_report();
+                std::process::exit(0);
+            }
+            return;
+        }
+        if self.script == "request-close" {
+            // The turn ends with its ask unanswered: opened, then the
+            // terminal with no decision in between.
+            self.emit_permission_request(stdout);
+            self.emit_assistant(stdout, "fake reply with an open ask. ");
+            self.emit_turn_result(stdout, "completed");
+            return;
+        }
+        let texts: Vec<String> = match self.script.as_str() {
+            "two-messages" => {
+                vec!["fake part one. ".to_owned(), "fake part two.".to_owned()]
+            }
+            _ => vec!["fake reply to the turn.".to_owned()],
+        };
+        for text in texts {
+            self.emit_assistant(stdout, &text);
+        }
+        let terminal_reason = if self.script == "failed-turn" {
+            "failed".to_owned()
+        } else if self.script == "secret-reason" {
+            // The report path is a pass_env secret: the committed
+            // status must carry the redaction marker, never the path.
+            format!("completed {}", self.report_path.to_string_lossy())
+        } else {
+            "completed".to_owned()
+        };
+        self.emit_turn_result(stdout, &terminal_reason);
+        if self.script == "stray-ask" {
+            // The turn is over: this ask has no exact active turn, so it
+            // gets an explicit deny plus a gap, never an open.
+            self.emit_permission_request(stdout);
         }
     }
 
@@ -631,6 +713,9 @@ impl FakeClaude {
         // scripts pin a readback that differs from the requested one.
         let current_permission_mode = match self.script.as_str() {
             "resume-realign" | "quirk-manual" => "default".to_owned(),
+            // Drifted from the requested manual, so the permission setter
+            // runs — and then echoes the CLI's own mode instead.
+            "setter-drift" => "plan".to_owned(),
             _ if !self.argv_permission_mode.is_empty() => self.argv_permission_mode.clone(),
             _ => "default".to_owned(),
         };
@@ -940,6 +1025,71 @@ impl Host {
             .expect("plugin request channel")
     }
 
+    /// Answer every host request while `agent.start` is in flight: the CLI
+    /// registration plus (on success) the `session.ready` batch. Returns the
+    /// start outcome, the ready batch data, and whether a gap was recorded.
+    async fn pump_start_outcome(
+        &mut self,
+        owned: &OwnedChildren,
+        agent_id: &str,
+        generation: i64,
+        rx: oneshot::Receiver<Result<Value, String>>,
+    ) -> (Result<Value, String>, Option<Value>, bool) {
+        let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
+        // `agent.start` only resolves after the CLI registers and (on
+        // success) the session.ready batch commits; answer all host
+        // requests while it is in flight.
+        let mut ready_data: Option<Value> = None;
+        let mut gapped = false;
+        let outcome = loop {
+            tokio::select! {
+                biased;
+                request = self.next_request() => {
+                    match request.method.as_str() {
+                        "process.put" => {
+                            let pid = request.params.get("pid").and_then(Value::as_u64).unwrap_or(0);
+                            assert!(pid > 0);
+                            owned.set_cli_pid(pid).await;
+                            assert_eq!(request.params.get("role").and_then(Value::as_str), Some("harness"));
+                            self.respond(&request.id, json!({
+                                "identity": {"host_boot_id": "test-boot", "pid": pid, "start_time": 1},
+                                "owner": format!("agent:{agent_id}#{generation}"),
+                                "role": "harness",
+                                "state": "running",
+                                "exit_code": null,
+                                "updated_at": 1,
+                            })).await;
+                        }
+                        "events.put" => {
+                            let events = request.params.get("events").and_then(Value::as_array).cloned().unwrap_or_default();
+                            assert_eq!(events.len(), 1, "one native record per batch");
+                            assert_eq!(events[0].get("kind").and_then(Value::as_str), Some("session.ready"));
+                            ready_data = Some(events[0].get("data").cloned().unwrap_or(Value::Null));
+                            let first = self.next_seq;
+                            self.next_seq += 1;
+                            self.respond(&request.id, json!({
+                                "first_seq": first, "last_seq": first,
+                                "cursor": request.params.get("cursor").cloned().unwrap_or(Value::Null),
+                            })).await;
+                        }
+                        "source.gap" => {
+                            gapped = true;
+                            let gap_id = request.params.get("gap_id").and_then(Value::as_str).unwrap_or_default().to_owned();
+                            self.respond(&request.id, json!({"gap_id": gap_id, "seq": self.next_seq})).await;
+                            self.next_seq += 1;
+                        }
+                        other => panic!("unexpected host request during start: {other}"),
+                    }
+                }
+                result = &mut rx => break result,
+            }
+        };
+        let resolved = outcome
+            .expect("agent.start deadline")
+            .expect("agent.start response channel");
+        (resolved, ready_data, gapped)
+    }
+
     /// Answer one `events.put` of any kind, returning `(kind, data)`.
     async fn answer_any_events_put(&mut self, agent_id: &str) -> (String, Value) {
         let request = self.next_request().await;
@@ -1031,6 +1181,37 @@ impl StartConfig {
     }
 }
 
+struct ReadyExpectations {
+    generation: i64,
+    start_id: String,
+    requested_mode: Option<String>,
+    effective_mode: String,
+}
+
+fn assert_claude_manifest(manifest: &Value) {
+    assert_eq!(manifest.get("name").and_then(Value::as_str), Some("claude"));
+    assert_eq!(
+        manifest.get("protocol").and_then(Value::as_str),
+        Some("eliot-plugin/1")
+    );
+    assert_eq!(
+        manifest["verbs"],
+        json!([
+            "launch",
+            "resume",
+            "send",
+            "interrupt",
+            "approve",
+            "deny",
+            "stop"
+        ])
+    );
+    assert_eq!(
+        manifest["sources"]["controlled"],
+        json!({"message": "stream", "request": "stream", "session": "stream", "turn": "stream"})
+    );
+}
+
 impl Scenario {
     async fn start(script: &str, profile: Value, owned: &OwnedChildren) -> Self {
         let (scenario, _) = Self::start_full(StartConfig::fresh(script, profile), owned).await;
@@ -1079,27 +1260,7 @@ impl Scenario {
             )
             .await
             .expect("initialize");
-        assert_eq!(manifest.get("name").and_then(Value::as_str), Some("claude"));
-        assert_eq!(
-            manifest.get("protocol").and_then(Value::as_str),
-            Some("eliot-plugin/1")
-        );
-        assert_eq!(
-            manifest["verbs"],
-            json!([
-                "launch",
-                "resume",
-                "send",
-                "interrupt",
-                "approve",
-                "deny",
-                "stop"
-            ])
-        );
-        assert_eq!(
-            manifest["sources"]["controlled"],
-            json!({"message": "stream", "request": "stream", "session": "stream", "turn": "stream"})
-        );
+        assert_claude_manifest(&manifest);
         let start_id = ulid::Ulid::new().to_string();
         let self_exe = std::env::current_exe().expect("test executable");
         let mut full_profile = profile;
@@ -1129,69 +1290,47 @@ impl Scenario {
                 }),
             )
             .await;
-        let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
-        // `agent.start` only resolves after the CLI registers and (on
-        // success) the session.ready batch commits; answer all host
-        // requests while it is in flight.
-        let mut ready_data: Option<Value> = None;
-        let mut gapped = false;
-        let outcome = loop {
-            tokio::select! {
-                biased;
-                request = host.next_request() => {
-                    match request.method.as_str() {
-                        "process.put" => {
-                            let pid = request.params.get("pid").and_then(Value::as_u64).unwrap_or(0);
-                            assert!(pid > 0);
-                            owned.set_cli_pid(pid).await;
-                            assert_eq!(request.params.get("role").and_then(Value::as_str), Some("harness"));
-                            host.respond(&request.id, json!({
-                                "identity": {"host_boot_id": "test-boot", "pid": pid, "start_time": 1},
-                                "owner": format!("agent:{agent_id}#{generation}"),
-                                "role": "harness",
-                                "state": "running",
-                                "exit_code": null,
-                                "updated_at": 1,
-                            })).await;
-                        }
-                        "events.put" => {
-                            let events = request.params.get("events").and_then(Value::as_array).cloned().unwrap_or_default();
-                            assert_eq!(events.len(), 1, "one native record per batch");
-                            assert_eq!(events[0].get("kind").and_then(Value::as_str), Some("session.ready"));
-                            ready_data = Some(events[0].get("data").cloned().unwrap_or(Value::Null));
-                            let first = host.next_seq;
-                            host.next_seq += 1;
-                            host.respond(&request.id, json!({
-                                "first_seq": first, "last_seq": first,
-                                "cursor": request.params.get("cursor").cloned().unwrap_or(Value::Null),
-                            })).await;
-                        }
-                        "source.gap" => {
-                            gapped = true;
-                            let gap_id = request.params.get("gap_id").and_then(Value::as_str).unwrap_or_default().to_owned();
-                            host.respond(&request.id, json!({"gap_id": gap_id, "seq": host.next_seq})).await;
-                            host.next_seq += 1;
-                        }
-                        other => panic!("unexpected host request during start: {other}"),
-                    }
-                }
-                result = &mut rx => break result,
-            }
-        };
-        let resolved = outcome
-            .expect("agent.start deadline")
-            .expect("agent.start response channel");
+        let (resolved, ready_data, gapped) = host
+            .pump_start_outcome(owned, &agent_id, generation, rx)
+            .await;
         let scenario = Self {
             root,
             agent_id,
             host,
         };
+        let expectations = ReadyExpectations {
+            generation,
+            start_id,
+            requested_mode,
+            effective_mode,
+        };
+        scenario.check_start(resolved, ready_data, gapped, expect_ready, expectations)
+    }
+
+    /// Assert the pumped start outcome against the scenario's expectations.
+    /// On an expected ready the committed `session.ready` batch and the
+    /// requested/effective settings must all match; anything else passes the
+    /// outcome through for the scenario to assert.
+    fn check_start(
+        self,
+        resolved: Result<Value, String>,
+        ready_data: Option<Value>,
+        gapped: bool,
+        expect_ready: bool,
+        expectations: ReadyExpectations,
+    ) -> (Self, Result<(Value, Value), String>) {
+        let ReadyExpectations {
+            generation,
+            start_id,
+            requested_mode,
+            effective_mode,
+        } = expectations;
         match resolved {
             Ok(ready) if expect_ready => {
                 assert_eq!(ready.get("state").and_then(Value::as_str), Some("ready"));
                 assert_eq!(
                     ready.get("agent_id").and_then(Value::as_str),
-                    Some(scenario.agent_id.as_str())
+                    Some(self.agent_id.as_str())
                 );
                 assert_eq!(
                     ready.get("generation").and_then(Value::as_i64),
@@ -1233,10 +1372,9 @@ impl Scenario {
                         .and_then(Value::as_str),
                     requested_mode.as_deref()
                 );
-                assert_eq!(
-                    ready["effective"].get("model").and_then(Value::as_str),
-                    Some(MODEL)
-                );
+                // The CLI never reads the active model back: effective stays
+                // null and the requested id travels under `requested`.
+                assert_eq!(ready["effective"].get("model"), Some(&Value::Null));
                 assert_eq!(
                     ready["effective"]
                         .get("permission_mode")
@@ -1258,10 +1396,10 @@ impl Scenario {
                     "initialize pid readback"
                 );
                 assert!(!gapped, "no gap on the happy path");
-                (scenario, Ok((ready, ready_data)))
+                (self, Ok((ready, ready_data)))
             }
-            Ok(ready) => (scenario, Ok((ready, ready_data.unwrap_or(Value::Null)))),
-            Err(error) => (scenario, Err(error)),
+            Ok(ready) => (self, Ok((ready, ready_data.unwrap_or(Value::Null)))),
+            Err(error) => (self, Err(error)),
         }
     }
 
@@ -1429,6 +1567,76 @@ async fn send_until_permission_asked(
         Some(turn_id.as_str())
     );
     (send_id, turn_id, opened)
+}
+
+/// Begin a send and pump until the applied response, the turn terminal, and
+/// one gap all land. Returns the applied value, the host-observed event
+/// sequence (`"gap"` marks the gap), and the gap reasons.
+async fn send_until_gapped_turn_ends(
+    host: &mut Host,
+    agent_id: &str,
+    generation: i64,
+    text: &str,
+) -> (Value, Vec<String>, Vec<String>) {
+    let send_id = ulid::Ulid::new().to_string();
+    let rx = host
+        .begin_call(
+            "agent.command",
+            json!({
+                "agent_id": agent_id,
+                "generation": generation,
+                "command_id": send_id,
+                "verb": "send",
+                "args": {"text": text},
+                "turn_id": null,
+                "request_id": null,
+            }),
+        )
+        .await;
+    let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
+    let mut applied: Option<Value> = None;
+    let mut sequence: Vec<String> = Vec::new();
+    let mut gaps: Vec<String> = Vec::new();
+    loop {
+        let terminal = sequence.iter().any(|event| event == "turn.completed");
+        if applied.is_some() && terminal && !gaps.is_empty() {
+            break;
+        }
+        tokio::select! {
+            biased;
+            request = host.next_request() => {
+                match request.method.as_str() {
+                    "events.put" => {
+                        let events = request.params.get("events").and_then(Value::as_array).cloned().unwrap_or_default();
+                        assert_eq!(events.len(), 1, "one native record per batch");
+                        sequence.push(events[0].get("kind").and_then(Value::as_str).unwrap_or_default().to_owned());
+                        let first = host.next_seq;
+                        host.next_seq += 1;
+                        host.respond(&request.id, json!({
+                            "first_seq": first, "last_seq": first,
+                            "cursor": request.params.get("cursor").cloned().unwrap_or(Value::Null),
+                        })).await;
+                    }
+                    "source.gap" => {
+                        gaps.push(request.params.get("reason").and_then(Value::as_str).unwrap_or_default().to_owned());
+                        sequence.push("gap".to_owned());
+                        let gap_id = request.params.get("gap_id").and_then(Value::as_str).unwrap_or_default().to_owned();
+                        host.respond(&request.id, json!({"gap_id": gap_id, "seq": host.next_seq})).await;
+                        host.next_seq += 1;
+                    }
+                    other => panic!("unexpected host request: {other}"),
+                }
+            }
+            // Guarded: polling the spent response a second time panics.
+            result = &mut rx, if applied.is_none() => {
+                applied = Some(result
+                    .expect("send deadline")
+                    .expect("send response channel")
+                    .expect("send applied"));
+            }
+        }
+    }
+    (applied.expect("send applied"), sequence, gaps)
 }
 
 /// Send one approve/deny and pump until the reply value lands, collecting
@@ -1661,6 +1869,41 @@ async fn stop_agent(host: &mut Host, agent_id: &str, generation: i64) {
         Some("applied")
     );
     assert!(ended, "stop commits session.ended");
+}
+
+/// Shut down a plugin whose owned session never reached readiness:
+/// `session.ended` still commits while the shutdown call is in flight.
+async fn shutdown_with_session_end(host: &mut Host) {
+    let rx = host.begin_call("shutdown", json!({})).await;
+    let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
+    let mut ended = false;
+    let shutdown = loop {
+        tokio::select! {
+            biased;
+            request = host.next_request() => {
+                assert_eq!(request.method, "events.put");
+                let events = request.params.get("events").and_then(Value::as_array).cloned().unwrap_or_default();
+                assert_eq!(events[0].get("kind").and_then(Value::as_str), Some("session.ended"));
+                ended = true;
+                let first = host.next_seq;
+                host.next_seq += 1;
+                host.respond(&request.id, json!({
+                    "first_seq": first, "last_seq": first,
+                    "cursor": request.params.get("cursor").cloned().unwrap_or(Value::Null),
+                })).await;
+            }
+            result = &mut rx => break result,
+        }
+    };
+    let shutdown = shutdown
+        .expect("shutdown deadline")
+        .expect("shutdown channel")
+        .expect("shutdown");
+    assert_eq!(
+        shutdown.get("state").and_then(Value::as_str),
+        Some("shutdown")
+    );
+    assert!(ended, "shutdown commits session.ended");
 }
 
 /// Park one turn: the association commits, the terminal stays pending.
@@ -2379,38 +2622,7 @@ async fn scenario_session_mismatch_is_unknown_with_gap(owned: OwnedChildren) {
     let (mut scenario, outcome) = Scenario::start_full(config, &owned).await;
     let error = outcome.expect_err("session mismatch must fail start");
     assert!(error.contains("unknown"), "{error}");
-    // Shutdown still settles the owned session: `session.ended` commits
-    // while the shutdown call is in flight.
-    let rx = scenario.host.begin_call("shutdown", json!({})).await;
-    let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
-    let mut ended = false;
-    let shutdown = loop {
-        tokio::select! {
-            biased;
-            request = scenario.host.next_request() => {
-                assert_eq!(request.method, "events.put");
-                let events = request.params.get("events").and_then(Value::as_array).cloned().unwrap_or_default();
-                assert_eq!(events[0].get("kind").and_then(Value::as_str), Some("session.ended"));
-                ended = true;
-                let first = scenario.host.next_seq;
-                scenario.host.next_seq += 1;
-                scenario.host.respond(&request.id, json!({
-                    "first_seq": first, "last_seq": first,
-                    "cursor": request.params.get("cursor").cloned().unwrap_or(Value::Null),
-                })).await;
-            }
-            result = &mut rx => break result,
-        }
-    };
-    let shutdown = shutdown
-        .expect("shutdown deadline")
-        .expect("shutdown channel")
-        .expect("shutdown");
-    assert_eq!(
-        shutdown.get("state").and_then(Value::as_str),
-        Some("shutdown")
-    );
-    assert!(ended, "shutdown commits session.ended");
+    shutdown_with_session_end(&mut scenario.host).await;
     scenario.host.shutdown_child().await;
 }
 
@@ -3188,6 +3400,233 @@ async fn scenario_lost_reply_is_unknown_without_rewrite(owned: OwnedChildren) {
     // Stop still settles: the unanswered ask closes before `session.ended`.
     stop_agent(&mut scenario.host, &agent_id, 1).await;
     scenario.assert_cli_exit("scripted-drop");
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+}
+
+async fn scenario_initialize_error_is_unknown_without_rewrite(owned: OwnedChildren) {
+    // A refused initialize leaves the CLI state uncertain: the start fails
+    // `unknown` (never recoded to `profile_error`) with no second write.
+    let mut config = StartConfig::fresh("initialize-error", claude_profile());
+    config.expect_ready = false;
+    let (mut scenario, outcome) = Scenario::start_full(config, &owned).await;
+    let error = outcome.expect_err("refused initialize must fail start");
+    assert!(error.contains("unknown"), "{error}");
+    assert!(!error.contains("profile_error"), "{error}");
+    assert_eq!(
+        scenario.report()["controls"]
+            .get("initialize")
+            .and_then(Value::as_u64),
+        Some(1),
+        "no second initialize write"
+    );
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+}
+
+async fn scenario_setter_echo_mismatch_is_unknown(owned: OwnedChildren) {
+    // Resume with a manual profile: the drifted mode runs the permission
+    // setter, the CLI echoes its own mode instead, and the start fails
+    // `unknown` — an unexpected echo is not a profile error.
+    let (agent_id, native_scope, native_ref) = retained_subject(&owned).await;
+    let config = StartConfig {
+        script: "setter-drift".to_owned(),
+        profile: claude_profile_with_mode("manual"),
+        agent_id: Some(agent_id.clone()),
+        generation: 2,
+        resume_from: json!({"native_scope": native_scope, "native_ref": native_ref}),
+        source_state: resume_source_state(&agent_id),
+        extra_env: Vec::new(),
+        expect_ready: false,
+        requested_mode: Some("manual".to_owned()),
+        // Unchecked: the start fails before readiness.
+        effective_mode: "default".to_owned(),
+    };
+    let (mut gen2, outcome) = Scenario::start_full(config, &owned).await;
+    let error = outcome.expect_err("echo mismatch must fail resume");
+    assert!(error.contains("unknown"), "{error}");
+    assert!(!error.contains("profile_error"), "{error}");
+    let report = gen2.report();
+    assert_eq!(
+        report["controls"].get("set_model").and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        report["controls"]
+            .get("set_permission_mode")
+            .and_then(Value::as_u64),
+        Some(1),
+        "no second setter write"
+    );
+    assert_eq!(
+        report.get("resume").and_then(Value::as_str),
+        Some(native_ref.as_str())
+    );
+    gen2.host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    gen2.host.shutdown_child().await;
+}
+
+async fn scenario_retained_session_missing_is_unknown(owned: OwnedChildren) {
+    // The resumed CLI announces a fresh session instead of the retained one:
+    // no `session.ready` commits and the start fails `unknown` with a gap.
+    let (agent_id, native_scope, native_ref) = retained_subject(&owned).await;
+    let config = StartConfig {
+        script: "resume-missing".to_owned(),
+        profile: claude_profile(),
+        agent_id: Some(agent_id.clone()),
+        generation: 2,
+        resume_from: json!({"native_scope": native_scope, "native_ref": native_ref}),
+        source_state: resume_source_state(&agent_id),
+        extra_env: Vec::new(),
+        expect_ready: false,
+        requested_mode: None,
+        effective_mode: "default".to_owned(),
+    };
+    let (mut gen2, outcome) = Scenario::start_full(config, &owned).await;
+    let error = outcome.expect_err("missing retained session must fail resume");
+    assert!(error.contains("unknown"), "{error}");
+    assert_eq!(
+        gen2.report().get("resume").and_then(Value::as_str),
+        Some(native_ref.as_str())
+    );
+    shutdown_with_session_end(&mut gen2.host).await;
+    gen2.host.shutdown_child().await;
+}
+
+async fn scenario_stale_generation_resume_rejected_before_spawn(owned: OwnedChildren) {
+    // Resuming generation 3 from a generation-1 readback is stale: the
+    // resume fails before any native process spawns.
+    let (agent_id, native_scope, native_ref) = retained_subject(&owned).await;
+    let config = StartConfig {
+        script: "resume-ok".to_owned(),
+        profile: claude_profile(),
+        agent_id: Some(agent_id.clone()),
+        generation: 3,
+        resume_from: json!({"native_scope": native_scope, "native_ref": native_ref}),
+        source_state: resume_source_state(&agent_id),
+        extra_env: Vec::new(),
+        expect_ready: false,
+        requested_mode: None,
+        effective_mode: "default".to_owned(),
+    };
+    let (mut gen3, outcome) = Scenario::start_full(config, &owned).await;
+    let error = outcome.expect_err("stale resume must fail");
+    assert!(error.contains("stale_generation"), "{error}");
+    gen3.host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    gen3.host.shutdown_child().await;
+    assert!(
+        !gen3.root.join("report.json").exists(),
+        "no native process spawns for a stale resume subject"
+    );
+}
+
+async fn scenario_late_old_generation_frames_gap_without_applying(owned: OwnedChildren) {
+    // A lifecycle frame for a turn this generation never submitted (the
+    // stand-in for a late generation-1 frame) gaps instead of applying, and
+    // the submitted turn still runs to its terminal.
+    let mut scenario = Scenario::start("stale-frame", claude_profile(), &owned).await;
+    let agent_id = scenario.agent_id.clone();
+    let (applied, sequence, gaps) =
+        send_until_gapped_turn_ends(&mut scenario.host, &agent_id, 1, "hello").await;
+    assert_eq!(
+        applied.get("state").and_then(Value::as_str),
+        Some("applied")
+    );
+    assert_eq!(
+        sequence.as_slice(),
+        ["gap", "turn.started", "message.completed", "turn.completed"]
+    );
+    assert_eq!(gaps.len(), 1);
+    assert!(
+        gaps[0].contains("did not match the exact submitted turn"),
+        "stale frame gaps: {:?}",
+        gaps
+    );
+    stop_agent(&mut scenario.host, &agent_id, 1).await;
+    scenario.assert_cli_exit("stdin-eof");
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+}
+
+async fn scenario_stray_permission_ask_gets_explicit_deny(owned: OwnedChildren) {
+    // An ask that arrives with no exact active turn (here: after the turn
+    // ended) gets an explicit deny plus a gap — never an open request.
+    let mut scenario = Scenario::start("stray-ask", claude_profile(), &owned).await;
+    let agent_id = scenario.agent_id.clone();
+    let (applied, sequence, gaps) =
+        send_until_gapped_turn_ends(&mut scenario.host, &agent_id, 1, "hello").await;
+    assert_eq!(
+        applied.get("state").and_then(Value::as_str),
+        Some("applied")
+    );
+    let turn_id = applied
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .expect("applied turn uuid")
+        .to_owned();
+    assert_eq!(
+        sequence.as_slice(),
+        ["turn.started", "message.completed", "turn.completed", "gap"]
+    );
+    assert_eq!(gaps.len(), 1);
+    assert!(
+        gaps[0].contains("arrived outside the exact active turn"),
+        "stray ask gaps: {:?}",
+        gaps
+    );
+    // A reply to the never-opened ask is rejected without a rewrite.
+    let (reply, collected, _) = reply_for_permission(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "deny",
+        json!({}),
+        "fake-perm-1",
+        &turn_id,
+    )
+    .await;
+    assert_eq!(reply.get("state").and_then(Value::as_str), Some("rejected"));
+    assert_eq!(
+        reply.get("reason").and_then(Value::as_str),
+        Some("Claude request is no longer pending")
+    );
+    assert!(collected.is_empty(), "rejected reply commits nothing");
+    stop_agent(&mut scenario.host, &agent_id, 1).await;
+    scenario.assert_cli_exit("stdin-eof");
+    // The deny was piped before input closed, so the exited CLI's report
+    // carries it deterministically: exactly one explicit deny.
+    let replies = scenario
+        .report()
+        .get("permission_replies")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        replies.as_slice(),
+        &[json!({
+            "request_id": "fake-perm-1",
+            "subtype": "success",
+            "result": {"behavior": "deny", "message": "Eliot denied this tool call."},
+        })]
+    );
     scenario
         .host
         .call("shutdown", json!({}))
