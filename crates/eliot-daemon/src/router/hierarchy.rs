@@ -6,6 +6,7 @@
 //! transactionally; targeted-verb submit scope and read scope are
 //! Router-enforced here against the Store's one scope walk.
 
+use super::auth::{authorize_agent_read_self, authorize_command_read_self};
 use super::*;
 use eliot_core::AgentControl;
 use eliot_store::Store;

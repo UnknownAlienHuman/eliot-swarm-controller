@@ -1,17 +1,19 @@
 //! Command execution: dispatch a Store-admitted command to native I/O and settle it.
 //!
-//! This module holds `process_command_inner` with its private preparation and
-//! settlement helpers as plain `impl Router` blocks. Shared admission, read and
-//! progress helpers stay in the parent module; native I/O still runs outside
-//! the Store lock exactly as before.
+//! This module holds `process_command_inner` with its private preparation,
+//! dispatch-wait, verb-family, and settlement helpers as plain `impl Router`
+//! blocks. Shared admission, read and progress helpers stay in the parent
+//! module; native I/O still runs outside the Store lock exactly as before.
 use super::{
     MODE_FORCE, Router, RouterInner, RunWorkerHandle, validate_project_rule_launch_command,
     validate_project_rule_resume_command, validate_retained_resume_agent,
 };
 use crate::common::now_ms;
 use eliot_core::{
-    Agent, AgentState, Command, CommandState, Error, FrozenScriptRun, Result, SecretPolicy,
-    api::FrozenGitFetch, classify_dispatched_error,
+    Agent, AgentState, Command, CommandState, Error, Event, FrozenScriptRun, NativeStoreBinding,
+    Result, SecretPolicy,
+    api::{FrozenGitFetch, ProjectRegistrationView},
+    classify_dispatched_error,
 };
 use eliot_plugin::{MAX_EVENT_BYTES, sync::LockExt};
 use futures_util::future::BoxFuture;
@@ -74,6 +76,22 @@ pub(super) enum RunWorkerStart {
     ForceRequested,
 }
 
+/// A command that passed every pre-dispatch gate with the inputs its
+/// dispatch and execution need.
+struct PreparedCommand {
+    command: Command,
+    git_fetch_registration: Option<ProjectRegistrationView>,
+    launch_binding: Option<(Agent, NativeStoreBinding)>,
+    resume_source_state: Option<Value>,
+}
+
+/// Launch/resume start inputs captured before dispatch: the native Store
+/// binding for a Codex launch and the retained source state for a resume.
+struct StartInputs {
+    launch_binding: Option<(Agent, NativeStoreBinding)>,
+    resume_source_state: Option<Value>,
+}
+
 impl Router {
     pub(super) fn process_command(
         self,
@@ -85,161 +103,257 @@ impl Router {
 
     pub(super) async fn process_command_inner(self, id: String, linked_id: Option<String>) {
         let mut receiver = self.inner.bus.subscribe();
-        let command = {
-            let store = self.inner.store.lock().await;
-            match store.get_command(&id) {
-                Ok(Some(command)) => command,
-                _ => return,
-            }
+        let Some(prepared) = self
+            .prepare_command_dispatch(&id, linked_id.is_some())
+            .await
+        else {
+            return;
         };
+        let Some(dispatched) = self
+            .dispatch_and_wait_for_effect(
+                &id,
+                &mut receiver,
+                &prepared.command,
+                &prepared.launch_binding,
+            )
+            .await
+        else {
+            return;
+        };
+        self.execute_dispatched_command(
+            &id,
+            dispatched,
+            prepared.git_fetch_registration,
+            prepared.resume_source_state,
+            linked_id,
+        )
+        .await;
+    }
+
+    /// Run every pre-dispatch gate in order: load, script gates, Git fetch
+    /// registration, project authority, workspace preparation, then launch
+    /// and resume start inputs. Each gate settles its own rejection; `None`
+    /// means the caller must return without dispatching.
+    async fn prepare_command_dispatch(
+        &self,
+        id: &str,
+        has_linked: bool,
+    ) -> Option<PreparedCommand> {
+        let command = self.load_command_for_dispatch(id).await?;
+        if !self.check_script_dispatch_gate(id, &command).await {
+            return None;
+        }
+        let git_fetch_registration = self.load_git_fetch_registration(id, &command).await.ok()?;
+        if !self
+            .check_project_dispatch(id, &command, &git_fetch_registration, has_linked)
+            .await
+        {
+            return None;
+        }
+        if !self.prepare_start_workspace(id, &command).await {
+            return None;
+        }
+        let inputs = self.load_dispatch_binding(id, &command).await?;
+        Some(PreparedCommand {
+            command,
+            git_fetch_registration,
+            launch_binding: inputs.launch_binding,
+            resume_source_state: inputs.resume_source_state,
+        })
+    }
+
+    /// Load the command to dispatch; a missing or unreadable command ends
+    /// silently because a retained/settled command cannot acquire new I/O.
+    async fn load_command_for_dispatch(&self, id: &str) -> Option<Command> {
+        let store = self.inner.store.lock().await;
+        match store.get_command(id) {
+            Ok(Some(command)) => Some(command),
+            _ => None,
+        }
+    }
+
+    /// Reject `run` commands outside owner/project authority and re-verify
+    /// the frozen owner Run before dispatch. Returns false after settling.
+    async fn check_script_dispatch_gate(&self, id: &str, command: &Command) -> bool {
         if command.verb == "run"
             && command.principal != "owner"
             && !command.principal.starts_with("project:")
         {
-            self.reject_undispatched(&id, "unsupported").await;
-            return;
+            self.reject_undispatched(id, "unsupported").await;
+            return false;
         }
         if command.verb == "run" && command.principal == "owner" {
             let frozen: FrozenScriptRun = match serde_json::from_value(command.args.clone()) {
                 Ok(frozen) => frozen,
                 Err(_) => {
-                    self.reject_undispatched(&id, "invalid").await;
-                    return;
+                    self.reject_undispatched(id, "invalid").await;
+                    return false;
                 }
             };
             if let Err(error) = self.verify_global_run(&frozen).await {
-                self.reject_undispatched(&id, &error.code).await;
-                return;
+                self.reject_undispatched(id, &error.code).await;
+                return false;
             }
         }
-        let git_fetch_registration = if command.verb == "git.fetch" {
-            let frozen = match serde_json::from_value::<FrozenGitFetch>(command.args.clone()) {
-                Ok(frozen) if frozen.validate().is_ok() => frozen,
-                _ => {
-                    self.reject_undispatched(&id, "invalid").await;
-                    return;
-                }
-            };
-            let project_principal = command.principal.strip_prefix("project:");
-            if command.principal != "owner" && project_principal != Some(frozen.repository.as_str())
-            {
-                self.reject_undispatched(&id, "not_allowed").await;
-                return;
+        true
+    }
+
+    /// Validate the frozen `git.fetch` args and load its project
+    /// registration. `Err` means the rejection was settled already.
+    async fn load_git_fetch_registration(
+        &self,
+        id: &str,
+        command: &Command,
+    ) -> std::result::Result<Option<ProjectRegistrationView>, ()> {
+        if command.verb != "git.fetch" {
+            return Ok(None);
+        }
+        let frozen = match serde_json::from_value::<FrozenGitFetch>(command.args.clone()) {
+            Ok(frozen) if frozen.validate().is_ok() => frozen,
+            _ => {
+                self.reject_undispatched(id, "invalid").await;
+                return Err(());
             }
-            let registration = {
-                let store = self.inner.store.lock().await;
-                store.get_project_registration("owner", &frozen.repository)
-            };
-            match registration {
-                Ok(Some(registration)) => Some(registration),
-                Ok(None) => {
-                    self.reject_undispatched(&id, "not_allowed").await;
-                    return;
-                }
-                Err(error) => {
-                    self.reject_undispatched(&id, &error.code).await;
-                    return;
-                }
+        };
+        let project_principal = command.principal.strip_prefix("project:");
+        if command.principal != "owner" && project_principal != Some(frozen.repository.as_str()) {
+            self.reject_undispatched(id, "not_allowed").await;
+            return Err(());
+        }
+        let registration = {
+            let store = self.inner.store.lock().await;
+            store.get_project_registration("owner", &frozen.repository)
+        };
+        match registration {
+            Ok(Some(registration)) => Ok(Some(registration)),
+            Ok(None) => {
+                self.reject_undispatched(id, "not_allowed").await;
+                Err(())
+            }
+            Err(error) => {
+                self.reject_undispatched(id, &error.code).await;
+                Err(())
+            }
+        }
+    }
+
+    /// Enforce project-rule authority for a project-principal command: the
+    /// registration must load and verify, then launch, resume, and targeted
+    /// verbs each keep their own fences. Returns false after settling.
+    async fn check_project_dispatch(
+        &self,
+        id: &str,
+        command: &Command,
+        git_fetch_registration: &Option<ProjectRegistrationView>,
+        has_linked: bool,
+    ) -> bool {
+        let Some(project_id) = command.principal.strip_prefix("project:") else {
+            return true;
+        };
+        let registration = if command.verb == "git.fetch" {
+            match git_fetch_registration {
+                Some(registration) => Ok(Some(registration.clone())),
+                None => Err(Error::new(
+                    "not_allowed",
+                    "Git fetch registration is unavailable",
+                )),
             }
         } else {
-            None
+            let store = self.inner.store.lock().await;
+            store.get_project_registration("owner", project_id)
         };
-        if let Some(project_id) = command.principal.strip_prefix("project:") {
-            let registration = if command.verb == "git.fetch" {
-                match &git_fetch_registration {
-                    Some(registration) => Ok(Some(registration.clone())),
-                    None => Err(Error::new(
-                        "not_allowed",
-                        "Git fetch registration is unavailable",
-                    )),
-                }
-            } else {
-                let store = self.inner.store.lock().await;
-                store.get_project_registration("owner", project_id)
-            };
-            let registration = match registration {
-                Ok(Some(registration)) => registration,
-                Ok(None) => {
-                    self.reject_undispatched(&id, "not_allowed").await;
-                    return;
-                }
-                Err(error) => {
-                    self.reject_undispatched(&id, &error.code).await;
-                    return;
-                }
-            };
-            if let Err(error) =
-                crate::automation::verify_project_registration(&self.inner.data_root, &registration)
-                    .await
-            {
-                self.reject_undispatched(&id, &error.code).await;
-                return;
+        let registration = match registration {
+            Ok(Some(registration)) => registration,
+            Ok(None) => {
+                self.reject_undispatched(id, "not_allowed").await;
+                return false;
             }
-            if command.verb == "launch" {
-                if let Err(error) = validate_project_rule_launch_command(&registration, &command) {
-                    self.reject_undispatched(&id, &error.code).await;
-                    return;
-                }
-            } else if command.verb == "resume" {
-                if let Err(error) = validate_project_rule_resume_command(
-                    &registration,
-                    &command,
-                    linked_id.is_some(),
-                ) {
-                    self.reject_undispatched(&id, &error.code).await;
-                    return;
-                }
-                if let Err(error) = self
-                    .verify_project_rule_resume_after_admission(&registration, &command)
-                    .await
-                {
-                    self.reject_undispatched(&id, &error.code).await;
-                    return;
-                }
-            } else if matches!(
-                command.verb.as_str(),
-                "stop" | "send" | "steer" | "interrupt" | "approve" | "deny" | "answer"
-            ) {
-                let (Some(target), Some(generation)) =
-                    (command.target.as_deref(), command.generation)
-                else {
-                    self.reject_undispatched(&id, "invalid").await;
-                    return;
-                };
-                if let Err(error) = self
-                    .verify_project_rule_target(&registration, target, generation)
-                    .await
-                {
-                    self.reject_undispatched(&id, &error.code).await;
-                    return;
-                }
+            Err(error) => {
+                self.reject_undispatched(id, &error.code).await;
+                return false;
             }
-        }
-        if matches!(command.verb.as_str(), "launch" | "resume")
-            && let Err(error) = self.inner.workspaces.prepare(&id).await
+        };
+        if let Err(error) =
+            crate::automation::verify_project_registration(&self.inner.data_root, &registration)
+                .await
         {
-            self.settle_workspace_prepare_error(&id, &error).await;
-            self.signal_progress();
-            return;
+            self.reject_undispatched(id, &error.code).await;
+            return false;
         }
+        if command.verb == "launch" {
+            if let Err(error) = validate_project_rule_launch_command(&registration, command) {
+                self.reject_undispatched(id, &error.code).await;
+                return false;
+            }
+        } else if command.verb == "resume" {
+            if let Err(error) =
+                validate_project_rule_resume_command(&registration, command, has_linked)
+            {
+                self.reject_undispatched(id, &error.code).await;
+                return false;
+            }
+            if let Err(error) = self
+                .verify_project_rule_resume_after_admission(&registration, command)
+                .await
+            {
+                self.reject_undispatched(id, &error.code).await;
+                return false;
+            }
+        } else if matches!(
+            command.verb.as_str(),
+            "stop" | "send" | "steer" | "interrupt" | "approve" | "deny" | "answer"
+        ) {
+            let (Some(target), Some(generation)) = (command.target.as_deref(), command.generation)
+            else {
+                self.reject_undispatched(id, "invalid").await;
+                return false;
+            };
+            if let Err(error) = self
+                .verify_project_rule_target(&registration, target, generation)
+                .await
+            {
+                self.reject_undispatched(id, &error.code).await;
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Prepare the managed workspace for a start verb before dispatch.
+    /// Returns false after settling a preparation failure.
+    async fn prepare_start_workspace(&self, id: &str, command: &Command) -> bool {
+        if matches!(command.verb.as_str(), "launch" | "resume")
+            && let Err(error) = self.inner.workspaces.prepare(id).await
+        {
+            self.settle_workspace_prepare_error(id, &error).await;
+            self.signal_progress();
+            return false;
+        }
+        true
+    }
+
+    /// Capture launch and resume start inputs: the admitted launch Agent,
+    /// the retained resume source state, route readiness, and the native
+    /// Store binding for a Codex launch. `None` means settled already.
+    async fn load_dispatch_binding(&self, id: &str, command: &Command) -> Option<StartInputs> {
         let launch_agent = if command.verb == "launch" {
-            match self.accepted_launch_agent(&id).await {
+            match self.accepted_launch_agent(id).await {
                 Ok(Some(agent)) => Some(agent),
-                Ok(None) => return, // A retained/settled command cannot acquire new I/O.
+                Ok(None) => return None, // A retained/settled command cannot acquire new I/O.
                 Err(error) => {
-                    self.reject_undispatched(&id, &error.code).await;
-                    return;
+                    self.reject_undispatched(id, &error.code).await;
+                    return None;
                 }
             }
         } else {
             None
         };
         let (resume_profile, resume_source_state) = if command.verb == "resume" {
-            match self.capture_resume_source_state(&id).await {
+            match self.capture_resume_source_state(id).await {
                 Ok((profile, source_state)) => (Some(profile), Some(source_state)),
                 Err(error) => {
-                    self.reject_undispatched(&id, &error.code).await;
-                    return;
+                    self.reject_undispatched(id, &error.code).await;
+                    return None;
                 }
             }
         } else {
@@ -253,16 +367,16 @@ impl Router {
             && profile.get("route_binding").is_some()
             && let Err(error) = crate::proxy::check_profile_ready(profile).await
         {
-            self.reject_undispatched(&id, &error.code).await;
-            return;
+            self.reject_undispatched(id, &error.code).await;
+            return None;
         }
         let launch_binding = if let Some(agent) = launch_agent {
             if agent.harness == "codex" {
                 let workspace = match agent.workspace.as_deref() {
                     Some(workspace) => workspace,
                     None => {
-                        self.reject_undispatched(&id, "invalid").await;
-                        return;
+                        self.reject_undispatched(id, "invalid").await;
+                        return None;
                     }
                 };
                 let binding = match self
@@ -273,8 +387,8 @@ impl Router {
                 {
                     Ok(binding) => binding,
                     Err(error) => {
-                        self.reject_undispatched(&id, &error.code).await;
-                        return;
+                        self.reject_undispatched(id, &error.code).await;
+                        return None;
                     }
                 };
                 Some((agent, binding))
@@ -284,12 +398,29 @@ impl Router {
         } else {
             None
         };
+        Some(StartInputs {
+            launch_binding,
+            resume_source_state,
+        })
+    }
+
+    /// Commit the dispatch through the one Store writer, waiting on the bus
+    /// while the command is queued, and return only a Store-confirmed
+    /// `Dispatched` command. Queued/held, terminal, unknown, and dispatch
+    /// errors settle here; `None` means the caller must return.
+    async fn dispatch_and_wait_for_effect(
+        &self,
+        id: &str,
+        receiver: &mut broadcast::Receiver<Event>,
+        command: &Command,
+        launch_binding: &Option<(Agent, NativeStoreBinding)>,
+    ) -> Option<Command> {
         let dispatched = loop {
             let change = {
                 let mut store = self.inner.store.lock().await;
-                let dispatched = match &launch_binding {
+                let dispatched = match launch_binding {
                     Some((expected_agent, binding)) => store.dispatch_with_native_store_binding(
-                        &id,
+                        id,
                         now_ms(),
                         expected_agent,
                         binding,
@@ -310,7 +441,7 @@ impl Router {
                             "force shutdown prevents Git fetch dispatch",
                         ))
                     }
-                    None => store.dispatch(&id, now_ms()),
+                    None => store.dispatch(id, now_ms()),
                 };
                 let result = match dispatched {
                     Ok(change) => {
@@ -325,35 +456,11 @@ impl Router {
                 Ok(change) if change.value.state == CommandState::Queued => {
                     let target = change.value.target.clone();
                     let generation = change.value.generation;
-                    loop {
-                        match receiver.recv().await {
-                            Ok(event)
-                                if event.kind.starts_with("provider.")
-                                    || matches!(
-                                        event.kind.as_str(),
-                                        "command.applied"
-                                            | "command.failed"
-                                            | "command.rejected"
-                                            | "command.cancelled"
-                                            | "command.unknown"
-                                            | "command.resolved"
-                                    )
-                                    || event.kind.starts_with("workspace.")
-                                    || (event.agent == target
-                                        && event.generation == generation
-                                        && (event.kind.starts_with("turn.")
-                                            || event.kind.starts_with("session.")
-                                            || event.kind.starts_with("request."))) =>
-                            {
-                                break;
-                            }
-                            Ok(_) => continue,
-                            Err(broadcast::error::RecvError::Lagged(_)) => break,
-                            Err(broadcast::error::RecvError::Closed) => {
-                                self.reject_undispatched(&id, "event bus closed").await;
-                                return;
-                            }
-                        }
+                    if !self
+                        .wait_for_queue_release(id, receiver, target, generation)
+                        .await
+                    {
+                        return None;
                     }
                 }
                 Ok(change) if change.value.state.is_terminal() => {
@@ -361,13 +468,13 @@ impl Router {
                     // successor at this dispatch gate; never pass it to a native
                     // plugin after that result.
                     self.signal_progress();
-                    return;
+                    return None;
                 }
                 Ok(change) => break change.value,
                 Err(error) => {
-                    self.settle_dispatch_error(&id, &error, change.1, launch_binding.is_some())
+                    self.settle_dispatch_error(id, &error, change.1, launch_binding.is_some())
                         .await;
-                    return;
+                    return None;
                 }
             }
         };
@@ -376,64 +483,73 @@ impl Router {
         // terminal, unknown, and any future non-dispatched state are not effects.
         if dispatched.state != CommandState::Dispatched {
             self.signal_progress();
-            return;
+            return None;
         }
+        Some(dispatched)
+    }
 
-        if dispatched.verb == "run" {
-            let run_id = dispatched.id.clone();
-            match self.start_run_worker(dispatched) {
-                RunWorkerStart::Started | RunWorkerStart::AlreadyActive => {
-                    self.wait_run_worker(&run_id).await;
+    /// Wait for one bus event that can release a queued dispatch: provider
+    /// and command-settlement frames, workspace frames, or the target's
+    /// turn/session/request frames. Returns false only when the bus closed,
+    /// after settling that the dispatch cannot proceed.
+    async fn wait_for_queue_release(
+        &self,
+        id: &str,
+        receiver: &mut broadcast::Receiver<Event>,
+        target: Option<String>,
+        generation: Option<i64>,
+    ) -> bool {
+        loop {
+            match receiver.recv().await {
+                Ok(event)
+                    if event.kind.starts_with("provider.")
+                        || matches!(
+                            event.kind.as_str(),
+                            "command.applied"
+                                | "command.failed"
+                                | "command.rejected"
+                                | "command.cancelled"
+                                | "command.unknown"
+                                | "command.resolved"
+                        )
+                        || event.kind.starts_with("workspace.")
+                        || (event.agent == target
+                            && event.generation == generation
+                            && (event.kind.starts_with("turn.")
+                                || event.kind.starts_with("session.")
+                                || event.kind.starts_with("request."))) =>
+                {
+                    return true;
                 }
-                RunWorkerStart::ForceRequested => {
-                    self.settle_run_cancelled_before_start(&run_id).await;
+                Ok(_) => continue,
+                Err(broadcast::error::RecvError::Lagged(_)) => return true,
+                Err(broadcast::error::RecvError::Closed) => {
+                    self.reject_undispatched(id, "event bus closed").await;
+                    return false;
                 }
             }
-            self.signal_progress();
+        }
+    }
+
+    /// Run native I/O for one Store-confirmed dispatch and settle it, keeping
+    /// the order committed dispatch, native I/O, then settlement. `run` and
+    /// `git.fetch` carry their own settlement; every other verb loads its
+    /// Agent and runs one verb-family helper.
+    async fn execute_dispatched_command(
+        &self,
+        id: &str,
+        dispatched: Command,
+        git_fetch_registration: Option<ProjectRegistrationView>,
+        resume_source_state: Option<Value>,
+        linked_id: Option<String>,
+    ) {
+        if dispatched.verb == "run" {
+            self.execute_run_command(dispatched).await;
             return;
         }
         if dispatched.verb == "git.fetch" {
-            let Some(registration) = git_fetch_registration else {
-                self.settle(
-                    &id,
-                    CommandState::Rejected,
-                    Some(json!({"code":"not_allowed"})),
-                )
+            self.execute_git_fetch_command(id, dispatched, git_fetch_registration)
                 .await;
-                return;
-            };
-            let frozen = match serde_json::from_value::<FrozenGitFetch>(dispatched.args.clone()) {
-                Ok(frozen) => frozen,
-                Err(_) => {
-                    self.settle(&id, CommandState::Rejected, Some(json!({"code":"invalid"})))
-                        .await;
-                    return;
-                }
-            };
-            let mut execution = crate::git_actions::execute(
-                &self.inner.data_root,
-                &id,
-                &frozen,
-                &registration,
-                self.inner.run_cancellation.subscribe(),
-            )
-            .await;
-            self.redact_native_value(&mut execution.outcome);
-            let state = execution.state;
-            let expected_outcome = execution.outcome.clone();
-            let cleanup_view = execution.cleanup_view.take();
-            let settled = self.settle(&id, state, Some(execution.outcome)).await;
-            let durable_match = settled.as_ref().is_some_and(|command| {
-                command.id == id
-                    && command.verb == "git.fetch"
-                    && command.state == state
-                    && state != CommandState::Unknown
-                    && command.outcome.as_ref() == Some(&expected_outcome)
-            });
-            if durable_match && let Some(view) = cleanup_view {
-                crate::git_actions::cleanup_after_settlement(&self.inner.data_root, &view);
-            }
-            self.signal_progress();
             return;
         }
         let target = match dispatched.target.as_deref() {
@@ -447,259 +563,355 @@ impl Router {
                 _ => return,
             }
         };
-
-        let _result = match dispatched.verb.as_str() {
+        let verb = dispatched.verb.clone();
+        let trailing_signal = match verb.as_str() {
             "attach" => {
-                match self
-                    .inner
-                    .plugin_host
-                    .attach_observer(agent.clone(), dispatched.clone(), None)
-                    .await
-                {
-                    Ok(mut value) => {
-                        self.redact_native_value(&mut value);
-                        match validate_observer_command_result(
-                            value,
-                            &agent,
-                            &dispatched,
-                            "attached",
-                        ) {
-                            Ok(snapshot) => {
-                                let _ = self.settle_observe_attach(&id, snapshot.clone()).await;
-                                Ok(snapshot)
-                            }
-                            Err(error) => {
-                                self.settle_plugin_error(&id, &error).await;
-                                Err(error)
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        self.settle_plugin_error(&id, &error).await;
-                        Err(error)
-                    }
-                }
+                self.execute_attach_command(id, &agent, dispatched).await;
+                true
             }
-            "worktree.remove" => match self.inner.workspaces.remove(&dispatched).await {
-                Ok(value) => Ok(value),
-                Err(error) => {
-                    self.settle_plugin_error(&id, &error).await;
-                    Err(error)
-                }
-            },
+            "worktree.remove" => {
+                self.execute_worktree_remove_command(id, dispatched).await;
+                true
+            }
             "launch" | "resume" => {
-                let start = self
-                    .inner
-                    .plugin_host
-                    .start(agent, dispatched.clone(), resume_source_state)
+                self.execute_start_command(id, agent, dispatched, resume_source_state, linked_id)
                     .await;
-                match start {
-                    Ok(value) => {
-                        let _ = self
-                            .settle(&id, CommandState::Applied, Some(json!({"state": "ready"})))
-                            .await;
-                        if let Some(linked_id) = linked_id {
-                            self.schedule_command(linked_id, None);
-                        }
-                        Ok(value)
-                    }
-                    Err(error) => {
-                        self.settle_plugin_error(&id, &error).await;
-                        Err(error)
-                    }
-                }
+                true
             }
-            "send" => {
-                let response = self
-                    .inner
-                    .plugin_host
-                    .command(&agent, dispatched.clone())
-                    .await;
-                match response {
-                    Ok(value) => {
-                        let response_state = value.get("state").and_then(Value::as_str);
-                        if let Some(state) = match response_state {
-                            Some("rejected") => Some(CommandState::Rejected),
-                            Some("failed") => Some(CommandState::Failed),
-                            Some("unknown") => Some(CommandState::Unknown),
-                            _ => None,
-                        } {
-                            let mut value = value;
-                            if state == CommandState::Unknown
-                                && let Some(cause) = self
-                                    .inner
-                                    .plugin_host
-                                    .take_late_batch_cause(&agent.id, agent.generation)
-                            {
-                                value["cause"] = Value::String(cause);
-                            }
-                            self.redact_native_value(&mut value);
-                            let _ = self.settle(&id, state, Some(value.clone())).await;
-                            return;
-                        }
-                        if response_state != Some("applied") {
-                            let error = Error::new(
-                                "unknown",
-                                "plugin send response omitted its command outcome",
-                            );
-                            self.settle_plugin_error(&id, &error).await;
-                            return;
-                        }
-                        let expected_turn = value
-                            .get("turn_id")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        let current = {
-                            let store = self.inner.store.lock().await;
-                            store.get_command(&id)
-                        };
-                        match current {
-                            Ok(Some(command))
-                                if command.state == CommandState::Applied
-                                    && command.turn_id.as_deref() == Some(expected_turn) =>
-                            {
-                                Ok(value)
-                            }
-                            Ok(Some(command)) if command.state == CommandState::Unknown => {
-                                Err(Error::new(
-                                    "unknown",
-                                    "plugin event batch did not establish a committed terminal turn",
-                                ))
-                            }
-                            Ok(Some(_)) => {
-                                let error = Error::new(
-                                    "unknown",
-                                    "plugin returned without committed turn association",
-                                );
-                                self.settle_plugin_error(&id, &error).await;
-                                Err(error)
-                            }
-                            Ok(None) => Err(Error::new("not_found", "command disappeared")),
-                            Err(error) => Err(error),
-                        }
-                    }
-                    Err(error) => {
-                        self.settle_plugin_error(&id, &error).await;
-                        Err(error)
-                    }
-                }
-            }
+            "send" => self.execute_send_command(id, &agent, dispatched).await,
             "steer" | "interrupt" | "approve" | "deny" | "answer" => {
-                match self
-                    .inner
-                    .plugin_host
-                    .command(&agent, dispatched.clone())
-                    .await
-                {
-                    Ok(mut value) => {
-                        let state = match value.get("state").and_then(Value::as_str) {
-                            Some("applied") => CommandState::Applied,
-                            Some("rejected") => CommandState::Rejected,
-                            Some("failed") => CommandState::Failed,
-                            Some("unknown") => CommandState::Unknown,
-                            _ => {
-                                let error = Error::new(
-                                    "unknown",
-                                    "plugin command response omitted its outcome",
-                                );
-                                self.settle_plugin_error(&id, &error).await;
-                                return;
-                            }
-                        };
-                        if state == CommandState::Unknown
-                            && let Some(cause) = self
-                                .inner
-                                .plugin_host
-                                .take_late_batch_cause(&agent.id, agent.generation)
-                        {
-                            value["cause"] = Value::String(cause);
-                        }
-                        self.redact_native_value(&mut value);
-                        let _ = self.settle(&id, state, Some(value.clone())).await;
-                        Ok(value)
-                    }
-                    Err(error) => {
-                        self.settle_plugin_error(&id, &error).await;
-                        Err(error)
-                    }
-                }
+                self.execute_control_command(id, &agent, dispatched).await
             }
-            "stop" => {
-                // Store dispatch atomically latches a preparation cancel before
-                // the manager signals its custody. Otherwise this is native stop.
-                match self.inner.workspaces.cancel(&id).await {
-                    Ok(true) => {
-                        self.signal_progress();
-                        return;
-                    }
-                    Ok(false) => {}
-                    Err(error) => {
-                        self.settle_plugin_error(&id, &error).await;
-                        self.signal_progress();
-                        return;
-                    }
-                }
-                let force = dispatched
-                    .args
-                    .get("force")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                match self
-                    .inner
-                    .plugin_host
-                    .stop(&agent, dispatched.clone(), force)
-                    .await
-                {
-                    Ok(value) => {
-                        let mut summary = json!({
-                            "state": "applied",
-                            "custody": value.get("custody").cloned().unwrap_or(Value::Null),
-                            "graceful": value.get("graceful").cloned().unwrap_or(Value::Bool(false)),
-                        });
-                        if let Some(diagnostics) = value.get("diagnostics") {
-                            summary["diagnostics"] = diagnostics.clone();
-                        }
-                        self.redact_native_value(&mut summary);
-                        let _ = self.settle(&id, CommandState::Applied, Some(summary)).await;
-                        Ok(value)
-                    }
-                    Err(error) => {
-                        self.settle_plugin_error(&id, &error).await;
-                        Err(error)
-                    }
-                }
-            }
+            "stop" => self.execute_stop_command(id, &agent, dispatched).await,
             "detach" => {
-                match self
-                    .inner
-                    .plugin_host
-                    .detach_observer(&agent, dispatched.clone())
-                    .await
-                {
-                    Ok(value) => match validate_observer_command_result(
-                        value,
-                        &agent,
-                        &dispatched,
-                        "detached",
-                    ) {
-                        Ok(outcome) => {
-                            let _ = self.settle_observe_detach(&id, outcome.clone()).await;
-                            Ok(outcome)
-                        }
-                        Err(error) => {
-                            self.settle_plugin_error(&id, &error).await;
-                            Err(error)
-                        }
-                    },
+                self.execute_detach_command(id, &agent, dispatched).await;
+                true
+            }
+            _ => {
+                let _ = Error::new("unsupported", "command verb is not implemented");
+                true
+            }
+        };
+        if trailing_signal {
+            self.signal_progress();
+        }
+    }
+
+    /// Run a dispatched `run` command to worker completion, or settle the
+    /// pre-start cancellation when Force was requested first.
+    async fn execute_run_command(&self, dispatched: Command) {
+        let run_id = dispatched.id.clone();
+        match self.start_run_worker(dispatched) {
+            RunWorkerStart::Started | RunWorkerStart::AlreadyActive => {
+                self.wait_run_worker(&run_id).await;
+            }
+            RunWorkerStart::ForceRequested => {
+                self.settle_run_cancelled_before_start(&run_id).await;
+            }
+        }
+        self.signal_progress();
+    }
+
+    /// Execute a dispatched `git.fetch` against its registration and settle
+    /// the recorded outcome, cleaning up only after a durable match.
+    async fn execute_git_fetch_command(
+        &self,
+        id: &str,
+        dispatched: Command,
+        registration: Option<ProjectRegistrationView>,
+    ) {
+        let Some(registration) = registration else {
+            self.settle(
+                id,
+                CommandState::Rejected,
+                Some(json!({"code":"not_allowed"})),
+            )
+            .await;
+            return;
+        };
+        let frozen = match serde_json::from_value::<FrozenGitFetch>(dispatched.args.clone()) {
+            Ok(frozen) => frozen,
+            Err(_) => {
+                self.settle(id, CommandState::Rejected, Some(json!({"code":"invalid"})))
+                    .await;
+                return;
+            }
+        };
+        let mut execution = crate::git_actions::execute(
+            &self.inner.data_root,
+            id,
+            &frozen,
+            &registration,
+            self.inner.run_cancellation.subscribe(),
+        )
+        .await;
+        self.redact_native_value(&mut execution.outcome);
+        let state = execution.state;
+        let expected_outcome = execution.outcome.clone();
+        let cleanup_view = execution.cleanup_view.take();
+        let settled = self.settle(id, state, Some(execution.outcome)).await;
+        let durable_match = settled.as_ref().is_some_and(|command| {
+            command.id == id
+                && command.verb == "git.fetch"
+                && command.state == state
+                && state != CommandState::Unknown
+                && command.outcome.as_ref() == Some(&expected_outcome)
+        });
+        if durable_match && let Some(view) = cleanup_view {
+            crate::git_actions::cleanup_after_settlement(&self.inner.data_root, &view);
+        }
+        self.signal_progress();
+    }
+
+    /// Attach an observer through the owned plugin and settle the validated
+    /// snapshot.
+    async fn execute_attach_command(&self, id: &str, agent: &Agent, dispatched: Command) {
+        match self
+            .inner
+            .plugin_host
+            .attach_observer(agent.clone(), dispatched.clone(), None)
+            .await
+        {
+            Ok(mut value) => {
+                self.redact_native_value(&mut value);
+                match validate_observer_command_result(value, agent, &dispatched, "attached") {
+                    Ok(snapshot) => {
+                        let _ = self.settle_observe_attach(id, snapshot.clone()).await;
+                    }
                     Err(error) => {
-                        self.settle_plugin_error(&id, &error).await;
-                        Err(error)
+                        self.settle_plugin_error(id, &error).await;
                     }
                 }
             }
-            _ => Err(Error::new("unsupported", "command verb is not implemented")),
-        };
-        self.signal_progress();
+            Err(error) => {
+                self.settle_plugin_error(id, &error).await;
+            }
+        }
+    }
+
+    /// Remove a managed worktree and settle a removal failure.
+    async fn execute_worktree_remove_command(&self, id: &str, dispatched: Command) {
+        match self.inner.workspaces.remove(&dispatched).await {
+            Ok(_) => {}
+            Err(error) => {
+                self.settle_plugin_error(id, &error).await;
+            }
+        }
+    }
+
+    /// Start a launched or resumed Agent through the owned plugin, settle
+    /// ready, and schedule the linked input if there is one.
+    async fn execute_start_command(
+        &self,
+        id: &str,
+        agent: Agent,
+        dispatched: Command,
+        resume_source_state: Option<Value>,
+        linked_id: Option<String>,
+    ) {
+        let start = self
+            .inner
+            .plugin_host
+            .start(agent, dispatched.clone(), resume_source_state)
+            .await;
+        match start {
+            Ok(_) => {
+                let _ = self
+                    .settle(id, CommandState::Applied, Some(json!({"state": "ready"})))
+                    .await;
+                if let Some(linked_id) = linked_id {
+                    self.schedule_command(linked_id, None);
+                }
+            }
+            Err(error) => {
+                self.settle_plugin_error(id, &error).await;
+            }
+        }
+    }
+
+    /// Send one turn through the owned plugin and settle its outcome,
+    /// requiring a committed turn association for an applied send. Returns
+    /// whether the caller must send the trailing progress signal.
+    async fn execute_send_command(&self, id: &str, agent: &Agent, dispatched: Command) -> bool {
+        let response = self
+            .inner
+            .plugin_host
+            .command(agent, dispatched.clone())
+            .await;
+        match response {
+            Ok(value) => {
+                let response_state = value.get("state").and_then(Value::as_str);
+                if let Some(state) = match response_state {
+                    Some("rejected") => Some(CommandState::Rejected),
+                    Some("failed") => Some(CommandState::Failed),
+                    Some("unknown") => Some(CommandState::Unknown),
+                    _ => None,
+                } {
+                    let mut value = value;
+                    if state == CommandState::Unknown
+                        && let Some(cause) = self
+                            .inner
+                            .plugin_host
+                            .take_late_batch_cause(&agent.id, agent.generation)
+                    {
+                        value["cause"] = Value::String(cause);
+                    }
+                    self.redact_native_value(&mut value);
+                    let _ = self.settle(id, state, Some(value.clone())).await;
+                    return false;
+                }
+                if response_state != Some("applied") {
+                    let error = Error::new(
+                        "unknown",
+                        "plugin send response omitted its command outcome",
+                    );
+                    self.settle_plugin_error(id, &error).await;
+                    return false;
+                }
+                let expected_turn = value
+                    .get("turn_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let current = {
+                    let store = self.inner.store.lock().await;
+                    store.get_command(id)
+                };
+                match current {
+                    Ok(Some(command))
+                        if command.state == CommandState::Applied
+                            && command.turn_id.as_deref() == Some(expected_turn) => {}
+                    Ok(Some(command)) if command.state == CommandState::Unknown => {}
+                    Ok(Some(_)) => {
+                        let error = Error::new(
+                            "unknown",
+                            "plugin returned without committed turn association",
+                        );
+                        self.settle_plugin_error(id, &error).await;
+                    }
+                    Ok(None) => {}
+                    Err(_) => {}
+                }
+            }
+            Err(error) => {
+                self.settle_plugin_error(id, &error).await;
+            }
+        }
+        true
+    }
+
+    /// Run one native control (steer, interrupt, or a request reply) through
+    /// the owned plugin and settle its outcome. Returns whether the caller
+    /// must send the trailing progress signal.
+    async fn execute_control_command(&self, id: &str, agent: &Agent, dispatched: Command) -> bool {
+        match self
+            .inner
+            .plugin_host
+            .command(agent, dispatched.clone())
+            .await
+        {
+            Ok(mut value) => {
+                let state = match value.get("state").and_then(Value::as_str) {
+                    Some("applied") => CommandState::Applied,
+                    Some("rejected") => CommandState::Rejected,
+                    Some("failed") => CommandState::Failed,
+                    Some("unknown") => CommandState::Unknown,
+                    _ => {
+                        let error =
+                            Error::new("unknown", "plugin command response omitted its outcome");
+                        self.settle_plugin_error(id, &error).await;
+                        return false;
+                    }
+                };
+                if state == CommandState::Unknown
+                    && let Some(cause) = self
+                        .inner
+                        .plugin_host
+                        .take_late_batch_cause(&agent.id, agent.generation)
+                {
+                    value["cause"] = Value::String(cause);
+                }
+                self.redact_native_value(&mut value);
+                let _ = self.settle(id, state, Some(value.clone())).await;
+            }
+            Err(error) => {
+                self.settle_plugin_error(id, &error).await;
+            }
+        }
+        true
+    }
+
+    /// Stop an Agent: a latched preparation cancel settles through the
+    /// Store, otherwise the owned plugin stops natively and the summary is
+    /// settled. Returns whether the caller must send the trailing progress
+    /// signal.
+    async fn execute_stop_command(&self, id: &str, agent: &Agent, dispatched: Command) -> bool {
+        // Store dispatch atomically latches a preparation cancel before
+        // the manager signals its custody. Otherwise this is native stop.
+        match self.inner.workspaces.cancel(id).await {
+            Ok(true) => {
+                self.signal_progress();
+                return false;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                self.settle_plugin_error(id, &error).await;
+                self.signal_progress();
+                return false;
+            }
+        }
+        let force = dispatched
+            .args
+            .get("force")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        match self
+            .inner
+            .plugin_host
+            .stop(agent, dispatched.clone(), force)
+            .await
+        {
+            Ok(value) => {
+                let mut summary = json!({
+                    "state": "applied",
+                    "custody": value.get("custody").cloned().unwrap_or(Value::Null),
+                    "graceful": value.get("graceful").cloned().unwrap_or(Value::Bool(false)),
+                });
+                if let Some(diagnostics) = value.get("diagnostics") {
+                    summary["diagnostics"] = diagnostics.clone();
+                }
+                self.redact_native_value(&mut summary);
+                let _ = self.settle(id, CommandState::Applied, Some(summary)).await;
+            }
+            Err(error) => {
+                self.settle_plugin_error(id, &error).await;
+            }
+        }
+        true
+    }
+
+    /// Detach an observer through the owned plugin and settle the validated
+    /// outcome.
+    async fn execute_detach_command(&self, id: &str, agent: &Agent, dispatched: Command) {
+        match self
+            .inner
+            .plugin_host
+            .detach_observer(agent, dispatched.clone())
+            .await
+        {
+            Ok(value) => {
+                match validate_observer_command_result(value, agent, &dispatched, "detached") {
+                    Ok(outcome) => {
+                        let _ = self.settle_observe_detach(id, outcome.clone()).await;
+                    }
+                    Err(error) => {
+                        self.settle_plugin_error(id, &error).await;
+                    }
+                }
+            }
+            Err(error) => {
+                self.settle_plugin_error(id, &error).await;
+            }
+        }
     }
 }
 
