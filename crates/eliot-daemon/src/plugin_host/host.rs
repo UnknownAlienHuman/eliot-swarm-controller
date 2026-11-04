@@ -285,7 +285,7 @@ impl PluginHost {
         }
         if !matches!(
             agent.harness.as_str(),
-            "fake" | "codex" | "muse" | "claude" | "opencode"
+            "fake" | "codex" | "muse" | "claude" | "opencode" | "antigravity"
         ) || agent.generation <= 0
         {
             return Err(Error::new(
@@ -2110,7 +2110,10 @@ fn manifest_source_plan(manifest: &PluginManifest, harness: &str) -> Result<Valu
         return Err(unsupported_manifest());
     }
 
-    if !matches!(harness, "fake" | "codex" | "muse" | "claude" | "opencode") {
+    if !matches!(
+        harness,
+        "fake" | "codex" | "muse" | "claude" | "opencode" | "antigravity"
+    ) {
         return Err(unsupported_manifest());
     }
     let expected_families = ["message", "session", "turn"];
@@ -2136,7 +2139,7 @@ fn manifest_source_plan(manifest: &PluginManifest, harness: &str) -> Result<Valu
         .sources
         .get("controlled")
         .ok_or_else(unsupported_manifest)?;
-    let tool_expected = harness == "codex";
+    let tool_expected = harness == "codex" || harness == "antigravity";
     let request_expected = matches!(harness, "fake" | "codex" | "muse" | "claude" | "opencode");
     let expected_count = expected_families.len()
         + if tool_expected { 1 } else { 0 }

@@ -75,6 +75,14 @@ uses the installed experimental `turn/start.collaborationMode` field, so only pr
 that explicitly select a mode opt into `initialize.capabilities.experimentalApi`.
 No global Codex configuration is changed.
 
+An Antigravity profile selects `harness = "antigravity"` with an explicit native
+`cmd`, an exact `model`, an optional `mode` (`plan`, `auto` or `accept-edits`)
+and an optional `dangerously_skip_permissions` flag (default false). `effort`,
+`approval`, `collaboration_mode`, `permissions` and `approval_policy` presets have
+no mapping and are rejected. The effective permission mode and effective model come
+from native init facts; init does not establish the served model. See the
+[Antigravity page](../harnesses/antigravity.md).
+
 ## Owner workspace setup
 
 Global profiles accept ordered setup entries only for an explicit `launch --worktree`.

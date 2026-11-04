@@ -1,0 +1,17 @@
+[package]
+name = "eliot-plugin-antigravity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+eliot-core.workspace = true
+eliot-plugin.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+ulid.workspace = true

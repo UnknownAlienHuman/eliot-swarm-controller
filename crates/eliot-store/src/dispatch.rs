@@ -250,11 +250,11 @@ impl Store {
                 }
                 if !matches!(
                     agent.harness.as_str(),
-                    "codex" | "fake" | "muse" | "claude" | "opencode"
+                    "codex" | "fake" | "muse" | "claude" | "opencode" | "antigravity"
                 ) {
                     return Err(Error::new(
                         "unsupported",
-                        "resume is only supported for Codex, Muse, Claude, OpenCode, or Fake Agents",
+                        "resume is only supported for Codex, Muse, Claude, OpenCode, Antigravity, or Fake Agents",
                     ));
                 }
                 if has_pending_resume_tx(&tx, agent_num, old_generation, id)? {

@@ -27,6 +27,11 @@ name = "opencode_plugin"
 path = "tests/opencode_plugin.rs"
 harness = false
 
+[[test]]
+name = "antigravity_plugin"
+path = "tests/antigravity_plugin.rs"
+harness = false
+
 [target.'cfg(unix)'.dev-dependencies]
 libc.workspace = true
 
@@ -39,6 +44,7 @@ eliot-plugin-codex.workspace = true
 eliot-plugin-muse.workspace = true
 eliot-plugin-claude.workspace = true
 eliot-plugin-opencode.workspace = true
+eliot-plugin-antigravity.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 ulid.workspace = true

@@ -391,7 +391,7 @@ pub(super) fn submit_tx(
             };
             if !matches!(
                 harness.as_str(),
-                "fake" | "codex" | "muse" | "claude" | "opencode"
+                "fake" | "codex" | "muse" | "claude" | "opencode" | "antigravity"
             ) {
                 return Err(Error::new(
                     "unsupported",
@@ -634,11 +634,11 @@ pub(super) fn submit_tx(
             }
             if !matches!(
                 agent.harness.as_str(),
-                "codex" | "fake" | "muse" | "claude" | "opencode"
+                "codex" | "fake" | "muse" | "claude" | "opencode" | "antigravity"
             ) {
                 return Err(Error::new(
                     "unsupported",
-                    "resume is only supported for Codex, Muse, Claude, OpenCode, or Fake Agents with a retained native subject",
+                    "resume is only supported for Codex, Muse, Claude, OpenCode, Antigravity, or Fake Agents with a retained native subject",
                 ));
             }
             if let Some(expected) = request.expected_generation

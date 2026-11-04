@@ -3658,7 +3658,7 @@ fn validate_retained_resume_agent(agent: &Agent, command: &Command) -> Result<i6
                 ));
             }
         }
-        "fake" | "muse" | "claude" | "opencode" => {
+        "fake" | "muse" | "claude" | "opencode" | "antigravity" => {
             if agent.profile_snapshot.get("native_store_binding").is_some() {
                 return Err(Error::new(
                     "source_integrity",
@@ -4005,7 +4005,10 @@ fn install_frozen_profile(
     snapshot: Value,
     require_snapshot_harness: bool,
 ) -> Result<()> {
-    if !matches!(harness, "fake" | "codex" | "muse" | "claude" | "opencode") {
+    if !matches!(
+        harness,
+        "fake" | "codex" | "muse" | "claude" | "opencode" | "antigravity"
+    ) {
         return Err(Error::new(
             "unsupported",
             format!("unsupported launch harness {harness}"),

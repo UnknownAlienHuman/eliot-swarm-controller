@@ -40,7 +40,7 @@ per-task report packets or another status registry.
 
 ## Repairs to implemented paths
 
-**Next:** the remaining current-path repairs below, then L4.2. Checked layers record
+**Next:** the remaining current-path repairs below. Checked layers record
 delivered increments, not full crash/load qualification.
 Use the existing Store/router and small internal modules. Keep evidence in the PR/CI.
 
@@ -255,11 +255,8 @@ Codex or for unrelated adapters.
       the capability. Missing semantics reject; no compatibility executor.
 - [ ] **L6.4 Selected optional adapters.** Add only those explicitly selected for the
       release; record the selection here. Unselected adapters stay absent.
-      Muse Code selected by the owner 2026-11-03. PR1 connects launch, send,
-      stop and profile readback; PR2 adds resume of the exact retained session
-      in a new generation. A1 connects approvals; A2 connects steer,
-      interrupt and configure (model/reasoning/approval). The remainder is
-      native children, which stay unconnected for L5.3.
+      Muse Code selected by the owner 2026-11-03; Antigravity selected 2026-11-04.
+      Remainder: Muse native children; Antigravity launch/send/stop/resume.
 
 **Feature-complete local scope:** core, Codex, monitoring/workspaces, automation,
 coordination and the selected adapters. Do not hold this milestone for an unused vendor
