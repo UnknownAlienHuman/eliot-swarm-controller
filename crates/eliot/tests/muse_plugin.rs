@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1640,7 +1641,13 @@ impl FakeMsp {
 // Host-side emulator: drives `eliot plugin muse` over the plugin protocol
 // ---------------------------------------------------------------------------
 
-type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>>;
+/// A call response plus its consumption signal: the reader holds back later
+/// plugin requests until the test has taken every earlier response (the
+/// signal fires when the sender is dropped).
+type Reply = (Result<Value, String>, oneshot::Sender<()>);
+type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<Reply>>>>;
+type CallRx =
+    Pin<Box<dyn Future<Output = Result<Result<Value, String>, oneshot::error::RecvError>> + Send>>;
 
 struct Host {
     writes: Option<mpsc::Sender<String>>,
@@ -1714,6 +1721,11 @@ impl Host {
         let reader_pending = Arc::clone(&pending);
         tokio::spawn(async move {
             let mut lines = AsyncBufReader::new(stdout).lines();
+            // Responses and requests travel on separate channels, so a pump
+            // that polls both could see a request before the response that
+            // preceded it on the wire. Keep wire order: release a request
+            // only after the test consumed every earlier response.
+            let mut unconsumed: Vec<oneshot::Receiver<()>> = Vec::new();
             loop {
                 let line = match lines.next_line().await {
                     Ok(Some(line)) => line,
@@ -1727,6 +1739,9 @@ impl Host {
                     Err(_) => continue,
                 };
                 if let Some(method) = frame.get("method").and_then(Value::as_str) {
+                    for consumed in unconsumed.drain(..) {
+                        let _ = consumed.await;
+                    }
                     let _ = inbound_tx
                         .send(HostRequest {
                             id: frame.get("id").cloned().unwrap_or(Value::Null),
@@ -1743,17 +1758,19 @@ impl Host {
                     .to_owned();
                 let sender = reader_pending.lock().await.remove(&id);
                 let Some(sender) = sender else { continue };
-                if let Some(result) = frame.get("result") {
-                    let _ = sender.send(Ok(result.clone()));
-                } else {
-                    let code = frame
+                let result = match frame.get("result") {
+                    Some(result) => Ok(result.clone()),
+                    None => Err(frame
                         .get("error")
                         .and_then(|error| error.get("data"))
                         .and_then(|data| data.get("code"))
                         .and_then(Value::as_str)
                         .unwrap_or("rpc_error")
-                        .to_owned();
-                    let _ = sender.send(Err(code));
+                        .to_owned()),
+                };
+                let (consumed_tx, consumed) = oneshot::channel();
+                if sender.send((result, consumed_tx)).is_ok() {
+                    unconsumed.push(consumed);
                 }
             }
         });
@@ -1782,11 +1799,7 @@ impl Host {
 
     /// Send a call and return its owned response receiver, so pumps can poll
     /// inbound host requests while the call is in flight.
-    async fn begin_call(
-        &mut self,
-        method: &str,
-        params: Value,
-    ) -> oneshot::Receiver<Result<Value, String>> {
+    async fn begin_call(&mut self, method: &str, params: Value) -> CallRx {
         self.next_id += 1;
         let id = format!("host-call-{}", self.next_id);
         let (tx, rx) = oneshot::channel();
@@ -1796,7 +1809,7 @@ impl Host {
             .send(frame.to_string())
             .await
             .expect("host write queue");
-        rx
+        Box::pin(async move { rx.await.map(|(result, _consumed)| result) })
     }
 
     async fn respond(&self, id: &Value, result: Value) {
@@ -1923,7 +1936,7 @@ impl Scenario {
         generation: i64,
         resume_from: Value,
         source_state: Value,
-    ) -> (PendingStart, oneshot::Receiver<Result<Value, String>>) {
+    ) -> (PendingStart, CallRx) {
         let root: PathBuf = std::env::temp_dir().join(format!(
             "eliot-muse-plugin-test-{}",
             ulid::Ulid::new().to_string().to_lowercase()
@@ -2010,11 +2023,7 @@ impl Scenario {
 impl PendingStart {
     /// Drive the in-flight start to readiness. `expected_native_ref` pins
     /// the resumed session; launch leaves it absent.
-    async fn finish(
-        mut self,
-        rx: oneshot::Receiver<Result<Value, String>>,
-        expected_native_ref: Option<&str>,
-    ) -> Scenario {
+    async fn finish(mut self, rx: CallRx, expected_native_ref: Option<&str>) -> Scenario {
         let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
         // `agent.start` only resolves after the harness child registers and
         // the session.ready batch commits; answer both while it is in flight.
@@ -2131,7 +2140,7 @@ impl PendingStart {
     /// the recorded gap reason.
     async fn finish_with_snapshot_gap(
         mut self,
-        rx: oneshot::Receiver<Result<Value, String>>,
+        rx: CallRx,
         expected_native_ref: Option<&str>,
     ) -> (Scenario, String) {
         let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
@@ -2233,11 +2242,7 @@ impl PendingStart {
     /// still registers (it spawns before preflight/dispatch), a dead host's
     /// stream gap is acknowledged, but no `session.ready` may commit: no
     /// Agent session is created.
-    async fn finish_expecting_error(
-        mut self,
-        rx: oneshot::Receiver<Result<Value, String>>,
-        expected_code: &str,
-    ) -> FailedAttempt {
+    async fn finish_expecting_error(mut self, rx: CallRx, expected_code: &str) -> FailedAttempt {
         let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
         let outcome = loop {
             tokio::select! {
