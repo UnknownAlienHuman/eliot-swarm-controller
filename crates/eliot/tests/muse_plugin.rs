@@ -12,9 +12,10 @@
 //! (`process.put`, `events.put`, `source.gap`).
 
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1640,7 +1641,13 @@ impl FakeMsp {
 // Host-side emulator: drives `eliot plugin muse` over the plugin protocol
 // ---------------------------------------------------------------------------
 
-type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>>;
+/// A call response plus its consumption signal: the reader holds back later
+/// plugin requests until the test has taken every earlier response (the
+/// signal fires when the sender is dropped).
+type Reply = (Result<Value, String>, oneshot::Sender<()>);
+type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<Reply>>>>;
+type CallRx =
+    Pin<Box<dyn Future<Output = Result<Result<Value, String>, oneshot::error::RecvError>> + Send>>;
 
 struct Host {
     writes: Option<mpsc::Sender<String>>,
@@ -1650,6 +1657,9 @@ struct Host {
     next_seq: i64,
     child: tokio::process::Child,
     stderr: Option<tokio::task::JoinHandle<String>>,
+    /// Batches a reply pump already acked while the reply was in flight,
+    /// checked in commit order by `answer_events_put`.
+    early: VecDeque<HostRequest>,
 }
 
 struct HostRequest {
@@ -1714,6 +1724,11 @@ impl Host {
         let reader_pending = Arc::clone(&pending);
         tokio::spawn(async move {
             let mut lines = AsyncBufReader::new(stdout).lines();
+            // Responses and requests travel on separate channels, so a pump
+            // that polls both could see a request before the response that
+            // preceded it on the wire. Keep wire order: release a request
+            // only after the test consumed every earlier response.
+            let mut unconsumed: Vec<oneshot::Receiver<()>> = Vec::new();
             loop {
                 let line = match lines.next_line().await {
                     Ok(Some(line)) => line,
@@ -1727,6 +1742,9 @@ impl Host {
                     Err(_) => continue,
                 };
                 if let Some(method) = frame.get("method").and_then(Value::as_str) {
+                    for consumed in unconsumed.drain(..) {
+                        let _ = consumed.await;
+                    }
                     let _ = inbound_tx
                         .send(HostRequest {
                             id: frame.get("id").cloned().unwrap_or(Value::Null),
@@ -1743,17 +1761,19 @@ impl Host {
                     .to_owned();
                 let sender = reader_pending.lock().await.remove(&id);
                 let Some(sender) = sender else { continue };
-                if let Some(result) = frame.get("result") {
-                    let _ = sender.send(Ok(result.clone()));
-                } else {
-                    let code = frame
+                let result = match frame.get("result") {
+                    Some(result) => Ok(result.clone()),
+                    None => Err(frame
                         .get("error")
                         .and_then(|error| error.get("data"))
                         .and_then(|data| data.get("code"))
                         .and_then(Value::as_str)
                         .unwrap_or("rpc_error")
-                        .to_owned();
-                    let _ = sender.send(Err(code));
+                        .to_owned()),
+                };
+                let (consumed_tx, consumed) = oneshot::channel();
+                if sender.send((result, consumed_tx)).is_ok() {
+                    unconsumed.push(consumed);
                 }
             }
         });
@@ -1765,6 +1785,7 @@ impl Host {
             next_seq: 1,
             child,
             stderr: Some(stderr_task),
+            early: VecDeque::new(),
         }
     }
 
@@ -1781,12 +1802,10 @@ impl Host {
     }
 
     /// Send a call and return its owned response receiver, so pumps can poll
-    /// inbound host requests while the call is in flight.
-    async fn begin_call(
-        &mut self,
-        method: &str,
-        params: Value,
-    ) -> oneshot::Receiver<Result<Value, String>> {
+    /// inbound host requests while the call is in flight. Poll or drop the
+    /// receiver before waiting on a plugin request the plugin writes after
+    /// this response: the reader holds later requests until it is consumed.
+    async fn begin_call(&mut self, method: &str, params: Value) -> CallRx {
         self.next_id += 1;
         let id = format!("host-call-{}", self.next_id);
         let (tx, rx) = oneshot::channel();
@@ -1796,7 +1815,7 @@ impl Host {
             .send(frame.to_string())
             .await
             .expect("host write queue");
-        rx
+        Box::pin(async move { rx.await.map(|(result, _consumed)| result) })
     }
 
     async fn respond(&self, id: &Value, result: Value) {
@@ -1814,14 +1833,19 @@ impl Host {
             .expect("plugin request channel")
     }
 
-    /// Answer one `events.put`, returning its committed events.
+    /// Answer one `events.put`, returning its committed events. A batch a
+    /// reply pump already acked in flight is checked here without a second
+    /// ack.
     async fn answer_events_put(
         &mut self,
         agent_id: &str,
         generation: i64,
         expected_kind: &str,
     ) -> Vec<Value> {
-        let request = self.next_request().await;
+        let (request, acked) = match self.early.pop_front() {
+            Some(request) => (request, true),
+            None => (self.next_request().await, false),
+        };
         assert_eq!(
             request.method, "events.put",
             "expected {expected_kind}, plugin asked {}",
@@ -1850,6 +1874,9 @@ impl Host {
             events[0].get("kind").and_then(Value::as_str),
             Some(expected_kind)
         );
+        if acked {
+            return events;
+        }
         let first = self.next_seq;
         self.next_seq += events.len() as i64;
         self.respond(
@@ -1868,6 +1895,11 @@ impl Host {
         // Like the daemon, close the plugin's stdin after shutdown: the
         // plugin's reader teardown completes on EOF.
         drop(self.writes.take());
+        assert!(
+            self.early.is_empty(),
+            "{} batch(es) committed during a reply were never checked",
+            self.early.len()
+        );
         let status = tokio::time::timeout(OP_TIMEOUT, self.child.wait())
             .await
             .expect("plugin exit deadline")
@@ -1923,7 +1955,7 @@ impl Scenario {
         generation: i64,
         resume_from: Value,
         source_state: Value,
-    ) -> (PendingStart, oneshot::Receiver<Result<Value, String>>) {
+    ) -> (PendingStart, CallRx) {
         let root: PathBuf = std::env::temp_dir().join(format!(
             "eliot-muse-plugin-test-{}",
             ulid::Ulid::new().to_string().to_lowercase()
@@ -2010,11 +2042,7 @@ impl Scenario {
 impl PendingStart {
     /// Drive the in-flight start to readiness. `expected_native_ref` pins
     /// the resumed session; launch leaves it absent.
-    async fn finish(
-        mut self,
-        rx: oneshot::Receiver<Result<Value, String>>,
-        expected_native_ref: Option<&str>,
-    ) -> Scenario {
+    async fn finish(mut self, rx: CallRx, expected_native_ref: Option<&str>) -> Scenario {
         let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
         // `agent.start` only resolves after the harness child registers and
         // the session.ready batch commits; answer both while it is in flight.
@@ -2131,7 +2159,7 @@ impl PendingStart {
     /// the recorded gap reason.
     async fn finish_with_snapshot_gap(
         mut self,
-        rx: oneshot::Receiver<Result<Value, String>>,
+        rx: CallRx,
         expected_native_ref: Option<&str>,
     ) -> (Scenario, String) {
         let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
@@ -2233,11 +2261,7 @@ impl PendingStart {
     /// still registers (it spawns before preflight/dispatch), a dead host's
     /// stream gap is acknowledged, but no `session.ready` may commit: no
     /// Agent session is created.
-    async fn finish_expecting_error(
-        mut self,
-        rx: oneshot::Receiver<Result<Value, String>>,
-        expected_code: &str,
-    ) -> FailedAttempt {
+    async fn finish_expecting_error(mut self, rx: CallRx, expected_code: &str) -> FailedAttempt {
         let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
         let outcome = loop {
             tokio::select! {
@@ -2959,6 +2983,7 @@ async fn reply_with_id(
                     "first_seq": first, "last_seq": first,
                     "cursor": request.params.get("cursor").cloned().unwrap_or(Value::Null),
                 })).await;
+                host.early.push_back(request);
             }
             result = &mut rx => break result,
         }
@@ -2996,13 +3021,10 @@ async fn reply_until_applied(
         )
         .await;
         match result.get("state").and_then(Value::as_str) {
-            Some("applied") => {
-                // The resolution lands after the reply: the processor is
-                // busy inside this control call when the decide ack arrives,
-                // so no stream frame can commit while it is in flight.
-                assert!(in_flight.is_empty(), "resolution lands after the reply");
-                return (command_id, result);
-            }
+            // The resolution may commit before or after the reply's own
+            // response (the Store binds it to the dispatched command);
+            // callers check it through `answer_events_put` either way.
+            Some("applied") => return (command_id, result),
             // Any other non-rejected outcome (unknown, an RPC error shape)
             // is a real failure, not a not-yet-applied update.
             Some("rejected") => {
@@ -4972,7 +4994,7 @@ async fn scenario_approve_resolves_the_exact_offered_choice() {
     assert_eq!(choices.len(), 2);
     assert!(opened["details"].get("subagent_origin").is_none());
 
-    let (reply_id, result, in_flight) = reply(
+    let (reply_id, result, _) = reply(
         &mut scenario.host,
         &agent_id,
         1,
@@ -4986,7 +5008,6 @@ async fn scenario_approve_resolves_the_exact_offered_choice() {
     assert_eq!(result["command_id"], json!(reply_id));
     assert_eq!(result["request_id"], json!(request_id));
     assert_eq!(result["turn_id"], json!(turn_id));
-    assert!(in_flight.is_empty(), "resolution lands after the reply");
 
     let resolved = scenario
         .host
@@ -5182,7 +5203,7 @@ async fn scenario_unknown_choice_is_rejected_without_write() {
         json!(2)
     );
 
-    let (_, stale, _) = reply(
+    let (_, stale, in_flight) = reply(
         &mut scenario.host,
         &agent_id,
         1,
@@ -5193,6 +5214,10 @@ async fn scenario_unknown_choice_is_rejected_without_write() {
     )
     .await;
     assert_eq!(stale["state"], json!("rejected"));
+    assert!(
+        in_flight.is_empty(),
+        "a locally rejected reply commits nothing"
+    );
     assert_eq!(scenario.report()["decides"], json!(0));
 
     let (reply_id, result, _) = reply(
