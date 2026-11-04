@@ -103,7 +103,7 @@ fn main() {
         scenario_control_steer_after_terminal_is_stale().await;
         println!("ok - steer after terminal on the finished turn is stale_turn");
         scenario_control_terminal_race_refuses_both_controls().await;
-        println!("ok - queued terminal refuses interrupt and steer without a write");
+        println!("ok - controls racing a queued terminal are refused without a write");
         scenario_control_steer_missing_text_is_invalid().await;
         println!("ok - steer without text is invalid");
         scenario_control_steer_forwards_text_to_exact_turn().await;
@@ -3119,6 +3119,43 @@ async fn control(
     (command_id, result, committed)
 }
 
+/// Drive interrupt with fresh command ids until the readiness gate holds.
+/// The gate reads the watch snapshot the event loop publishes at its loop
+/// bottom, so a probe sent right after the gap ack may still see a healthy
+/// source and settle `unknown` (dead host, no write) instead. Bounded like
+/// `reply_until_applied`; every probe is writeless and the returned refusal
+/// carries the exact gate reason.
+async fn interrupt_until_rejected(
+    host: &mut Host,
+    agent_id: &str,
+    generation: i64,
+    turn_id: &str,
+) -> Value {
+    for _ in 0..500 {
+        let (_, result, committed) =
+            control(host, agent_id, generation, "interrupt", turn_id, json!({})).await;
+        let result = result.expect("interrupt responds");
+        assert!(
+            committed.is_empty(),
+            "a gated-or-lost control commits nothing"
+        );
+        if result["state"] == json!("rejected") {
+            assert_eq!(
+                result["reason"],
+                json!("Muse interrupt does not match a healthy active turn"),
+                "the refusal is the readiness gate, not the control bound"
+            );
+            return result;
+        }
+        assert_eq!(
+            result["state"],
+            json!("unknown"),
+            "a pre-gate probe settles unknown, never applied"
+        );
+    }
+    panic!("readiness gate never held after the source gap");
+}
+
 /// Acknowledge one `source.gap` host request.
 async fn answer_source_gap(host: &mut Host, request: &HostRequest) {
     let gap_id = request
@@ -3800,104 +3837,42 @@ async fn scenario_control_steer_after_terminal_is_stale() {
     finish_scenario(scenario, false).await;
 }
 
-/// The note-44 race: the fake's `turn/completed` is queued while the
-/// `message.completed` commit round-trips, and both controls are sent before
-/// the terminal commit is drained. Frames win, so both are refused with no
-/// native write.
+/// The note-44 race: interrupt #1 is admitted and the fake queues the
+/// cancelled `turn/completed` behind its ack. Interrupt #2 and a steer are
+/// sent before the terminal commit is drained: frames win, so both are
+/// refused and neither writes. (The parked turn keeps associate's buffer
+/// flush out of the picture: no send-time commit can stall the controls.)
 async fn scenario_control_terminal_race_refuses_both_controls() {
-    let mut scenario = Scenario::start("happy", muse_profile()).await;
+    let mut scenario = Scenario::start("turn-controls", muse_profile()).await;
     let agent_id = scenario.agent_id.clone();
 
-    let send_id = ulid::Ulid::new().to_string();
-    let send_rx = scenario
+    let (_send_id, turn_id, _) =
+        send_parked(&mut scenario.host, &agent_id, 1, "Count the stars.", 0).await;
+    // Admit the first interrupt without pumping: its applied answer needs
+    // no test ack (the turn check runs on the idle event task and the ack
+    // check is local), so awaiting it directly cannot stall — and pumping
+    // here would drain the terminal this race must keep queued.
+    let first_rx = scenario
         .host
         .begin_call(
             "agent.command",
             json!({
                 "agent_id": agent_id,
                 "generation": 1,
-                "command_id": send_id,
-                "verb": "send",
-                "args": {"text": "Say hello."},
-                "turn_id": null,
+                "command_id": ulid::Ulid::new().to_string(),
+                "verb": "interrupt",
+                "args": {},
+                "turn_id": turn_id,
                 "request_id": null,
             }),
         )
         .await;
-    let mut send_rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, send_rx));
-    // Pump until `message.completed` is answered: the send only applies
-    // after associate, and associate flushes whatever frames buffered
-    // early, so awaiting the applied response without pumping would stall
-    // the flush's ack. Answering `message.completed` proves associate
-    // finished, so the applied response needs no further test input. The
-    // loop breaks before the terminal put is touched: the fake emitted
-    // `turn/completed` with this batch and it waits queued.
-    let mut kinds: Vec<String> = Vec::new();
-    let mut applied = None;
-    while !kinds.iter().any(|kind| kind == "message.completed") {
-        tokio::select! {
-            biased;
-            request = scenario.host.next_request() => {
-                assert_eq!(request.method, "events.put");
-                let events = request
-                    .params
-                    .get("events")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                assert_eq!(events.len(), 1, "one native record per batch");
-                kinds.push(
-                    events[0]
-                        .get("kind")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                );
-                let first = scenario.host.next_seq;
-                scenario.host.next_seq += 1;
-                scenario
-                    .host
-                    .respond(
-                        &request.id,
-                        json!({
-                            "first_seq": first,
-                            "last_seq": first,
-                            "cursor": request.params.get("cursor").cloned().unwrap_or(Value::Null),
-                        }),
-                    )
-                    .await;
-            }
-            result = &mut send_rx, if applied.is_none() => {
-                applied = Some(
-                    result
-                        .expect("send deadline")
-                        .expect("send response channel")
-                        .expect("send applied"),
-                );
-            }
-        }
-    }
-    assert_eq!(
-        kinds,
-        vec!["turn.started".to_owned(), "message.completed".to_owned()]
-    );
-    let applied = match applied {
-        Some(applied) => applied,
-        None => send_rx
-            .await
-            .expect("send deadline")
-            .expect("send response channel")
-            .expect("send applied"),
-    };
-    assert_eq!(
-        applied.get("state").and_then(Value::as_str),
-        Some("applied")
-    );
-    let turn_id = applied
-        .get("turn_id")
-        .and_then(Value::as_str)
-        .expect("applied turn id")
-        .to_owned();
+    let first = tokio::time::timeout(OP_TIMEOUT, first_rx)
+        .await
+        .expect("interrupt deadline")
+        .expect("interrupt response channel")
+        .expect("interrupt responds");
+    assert_eq!(first["state"], json!("applied"));
     let interrupt_rx = scenario
         .host
         .begin_call(
@@ -3946,7 +3921,7 @@ async fn scenario_control_terminal_race_refuses_both_controls() {
             .get("data")
             .and_then(|data| data.get("status"))
             .and_then(Value::as_str),
-        Some("completed")
+        Some("interrupted")
     );
     let interrupt = interrupt_rx
         .await
@@ -3958,7 +3933,8 @@ async fn scenario_control_terminal_race_refuses_both_controls() {
         .expect("steer deadline")
         .expect("steer response channel");
     assert_eq!(steer, Err("stale_turn".to_owned()));
-    assert_eq!(scenario.report()["interrupts"], json!(0));
+    // Only the admitted first interrupt wrote; both racers were refused.
+    assert_eq!(scenario.report()["interrupts"], json!(1));
     assert_eq!(scenario.report()["steers"], json!(0));
     finish_scenario(scenario, false).await;
 }
@@ -4239,20 +4215,9 @@ async fn scenario_control_rejected_when_source_unknown() {
         assert_eq!(request.method, "source.gap");
         answer_source_gap(&mut scenario.host, &request).await;
     }
-    let (_, interrupt, committed) = control(
-        &mut scenario.host,
-        &agent_id,
-        1,
-        "interrupt",
-        &turn_id,
-        json!({}),
-    )
-    .await;
-    assert_eq!(
-        interrupt.expect("interrupt responds")["state"],
-        json!("rejected")
-    );
-    assert!(committed.is_empty(), "a gated control commits nothing");
+    // The first probe proves the gate holds (the unknown source latches, so
+    // the steer after it is deterministically gated too).
+    interrupt_until_rejected(&mut scenario.host, &agent_id, 1, &turn_id).await;
     let (_, steer, committed) = control(
         &mut scenario.host,
         &agent_id,
@@ -4262,7 +4227,13 @@ async fn scenario_control_rejected_when_source_unknown() {
         json!({"text": "gated too"}),
     )
     .await;
-    assert_eq!(steer.expect("steer responds")["state"], json!("rejected"));
+    let steer = steer.expect("steer responds");
+    assert_eq!(steer["state"], json!("rejected"));
+    assert_eq!(
+        steer["reason"],
+        json!("Muse steer does not match a healthy active turn"),
+        "the refusal is the readiness gate, not the control bound"
+    );
     assert!(committed.is_empty(), "a gated control commits nothing");
     assert_eq!(scenario.report()["interrupts"], json!(0));
     assert_eq!(scenario.report()["steers"], json!(1));
