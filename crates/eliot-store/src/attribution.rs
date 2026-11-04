@@ -592,9 +592,8 @@ fn load_current_claim_agent(
     num: i64,
     generation: i64,
 ) -> Result<eliot_core::Agent> {
-    let current = load_agent_by_num(connection, num)?.ok_or_else(|| {
-        Error::new("stale_generation", "Agent generation is no longer current")
-    })?;
+    let current = load_agent_by_num(connection, num)?
+        .ok_or_else(|| Error::new("stale_generation", "Agent generation is no longer current"))?;
     if current.generation != generation {
         return Err(Error::new(
             "stale_generation",
@@ -1441,7 +1440,7 @@ mod tests {
         let mut send = SubmitCommand::new(mail_notice.clone(), "send");
         send.target = Some(a.clone());
         send.expected_generation = Some(1);
-        send.args = json!({"text": "1 unread messages; run eliot inbox"});
+        send.args = json!({"text": "1 unread messages; run swarm inbox"});
         store.submit("owner", send, now).expect("admit mail notice");
         let suppressed = store
             .notice_claim(

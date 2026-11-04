@@ -736,7 +736,10 @@ mod tests {
         let id = ulid::Ulid::new().to_string();
         let first: ClaimSetResponse = serde_json::from_value(
             router
-                .claim_set(&json!({ "id": id, "glob": "src/**" }), &agent_principal(&c, 1))
+                .claim_set(
+                    &json!({ "id": id, "glob": "src/**" }),
+                    &agent_principal(&c, 1),
+                )
                 .await
                 .expect("C claims the broad area"),
         )
@@ -760,24 +763,33 @@ mod tests {
             assert_eq!(command.target.as_deref(), Some(holder.as_str()));
             assert_eq!(
                 command.args["text"],
-                json!("1 overlapping work claims; run eliot who")
+                json!("1 overlapping work claims; run swarm who")
             );
         }
-        assert_eq!(holder_notice_sends(&store, &a, &b).expect("count notices"), 2);
+        assert_eq!(
+            holder_notice_sends(&store, &a, &b).expect("count notices"),
+            2
+        );
         drop(store);
 
         // A replayed claim.set returns the retained response and routes no
         // further notice: the same two sends, nothing new.
         let replay: ClaimSetResponse = serde_json::from_value(
             router
-                .claim_set(&json!({ "id": id, "glob": "src/**" }), &agent_principal(&c, 1))
+                .claim_set(
+                    &json!({ "id": id, "glob": "src/**" }),
+                    &agent_principal(&c, 1),
+                )
                 .await
                 .expect("replay returns the retained response"),
         )
         .expect("decode replay response");
         assert_eq!(replay, first);
         let store = router.inner.store.lock().await;
-        assert_eq!(holder_notice_sends(&store, &a, &b).expect("count notices"), 2);
+        assert_eq!(
+            holder_notice_sends(&store, &a, &b).expect("count notices"),
+            2
+        );
     }
 
     #[tokio::test]

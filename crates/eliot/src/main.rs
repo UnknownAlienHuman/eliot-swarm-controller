@@ -799,10 +799,13 @@ impl Failure {
 #[tokio::main]
 async fn main() -> ExitCode {
     // The derived CLI parser overflows the 1 MiB Windows main-thread stack
-    // once the `who`/`claim` subcommands are added (established: the pre-PR
-    // parser fits, with them the daemon dies in `Cli::parse` before any
-    // output), so parse on a roomy thread instead. Help/version still exit
-    // from the parser.
+    // once the `who`/`claim` subcommands are added, so parse on a roomy
+    // thread instead. Measured in a debug build with a direct `Cli::parse`:
+    // the pre-PR parser prints `swarm --version` and exits 0, while with
+    // `who`/`claim` every probe (`--version`, `status`, `who`, `claim list`,
+    // `--help`) dies in `Cli::parse` with STATUS_STACK_OVERFLOW before any
+    // output. Help/version still exit from the parser. A `/STACK` link arg
+    // for the binary is a later follow-up.
     let cli = std::thread::Builder::new()
         .name("cli-parse".to_owned())
         .stack_size(8 * 1024 * 1024)

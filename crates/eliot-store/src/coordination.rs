@@ -1057,12 +1057,7 @@ fn notice_pending_count_tx(
 /// Whether the shared suppression gates skip this notice: the cooldown, an
 /// open or unknown notice command, an unknown command or turn, a pending
 /// request, or a provider hold. A suppression records nothing.
-fn notice_suppressed_tx(
-    tx: &Transaction<'_>,
-    num: i64,
-    agent: &Agent,
-    now: i64,
-) -> Result<bool> {
+fn notice_suppressed_tx(tx: &Transaction<'_>, num: i64, agent: &Agent, now: i64) -> Result<bool> {
     let notice: Option<(i64, Option<String>)> = tx
         .query_row(
             "SELECT last_notice_at, open_notice_command FROM mail_notices WHERE recipient = ?1",

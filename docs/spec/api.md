@@ -725,7 +725,7 @@ normalization (segments are compatible when equal or either side carries
 a wildcard, with `**` realigning across directories), in the same project
 — is reported in-band in the `claim.set` response and routes at most one
 coalesced generic notice per holder: `N overlapping work claims; run
-eliot who`. Detection is conservative: a false positive only adds an
+swarm who`. Detection is conservative: a false positive only adds an
 advisory notice. The in-band list holds at most 100 conflicts;
 `truncated` signals the scan or report cap engaged. The notice shares the
 mail-wake gate (one per minute, at most one open notice command per
