@@ -1,3 +1,4 @@
+use super::native_events::{persist_effects, verified_native_event_cause_tx};
 use super::*;
 
 impl Store {
