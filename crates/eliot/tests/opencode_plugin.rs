@@ -3028,10 +3028,13 @@ fn resume_subject(agent_id: &str, ready: &Value, turn_id: &str) -> (Value, Value
         "retained_source": {
             "agent_id": agent_id,
             "generation": 1,
-            "source": "controlled",
+            "source": "stream",
             "families": ["session", "turn", "message"],
         },
-        "current_turn": {"turn_id": turn_id, "state": "completed"},
+        "current_turn": {
+            "turn_id": turn_id, "state": "completed", "status": "completed",
+            "started_at": 1, "completed_at": 2,
+        },
     });
     (resume_from, source_state)
 }

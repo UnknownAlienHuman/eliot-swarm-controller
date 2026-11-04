@@ -236,6 +236,11 @@ impl OpenCodeHttp {
     /// abort the session's current execution. The 200 body is unwrapped
     /// (`{"interrupted": bool}`): `false` proves no execution was running,
     /// never an error. A 404 proves the session is gone (no effect).
+    /// `POST /api/session/{id}/interrupt` (`session.interrupt`):
+    /// interrupt the session's active execution. 200 answers
+    /// `{"interrupted": bool}` (unwrapped, unlike every other success
+    /// body); `true` means an execution owned by this server was
+    /// interrupted.
     pub async fn interrupt(
         &self,
         session_id: &str,

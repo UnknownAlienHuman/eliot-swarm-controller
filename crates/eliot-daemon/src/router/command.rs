@@ -1447,9 +1447,9 @@ mod tests {
     }
 
     #[test]
-    fn resume_capture_admits_muse_and_opencode_next_to_fake() {
+    fn resume_capture_admits_connected_harnesses_next_to_fake() {
         let resume = resume_command("a7");
-        for harness in ["fake", "muse", "opencode"] {
+        for harness in ["fake", "muse", "claude", "opencode"] {
             let agent = retained_agent(harness);
             assert_eq!(
                 validate_retained_resume_agent(&agent, &resume).unwrap(),
@@ -1467,7 +1467,7 @@ mod tests {
             "source_integrity"
         );
         // Harnesses without a connected resume stay unsupported.
-        let agent = retained_agent("claude");
+        let agent = retained_agent("acp");
         assert_eq!(
             validate_retained_resume_agent(&agent, &resume)
                 .unwrap_err()

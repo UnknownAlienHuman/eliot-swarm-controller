@@ -3658,7 +3658,7 @@ fn validate_retained_resume_agent(agent: &Agent, command: &Command) -> Result<i6
                 ));
             }
         }
-        "fake" | "muse" | "opencode" => {
+        "fake" | "muse" | "claude" | "opencode" => {
             if agent.profile_snapshot.get("native_store_binding").is_some() {
                 return Err(Error::new(
                     "source_integrity",

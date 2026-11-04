@@ -10,9 +10,10 @@ use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
     session::{
-        TargetEnvironment, contextual_error, decode, known_command, native_no_write,
-        not_initialized, paths_equal, register_native_process, target_environment,
-        unknown_snapshot, validate_binding, validate_identity, validate_source_plan,
+        ResumeSubject, TargetEnvironment, contextual_error, decode, known_command, native_no_write,
+        not_initialized, optional_profile_text, parse_resume_subject, paths_equal,
+        register_native_process, target_environment, unknown_snapshot, validate_binding,
+        validate_identity, validate_source_plan,
     },
 };
 use serde_json::{Value, json};
@@ -99,15 +100,6 @@ struct ParsedStart {
     credential: String,
     instance_dir: String,
     resume: Option<ResumeSubject>,
-}
-
-/// The exact retained native session a resume binds: its store scope plus
-/// its session id. No prompt is ever replayed; the new generation serves
-/// the same per-Agent store and reattaches to this session id.
-#[derive(Debug)]
-struct ResumeSubject {
-    native_scope: String,
-    native_ref: String,
 }
 
 /// Outcome of start admission: a replayed start response, or a parsed
@@ -317,9 +309,23 @@ impl OpenCodePlugin {
             return Ok(replay);
         }
         let (initialized, profile) = self.start_prereqs(&params)?;
-        let resume = parse_resume_subject(&params)?;
+        // The retained subject validates through the shared Muse/Claude
+        // helper: same continuity rules and codes, no local copy.
+        let resume = params
+            .resume_from
+            .as_ref()
+            .map(|resume| {
+                parse_resume_subject(
+                    resume,
+                    params.source_state.as_ref(),
+                    &params.agent_id,
+                    params.generation,
+                    "OpenCode",
+                )
+            })
+            .transpose()?;
         let (requested_model, model_ref) = start_model_ref(profile)?;
-        let requested_agent = optional_profile_agent(profile)?;
+        let requested_agent = optional_profile_text(profile, "agent", "OpenCode")?;
         let (workspace, program) = start_paths(profile, &params)?;
         let TargetEnvironment {
             variables: environment,
@@ -1888,129 +1894,6 @@ fn start_model_ref(profile: &serde_json::Map<String, Value>) -> Result<(String, 
 /// turn is presence-checked only (the Store already gates on no active
 /// turn); the native idle proof is the interrupt plus the empty
 /// inbox/permission/form lists, not served history.
-fn parse_resume_subject(params: &AgentStartParams) -> Result<Option<ResumeSubject>> {
-    let Some(resume) = params.resume_from.as_ref() else {
-        if params.source_state.is_some() {
-            return Err(Error::new(
-                "source_integrity",
-                "OpenCode launch must not carry retained source state",
-            ));
-        }
-        return Ok(None);
-    };
-    let resume = resume.as_object().ok_or_else(|| {
-        Error::new(
-            "source_integrity",
-            "OpenCode resume subject must be an object",
-        )
-    })?;
-    let native_scope = resume
-        .get("native_scope")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            Error::new(
-                "source_integrity",
-                "OpenCode resume subject omitted its native scope",
-            )
-        })?;
-    let native_ref = resume
-        .get("native_ref")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            Error::new(
-                "source_integrity",
-                "OpenCode resume subject omitted its native session",
-            )
-        })?;
-    let source_state = params
-        .source_state
-        .as_ref()
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            Error::new(
-                "source_integrity",
-                "OpenCode resume requires retained source state",
-            )
-        })?;
-    let retained = source_state
-        .get("retained_generation")
-        .and_then(Value::as_i64)
-        .ok_or_else(|| {
-            Error::new(
-                "source_integrity",
-                "OpenCode resume omitted its retained generation",
-            )
-        })?;
-    if retained + 1 != params.generation {
-        return Err(Error::new(
-            "source_integrity",
-            "OpenCode resume must continue exactly the previous generation",
-        ));
-    }
-    let retained_source = source_state
-        .get("retained_source")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            Error::new(
-                "source_integrity",
-                "OpenCode resume omitted its retained source",
-            )
-        })?;
-    if retained_source.get("agent_id").and_then(Value::as_str) != Some(params.agent_id.as_str())
-        || retained_source.get("generation").and_then(Value::as_i64) != Some(retained)
-        || retained_source.get("source").and_then(Value::as_str) != Some("controlled")
-    {
-        return Err(Error::new(
-            "source_integrity",
-            "OpenCode resume retained source is not this generation's controlled source",
-        ));
-    }
-    let families = retained_source
-        .get("families")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            Error::new(
-                "source_integrity",
-                "OpenCode resume omitted its retained families",
-            )
-        })?;
-    for family in ["session", "turn", "message"] {
-        if !families.iter().any(|entry| entry.as_str() == Some(family)) {
-            return Err(Error::new(
-                "source_integrity",
-                "OpenCode resume retained source does not own the session families",
-            ));
-        }
-    }
-    if !source_state.contains_key("current_turn") {
-        return Err(Error::new(
-            "source_integrity",
-            "OpenCode resume omitted its retained turn readback",
-        ));
-    }
-    Ok(Some(ResumeSubject {
-        native_scope: native_scope.to_owned(),
-        native_ref: native_ref.to_owned(),
-    }))
-}
-
-/// The optional frozen `agent` profile key: the requested native agent
-/// (`build`, `general`, ...) realigned at resume. Absent keeps the
-/// retained agent; a wrong-typed value is a profile error before any
-/// native I/O.
-fn optional_profile_agent(profile: &serde_json::Map<String, Value>) -> Result<Option<String>> {
-    match profile.get("agent") {
-        None => Ok(None),
-        Some(Value::String(agent)) if !agent.trim().is_empty() => Ok(Some(agent.clone())),
-        Some(_) => Err(Error::new(
-            "profile_error",
-            "OpenCode profile agent must be a non-empty string",
-        )),
-    }
-}
-
 /// The frozen start paths: an existing workspace directory and the explicit
 /// native executable.
 fn start_paths(
@@ -2161,12 +2044,11 @@ fn opencode_manifest() -> PluginManifest {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        opencode_manifest, opencode_scope, optional_profile_agent, parse_resume_subject,
-        split_model,
+    use super::{opencode_manifest, opencode_scope, split_model};
+    use eliot_core::{AgentStartParams, Result};
+    use eliot_plugin::session::{
+        ResumeSubject, optional_profile_text, parse_resume_subject, validate_source_plan,
     };
-    use eliot_core::AgentStartParams;
-    use eliot_plugin::session::validate_source_plan;
     use serde_json::json;
     use std::path::PathBuf;
 
@@ -2256,7 +2138,7 @@ mod tests {
         params.source_state = Some(json!({
             "retained_generation": 1,
             "retained_source": {
-                "agent_id": "a7", "generation": 1, "source": "controlled",
+                "agent_id": "a7", "generation": 1, "source": "stream",
                 "families": ["session", "turn", "message"],
             },
             "current_turn": serde_json::Value::Null,
@@ -2264,27 +2146,38 @@ mod tests {
         params
     }
 
+    fn validate_resume(params: &AgentStartParams) -> Result<ResumeSubject> {
+        parse_resume_subject(
+            params.resume_from.as_ref().expect("resume fixture"),
+            params.source_state.as_ref(),
+            &params.agent_id,
+            params.generation,
+            "OpenCode",
+        )
+    }
+
     #[test]
     fn resume_subject_binds_scope_ref_and_continuity() {
-        let subject = parse_resume_subject(&resume_params())
-            .expect("valid subject")
-            .expect("resume");
+        let subject = validate_resume(&resume_params()).expect("valid subject");
         assert_eq!(subject.native_scope, "scope-1");
         assert_eq!(subject.native_ref, "ses_1");
-        // A PR2 retained source (owning the request family) binds too.
+        assert_eq!(subject.retained_turn, None);
+        // A PR2 retained source (owning the request family) binds too:
+        // only session/turn/message ownership is required.
         let mut params = resume_params();
         params.source_state = Some(json!({
             "retained_generation": 1,
             "retained_source": {
-                "agent_id": "a7", "generation": 1, "source": "controlled",
+                "agent_id": "a7", "generation": 1, "source": "stream",
                 "families": ["session", "turn", "message", "request"],
             },
-            "current_turn": {"turn_id": "t", "state": "completed"},
+            "current_turn": {
+                "turn_id": "t", "state": "completed", "status": "completed",
+                "started_at": 1, "completed_at": 2,
+            },
         }));
-        assert!(parse_resume_subject(&params).expect("valid").is_some());
-        // A launch carries neither half of the subject.
-        let params = AgentStartParams::new("a7", 1, "start-1");
-        assert!(parse_resume_subject(&params).expect("launch").is_none());
+        let subject = validate_resume(&params).expect("valid");
+        assert_eq!(subject.retained_turn.as_deref(), Some("t"));
     }
 
     #[test]
@@ -2292,53 +2185,69 @@ mod tests {
         let mut params = resume_params();
         params.generation = 3;
         assert_eq!(
-            parse_resume_subject(&params).expect_err("skip").code,
-            "source_integrity"
+            validate_resume(&params).expect_err("skip").code,
+            "stale_generation"
         );
         let mut params = resume_params();
         params.resume_from = Some(json!({"native_scope": "scope-1"}));
         assert_eq!(
-            parse_resume_subject(&params).expect_err("no ref").code,
-            "source_integrity"
+            validate_resume(&params).expect_err("no ref").code,
+            "invalid"
         );
         let mut params = resume_params();
         params.source_state = Some(json!({
             "retained_generation": 1,
             "retained_source": {
-                "agent_id": "a7", "generation": 1, "source": "controlled",
+                "agent_id": "a7", "generation": 1, "source": "stream",
                 "families": ["session"],
             },
             "current_turn": serde_json::Value::Null,
         }));
         assert_eq!(
-            parse_resume_subject(&params).expect_err("families").code,
-            "source_integrity"
+            validate_resume(&params).expect_err("families").code,
+            "unknown"
         );
-        let mut params = AgentStartParams::new("a7", 1, "start-1");
-        params.source_state = Some(json!({"retained_generation": 0}));
+        // The daemon names the retained stream source "stream".
+        let mut params = resume_params();
+        params.source_state = Some(json!({
+            "retained_generation": 1,
+            "retained_source": {
+                "agent_id": "a7", "generation": 1, "source": "controlled",
+                "families": ["session", "turn", "message"],
+            },
+            "current_turn": serde_json::Value::Null,
+        }));
         assert_eq!(
-            parse_resume_subject(&params)
-                .expect_err("launch state")
-                .code,
-            "source_integrity"
+            validate_resume(&params).expect_err("source name").code,
+            "stale_generation"
         );
     }
 
     #[test]
     fn profile_agent_is_optional_but_typed() {
         let profile = serde_json::Map::new();
-        assert_eq!(optional_profile_agent(&profile).expect("absent"), None);
+        assert_eq!(
+            optional_profile_text(&profile, "agent", "OpenCode").expect("absent"),
+            None
+        );
         let profile = json!({"agent": "general"})
             .as_object()
             .expect("object")
             .clone();
         assert_eq!(
-            optional_profile_agent(&profile).expect("present"),
+            optional_profile_text(&profile, "agent", "OpenCode").expect("present"),
             Some("general".to_owned())
+        );
+        let profile = json!({"agent": null}).as_object().expect("object").clone();
+        assert_eq!(
+            optional_profile_text(&profile, "agent", "OpenCode").expect("null"),
+            None
         );
         let profile = json!({"agent": 7}).as_object().expect("object").clone();
         assert_eq!(
-            optional_profile_agent(&profile).expect_err("typed").code,
+            optional_profile_text(&profile, "agent", "OpenCode")
+                .expect_err("typed")
+                .code,
             "profile_error"
         );
     }
