@@ -13080,7 +13080,10 @@ fn cli_goal_crud_pause_and_native_unsupported() {
         "unbounded goal must name its missing bound: {}",
         unbounded.stderr.lines().next().unwrap_or("")
     );
-    // --check consumes the remaining arguments, so it goes last.
+    // Isolated from the automatic on_idle driver: a cadenced Goal rounds
+    // only on explicit slots, so no background round can add a marker
+    // between set and show. --check consumes the remaining arguments, so
+    // it goes last.
     let set = fixture.json(&[
         "goal",
         "set",
@@ -13089,6 +13092,8 @@ fn cli_goal_crud_pause_and_native_unsupported() {
         "keep green",
         "--max-turns",
         "4",
+        "--cadence-ms",
+        "120000",
         "--check",
         "check-goal",
         "--strict",
@@ -13100,18 +13105,26 @@ fn cli_goal_crud_pause_and_native_unsupported() {
         json!(["check-goal", "--strict"])
     );
     assert_eq!(set["definition"]["max_turns"], 4);
+    assert_eq!(set["definition"]["cadence_ms"], 120000);
+    assert!(set["cadence_anchor_ms"].as_i64().unwrap() > 0);
+    assert!(set["round_marker"].is_null());
+    assert!(set["last_round_key"].is_null());
     assert_eq!(set["cost_status"], "unsupported (no usage source)");
     let shown = fixture.json(&["goal", "show", &agent]);
     assert_eq!(shown, set);
+    assert!(shown["round_marker"].is_null());
     let paused = fixture.json(&["goal", "pause", &agent, "--reason", "waiting"]);
     assert_eq!(paused["revision"], 2);
     assert_eq!(paused["status"], "paused");
+    assert!(paused["round_marker"].is_null());
     let resumed = fixture.json(&["goal", "resume", &agent]);
     assert_eq!(resumed["revision"], 3);
     assert_eq!(resumed["status"], "active");
+    assert!(resumed["round_marker"].is_null());
     let cleared = fixture.json(&["goal", "clear", &agent]);
     assert_eq!(cleared["revision"], 4);
     assert_eq!(cleared["status"], "cleared");
+    assert!(cleared["round_marker"].is_null());
     // A cadenced Goal captures its slot anchor; its first slot is not due yet.
     let cadenced = fixture.json(&[
         "goal",
@@ -13127,6 +13140,8 @@ fn cli_goal_crud_pause_and_native_unsupported() {
     assert_eq!(cadenced["revision"], 5);
     assert_eq!(cadenced["definition"]["cadence_ms"], 60000);
     assert!(cadenced["cadence_anchor_ms"].as_i64().unwrap() > 0);
+    assert!(cadenced["round_marker"].is_null());
+    assert!(cadenced["last_round_key"].is_null());
     let slot = cli(&fixture.data, &["goal", "round", &agent, "--slot", "1"]);
     assert_eq!(slot.status.code(), Some(3));
     assert!(
@@ -13535,6 +13550,175 @@ fn cli_goal_auto_round_drives_idle_fake_agent() {
             .starts_with("idle:"),
         "auto round keys on the idle event"
     );
+    let stop = fixture.json(&["stop", &agent]);
+    fixture.wait_command(
+        stop["command_id"].as_str().expect("stop command"),
+        "applied",
+    );
+    fixture.stop(false);
+}
+
+fn wait_for_unknown_goal_marker(fixture: &Fixture, agent: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let shown = fixture.json(&["goal", "show", agent]);
+        if shown["round_marker"]["state"] == "unknown" {
+            return shown;
+        }
+        assert!(Instant::now() < deadline, "auto unknown marker deadline");
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn assert_unknown_goal_burn(shown: &Value, events: &[Value], agent: &str, send_id: &str) -> i64 {
+    assert_eq!(shown["generation"], 1);
+    assert_eq!(shown["revision"], 1);
+    assert_eq!(shown["status"], "active");
+    assert_eq!(shown["round_marker"]["generation"], 1);
+    assert_eq!(shown["round_marker"]["revision"], 1);
+    let marker_key = shown["round_marker"]["round_key"]
+        .as_str()
+        .expect("unknown marker key")
+        .to_owned();
+    assert!(
+        marker_key.starts_with("idle:"),
+        "auto round keys on the idle event"
+    );
+    let marker_seq: i64 = marker_key["idle:".len()..]
+        .parse()
+        .expect("idle marker seq");
+    let driving = events
+        .iter()
+        .find(|event| event["seq"].as_i64() == Some(marker_seq))
+        .expect("driving idle event retained");
+    assert_eq!(driving["agent"].as_str(), Some(agent));
+    assert_eq!(driving["generation"].as_i64(), Some(1));
+    assert_eq!(driving["subject"]["state"], "idle");
+    assert_eq!(shown["counters"]["rounds"], 0);
+    assert_eq!(shown["counters"]["consecutive_same_output"], 0);
+    assert!(shown["counters"]["last_exit_code"].is_null());
+    assert!(shown["counters"]["last_output_digest"].is_null());
+    assert!(shown["counters"]["last_observation"].is_null());
+    assert!(shown["counters"]["last_check_at"].is_null());
+    assert!(shown["last_round_key"].is_null());
+    let sends: Vec<&Value> = events
+        .iter()
+        .filter(|event| {
+            event["kind"] == "command.dispatched"
+                && event["data"]["verb"] == "send"
+                && event["agent"].as_str() == Some(agent)
+        })
+        .collect();
+    assert_eq!(sends.len(), 1, "unknown round admits no continuation send");
+    assert_eq!(sends[0]["data"]["command_id"].as_str(), Some(send_id));
+    marker_seq
+}
+
+fn assert_burned_goal_key_stays_stale(fixture: &Fixture, agent: &str, marker_seq: i64) {
+    // The burned key is never rerun: an explicit round on it stays stale.
+    // A follow-up automatic round may briefly hold the claim; retry the
+    // burned key within the same bound until the stale refusal lands.
+    let marker_arg = marker_seq.to_string();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let replay = cli(
+            &fixture.data,
+            &["goal", "round", agent, "--idle-seq", &marker_arg],
+        );
+        if replay.status.code() == Some(3) && replay.stderr.contains("stale_round") {
+            break;
+        }
+        assert_eq!(replay.status.code(), Some(3));
+        assert!(
+            replay.stderr.contains("busy"),
+            "burned key retry must be stale or briefly busy: {}",
+            replay.stderr.lines().next().unwrap_or("")
+        );
+        assert!(Instant::now() < deadline, "burned key replay deadline");
+        thread::sleep(Duration::from_millis(50));
+    }
+    let reread = fixture.json(&["goal", "show", agent]);
+    assert_eq!(reread["status"], "active");
+    assert_eq!(reread["revision"], 1);
+    assert_eq!(reread["counters"]["rounds"], 0);
+    assert!(reread["last_round_key"].is_null());
+    assert_eq!(reread["round_marker"]["state"], "unknown");
+}
+
+#[test]
+fn cli_goal_auto_round_burns_unknown_check_without_commit() {
+    let mut fixture = Fixture::new("goal auto unknown");
+    fixture.start();
+    let launched = fixture.json(&[
+        "launch",
+        "--profile",
+        "fake",
+        "--workspace",
+        fixture.workspace.to_str().unwrap(),
+    ]);
+    assert_eq!(launched["state"], "applied");
+    let agent = launched["target"].as_str().unwrap().to_owned();
+    let generation = launched["generation"].as_i64().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let ready = fixture.events().iter().any(|event| {
+            event["kind"] == "session.ready"
+                && event["agent"] == agent
+                && event["generation"] == generation
+        });
+        if ready {
+            break;
+        }
+        assert!(Instant::now() < deadline, "fake ready deadline");
+        thread::sleep(Duration::from_millis(50));
+    }
+    // An on_idle Goal whose check cannot spawn: the automatic driver must
+    // burn its idle key as unknown without committing. The exact spawn
+    // error is not retained, so this asserts only the marker, binding
+    // and counters.
+    let set = fixture.json(&[
+        "goal",
+        "set",
+        &agent,
+        "--text",
+        "keep green",
+        "--max-rounds",
+        "6",
+        "--check",
+        "eliot-missing-goal-check-9f3c",
+    ]);
+    assert_eq!(set["revision"], 1);
+    assert_eq!(set["status"], "active");
+    assert!(set["round_marker"].is_null());
+    // One fake turn; its completion commits the idle event the automatic
+    // driver rounds on. No explicit `goal round` call follows.
+    let send_id = ulid::Ulid::new().to_string();
+    let send = cli(
+        &fixture.data,
+        &[
+            "--id",
+            &send_id,
+            "send",
+            &agent,
+            "--generation",
+            &generation.to_string(),
+            "--wait",
+            "--timeout-seconds",
+            "10",
+            "--",
+            "do some work",
+        ],
+    );
+    assert!(
+        send.status.success(),
+        "fake send must complete: {}",
+        send.stderr.lines().next().unwrap_or("")
+    );
+    fixture.wait_command(&send_id, "applied");
+    let shown = wait_for_unknown_goal_marker(&fixture, &agent);
+    let events = fixture.events();
+    let marker_seq = assert_unknown_goal_burn(&shown, &events, &agent, &send_id);
+    assert_burned_goal_key_stays_stale(&fixture, &agent, marker_seq);
     let stop = fixture.json(&["stop", &agent]);
     fixture.wait_command(
         stop["command_id"].as_str().expect("stop command"),
