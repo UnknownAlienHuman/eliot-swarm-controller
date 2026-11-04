@@ -415,6 +415,7 @@ dependencies = [
  "eliot-plugin-codex",
  "eliot-plugin-muse",
  "eliot-plugin-opencode",
+ "libc",
  "serde_json",
  "tokio",
  "ulid",

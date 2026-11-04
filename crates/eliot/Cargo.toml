@@ -27,6 +27,9 @@ name = "opencode_plugin"
 path = "tests/opencode_plugin.rs"
 harness = false
 
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true
+
 [dependencies]
 clap.workspace = true
 eliot-core.workspace = true

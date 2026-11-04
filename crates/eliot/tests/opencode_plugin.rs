@@ -26,6 +26,15 @@ use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 const CLI: &str = env!("CARGO_BIN_EXE_swarm");
 const MODEL: &str = "test-provider/test-model";
 const OP_TIMEOUT: Duration = Duration::from_secs(15);
+/// Hard per-scenario bound: generous next to the 15 s operation bound, but
+/// a hang fails the run instead of living for hours (note 61).
+const SCENARIO_TIMEOUT: Duration = Duration::from_secs(120);
+/// Grace for an owned fake server to exit after its scenario ends before
+/// the run calls it orphaned.
+const ORPHAN_GRACE: Duration = Duration::from_secs(5);
+/// Backstop lifetime of one fake server: it exits itself well past the
+/// scenario timeout, so even a hard-cancelled run cannot orphan it for hours.
+const FAKE_MAX_LIFETIME: Duration = Duration::from_secs(180);
 
 fn main() {
     if let Ok(script) = std::env::var("ELIOT_FAKE_OPENCODE_SCRIPT") {
@@ -37,26 +46,225 @@ fn main() {
         .build()
         .expect("test runtime");
     runtime.block_on(async {
-        scenario_launch_send_snapshot_stop().await;
-        println!("ok - launch/send/snapshot/stop");
-        scenario_failed_turn_reports_native_error().await;
-        println!("ok - failed turn reports its native error");
-        scenario_model_mismatch_is_rejected_before_ready().await;
-        println!("ok - model mismatch is rejected before session.ready");
-        scenario_location_mismatch_is_rejected_before_ready().await;
-        println!("ok - location mismatch is rejected before session.ready");
-        scenario_prompt_400_is_rejected_without_rewrite().await;
-        println!("ok - prompt 400 is rejected without a second write");
-        scenario_lost_prompt_reply_is_unknown_without_rewrite().await;
-        println!("ok - lost prompt reply is unknown without a second write");
-        scenario_stop_of_gone_session_applies().await;
-        println!("ok - stop of a gone session applies");
-        scenario_invalid_profile_rejected_before_spawn().await;
-        println!("ok - invalid profile rejected before spawn");
-        scenario_sse_loss_during_send_gaps().await;
-        println!("ok - SSE loss during send gaps the source");
+        run_scenario(
+            "launch/send/snapshot/stop",
+            scenario_launch_send_snapshot_stop,
+        )
+        .await;
+        run_scenario(
+            "failed turn reports its native error",
+            scenario_failed_turn_reports_native_error,
+        )
+        .await;
+        run_scenario(
+            "model mismatch is rejected before session.ready",
+            scenario_model_mismatch_is_rejected_before_ready,
+        )
+        .await;
+        run_scenario(
+            "location mismatch is rejected before session.ready",
+            scenario_location_mismatch_is_rejected_before_ready,
+        )
+        .await;
+        run_scenario(
+            "prompt 400 is rejected without a second write",
+            scenario_prompt_400_is_rejected_without_rewrite,
+        )
+        .await;
+        run_scenario(
+            "lost prompt reply is unknown without a second write",
+            scenario_lost_prompt_reply_is_unknown_without_rewrite,
+        )
+        .await;
+        run_scenario(
+            "stop of a gone session applies",
+            scenario_stop_of_gone_session_applies,
+        )
+        .await;
+        run_scenario(
+            "invalid profile rejected before spawn",
+            scenario_invalid_profile_rejected_before_spawn,
+        )
+        .await;
+        run_scenario(
+            "SSE loss during send gaps the source",
+            scenario_sse_loss_during_send_gaps,
+        )
+        .await;
     });
     println!("opencode_plugin: all scenarios passed");
+}
+
+/// Run one scenario under the hard per-scenario timeout. On success the
+/// scenario's owned fake servers must already be dead (verified, not
+/// assumed); on timeout they are killed by exact recorded PID and the run
+/// fails with the scenario name. The plugin child itself always dies by
+/// handle: dropping the timed-out future drops every `Host`, whose
+/// `kill_on_drop` child ends it — on every exit path, including panics.
+async fn run_scenario<F, Fut>(name: &'static str, make: F)
+where
+    F: FnOnce(OwnedChildren) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let owned = OwnedChildren::default();
+    match tokio::time::timeout(SCENARIO_TIMEOUT, make(owned.clone())).await {
+        Ok(()) => {
+            owned.assert_all_dead(name).await;
+            println!("ok - {name}");
+        }
+        Err(_) => {
+            let recorded = owned.snapshot();
+            owned.kill_live();
+            panic!(
+                "opencode_plugin scenario '{name}' timed out after {SCENARIO_TIMEOUT:?}; owned fake PIDs were {recorded:?}"
+            );
+        }
+    }
+}
+
+/// PIDs of fake `opencode serve` processes this scenario owns. The plugin
+/// reports its server PID through `process.put`; the test records it here
+/// so scenario cleanup can kill exactly that process (never by name). The
+/// plugin child itself is owned by handle (`kill_on_drop`) and is never in
+/// this registry: it is reaped by `shutdown_child`, and killing a reaped
+/// PID could hit an unrelated process after PID reuse.
+#[derive(Clone, Default)]
+struct OwnedChildren(Arc<std::sync::Mutex<Vec<u32>>>);
+
+impl OwnedChildren {
+    fn record(&self, pid: u32) {
+        let mut pids = self.0.lock().expect("owned PID registry");
+        if !pids.contains(&pid) {
+            pids.push(pid);
+        }
+    }
+
+    fn snapshot(&self) -> Vec<u32> {
+        self.0.lock().expect("owned PID registry").clone()
+    }
+
+    /// Kill every still-live recorded fake by its exact PID. Best-effort
+    /// per PID; returns the PIDs a kill was attempted on.
+    fn kill_live(&self) -> Vec<u32> {
+        let mut killed = Vec::new();
+        for pid in self.snapshot() {
+            if pid_is_live(pid) {
+                kill_exact_pid(pid);
+                killed.push(pid);
+            }
+        }
+        killed
+    }
+
+    /// Success-path verification: every owned fake must already be dead
+    /// (the plugin's stop/shutdown terminates its server; a failed start
+    /// discards it). A survivor past the grace is killed by exact PID and
+    /// fails the run: never silently orphaned.
+    async fn assert_all_dead(&self, scenario: &'static str) {
+        let deadline = tokio::time::Instant::now() + ORPHAN_GRACE;
+        for pid in self.snapshot() {
+            while pid_is_live(pid) && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            if pid_is_live(pid) {
+                kill_exact_pid(pid);
+                panic!(
+                    "opencode_plugin scenario '{scenario}' orphaned its fake server (PID {pid}); killed it and failing"
+                );
+            }
+        }
+    }
+}
+
+impl Drop for OwnedChildren {
+    fn drop(&mut self) {
+        // RAII backstop for unwind paths (an assert or OP_TIMEOUT panic
+        // inside the scenario skips both `kill_live` and `assert_all_dead`):
+        // kill any still-live recorded fake by exact PID. The lock is taken
+        // without panicking: a Drop must never panic, and a poisoned
+        // registry means a scenario already failed loudly.
+        let pids = self.0.lock().map(|guard| guard.clone()).unwrap_or_default();
+        for pid in pids {
+            if pid_is_live(pid) {
+                kill_exact_pid(pid);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
+    fn TerminateProcess(process: *mut std::ffi::c_void, code: u32) -> i32;
+    fn GetExitCodeProcess(process: *mut std::ffi::c_void, code: *mut u32) -> i32;
+}
+
+/// Kill exactly `pid`. Best-effort: an already-exited PID is success (the
+/// process is gone, which is the goal).
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn kill_exact_pid(pid: u32) {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    const PROCESS_TERMINATE: u32 = 0x0001;
+    // SAFETY: null-checked; the returned handle is owned exactly once via
+    // `OwnedHandle`, never inherited, closed on drop.
+    let raw = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+    if raw.is_null() {
+        return;
+    }
+    // SAFETY: `OpenProcess` returned one owned, non-null process handle.
+    let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+    // SAFETY: the handle is live; the exit code is arbitrary for a test kill.
+    unsafe {
+        TerminateProcess(handle.as_raw_handle(), 1);
+    }
+}
+
+/// Whether `pid` names a live process right now. Unopenable counts as gone:
+/// our own scenario children are always openable while alive.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn pid_is_live(pid: u32) -> bool {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+    // SAFETY: as in `kill_exact_pid`.
+    let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if raw.is_null() {
+        return false;
+    }
+    // SAFETY: `OpenProcess` returned one owned, non-null process handle.
+    let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+    let mut code = 0;
+    // SAFETY: the handle is live and `code` is valid writable storage.
+    if unsafe { GetExitCodeProcess(handle.as_raw_handle(), &mut code) } == 0 {
+        return false;
+    }
+    code == STILL_ACTIVE
+}
+
+/// Kill exactly `pid`. Best-effort: an already-exited PID is success (the
+/// process is gone, which is the goal).
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn kill_exact_pid(pid: u32) {
+    // SAFETY: `kill` with SIGKILL on an exact scenario-owned PID has no
+    // memory effects; ESRCH (already gone) is success for our purpose.
+    let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+}
+
+/// Whether `pid` names a live process right now. Unopenable counts as gone:
+/// our own scenario children are always signallable while alive.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn pid_is_live(pid: u32) -> bool {
+    // SAFETY: signal 0 probes only; see `kill_exact_pid`.
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 // ---------------------------------------------------------------------------
@@ -187,6 +395,13 @@ fn fake_server_main(script_raw: &str) {
         .build()
         .expect("fixture runtime");
     runtime.block_on(async move {
+        // Backstop: one scenario never needs its fake past SCENARIO_TIMEOUT,
+        // so the fake exits itself rather than orphaning for hours when the
+        // harness is cancelled hard and test-side cleanup never runs.
+        tokio::spawn(async {
+            tokio::time::sleep(FAKE_MAX_LIFETIME).await;
+            std::process::exit(3);
+        });
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
             .await
             .expect("fixture bind");
@@ -731,6 +946,9 @@ struct Host {
     stderr: Option<tokio::task::JoinHandle<String>>,
     /// Fake server request log: quiesce markers are polled from here.
     log: PathBuf,
+    /// Scenario-owned fake PIDs (from `process.put`): timeout, success, and
+    /// unwind paths kill exactly these, never by name.
+    owned: OwnedChildren,
 }
 
 /// What proves the plugin is quiescent after the call response arrived.
@@ -762,7 +980,7 @@ struct Scenario {
 }
 
 impl Host {
-    async fn spawn(root: &Path) -> Self {
+    async fn spawn(root: &Path, owned: OwnedChildren) -> Self {
         let mut command = tokio::process::Command::new(CLI);
         command
             .arg("--data-dir")
@@ -864,6 +1082,7 @@ impl Host {
             child,
             stderr: Some(stderr_task),
             log: root.join("requests.jsonl"),
+            owned,
         }
     }
 
@@ -913,8 +1132,12 @@ impl Host {
             Quiesce::UntilKind(kind) => {
                 // Commits causally after the response (the terminal pair
                 // follows `applied`): drain until the terminal kind lands.
+                // The whole drain shares one deadline, so a plugin that
+                // keeps committing without the terminal kind fails the run
+                // instead of draining forever.
+                let drain_deadline = tokio::time::Instant::now() + timeout;
                 while committed.last().map(|(kind, _)| kind.as_str()) != Some(kind) {
-                    let request = tokio::time::timeout(OP_TIMEOUT, self.inbound.recv())
+                    let request = tokio::time::timeout_at(drain_deadline, self.inbound.recv())
                         .await
                         .expect("quiescent commit deadline")
                         .expect("plugin request channel");
@@ -967,18 +1190,20 @@ impl Host {
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id.clone(), tx);
         let frame = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        self.writer()
-            .send(frame.to_string())
+        // Bounded like every other host wait: a stuck writer task must fail
+        // the run, never park the scenario forever.
+        tokio::time::timeout(OP_TIMEOUT, self.writer().send(frame.to_string()))
             .await
+            .expect("host write deadline")
             .expect("host write queue");
         rx
     }
 
     async fn respond(&self, id: &Value, result: Value) {
         let frame = json!({"jsonrpc": "2.0", "id": id, "result": result});
-        self.writer()
-            .send(frame.to_string())
+        tokio::time::timeout(OP_TIMEOUT, self.writer().send(frame.to_string()))
             .await
+            .expect("host write deadline")
             .expect("host write queue");
     }
 
@@ -989,7 +1214,13 @@ impl Host {
             .expect("plugin exit deadline")
             .expect("plugin wait");
         assert!(status.success(), "plugin exit status: {status}");
-        self.stderr.take().unwrap().await.unwrap_or_default()
+        // The stderr EOF join is bounded too: the pipe stays open while any
+        // inheritor of the plugin's stderr (such as an orphaned fake server)
+        // is alive, and an unbounded join here is exactly the 0-CPU hang.
+        tokio::time::timeout(OP_TIMEOUT, self.stderr.take().unwrap())
+            .await
+            .expect("plugin stderr EOF deadline")
+            .unwrap_or_default()
     }
 }
 
@@ -1088,9 +1319,9 @@ struct FailedAttempt {
 }
 
 impl Scenario {
-    async fn start(script: &Value, profile: Value) -> Self {
+    async fn start(script: &Value, profile: Value, owned: OwnedChildren) -> Self {
         let agent_id = ulid::Ulid::new().to_string();
-        let (pending, rx) = Self::setup_start(script, profile, agent_id, 1).await;
+        let (pending, rx) = Self::setup_start(script, profile, agent_id, 1, owned).await;
         pending.finish(rx).await
     }
 
@@ -1099,6 +1330,7 @@ impl Scenario {
         profile: Value,
         agent_id: String,
         generation: i64,
+        owned: OwnedChildren,
     ) -> (PendingStart, oneshot::Receiver<Result<Value, String>>) {
         let root: PathBuf = std::env::temp_dir().join(format!(
             "eliot-opencode-plugin-test-{}",
@@ -1107,7 +1339,7 @@ impl Scenario {
         std::fs::create_dir_all(root.join("data")).unwrap();
         std::fs::create_dir_all(root.join("instance")).unwrap();
         std::fs::create_dir_all(root.join("workspace")).unwrap();
-        let mut host = Host::spawn(&root).await;
+        let mut host = Host::spawn(&root, owned).await;
         let manifest = host
             .call(
                 "initialize",
@@ -1341,6 +1573,10 @@ async fn answer_process_put(
         .and_then(Value::as_u64)
         .unwrap_or(0);
     assert!(pid > 0);
+    // The owned fake server, by exact PID: timeout, success, and unwind
+    // paths kill exactly this process (never by name).
+    host.owned
+        .record(u32::try_from(pid).expect("server PID fits u32"));
     assert_eq!(
         request.params.get("agent_id").and_then(Value::as_str),
         Some(agent_id)
@@ -1452,8 +1688,8 @@ fn kinds(committed: &[(String, Value)]) -> Vec<&str> {
     committed.iter().map(|(kind, _)| kind.as_str()).collect()
 }
 
-async fn scenario_launch_send_snapshot_stop() {
-    let mut scenario = Scenario::start(&script(json!({})), opencode_profile()).await;
+async fn scenario_launch_send_snapshot_stop(owned: OwnedChildren) {
+    let mut scenario = Scenario::start(&script(json!({})), opencode_profile(), owned).await;
     // The fixture proves the per-Agent isolation: its config path sits
     // under the plugin instance dir and names the profile model.
     let report = scenario.report();
@@ -1585,7 +1821,7 @@ async fn scenario_launch_send_snapshot_stop() {
     scenario.host.shutdown_child().await;
 }
 
-async fn scenario_failed_turn_reports_native_error() {
+async fn scenario_failed_turn_reports_native_error(owned: OwnedChildren) {
     let mut scenario = Scenario::start(
         &script(json!({
             "terminal": "session.execution.failed",
@@ -1593,6 +1829,7 @@ async fn scenario_failed_turn_reports_native_error() {
             "error": {"type": "provider.no-route", "message": "Model unavailable: x/y"},
         })),
         opencode_profile(),
+        owned,
     )
     .await;
     let (send_id, turn_id, committed) = send_turn(&mut scenario, "doomed").await;
@@ -1628,12 +1865,13 @@ async fn scenario_failed_turn_reports_native_error() {
     scenario.host.shutdown_child().await;
 }
 
-async fn scenario_model_mismatch_is_rejected_before_ready() {
+async fn scenario_model_mismatch_is_rejected_before_ready(owned: OwnedChildren) {
     let script = script(json!({
         "create_model": {"id": "other-model", "providerID": "other-provider"},
     }));
     let agent_id = ulid::Ulid::new().to_string();
-    let (pending, rx) = Scenario::setup_start(&script, opencode_profile(), agent_id, 1).await;
+    let (pending, rx) =
+        Scenario::setup_start(&script, opencode_profile(), agent_id, 1, owned).await;
     let mut failed = pending.finish_expecting_error(rx, "profile_error").await;
     failed.retry("profile_error").await;
     // The readback mismatch best-effort deletes the created session: the
@@ -1661,21 +1899,26 @@ async fn scenario_model_mismatch_is_rejected_before_ready() {
     assert_eq!((creates, deletes), (1, 1));
 }
 
-async fn scenario_location_mismatch_is_rejected_before_ready() {
+async fn scenario_location_mismatch_is_rejected_before_ready(owned: OwnedChildren) {
     let other = std::env::temp_dir()
         .join("eliot-opencode-plugin-test-elsewhere")
         .to_string_lossy()
         .into_owned();
     let script = script(json!({ "create_dir": other }));
     let agent_id = ulid::Ulid::new().to_string();
-    let (pending, rx) = Scenario::setup_start(&script, opencode_profile(), agent_id, 1).await;
+    let (pending, rx) =
+        Scenario::setup_start(&script, opencode_profile(), agent_id, 1, owned).await;
     let mut failed = pending.finish_expecting_error(rx, "profile_error").await;
     failed.retry("profile_error").await;
 }
 
-async fn scenario_prompt_400_is_rejected_without_rewrite() {
-    let mut scenario =
-        Scenario::start(&script(json!({ "prompt_status": 400 })), opencode_profile()).await;
+async fn scenario_prompt_400_is_rejected_without_rewrite(owned: OwnedChildren) {
+    let mut scenario = Scenario::start(
+        &script(json!({ "prompt_status": 400 })),
+        opencode_profile(),
+        owned,
+    )
+    .await;
     let send_id = ulid::Ulid::new().to_string();
     let agent_id = scenario.agent_id.clone();
     let params = json!({
@@ -1723,9 +1966,13 @@ async fn scenario_prompt_400_is_rejected_without_rewrite() {
     scenario.host.shutdown_child().await;
 }
 
-async fn scenario_lost_prompt_reply_is_unknown_without_rewrite() {
-    let mut scenario =
-        Scenario::start(&script(json!({ "prompt_drop": true })), opencode_profile()).await;
+async fn scenario_lost_prompt_reply_is_unknown_without_rewrite(owned: OwnedChildren) {
+    let mut scenario = Scenario::start(
+        &script(json!({ "prompt_drop": true })),
+        opencode_profile(),
+        owned,
+    )
+    .await;
     let send_id = ulid::Ulid::new().to_string();
     let agent_id = scenario.agent_id.clone();
     let params = json!({
@@ -1786,16 +2033,20 @@ async fn scenario_lost_prompt_reply_is_unknown_without_rewrite() {
     scenario.host.shutdown_child().await;
 }
 
-async fn scenario_stop_of_gone_session_applies() {
-    let mut scenario =
-        Scenario::start(&script(json!({ "delete_status": 404 })), opencode_profile()).await;
+async fn scenario_stop_of_gone_session_applies(owned: OwnedChildren) {
+    let mut scenario = Scenario::start(
+        &script(json!({ "delete_status": 404 })),
+        opencode_profile(),
+        owned,
+    )
+    .await;
     let committed = stop_agent(&mut scenario, false).await;
     assert_eq!(kinds(&committed), ["session.ended"]);
     scenario.host.call("shutdown", json!({})).await.unwrap();
     scenario.host.shutdown_child().await;
 }
 
-async fn scenario_invalid_profile_rejected_before_spawn() {
+async fn scenario_invalid_profile_rejected_before_spawn(owned: OwnedChildren) {
     // (cmd wrapper rejection lives in the daemon config layer, next to the
     // Muse rule it mirrors; the plugin trusts the frozen profile there.)
     let cases: Vec<(Value, Option<&str>)> = vec![
@@ -1832,7 +2083,7 @@ async fn scenario_invalid_profile_rejected_before_spawn() {
             Some(name) => root.join(name).to_string_lossy().into_owned(),
             None => root.join("workspace").to_string_lossy().into_owned(),
         };
-        let mut host = Host::spawn(&root).await;
+        let mut host = Host::spawn(&root, owned.clone()).await;
         host.call(
             "initialize",
             json!({
@@ -1874,10 +2125,11 @@ async fn scenario_invalid_profile_rejected_before_spawn() {
     }
 }
 
-async fn scenario_sse_loss_during_send_gaps() {
+async fn scenario_sse_loss_during_send_gaps(owned: OwnedChildren) {
     let mut scenario = Scenario::start(
         &script(json!({ "drop_sse_on_prompt": true })),
         opencode_profile(),
+        owned,
     )
     .await;
     // The prompt is admitted (200) but the stream dies before any
