@@ -27,6 +27,9 @@ const EARLY_EVENT_LIMIT: usize = 128;
 const EARLY_EVENT_BYTES: usize = 256 * 1024;
 const MAX_PENDING_REQUESTS: usize = 128;
 const RESOLVED_REQUEST_HISTORY: usize = 128;
+/// Native subagent threads tracked per generation (Codex caps live threads per
+/// session far below this).
+const MAX_CHILD_THREADS: usize = 256;
 const MAX_CHANGED_PATHS: usize = 1_000;
 
 #[derive(Clone, Debug, Default)]
@@ -160,6 +163,14 @@ struct EventProcessor {
     writes_blocked: bool,
     gap_reported: bool,
     final_text: Option<String>,
+    /// Native subagent threads spawned from the owned thread (or from one of
+    /// them). Their frames are not this Agent's lifecycle facts.
+    child_threads: HashSet<String>,
+    /// In-progress `spawnAgent` collab calls on the owned thread, by item id.
+    pending_spawns: HashSet<String>,
+    /// Threads whose frames arrived during a pending spawn before the child
+    /// was announced; confirmed by the spawn result or `thread/started`.
+    unconfirmed_threads: HashSet<String>,
 }
 
 pub(crate) fn spawn(
@@ -292,6 +303,9 @@ impl EventProcessor {
             writes_blocked: false,
             gap_reported: false,
             final_text: None,
+            child_threads: HashSet::new(),
+            pending_spawns: HashSet::new(),
+            unconfirmed_threads: HashSet::new(),
         }
     }
 
@@ -383,7 +397,9 @@ impl EventProcessor {
     async fn handle_frame(&mut self, frame: Option<NativeFrame>) {
         match frame {
             Some(NativeFrame::Request { id, method, params }) => {
-                if !self.status.ready || self.status.active_turn_id.is_none() {
+                if self.is_child_frame(&params) || self.hold_unannounced_frame(&params) {
+                    self.reject_child_request(id, &method, &params).await;
+                } else if !self.status.ready || self.status.active_turn_id.is_none() {
                     self.buffer_frame(BufferedNativeFrame::Request { id, method, params });
                 } else if let Err(error) = self.process_request(id, method, params).await {
                     self.status.source_unknown = true;
@@ -398,14 +414,20 @@ impl EventProcessor {
                 }
             }
             Some(NativeFrame::Notification { method, params }) => {
-                if self.should_buffer(&method, &params) {
+                if self.is_child_frame(&params) || self.hold_unannounced_frame(&params) {
+                    // Child-thread lifecycle is not attributed to the parent
+                    // generation; L5.3 native child discovery surfaces it.
+                } else if self.should_buffer(&method, &params) {
                     self.buffer_frame(BufferedNativeFrame::Notification { method, params });
-                } else if let Err(error) = self.process_notification(method, params).await {
+                } else if let Err(error) = self.process_notification(method.clone(), params).await {
                     self.status.source_unknown = true;
                     if !self.gap_reported && !self.writes_blocked {
-                        let _ = self
-                            .record_gap("Codex notification could not be normalized")
-                            .await;
+                        // Method and error code only: no native payload text.
+                        let reason = format!(
+                            "Codex {method} notification could not be normalized ({})",
+                            error.code
+                        );
+                        let _ = self.record_gap(&reason).await;
                     }
                     if self.status.failure.is_none() {
                         self.status.failure = Some(error.message);
@@ -445,6 +467,87 @@ impl EventProcessor {
             && let Some(reason) = self.loss_reason
         {
             let _ = self.record_gap(reason).await;
+        }
+    }
+
+    fn is_child_frame(&self, params: &Value) -> bool {
+        frame_thread_id(params).is_some_and(|thread_id| self.child_threads.contains(thread_id))
+    }
+
+    /// A spawned child's first frames can precede both its `thread/started`
+    /// and the spawn result. While the owned thread has a `spawnAgent` call in
+    /// flight, note such a thread as unconfirmed and drop the frame; it must be
+    /// confirmed before the last pending spawn completes.
+    fn hold_unannounced_frame(&mut self, params: &Value) -> bool {
+        let Some(thread_id) = frame_thread_id(params) else {
+            return false;
+        };
+        if self.pending_spawns.is_empty()
+            || self
+                .status
+                .thread_id
+                .as_deref()
+                .is_none_or(|owned| owned == thread_id)
+        {
+            return false;
+        }
+        if self.unconfirmed_threads.len() >= MAX_CHILD_THREADS
+            && !self.unconfirmed_threads.contains(thread_id)
+        {
+            self.defer_gap("Codex sent frames from more unannounced threads than are tracked");
+            return true;
+        }
+        self.unconfirmed_threads.insert(thread_id.to_owned());
+        true
+    }
+
+    fn confirm_child_thread(&mut self, thread_id: &str) -> bool {
+        self.unconfirmed_threads.remove(thread_id);
+        if self.child_threads.len() >= MAX_CHILD_THREADS && !self.child_threads.contains(thread_id)
+        {
+            return false;
+        }
+        self.child_threads.insert(thread_id.to_owned());
+        true
+    }
+
+    /// Track the owned thread's `spawnAgent` calls; a completed spawn confirms
+    /// its `receiverThreadIds`, and once none is pending every unconfirmed
+    /// thread is a source gap.
+    async fn observe_spawn(&mut self, item: &Value, completed: bool) -> Result<()> {
+        let Some((item_id, receivers)) = spawn_call(item) else {
+            return Ok(());
+        };
+        if !completed {
+            self.pending_spawns.insert(item_id);
+            return Ok(());
+        }
+        self.pending_spawns.remove(&item_id);
+        for receiver in &receivers {
+            if !self.confirm_child_thread(receiver) {
+                return self
+                    .record_gap("Codex announced more native child threads than are tracked")
+                    .await;
+            }
+        }
+        if self.pending_spawns.is_empty() && !self.unconfirmed_threads.is_empty() {
+            self.unconfirmed_threads.clear();
+            return self
+                .record_gap("Codex sent frames from a thread no spawn announced")
+                .await;
+        }
+        Ok(())
+    }
+
+    /// A child thread's request has no Eliot principal to answer it yet; reject
+    /// it as unsupported instead of leaving the child waiting.
+    async fn reject_child_request(&mut self, id: Value, method: &str, params: &Value) {
+        let rejected = self
+            .native
+            .reject_unsupported_request(id, method, params, Instant::now() + EVENT_DEADLINE)
+            .await;
+        if rejected.is_err() {
+            self.defer_gap("Codex child-thread request could not be rejected");
         }
     }
 
@@ -965,6 +1068,7 @@ impl EventProcessor {
                         .record_gap("Codex item/started was outside the exact active turn")
                         .await;
                 }
+                self.observe_spawn(&notification.item, false).await?;
                 let item_type = notification
                     .item
                     .get("type")
@@ -1017,6 +1121,7 @@ impl EventProcessor {
                         .await;
                 }
                 let raw_item = params.get("item").cloned().unwrap_or(Value::Null);
+                self.observe_spawn(&raw_item, true).await?;
                 let item_type = raw_item
                     .get("type")
                     .and_then(Value::as_str)
@@ -1265,12 +1370,18 @@ impl EventProcessor {
                     "Codex thread/started omitted its exact thread id",
                 )
             })?;
-        if self
-            .status
-            .thread_id
-            .as_deref()
-            .is_some_and(|existing| existing != thread_id)
+        if let Some(owned) = self.status.thread_id.as_deref()
+            && owned != thread_id
         {
+            let parent = params.get("thread").and_then(spawned_parent_thread);
+            if parent.is_some_and(|parent| parent == owned || self.child_threads.contains(parent)) {
+                if !self.confirm_child_thread(thread_id) {
+                    return self
+                        .record_gap("Codex announced more native child threads than are tracked")
+                        .await;
+                }
+                return Ok(());
+            }
             return self
                 .record_gap("Codex app-server announced a second thread in one Agent generation")
                 .await;
@@ -1517,6 +1628,48 @@ fn attach_native_error(data: &mut Value, error: Option<&NativeTurnError>, policy
     }
 }
 
+/// A `spawnAgent` collab call: its item id and the spawned thread ids
+/// (`receiverThreadIds`, filled once the spawn completes).
+fn spawn_call(item: &Value) -> Option<(String, Vec<String>)> {
+    if item.get("type").and_then(Value::as_str) != Some("collabAgentToolCall")
+        || item.get("tool").and_then(Value::as_str) != Some("spawnAgent")
+    {
+        return None;
+    }
+    let item_id = item
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())?;
+    let receivers = item
+        .get("receiverThreadIds")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|receiver| !receiver.trim().is_empty())
+        .map(str::to_owned)
+        .collect();
+    Some((item_id.to_owned(), receivers))
+}
+
+/// The thread a native frame belongs to: `threadId` on notifications and
+/// server requests.
+fn frame_thread_id(params: &Value) -> Option<&str> {
+    params.get("threadId").and_then(Value::as_str)
+}
+
+/// The parent of a subagent thread, from the installed 0.161 `Thread.source`
+/// shape `{"subAgent": {"thread_spawn": {"parent_thread_id": ...}}}`.
+fn spawned_parent_thread(thread: &Value) -> Option<&str> {
+    thread
+        .get("source")?
+        .get("subAgent")?
+        .get("thread_spawn")?
+        .get("parent_thread_id")?
+        .as_str()
+        .filter(|parent| !parent.trim().is_empty())
+}
+
 fn validate_thread_and_turn(status: &EventStatus, thread_id: &str, turn_id: &str) -> Result<()> {
     if status.thread_id.as_deref() != Some(thread_id) || turn_id.trim().is_empty() {
         return Err(Error::new(
@@ -1731,6 +1884,56 @@ fn attach_final_text_unavailable(data: &mut Value, policy: &SecretPolicy) {
 mod tests {
     use super::*;
     use eliot_core::ProviderRestrictionKind;
+
+    #[test]
+    fn spawned_parent_reads_only_the_installed_thread_spawn_shape() {
+        let child = json!({"id": "child", "source": {"subAgent": {"thread_spawn": {
+            "parent_thread_id": "owned", "depth": 1, "agent_nickname": null
+        }}}});
+        assert_eq!(spawned_parent_thread(&child), Some("owned"));
+        for thread in [
+            json!({"id": "t", "source": "appServer"}),
+            json!({"id": "t", "source": {"subAgent": "review"}}),
+            json!({"id": "t", "source": {"subAgent": {"other": "x"}}}),
+            json!({"id": "t", "source": {"subAgent": {"thread_spawn": {"parent_thread_id": " "}}}}),
+            json!({"id": "t"}),
+        ] {
+            assert_eq!(spawned_parent_thread(&thread), None, "{thread}");
+        }
+        assert_eq!(
+            frame_thread_id(&json!({"threadId": "child"})),
+            Some("child")
+        );
+        assert_eq!(frame_thread_id(&json!({"thread": {"id": "child"}})), None);
+    }
+
+    #[test]
+    fn spawn_call_reads_only_spawn_agent_collab_items() {
+        let completed = json!({
+            "type": "collabAgentToolCall", "id": "call-1", "tool": "spawnAgent",
+            "senderThreadId": "owned", "receiverThreadIds": ["child-1", " "],
+            "status": "completed", "agentsStates": {}
+        });
+        assert_eq!(
+            spawn_call(&completed),
+            Some(("call-1".to_owned(), vec!["child-1".to_owned()]))
+        );
+        let started = json!({
+            "type": "collabAgentToolCall", "id": "call-2", "tool": "spawnAgent",
+            "senderThreadId": "owned", "receiverThreadIds": [], "status": "inProgress"
+        });
+        assert_eq!(
+            spawn_call(&started),
+            Some(("call-2".to_owned(), Vec::new()))
+        );
+        for item in [
+            json!({"type": "collabAgentToolCall", "id": "c", "tool": "wait"}),
+            json!({"type": "commandExecution", "id": "c", "tool": "spawnAgent"}),
+            json!({"type": "collabAgentToolCall", "tool": "spawnAgent"}),
+        ] {
+            assert_eq!(spawn_call(&item), None, "{item}");
+        }
+    }
 
     fn native_error(error_info: Option<Value>, message: &str) -> NativeTurnError {
         NativeTurnError {

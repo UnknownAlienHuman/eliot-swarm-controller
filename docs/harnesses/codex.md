@@ -188,6 +188,16 @@ token, Git identity and custody separate. Native child threads share the parent
 process environment and have no independent Eliot CLI principal unless isolation is
 actually supported. They are added after the basic path, not emulated in L2.
 
+Native subagents (`[agents]` / `multi_agent` in the owner's Codex config) arrive on
+the same stream. A thread is a child when its `thread/started` names the owned thread
+(or a known child) in `source.subAgent.thread_spawn.parent_thread_id`, or when the
+owned thread's completed `collabAgentToolCall` `spawnAgent` lists it in
+`receiverThreadIds`. A child's first frames can precede both; while a `spawnAgent`
+call is in flight they are dropped and the thread stays unconfirmed until one of
+those two facts arrives. Child frames are not the parent generation's lifecycle and
+child server requests are rejected as unsupported until L5.3 native child discovery
+connects them. A thread that is neither owned nor confirmed is still a source gap.
+
 Start owns one live stream. It publishes the implemented lifecycle families only; do not
 install hooks or tail rollouts in parallel to duplicate those facts. The reader exists
 before create/resume/input. A lost native write reply is readback/unknown, never a second
