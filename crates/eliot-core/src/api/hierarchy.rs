@@ -158,9 +158,11 @@ mod tests {
                 ..HierarchyLimits::default()
             }
         );
-        assert!(serde_json::from_value::<HierarchyLimits>(
-            serde_json::json!({"max_depth": 4, "unknown": 1})
-        )
-        .is_err());
+        assert!(
+            serde_json::from_value::<HierarchyLimits>(
+                serde_json::json!({"max_depth": 4, "unknown": 1})
+            )
+            .is_err()
+        );
     }
 }

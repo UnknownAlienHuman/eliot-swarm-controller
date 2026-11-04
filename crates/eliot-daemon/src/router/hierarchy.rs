@@ -355,8 +355,8 @@ impl Router {
             // have been pruned; anyone else reads `not_found`, so an
             // unauthorized caller cannot tell pruned from absent or probe
             // cursors.
-            let gap = matches!(principal, Principal::Owner)
-                && eliot_store::history_expired(id, now_ms());
+            let gap =
+                matches!(principal, Principal::Owner) && eliot_store::history_expired(id, now_ms());
             return Err(if gap {
                 Error::new(
                     "history_gap",
@@ -675,7 +675,10 @@ mod tests {
         let store = router.inner.store.lock().await;
         let row = store.get_agent(&child).unwrap().unwrap();
         assert_eq!(row.parent.as_deref(), Some(manager.as_str()));
-        assert_eq!(row.project, store.get_agent(&manager).unwrap().unwrap().project);
+        assert_eq!(
+            row.project,
+            store.get_agent(&manager).unwrap().unwrap().project
+        );
         assert_eq!(row.root, manager);
         assert_eq!(row.depth, 1);
         let _ = std::fs::remove_dir_all(&workspace);

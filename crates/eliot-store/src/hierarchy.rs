@@ -1264,10 +1264,7 @@ mod tests {
         store.submit("owner", stop, now + 5).expect("expand stop");
         assert_eq!(
             child_ids(&store, &stop_id),
-            vec![
-                format!("{stop_id}/{parent}"),
-                format!("{stop_id}/{child}")
-            ]
+            vec![format!("{stop_id}/{parent}"), format!("{stop_id}/{child}")]
         );
     }
 

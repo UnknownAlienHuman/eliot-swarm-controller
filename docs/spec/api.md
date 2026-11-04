@@ -315,7 +315,9 @@ the existing readiness/linked-input wait semantics above are unchanged.
 With `parent`, the launch creates a child of that Agent: an Agent principal launches
 only its own children (the Router defaults an absent parent to the caller), the child
 inherits the parent's project label and tree root, and the configured fanout limits
-are checked at admission (see [coordination](coordination.md#claims-and-hierarchy)).
+are checked at admission. The parent must be controlled; an Agent's child reuses the
+parent's frozen profile with control narrowed or equal, shares its workspace, and
+mints no worktree (see [coordination](coordination.md#claims-and-hierarchy)).
 
 Removal uses the same command admission and readback path:
 
@@ -335,11 +337,12 @@ the directory has gone.
 A tree selector snapshots its members once at admission: the parent snapshots/sorts
 concrete ids in one bounded transaction (bounded by `max_selector_targets`) and reads
 applied for the expansion itself; children settle independently with the ordinary
-per-target gates. Parent applied means expansion only. `command.children` pages that
-fixed set; a child created after admission is never part of it. Retain/prune parent
-sets transactionally so a caller never sees a partly pruned expansion; after removal
-return `history_gap`. Ordered rule actions reuse the same representation with a
-distinct link kind, not selector execution semantics.
+per-target gates, except `send` skips terminal members instead of failing on them
+(an all-terminal send applies with no children). Parent applied means expansion only.
+`command.children` pages that fixed set; a child created after admission is never
+part of it. Retain/prune parent sets transactionally so a caller never sees a partly
+pruned expansion; after removal return `history_gap`. Ordered rule actions reuse the
+same representation with a distinct link kind, not selector execution semantics.
 
 `command.children` is implemented for retained expansions through Core
 [`CommandChildrenRequest`/`CommandChildrenResponse`](../../crates/eliot-core/src/api/reads.rs).
