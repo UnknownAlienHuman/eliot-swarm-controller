@@ -273,6 +273,10 @@ impl ClaudePlugin {
                 Error::new("profile_error", "Claude profile requires an exact model id")
             })?
             .to_owned();
+        // Requested permission posture next to the CLI's effective mode: PR1
+        // passes no permission-mode flag, so the readback is the CLI default
+        // until PR2 configures it.
+        let requested_permission_mode = profile.get("permissions").cloned().unwrap_or(Value::Null);
         let workspace = params
             .workspace
             .as_deref()
@@ -499,6 +503,7 @@ impl ClaudePlugin {
             "native_ref": session_id,
             "requested": {
                 "model": requested_model,
+                "permission_mode": requested_permission_mode,
                 "cwd": workspace.to_string_lossy(),
             },
             "effective": effective,

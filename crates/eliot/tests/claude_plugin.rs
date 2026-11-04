@@ -943,6 +943,12 @@ impl Scenario {
                     Some(MODEL)
                 );
                 assert_eq!(
+                    ready["requested"]
+                        .get("permission_mode")
+                        .and_then(Value::as_str),
+                    Some("workspace-write")
+                );
+                assert_eq!(
                     ready["effective"].get("model").and_then(Value::as_str),
                     Some(MODEL)
                 );
