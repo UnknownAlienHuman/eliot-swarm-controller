@@ -18,8 +18,8 @@ These notes do not establish runtime support or a current license approval.
 ## Native identity and generation
 
 Subject is `(canonical CLAUDE_CONFIG_DIR + project/store identity, exact session id)`.
-Resume uses that session in a new Eliot generation. Late SDK callbacks belong to the old
-generation and cannot affect replacement work. Native subagents normally share parent
+Resume uses that session in a new Eliot generation. Late stream-json records belong to
+the old generation and cannot affect replacement work. Native subagents normally share parent
 environment; no independent Eliot token without actual isolated environment support.
 
 ## Transport
@@ -63,8 +63,9 @@ turn. A delayed hook is inject, never advertised as exact steer.
 
 ## Source ownership and recovery
 
-SDK stream owns supplied session/turn/message/tool/usage facts. Callbacks own missing
-permission/question decisions; hooks never mirror the same lifecycle. Final text is
+The stream-json stdout stream owns supplied session/turn/message/tool/usage facts.
+Callbacks own missing permission/question decisions; hooks never mirror the same
+lifecycle. Final text is
 persisted before exact terminal result. Distinguish content blocks/tool ids within a
 message instead of deduplicating all blocks by message id.
 
