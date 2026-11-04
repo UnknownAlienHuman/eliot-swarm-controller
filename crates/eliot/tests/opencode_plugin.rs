@@ -2560,6 +2560,28 @@ async fn control_as(
     (command_id.to_owned(), outcome, committed)
 }
 
+/// Request ids opened so far, draining until `count` are open. A send's pump
+/// may already have committed a later ask before its response, so the ids
+/// come from `committed` first and only the missing ones are awaited.
+async fn opened_requests(
+    host: &mut Host,
+    mut committed: Vec<(String, Value)>,
+    count: usize,
+) -> Vec<String> {
+    loop {
+        let ids: Vec<String> = committed
+            .iter()
+            .filter(|(kind, _)| kind == "request.opened")
+            .filter_map(|(_, data)| data.get("request_id").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect();
+        if ids.len() >= count {
+            return ids;
+        }
+        committed.extend(drain_until(host, "request.opened").await);
+    }
+}
+
 /// Drain inbound until `kind` commits (bounded): the follow-up commits a
 /// `terminal_on_reply` settle or an interrupt terminal lands after the
 /// control response quiesced.
@@ -3591,15 +3613,10 @@ async fn scenario_permission_approve_deny_roundtrip(owned: OwnedChildren) {
     )
     .await;
     // First turn: two asks open; `once` settles only its own request.
-    let (_, turn1, first, _) = send_until_ask(&mut scenario, 1, "first asks").await;
+    let (_, turn1, first, committed) = send_until_ask(&mut scenario, 1, "first asks").await;
     assert_eq!(first, "per_a1");
-    let opened = drain_until(&mut scenario.host, "request.opened").await;
-    let second = opened
-        .iter()
-        .find(|(kind, _)| kind == "request.opened")
-        .and_then(|(_, data)| data.get("request_id").and_then(Value::as_str))
-        .expect("second opened id");
-    assert_eq!(second, "per_b1");
+    let opened = opened_requests(&mut scenario.host, committed, 2).await;
+    assert_eq!(opened, ["per_a1", "per_b1"]);
     let (approve_id, outcome, committed) = control(
         &mut scenario,
         1,
@@ -3679,9 +3696,10 @@ async fn scenario_permission_approve_deny_roundtrip(owned: OwnedChildren) {
 async fn reject_settles_every_pending_permission(scenario: &mut Scenario) {
     // Second turn: a `reject` settles every pending permission — the
     // sibling closes without a command binding.
-    let (_, turn2, first, _) = send_until_ask(scenario, 1, "second asks").await;
+    let (_, turn2, first, committed) = send_until_ask(scenario, 1, "second asks").await;
     assert_eq!(first, "per_c1");
-    drain_until(&mut scenario.host, "request.opened").await;
+    let opened = opened_requests(&mut scenario.host, committed, 2).await;
+    assert_eq!(opened, ["per_c1", "per_d1"]);
     let (_, outcome, committed) = control(
         scenario,
         1,
