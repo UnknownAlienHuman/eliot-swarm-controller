@@ -2111,7 +2111,7 @@ pub(super) fn gate_rule_action_dispatch_tx(
             super::capacity::release_unstarted_tx(tx, target, 1, &row.0)?;
             super::fail_unstarted_launch_tx(tx, target, &row.0, now, events)?;
         } else if sibling.command.verb == "resume" {
-            super::cancel_unstarted_resume_input_tx(
+            super::lifecycle::cancel_unstarted_resume_input_tx(
                 tx,
                 target,
                 &row.0,
