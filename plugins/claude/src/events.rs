@@ -136,12 +136,39 @@ pub(crate) fn spawn(
 }
 
 impl EventHandle {
+    /// Commit readiness only after the SessionStart proof is observed: the
+    /// initialize reply and the session_start record race, and readiness
+    /// must compare against the observed session, never assume it.
     pub async fn ready(
-        &self,
+        &mut self,
         native_scope: String,
         session_id: String,
         effective: Value,
     ) -> Result<()> {
+        let deadline = Instant::now() + EVENT_DEADLINE;
+        loop {
+            {
+                let status = self.status.borrow();
+                if status.session_id.is_some() || status.failure.is_some() {
+                    break;
+                }
+            }
+            match timeout_at(deadline, self.status.changed()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    return Err(Error::new(
+                        "unknown",
+                        "Claude event task ended before session proof",
+                    ));
+                }
+                Err(_) => {
+                    return Err(Error::new(
+                        "unknown",
+                        "Claude session proof was not observed before readiness",
+                    ));
+                }
+            }
+        }
         self.send(|reply| Control::Ready {
             native_scope,
             session_id,
@@ -383,6 +410,12 @@ impl EventProcessor {
             return Err(Error::new(
                 "unknown",
                 "Claude event source acknowledgement is unresolved",
+            ));
+        }
+        if let Some(failure) = self.status.failure.clone() {
+            return Err(Error::new(
+                "unknown",
+                format!("Claude event source failed before readiness: {failure}"),
             ));
         }
         self.status.session_id = Some(session_id.clone());
@@ -771,7 +804,11 @@ impl EventProcessor {
         }
         let session_id = self.status.session_id.as_deref().unwrap_or_default();
         let native_id = format!("claude:{session_id}:{turn_id}:turn.completed");
-        self.commit_event("turn.completed", native_id, data).await?;
+        // Publish the observed terminal BEFORE the commit resolves: the host
+        // may snapshot as soon as it receives the batch, and a control
+        // racing the terminal must see the finished turn (same order as the
+        // association path, which binds active before its own commit). A
+        // failed commit still latches source_unknown with this terminal.
         self.status.last_turn = Some(TurnFacts {
             command_id,
             turn_id,
@@ -781,6 +818,7 @@ impl EventProcessor {
         });
         self.status.active_turn_id = None;
         self.status.active_command_id = None;
+        self.commit_event("turn.completed", native_id, data).await?;
         Ok(())
     }
 
