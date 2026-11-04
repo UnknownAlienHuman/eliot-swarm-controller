@@ -120,6 +120,7 @@ struct EventProcessor {
     gap_reported: bool,
     final_text: Option<String>,
     closed: bool,
+    status_tx: watch::Sender<EventStatus>,
 }
 
 pub(crate) fn spawn(
@@ -128,9 +129,9 @@ pub(crate) fn spawn(
     host: PeerClient,
     config: EventConfig,
 ) -> EventHandle {
-    let processor = EventProcessor::new(host, config);
     let (control, control_rx) = mpsc::channel(CONTROL_QUEUE);
     let (status_tx, status) = watch::channel(EventStatus::default());
+    let processor = EventProcessor::new(host, config, status_tx.clone());
     tokio::spawn(run(frames, stream, processor, control_rx, status_tx));
     EventHandle { control, status }
 }
@@ -355,7 +356,7 @@ fn publish(processor: &EventProcessor, status: &watch::Sender<EventStatus>) {
 }
 
 impl EventProcessor {
-    fn new(host: PeerClient, config: EventConfig) -> Self {
+    fn new(host: PeerClient, config: EventConfig, status_tx: watch::Sender<EventStatus>) -> Self {
         let sink = CommitSink::new(host.clone(), config.credential.clone());
         Self {
             host,
@@ -378,7 +379,16 @@ impl EventProcessor {
             gap_reported: false,
             final_text: None,
             closed: false,
+            status_tx,
         }
+    }
+
+    /// Publish the current status immediately, ahead of the run loop's
+    /// end-of-iteration publish. Commits await a host round trip; without
+    /// this the host can receive a batch, ack it and snapshot before the
+    /// status the batch proves is visible.
+    fn publish_now(&self) {
+        let _ = self.status_tx.send_replace(self.status.clone());
     }
 
     async fn ready(
@@ -681,6 +691,7 @@ impl EventProcessor {
                 self.status.active_command_id = Some(command_id.clone());
                 self.status.active_turn_id = Some(turn_id.clone());
                 self.final_text = None;
+                self.publish_now();
                 let session_id = self.status.session_id.as_deref().unwrap_or_default();
                 let native_id = format!("claude:{session_id}:{turn_id}:turn.started");
                 let data = json!({
@@ -818,6 +829,7 @@ impl EventProcessor {
         });
         self.status.active_turn_id = None;
         self.status.active_command_id = None;
+        self.publish_now();
         self.commit_event("turn.completed", native_id, data).await?;
         Ok(())
     }
