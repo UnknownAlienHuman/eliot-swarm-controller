@@ -32,9 +32,9 @@ jobs:
       - name: Formatting
         run: cargo fmt --check
       - name: Scoped Clippy and compile
-        run: cargo clippy --locked --all-targets -p eliot -p eliot-core -p eliot-store -p eliot-plugin -p eliot-daemon -p eliot-plugin-codex -p eliot-plugin-muse -p eliot-plugin-claude -- -D warnings
+        run: cargo clippy --locked --all-targets -p eliot -p eliot-core -p eliot-store -p eliot-plugin -p eliot-daemon -p eliot-plugin-codex -p eliot-plugin-muse -p eliot-plugin-claude -p eliot-plugin-opencode -- -D warnings
       - name: Compile maintained-package test targets
-        run: cargo test --no-run --locked --all-targets -p eliot -p eliot-core -p eliot-store -p eliot-plugin -p eliot-daemon -p eliot-plugin-codex -p eliot-plugin-muse -p eliot-plugin-claude
+        run: cargo test --no-run --locked --all-targets -p eliot -p eliot-core -p eliot-store -p eliot-plugin -p eliot-daemon -p eliot-plugin-codex -p eliot-plugin-muse -p eliot-plugin-claude -p eliot-plugin-opencode
       - name: Deterministic maintained-package regressions
         timeout-minutes: 4
-        run: cargo test --locked --all-targets -p eliot -p eliot-core -p eliot-store -p eliot-plugin -p eliot-daemon -p eliot-plugin-codex -p eliot-plugin-muse -p eliot-plugin-claude
+        run: cargo test --locked --all-targets -p eliot -p eliot-core -p eliot-store -p eliot-plugin -p eliot-daemon -p eliot-plugin-codex -p eliot-plugin-muse -p eliot-plugin-claude -p eliot-plugin-opencode

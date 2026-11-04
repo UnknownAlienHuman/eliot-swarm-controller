@@ -26,7 +26,6 @@ use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 const CLI: &str = env!("CARGO_BIN_EXE_eliot");
 const MODEL: &str = "test-provider/test-model";
 const OP_TIMEOUT: Duration = Duration::from_secs(15);
-const HANG_TIMEOUT: Duration = Duration::from_secs(45);
 
 fn main() {
     if let Ok(script) = std::env::var("ELIOT_FAKE_OPENCODE_SCRIPT") {
@@ -72,7 +71,7 @@ struct Script {
     create_model: Option<Value>,
     create_dir: Option<String>,
     prompt_status: u16,
-    prompt_hang: bool,
+    prompt_drop: bool,
     terminal: String,
     assistant_text: Option<String>,
     error: Option<Value>,
@@ -97,7 +96,7 @@ impl Script {
                 _ => None,
             },
             prompt_status: get("prompt_status").as_u64().unwrap_or(200) as u16,
-            prompt_hang: get("prompt_hang").as_bool().unwrap_or(false),
+            prompt_drop: get("prompt_drop").as_bool().unwrap_or(false),
             terminal: text("terminal", "succeeded"),
             assistant_text: match get("assistant_text") {
                 Value::Null => None,
@@ -313,9 +312,9 @@ async fn serve_connection(fixture: Arc<Fixture>, stream: tokio::net::TcpStream) 
     match payload {
         Some((status, text)) => write_response(&mut writer, status, &text).await,
         None => {
-            // A hung handler (the lost-reply script): hold the connection
-            // until the client deadline fires.
-            std::future::pending::<()>().await;
+            // A dropped handler (the lost-reply script): close the
+            // connection without a response, so the client sees a
+            // transport failure instead of waiting out its deadline.
         }
     }
 }
@@ -390,7 +389,7 @@ async fn write_chunk(
     writer.flush().await
 }
 
-/// Route one fixture request. `None` hangs the connection (lost reply).
+/// Route one fixture request. `None` drops the connection (lost reply).
 async fn route(
     fixture: &Fixture,
     method: &str,
@@ -503,7 +502,7 @@ async fn route(
             return Some((204, String::new()));
         }
         if method == "POST" && tail == "/prompt" {
-            if fixture.script.prompt_hang {
+            if fixture.script.prompt_drop {
                 return None;
             }
             if fixture.script.prompt_status != 200 {
@@ -1594,7 +1593,7 @@ async fn scenario_prompt_400_is_rejected_without_rewrite() {
 
 async fn scenario_lost_prompt_reply_is_unknown_without_rewrite() {
     let mut scenario =
-        Scenario::start(&script(json!({ "prompt_hang": true })), opencode_profile()).await;
+        Scenario::start(&script(json!({ "prompt_drop": true })), opencode_profile()).await;
     let send_id = ulid::Ulid::new().to_string();
     let agent_id = scenario.agent_id.clone();
     let params = json!({
@@ -1602,13 +1601,13 @@ async fn scenario_lost_prompt_reply_is_unknown_without_rewrite() {
         "generation": 1,
         "command_id": send_id,
         "verb": "send",
-        "args": {"text": "hanging"},
+        "args": {"text": "dropped"},
         "turn_id": null,
         "request_id": null,
     });
     let (outcome, committed) = scenario
         .host
-        .pump_call("agent.command", params.clone(), HANG_TIMEOUT)
+        .pump_call("agent.command", params.clone(), OP_TIMEOUT)
         .await;
     assert_eq!(outcome, Err("unknown".to_owned()));
     assert!(committed.is_empty());
