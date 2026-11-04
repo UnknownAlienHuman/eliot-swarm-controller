@@ -217,7 +217,13 @@ impl EventHandle {
 
     /// Wait until `ready` for the association of `command_id`: its turn
     /// opened (applied), the source failed/stopped (unknown), or the
-    /// deadline elapsed (unknown; the admitted input is never resent).
+    /// deadline elapsed (unknown; the admitted input is never resent). A
+    /// turn that already completed (its terminal facts retained) counts as
+    /// opened: when the terminal flushes synchronously inside the
+    /// `AssociateInbox` control, open and close land in one event-loop
+    /// iteration and only the closed state is ever published, so a watcher
+    /// that starts after it must not wait for an active window that will
+    /// never come again.
     pub async fn await_association(&self, command_id: &str, deadline: Instant) -> Result<String> {
         // One watcher for the whole wait: cloning per iteration could miss
         // a status version that lands between the check and the clone.
@@ -235,6 +241,12 @@ impl EventHandle {
                         "unknown",
                         "OpenCode send association did not complete",
                     ));
+                }
+                if let Some(turn) = status.last_turn.as_ref()
+                    && turn.command_id == command_id
+                    && turn.terminal
+                {
+                    return Ok(turn.turn_id.clone());
                 }
             }
             match timeout_at(deadline, watcher.changed()).await {
@@ -1156,4 +1168,75 @@ async fn run(
     // Keep the host/client alive until the task ends; dropping them here
     // would close shared connection state early.
     let _ = (&processor.host, &processor.http);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EventHandle, EventStatus, TurnFacts};
+    use tokio::time::Instant;
+
+    fn handle_with(status: EventStatus) -> EventHandle {
+        let (control, _) = tokio::sync::mpsc::channel(1);
+        let (_, watcher) = tokio::sync::watch::channel(status);
+        EventHandle {
+            control,
+            status: watcher,
+        }
+    }
+
+    /// When the terminal flushes synchronously inside `AssociateInbox`, open
+    /// and close land in one event-loop iteration and only the closed state
+    /// is ever published: a waiter that starts after it still associates.
+    #[tokio::test]
+    async fn association_sees_a_turn_completed_before_the_wait() {
+        let handle = handle_with(EventStatus {
+            last_turn: Some(TurnFacts {
+                command_id: "cmd-1".to_owned(),
+                turn_id: "turn-1".to_owned(),
+                status: Some("completed".to_owned()),
+                final_text: None,
+                terminal: true,
+            }),
+            ..EventStatus::default()
+        });
+        let turn = handle
+            .await_association("cmd-1", Instant::now() + std::time::Duration::from_secs(5))
+            .await
+            .expect("completed turn associates");
+        assert_eq!(turn, "turn-1");
+    }
+
+    /// A retained turn for another command (or a non-terminal stop snapshot)
+    /// never satisfies the wait.
+    #[tokio::test]
+    async fn association_ignores_foreign_and_nonterminal_turns() {
+        for last_turn in [
+            TurnFacts {
+                command_id: "cmd-other".to_owned(),
+                turn_id: "turn-1".to_owned(),
+                status: Some("completed".to_owned()),
+                final_text: None,
+                terminal: true,
+            },
+            TurnFacts {
+                command_id: "cmd-1".to_owned(),
+                turn_id: "turn-1".to_owned(),
+                status: None,
+                final_text: None,
+                terminal: false,
+            },
+        ] {
+            let handle = handle_with(EventStatus {
+                last_turn: Some(last_turn),
+                ..EventStatus::default()
+            });
+            handle
+                .await_association(
+                    "cmd-1",
+                    Instant::now() + std::time::Duration::from_millis(50),
+                )
+                .await
+                .expect_err("no association without our terminal turn");
+        }
+    }
 }

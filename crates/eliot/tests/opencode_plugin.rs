@@ -1127,7 +1127,10 @@ impl Host {
         };
         let outcome = outcome
             .unwrap_or_else(|_| {
-                panic!("host call deadline during {method}: no response or inbound for {timeout:?}")
+                panic!(
+                    "host call deadline during {method}: no response for {timeout:?} (committed so far: {:?})",
+                    kinds(&committed)
+                )
             })
             .expect("host response channel");
         match quiesce {
