@@ -1,7 +1,7 @@
 use crate::{
     events::{self, EventConfig, EventHandle, TurnOutcome},
     native::{
-        ClaudeClient, ClaudeLaunch, ClaudeProcess, native_no_write,
+        ClaudeClient, ClaudeProcess, native_no_write,
         types::{InitializeReadback, OutboundUserInput, OutboundUserMessage},
     },
 };
@@ -9,6 +9,7 @@ use eliot_core::{Error, ProcessRecord, ProcessState, Result, SecretPolicy};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
+    native_transport::NativeLaunch,
     protocol::{MAX_COMMAND_ID_BYTES, MAX_CREDENTIAL_BYTES},
 };
 use serde_json::{Value, json};
@@ -307,7 +308,7 @@ impl ClaudePlugin {
         // Eliot mints the session id and pre-assigns it: SessionStart hook
         // lines carry it before any input, so no `start_requires_input`.
         let session_id = new_uuid();
-        let launch = ClaudeLaunch {
+        let launch = NativeLaunch {
             program,
             args: vec![
                 OsString::from("-p"),
