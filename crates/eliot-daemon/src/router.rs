@@ -83,6 +83,7 @@ struct RouterInner {
     data_root: PathBuf,
     store: StoreHandle,
     bus: Bus,
+    mail: crate::config::MailConfig,
     owner_token: String,
     secrets: SecretSet,
     agent_credentials: AgentCredentials,
@@ -142,11 +143,32 @@ struct ProjectGetRequest {
 struct ProjectListRequest {}
 
 impl Router {
+    /// Test harness constructor with default `[mail]` limits; production
+    /// startup passes the loaded config through `new_with_mail_config`.
+    #[cfg(test)]
     pub(crate) fn new(
         data_root: std::path::PathBuf,
         owner_token: String,
         store: StoreHandle,
         bus: Bus,
+    ) -> Self {
+        Self::new_with_mail_config(
+            data_root,
+            owner_token,
+            store,
+            bus,
+            crate::config::MailConfig::default(),
+        )
+    }
+
+    /// Build a Router with owner `[mail]` limits loaded once by the caller
+    /// (daemon startup), instead of re-reading the config file per send.
+    pub(crate) fn new_with_mail_config(
+        data_root: std::path::PathBuf,
+        owner_token: String,
+        store: StoreHandle,
+        bus: Bus,
+        mail: crate::config::MailConfig,
     ) -> Self {
         let secrets: SecretSet = Arc::new(Mutex::new(HashSet::from([owner_token.clone()])));
         let agent_credentials: AgentCredentials = Arc::new(Mutex::new(Default::default()));
@@ -178,6 +200,7 @@ impl Router {
                 data_root,
                 store,
                 bus,
+                mail,
                 owner_token,
                 secrets,
                 agent_credentials,

@@ -83,7 +83,8 @@ config-file `[mail]` table); overflow returns `mailbox_full` without a partial
 fanout. `mail.max_unread_messages_per_agent` (default 10,000) also bounds
 metadata for empty/tiny messages. Acknowledged/history retention is bounded by
 `daemon.retention.mail_days` (unset disables pruning; unread mail is never
-pruned); requests for removed history return `history_gap`.
+pruned); reads of removed deliveries return `history_gap`, while a retried
+ack over them succeeds as already acked.
 
 ```sql
 CREATE TABLE messages (

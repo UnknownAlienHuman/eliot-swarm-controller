@@ -202,10 +202,10 @@ sets and acknowledged mail older than `mail_days` through the Store writer;
 see the [Core retention contract](core.md#retention). Command and write
 bindings always outlive the 24-hour retry window plus the 5-minute allowed
 clock-skew margin regardless of `commands_days`, so a pruned id resubmits as
-`id_expired`, never as new, even when its ULID timestamp runs ahead of the
-Store commit clock. Mail rows outlive the same margin regardless of
-`mail_days`, so a removed delivery always reads `history_gap`, never
-`not_found`.
+`id_expired`, never as new. Mail rows outlive the retry window plus twice
+that margin regardless of `mail_days`, so a removed delivery admitted with a
+skew-bounded write id reads `history_gap` on its own mailbox's read paths;
+a retried ack over it succeeds as already acked.
 
 The implemented unread mailbox bounds are a root-level mail table:
 

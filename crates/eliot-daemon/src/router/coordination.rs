@@ -60,10 +60,10 @@ impl Router {
             MailSendRequest::validate,
         )?;
         let name = principal_name(principal);
-        let mail = crate::config::load_mail_config(&self.inner.data_root)?;
+        let limits = self.inner.mail.limits();
         let change = {
             let mut store = self.inner.store.lock().await;
-            let change = store.mail_send(&name, &request, mail.limits(), now_ms())?;
+            let change = store.mail_send(&name, &request, limits, now_ms())?;
             self.publish_locked(&change.events);
             change
         };
@@ -308,12 +308,16 @@ mod tests {
     fn router_with_config(root: &std::path::Path, source: &str) -> Router {
         std::fs::create_dir_all(root).unwrap();
         std::fs::write(root.join("config.toml"), source).unwrap();
+        // Loaded once at construction, like daemon startup: sends never
+        // re-read the file.
+        let mail = crate::config::load_mail_config(root).unwrap();
         let store = eliot_store::Store::open(std::path::Path::new(":memory:")).unwrap();
-        Router::new(
+        Router::new_with_mail_config(
             PathBuf::from(root),
             "owner-credential".to_owned(),
             std::sync::Arc::new(AsyncMutex::new(store)),
             Bus::new(16),
+            mail,
         )
     }
 

@@ -114,12 +114,16 @@ impl Store {
                         "retention windows must be positive days",
                     ));
                 }
-                // Mail rows must outlive the retry window plus the allowed
-                // clock skew no matter how short the configured window is:
-                // the absent-delivery rule reads `history_gap` exactly past
-                // that age, and a pruned row must always land on the gap
-                // side of it, never `not_found`.
-                let retry_floor = RETRY_WINDOW_MS + RETRY_CLOCK_SKEW_MS + 1;
+                // Mail rows must outlive the retry window plus twice the
+                // allowed clock skew no matter how short the configured
+                // window is. Two skews chain here: an admitted write-id ULID
+                // may run one skew ahead of its row's commit-clock stamps,
+                // and the absent-delivery rule itself allows the retry window
+                // plus one more skew before it reads `history_gap`. Past this
+                // floor a pruned delivery admitted through `mail.send` lands
+                // on the gap side of that rule on its own mailbox's read
+                // paths, never `not_found`.
+                let retry_floor = RETRY_WINDOW_MS + 2 * RETRY_CLOCK_SKEW_MS + 1;
                 Some(now.saturating_sub(days.saturating_mul(MS_PER_DAY).max(retry_floor)))
             }
             None => None,
@@ -308,25 +312,29 @@ impl Store {
     /// Delete one bounded batch of acknowledged messages whose acknowledgement
     /// is older than the mail cutoff, oldest ack first. Unread rows
     /// (`read_at IS NULL`) never match, however old. Deletion is silent: no
-    /// events are emitted, and later reads of a removed delivery return
-    /// `history_gap` through the shared absent-id age rule.
+    /// events are emitted. Later reads of a removed delivery return
+    /// `history_gap` through the shared absent-id age rule, and a retried ack
+    /// treats it as already acked.
     fn prune_mail(&mut self, cutoff: i64) -> Result<i64> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
         let deleted = db!(tx.execute(
-            "DELETE FROM messages WHERE delivery_id IN (
-                 SELECT delivery_id FROM messages
-                 WHERE read_at IS NOT NULL AND read_at <= ?1
-                 ORDER BY read_at, delivery_id LIMIT ?2
-             )",
+            &format!("DELETE FROM messages WHERE delivery_id IN ({PRUNE_MAIL_SELECT})"),
             params![cutoff, MAX_PAGE_ENTRIES as i64],
         ));
         commit_transaction(tx, &self.write_faulted)?;
         Ok(deleted as i64)
     }
 }
+
+/// The prune batch `prune_mail` deletes: acknowledged rows only, oldest ack
+/// first. Shared with the plan test so the asserted plan cannot drift from
+/// the executed query.
+const PRUNE_MAIL_SELECT: &str = "SELECT delivery_id FROM messages
+             WHERE read_at IS NOT NULL AND read_at <= ?1
+             ORDER BY read_at, delivery_id LIMIT ?2";
 
 impl SubtreeMember {
     fn is_open(&self) -> bool {
@@ -1384,21 +1392,22 @@ mod tests {
     #[test]
     fn mail_pruning_honors_the_retry_floor_for_short_windows() {
         let mut store = store();
-        // A one-day window still keeps rows younger than the retry window
-        // plus the allowed clock skew, so a pruned row always reads
-        // `history_gap`, never `not_found`.
-        let floor = RETRY_WINDOW_MS + RETRY_CLOCK_SKEW_MS + 1;
+        // A one-day window still keeps rows acked more recently than the
+        // retry window plus twice the allowed clock skew, so a pruned
+        // delivery admitted with a skew-bounded write id reads `history_gap`
+        // on its own mailbox's read paths.
+        let floor = RETRY_WINDOW_MS + 2 * RETRY_CLOCK_SKEW_MS + 1;
         insert_message(
             &mut store,
-            "below-floor/a1",
+            "above-cutoff/a1",
             NOW - floor + 1,
             Some(NOW - floor + 1),
         );
-        insert_message(&mut store, "above-floor/a1", NOW - floor, Some(NOW - floor));
+        insert_message(&mut store, "at-cutoff/a1", NOW - floor, Some(NOW - floor));
         let report = store.prune_retention(None, None, Some(1), NOW).unwrap();
         assert_eq!(report.mail_deleted, 1);
-        assert!(message_exists(&store, "below-floor/a1"));
-        assert!(!message_exists(&store, "above-floor/a1"));
+        assert!(message_exists(&store, "above-cutoff/a1"));
+        assert!(!message_exists(&store, "at-cutoff/a1"));
     }
 
     #[test]
@@ -1417,6 +1426,36 @@ mod tests {
         assert_eq!(report.mail_deleted, 5);
         let report = store.prune_retention(None, None, Some(30), NOW).unwrap();
         assert_eq!(report.mail_deleted, 0);
+    }
+
+    #[test]
+    fn prune_mail_seeks_the_acked_index_without_scan_or_sort() {
+        let store = store();
+        let mut statement = store
+            .connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {PRUNE_MAIL_SELECT}"))
+            .unwrap();
+        let plan = statement
+            .query_map(params![NOW, MAX_PAGE_ENTRIES as i64], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            plan.contains("USING INDEX messages_prune_acked")
+                || plan.contains("USING COVERING INDEX messages_prune_acked"),
+            "prune batch should seek the acked-mail index, got:\n{plan}"
+        );
+        assert!(
+            !plan.contains("SCAN messages"),
+            "prune batch should not table-scan messages, got:\n{plan}"
+        );
+        assert!(
+            !plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+            "prune batch should not sort, got:\n{plan}"
+        );
     }
 
     #[test]

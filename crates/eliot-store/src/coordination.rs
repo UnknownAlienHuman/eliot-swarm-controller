@@ -179,8 +179,11 @@ impl Store {
         Ok(delivery)
     }
 
-    /// Acknowledge exact delivery ids, idempotently. Unknown ids reject the
-    /// whole acknowledgement; nothing arrived after the fetch is affected.
+    /// Acknowledge exact delivery ids, idempotently. An absent id that may
+    /// have been pruned (own mailbox suffix, write id past the gap age)
+    /// succeeds as already acked, so a retried ack never fails on removed
+    /// history; any other unknown id rejects the whole acknowledgement and
+    /// marks nothing. Nothing arrived after the fetch is affected.
     pub fn mail_ack(
         &mut self,
         principal: &str,
@@ -743,7 +746,13 @@ impl Store {
                     |row| row.get(0),
                 )
                 .map_err(sql_error)?;
-            if !found {
+            // A gap-eligible absent id may have been acked and then pruned
+            // (pruning deletes acknowledged rows only), or never issued;
+            // either way succeeding changes nothing, while failing would
+            // break a retried ack over removed history. The sibling update
+            // below is a no-op for it. Every other absent id still rejects
+            // the whole batch, and the remainder can only read `not_found`.
+            if !found && !delivery_may_be_pruned(delivery, mailbox, now) {
                 return Err(absent_delivery_error(delivery, mailbox, now));
             }
         }
@@ -1231,7 +1240,7 @@ mod tests {
     }
 
     #[test]
-    fn mail_migration_installs_v21_tables() {
+    fn mail_migration_installs_v22_tables_and_prune_index() {
         let store = store();
         let version: i64 = store
             .connection
@@ -1240,7 +1249,7 @@ mod tests {
             })
             .expect("read Store migration version");
         assert_eq!(version, super::super::schema::CURRENT_SCHEMA_VERSION);
-        assert_eq!(version, 21);
+        assert_eq!(version, 22);
         for table in ["messages", "vars", "mail_notices"] {
             let found: i64 = store
                 .connection
@@ -1252,6 +1261,16 @@ mod tests {
                 .expect("count coordination table");
             assert_eq!(found, 1, "missing {table}");
         }
+        let index: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'messages_prune_acked'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count prune index");
+        assert_eq!(index, 1, "missing messages_prune_acked");
     }
 
     #[test]
@@ -1809,7 +1828,9 @@ mod tests {
         assert_eq!(report.commands_deleted, 0);
         assert_eq!(report.writes_deleted, 0);
 
-        // The removed delivery reads history_gap on every request path.
+        // The removed delivery reads history_gap on every read path (ack
+        // instead succeeds as already acked; see
+        // retried_ack_after_prune_succeeds_for_pruned_ids).
         let read = MailReadRequest {
             agent: None,
             delivery_id: pruned_id.clone(),
@@ -1817,18 +1838,6 @@ mod tests {
         assert_eq!(
             store
                 .mail_read(&agent_principal(&a), &read, now)
-                .unwrap_err()
-                .code,
-            "history_gap"
-        );
-        let ack = MailAckRequest {
-            id: Ulid::new().to_string(),
-            agent: None,
-            deliveries: vec![pruned_id.clone()],
-        };
-        assert_eq!(
-            store
-                .mail_ack(&agent_principal(&a), &ack, now)
                 .unwrap_err()
                 .code,
             "history_gap"
@@ -1907,6 +1916,221 @@ mod tests {
         store
             .mail_read(&agent_principal(&a), &kept, now)
             .expect("young acked mail still reads");
+    }
+
+    #[test]
+    fn mail_write_ids_beyond_clock_skew_in_the_future_are_refused() {
+        let mut store = store();
+        let now = now_ms();
+        let a = ready_agent(&mut store, "app", now);
+        let principal = agent_principal(&a);
+        let skew = super::super::RETRY_CLOCK_SKEW_MS;
+        // An id more than the allowed skew ahead of admission is refused on
+        // all three write paths through the shared command id rule.
+        let mut ahead = send_request(vec![a.clone()], "future");
+        ahead.id = ulid_at(now + skew + 1, 1);
+        assert_eq!(
+            store
+                .mail_send("owner", &ahead, MailLimits::default(), now)
+                .unwrap_err()
+                .code,
+            "invalid"
+        );
+        let ack = MailAckRequest {
+            id: ulid_at(now + skew + 1, 2),
+            agent: None,
+            deliveries: vec![format!("{}/{}", ulid_at(now, 3), a)],
+        };
+        assert_eq!(
+            store.mail_ack(&principal, &ack, now).unwrap_err().code,
+            "invalid"
+        );
+        let var = VarSetRequest {
+            id: ulid_at(now + skew + 1, 4),
+            scope: Some("project:app".to_owned()),
+            key: "k".to_owned(),
+            value: json!(1),
+            expect_version: None,
+            note: None,
+        };
+        assert_eq!(
+            store.var_set(&principal, &var, now).unwrap_err().code,
+            "invalid"
+        );
+        assert_eq!(unread(&store, &a), 0);
+        // Exactly the skew ahead still admits: the boundary favors the writer.
+        let mut edge = send_request(vec![a.clone()], "edge");
+        edge.id = ulid_at(now + skew, 5);
+        store
+            .mail_send("owner", &edge, MailLimits::default(), now)
+            .expect("skew-boundary send admits");
+        assert_eq!(unread(&store, &a), 1);
+    }
+
+    #[test]
+    fn replay_of_a_pruned_message_id_is_refused_never_readmitted() {
+        let mut store = store();
+        let now = now_ms();
+        let a = ready_agent(&mut store, "app", now);
+        let principal = agent_principal(&a);
+        let mut request = send_request(vec![a.clone()], "short-lived");
+        request.id = ulid_at(now, 1);
+        let sent = store
+            .mail_send("owner", &request, MailLimits::default(), now)
+            .expect("send")
+            .value;
+        let delivery = sent.deliveries[0].delivery_id.clone();
+        store
+            .mail_ack(
+                &principal,
+                &MailAckRequest {
+                    id: ulid_at(now, 2),
+                    agent: None,
+                    deliveries: vec![delivery.clone()],
+                },
+                now,
+            )
+            .expect("ack");
+        // Past both windows, one pass removes the mail row and the send's
+        // write binding: the send and the ack bindings share the commands
+        // cutoff, so both go.
+        let later = now + 31 * DAY_MS;
+        let report = store
+            .prune_retention(None, Some(30), Some(30), later)
+            .unwrap();
+        assert_eq!(report.mail_deleted, 1);
+        assert_eq!(report.writes_deleted, 2);
+        // Replaying the pruned send id is refused: it reads expired, never
+        // re-admits as new mail.
+        assert_eq!(
+            store
+                .mail_send("owner", &request, MailLimits::default(), later)
+                .unwrap_err()
+                .code,
+            "id_expired"
+        );
+        let rows: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "a pruned send id must not fan out again");
+        // And the removed delivery still reads history_gap on read paths.
+        assert_eq!(
+            store
+                .mail_read(
+                    &principal,
+                    &MailReadRequest {
+                        agent: None,
+                        delivery_id: delivery,
+                    },
+                    later,
+                )
+                .unwrap_err()
+                .code,
+            "history_gap"
+        );
+    }
+
+    #[test]
+    fn retried_ack_after_prune_succeeds_for_pruned_ids() {
+        let mut store = store();
+        let now = now_ms();
+        let a = ready_agent(&mut store, "app", now);
+        let b = ready_agent(&mut store, "app", now);
+        let principal = agent_principal(&a);
+        let first = store
+            .mail_send(
+                "owner",
+                &send_request(vec![a.clone()], "one"),
+                MailLimits::default(),
+                now,
+            )
+            .expect("send one")
+            .value
+            .deliveries[0]
+            .delivery_id
+            .clone();
+        let second = store
+            .mail_send(
+                "owner",
+                &send_request(vec![a.clone()], "two"),
+                MailLimits::default(),
+                now,
+            )
+            .expect("send two")
+            .value
+            .deliveries[0]
+            .delivery_id
+            .clone();
+        // Ack only the first; the second stays unread so it survives pruning.
+        store
+            .mail_ack(
+                &principal,
+                &MailAckRequest {
+                    id: Ulid::new().to_string(),
+                    agent: None,
+                    deliveries: vec![first.clone()],
+                },
+                now,
+            )
+            .expect("ack first");
+        let later = now + 31 * DAY_MS;
+        let report = store.prune_retention(None, None, Some(30), later).unwrap();
+        assert_eq!(report.mail_deleted, 1);
+        // A retried batch over the pruned id and a live sibling succeeds for
+        // both: the pruned id counts as already acked, the sibling gets acked.
+        let retry = MailAckRequest {
+            id: ulid_at(later, 7),
+            agent: None,
+            deliveries: vec![first.clone(), second.clone()],
+        };
+        let acked = store
+            .mail_ack(&principal, &retry, later)
+            .expect("retried ack succeeds")
+            .value;
+        assert_eq!(acked.acked, vec![first.clone(), second.clone()]);
+        assert_eq!(unread(&store, &a), 0);
+        // Foreign and young-unknown ids still reject the whole batch
+        // atomically: nothing is marked.
+        let mut fresh = send_request(vec![a.clone()], "three");
+        fresh.id = ulid_at(later, 8);
+        let third = store
+            .mail_send("owner", &fresh, MailLimits::default(), later)
+            .expect("send three")
+            .value
+            .deliveries[0]
+            .delivery_id
+            .clone();
+        let mut to_b = send_request(vec![b.clone()], "for b");
+        to_b.id = ulid_at(later, 10);
+        let foreign = store
+            .mail_send("owner", &to_b, MailLimits::default(), later)
+            .expect("send to b")
+            .value
+            .deliveries[0]
+            .delivery_id
+            .clone();
+        let bad = MailAckRequest {
+            id: ulid_at(later, 11),
+            agent: None,
+            deliveries: vec![third.clone(), foreign.clone()],
+        };
+        assert_eq!(
+            store.mail_ack(&principal, &bad, later).unwrap_err().code,
+            "not_found"
+        );
+        assert_eq!(unread(&store, &a), 1, "failed ack marks nothing");
+        assert_eq!(unread(&store, &b), 1);
+        let young = MailAckRequest {
+            id: ulid_at(later, 12),
+            agent: None,
+            deliveries: vec![format!("{}/{}", ulid_at(later, 13), a)],
+        };
+        assert_eq!(
+            store.mail_ack(&principal, &young, later).unwrap_err().code,
+            "not_found"
+        );
+        assert_eq!(unread(&store, &a), 1);
     }
 
     #[test]

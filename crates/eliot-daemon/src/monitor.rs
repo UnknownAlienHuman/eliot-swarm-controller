@@ -1716,7 +1716,10 @@ mod tests {
 
     fn handoff_health_fixture(families: &[&str]) -> (eliot_store::Store, String) {
         let mut store = eliot_store::Store::open(std::path::Path::new(":memory:")).unwrap();
-        let mut request = eliot_core::SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+        // The fixture clock is fixed at 1000, so the id carries that
+        // timestamp: admission refuses ULIDs ahead of the commit clock.
+        let id = ulid::Ulid::from_parts(1000, 1).to_string();
+        let mut request = eliot_core::SubmitCommand::new(id, "launch");
         request.args = serde_json::json!({
             "project":"source-health", "workspace":"synthetic-workspace", "harness":"fake",
         });

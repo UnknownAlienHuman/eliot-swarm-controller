@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 21;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 22;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -541,7 +541,7 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
-        if current < CURRENT_SCHEMA_VERSION {
+        if current < 21 {
             let tx = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -571,6 +571,19 @@ impl Store {
                      open_notice_command TEXT
                  );
                  INSERT INTO schema_migrations(version) VALUES (21);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < CURRENT_SCHEMA_VERSION {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE INDEX messages_prune_acked ON messages(read_at, delivery_id)
+                     WHERE read_at IS NOT NULL;
+                 INSERT INTO schema_migrations(version) VALUES (22);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

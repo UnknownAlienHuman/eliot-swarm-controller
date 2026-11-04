@@ -51,9 +51,10 @@ const MAX_INPUT_BYTES: usize = 512 * 1024;
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const RETRY_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 /// Allowed generator-clock skew for ULID age checks. A mutation id timestamp
-/// may run ahead of the Store commit clock by up to this margin; retention
-/// keeps rows long enough that such an id still reads `id_expired` after
-/// pruning. See docs/spec/configuration.md (daemon retention).
+/// may run ahead of the Store commit clock by up to this margin; admission
+/// refuses anything further ahead, and retention keeps rows long enough that
+/// such an id still reads `id_expired` after pruning. See
+/// docs/spec/configuration.md (daemon retention).
 const RETRY_CLOCK_SKEW_MS: i64 = 5 * 60 * 1_000;
 const COMMAND_METHOD: &str = "command.submit";
 const INITIAL_SOURCE: &str = "stream";
@@ -6024,6 +6025,16 @@ fn validate_id_age(id: &str, now: i64) -> Result<()> {
         return Err(Error::new(
             "id_expired",
             "an absent mutation id is older than the 24-hour retry window",
+        ));
+    }
+    // A ULID further ahead than the allowed generator-clock skew is a client
+    // clock error, not a retry: refusing it at admission keeps every retained
+    // id skew-bounded, so the retention floors can promise `id_expired` (and
+    // mail `history_gap`) after pruning instead of a re-admitted-as-new id.
+    if created_at.saturating_sub(now) > RETRY_CLOCK_SKEW_MS {
+        return Err(Error::new(
+            "invalid",
+            "mutation id is more than the allowed clock skew in the future",
         ));
     }
     Ok(())
