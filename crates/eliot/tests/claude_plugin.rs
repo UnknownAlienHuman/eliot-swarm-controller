@@ -114,6 +114,18 @@ fn main() {
         )
         .await;
         run_scenario(
+            "a logged-out CLI logs in through its own login, then launches",
+            OwnedChildren::default(),
+            scenario_logged_out_cli_logs_in_then_launches,
+        )
+        .await;
+        run_scenario(
+            "an abandoned CLI login rejects the start before any session",
+            OwnedChildren::default(),
+            scenario_abandoned_login_rejects_start,
+        )
+        .await;
+        run_scenario(
             "session mismatch is unknown with an explicit gap",
             OwnedChildren::default(),
             scenario_session_mismatch_is_unknown_with_gap,
@@ -289,6 +301,10 @@ fn fake_claude_main(script: &str) {
         .map(PathBuf::from)
         .expect("ELIOT_FAKE_CLAUDE_REPORT");
     let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("auth") {
+        fake_auth(script, &report_path, argv.get(2).map(String::as_str));
+        return;
+    }
     let flag = |name: &str| {
         argv.iter()
             .position(|arg| arg == name)
@@ -314,6 +330,27 @@ fn fake_claude_main(script: &str) {
         report_path: fake.report_path.clone(),
     };
     fake.run();
+}
+
+/// `claude auth status|login` for the plugin's pre-launch login check. A
+/// `logged-out-*` script starts logged out; `auth login` logs in only for
+/// `logged-out-login-completes` (writing `login.marker` beside the report).
+fn fake_auth(script: &str, report_path: &std::path::Path, command: Option<&str>) {
+    let marker = report_path.with_file_name("login.marker");
+    match command {
+        Some("status") => {
+            let logged_in = !script.starts_with("logged-out") || marker.exists();
+            println!(
+                "{}",
+                json!({"loggedIn": logged_in, "authMethod": "claude.ai"})
+            );
+            std::process::exit(if logged_in { 0 } else { 1 });
+        }
+        Some("login") if script == "logged-out-login-completes" => {
+            std::fs::write(&marker, b"ok").expect("write login marker");
+        }
+        _ => std::process::exit(1),
+    }
 }
 
 /// Marks the fake CLI's exit even when it panics (e.g. a broken-pipe write
@@ -2588,6 +2625,42 @@ async fn scenario_interrupt_reports_nonempty_still_queued(owned: OwnedChildren) 
     drain_interrupted_turn(&mut scenario.host, &agent_id, &turn_id).await;
     stop_agent(&mut scenario.host, &agent_id, 1).await;
     scenario.assert_cli_exit("stdin-eof");
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+}
+
+async fn scenario_logged_out_cli_logs_in_then_launches(owned: OwnedChildren) {
+    let config = StartConfig::fresh("logged-out-login-completes", claude_profile());
+    let (mut scenario, outcome) = Scenario::start_full(config, &owned).await;
+    outcome.expect("the CLI's own login completes, then the session starts");
+    assert!(
+        scenario.root.join("login.marker").exists(),
+        "the plugin ran the CLI's login before launching"
+    );
+    assert_eq!(
+        scenario.report()["controls"]
+            .get("initialize")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    shutdown_with_session_end(&mut scenario.host).await;
+    scenario.host.shutdown_child().await;
+}
+
+async fn scenario_abandoned_login_rejects_start(owned: OwnedChildren) {
+    let mut config = StartConfig::fresh("logged-out-login-abandons", claude_profile());
+    config.expect_ready = false;
+    let (mut scenario, outcome) = Scenario::start_full(config, &owned).await;
+    let error = outcome.expect_err("an unfinished login must fail start");
+    assert!(error.contains("native_not_dispatched"), "{error}");
+    assert!(
+        !scenario.root.join("report.json").exists(),
+        "no session CLI was started"
+    );
     scenario
         .host
         .call("shutdown", json!({}))

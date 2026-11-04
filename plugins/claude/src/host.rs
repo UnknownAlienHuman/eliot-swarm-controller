@@ -1300,6 +1300,9 @@ async fn launch_session(
         argv.push(OsString::from("--permission-mode"));
         argv.push(OsString::from(mode));
     }
+    // The CLI keeps its own login (not the desktop app's): check it, and run
+    // its browser login when it is logged out, before any native resource.
+    crate::native::ensure_logged_in(&plan.program, &plan.workspace, &plan.environment).await?;
     let launch = NativeLaunch {
         program: plan.program.clone(),
         args: argv,
