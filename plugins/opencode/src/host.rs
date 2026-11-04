@@ -1,18 +1,18 @@
 use crate::{
     events::{EventConfig, EventHandle, EventStatus, TurnFacts},
     native::{
-        HttpOutcome, OpenCodeHttp, OwnedServer, ServerLaunch, native_no_write,
+        HttpOutcome, OpenCodeHttp, OwnedServer, ServerLaunch,
         types::{InboxUser, ModelRef, SessionInfo},
     },
 };
-use eliot_core::{Error, ProcessRecord, ProcessState, Result};
+use eliot_core::{Error, Result};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
     session::{
-        TargetEnvironment, contextual_error, decode, known_command, not_initialized, paths_equal,
-        target_environment, unknown_snapshot, validate_binding, validate_identity,
-        validate_source_plan,
+        TargetEnvironment, contextual_error, decode, known_command, native_no_write,
+        not_initialized, paths_equal, register_native_process, target_environment,
+        unknown_snapshot, validate_binding, validate_identity, validate_source_plan,
     },
 };
 use serde_json::{Value, json};
@@ -462,7 +462,10 @@ impl OpenCodePlugin {
             &parsed.credential,
             &session.agent_id,
             session.generation,
-            &session.server,
+            session.server.pid(),
+            "OpenCode",
+            "server",
+            RPC_TIMEOUT,
         )
         .await
         {
@@ -1205,61 +1208,6 @@ async fn terminate_session(session: &mut AgentSession, force: bool) -> Result<()
         ));
     }
     session.phase = SessionPhase::Stopped;
-    Ok(())
-}
-
-async fn register_native_process(
-    peer: &PeerClient,
-    credential: &str,
-    agent_id: &str,
-    generation: i64,
-    server: &OwnedServer,
-) -> Result<()> {
-    let pid = server.pid().filter(|pid| *pid > 0).ok_or_else(|| {
-        Error::new(
-            "process_registration",
-            "OpenCode server PID is unavailable; no session or input was sent",
-        )
-    })?;
-    let value = peer
-        .call(
-            "process.put",
-            json!({
-                "credential": credential,
-                "agent_id": agent_id,
-                "generation": generation,
-                "pid": pid,
-                "role": "harness",
-            }),
-            Instant::now() + RPC_TIMEOUT,
-        )
-        .await
-        .map_err(|error| {
-            let message = format!(
-                "OpenCode server process registration failed ({})",
-                error.code
-            );
-            contextual_error(error, "process_registration", message)
-        })?;
-    let record: ProcessRecord = serde_json::from_value(value).map_err(|_| {
-        Error::new(
-            "process_registration",
-            "OpenCode host returned an invalid process.put acknowledgement",
-        )
-    })?;
-    if record.identity.pid != pid
-        || record.identity.host_boot_id.trim().is_empty()
-        || record.identity.start_time == 0
-        || record.owner != format!("agent:{agent_id}#{generation}")
-        || record.role != "harness"
-        || record.state != ProcessState::Running
-        || record.exit_code.is_some()
-    {
-        return Err(Error::new(
-            "process_registration",
-            "OpenCode host did not verify the running server under this Agent generation",
-        ));
-    }
     Ok(())
 }
 

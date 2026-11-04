@@ -4,7 +4,7 @@ use eliot_plugin::{
     protocol::MAX_COMMAND_ID_BYTES,
     session::{
         EVENT_DEADLINE, StreamSource, attach_final_text, attach_native_error,
-        event_id as shared_event_id,
+        event_id as shared_event_id, native_no_write,
     },
 };
 use serde::Serialize;
@@ -965,10 +965,7 @@ impl EventProcessor {
             .await
         {
             Ok(ack) => ack,
-            Err(error)
-                if crate::native::native_no_write(&error.code)
-                    || error.code == "native_rejected" =>
-            {
+            Err(error) if native_no_write(&error.code) || error.code == "native_rejected" => {
                 // Proven not admitted (transport never wrote, or a
                 // schema-documented pre-admission/validation error): the
                 // request stays available for a later reply.

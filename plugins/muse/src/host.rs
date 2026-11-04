@@ -1,7 +1,7 @@
 use crate::{
     events::{self, EventConfig, EventHandle, TurnFacts, rejected_control, unknown_control},
     native::{
-        NativeClient, NativeLaunch, NativeProcess, native_no_write,
+        NativeClient, NativeLaunch, NativeProcess,
         requests::describe_request,
         types::{
             NativeApprovalListPendingParams, NativeApprovalListPendingResult,
@@ -22,14 +22,15 @@ use crate::{
         },
     },
 };
-use eliot_core::{Error, ProcessRecord, ProcessState, Result, SecretPolicy};
+use eliot_core::{Error, Result, SecretPolicy};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
     protocol::MAX_CREDENTIAL_BYTES,
     session::{
-        TargetEnvironment, decode, known_command, not_initialized, paths_equal, target_environment,
-        unknown_snapshot, validate_binding, validate_identity, validate_source_plan,
+        TargetEnvironment, decode, known_command, native_no_write, not_initialized, paths_equal,
+        register_native_process, target_environment, unknown_snapshot, validate_binding,
+        validate_identity, validate_source_plan,
     },
 };
 use serde_json::{Value, json};
@@ -456,7 +457,10 @@ impl MusePlugin {
             &initialized.credential,
             &session.agent_id,
             session.generation,
-            &session.native,
+            session.native.pid(),
+            "Muse",
+            "session host",
+            RPC_TIMEOUT,
         )
         .await
         {
@@ -1969,61 +1973,6 @@ async fn terminate_session(session: &mut AgentSession, force: bool) -> Result<()
         ));
     }
     session.phase = SessionPhase::Stopped;
-    Ok(())
-}
-
-async fn register_native_process(
-    peer: &PeerClient,
-    credential: &str,
-    agent_id: &str,
-    generation: i64,
-    native: &NativeProcess,
-) -> Result<()> {
-    let pid = native.pid().filter(|pid| *pid > 0).ok_or_else(|| {
-        Error::new(
-            "process_registration",
-            "Muse session host PID is unavailable; no session or input was sent",
-        )
-    })?;
-    let value = peer
-        .call(
-            "process.put",
-            json!({
-                "credential": credential,
-                "agent_id": agent_id,
-                "generation": generation,
-                "pid": pid,
-                "role": "harness",
-            }),
-            Instant::now() + RPC_TIMEOUT,
-        )
-        .await
-        .map_err(|error| {
-            let message = format!(
-                "Muse session host process registration failed ({})",
-                error.code
-            );
-            contextual_error(error, "process_registration", message)
-        })?;
-    let record: ProcessRecord = serde_json::from_value(value).map_err(|_| {
-        Error::new(
-            "process_registration",
-            "Muse host returned an invalid process.put acknowledgement",
-        )
-    })?;
-    if record.identity.pid != pid
-        || record.identity.host_boot_id.trim().is_empty()
-        || record.identity.start_time == 0
-        || record.owner != format!("agent:{agent_id}#{generation}")
-        || record.role != "harness"
-        || record.state != ProcessState::Running
-        || record.exit_code.is_some()
-    {
-        return Err(Error::new(
-            "process_registration",
-            "Muse host did not verify the running session host under this Agent generation",
-        ));
-    }
     Ok(())
 }
 

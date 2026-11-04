@@ -37,7 +37,9 @@ jobs:
         run: cargo test --no-run --locked --all-targets -p eliot -p eliot-core -p eliot-store -p eliot-plugin -p eliot-daemon -p eliot-plugin-codex -p eliot-plugin-muse -p eliot-plugin-claude -p eliot-plugin-opencode
       - name: Deterministic maintained-package regressions
         # The Windows leg runs the full subprocess-heavy suites plus the
-        # attribution suites in ~4:10; 4 minutes kills it mid-pass. Suite
-        # timeouts (120 s per plugin scenario) still bound real hangs.
+        # attribution suites in 3:41 (green run 41804589917); the 4-minute
+        # budget killed an earlier run mid-pass (run 41801869741), so 8
+        # minutes is headroom. Suite timeouts (120 s per plugin scenario)
+        # still bound real hangs.
         timeout-minutes: 8
         run: cargo test --locked --all-targets -p eliot -p eliot-core -p eliot-store -p eliot-plugin -p eliot-daemon -p eliot-plugin-codex -p eliot-plugin-muse -p eliot-plugin-claude -p eliot-plugin-opencode

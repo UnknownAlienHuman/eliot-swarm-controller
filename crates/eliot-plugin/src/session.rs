@@ -2,18 +2,21 @@
 //!
 //! Muse and OpenCode bind one Agent generation to one owned native server
 //! through this module: the target-environment mapping, identity/binding
-//! validation, unknown snapshots, contextual errors, stream event
-//! commits/gaps and the bounded native-error/final-text attachments are
-//! identical up to the harness name. This module holds the single copy;
-//! each plugin passes its own display name (`"Muse"`, `"OpenCode"`) and id
-//! prefix (`"muse"`, `"opencode"`). Codex uses only the target-environment
+//! validation, unknown snapshots, contextual errors, native process
+//! registration, the no-write code predicate, stream event commits/gaps
+//! and the bounded native-error/final-text attachments are identical up
+//! to the harness name. This module holds the single copy; each plugin
+//! passes its own display name (`"Muse"`, `"OpenCode"`) and id prefix
+//! (`"muse"`, `"opencode"`). Codex uses only the target-environment
 //! mapping here and still carries its own copies of the rest; it converts
 //! in a follow-up. No trait: the shared state is passed by reference
 //! through [`StreamSource`].
 
 use std::{collections::HashMap, ffi::OsString, path::Path, time::Duration};
 
-use eliot_core::{Error, NativeEvent, Result, SecretPolicy, SourceBatch};
+use eliot_core::{
+    Error, NativeEvent, ProcessRecord, ProcessState, Result, SecretPolicy, SourceBatch,
+};
 use serde_json::{Value, json};
 use tokio::time::Instant;
 
@@ -143,6 +146,12 @@ pub fn decode<T: serde::de::DeserializeOwned>(raw: &Value, message: &str) -> Res
     serde_json::from_value(raw.clone()).map_err(|_| Error::new("invalid", message))
 }
 
+/// Local non-dispatch codes: the write provably never reached the native
+/// side, so the host may report `rejected` (never sent, safe to supersede).
+pub fn native_no_write(code: &str) -> bool {
+    matches!(code, "native_not_dispatched" | "busy" | "frame_too_large")
+}
+
 /// `bad_state` for a request that arrived before `initialize`.
 pub fn not_initialized(harness: &str) -> Error {
     Error::new(
@@ -243,6 +252,72 @@ pub fn contextual_error(
     message: impl Into<String>,
 ) -> Error {
     error.with_code(code).with_message(message)
+}
+
+/// Register the owned native process as the `harness` role under this
+/// Agent generation. `harness` is the display name (`"Muse"`,
+/// `"OpenCode"`); `process_noun` is the owned child (`"session host"`,
+/// `"server"`). The caller resolves the pid through its own child handle;
+/// a missing or zero pid fails before any session or input is sent.
+#[allow(clippy::too_many_arguments)]
+pub async fn register_native_process(
+    peer: &PeerClient,
+    credential: &str,
+    agent_id: &str,
+    generation: i64,
+    pid: Option<u32>,
+    harness: &str,
+    process_noun: &str,
+    rpc_timeout: Duration,
+) -> Result<()> {
+    let pid = pid.filter(|pid| *pid > 0).ok_or_else(|| {
+        Error::new(
+            "process_registration",
+            format!("{harness} {process_noun} PID is unavailable; no session or input was sent"),
+        )
+    })?;
+    let value = peer
+        .call(
+            "process.put",
+            json!({
+                "credential": credential,
+                "agent_id": agent_id,
+                "generation": generation,
+                "pid": pid,
+                "role": "harness",
+            }),
+            Instant::now() + rpc_timeout,
+        )
+        .await
+        .map_err(|error| {
+            let message = format!(
+                "{harness} {process_noun} process registration failed ({})",
+                error.code
+            );
+            contextual_error(error, "process_registration", message)
+        })?;
+    let record: ProcessRecord = serde_json::from_value(value).map_err(|_| {
+        Error::new(
+            "process_registration",
+            format!("{harness} host returned an invalid process.put acknowledgement"),
+        )
+    })?;
+    if record.identity.pid != pid
+        || record.identity.host_boot_id.trim().is_empty()
+        || record.identity.start_time == 0
+        || record.owner != format!("agent:{agent_id}#{generation}")
+        || record.role != "harness"
+        || record.state != ProcessState::Running
+        || record.exit_code.is_some()
+    {
+        return Err(Error::new(
+            "process_registration",
+            format!(
+                "{harness} host did not verify the running {process_noun} under this Agent generation"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Native event identity for one stream-owned fact.
