@@ -439,12 +439,15 @@ pub fn unknown_snapshot(params: &AgentSnapshotParams, reason: &str) -> Result<Va
     }))
 }
 
-/// Re-code an error for its propagation context, keeping its diagnostics.
+/// Unknown outcomes stay verbatim; other errors get the caller code/message.
 pub fn contextual_error(
     error: Error,
     code: impl Into<String>,
     message: impl Into<String>,
 ) -> Error {
+    if error.code == "unknown" {
+        return error;
+    }
     error.with_code(code).with_message(message)
 }
 
@@ -861,7 +864,8 @@ pub fn require_nonempty(value: &str, harness: &str, what: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{optional_profile_text, request_event_id, validate_source_plan};
+    use super::{contextual_error, optional_profile_text, request_event_id, validate_source_plan};
+    use eliot_core::{Error, StderrSnapshot, StderrSource};
     use serde_json::json;
 
     /// The shared source-plan check spells every harness message exactly as
@@ -943,5 +947,33 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn contextual_error_preserves_unknown_and_contextualizes_others() {
+        let snapshot = StderrSnapshot {
+            text: "dummy diagnostic".to_owned(),
+            truncated: false,
+            eof: true,
+            read_error: false,
+        };
+        let unknown = Error::new("unknown", "dummy uncertain outcome")
+            .with_stderr(StderrSource::Plugin, snapshot.clone())
+            .with_stderr(StderrSource::Harness, snapshot.clone());
+        let before = serde_json::to_value(&unknown).expect("serialize unknown");
+        let preserved = contextual_error(unknown, "profile_error", "context message");
+        assert_eq!(preserved.code, "unknown");
+        assert_eq!(preserved.message, "dummy uncertain outcome");
+        assert_eq!(preserved.diagnostics.len(), 2);
+        assert_eq!(
+            serde_json::to_value(&preserved).expect("serialize preserved"),
+            before
+        );
+        let normal = Error::new("failed", "original").with_stderr(StderrSource::Plugin, snapshot);
+        let contextualized = contextual_error(normal, "profile_error", "context message");
+        assert_eq!(contextualized.code, "profile_error");
+        assert_eq!(contextualized.message, "context message");
+        assert_eq!(contextualized.diagnostics.len(), 1);
+        assert_eq!(contextualized.diagnostics[0].source, StderrSource::Plugin);
     }
 }
