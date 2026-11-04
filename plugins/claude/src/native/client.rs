@@ -111,9 +111,11 @@ impl ClaudeProcess {
         self.transport.await_output_drained(deadline).await
     }
 
-    /// Drop stdin so `claude -p` sees EOF and exits, then end the owned
-    /// tree. The kill path only fires when the graceful close cannot be
-    /// confirmed.
+    /// Drop stdin so `claude -p` sees EOF and exits, then kill that direct
+    /// child by handle. The kill path only fires when the graceful close
+    /// cannot be confirmed. Grandchildren are not touched here: the
+    /// generation's named kill-on-close Job (Windows) or process group
+    /// (Unix) reaps the rest.
     pub async fn terminate(&mut self, force: bool, deadline: Instant) -> Result<ExitStatus> {
         self.transport
             .terminate_dropping_input(force, deadline)

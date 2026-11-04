@@ -37,11 +37,16 @@ session id before any input, so the adapter declares no `start_requires_input`.
 Resolve Windows executables explicitly; never insert an unrequested shell wrapper.
 Avoid modes that disable required hooks/instructions.
 
-Stop drops the CLI's stdin and reaps that direct child by handle (kill after
-a 2 s grace if EOF does not end it). Grandchildren — tool processes the CLI
-itself spawns — are neither tracked nor reaped by the plugin: on stop they
-are left to the OS (reparented on Unix, detached but running on Windows).
-The fixture CLI spawns nothing, so no test covers their fate.
+Stop drops the CLI's stdin and kills only that direct child by handle (kill
+after a 2 s grace if EOF does not end it). Grandchildren — tool processes
+the CLI itself spawns — are reaped by the generation custody the daemon put
+the plugin in, not by the plugin: on Windows the plugin starts inside the
+generation's named kill-on-close Job (`OwnedChild::spawn_agent` in
+`crates/eliot-daemon/src/platform/custody.rs`, via
+`PluginHost::spawn_plugin`), so closing the Job kills the whole family; on
+Unix the plugin leads its own process group and the daemon group-kills it
+(degraded: escapable via setsid). The fixture CLI spawns nothing, so no test
+covers their fate.
 
 ## Native mapping
 
@@ -51,7 +56,7 @@ The fixture CLI spawns nothing, so no test covers their fate.
 | steer | unsupported: no exact-current-turn mechanism exists in PR1 |
 | inject | unsupported: no inject verb; a turn never receives another turn's queued context |
 | interrupt | stdin `control_request interrupt` for the bound active turn uuid, with the `still_queued` readback; the terminal follows and unknown is not repeated |
-| stop | drop stdin (the CLI exits on EOF) and reap the owned CLI by handle; does not merely detach observation; grandchildren are left to the OS (see Transport) |
+| stop | drop stdin (the CLI exits on EOF) and kill only the direct CLI child by handle; does not merely detach observation; grandchildren are reaped by the generation Job on Windows / process group on Unix, not the plugin (see Transport) |
 | resume | unsupported in PR1: `resume_from` is rejected; resume with the exact native session id lands in a later slice |
 | approve/deny | unsupported in PR1: approvals are unconnected and the CLI runs its default permission posture |
 | answer | unsupported in PR1: no question-answer verb |

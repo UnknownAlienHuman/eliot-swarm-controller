@@ -90,6 +90,12 @@ fn main() {
         )
         .await;
         run_scenario(
+            "rejected oversized send does not wedge the session",
+            OwnedChildren::default(),
+            scenario_rejected_send_does_not_wedge_session,
+        )
+        .await;
+        run_scenario(
             "interrupt applied once, then stale_turn",
             OwnedChildren::default(),
             scenario_interrupt_applied_then_stale,
@@ -707,8 +713,20 @@ impl Host {
     ) -> oneshot::Receiver<Result<Value, String>> {
         self.next_id += 1;
         let id = format!("host-call-{}", self.next_id);
+        self.begin_call_with_id(&id, method, params).await
+    }
+
+    /// Send a call under an explicit JSON-RPC id. The oversized-send
+    /// scenario pins a 1-char id to shrink the frame it measures and fits;
+    /// every other scenario uses [`Host::begin_call`].
+    async fn begin_call_with_id(
+        &mut self,
+        id: &str,
+        method: &str,
+        params: Value,
+    ) -> oneshot::Receiver<Result<Value, String>> {
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id.clone(), tx);
+        self.pending.lock().await.insert(id.to_owned(), tx);
         let frame = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         self.writer()
             .send(frame.to_string())
@@ -789,6 +807,19 @@ impl Scenario {
         scenario
     }
 
+    /// Start under an explicit agent id. The oversized-send scenario pins a
+    /// 1-char id to shrink the `agent.command` frame it measures and fits.
+    async fn start_with_agent(
+        script: &str,
+        profile: Value,
+        owned: &OwnedChildren,
+        agent_id: &str,
+    ) -> Self {
+        let (scenario, _) =
+            Self::start_raw_with_agent(script, profile, true, owned, agent_id.to_owned()).await;
+        scenario
+    }
+
     /// `expect_ready` pumps `process.put` plus (on success) the `session.ready`
     /// batch while `agent.start` is in flight. Returns the scenario and the
     /// start result on success, or the scenario parts with the error text.
@@ -798,6 +829,23 @@ impl Scenario {
         expect_ready: bool,
         owned: &OwnedChildren,
     ) -> (Self, Result<(Value, Value), String>) {
+        Self::start_raw_with_agent(
+            script,
+            profile,
+            expect_ready,
+            owned,
+            ulid::Ulid::new().to_string(),
+        )
+        .await
+    }
+
+    async fn start_raw_with_agent(
+        script: &str,
+        profile: Value,
+        expect_ready: bool,
+        owned: &OwnedChildren,
+        agent_id: String,
+    ) -> (Self, Result<(Value, Value), String>) {
         let root: PathBuf = std::env::temp_dir().join(format!(
             "eliot-claude-plugin-test-{}",
             ulid::Ulid::new().to_string().to_lowercase()
@@ -806,7 +854,6 @@ impl Scenario {
         std::fs::create_dir_all(root.join("data")).unwrap();
         std::fs::create_dir_all(root.join("instance")).unwrap();
         std::fs::create_dir_all(root.join("workspace")).unwrap();
-        let agent_id = ulid::Ulid::new().to_string();
         let mut host = Host::spawn(&root).await;
         let manifest = host
             .call(
@@ -1625,6 +1672,120 @@ async fn scenario_dropped_input_is_unknown_without_rewrite(owned: OwnedChildren)
     );
     stop_agent(&mut scenario.host, &agent_id).await;
     scenario.assert_cli_exit("scripted-drop");
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+}
+
+/// A send that fails the native encode after the pending-turn registration
+/// (64c) answers `rejected` and unwedges: the next send on the same session
+/// is accepted, not `busy`. Without the `cancel_turn` on the no-write path
+/// the follow-up send fails `busy` and this scenario fails.
+async fn scenario_rejected_send_does_not_wedge_session(owned: OwnedChildren) {
+    // 1-char ids shrink the `agent.command` envelope: the oversized prompt
+    // must fit the 1 MiB plugin frame while its native user-input encoding
+    // exceeds the 1 MiB native frame, so the host envelope must be the
+    // smaller of the two. `turn_id`/`request_id` are omitted (`#[serde(default)]`).
+    let mut scenario = Scenario::start_with_agent("ok", claude_profile(), &owned, "a").await;
+    let agent_id = scenario.agent_id.clone();
+    const MAX_FRAME_BYTES: usize = 1024 * 1024;
+    const MAX_TEXT_BYTES: usize = 512 * 1024;
+    // Both frames carry the same prompt; each `"` escapes to 2 bytes, so a
+    // quotes-only prompt of N chars adds exactly 2N bytes to each frame past
+    // its measured empty-text length. Lengths, not key order, matter.
+    let host_empty = json!({
+        "jsonrpc": "2.0",
+        "id": "b",
+        "method": "agent.command",
+        "params": {
+            "agent_id": agent_id,
+            "generation": 1,
+            "command_id": "big",
+            "verb": "send",
+            "args": {"text": ""},
+        },
+    })
+    .to_string()
+    .len();
+    // Mirror of the plugin's native user-input record
+    // (`plugins/claude/src/native/types.rs` `OutboundUserInput`, no
+    // `skip_serializing_if` on `parent_tool_use_id`); uuids are always 36
+    // chars (`host.rs` `new_uuid`).
+    let pad36 = "x".repeat(36);
+    let native_empty = json!({
+        "type": "user",
+        "uuid": pad36,
+        "session_id": "x".repeat(36),
+        "parent_tool_use_id": Value::Null,
+        "message": {"role": "user", "content": ""},
+    })
+    .to_string()
+    .len();
+    // Largest N whose host frame (plus newline) still fits, smallest N whose
+    // native encoding (plus newline) exceeds the bound; use the middle.
+    let host_max = (MAX_FRAME_BYTES - 1 - host_empty) / 2;
+    let native_min = (MAX_FRAME_BYTES - 1 - native_empty) / 2 + 1;
+    assert!(
+        native_min <= host_max,
+        "no quote count fits the host frame while overflowing the native frame \
+         (host_empty={host_empty}, native_empty={native_empty}); envelopes drifted"
+    );
+    let quotes = (native_min + host_max) / 2;
+    assert!(
+        quotes <= MAX_TEXT_BYTES,
+        "oversized prompt must pass the host 512 KiB pre-check to reach the native encode"
+    );
+    let big = "\"".repeat(quotes);
+    let send_params = json!({
+        "agent_id": agent_id,
+        "generation": 1,
+        "command_id": "big",
+        "verb": "send",
+        "args": {"text": big},
+    });
+    let rx = scenario
+        .host
+        .begin_call_with_id("b", "agent.command", send_params)
+        .await;
+    let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
+    // The failed encode commits nothing: the first inbound frame must be
+    // the rejection, never a host request.
+    let rejected = tokio::select! {
+        biased;
+        request = scenario.host.next_request() => {
+            panic!("rejected input commits nothing, plugin asked {}", request.method);
+        }
+        result = &mut rx => result,
+    };
+    let rejected = rejected
+        .expect("send deadline")
+        .expect("send response channel")
+        .expect("send rejected");
+    assert_eq!(
+        rejected.get("state").and_then(Value::as_str),
+        Some("rejected")
+    );
+    assert_eq!(
+        scenario.report().get("user_inputs").and_then(Value::as_u64),
+        Some(0),
+        "the rejected send wrote nothing to the CLI"
+    );
+    // The session is not wedged behind the withdrawn pending turn: a normal
+    // send on the same session applies (without the 64c fix this is `busy`).
+    let (_, _, committed) = send_turn(&mut scenario.host, &agent_id, "hello").await;
+    assert!(
+        committed.iter().any(|(kind, _)| kind == "turn.completed"),
+        "follow-up turn completes"
+    );
+    assert_eq!(
+        scenario.report().get("user_inputs").and_then(Value::as_u64),
+        Some(1)
+    );
+    stop_agent(&mut scenario.host, &agent_id).await;
+    scenario.assert_cli_exit("stdin-eof");
     scenario
         .host
         .call("shutdown", json!({}))
