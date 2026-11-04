@@ -1151,7 +1151,7 @@ impl OpenCodePlugin {
                 "OpenCode session or event source outcome is unresolved",
             ));
         }
-        let (command_id, text) = match Self::admit_send_command(session, &params)? {
+        let (command_id, text) = match Self::admit_send_command(session, &params).await? {
             SendAdmission::Replay(value) => return Ok(value),
             SendAdmission::New { command_id, text } => (command_id, text),
         };
@@ -1172,8 +1172,12 @@ impl OpenCodePlugin {
     }
 
     /// Send phase 1, admission: validate the input, replay a retained
-    /// outcome without new native I/O, or record the new command.
-    fn admit_send_command(
+    /// outcome without new native I/O, or record the new command. The
+    /// idle check reads the event task's current status through the
+    /// control queue, serialized behind the terminal commit: the watch
+    /// snapshot still shows the finished turn when a send follows its
+    /// `turn.completed` immediately.
+    async fn admit_send_command(
         session: &mut AgentSession,
         params: &AgentCommandParams,
     ) -> Result<SendAdmission> {
@@ -1217,7 +1221,12 @@ impl OpenCodePlugin {
                 "OpenCode command was already dispatched without a retained exact outcome",
             ));
         }
-        let event_status = session.events.status();
+        let event_status = session.events.current_status().await.map_err(|_| {
+            Error::new(
+                "unknown",
+                "OpenCode event status is unavailable; the send cannot prove the turn idle",
+            )
+        })?;
         if let Some(reason) = event_status.failure {
             return Err(Error::new("unknown", reason));
         }

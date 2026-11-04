@@ -343,10 +343,6 @@ impl EventHandle {
         }
     }
 
-    pub fn status(&self) -> EventStatus {
-        self.status.borrow().clone()
-    }
-
     /// Wait until `ready` for the association of `command_id`: its turn
     /// opened (applied), the source failed/stopped (unknown), or the
     /// deadline elapsed (unknown; the admitted input is never resent). A
