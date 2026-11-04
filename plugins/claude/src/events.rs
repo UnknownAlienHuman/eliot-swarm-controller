@@ -234,13 +234,24 @@ async fn run(
     mut control: mpsc::Receiver<Control>,
     status: watch::Sender<EventStatus>,
 ) {
+    // Once the native reader ends, its channel stays closed and its stream
+    // watch stays dropped: both branches would resolve immediately forever
+    // and (biased first) starve every control. Disable them after the drain
+    // so `EndStop`/`Close` are still served. This is separate from
+    // `accept_frames`, which only diverts trailing records into the buffer.
+    let mut frames_open = true;
     loop {
         // Frames win over controls: a queued terminal settles before any
         // `CheckTurn` behind it is answered.
         tokio::select! {
             biased;
-            frame = frames.recv() => {
+            frame = frames.recv(), if frames_open => {
                 let Some(frame) = frame else {
+                    frames_open = false;
+                    // Observe the terminal stream state exactly once: an
+                    // overflow that landed with the last frame still gaps.
+                    let terminal = *stream.borrow_and_update();
+                    processor.note_stream_state(terminal).await;
                     processor.note_frames_drained().await;
                     if processor.closed {
                         break;
@@ -255,7 +266,7 @@ async fn run(
                     processor.buffer_record(record);
                 }
             }
-            _ = stream.changed() => {
+            _ = stream.changed(), if frames_open => {
                 let state: StreamState = *stream.borrow();
                 processor.note_stream_state(state).await;
             }

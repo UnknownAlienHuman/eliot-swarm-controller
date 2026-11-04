@@ -68,7 +68,6 @@ struct FakeClaude {
     argv_session: String,
     argv_model: String,
     argv: Vec<String>,
-    parked_turn: Option<String>,
     controls: HashMap<String, u64>,
     user_inputs: u64,
 }
@@ -91,7 +90,6 @@ fn fake_claude_main(script: &str) {
         argv_session: flag("--session-id"),
         argv_model: flag("--model"),
         argv,
-        parked_turn: None,
         controls: HashMap::new(),
         user_inputs: 0,
     };
@@ -178,6 +176,9 @@ impl FakeClaude {
                             }),
                         );
                         if self.script == "interrupt-race" {
+                            // The CLI flushes partial text as it interrupts;
+                            // the adapter must keep it before the terminal.
+                            self.emit_assistant(stdout, "fake partial text. ");
                             self.emit_turn_result(stdout, "interrupted");
                         }
                     }
@@ -236,7 +237,8 @@ impl FakeClaude {
                     }),
                 );
                 if self.script == "interrupt-race" {
-                    self.parked_turn = Some(uuid);
+                    // Park the turn: no assistant text and no terminal
+                    // record until the interrupt arrives.
                     return true;
                 }
                 let texts: Vec<String> = match self.script.as_str() {
@@ -1421,22 +1423,59 @@ async fn scenario_not_idle_rejected_before_ready() {
 }
 
 async fn scenario_invalid_profile_rejected_before_spawn() {
-    let mut profile = claude_profile();
-    profile
-        .as_object_mut()
-        .expect("profile object")
-        .remove("cmd");
-    let (mut scenario, outcome) = Scenario::start_raw("ok", profile, false).await;
-    let error = outcome.expect_err("missing cmd must fail start");
-    assert!(error.contains("profile_error"), "{error}");
+    let root: PathBuf = std::env::temp_dir().join(format!(
+        "eliot-claude-plugin-test-{}",
+        ulid::Ulid::new().to_string().to_lowercase()
+    ));
+    std::fs::create_dir_all(root.join("data")).unwrap();
+    std::fs::create_dir_all(root.join("instance")).unwrap();
+    std::fs::create_dir_all(root.join("workspace")).unwrap();
+    let agent_id = ulid::Ulid::new().to_string();
+    let mut host = Host::spawn(&root).await;
+    host.call(
+        "initialize",
+        json!({
+            "protocol": "eliot-plugin/1",
+            "credential": format!("credential-{}", ulid::Ulid::new()),
+            "instance_dir": root.join("instance").to_string_lossy(),
+            "config": {},
+        }),
+    )
+    .await
+    .expect("initialize");
+    // Missing model, then missing explicit cmd, then a profile for another
+    // harness: all fail before any spawn.
+    for profile in [
+        json!({"harness": "claude"}),
+        json!({"harness": "claude", "model": MODEL}),
+        json!({"harness": "muse", "model": MODEL}),
+    ] {
+        let outcome = host
+            .call(
+                "agent.start",
+                json!({
+                    "agent_id": agent_id,
+                    "generation": 1,
+                    "command_id": ulid::Ulid::new().to_string(),
+                    "profile": profile,
+                    "workspace": root.join("workspace").to_string_lossy(),
+                    "target_environment": {},
+                    "note": null,
+                    "source_plan": {"session": "stream", "turn": "stream", "message": "stream"},
+                    "source_state": null,
+                    "resume_from": null,
+                    "initial": null,
+                }),
+            )
+            .await;
+        let error = outcome.expect_err("invalid profile must fail start");
+        assert!(error.contains("profile_error"), "{error}");
+    }
+    host.call("shutdown", json!({})).await.expect("shutdown");
+    host.shutdown_child().await;
     assert!(
-        !scenario.root.join("report.json").exists(),
+        !root.join("report.json").exists(),
         "no native process spawns for an invalid profile"
     );
-    scenario
-        .host
-        .call("shutdown", json!({}))
-        .await
-        .expect("shutdown");
-    scenario.host.shutdown_child().await;
+    let _ = std::fs::remove_dir_all(&root);
 }
