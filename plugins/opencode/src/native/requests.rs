@@ -148,25 +148,12 @@ pub(crate) fn reply_for(request: &CorePending, verb: &str, args: &Value) -> Resu
 }
 
 /// Approval replies: the installed offer is always the three decisions
-/// (`once`, `always`, `reject`). Approve defaults to `once`, deny to
-/// `reject`; an explicit `choice_id` must name an offered decision the
-/// verb can decide. `feedback` travels as the reply `message`.
+/// (`once`, `always`, `reject`). Approve offers two decisions, so it must
+/// name one with `choice_id` (no default choice); deny has only `reject`.
+/// An explicit `choice_id` must name an offered decision the verb can
+/// decide. `feedback` travels as the reply `message`.
 fn reply_to_approval(request: &CorePending, approve: bool, args: &Value) -> Result<StagedReply> {
-    let args = args.as_object().ok_or_else(|| {
-        Error::new(
-            "invalid",
-            "approval reply args must be an object with only choice_id and feedback",
-        )
-    })?;
-    if args
-        .keys()
-        .any(|key| key != "choice_id" && key != "feedback")
-    {
-        return Err(Error::new(
-            "invalid",
-            "approval reply args must be an object with only choice_id and feedback",
-        ));
-    }
+    let args = eliot_plugin::session::approval_reply_args(args)?;
     let offered = ["once", "always", "reject"];
     let wanted = match args.get("choice_id") {
         None | Some(Value::Null) => None,
@@ -188,7 +175,12 @@ fn reply_to_approval(request: &CorePending, approve: bool, args: &Value) -> Resu
     }
     let verb = if approve { "approve" } else { "deny" };
     let decision = match (approve, wanted) {
-        (true, None) => "once",
+        (true, None) => {
+            return Err(Error::new(
+                "invalid",
+                "approve must name its choice_id: the offer has two approving decisions (once, always)",
+            ));
+        }
         (false, None) => "reject",
         (true, Some("once" | "always")) => wanted.expect("checked offered decision"),
         (false, Some("reject")) => "reject",
@@ -327,13 +319,7 @@ fn reply_to_form_cancel(request: &CorePending, args: &Value) -> Result<StagedRep
 }
 
 fn require_nonempty(value: &str, what: &str) -> Result<()> {
-    if value.trim().is_empty() {
-        return Err(Error::new(
-            "source_integrity",
-            format!("OpenCode {what} is missing"),
-        ));
-    }
-    Ok(())
+    eliot_plugin::session::require_nonempty(value, "OpenCode", what)
 }
 
 /// Redact display text in committed request details with the session
@@ -470,8 +456,11 @@ mod tests {
     #[test]
     fn approval_replies_decide_from_the_offered_decisions() {
         let pending = describe_permission(&asked(), "ses_test", "turn-1").expect("described");
-        // Defaults: approve once, deny rejects.
-        let staged = reply_for(&pending, "approve", &json!({})).expect("approve");
+        // Approve has no default choice; deny has only `reject`.
+        let error = reply_for(&pending, "approve", &json!({})).expect_err("no default");
+        assert_eq!(error.code, "invalid");
+        let staged =
+            reply_for(&pending, "approve", &json!({"choice_id": "once"})).expect("approve once");
         assert_eq!(
             staged.route,
             ReplyRoute::Permission {

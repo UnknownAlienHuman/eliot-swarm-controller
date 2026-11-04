@@ -833,6 +833,32 @@ impl StreamSource<'_> {
     }
 }
 
+/// Approval reply args: an object holding only `choice_id` and `feedback`.
+pub fn approval_reply_args(args: &Value) -> Result<&serde_json::Map<String, Value>> {
+    const SHAPE: &str = "approval reply args must be an object with only choice_id and feedback";
+    let args = args
+        .as_object()
+        .ok_or_else(|| Error::new("invalid", SHAPE))?;
+    if args
+        .keys()
+        .any(|key| key != "choice_id" && key != "feedback")
+    {
+        return Err(Error::new("invalid", SHAPE));
+    }
+    Ok(args)
+}
+
+/// A native request field that must not be blank.
+pub fn require_nonempty(value: &str, harness: &str, what: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        return Err(Error::new(
+            "source_integrity",
+            format!("{harness} native request has an empty {what}"),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{optional_profile_text, request_event_id, validate_source_plan};

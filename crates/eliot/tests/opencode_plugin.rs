@@ -46,123 +46,138 @@ fn main() {
         .build()
         .expect("test runtime");
     runtime.block_on(async {
-        run_scenario(
-            "launch/send/snapshot/stop",
-            scenario_launch_send_snapshot_stop,
-        )
-        .await;
-        run_scenario(
-            "failed turn reports its native error",
-            scenario_failed_turn_reports_native_error,
-        )
-        .await;
-        run_scenario(
-            "model mismatch is rejected before session.ready",
-            scenario_model_mismatch_is_rejected_before_ready,
-        )
-        .await;
-        run_scenario(
-            "location mismatch is rejected before session.ready",
-            scenario_location_mismatch_is_rejected_before_ready,
-        )
-        .await;
-        run_scenario(
-            "prompt 400 is rejected without a second write",
-            scenario_prompt_400_is_rejected_without_rewrite,
-        )
-        .await;
-        run_scenario(
-            "lost prompt reply is unknown without a second write",
-            scenario_lost_prompt_reply_is_unknown_without_rewrite,
-        )
-        .await;
-        run_scenario(
-            "stop of a gone session applies",
-            scenario_stop_of_gone_session_applies,
-        )
-        .await;
-        run_scenario(
-            "invalid profile rejected before spawn",
-            scenario_invalid_profile_rejected_before_spawn,
-        )
-        .await;
-        run_scenario(
-            "SSE loss during send gaps the source",
-            scenario_sse_loss_during_send_gaps,
-        )
-        .await;
-        run_scenario(
-            "resume reattaches the retained session on the stable store",
-            scenario_resume_reattaches_retained_session,
-        )
-        .await;
-        run_scenario(
-            "resume aborts a retained running execution and drops its terminal",
-            scenario_resume_aborts_retained_running_execution,
-        )
-        .await;
-        run_scenario(
-            "resume of a deleted session is not_found",
-            scenario_resume_of_deleted_session_is_not_found,
-        )
-        .await;
-        run_scenario(
-            "resume refuses pending native requests",
-            scenario_resume_refuses_pending_requests,
-        )
-        .await;
-        run_scenario(
-            "resume realigns model and agent with readback",
-            scenario_resume_realigns_model_and_agent,
-        )
-        .await;
-        run_scenario(
-            "permission approve and deny round trip",
-            scenario_permission_approve_deny_roundtrip,
-        )
-        .await;
-        run_scenario(
-            "form answer applies and deny cancels",
-            scenario_form_answer_and_deny_cancel,
-        )
-        .await;
-        run_scenario(
-            "stale choice is rejected before any write",
-            scenario_stale_choice_rejected_without_write,
-        )
-        .await;
-        run_scenario(
-            "server-refused answer is rejected and retryable",
-            scenario_server_refused_answer_is_rejected,
-        )
-        .await;
-        run_scenario(
-            "lost reply is unknown without a second write",
-            scenario_lost_reply_is_unknown_without_rewrite,
-        )
-        .await;
-        run_scenario(
-            "reply to a settled request closes it",
-            scenario_reply_to_settled_request_closes_it,
-        )
-        .await;
-        run_scenario(
-            "interrupt applies and the terminal settles",
-            scenario_interrupt_applies_and_terminal_settles,
-        )
-        .await;
-        run_scenario(
-            "interrupt after the terminal is stale",
-            scenario_interrupt_after_terminal_is_stale,
-        )
-        .await;
-        run_scenario(
-            "request details commit redacted",
-            scenario_request_details_commit_redacted,
-        )
-        .await;
+        run_lifecycle_scenarios().await;
+        run_request_scenarios().await;
     });
     println!("opencode_plugin: all scenarios passed");
+}
+
+/// Launch, send, stop and resume scenarios.
+async fn run_lifecycle_scenarios() {
+    run_scenario(
+        "launch/send/snapshot/stop",
+        scenario_launch_send_snapshot_stop,
+    )
+    .await;
+    run_scenario(
+        "failed turn reports its native error",
+        scenario_failed_turn_reports_native_error,
+    )
+    .await;
+    run_scenario(
+        "model mismatch is rejected before session.ready",
+        scenario_model_mismatch_is_rejected_before_ready,
+    )
+    .await;
+    run_scenario(
+        "location mismatch is rejected before session.ready",
+        scenario_location_mismatch_is_rejected_before_ready,
+    )
+    .await;
+    run_scenario(
+        "prompt 400 is rejected without a second write",
+        scenario_prompt_400_is_rejected_without_rewrite,
+    )
+    .await;
+    run_scenario(
+        "lost prompt reply is unknown without a second write",
+        scenario_lost_prompt_reply_is_unknown_without_rewrite,
+    )
+    .await;
+    run_scenario(
+        "stop of a gone session applies",
+        scenario_stop_of_gone_session_applies,
+    )
+    .await;
+    run_scenario(
+        "invalid profile rejected before spawn",
+        scenario_invalid_profile_rejected_before_spawn,
+    )
+    .await;
+    run_scenario(
+        "SSE loss during send gaps the source",
+        scenario_sse_loss_during_send_gaps,
+    )
+    .await;
+    run_scenario(
+        "resume reattaches the retained session on the stable store",
+        scenario_resume_reattaches_retained_session,
+    )
+    .await;
+    run_scenario(
+        "resume aborts a retained running execution and drops its terminal",
+        scenario_resume_aborts_retained_running_execution,
+    )
+    .await;
+    run_scenario(
+        "resume of a deleted session is not_found",
+        scenario_resume_of_deleted_session_is_not_found,
+    )
+    .await;
+}
+
+/// Request, control and secret-handling scenarios.
+async fn run_request_scenarios() {
+    run_scenario(
+        "resume refuses pending native requests",
+        scenario_resume_refuses_pending_requests,
+    )
+    .await;
+    run_scenario(
+        "resume realigns model and agent with readback",
+        scenario_resume_realigns_model_and_agent,
+    )
+    .await;
+    run_scenario(
+        "permission approve and deny round trip",
+        scenario_permission_approve_deny_roundtrip,
+    )
+    .await;
+    run_scenario(
+        "form answer applies and deny cancels",
+        scenario_form_answer_and_deny_cancel,
+    )
+    .await;
+    run_scenario(
+        "stale choice is rejected before any write",
+        scenario_stale_choice_rejected_without_write,
+    )
+    .await;
+    run_scenario(
+        "server-refused answer is rejected and retryable",
+        scenario_server_refused_answer_is_rejected,
+    )
+    .await;
+    run_scenario(
+        "lost reply is unknown without a second write",
+        scenario_lost_reply_is_unknown_without_rewrite,
+    )
+    .await;
+    run_scenario(
+        "reply to a settled request closes it",
+        scenario_reply_to_settled_request_closes_it,
+    )
+    .await;
+    run_scenario(
+        "interrupt applies and the terminal settles",
+        scenario_interrupt_applies_and_terminal_settles,
+    )
+    .await;
+    run_scenario(
+        "interrupt after the terminal is stale",
+        scenario_interrupt_after_terminal_is_stale,
+    )
+    .await;
+    run_scenario(
+        "a lost interrupt is unknown and never re-sent",
+        scenario_lost_interrupt_is_unknown_without_rewrite,
+    )
+    .await;
+    run_scenario(
+        "request details commit redacted",
+        scenario_request_details_commit_redacted,
+    )
+    .await;
 }
 
 /// Run one scenario under the hard per-scenario timeout. On success the
@@ -170,7 +185,7 @@ fn main() {
 /// assumed); on timeout they are killed by exact recorded PID and the run
 /// fails with the scenario name. The plugin child itself always dies by
 /// handle: dropping the timed-out future drops every `Host`, whose
-/// `kill_on_drop` child ends it Ã¢â‚¬â€ on every exit path, including panics.
+/// `kill_on_drop` child ends it — on every exit path, including panics.
 async fn run_scenario<F, Fut>(name: &'static str, make: F)
 where
     F: FnOnce(OwnedChildren) -> Fut,
@@ -378,6 +393,8 @@ struct Script {
     ghost_settle: bool,
     /// Drop reply/cancel connections without a response (lost reply).
     reply_drop: bool,
+    /// Drop `/interrupt` connections without a response (lost interrupt).
+    interrupt_drop: bool,
     /// Installed agent ids for `GET /api/agent`.
     agents: Vec<String>,
 }
@@ -426,6 +443,7 @@ impl Script {
             seed_forms: get("seed_forms").as_array().cloned().unwrap_or_default(),
             ghost_settle: get("ghost_settle").as_bool().unwrap_or(false),
             reply_drop: get("reply_drop").as_bool().unwrap_or(false),
+            interrupt_drop: get("interrupt_drop").as_bool().unwrap_or(false),
             agents: get("agents")
                 .as_array()
                 .map(|agents| {
@@ -816,378 +834,23 @@ async fn route(
         if !fixture.sessions.lock().await.contains_key(id) {
             return Some((404, not_found(id)));
         }
-        if method == "GET" && tail.is_empty() {
-            let sessions = fixture.sessions.lock().await;
-            let session = sessions.get(id).expect("fixture session");
-            let mut info = json!({
-                "id": id,
-                "model": session.model,
-                "time": {"created": 1000, "updated": 1000},
-                "location": {"directory": session.directory},
-            });
-            if let Some(agent) = session.agent.clone() {
-                info["agent"] = Value::String(agent);
-            }
-            let payload = json!({"data": info});
-            return Some((200, payload.to_string()));
+        if let Some(reply) = session_read_route(fixture, method, id, &tail, query).await {
+            return reply;
         }
-        if method == "POST" && tail == "/interrupt" {
-            let live = {
-                let sessions = fixture.sessions.lock().await;
-                sessions.get(id).expect("fixture session").live
-            };
-            if !live {
-                return Some((200, json!({"interrupted": false}).to_string()));
-            }
-            {
-                let mut sessions = fixture.sessions.lock().await;
-                let session = sessions.get_mut(id).expect("fixture session");
-                session.live = false;
-                session.terminal = Some("session.execution.interrupted".to_owned());
-            }
-            let seq = next_seq(fixture, id).await;
-            let mut data = json!({"sessionID": id});
-            data["reason"] = Value::String("user".to_owned());
-            let terminal = json!({
-                "id": format!("evt_{id}_terminal_{seq}"),
-                "created": 2005,
-                "type": "session.execution.interrupted",
-                "data": data,
-                "durable": {"aggregateID": id, "seq": seq, "version": 1},
-            });
-            let _ = fixture.events.send(terminal.to_string());
-            return Some((200, json!({"interrupted": true}).to_string()));
+        if let Some(reply) = session_control_route(fixture, method, id, &tail, body).await {
+            return reply;
         }
-        if method == "GET" && tail == "/permission" {
-            let permissions = fixture.permissions.lock().await;
-            let pending = permissions.get(id).cloned().unwrap_or_default();
-            return Some((200, json!({"data": pending}).to_string()));
+        if let Some(reply) = permission_reply_route(fixture, method, id, &tail, body).await {
+            return reply;
         }
-        if method == "GET" && tail == "/form" {
-            let forms = fixture.forms.lock().await;
-            let pending = forms.get(id).cloned().unwrap_or_default();
-            return Some((200, json!({"data": pending}).to_string()));
+        if let Some(reply) = form_reply_route(fixture, method, id, &tail, body).await {
+            return reply;
         }
-        if method == "GET" && tail == "/inbox" {
-            return Some((200, json!({"data": []}).to_string()));
+        if let Some(reply) = prompt_route(fixture, method, id, &tail, body).await {
+            return reply;
         }
-        if method == "POST" && tail == "/model" {
-            let request: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
-            let model = request.get("model").cloned().unwrap_or(Value::Null);
-            {
-                let mut sessions = fixture.sessions.lock().await;
-                let session = sessions.get_mut(id).expect("fixture session");
-                session.model = model.clone();
-            }
-            let seq = next_seq(fixture, id).await;
-            let selected = json!({
-                "id": format!("evt_{id}_model_{seq}"),
-                "created": 3000,
-                "type": "session.model.selected",
-                "data": {"sessionID": id, "model": model},
-                "durable": {"aggregateID": id, "seq": seq, "version": 1},
-            });
-            let _ = fixture.events.send(selected.to_string());
-            return Some((204, String::new()));
-        }
-        if method == "POST" && tail == "/agent" {
-            let request: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
-            let agent = request
-                .get("agent")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            {
-                let mut sessions = fixture.sessions.lock().await;
-                let session = sessions.get_mut(id).expect("fixture session");
-                session.agent = Some(agent.clone());
-            }
-            let seq = next_seq(fixture, id).await;
-            let selected = json!({
-                "id": format!("evt_{id}_agent_{seq}"),
-                "created": 3000,
-                "type": "session.agent.selected",
-                "data": {"sessionID": id, "agent": agent},
-                "durable": {"aggregateID": id, "seq": seq, "version": 1},
-            });
-            let _ = fixture.events.send(selected.to_string());
-            return Some((204, String::new()));
-        }
-        if let Some(request_id) = tail
-            .strip_prefix("/permission/")
-            .and_then(|rest| rest.strip_suffix("/reply"))
-        {
-            if fixture.script.reply_drop {
-                return None;
-            }
-            if method != "POST" {
-                return Some((404, not_found(id)));
-            }
-            let request: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
-            let decision = request
-                .get("decision")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if !["once", "always", "reject"].contains(&decision) {
-                return Some((400, String::new()));
-            }
-            let mut permissions = fixture.permissions.lock().await;
-            let pending = permissions.entry(id.to_owned()).or_default();
-            if !pending
-                .iter()
-                .any(|entry| entry.get("id").and_then(Value::as_str) == Some(request_id))
-            {
-                return Some((404, not_found(id)));
-            }
-            // Installed behavior: a reject settles every pending permission
-            // of the session; once/always settle only the targeted one.
-            let settled = if decision == "reject" {
-                std::mem::take(pending)
-            } else {
-                let position = pending
-                    .iter()
-                    .position(|entry| entry.get("id").and_then(Value::as_str) == Some(request_id))
-                    .expect("pending permission");
-                vec![pending.remove(position)]
-            };
-            drop(permissions);
-            for entry in settled {
-                let replied = json!({
-                    "id": format!("evt_replied_{}", entry.get("id").and_then(Value::as_str).unwrap_or_default()),
-                    "created": 4000,
-                    "type": "permission.replied",
-                    "data": {
-                        "sessionID": id,
-                        "requestID": entry.get("id").cloned().unwrap_or(Value::Null),
-                        "reply": decision,
-                    },
-                });
-                let _ = fixture.events.send(replied.to_string());
-            }
-            maybe_emit_reply_terminal(fixture, id).await;
-            return Some((204, String::new()));
-        }
-        if let Some(form_id) = tail
-            .strip_prefix("/form/")
-            .and_then(|rest| rest.strip_suffix("/reply"))
-        {
-            if fixture.script.reply_drop {
-                return None;
-            }
-            if method != "POST" {
-                return Some((404, not_found(id)));
-            }
-            let mut forms = fixture.forms.lock().await;
-            let pending = forms.entry(id.to_owned()).or_default();
-            let position = pending
-                .iter()
-                .position(|entry| entry.get("id").and_then(Value::as_str) == Some(form_id));
-            let Some(position) = position else {
-                if fixture
-                    .settled_forms
-                    .lock()
-                    .await
-                    .contains(&(id.to_owned(), form_id.to_owned()))
-                {
-                    return Some((409, String::new()));
-                }
-                return Some((404, not_found(id)));
-            };
-            let request: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
-            let answer = request.get("answer").cloned().unwrap_or(Value::Null);
-            if !form_answer_valid(&pending[position], &answer) {
-                return Some((400, String::new()));
-            }
-            pending.remove(position);
-            drop(forms);
-            fixture
-                .settled_forms
-                .lock()
-                .await
-                .insert((id.to_owned(), form_id.to_owned()));
-            let replied = json!({
-                "id": format!("evt_form_replied_{form_id}"),
-                "created": 4000,
-                "type": "form.replied",
-                "data": {"id": form_id, "sessionID": id, "answer": answer},
-            });
-            let _ = fixture.events.send(replied.to_string());
-            maybe_emit_reply_terminal(fixture, id).await;
-            return Some((204, String::new()));
-        }
-        if let Some(form_id) = tail.strip_prefix("/form/") {
-            if method != "DELETE" || form_id.contains('/') {
-                return Some((404, not_found(id)));
-            }
-            if fixture.script.reply_drop {
-                return None;
-            }
-            let mut forms = fixture.forms.lock().await;
-            let pending = forms.entry(id.to_owned()).or_default();
-            let Some(position) = pending
-                .iter()
-                .position(|entry| entry.get("id").and_then(Value::as_str) == Some(form_id))
-            else {
-                return Some((404, not_found(id)));
-            };
-            pending.remove(position);
-            drop(forms);
-            let cancelled = json!({
-                "id": format!("evt_form_cancelled_{form_id}"),
-                "created": 4000,
-                "type": "form.cancelled",
-                "data": {"id": form_id, "sessionID": id},
-            });
-            let _ = fixture.events.send(cancelled.to_string());
-            maybe_emit_reply_terminal(fixture, id).await;
-            return Some((204, String::new()));
-        }
-        if method == "DELETE" && tail.is_empty() {
-            if fixture.script.delete_status != 204 {
-                // The session was already gone: DELETE reports 404 and the
-                // session stays absent for the follow-up readback.
-                fixture.deleted.lock().await.insert(id.to_owned());
-                return Some((fixture.script.delete_status, not_found(id)));
-            }
-            fixture.deleted.lock().await.insert(id.to_owned());
-            let seq = next_seq(fixture, id).await;
-            let deleted = json!({
-                "id": format!("evt_{id}_deleted"),
-                "created": 9000,
-                "type": "session.deleted",
-                "data": {"sessionID": id},
-                "durable": {"aggregateID": id, "seq": seq, "version": 2},
-            });
-            let _ = fixture.events.send(deleted.to_string());
-            return Some((204, String::new()));
-        }
-        if method == "POST" && tail == "/prompt" {
-            if fixture.script.prompt_drop {
-                fixture.log_marker(0).await;
-                return None;
-            }
-            if fixture.script.prompt_status != 200 {
-                // The installed server refuses invalid writes with an
-                // empty 400; the fixture matches it.
-                fixture.log_marker(0).await;
-                return Some((fixture.script.prompt_status, String::new()));
-            }
-            let request: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
-            let text = request
-                .get("text")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let mut counter = fixture.inbox_counter.lock().await;
-            *counter += 1;
-            let prompt_index = *counter as usize;
-            let inbox_id = format!("msg_fixture_{prompt_index:03}");
-            drop(counter);
-            {
-                let mut sessions = fixture.sessions.lock().await;
-                let session = sessions.get_mut(id).expect("fixture session");
-                session.inbox_id = Some(inbox_id.clone());
-                session.terminal = Some(fixture.script.terminal.clone());
-                session.live = true;
-            }
-            if fixture.script.drop_sse_on_prompt {
-                // Admit the input, then lose the stream before any
-                // association fact flows: the send must settle unknown.
-                let _ = fixture.sse_close.send(());
-                fixture.log_marker(0).await;
-                let payload = json!({"data": {
-                    "id": inbox_id,
-                    "sessionID": id,
-                    "time": {"created": 2000},
-                    "type": "user",
-                    "payload": {"text": text},
-                    "delivery": "steer",
-                }});
-                return Some((200, payload.to_string()));
-            }
-            let enqueued_seq = next_seq(fixture, id).await;
-            let started_seq = next_seq(fixture, id).await;
-            let delivered_seq = next_seq(fixture, id).await;
-            let started_id = format!("evt_{id}_started_{enqueued_seq}");
-            let mut envelopes = vec![
-                json!({
-                    "id": format!("evt_{id}_enqueued_{enqueued_seq}"),
-                    "created": 2000,
-                    "type": "session.inbox.enqueued",
-                    "data": {"sessionID": id, "inboxID": inbox_id,
-                             "item": {"type": "user", "payload": {"text": text}, "delivery": "steer"}},
-                    "durable": {"aggregateID": id, "seq": enqueued_seq, "version": 1},
-                }),
-                json!({
-                    "id": started_id,
-                    "created": 2001,
-                    "type": "session.execution.started",
-                    "data": {"sessionID": id},
-                    "durable": {"aggregateID": id, "seq": started_seq, "version": 1},
-                }),
-                json!({
-                    "id": format!("evt_{id}_delivered_{delivered_seq}"),
-                    "created": 2002,
-                    "type": "session.inbox.delivered",
-                    "data": {"sessionID": id, "inboxID": inbox_id},
-                    "durable": {"aggregateID": id, "seq": delivered_seq, "version": 1},
-                }),
-            ];
-            envelopes.extend(emit_asks(fixture, id, prompt_index).await);
-            if !fixture.script.manual_terminal && !fixture.script.terminal_on_reply {
-                let terminal_seq = next_seq(fixture, id).await;
-                envelopes.push(terminal_envelope(fixture, id, terminal_seq));
-                let mut sessions = fixture.sessions.lock().await;
-                sessions.get_mut(id).expect("fixture session").live = false;
-            }
-            let emitted = envelopes.len();
-            for envelope in envelopes {
-                let _ = fixture.events.send(envelope.to_string());
-            }
-            fixture.log_marker(emitted).await;
-            let payload = json!({"data": {
-                "id": inbox_id,
-                "sessionID": id,
-                "time": {"created": 2000},
-                "type": "user",
-                "payload": {"text": text},
-                "delivery": "steer",
-            }});
-            return Some((200, payload.to_string()));
-        }
-        if method == "GET" && tail == "/message" {
-            let _ = query;
-            let sessions = fixture.sessions.lock().await;
-            let session = sessions.get(id).expect("fixture session");
-            let Some(inbox_id) = session.inbox_id.clone() else {
-                let payload = json!({"data": [], "cursor": {"previous": null, "next": null}});
-                return Some((200, payload.to_string()));
-            };
-            let terminal = session.terminal.clone().unwrap_or_default();
-            let outcome = match terminal.as_str() {
-                "session.execution.succeeded" => "succeeded",
-                "session.execution.interrupted" => "interrupted",
-                _ => "failed",
-            };
-            let mut data = vec![idle_message(fixture, outcome)];
-            if let Some(text) = fixture.script.assistant_text.clone() {
-                data.push(json!({
-                    "id": "msg_fixture_assistant_001",
-                    "time": {"created": 2003, "completed": 2004},
-                    "type": "assistant",
-                    "agent": "build",
-                    "model": {"id": "test-model", "providerID": "test-provider"},
-                    "content": [{"type": "text", "text": text}],
-                }));
-            }
-            data.push(json!({
-                "id": inbox_id,
-                "time": {"created": 2000},
-                "text": "fixture input",
-                "type": "user",
-            }));
-            let payload = json!({"data": data, "cursor": {"previous": null, "next": null}});
-            return Some((200, payload.to_string()));
-        }
+        let payload = json!({"_tag": "UnknownError", "message": "fixture has no such route"});
+        return Some((404, payload.to_string()));
     }
     if method == "GET" && path == "/api/agent" {
         let data = fixture
@@ -1200,6 +863,440 @@ async fn route(
     }
     let payload = json!({"_tag": "UnknownError", "message": "fixture has no such route"});
     Some((404, payload.to_string()))
+}
+
+/// A fixture route result: `None` when no route matched, `Some(None)` to drop
+/// the connection without a reply, `Some(Some(reply))` to answer.
+type Routed = Option<Option<(u16, String)>>;
+
+/// Session, pending-request, inbox and message reads.
+async fn session_read_route(
+    fixture: &Fixture,
+    method: &str,
+    id: &str,
+    tail: &str,
+    query: Option<&str>,
+) -> Routed {
+    if method == "GET" && tail.is_empty() {
+        let sessions = fixture.sessions.lock().await;
+        let session = sessions.get(id).expect("fixture session");
+        let mut info = json!({
+            "id": id,
+            "model": session.model,
+            "time": {"created": 1000, "updated": 1000},
+            "location": {"directory": session.directory},
+        });
+        if let Some(agent) = session.agent.clone() {
+            info["agent"] = Value::String(agent);
+        }
+        let payload = json!({"data": info});
+        return Some(Some((200, payload.to_string())));
+    }
+    if method == "GET" && tail == "/permission" {
+        let permissions = fixture.permissions.lock().await;
+        let pending = permissions.get(id).cloned().unwrap_or_default();
+        return Some(Some((200, json!({"data": pending}).to_string())));
+    }
+    if method == "GET" && tail == "/form" {
+        let forms = fixture.forms.lock().await;
+        let pending = forms.get(id).cloned().unwrap_or_default();
+        return Some(Some((200, json!({"data": pending}).to_string())));
+    }
+    if method == "GET" && tail == "/inbox" {
+        return Some(Some((200, json!({"data": []}).to_string())));
+    }
+    if method == "GET" && tail == "/message" {
+        let _ = query;
+        let sessions = fixture.sessions.lock().await;
+        let session = sessions.get(id).expect("fixture session");
+        let Some(inbox_id) = session.inbox_id.clone() else {
+            let payload = json!({"data": [], "cursor": {"previous": null, "next": null}});
+            return Some(Some((200, payload.to_string())));
+        };
+        let terminal = session.terminal.clone().unwrap_or_default();
+        let outcome = match terminal.as_str() {
+            "session.execution.succeeded" => "succeeded",
+            "session.execution.interrupted" => "interrupted",
+            _ => "failed",
+        };
+        let mut data = vec![idle_message(fixture, outcome)];
+        if let Some(text) = fixture.script.assistant_text.clone() {
+            data.push(json!({
+                "id": "msg_fixture_assistant_001",
+                "time": {"created": 2003, "completed": 2004},
+                "type": "assistant",
+                "agent": "build",
+                "model": {"id": "test-model", "providerID": "test-provider"},
+                "content": [{"type": "text", "text": text}],
+            }));
+        }
+        data.push(json!({
+            "id": inbox_id,
+            "time": {"created": 2000},
+            "text": "fixture input",
+            "type": "user",
+        }));
+        let payload = json!({"data": data, "cursor": {"previous": null, "next": null}});
+        return Some(Some((200, payload.to_string())));
+    }
+    None
+}
+
+/// Interrupt, model/agent switches and session delete.
+async fn session_control_route(
+    fixture: &Fixture,
+    method: &str,
+    id: &str,
+    tail: &str,
+    body: &[u8],
+) -> Routed {
+    if method == "POST" && tail == "/interrupt" {
+        if fixture.script.interrupt_drop {
+            return Some(None);
+        }
+        let live = {
+            let sessions = fixture.sessions.lock().await;
+            sessions.get(id).expect("fixture session").live
+        };
+        if !live {
+            return Some(Some((200, json!({"interrupted": false}).to_string())));
+        }
+        {
+            let mut sessions = fixture.sessions.lock().await;
+            let session = sessions.get_mut(id).expect("fixture session");
+            session.live = false;
+            session.terminal = Some("session.execution.interrupted".to_owned());
+        }
+        let seq = next_seq(fixture, id).await;
+        let mut data = json!({"sessionID": id});
+        data["reason"] = Value::String("user".to_owned());
+        let terminal = json!({
+            "id": format!("evt_{id}_terminal_{seq}"),
+            "created": 2005,
+            "type": "session.execution.interrupted",
+            "data": data,
+            "durable": {"aggregateID": id, "seq": seq, "version": 1},
+        });
+        let _ = fixture.events.send(terminal.to_string());
+        return Some(Some((200, json!({"interrupted": true}).to_string())));
+    }
+    if method == "POST" && tail == "/model" {
+        let request: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+        let model = request.get("model").cloned().unwrap_or(Value::Null);
+        {
+            let mut sessions = fixture.sessions.lock().await;
+            let session = sessions.get_mut(id).expect("fixture session");
+            session.model = model.clone();
+        }
+        let seq = next_seq(fixture, id).await;
+        let selected = json!({
+            "id": format!("evt_{id}_model_{seq}"),
+            "created": 3000,
+            "type": "session.model.selected",
+            "data": {"sessionID": id, "model": model},
+            "durable": {"aggregateID": id, "seq": seq, "version": 1},
+        });
+        let _ = fixture.events.send(selected.to_string());
+        return Some(Some((204, String::new())));
+    }
+    if method == "POST" && tail == "/agent" {
+        let request: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+        let agent = request
+            .get("agent")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        {
+            let mut sessions = fixture.sessions.lock().await;
+            let session = sessions.get_mut(id).expect("fixture session");
+            session.agent = Some(agent.clone());
+        }
+        let seq = next_seq(fixture, id).await;
+        let selected = json!({
+            "id": format!("evt_{id}_agent_{seq}"),
+            "created": 3000,
+            "type": "session.agent.selected",
+            "data": {"sessionID": id, "agent": agent},
+            "durable": {"aggregateID": id, "seq": seq, "version": 1},
+        });
+        let _ = fixture.events.send(selected.to_string());
+        return Some(Some((204, String::new())));
+    }
+    if method == "DELETE" && tail.is_empty() {
+        if fixture.script.delete_status != 204 {
+            // The session was already gone: DELETE reports 404 and the
+            // session stays absent for the follow-up readback.
+            fixture.deleted.lock().await.insert(id.to_owned());
+            return Some(Some((fixture.script.delete_status, not_found(id))));
+        }
+        fixture.deleted.lock().await.insert(id.to_owned());
+        let seq = next_seq(fixture, id).await;
+        let deleted = json!({
+            "id": format!("evt_{id}_deleted"),
+            "created": 9000,
+            "type": "session.deleted",
+            "data": {"sessionID": id},
+            "durable": {"aggregateID": id, "seq": seq, "version": 2},
+        });
+        let _ = fixture.events.send(deleted.to_string());
+        return Some(Some((204, String::new())));
+    }
+    None
+}
+
+/// Permission replies.
+async fn permission_reply_route(
+    fixture: &Fixture,
+    method: &str,
+    id: &str,
+    tail: &str,
+    body: &[u8],
+) -> Routed {
+    if let Some(request_id) = tail
+        .strip_prefix("/permission/")
+        .and_then(|rest| rest.strip_suffix("/reply"))
+    {
+        if fixture.script.reply_drop {
+            return Some(None);
+        }
+        if method != "POST" {
+            return Some(Some((404, not_found(id))));
+        }
+        let request: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+        let decision = request
+            .get("decision")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !["once", "always", "reject"].contains(&decision) {
+            return Some(Some((400, String::new())));
+        }
+        let mut permissions = fixture.permissions.lock().await;
+        let pending = permissions.entry(id.to_owned()).or_default();
+        if !pending
+            .iter()
+            .any(|entry| entry.get("id").and_then(Value::as_str) == Some(request_id))
+        {
+            return Some(Some((404, not_found(id))));
+        }
+        // Installed behavior: a reject settles every pending permission
+        // of the session; once/always settle only the targeted one.
+        let settled = if decision == "reject" {
+            std::mem::take(pending)
+        } else {
+            let position = pending
+                .iter()
+                .position(|entry| entry.get("id").and_then(Value::as_str) == Some(request_id))
+                .expect("pending permission");
+            vec![pending.remove(position)]
+        };
+        drop(permissions);
+        for entry in settled {
+            let replied = json!({
+                "id": format!("evt_replied_{}", entry.get("id").and_then(Value::as_str).unwrap_or_default()),
+                "created": 4000,
+                "type": "permission.replied",
+                "data": {
+                    "sessionID": id,
+                    "requestID": entry.get("id").cloned().unwrap_or(Value::Null),
+                    "reply": decision,
+                },
+            });
+            let _ = fixture.events.send(replied.to_string());
+        }
+        maybe_emit_reply_terminal(fixture, id).await;
+        return Some(Some((204, String::new())));
+    }
+    None
+}
+
+/// Form replies and cancels.
+async fn form_reply_route(
+    fixture: &Fixture,
+    method: &str,
+    id: &str,
+    tail: &str,
+    body: &[u8],
+) -> Routed {
+    if let Some(form_id) = tail
+        .strip_prefix("/form/")
+        .and_then(|rest| rest.strip_suffix("/reply"))
+    {
+        if fixture.script.reply_drop {
+            return Some(None);
+        }
+        if method != "POST" {
+            return Some(Some((404, not_found(id))));
+        }
+        let mut forms = fixture.forms.lock().await;
+        let pending = forms.entry(id.to_owned()).or_default();
+        let position = pending
+            .iter()
+            .position(|entry| entry.get("id").and_then(Value::as_str) == Some(form_id));
+        let Some(position) = position else {
+            if fixture
+                .settled_forms
+                .lock()
+                .await
+                .contains(&(id.to_owned(), form_id.to_owned()))
+            {
+                return Some(Some((409, String::new())));
+            }
+            return Some(Some((404, not_found(id))));
+        };
+        let request: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+        let answer = request.get("answer").cloned().unwrap_or(Value::Null);
+        if !form_answer_valid(&pending[position], &answer) {
+            return Some(Some((400, String::new())));
+        }
+        pending.remove(position);
+        drop(forms);
+        fixture
+            .settled_forms
+            .lock()
+            .await
+            .insert((id.to_owned(), form_id.to_owned()));
+        let replied = json!({
+            "id": format!("evt_form_replied_{form_id}"),
+            "created": 4000,
+            "type": "form.replied",
+            "data": {"id": form_id, "sessionID": id, "answer": answer},
+        });
+        let _ = fixture.events.send(replied.to_string());
+        maybe_emit_reply_terminal(fixture, id).await;
+        return Some(Some((204, String::new())));
+    }
+    if let Some(form_id) = tail.strip_prefix("/form/") {
+        if method != "DELETE" || form_id.contains('/') {
+            return Some(Some((404, not_found(id))));
+        }
+        if fixture.script.reply_drop {
+            return Some(None);
+        }
+        let mut forms = fixture.forms.lock().await;
+        let pending = forms.entry(id.to_owned()).or_default();
+        let Some(position) = pending
+            .iter()
+            .position(|entry| entry.get("id").and_then(Value::as_str) == Some(form_id))
+        else {
+            return Some(Some((404, not_found(id))));
+        };
+        pending.remove(position);
+        drop(forms);
+        let cancelled = json!({
+            "id": format!("evt_form_cancelled_{form_id}"),
+            "created": 4000,
+            "type": "form.cancelled",
+            "data": {"id": form_id, "sessionID": id},
+        });
+        let _ = fixture.events.send(cancelled.to_string());
+        maybe_emit_reply_terminal(fixture, id).await;
+        return Some(Some((204, String::new())));
+    }
+    None
+}
+
+/// Prompt submission.
+async fn prompt_route(
+    fixture: &Fixture,
+    method: &str,
+    id: &str,
+    tail: &str,
+    body: &[u8],
+) -> Routed {
+    if method == "POST" && tail == "/prompt" {
+        if fixture.script.prompt_drop {
+            fixture.log_marker(0).await;
+            return Some(None);
+        }
+        if fixture.script.prompt_status != 200 {
+            // The installed server refuses invalid writes with an
+            // empty 400; the fixture matches it.
+            fixture.log_marker(0).await;
+            return Some(Some((fixture.script.prompt_status, String::new())));
+        }
+        let request: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+        let text = request
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let mut counter = fixture.inbox_counter.lock().await;
+        *counter += 1;
+        let prompt_index = *counter as usize;
+        let inbox_id = format!("msg_fixture_{prompt_index:03}");
+        drop(counter);
+        {
+            let mut sessions = fixture.sessions.lock().await;
+            let session = sessions.get_mut(id).expect("fixture session");
+            session.inbox_id = Some(inbox_id.clone());
+            session.terminal = Some(fixture.script.terminal.clone());
+            session.live = true;
+        }
+        if fixture.script.drop_sse_on_prompt {
+            // Admit the input, then lose the stream before any
+            // association fact flows: the send must settle unknown.
+            let _ = fixture.sse_close.send(());
+            fixture.log_marker(0).await;
+            let payload = json!({"data": {
+                "id": inbox_id,
+                "sessionID": id,
+                "time": {"created": 2000},
+                "type": "user",
+                "payload": {"text": text},
+                "delivery": "steer",
+            }});
+            return Some(Some((200, payload.to_string())));
+        }
+        let enqueued_seq = next_seq(fixture, id).await;
+        let started_seq = next_seq(fixture, id).await;
+        let delivered_seq = next_seq(fixture, id).await;
+        let started_id = format!("evt_{id}_started_{enqueued_seq}");
+        let mut envelopes = vec![
+            json!({
+                "id": format!("evt_{id}_enqueued_{enqueued_seq}"),
+                "created": 2000,
+                "type": "session.inbox.enqueued",
+                "data": {"sessionID": id, "inboxID": inbox_id,
+                         "item": {"type": "user", "payload": {"text": text}, "delivery": "steer"}},
+                "durable": {"aggregateID": id, "seq": enqueued_seq, "version": 1},
+            }),
+            json!({
+                "id": started_id,
+                "created": 2001,
+                "type": "session.execution.started",
+                "data": {"sessionID": id},
+                "durable": {"aggregateID": id, "seq": started_seq, "version": 1},
+            }),
+            json!({
+                "id": format!("evt_{id}_delivered_{delivered_seq}"),
+                "created": 2002,
+                "type": "session.inbox.delivered",
+                "data": {"sessionID": id, "inboxID": inbox_id},
+                "durable": {"aggregateID": id, "seq": delivered_seq, "version": 1},
+            }),
+        ];
+        envelopes.extend(emit_asks(fixture, id, prompt_index).await);
+        if !fixture.script.manual_terminal && !fixture.script.terminal_on_reply {
+            let terminal_seq = next_seq(fixture, id).await;
+            envelopes.push(terminal_envelope(fixture, id, terminal_seq));
+            let mut sessions = fixture.sessions.lock().await;
+            sessions.get_mut(id).expect("fixture session").live = false;
+        }
+        let emitted = envelopes.len();
+        for envelope in envelopes {
+            let _ = fixture.events.send(envelope.to_string());
+        }
+        fixture.log_marker(emitted).await;
+        let payload = json!({"data": {
+            "id": inbox_id,
+            "sessionID": id,
+            "time": {"created": 2000},
+            "type": "user",
+            "payload": {"text": text},
+            "delivery": "steer",
+        }});
+        return Some(Some((200, payload.to_string())));
+    }
+    None
 }
 
 /// With `terminal_on_reply`, the first applied reply or cancel resumes
@@ -3562,13 +3659,31 @@ async fn scenario_permission_approve_deny_roundtrip(owned: OwnedChildren) {
         Some("applied")
     );
     assert_eq!(kinds(&committed), ["message.completed", "turn.completed"]);
-    // Second turn: a `reject` settles every pending permission â€” the
+    reject_settles_every_pending_permission(&mut scenario).await;
+    // Exactly three reply writes ran (always, reject, reject): every other
+    // reply round tripped without new native I/O.
+    let requests = requests_at(&scenario.root, "requests.jsonl");
+    assert_eq!(count_requests(&requests, "POST", "/reply"), 3);
+    let committed = stop_agent(&mut scenario, 1, false).await;
+    assert_eq!(kinds(&committed), ["session.ended"]);
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+}
+
+/// Second turn of the permission round trip: a `reject` settles every
+/// pending permission; the sibling closes without a command binding.
+async fn reject_settles_every_pending_permission(scenario: &mut Scenario) {
+    // Second turn: a `reject` settles every pending permission — the
     // sibling closes without a command binding.
-    let (_, turn2, first, _) = send_until_ask(&mut scenario, 1, "second asks").await;
+    let (_, turn2, first, _) = send_until_ask(scenario, 1, "second asks").await;
     assert_eq!(first, "per_c1");
     drain_until(&mut scenario.host, "request.opened").await;
     let (_, outcome, committed) = control(
-        &mut scenario,
+        scenario,
         1,
         "deny",
         Some(&turn2),
@@ -3596,7 +3711,7 @@ async fn scenario_permission_approve_deny_roundtrip(owned: OwnedChildren) {
     );
     assert!(committed[1].1.get("command_id").is_none());
     let (_, outcome, _) = control(
-        &mut scenario,
+        scenario,
         1,
         "interrupt",
         Some(&turn2),
@@ -3612,18 +3727,6 @@ async fn scenario_permission_approve_deny_roundtrip(owned: OwnedChildren) {
             .and_then(Value::as_str),
         Some("applied")
     );
-    // Exactly three reply writes ran (always, reject, reject): every other
-    // reply round tripped without new native I/O.
-    let requests = requests_at(&scenario.root, "requests.jsonl");
-    assert_eq!(count_requests(&requests, "POST", "/reply"), 3);
-    let committed = stop_agent(&mut scenario, 1, false).await;
-    assert_eq!(kinds(&committed), ["session.ended"]);
-    scenario
-        .host
-        .call("shutdown", json!({}))
-        .await
-        .expect("shutdown");
-    scenario.host.shutdown_child().await;
 }
 
 async fn scenario_form_answer_and_deny_cancel(owned: OwnedChildren) {
@@ -3870,7 +3973,7 @@ async fn scenario_lost_reply_is_unknown_without_rewrite(owned: OwnedChildren) {
         "approve",
         Some(&turn_id),
         Some("per_lost1"),
-        json!({}),
+        json!({"choice_id": "once"}),
         Quiesce::SilenceNow,
     )
     .await;
@@ -3888,7 +3991,7 @@ async fn scenario_lost_reply_is_unknown_without_rewrite(owned: OwnedChildren) {
         "approve",
         Some(&turn_id),
         Some("per_lost1"),
-        json!({}),
+        json!({"choice_id": "once"}),
         Quiesce::SilenceNow,
     )
     .await;
@@ -3935,7 +4038,7 @@ async fn scenario_reply_to_settled_request_closes_it(owned: OwnedChildren) {
         "approve",
         Some(&turn_id),
         Some("per_ghost1"),
-        json!({}),
+        json!({"choice_id": "once"}),
         Quiesce::UntilKind("request.closed"),
     )
     .await;
@@ -3957,7 +4060,7 @@ async fn scenario_reply_to_settled_request_closes_it(owned: OwnedChildren) {
         "approve",
         Some(&turn_id),
         Some("per_ghost1"),
-        json!({}),
+        json!({"choice_id": "once"}),
         Quiesce::SilenceNow,
     )
     .await;
@@ -3984,6 +4087,61 @@ async fn scenario_reply_to_settled_request_closes_it(owned: OwnedChildren) {
     );
     let committed = stop_agent(&mut scenario, 1, false).await;
     assert_eq!(kinds(&committed), ["session.ended"]);
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+}
+
+async fn scenario_lost_interrupt_is_unknown_without_rewrite(owned: OwnedChildren) {
+    let mut scenario = Scenario::start(
+        &script(json!({ "manual_terminal": true, "interrupt_drop": true })),
+        opencode_profile(),
+        owned,
+    )
+    .await;
+    let (_, outcome, _) = control(
+        &mut scenario,
+        1,
+        "send",
+        None,
+        None,
+        json!({"text": "long work"}),
+        Quiesce::UntilKind("turn.started"),
+    )
+    .await;
+    let turn_id = outcome
+        .expect("send applies")
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .expect("applied turn id")
+        .to_owned();
+    let command_id = ulid::Ulid::new().to_string();
+    for attempt in ["first", "retry"] {
+        let (_, outcome, committed) = control_as(
+            &mut scenario,
+            1,
+            &command_id,
+            "interrupt",
+            Some(&turn_id),
+            None,
+            json!({}),
+            Quiesce::SilenceNow,
+        )
+        .await;
+        let error = outcome.expect_err("a lost interrupt is not applied");
+        assert!(error.contains("unknown"), "{attempt}: {error}");
+        assert!(committed.is_empty(), "{attempt}");
+    }
+    let requests = requests_at(&scenario.root, "requests.jsonl");
+    assert_eq!(
+        count_requests(&requests, "POST", "/interrupt"),
+        1,
+        "the exact retry never re-sends /interrupt"
+    );
+    let _ = stop_agent(&mut scenario, 1, true).await;
     scenario
         .host
         .call("shutdown", json!({}))
@@ -4147,7 +4305,7 @@ async fn scenario_request_details_commit_redacted(owned: OwnedChildren) {
         "approve",
         Some(&turn_id),
         Some("per_sec1"),
-        json!({}),
+        json!({"choice_id": "once"}),
         Quiesce::UntilKind("request.resolved"),
     )
     .await;

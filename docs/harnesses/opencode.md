@@ -23,8 +23,9 @@ of the same live controller may preserve it.
 ## Transport
 
 Subscribe before session create/input. Route SSE by exact session/directory, never
-cwd/title/time heuristics. Missing identity is a visible gap. Include the installed API's
-workspace parameter on each request. Read complete error bodies; only authoritative
+cwd/title/time heuristics. Missing identity is a visible gap. Session routes bind their
+location from the session; requests outside a session pass the installed API's workspace
+parameter. Read complete error bodies; only authoritative
 rejection proves no effect. Timeout/ambiguous server response after a write is unknown.
 Catalogue preflight may retry only before any session/input may have been admitted.
 
@@ -32,16 +33,16 @@ Catalogue preflight may retry only before any session/input may have been admitt
 
 | Eliot operation | Mechanism / settlement |
 | --- | --- |
-| launch | installed `POST /api/session` with the workspace directory, no input; per-Agent `serve` on loopback with a generated `OPENCODE_PASSWORD` and per-Agent `XDG_CONFIG_HOME`/`XDG_DATA_HOME`; exact session/model/directory echo required before Eliot `session.ready` (PR1, fake-server verified) |
-| send | installed `POST /api/session/{id}/prompt`; the 200 inbox id is intermediate, applied needs the exact input-to-execution association on SSE (`session.inbox.enqueued`/`delivered` plus `session.execution.started`; turn id is the exact `started` event id) (PR1, fake-server verified) |
+| launch | installed `POST /api/session` with the workspace directory, no input; per-Agent `serve` on loopback with a generated `OPENCODE_PASSWORD` and per-Agent `XDG_CONFIG_HOME`/`XDG_DATA_HOME`; exact session/model/directory echo required before Eliot `session.ready` |
+| send | installed `POST /api/session/{id}/prompt`; the 200 inbox id is intermediate, applied needs the exact input-to-execution association on SSE (`session.inbox.enqueued`/`delivered` plus `session.execution.started`; turn id is the exact `started` event id) |
 | steer | exact-current-execution method only; queueing another prompt is not steer |
 | inject | verified safe point or explicit next-send prepend |
-| interrupt | installed `POST /api/session/{id}/interrupt` (`{"interrupted": bool}`); the exact-turn gate refuses a finished turn as stale without a write, `interrupted:true` applies and the terminal pair settles the turn (PR2, fake-server verified) |
-| stop | installed `DELETE /api/session/{id}` (`204` removed, `404` already gone) plus a `404` session readback proving the session is gone, then the owned per-Agent server ends through the generation's process custody; stop ends the directly spawned `serve` child while the generation Job owns any descendants it spawned; abort-plus-detach is **not** stop (PR1, fake-server verified) |
+| interrupt | installed `POST /api/session/{id}/interrupt` (`{"interrupted": bool}`); the exact-turn gate refuses a finished turn as stale without a write, `interrupted:true` applies and the terminal pair settles the turn |
+| stop | installed `DELETE /api/session/{id}` (`204` removed, `404` already gone) plus a `404` session readback proving the session is gone, then the owned per-Agent server ends through the generation's process custody; stop ends the directly spawned `serve` child while the generation Job owns any descendants it spawned; abort-plus-detach is **not** stop |
 | detach | explicitly stop controlling/observing as defined, leaving native service/session alive |
-| resume | installed exact native session reattachment: `GET /api/session/{id}` proves the retained session, then the interrupt-quiesce (`POST .../interrupt`, which aborts a running retained execution — refusing would wedge crash-recovery resume) plus the empty `inbox`/`permission`/`form` lists prove it idle (anything still pending refuses the resume); never replays the prompt (PR2, fake-server verified) |
-| approve/deny/answer | installed `POST .../permission/{id}/reply` (`once`/`always`/`reject`), `POST .../form/{id}/reply` (`answer` map), `DELETE .../form/{id}` for deny; the public request id is the native id, choices stage against the offered schema (a miss rejects before any write), a lost reply is unknown and never rewritten (PR2, fake-server verified) |
-| configure | resume-time only: installed `POST .../model` / `POST .../agent` setters realign the retained session with `session.get` effective readback (a refused switch fails the resume as unknown); no mid-turn configure verb (PR2, fake-server verified) |
+| resume | installed exact native session reattachment: `GET /api/session/{id}` proves the retained session, then the interrupt-quiesce (`POST .../interrupt`, which aborts a running retained execution — refusing would wedge crash-recovery resume) plus the empty `inbox`/`permission`/`form` lists prove it idle (anything still pending refuses the resume); never replays the prompt |
+| approve/deny/answer | installed `POST .../permission/{id}/reply` (`once`/`always`/`reject`; approve must name `once` or `always`, there is no default choice), `POST .../form/{id}/reply` (`answer` map), `DELETE .../form/{id}` for deny; the public request id is the native id, choices stage against the offered schema (a miss rejects before any write), a lost reply is unknown and never rewritten |
+| configure | resume-time only: installed `POST .../model` / `POST .../agent` setters realign the retained session with `session.get` effective readback (a refused switch fails the resume as unknown); no mid-turn configure verb |
 | fork/background | installed native method and exact resulting identity/state |
 | goal | explicitly selected Eliot Goal; no assumed native Goal |
 

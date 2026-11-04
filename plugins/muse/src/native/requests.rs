@@ -293,21 +293,7 @@ fn reply_to_approval(
     command_id: &str,
     session_id: &str,
 ) -> Result<NativeReply> {
-    let args = args.as_object().ok_or_else(|| {
-        Error::new(
-            "invalid",
-            "approval reply args must be an object with only choice_id and feedback",
-        )
-    })?;
-    if args
-        .keys()
-        .any(|key| key != "choice_id" && key != "feedback")
-    {
-        return Err(Error::new(
-            "invalid",
-            "approval reply args must be an object with only choice_id and feedback",
-        ));
-    }
+    let args = eliot_plugin::session::approval_reply_args(args)?;
     let choices: Vec<OfferedChoice> = request
         .details
         .get("available_choices")
@@ -866,13 +852,7 @@ fn validate_session_turn(
 }
 
 fn require_nonempty(value: &str, what: &str) -> Result<()> {
-    if value.trim().is_empty() {
-        return Err(Error::new(
-            "source_integrity",
-            format!("Muse native request has an empty {what}"),
-        ));
-    }
-    Ok(())
+    eliot_plugin::session::require_nonempty(value, "Muse", what)
 }
 
 fn decode_params<T: for<'de> Deserialize<'de>>(params: &Value, message: &str) -> Result<T> {

@@ -1478,8 +1478,9 @@ impl OpenCodePlugin {
                 Ok(result)
             }
             Err(HttpOutcome::Unknown { reason } | HttpOutcome::NotDispatched { reason }) => {
+                // The binding stays: an exact retry is answered `unknown` and
+                // never re-sends `/interrupt` (decision D-14).
                 session.unknown_commands.insert(command_id.to_owned());
-                Self::abandon_control(session, command_id);
                 Err(Error::new(
                     "unknown",
                     format!("OpenCode interrupt outcome is unresolved ({reason})"),
@@ -1551,8 +1552,8 @@ impl OpenCodePlugin {
                     Self::abandon_control(session, &command_id);
                     return Err(error);
                 }
+                // The binding stays so an exact retry is answered `unknown`.
                 session.unknown_commands.insert(command_id.clone());
-                Self::abandon_control(session, &command_id);
                 Err(Error::new(
                     "unknown",
                     format!("OpenCode reply outcome is unresolved ({})", error.message),
@@ -1570,6 +1571,14 @@ impl OpenCodePlugin {
         params: &AgentCommandParams,
         needs_request: bool,
     ) -> Result<ControlAdmission> {
+        if session.unknown_commands.contains(&params.command_id)
+            && !session.control_bindings.contains_key(&params.command_id)
+        {
+            return Err(Error::new(
+                "unknown",
+                "OpenCode control outcome is unresolved and will not be repeated",
+            ));
+        }
         if let Some(binding) = session.control_bindings.get(&params.command_id) {
             if binding.verb != params.verb
                 || binding.turn_id != params.turn_id

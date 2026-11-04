@@ -249,12 +249,7 @@ Codex or for unrelated adapters.
       points. Delayed hook context is inject, not exact-turn steer.
 - [x] **L6.2 OpenCode.** Select one installed API. Shared mode only if per-session
       attribution/environment/stop are supported; otherwise per-Agent server.
-      PR1 connects per-Agent `serve` with launch, send, stop and profile
-      readback; PR2 adds resume of the exact retained session in a new
-      generation, native requests (approve/deny/answer), interrupt and
-      resume-time configure (model/agent) with effective readback. The
-      remainder is steer, inject, detach and fork/background, which stay
-      unconnected.
+      Steer, inject, detach and fork/background stay unconnected.
 - [ ] **L6.3 Cross-harness use.** Reuse L4/L5 rules/mail against the added plugins.
       Add hooks, shared mode, native children or MCP only when a concrete caller needs
       the capability. Missing semantics reject; no compatibility executor.
