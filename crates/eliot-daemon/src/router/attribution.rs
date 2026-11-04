@@ -415,6 +415,7 @@ mod tests {
                 SubmitCommand {
                     id: launch_id.clone(),
                     target: None,
+                    selector: None,
                     verb: "launch".to_owned(),
                     args: json!({
                         "project": project,
@@ -501,6 +502,7 @@ mod tests {
                 SubmitCommand {
                     id: send_id.clone(),
                     target: Some(agent.to_owned()),
+                    selector: None,
                     verb: "send".to_owned(),
                     args: json!({"text": "edit the file"}),
                     expected_generation: None,
@@ -963,6 +965,7 @@ mod tests {
                 SubmitCommand {
                     id: resume_id.clone(),
                     target: Some(a.clone()),
+                    selector: None,
                     verb: "resume".to_owned(),
                     args: json!({}),
                     expected_generation: Some(1),

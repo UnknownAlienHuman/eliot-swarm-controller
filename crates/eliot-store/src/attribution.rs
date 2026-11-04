@@ -668,6 +668,7 @@ mod tests {
                 SubmitCommand {
                     id: launch_id.clone(),
                     target: None,
+                    selector: None,
                     verb: "launch".to_owned(),
                     args: json!({"project":project, "workspace":workspace}),
                     expected_generation: Some(0),
@@ -714,6 +715,7 @@ mod tests {
                 SubmitCommand {
                     id: stop_id.clone(),
                     target: Some(agent.to_owned()),
+                    selector: None,
                     verb: "stop".to_owned(),
                     args: json!({}),
                     expected_generation: None,
@@ -766,6 +768,7 @@ mod tests {
                 SubmitCommand {
                     id: resume_id.clone(),
                     target: Some(agent.to_owned()),
+                    selector: None,
                     verb: "resume".to_owned(),
                     args: json!({}),
                     expected_generation: Some(1),
@@ -1334,6 +1337,7 @@ mod tests {
                 SubmitCommand {
                     id: send_id.clone(),
                     target: Some(a.clone()),
+                    selector: None,
                     verb: "send".to_owned(),
                     args: json!({"text":"hello"}),
                     expected_generation: None,
