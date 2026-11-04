@@ -1,16 +1,14 @@
 //! Shared per-Agent session helpers for the stream-owning harness plugins.
 //!
-//! Muse and OpenCode bind one Agent generation to one owned native server
-//! through this module: the target-environment mapping, identity/binding
-//! validation, unknown snapshots, contextual errors, native process
-//! registration, the no-write code predicate, stream event commits/gaps
-//! and the bounded native-error/final-text attachments are identical up
-//! to the harness name. This module holds the single copy; each plugin
-//! passes its own display name (`"Muse"`, `"OpenCode"`) and id prefix
-//! (`"muse"`, `"opencode"`). Codex uses only the target-environment
-//! mapping here and still carries its own copies of the rest; it converts
-//! in a follow-up. No trait: the shared state is passed by reference
-//! through [`StreamSource`].
+//! Muse, OpenCode and Codex bind one Agent generation to one owned native
+//! server through this module: the target-environment mapping,
+//! identity/binding validation, unknown snapshots, contextual errors,
+//! native process registration, the no-write code predicate, stream event
+//! commits/gaps and the bounded native-error/final-text attachments are
+//! identical up to the harness name. This module holds the single copy;
+//! each plugin passes its own display name (`"Muse"`, `"OpenCode"`,
+//! `"Codex"`) and id prefix (`"muse"`, `"opencode"`, `"codex"`). No trait:
+//! the shared state is passed by reference through [`StreamSource`].
 
 use std::{collections::HashMap, ffi::OsString, path::Path, time::Duration};
 
@@ -254,11 +252,23 @@ pub fn contextual_error(
     error.with_code(code).with_message(message)
 }
 
+/// A control reply the native side provably never applied.
+pub fn rejected_control(reason: &str) -> Value {
+    json!({"state": "rejected", "reason": reason})
+}
+
+/// A control reply whose native outcome is unresolved.
+pub fn unknown_control(reason: &str) -> Value {
+    json!({"state": "unknown", "reason": reason})
+}
+
 /// Register the owned native process as the `harness` role under this
 /// Agent generation. `harness` is the display name (`"Muse"`,
-/// `"OpenCode"`); `process_noun` is the owned child (`"session host"`,
-/// `"server"`). The caller resolves the pid through its own child handle;
-/// a missing or zero pid fails before any session or input is sent.
+/// `"OpenCode"`, `"Codex"`); `process_noun` is the owned child
+/// (`"session host"`, `"server"`, `"app-server"`); `scope_noun` is the
+/// native scope no input was sent to (`"session"`, or `"thread"` for
+/// Codex). The caller resolves the pid through its own child handle; a
+/// missing or zero pid fails before any session or input is sent.
 #[allow(clippy::too_many_arguments)]
 pub async fn register_native_process(
     peer: &PeerClient,
@@ -268,12 +278,15 @@ pub async fn register_native_process(
     pid: Option<u32>,
     harness: &str,
     process_noun: &str,
+    scope_noun: &str,
     rpc_timeout: Duration,
 ) -> Result<()> {
     let pid = pid.filter(|pid| *pid > 0).ok_or_else(|| {
         Error::new(
             "process_registration",
-            format!("{harness} {process_noun} PID is unavailable; no session or input was sent"),
+            format!(
+                "{harness} {process_noun} PID is unavailable; no {scope_noun} or input was sent"
+            ),
         )
     })?;
     let value = peer
@@ -599,8 +612,7 @@ mod tests {
     use serde_json::json;
 
     /// The shared source-plan check spells every harness message exactly as
-    /// the per-plugin copies did (pure move, incl. the Codex shape its
-    /// follow-up conversion will use).
+    /// the per-plugin copies did (pure move).
     #[test]
     fn source_plan_messages_match_the_per_harness_originals() {
         for (harness, families, joined) in [

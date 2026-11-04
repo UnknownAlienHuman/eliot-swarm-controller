@@ -1,18 +1,23 @@
-use eliot_core::{Error, NativeEvent, ProviderRestriction, Result, SecretPolicy, SourceBatch};
-use eliot_plugin::{CommitSink, MAX_EVENT_BYTES, PeerClient, protocol::MAX_COMMAND_ID_BYTES};
+use eliot_core::{Error, ProviderRestriction, Result, SecretPolicy};
+use eliot_plugin::{
+    CommitSink, MAX_EVENT_BYTES, PeerClient,
+    protocol::MAX_COMMAND_ID_BYTES,
+    session::{
+        EVENT_DEADLINE, StreamSource, attach_final_text as shared_attach_final_text,
+        attach_native_error as shared_attach_native_error, event_id as shared_event_id,
+        native_no_write, rejected_control, unknown_control,
+    },
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    time::Duration,
-};
+use std::collections::{HashMap, HashSet, VecDeque};
 use tokio::{
     sync::{mpsc, oneshot, watch},
     time::{Instant, timeout_at},
 };
 
 use crate::native::{
-    NativeClient, NativeFrame, StreamState, native_no_write,
+    NativeClient, NativeFrame, StreamState,
     requests::{self, CorePending},
     types::{
         NativeFileChangeItem, NativeItemCompletedNotification, NativePatchChangeKind,
@@ -21,7 +26,6 @@ use crate::native::{
     },
 };
 
-const EVENT_DEADLINE: Duration = Duration::from_secs(30);
 const CONTROL_QUEUE: usize = 16;
 const EARLY_EVENT_LIMIT: usize = 128;
 const EARLY_EVENT_BYTES: usize = 256 * 1024;
@@ -1498,111 +1502,32 @@ impl EventProcessor {
     }
 
     async fn commit_event(&mut self, kind: &str, native_id: String, data: Value) -> Result<()> {
-        if self.writes_blocked {
-            return Err(Error::new(
-                "unknown",
-                "Codex event acknowledgement is unresolved",
-            ));
-        }
-        let batch = SourceBatch {
-            batch_id: format!("{native_id}:batch"),
-            agent_id: self.agent_id.clone(),
-            generation: self.generation,
-            source: "stream".to_owned(),
-            events: vec![NativeEvent {
-                kind: kind.to_owned(),
-                native_id,
-                data,
-                ts: None,
-            }],
-            cursor: None,
-        };
-        let error = match self
-            .sink
-            .commit(batch, Instant::now() + EVENT_DEADLINE)
+        self.stream_source()
+            .commit_event(kind, native_id, data)
             .await
-        {
-            Ok(_) => return Ok(()),
-            Err(error) => error,
-        };
-        if self.sink.is_unknown() {
-            self.writes_blocked = true;
-            self.status.source_unknown = true;
-            self.status.failure = Some("Codex event batch acknowledgement is unknown".to_owned());
-            self.status.batch_unknown = true;
-            return Err(Error::new(
-                "unknown",
-                "Codex event batch acknowledgement is unknown",
-            ));
-        }
-        let reason = format!("{kind} could not be committed: {}", error.code);
-        self.record_gap(&reason).await?;
-        Err(Error::new(
-            "unknown",
-            "Codex native fact was not committed; no replay is allowed",
-        ))
     }
 
     async fn record_gap(&mut self, reason: &str) -> Result<()> {
-        if self.writes_blocked {
-            self.status.source_unknown = true;
-            return Err(Error::new(
-                "unknown",
-                "Codex event acknowledgement is unresolved; no source gap was issued",
-            ));
-        }
-        if self.gap_reported {
-            return Err(Error::new(
-                "unknown",
-                "Codex source already has an unresolved gap",
-            ));
-        }
-        self.status.source_unknown = true;
-        self.gap_reported = true;
-        self.gap_number = self.gap_number.saturating_add(1);
-        let gap_id = format!(
-            "codex:{}:{}:gap-{}",
-            self.agent_id, self.generation, self.gap_number
-        );
-        let ack_id = gap_id.clone();
-        let result = self
-            .host
-            .call(
-                "source.gap",
-                json!({
-                    "credential": self.credential,
-                    "agent_id": self.agent_id,
-                    "generation": self.generation,
-                    "source": "stream",
-                    "gap_id": gap_id,
-                    "families": ["session", "turn", "message", "tool", "request"],
-                    "reason": reason,
-                    "from": null,
-                    "to": null,
-                }),
-                Instant::now() + EVENT_DEADLINE,
-            )
-            .await;
-        match result {
-            Ok(ack)
-                if ack.get("gap_id").and_then(Value::as_str) == Some(ack_id.as_str())
-                    && ack
-                        .get("seq")
-                        .and_then(Value::as_i64)
-                        .is_some_and(|seq| seq > 0) =>
-            {
-                self.status.failure = Some(format!("{reason}; terminal outcome is unknown"));
-                Ok(())
-            }
-            Ok(_) | Err(_) => {
-                self.writes_blocked = true;
-                self.status.failure =
-                    Some("Codex source gap acknowledgement is unknown".to_owned());
-                Err(Error::new(
-                    "unknown",
-                    "Codex source gap acknowledgement is unknown",
-                ))
-            }
+        self.stream_source().record_gap(reason).await
+    }
+
+    /// The shared stream-commit half of this processor.
+    fn stream_source(&mut self) -> StreamSource<'_> {
+        StreamSource {
+            sink: &mut self.sink,
+            host: &self.host,
+            credential: &self.credential,
+            agent_id: &self.agent_id,
+            generation: self.generation,
+            harness: "Codex",
+            id_prefix: "codex",
+            families: &["session", "turn", "message", "tool", "request"],
+            writes_blocked: &mut self.writes_blocked,
+            gap_reported: &mut self.gap_reported,
+            gap_number: &mut self.gap_number,
+            source_unknown: &mut self.status.source_unknown,
+            batch_unknown: &mut self.status.batch_unknown,
+            failure: &mut self.status.failure,
         }
     }
 }
@@ -1648,46 +1573,11 @@ async fn run(
     }
 }
 
+/// Shared bounded native-error attachment, projecting the Codex turn
+/// error to its message. Kept under the local path for the terminal-data
+/// tests.
 fn attach_native_error(data: &mut Value, error: Option<&NativeTurnError>, policy: &SecretPolicy) {
-    let Some(error) = error else { return };
-    if ["native_error", "message", "truncated"]
-        .into_iter()
-        .any(|key| policy.contains_text(key))
-    {
-        return;
-    }
-    let Some(data) = data.as_object_mut() else {
-        return;
-    };
-    let Ok(encoded) = serde_json::to_vec(&*data) else {
-        return;
-    };
-    let budget = MAX_EVENT_BYTES
-        .saturating_sub(encoded.len().saturating_add(r#","native_error":"#.len()))
-        .min(4 * 1024);
-    let mut message = policy.redact_text(&error.message);
-    let mut truncated = false;
-    loop {
-        let diagnostic = json!({"message": &message, "truncated": truncated});
-        let Ok(encoded) = serde_json::to_vec(&diagnostic) else {
-            return;
-        };
-        if encoded.len() <= budget {
-            data.insert("native_error".to_owned(), diagnostic);
-            return;
-        }
-        if message.is_empty() {
-            return;
-        }
-        let mut end = message.len() / 2;
-        while !message.is_char_boundary(end) {
-            end -= 1;
-        }
-        // Preserve complete masks across the host's repeated sanitization.
-        let (safe, _) = policy.redact_prefix(&message.as_bytes()[..end], false);
-        message = String::from_utf8_lossy(&safe).into_owned();
-        truncated = true;
-    }
+    shared_attach_native_error(data, error.map(|error| error.message.as_str()), policy);
 }
 
 /// A `spawnAgent` collab call: its item id and the spawned thread ids
@@ -1742,18 +1632,10 @@ fn validate_thread_and_turn(status: &EventStatus, thread_id: &str, turn_id: &str
     Ok(())
 }
 
+/// Shared native event identity with the Codex prefix, kept under the
+/// local path for this processor's call sites.
 fn event_id(thread_id: &str, turn_id: &str, item_id: &str, kind: &str) -> Result<String> {
-    let native_id = format!("codex:{thread_id}:{turn_id}:{item_id}:{kind}");
-    if native_id.len() > MAX_COMMAND_ID_BYTES
-        || thread_id.trim().is_empty()
-        || item_id.trim().is_empty()
-    {
-        return Err(Error::new(
-            "source_integrity",
-            "Codex native event identity exceeded its bound",
-        ));
-    }
-    Ok(native_id)
+    shared_event_id(thread_id, turn_id, item_id, kind, "codex", "Codex")
 }
 
 fn request_event_id(request_id: &str, kind: &str) -> Result<String> {
@@ -1790,14 +1672,6 @@ fn request_event_id(request_id: &str, kind: &str) -> Result<String> {
 fn transport_key(id: &Value) -> Result<String> {
     serde_json::to_string(id)
         .map_err(|_| Error::new("native_protocol", "Codex transport request id is invalid"))
-}
-
-pub(crate) fn rejected_control(reason: &str) -> Value {
-    json!({"state": "rejected", "reason": reason})
-}
-
-pub(crate) fn unknown_control(reason: &str) -> Value {
-    json!({"state": "unknown", "reason": reason})
 }
 
 fn tool_item(item: &Value) -> Option<(String, String, Option<String>)> {
@@ -1890,56 +1764,21 @@ fn attach_provider_restriction(
     false
 }
 
+/// Shared bounded terminal-text attachment, projecting the Codex turn
+/// status to its failed bit. Kept under the local path for the
+/// terminal-data tests.
 fn attach_final_text(
     data: &mut Value,
     final_text: &str,
     status: &NativeTurnStatus,
     policy: &SecretPolicy,
 ) {
-    let mut candidate = data.clone();
-    let Some(fields) = candidate.as_object_mut() else {
-        return;
-    };
-    fields.insert(
-        "final_text".to_owned(),
-        Value::String(final_text.to_owned()),
+    shared_attach_final_text(
+        data,
+        final_text,
+        *status == NativeTurnStatus::Failed,
+        policy,
     );
-    let exceeds_event_bound =
-        serde_json::to_vec(&candidate).map_or(true, |encoded| encoded.len() > MAX_EVENT_BYTES);
-    if *status == NativeTurnStatus::Failed && exceeds_event_bound {
-        attach_final_text_unavailable(data, policy);
-        return;
-    }
-    *data = candidate;
-}
-
-fn attach_final_text_unavailable(data: &mut Value, policy: &SecretPolicy) {
-    if ["final_text_unavailable", "event_budget"]
-        .iter()
-        .any(|literal| policy.contains_text(literal))
-        || data
-            .as_object()
-            .is_none_or(|fields| fields.contains_key("final_text_unavailable"))
-    {
-        return;
-    }
-    let mut candidate = data.clone();
-    let Some(fields) = candidate.as_object_mut() else {
-        return;
-    };
-    fields.insert(
-        "final_text_unavailable".to_owned(),
-        Value::String("event_budget".to_owned()),
-    );
-    if serde_json::to_vec(&candidate).map_or(true, |encoded| encoded.len() > MAX_EVENT_BYTES) {
-        return;
-    }
-    if let Some(fields) = data.as_object_mut() {
-        fields.insert(
-            "final_text_unavailable".to_owned(),
-            Value::String("event_budget".to_owned()),
-        );
-    }
 }
 
 #[cfg(test)]

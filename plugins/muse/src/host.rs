@@ -460,6 +460,7 @@ impl MusePlugin {
             session.native.pid(),
             "Muse",
             "session host",
+            "session",
             RPC_TIMEOUT,
         )
         .await

@@ -1,6 +1,7 @@
 use eliot_core::{Error, Result};
 use eliot_plugin::protocol::{
-    DecodeErrorKind, PrivateIncoming as Incoming, decode_private_frame, valid_private_id,
+    DecodeErrorKind, EncodeErrorKind, PrivateIncoming as Incoming, decode_private_frame,
+    encode_private_frame, valid_private_id,
 };
 use eliot_plugin::{MAX_FRAME_BYTES, RpcError, RpcRequest, RpcResponse};
 use futures_util::{SinkExt, StreamExt};
@@ -572,15 +573,14 @@ fn decode_frame(line: &str) -> Result<Incoming> {
 }
 
 fn encode_frame<T: Serialize>(message: &T) -> Result<String> {
-    let frame = serde_json::to_string(message)
-        .map_err(|_| Error::new("internal", "plugin JSON-RPC frame could not be encoded"))?;
-    if frame.len().saturating_add(1) > MAX_FRAME_BYTES {
-        return Err(Error::new(
-            "frame_too_large",
-            "plugin JSON-RPC frame exceeds 1 MiB",
-        ));
-    }
-    Ok(frame)
+    encode_private_frame(message).map_err(|kind| match kind {
+        EncodeErrorKind::Unencodable => {
+            Error::new("internal", "plugin JSON-RPC frame could not be encoded")
+        }
+        EncodeErrorKind::TooLarge => {
+            Error::new("frame_too_large", "plugin JSON-RPC frame exceeds 1 MiB")
+        }
+    })
 }
 
 fn id_key(id: &Value) -> Result<String> {

@@ -1,7 +1,7 @@
 use crate::{
-    events::{self, EventConfig, EventHandle, TurnFacts, rejected_control, unknown_control},
+    events::{self, EventConfig, EventHandle, TurnFacts},
     native::{
-        NativeClient, NativeLaunch, NativeProcess, native_no_write,
+        NativeClient, NativeLaunch, NativeProcess,
         types::{
             NativeClientInfo, NativeCollaborationMode, NativeCollaborationModeKind,
             NativeCollaborationSettings, NativeInitializeCapabilities, NativeInitializeParams,
@@ -16,13 +16,18 @@ use crate::{
     observe::ObserverSession,
     route::CodexRoute,
 };
-use eliot_core::{Error, NativeStoreBinding, ProcessRecord, ProcessState, Result, SecretPolicy};
+use eliot_core::{Error, NativeStoreBinding, Result, SecretPolicy};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, DiscoverParams,
     InitializeParams, MAX_EVENT_BYTES, MAX_TEXT_BYTES, ObserverAttachParams, ObserverDetachParams,
     ObserverSnapshotParams, Peer, PeerClient, PluginManifest, RpcRequest,
-    protocol::{MAX_COMMAND_ID_BYTES, MAX_CREDENTIAL_BYTES, ProfileStoreParams},
-    session::{is_passed_env, is_secret_name, target_environment as shared_target_environment},
+    protocol::{MAX_CREDENTIAL_BYTES, ProfileStoreParams},
+    session::{
+        decode, is_passed_env, is_secret_name, known_command, native_no_write, not_initialized,
+        paths_equal, register_native_process, rejected_control,
+        target_environment as shared_target_environment, unknown_control, unknown_snapshot,
+        validate_binding, validate_identity, validate_source_plan,
+    },
 };
 use serde_json::{Value, json};
 use std::{
@@ -151,8 +156,14 @@ pub(crate) async fn run() -> Result<()> {
             biased;
             request = requests.recv() => request,
             _ = live_ticks.tick(), if plugin.observer.as_ref().is_some_and(ObserverSession::live_poll_enabled) => {
-                let initialized = plugin.initialized.as_ref().ok_or_else(not_initialized)?;
-                let observer = plugin.observer.as_mut().ok_or_else(not_initialized)?;
+                let initialized = plugin
+                    .initialized
+                    .as_ref()
+                    .ok_or_else(|| not_initialized("Codex"))?;
+                let observer = plugin
+                    .observer
+                    .as_mut()
+                    .ok_or_else(|| not_initialized("Codex"))?;
                 let until = Instant::now() + LIVE_POLL_DEADLINE;
                 // Cancelling this future leaves owned file I/O and pending
                 // publication in the observer/publisher for settlement or close.
@@ -297,7 +308,10 @@ impl CodexPlugin {
         profile: &Value,
         environment: &Value,
     ) -> Result<(NativeLaunch, Vec<String>, Vec<String>)> {
-        let initialized = self.initialized.as_ref().ok_or_else(not_initialized)?;
+        let initialized = self
+            .initialized
+            .as_ref()
+            .ok_or_else(|| not_initialized("Codex"))?;
         let route = CodexRoute::from_profile(profile)?;
         let profile = profile.as_object().ok_or_else(|| {
             Error::new(
@@ -391,7 +405,12 @@ impl CodexPlugin {
 
     async fn attach(&mut self, raw: &Value) -> Result<Value> {
         let params: ObserverAttachParams = decode(raw, "Codex observer attach params are invalid")?;
-        validate_identity(&params.agent_id, params.generation, &params.command_id)?;
+        validate_identity(
+            &params.agent_id,
+            params.generation,
+            &params.command_id,
+            "Codex",
+        )?;
         if self.session.is_some() || self.failed_start.is_some() {
             return Err(Error::new(
                 "bad_state",
@@ -431,7 +450,12 @@ impl CodexPlugin {
             ));
         }
         let params: AgentStartParams = decode(raw, "Codex agent.start params are invalid")?;
-        validate_identity(&params.agent_id, params.generation, &params.command_id)?;
+        validate_identity(
+            &params.agent_id,
+            params.generation,
+            &params.command_id,
+            "Codex",
+        )?;
         if let Some(session) = &self.session {
             if session.agent_id == params.agent_id
                 && session.generation == params.generation
@@ -468,7 +492,10 @@ impl CodexPlugin {
                 "Codex plugin already settled a different start command",
             ));
         }
-        let initialized = self.initialized.as_ref().ok_or_else(not_initialized)?;
+        let initialized = self
+            .initialized
+            .as_ref()
+            .ok_or_else(|| not_initialized("Codex"))?;
         if params.initial.is_some() {
             return Err(Error::new(
                 "unsupported",
@@ -493,7 +520,11 @@ impl CodexPlugin {
                 }
                 error
             })?;
-        validate_source_plan(params.source_plan.as_ref())?;
+        validate_source_plan(
+            "Codex",
+            &["session", "turn", "message", "tool", "request"],
+            params.source_plan.as_ref(),
+        )?;
         let frozen_profile = params
             .profile
             .as_ref()
@@ -639,7 +670,11 @@ impl CodexPlugin {
             &initialized.credential,
             &session.agent_id,
             session.generation,
-            &session.native,
+            session.native.pid(),
+            "Codex",
+            "app-server",
+            "thread",
+            RPC_TIMEOUT,
         )
         .await
         {
@@ -1123,7 +1158,12 @@ impl CodexPlugin {
             ));
         }
         let params: AgentCommandParams = decode(raw, "Codex agent.command params are invalid")?;
-        validate_identity(&params.agent_id, params.generation, &params.command_id)?;
+        validate_identity(
+            &params.agent_id,
+            params.generation,
+            &params.command_id,
+            "Codex",
+        )?;
         match params.verb.as_str() {
             "send" => self.send_command(params).await,
             "steer" => self.steer(params).await,
@@ -1141,7 +1181,13 @@ impl CodexPlugin {
             .session
             .as_mut()
             .ok_or_else(|| Error::new("bad_state", "Codex Agent session has not started"))?;
-        validate_binding(session, &params.agent_id, params.generation)?;
+        validate_binding(
+            &session.agent_id,
+            session.generation,
+            &params.agent_id,
+            params.generation,
+            "Codex",
+        )?;
         if session.phase != SessionPhase::Ready {
             return Err(Error::new(
                 "unknown",
@@ -1296,7 +1342,13 @@ impl CodexPlugin {
             .session
             .as_mut()
             .ok_or_else(|| Error::new("bad_state", "Codex Agent session has not started"))?;
-        validate_binding(session, &params.agent_id, params.generation)?;
+        validate_binding(
+            &session.agent_id,
+            session.generation,
+            &params.agent_id,
+            params.generation,
+            "Codex",
+        )?;
         if params.request_id.is_some() {
             return Err(Error::new(
                 "invalid",
@@ -1407,7 +1459,13 @@ impl CodexPlugin {
             .session
             .as_mut()
             .ok_or_else(|| Error::new("bad_state", "Codex Agent session has not started"))?;
-        validate_binding(session, &params.agent_id, params.generation)?;
+        validate_binding(
+            &session.agent_id,
+            session.generation,
+            &params.agent_id,
+            params.generation,
+            "Codex",
+        )?;
         if params.request_id.is_some() {
             return Err(Error::new(
                 "invalid",
@@ -1492,7 +1550,13 @@ impl CodexPlugin {
             .session
             .as_mut()
             .ok_or_else(|| Error::new("bad_state", "Codex Agent session has not started"))?;
-        validate_binding(session, &params.agent_id, params.generation)?;
+        validate_binding(
+            &session.agent_id,
+            session.generation,
+            &params.agent_id,
+            params.generation,
+            "Codex",
+        )?;
         let turn_id = params
             .turn_id
             .as_deref()
@@ -1587,12 +1651,23 @@ impl CodexPlugin {
             ));
         }
         let params: AgentSnapshotParams = decode(raw, "Codex agent.snapshot params are invalid")?;
-        validate_identity(&params.agent_id, params.generation, &params.command_id)?;
+        validate_identity(
+            &params.agent_id,
+            params.generation,
+            &params.command_id,
+            "Codex",
+        )?;
         let session = self
             .session
             .as_mut()
             .ok_or_else(|| Error::new("not_found", "Codex Agent session is not retained"))?;
-        validate_binding(session, &params.agent_id, params.generation)?;
+        validate_binding(
+            &session.agent_id,
+            session.generation,
+            &params.agent_id,
+            params.generation,
+            "Codex",
+        )?;
         if session.stop_command_id.as_deref() == Some(params.command_id.as_str())
             && session.phase == SessionPhase::Stopped
             && params.turn_id.is_none()
@@ -1632,7 +1707,12 @@ impl CodexPlugin {
                 "Codex command has no proof for the requested native turn",
             );
         }
-        if !known_command(session, &params.command_id) {
+        if !known_command(
+            &session.start_command_id,
+            &session.command_inputs,
+            &session.stop_command_id,
+            &params.command_id,
+        ) {
             return unknown_snapshot(&params, "Codex command identity is not retained");
         }
         if session.phase == SessionPhase::Stopped {
@@ -1711,12 +1791,23 @@ impl CodexPlugin {
             ));
         }
         let params: AgentStopParams = decode(raw, "Codex agent.stop params are invalid")?;
-        validate_identity(&params.agent_id, params.generation, &params.command_id)?;
+        validate_identity(
+            &params.agent_id,
+            params.generation,
+            &params.command_id,
+            "Codex",
+        )?;
         let session = self
             .session
             .as_mut()
             .ok_or_else(|| Error::new("not_found", "Codex Agent session is not retained"))?;
-        validate_binding(session, &params.agent_id, params.generation)?;
+        validate_binding(
+            &session.agent_id,
+            session.generation,
+            &params.agent_id,
+            params.generation,
+            "Codex",
+        )?;
         if session.phase == SessionPhase::Stopped
             && session.stop_command_id.as_deref() == Some(params.command_id.as_str())
         {
@@ -1790,61 +1881,6 @@ async fn terminate_session(session: &mut AgentSession, force: bool) -> Result<()
         ));
     }
     session.phase = SessionPhase::Stopped;
-    Ok(())
-}
-
-async fn register_native_process(
-    peer: &PeerClient,
-    credential: &str,
-    agent_id: &str,
-    generation: i64,
-    native: &NativeProcess,
-) -> Result<()> {
-    let pid = native.pid().filter(|pid| *pid > 0).ok_or_else(|| {
-        Error::new(
-            "process_registration",
-            "Codex app-server PID is unavailable; no thread or input was sent",
-        )
-    })?;
-    let value = peer
-        .call(
-            "process.put",
-            json!({
-                "credential": credential,
-                "agent_id": agent_id,
-                "generation": generation,
-                "pid": pid,
-                "role": "harness",
-            }),
-            Instant::now() + RPC_TIMEOUT,
-        )
-        .await
-        .map_err(|error| {
-            let message = format!(
-                "Codex app-server process registration failed ({})",
-                error.code
-            );
-            contextual_error(error, "process_registration", message)
-        })?;
-    let record: ProcessRecord = serde_json::from_value(value).map_err(|_| {
-        Error::new(
-            "process_registration",
-            "Codex host returned an invalid process.put acknowledgement",
-        )
-    })?;
-    if record.identity.pid != pid
-        || record.identity.host_boot_id.trim().is_empty()
-        || record.identity.start_time == 0
-        || record.owner != format!("agent:{agent_id}#{generation}")
-        || record.role != "harness"
-        || record.state != ProcessState::Running
-        || record.exit_code.is_some()
-    {
-        return Err(Error::new(
-            "process_registration",
-            "Codex host did not verify the running app-server under this Agent generation",
-        ));
-    }
     Ok(())
 }
 
@@ -2139,37 +2175,6 @@ fn readback_approval_matches(actual: &Value, requested: &str) -> bool {
     actual.as_str() == Some(requested)
 }
 
-fn paths_equal(left: &Path, right: &Path) -> bool {
-    let left = std::fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
-    let right = std::fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
-    if cfg!(windows) {
-        left.to_string_lossy()
-            .eq_ignore_ascii_case(&right.to_string_lossy())
-    } else {
-        left == right
-    }
-}
-
-fn unknown_snapshot(params: &AgentSnapshotParams, reason: &str) -> Result<Value> {
-    Ok(json!({
-        "agent_id": params.agent_id,
-        "generation": params.generation,
-        "command_id": params.command_id,
-        "state": "unknown",
-        "active_turn": null,
-        "last_turn": null,
-        "source_unknown": true,
-        "result_known": false,
-        "reason": reason,
-    }))
-}
-
-fn known_command(session: &AgentSession, command_id: &str) -> bool {
-    session.start_command_id == command_id
-        || session.command_inputs.contains_key(command_id)
-        || session.stop_command_id.as_deref() == Some(command_id)
-}
-
 fn control_replay(
     session: &mut AgentSession,
     params: &AgentCommandParams,
@@ -2217,49 +2222,6 @@ fn settle_control(session: &mut AgentSession, command_id: &str, outcome: Control
     if let Some(command) = session.control_commands.get_mut(command_id) {
         command.outcome = outcome;
     }
-}
-
-fn validate_binding(session: &AgentSession, agent_id: &str, generation: i64) -> Result<()> {
-    if session.agent_id != agent_id || session.generation != generation {
-        return Err(Error::new(
-            "stale_generation",
-            "Codex request does not match the bound Agent generation",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_identity(agent_id: &str, generation: i64, command_id: &str) -> Result<()> {
-    if agent_id.trim().is_empty()
-        || generation <= 0
-        || command_id.trim().is_empty()
-        || command_id.len() > MAX_COMMAND_ID_BYTES
-    {
-        return Err(Error::new(
-            "invalid",
-            "Codex request requires a bounded Agent, generation, and command identity",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_source_plan(source_plan: Option<&Value>) -> Result<()> {
-    let Some(plan) = source_plan.and_then(Value::as_object) else {
-        return Err(Error::new(
-            "unsupported",
-            "Codex start requires an installed stream source plan",
-        ));
-    };
-    if ["session", "turn", "message", "tool", "request"]
-        .iter()
-        .any(|family| plan.get(*family).and_then(Value::as_str) != Some("stream"))
-    {
-        return Err(Error::new(
-            "unsupported",
-            "Codex start requires stream ownership for session, turn, message, tool, and request",
-        ));
-    }
-    Ok(())
 }
 
 fn parse_resume_subject(
@@ -2484,12 +2446,14 @@ fn terminal_turn_status(status: &str) -> bool {
     matches!(status, "completed" | "interrupted" | "failed")
 }
 
+/// Shared error re-coding, kept under the local path for the sibling
+/// modules that reach it through this host.
 pub(crate) fn contextual_error(
     error: Error,
     code: impl Into<String>,
     message: impl Into<String>,
 ) -> Error {
-    error.with_code(code).with_message(message)
+    eliot_plugin::session::contextual_error(error, code, message)
 }
 
 fn optional_profile_text(
@@ -2616,14 +2580,6 @@ fn codex_manifest() -> PluginManifest {
         ]),
         proxy: "responses".to_owned(),
     }
-}
-
-fn decode<T: serde::de::DeserializeOwned>(raw: &Value, message: &str) -> Result<T> {
-    serde_json::from_value(raw.clone()).map_err(|_| Error::new("invalid", message))
-}
-
-fn not_initialized() -> Error {
-    Error::new("bad_state", "Codex plugin has not been initialized")
 }
 
 #[cfg(test)]
