@@ -96,6 +96,12 @@ fn main() {
         )
         .await;
         run_scenario(
+            "interrupt reports a non-empty still_queued",
+            OwnedChildren::default(),
+            scenario_interrupt_reports_nonempty_still_queued,
+        )
+        .await;
+        run_scenario(
             "unknown model is rejected before session.ready",
             OwnedChildren::default(),
             scenario_model_not_in_catalogue_rejected_before_ready,
@@ -300,6 +306,11 @@ impl FakeClaude {
                         );
                     }
                     "interrupt" => {
+                        let still_queued = if self.script == "interrupt-queued" {
+                            json!(["queued-turn-1"])
+                        } else {
+                            json!([])
+                        };
                         self.emit(
                             stdout,
                             json!({
@@ -307,11 +318,11 @@ impl FakeClaude {
                                 "response": {
                                     "subtype": "success",
                                     "request_id": request_id,
-                                    "response": {"still_queued": []},
+                                    "response": {"still_queued": still_queued},
                                 },
                             }),
                         );
-                        if self.script == "interrupt-race" {
+                        if self.script == "interrupt-race" || self.script == "interrupt-queued" {
                             // The CLI flushes partial text as it interrupts;
                             // the adapter must keep it before the terminal.
                             self.emit_assistant(stdout, "fake partial text. ");
@@ -374,7 +385,7 @@ impl FakeClaude {
                         "state": "started",
                     }),
                 );
-                if self.script == "interrupt-race" {
+                if self.script == "interrupt-race" || self.script == "interrupt-queued" {
                     // Park the turn: no assistant text and no terminal
                     // record until the interrupt arrives.
                     return true;
@@ -1157,6 +1168,80 @@ async fn stop_agent(host: &mut Host, agent_id: &str) {
     assert!(ended, "stop commits session.ended");
 }
 
+/// Park one turn: the association commits, the terminal stays pending.
+/// Returns the applied turn uuid. Only the parking scripts
+/// (`interrupt-race`, `interrupt-queued`) withhold the terminal.
+async fn park_turn(host: &mut Host, agent_id: &str, text: &str) -> String {
+    let send_id = ulid::Ulid::new().to_string();
+    let rx = host
+        .begin_call(
+            "agent.command",
+            json!({
+                "agent_id": agent_id,
+                "generation": 1,
+                "command_id": send_id,
+                "verb": "send",
+                "args": {"text": text},
+                "turn_id": null,
+                "request_id": null,
+            }),
+        )
+        .await;
+    let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
+    let applied = loop {
+        tokio::select! {
+            biased;
+            request = host.next_request() => {
+                assert_eq!(request.method, "events.put");
+                let events = request.params.get("events").and_then(Value::as_array).cloned().unwrap_or_default();
+                assert_eq!(events[0].get("kind").and_then(Value::as_str), Some("turn.started"));
+                let first = host.next_seq;
+                host.next_seq += 1;
+                host.respond(&request.id, json!({
+                    "first_seq": first, "last_seq": first,
+                    "cursor": request.params.get("cursor").cloned().unwrap_or(Value::Null),
+                })).await;
+            }
+            result = &mut rx => break result,
+        }
+    };
+    let applied = applied
+        .expect("send deadline")
+        .expect("send response channel")
+        .expect("send applied");
+    applied
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .expect("parked turn uuid")
+        .to_owned()
+}
+
+/// Drain the interrupted turn's facts: the partial text is kept and the
+/// terminal is `interrupted`.
+async fn drain_interrupted_turn(host: &mut Host, agent_id: &str, turn_id: &str) {
+    let mut saw_message = false;
+    let mut saw_terminal = false;
+    while !saw_terminal {
+        let (kind, data) = host.answer_any_events_put(agent_id).await;
+        match kind.as_str() {
+            "message.completed" => {
+                saw_message = true;
+                assert_eq!(data.get("turn_id").and_then(Value::as_str), Some(turn_id));
+            }
+            "turn.completed" => {
+                saw_terminal = true;
+                assert_eq!(data.get("turn_id").and_then(Value::as_str), Some(turn_id));
+                assert_eq!(
+                    data.get("status").and_then(Value::as_str),
+                    Some("interrupted")
+                );
+            }
+            other => panic!("unexpected turn fact: {other}"),
+        }
+    }
+    assert!(saw_message, "interrupted turn keeps its text");
+}
+
 async fn scenario_launch_send_snapshot_stop(owned: OwnedChildren) {
     let mut scenario = Scenario::start("ok", claude_profile(), &owned).await;
     let agent_id = scenario.agent_id.clone();
@@ -1551,50 +1636,7 @@ async fn scenario_dropped_input_is_unknown_without_rewrite(owned: OwnedChildren)
 async fn scenario_interrupt_applied_then_stale(owned: OwnedChildren) {
     let mut scenario = Scenario::start("interrupt-race", claude_profile(), &owned).await;
     let agent_id = scenario.agent_id.clone();
-    // Park one turn: the association commits, the terminal stays pending.
-    let send_id = ulid::Ulid::new().to_string();
-    let rx = scenario
-        .host
-        .begin_call(
-            "agent.command",
-            json!({
-                "agent_id": agent_id,
-                "generation": 1,
-                "command_id": send_id,
-                "verb": "send",
-                "args": {"text": "park me"},
-                "turn_id": null,
-                "request_id": null,
-            }),
-        )
-        .await;
-    let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
-    let applied = loop {
-        tokio::select! {
-            biased;
-            request = scenario.host.next_request() => {
-                assert_eq!(request.method, "events.put");
-                let events = request.params.get("events").and_then(Value::as_array).cloned().unwrap_or_default();
-                assert_eq!(events[0].get("kind").and_then(Value::as_str), Some("turn.started"));
-                let first = scenario.host.next_seq;
-                scenario.host.next_seq += 1;
-                scenario.host.respond(&request.id, json!({
-                    "first_seq": first, "last_seq": first,
-                    "cursor": request.params.get("cursor").cloned().unwrap_or(Value::Null),
-                })).await;
-            }
-            result = &mut rx => break result,
-        }
-    };
-    let applied = applied
-        .expect("send deadline")
-        .expect("send response channel")
-        .expect("send applied");
-    let turn_id = applied
-        .get("turn_id")
-        .and_then(Value::as_str)
-        .expect("parked turn uuid")
-        .to_owned();
+    let turn_id = park_turn(&mut scenario.host, &agent_id, "park me").await;
     // The bound active turn interrupts exactly once.
     let interrupted = scenario
         .host
@@ -1622,33 +1664,7 @@ async fn scenario_interrupt_applied_then_stale(owned: OwnedChildren) {
     );
     assert_eq!(interrupted.get("still_queued"), Some(&json!([])));
     // The terminal follows on either side of the interrupt response.
-    let mut saw_message = false;
-    let mut saw_terminal = false;
-    while !saw_terminal {
-        let (kind, data) = scenario.host.answer_any_events_put(&agent_id).await;
-        match kind.as_str() {
-            "message.completed" => {
-                saw_message = true;
-                assert_eq!(
-                    data.get("turn_id").and_then(Value::as_str),
-                    Some(turn_id.as_str())
-                );
-            }
-            "turn.completed" => {
-                saw_terminal = true;
-                assert_eq!(
-                    data.get("turn_id").and_then(Value::as_str),
-                    Some(turn_id.as_str())
-                );
-                assert_eq!(
-                    data.get("status").and_then(Value::as_str),
-                    Some("interrupted")
-                );
-            }
-            other => panic!("unexpected turn fact: {other}"),
-        }
-    }
-    assert!(saw_message, "interrupted turn keeps its text");
+    drain_interrupted_turn(&mut scenario.host, &agent_id, &turn_id).await;
     // After the terminal, the same turn refuses without a second write.
     let stale = scenario
         .host
@@ -1673,6 +1689,49 @@ async fn scenario_interrupt_applied_then_stale(owned: OwnedChildren) {
             .and_then(Value::as_u64),
         Some(1)
     );
+    stop_agent(&mut scenario.host, &agent_id).await;
+    scenario.assert_cli_exit("stdin-eof");
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+}
+
+async fn scenario_interrupt_reports_nonempty_still_queued(owned: OwnedChildren) {
+    let mut scenario = Scenario::start("interrupt-queued", claude_profile(), &owned).await;
+    let agent_id = scenario.agent_id.clone();
+    let turn_id = park_turn(&mut scenario.host, &agent_id, "park me").await;
+    let interrupted = scenario
+        .host
+        .call(
+            "agent.command",
+            json!({
+                "agent_id": agent_id,
+                "generation": 1,
+                "command_id": ulid::Ulid::new().to_string(),
+                "verb": "interrupt",
+                "args": {},
+                "turn_id": turn_id,
+                "request_id": null,
+            }),
+        )
+        .await
+        .expect("interrupt applied");
+    assert_eq!(
+        interrupted.get("state").and_then(Value::as_str),
+        Some("applied")
+    );
+    assert_eq!(
+        interrupted.get("turn_id").and_then(Value::as_str),
+        Some(turn_id.as_str())
+    );
+    assert_eq!(
+        interrupted.get("still_queued"),
+        Some(&json!(["queued-turn-1"]))
+    );
+    drain_interrupted_turn(&mut scenario.host, &agent_id, &turn_id).await;
     stop_agent(&mut scenario.host, &agent_id).await;
     scenario.assert_cli_exit("stdin-eof");
     scenario
