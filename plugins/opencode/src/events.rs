@@ -651,11 +651,20 @@ impl EventProcessor {
         }
         if matches!(
             event_type,
-            "session.inbox.cancelled"
-                | "session.execution.succeeded"
+            "session.execution.succeeded"
                 | "session.execution.failed"
                 | "session.execution.interrupted"
         ) {
+            // A terminal buffers only while an association may still open
+            // its turn: our send is in flight, or a start awaits its
+            // association. A turn-less terminal with neither coming is
+            // classifiable now — the dead generation's close (dropped) or a
+            // transcript gap — and must never wait to be misbound to a
+            // later turn.
+            return self.status.active_turn_id.is_none()
+                && (self.pending.is_some() || self.stashed_started.is_some());
+        }
+        if event_type == "session.inbox.cancelled" {
             return self.status.active_turn_id.is_none();
         }
         // An ask racing our send association buffers until the turn opens:
@@ -1071,6 +1080,32 @@ impl EventProcessor {
         Ok(())
     }
 
+    /// Bind a terminal event of our session to its exact Eliot turn.
+    /// A terminal with no turn before this generation's first send is the
+    /// dead generation's close: drop it (`None`), never attribute it. Any
+    /// other turn-less terminal is a transcript gap.
+    async fn resolve_terminal_turn(&mut self) -> Result<Option<(String, String)>> {
+        match (
+            self.status.active_command_id.clone(),
+            self.status.active_turn_id.clone(),
+        ) {
+            (Some(command_id), Some(turn_id)) => Ok(Some((command_id, turn_id))),
+            // Before this generation's first send a resumed terminal is the
+            // dead generation's close: drop it, never attribute it. After a
+            // send (or on a fresh session) a terminal with no turn is a
+            // transcript gap.
+            _ if self.resumed && !self.saw_send => Ok(None),
+            _ => {
+                self.record_gap("OpenCode terminal event matched no exact active turn")
+                    .await?;
+                Err(Error::new(
+                    "unknown",
+                    "OpenCode turn completed outside any Eliot send",
+                ))
+            }
+        }
+    }
+
     async fn complete_turn(&mut self, envelope: &SseEnvelope) -> Result<()> {
         let terminal: ExecutionEventData =
             serde_json::from_value(envelope.data.clone()).map_err(|_| {
@@ -1082,24 +1117,8 @@ impl EventProcessor {
         if self.status.session_id.as_deref() != Some(terminal.session_id.as_str()) {
             return Ok(());
         }
-        let (command_id, turn_id) = match (
-            self.status.active_command_id.clone(),
-            self.status.active_turn_id.clone(),
-        ) {
-            (Some(command_id), Some(turn_id)) => (command_id, turn_id),
-            // Before this generation's first send a resumed terminal is the
-            // dead generation's close: drop it, never attribute it. After a
-            // send (or on a fresh session) a terminal with no turn is a
-            // transcript gap.
-            _ if self.resumed && !self.saw_send => return Ok(()),
-            _ => {
-                self.record_gap("OpenCode terminal event matched no exact active turn")
-                    .await?;
-                return Err(Error::new(
-                    "unknown",
-                    "OpenCode turn completed outside any Eliot send",
-                ));
-            }
+        let Some((command_id, turn_id)) = self.resolve_terminal_turn().await? else {
+            return Ok(());
         };
         let status = match envelope.event_type.as_str() {
             "session.execution.succeeded" => "completed",
@@ -1564,15 +1583,7 @@ impl EventProcessor {
             return Ok(());
         };
         let Some(session_id) = self.status.session_id.clone() else {
-            self.pending_requests.insert(
-                native_id.to_owned(),
-                PendingNativeRequest {
-                    request: pending.request,
-                    reply_command_id: pending.reply_command_id,
-                    reply_state: pending.reply_state,
-                    reply_is_cancel: pending.reply_is_cancel,
-                },
-            );
+            self.pending_requests.insert(native_id.to_owned(), pending);
             return Err(Error::new("unknown", "OpenCode session is unresolved"));
         };
         let turn_id = pending.request.turn_id.clone();
@@ -1741,7 +1752,8 @@ impl EventProcessor {
 
     /// Settle the reply lane after its one write: applied on 204, rejected
     /// on proven non-admission (closing the retained offer when the target
-    /// is gone), unknown on anything ambiguous.
+    /// is gone), unknown on anything ambiguous — including a provably-unsent
+    /// (`NotDispatched`) write, which latches unknown like a lost reply.
     async fn finish_reply_write(
         &mut self,
         request_id: &str,
@@ -1801,8 +1813,9 @@ impl EventProcessor {
         }
     }
 
-    /// Latch a reply lane unknown after an ambiguous write: the reply is
-    /// never written again for this request.
+    /// Latch a reply lane unknown after an ambiguous write — or a
+    /// provably-unsent one (`NotDispatched` latches unknown too): the lane
+    /// never reopens, so the reply is never written again for this request.
     fn latch_reply_unknown(&mut self, request_id: &str) {
         if let Some(pending) = self.pending_requests.get_mut(request_id) {
             pending.reply_state = NativeReplyState::Unknown;
@@ -1817,15 +1830,7 @@ impl EventProcessor {
             return Ok(());
         };
         let Some(session_id) = self.status.session_id.clone() else {
-            self.pending_requests.insert(
-                request_id.to_owned(),
-                PendingNativeRequest {
-                    request: pending.request,
-                    reply_command_id: pending.reply_command_id,
-                    reply_state: pending.reply_state,
-                    reply_is_cancel: pending.reply_is_cancel,
-                },
-            );
+            self.pending_requests.insert(request_id.to_owned(), pending);
             return Err(Error::new("unknown", "OpenCode session is unresolved"));
         };
         let native_event = event_id(

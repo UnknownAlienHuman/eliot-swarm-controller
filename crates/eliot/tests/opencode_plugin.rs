@@ -97,6 +97,11 @@ fn main() {
         )
         .await;
         run_scenario(
+            "resume aborts a retained running execution and drops its terminal",
+            scenario_resume_aborts_retained_running_execution,
+        )
+        .await;
+        run_scenario(
             "resume of a deleted session is not_found",
             scenario_resume_of_deleted_session_is_not_found,
         )
@@ -361,7 +366,8 @@ struct Script {
     /// request and completes). Implies the prompt holds its terminal.
     terminal_on_reply: bool,
     /// A retained session the fake boots with (the stable-store stand-in
-    /// for resume): `{id, model_id, provider_id, agent?, directory, seq}`.
+    /// for resume): `{id, model_id, provider_id, agent?, directory, seq,
+    /// live?}` (`live` seeds a still-running retained execution).
     seed_session: Option<Value>,
     /// Pending permission seeds at boot: `{id, action, resources, message?}`.
     seed_permissions: Vec<Value>,
@@ -1375,7 +1381,7 @@ async fn seed_fixture(fixture: &Fixture) {
             seq: seed.get("seq").and_then(Value::as_u64).unwrap_or(0),
             inbox_id: None,
             terminal: None,
-            live: false,
+            live: seed.get("live").and_then(Value::as_bool).unwrap_or(false),
         },
     );
     if !fixture.script.seed_permissions.is_empty() {
@@ -3126,8 +3132,101 @@ async fn scenario_resume_reattaches_retained_session(owned: OwnedChildren) {
         home2.contains(&format!("opencode-{agent_id}")),
         "stable store is per Agent: {home2}"
     );
+    let requests = requests_at(&root, "requests2.jsonl");
+    assert_eq!(
+        count_requests(&requests, "POST", "/prompt"),
+        0,
+        "resume never replays the prompt"
+    );
     // The adopted live edge tracks the continued aggregate: no gap, and a
     // post-resume send completes on it.
+    let (_, _, committed) = send_turn(&mut gen2, 2, "continued work").await;
+    assert_eq!(
+        kinds(&committed),
+        ["turn.started", "message.completed", "turn.completed"]
+    );
+    let committed = stop_agent(&mut gen2, 2, false).await;
+    assert_eq!(kinds(&committed), ["session.ended"]);
+    gen2.host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    gen2.host.shutdown_child().await;
+}
+
+async fn scenario_resume_aborts_retained_running_execution(owned: OwnedChildren) {
+    let root: PathBuf = std::env::temp_dir().join(format!(
+        "eliot-opencode-resume-abort-test-{}",
+        ulid::Ulid::new().to_string().to_lowercase()
+    ));
+    std::fs::create_dir_all(root.join("data")).unwrap();
+    std::fs::create_dir_all(root.join("workspace")).unwrap();
+    let agent_id = ulid::Ulid::new().to_string();
+    let workspace = root.join("workspace").to_string_lossy().into_owned();
+    // Generation 1 runs one completed turn, then dies without stopping.
+    let (pending, rx) = Scenario::setup_start_in(
+        &root,
+        "instance",
+        "requests.jsonl",
+        "report.json",
+        &script(json!({})),
+        opencode_profile(),
+        agent_id.clone(),
+        1,
+        None,
+        None,
+        owned.clone(),
+    )
+    .await;
+    let (mut gen1, ready1) = pending.finish(rx).await;
+    let (_, turn_id, _) = send_turn(&mut gen1, 1, "retained work").await;
+    let retained_ref = ready1
+        .get("native_ref")
+        .and_then(Value::as_str)
+        .expect("retained ref")
+        .to_owned();
+    let resume = resume_subject(&agent_id, &ready1, &turn_id);
+    drop(gen1);
+    // Generation 2 finds the retained execution still running: the resume
+    // quiesce aborts it (two interrupts: the abort plus the drain confirm)
+    // and the dead generation's terminal drops silently — no gap, no replay.
+    let (pending, rx) = Scenario::setup_start_in(
+        &root,
+        "instance2",
+        "requests2.jsonl",
+        "report2.json",
+        &script(json!({
+            "seed_session": {
+                "id": retained_ref,
+                "model_id": "test-model",
+                "provider_id": "test-provider",
+                "directory": workspace,
+                "seq": 5,
+                "live": true,
+            },
+        })),
+        opencode_profile(),
+        agent_id.clone(),
+        2,
+        Some(resume),
+        None,
+        owned,
+    )
+    .await;
+    let (mut gen2, ready2) = pending.finish(rx).await;
+    assert_eq!(
+        ready2.get("native_ref").and_then(Value::as_str),
+        Some(retained_ref.as_str()),
+        "resume reattaches the exact retained session without replay"
+    );
+    let requests = requests_at(&root, "requests2.jsonl");
+    assert_eq!(count_requests(&requests, "POST", "/interrupt"), 2);
+    assert_eq!(
+        count_requests(&requests, "POST", "/prompt"),
+        0,
+        "resume never replays the prompt"
+    );
+    // A post-resume send completes on the adopted edge without a gap.
     let (_, _, committed) = send_turn(&mut gen2, 2, "continued work").await;
     assert_eq!(
         kinds(&committed),

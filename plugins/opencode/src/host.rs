@@ -775,8 +775,11 @@ impl OpenCodePlugin {
     }
 
     /// Resume quiesce: one `session.interrupt` must report no running
-    /// execution. When it aborts one, the settle is awaited on a bounded
-    /// leg poll; anything else refuses the resume as unknown.
+    /// execution. A running retained execution is aborted (refusing would
+    /// wedge crash-recovery resume) and its settle is awaited on a bounded
+    /// leg poll; anything else refuses the resume as unknown. The native
+    /// idle proof is this interrupt plus the empty inbox/permission/form
+    /// lists, not served history.
     async fn resume_quiesce(session: &AgentSession, session_id: &str) -> Result<()> {
         let interrupted = match session
             .http
@@ -1384,7 +1387,19 @@ impl OpenCodePlugin {
                 "OpenCode interrupt requires the exact turn id",
             ));
         };
-        if !session.events.check_turn(&turn_id).await.unwrap_or(false) {
+        let live = match session.events.check_turn(&turn_id).await {
+            Ok(live) => live,
+            // The gate itself is unresolved (the event task is gone): the
+            // turn may still be live, so this is unknown, never stale.
+            Err(_) => {
+                Self::abandon_control(session, &command_id);
+                return Err(Error::new(
+                    "unknown",
+                    "OpenCode interrupt turn check is unresolved",
+                ));
+            }
+        };
+        if !live {
             Self::abandon_control(session, &command_id);
             return Err(Error::new(
                 "stale_turn",
@@ -1424,7 +1439,20 @@ impl OpenCodePlugin {
                 Ok(result)
             }
             Ok(false) => {
-                if session.events.check_turn(turn_id).await.unwrap_or(false) {
+                let live = match session.events.check_turn(turn_id).await {
+                    Ok(live) => live,
+                    // The write went out but the gate is unresolved (the
+                    // event task is gone): unknown, never stale.
+                    Err(_) => {
+                        session.unknown_commands.insert(command_id.to_owned());
+                        Self::abandon_control(session, command_id);
+                        return Err(Error::new(
+                            "unknown",
+                            "OpenCode interrupt turn check is unresolved",
+                        ));
+                    }
+                };
+                if live {
                     session.unknown_commands.insert(command_id.to_owned());
                     Self::abandon_control(session, command_id);
                     Err(Error::new(
@@ -1886,14 +1914,6 @@ fn start_model_ref(profile: &serde_json::Map<String, Value>) -> Result<(String, 
     Ok((requested_model, model_ref))
 }
 
-/// Parse and bind a resume subject: the retained store scope and session
-/// id, generation continuity (exactly the previous generation), and the
-/// retained source identity (same Agent, same generation, same controlled
-/// source, owning at least the session/turn/message families — PR1
-/// generations own no `request` family and still resume). The retained
-/// turn is presence-checked only (the Store already gates on no active
-/// turn); the native idle proof is the interrupt plus the empty
-/// inbox/permission/form lists, not served history.
 /// The frozen start paths: an existing workspace directory and the explicit
 /// native executable.
 fn start_paths(

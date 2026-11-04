@@ -234,13 +234,10 @@ impl OpenCodeHttp {
 
     /// `POST /api/session/{id}/interrupt` (`session.interrupt`):
     /// abort the session's current execution. The 200 body is unwrapped
-    /// (`{"interrupted": bool}`): `false` proves no execution was running,
-    /// never an error. A 404 proves the session is gone (no effect).
-    /// `POST /api/session/{id}/interrupt` (`session.interrupt`):
-    /// interrupt the session's active execution. 200 answers
-    /// `{"interrupted": bool}` (unwrapped, unlike every other success
-    /// body); `true` means an execution owned by this server was
-    /// interrupted.
+    /// (`{"interrupted": bool}`), unlike every other success body: `true`
+    /// means an execution owned by this server was interrupted, `false`
+    /// proves no execution was running, never an error. A 404 proves the
+    /// session is gone (no effect).
     pub async fn interrupt(
         &self,
         session_id: &str,
@@ -375,7 +372,8 @@ impl OpenCodeHttp {
     }
 
     /// `DELETE /api/session/{id}/form/{formID}`: cancel one pending form
-    /// (the native deny). 204 applies; 404 proves the form is already gone.
+    /// (the native deny). 204 applies; 404 proves the form is already gone
+    /// and 409 (`FormAlreadySettledError`) proves it is already settled.
     pub async fn delete_form(
         &self,
         session_id: &str,
@@ -392,6 +390,13 @@ impl OpenCodeHttp {
             .await?;
         if response.status == 204 {
             return Ok(());
+        }
+        if response.status == 409 {
+            return Err(HttpOutcome::Rejected {
+                status: Some(409),
+                reason: "OpenCode refused the write (already_settled): the form is already settled"
+                    .to_owned(),
+            });
         }
         Err(map_write_error("session.form.delete", &response))
     }
