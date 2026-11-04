@@ -72,6 +72,12 @@ fn main() {
         )
         .await;
         run_scenario(
+            "cancelled active turn reaches a terminal state",
+            OwnedChildren::default(),
+            scenario_cancelled_active_turn_reaches_terminal,
+        )
+        .await;
+        run_scenario(
             "dropped input is unknown without a second write",
             OwnedChildren::default(),
             scenario_dropped_input_is_unknown_without_rewrite,
@@ -365,6 +371,19 @@ impl FakeClaude {
                 if self.script == "interrupt-race" {
                     // Park the turn: no assistant text and no terminal
                     // record until the interrupt arrives.
+                    return true;
+                }
+                if self.script == "cancel-active" {
+                    // The queued turn is cancelled after association; no
+                    // result record follows, the cancellation is terminal.
+                    self.emit(
+                        stdout,
+                        json!({
+                            "type": "command_lifecycle",
+                            "command_uuid": uuid,
+                            "state": "cancelled",
+                        }),
+                    );
                     return true;
                 }
                 let texts: Vec<String> = match self.script.as_str() {
@@ -1362,6 +1381,63 @@ async fn scenario_cancelled_input_is_rejected_without_rewrite(owned: OwnedChildr
     assert_eq!(
         scenario.report().get("user_inputs").and_then(Value::as_u64),
         Some(1)
+    );
+    stop_agent(&mut scenario.host, &agent_id).await;
+    scenario.assert_cli_exit("stdin-eof");
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+}
+
+async fn scenario_cancelled_active_turn_reaches_terminal(owned: OwnedChildren) {
+    let mut scenario = Scenario::start("cancel-active", claude_profile(), &owned).await;
+    let agent_id = scenario.agent_id.clone();
+    let (send_id, _, committed) = send_turn(&mut scenario.host, &agent_id, "hello").await;
+    assert_eq!(
+        committed
+            .iter()
+            .map(|(kind, _)| kind.as_str())
+            .collect::<Vec<_>>(),
+        vec!["turn.started", "turn.completed"]
+    );
+    let terminal = committed
+        .iter()
+        .find(|(kind, _)| kind == "turn.completed")
+        .map(|(_, data)| data)
+        .expect("terminal data");
+    assert_eq!(
+        terminal.get("status").and_then(Value::as_str),
+        Some("cancelled")
+    );
+    // The turn is terminal, not stuck active: the session is idle and a
+    // following send is not busy.
+    let snapshot = scenario
+        .host
+        .call(
+            "agent.snapshot",
+            json!({
+                "agent_id": agent_id,
+                "generation": 1,
+                "command_id": send_id,
+            }),
+        )
+        .await
+        .expect("snapshot");
+    assert_eq!(snapshot.get("state").and_then(Value::as_str), Some("idle"));
+    assert_eq!(
+        snapshot["last_turn"].get("status").and_then(Value::as_str),
+        Some("cancelled")
+    );
+    let (_, _, recommitted) = send_turn(&mut scenario.host, &agent_id, "again").await;
+    assert_eq!(
+        recommitted
+            .iter()
+            .map(|(kind, _)| kind.as_str())
+            .collect::<Vec<_>>(),
+        vec!["turn.started", "turn.completed"]
     );
     stop_agent(&mut scenario.host, &agent_id).await;
     scenario.assert_cli_exit("stdin-eof");

@@ -693,6 +693,9 @@ impl EventProcessor {
             return self.settle_pending_lifecycle(parsed).await;
         }
         if self.status.active_turn_id.as_deref() == Some(parsed.command_uuid.as_str()) {
+            if parsed.state == "cancelled" {
+                return self.complete_cancelled_turn().await;
+            }
             return Ok(());
         }
         if self
@@ -768,6 +771,19 @@ impl EventProcessor {
         if let Some(sender) = pending.outcome {
             let _ = sender.send(outcome);
         }
+    }
+
+    /// A queued turn the CLI cancels reaches its terminal state instead of
+    /// staying active forever. The cancellation is the terminal fact; it
+    /// folds through the same commit path as a result record.
+    async fn complete_cancelled_turn(&mut self) -> Result<()> {
+        let session_id = self.status.session_id.clone().unwrap_or_default();
+        self.complete_turn(&json!({
+            "type": "result",
+            "terminal_reason": "cancelled",
+            "session_id": session_id,
+        }))
+        .await
     }
 
     async fn observe_assistant(&mut self, record: &Value) -> Result<()> {
