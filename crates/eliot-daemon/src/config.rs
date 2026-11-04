@@ -3319,6 +3319,12 @@ pass_env = ["OPENAI_API_KEY"]
         );
         assert_eq!(snapshot["model"], "opencode/big-pickle");
         assert_eq!(snapshot["pass_env"], json!(["OPENAI_API_KEY"]));
+        // Control freezes like every other harness snapshot (#269): unset
+        // means self, an explicit tree survives the freeze.
+        assert_eq!(snapshot["control"], "self");
+        let source = format!("{source}control = \"tree\"\n");
+        let snapshot = resolve_text_profile(&source, "oc").unwrap();
+        assert_eq!(snapshot["control"], "tree");
 
         // The installed model-id syntax is provider/model, slashes included.
         for model in ["big-pickle", "/big-pickle", "opencode/", "a/b/c", ""] {
