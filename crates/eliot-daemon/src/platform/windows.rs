@@ -1176,29 +1176,42 @@ fn ensure_current_owner(path: &Path) -> Result<()> {
         ));
     }
 
-    let user_sid = current_user_sid();
-    let same_owner = match user_sid {
-        Ok(user_sid) if !owner.is_null() => {
-            // SAFETY: both SID pointers remain valid until descriptor/buffer drop.
-            unsafe { EqualSid(owner, sid_pointer(&user_sid)) != 0 }
+    let result = match current_user_sid() {
+        // SAFETY: both SID pointers remain valid until descriptor/buffer drop.
+        Ok(user_sid)
+            if !owner.is_null() && unsafe { EqualSid(owner, sid_pointer(&user_sid)) } != 0 =>
+        {
+            Ok(())
         }
-        Ok(_) => false,
-        Err(error) => {
-            // SAFETY: descriptor is owned by this function.
-            unsafe { windows_sys::Win32::Foundation::LocalFree(descriptor as HLOCAL) };
-            return Err(error);
-        }
+        Ok(user_sid) => Err(foreign_owner(path, owner, &user_sid)),
+        Err(error) => Err(error),
     };
     // SAFETY: GetNamedSecurityInfoW allocated this descriptor for the caller.
     unsafe { windows_sys::Win32::Foundation::LocalFree(descriptor as HLOCAL) };
-    if same_owner {
-        Ok(())
+    result
+}
+
+/// Name the object and both SIDs: Windows CI runners intermittently report
+/// this mismatch, and the bare message did not say which file or owner.
+/// `owner` must point into a live security descriptor.
+fn foreign_owner(path: &Path, owner: *mut c_void, user_sid: &[usize]) -> Error {
+    let owner = if owner.is_null() {
+        "none".to_owned()
     } else {
-        Err(Error::new(
-            "unsafe_data_dir",
-            "data root or private file is owned by another Windows user",
-        ))
-    }
+        sid_text(owner).unwrap_or_else(|_| "unreadable".to_owned())
+    };
+    let user = sid_to_string(user_sid).unwrap_or_else(|_| "unreadable".to_owned());
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    Error::new(
+        "unsafe_data_dir",
+        format!(
+            "data root or private file is owned by another Windows user \
+             ({name}: owner {owner}, current user {user})"
+        ),
+    )
 }
 
 fn validate_current_user_acl(path: &Path, directory: bool) -> Result<()> {
@@ -1233,10 +1246,7 @@ fn validate_current_user_acl(path: &Path, directory: bool) -> Result<()> {
             // SAFETY: owner and current-user SID remain valid during this closure.
             || unsafe { EqualSid(owner, sid_pointer(&user_sid)) } == 0
         {
-            return Err(Error::new(
-                "unsafe_data_dir",
-                "data root or private file is owned by another Windows user",
-            ));
+            return Err(foreign_owner(path, owner, &user_sid));
         }
         if dacl.is_null() {
             return Err(Error::new(
@@ -1441,13 +1451,15 @@ fn sid_pointer(buffer: &[usize]) -> *mut c_void {
 }
 
 fn sid_to_string(buffer: &[usize]) -> Result<String> {
+    sid_text(sid_pointer(buffer))
+}
+
+/// `sid` must point to a valid SID that stays live through the call.
+fn sid_text(sid: *mut c_void) -> Result<String> {
     let mut text: *mut u16 = null_mut();
-    // SAFETY: the SID pointer references the aligned, live token buffer.
-    if unsafe { ConvertSidToStringSidW(sid_pointer(buffer), &mut text) } == 0 {
-        return Err(io_error(
-            "format current user SID",
-            std::io::Error::last_os_error(),
-        ));
+    // SAFETY: the caller guarantees `sid` references a live SID.
+    if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
+        return Err(io_error("format SID", std::io::Error::last_os_error()));
     }
     let mut length = 0usize;
     // SAFETY: ConvertSidToStringSidW returns a NUL-terminated allocation.
@@ -1456,7 +1468,7 @@ fn sid_to_string(buffer: &[usize]) -> Result<String> {
         if length > 256 {
             // SAFETY: text was allocated by ConvertSidToStringSidW.
             unsafe { windows_sys::Win32::Foundation::LocalFree(text as HLOCAL) };
-            return Err(Error::new("platform_acl", "current user SID is too long"));
+            return Err(Error::new("platform_acl", "SID is too long"));
         }
     }
     // SAFETY: text points to `length` initialized UTF-16 code units.
@@ -1503,4 +1515,34 @@ fn io_error(action: &str, error: std::io::Error) -> Error {
 #[link(name = "ntdll")]
 unsafe extern "system" {
     fn NtResumeProcess(process_handle: HANDLE) -> i32;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+
+    #[test]
+    fn foreign_owner_names_the_file_and_both_sids() {
+        let text: Vec<u16> = "S-1-5-32-544".encode_utf16().chain(Some(0)).collect();
+        let mut sid = null_mut();
+        // SAFETY: text is NUL-terminated and sid receives a LocalAlloc'd SID.
+        assert_ne!(
+            unsafe { ConvertStringSidToSidW(text.as_ptr(), &mut sid) },
+            0
+        );
+        let user_sid = current_user_sid().expect("current user SID");
+        let error = foreign_owner(Path::new(r"C:\data\daemon.json"), sid, &user_sid);
+        // SAFETY: ConvertStringSidToSidW allocated sid for the caller.
+        unsafe { windows_sys::Win32::Foundation::LocalFree(sid as HLOCAL) };
+        let user = sid_to_string(&user_sid).expect("current user SID text");
+        assert_eq!(error.code, "unsafe_data_dir");
+        assert!(
+            error.message.contains(&format!(
+                "(daemon.json: owner S-1-5-32-544, current user {user})"
+            )),
+            "{}",
+            error.message
+        );
+    }
 }
