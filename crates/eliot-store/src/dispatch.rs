@@ -248,10 +248,10 @@ impl Store {
                         "resume no longer targets the captured terminal Agent generation",
                     ));
                 }
-                if !matches!(agent.harness.as_str(), "codex" | "fake" | "muse") {
+                if !matches!(agent.harness.as_str(), "codex" | "fake" | "muse" | "claude") {
                     return Err(Error::new(
                         "unsupported",
-                        "resume is only supported for Codex, Muse, or Fake Agents",
+                        "resume is only supported for Codex, Muse, Claude, or Fake Agents",
                     ));
                 }
                 if has_pending_resume_tx(&tx, agent_num, old_generation, id)? {

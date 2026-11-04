@@ -4474,7 +4474,7 @@ fn source_families_for_harness(harness: &str) -> Result<&'static [&'static str]>
         "fake" => Ok(&["session", "turn", "message", "request"]),
         "codex" => Ok(&["session", "turn", "message", "tool", "request"]),
         "muse" => Ok(&["session", "turn", "message", "request"]),
-        "claude" => Ok(&["session", "turn", "message"]),
+        "claude" => Ok(&["session", "turn", "message", "request"]),
         "opencode" => Ok(&["session", "turn", "message"]),
         other => Err(Error::new(
             "unsupported",
@@ -4775,7 +4775,7 @@ fn supports_control_verb(harness: &str, verb: &str) -> bool {
             && matches!(verb, "interrupt" | "steer" | "approve" | "deny" | "answer"))
         || (harness == "muse"
             && matches!(verb, "approve" | "deny" | "answer" | "steer" | "interrupt"))
-        || (harness == "claude" && verb == "interrupt")
+        || (harness == "claude" && matches!(verb, "interrupt" | "approve" | "deny"))
 }
 
 fn contains_secret_marker(value: &Value) -> bool {

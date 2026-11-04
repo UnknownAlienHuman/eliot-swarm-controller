@@ -14,6 +14,9 @@ Claude Code 2.1.278): [headless](https://code.claude.com/docs/en/headless),
 [CLI](https://code.claude.com/docs/en/cli-reference).
 The TypeScript Agent SDK is not used.
 These notes do not establish runtime support or a current license approval.
+The `can_use_tool` ask and its allow/deny reply follow the documented SDK
+`PermissionResult` shape; live verification on the installed CLI is pending
+the owner login, and the adapter marks that unverified until then.
 
 ## Native identity and generation
 
@@ -26,13 +29,18 @@ environment; no independent Eliot token without actual isolated environment supp
 
 Run the installed native `claude` executable with `-p --input-format stream-json
 --output-format stream-json --verbose` and an Eliot-minted `--session-id`; pass
-`--model` for the frozen profile model and `--resume` only for explicit resume.
-Speak NDJSON on stdin/stdout: `control_request` envelopes (`initialize`,
-`set_model`, `set_permission_mode`, `interrupt`) with `request_id` correlation,
-`user` input records whose Eliot-minted `uuid` is the exact turn association,
-and the `command_lifecycle` / `assistant` / `system` / `result` stream records.
+`--model` for the frozen profile model, `--permission-mode` when the frozen
+profile sets one, and `--permission-prompt-tool stdio` always so every
+permission ask reaches Eliot. Pass `--resume <session-id>` only for explicit
+resume, instead of `--session-id`. Speak NDJSON on stdin/stdout: `control_request`
+envelopes (`initialize`, `set_model`, `set_permission_mode`, `interrupt`) with
+`request_id` correlation, `user` input records whose Eliot-minted `uuid` is the
+exact turn association, the `command_lifecycle` / `assistant` / `system` /
+`result` stream records, and inbound `can_use_tool` permission asks answered
+with a `control_response` carrying the documented SDK `PermissionResult`.
 Arm the message reader before input. SessionStart hook lines carry the minted
 session id before any input, so the adapter declares no `start_requires_input`.
+A resumed CLI re-announces the same retained session id.
 
 Resolve Windows executables explicitly; never insert an unrequested shell wrapper.
 Avoid modes that disable required hooks/instructions.
@@ -53,14 +61,14 @@ covers their fate.
 | Eliot verb | Mechanism / limitation |
 | --- | --- |
 | launch/send | stdin `control_request initialize` with the pre-assigned session id, then one stdin `user` record per send; the Eliot-minted `uuid` echoed in `command_lifecycle` is the exact turn association, not local pipe acceptance |
-| steer | unsupported: no exact-current-turn mechanism exists in PR1 |
+| steer | unsupported: no exact-current-turn mechanism exists |
 | inject | unsupported: no inject verb; a turn never receives another turn's queued context |
 | interrupt | stdin `control_request interrupt` for the bound active turn uuid, with the `still_queued` readback; the terminal follows and unknown is not repeated |
 | stop | drop stdin (the CLI exits on EOF) and kill only the direct CLI child by handle; does not merely detach observation; grandchildren are reaped by the generation Job on Windows / process group on Unix, not the plugin (see Transport) |
-| resume | unsupported in PR1: `resume_from` is rejected; resume with the exact native session id lands in a later slice |
-| approve/deny | unsupported in PR1: approvals are unconnected and the CLI runs its default permission posture |
-| answer | unsupported in PR1: no question-answer verb |
-| configure | unsupported in PR1: `set_model` / `set_permission_mode` are never sent; the CLI runs its launch flags |
+| resume | new plugin/CLI with `--resume` and the exact retained session id; never resend prior prompt; the frozen model is re-applied via `set_model` and a drifted permission mode via `set_permission_mode` on the idle preflight |
+| approve/deny | exact `can_use_tool` native request id; allow echoes the asked `input` as `updatedInput`, deny sends the fixed message (documented SDK shape; live verification pending owner login) |
+| answer | unsupported: the AskUserQuestion shape on the installed CLI is unverified |
+| configure | applied at start, not a runtime verb: `--model` / `--permission-mode` argv on a fresh start, `set_model` / `set_permission_mode` realign on resume; requested vs effective settings are reported before readiness |
 | goal | no native goal mechanism; goal selection stays in Eliot |
 
 If a turn ends before queued hook context is consumed, do not deliver it to a later

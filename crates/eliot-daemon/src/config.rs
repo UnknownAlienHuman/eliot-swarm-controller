@@ -1379,20 +1379,24 @@ fn claude_snapshot_from_entry(
             "unsupported",
         ));
     }
-    if entry
-        .approval
-        .as_deref()
-        .is_some_and(|mode| !mode.trim().is_empty())
-    {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
-            "approval",
-            "the Claude slice leaves approvals unconnected",
-            "unsupported",
-        ));
-    }
+    let permission_mode = match entry.approval.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(mode) => match mode {
+            "acceptEdits" | "auto" | "bypassPermissions" | "manual" | "dontAsk" | "plan" => {
+                Some(mode.to_owned())
+            }
+            _ => {
+                return Err(profile_field_error(
+                    source,
+                    table_offset,
+                    name,
+                    "approval",
+                    "unknown Claude permission mode (acceptEdits, auto, bypassPermissions, manual, dontAsk, or plan)",
+                    "profile_error",
+                ));
+            }
+        },
+    };
     if entry.collaboration_mode.is_some() {
         return Err(profile_field_error(
             source,
@@ -1492,6 +1496,9 @@ fn claude_snapshot_from_entry(
         "approval_policy".to_owned(),
         Value::String(APPROVAL_POLICY_NEVER.to_owned()),
     );
+    if let Some(mode) = permission_mode {
+        snapshot.insert("permission_mode".to_owned(), Value::String(mode));
+    }
     snapshot.insert(
         "pass_env".to_owned(),
         Value::Array(pass_env.into_iter().map(Value::String).collect()),
@@ -3219,12 +3226,30 @@ pass_env = ["EXAMPLE_API_KEY"]
         assert_eq!(snapshot["model"], "claude-opus-4-6");
         assert_eq!(snapshot["permissions"], "workspace-write");
         assert_eq!(snapshot["approval_policy"], "never");
+        assert!(snapshot.get("permission_mode").is_none());
         assert_eq!(snapshot["pass_env"], json!(["EXAMPLE_API_KEY"]));
+
+        // The approval vocabulary is the CLI permission-mode vocabulary and
+        // freezes under the CLI-exact key.
+        let source = r#"
+[profiles.claude]
+harness = "claude"
+cmd = "C:/Users/test/.local/bin/claude.exe"
+model = "claude-opus-4-6"
+approval = "plan"
+"#;
+        let snapshot = resolve_text_profile(source, "claude").unwrap();
+        assert_eq!(snapshot["permission_mode"], "plan");
+        let error = resolve_text_profile(
+            "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\ncmd='C:/bin/claude.exe'\napproval='promptUnmatched'\n",
+            "claude",
+        )
+        .expect_err("unknown permission mode must fail");
+        assert_eq!(error.code, "profile_error");
 
         for source in [
             "[profiles.claude]\nharness='claude'\n",
             "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\neffort='high'\n",
-            "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\napproval='promptUnmatched'\n",
             "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\ncollaboration_mode='plan'\n",
             "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\npermissions='read-only'\n",
             "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\napproval_policy='on-request'\n",

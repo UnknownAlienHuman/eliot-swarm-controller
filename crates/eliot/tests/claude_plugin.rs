@@ -131,6 +131,66 @@ fn main() {
             scenario_invalid_profile_rejected_before_spawn,
         )
         .await;
+        run_scenario(
+            "resume realigns drifted settings and sends without a resend",
+            OwnedChildren::default(),
+            scenario_resume_realigns_drifted_settings_and_sends,
+        )
+        .await;
+        run_scenario(
+            "resume without drift skips the permission setter",
+            OwnedChildren::default(),
+            scenario_resume_without_drift_skips_permission_setter,
+        )
+        .await;
+        run_scenario(
+            "foreign resume scope rejected before spawn",
+            OwnedChildren::default(),
+            scenario_resume_scope_mismatch_rejected_before_spawn,
+        )
+        .await;
+        run_scenario(
+            "manual permission mode quirk reported as requested vs effective",
+            OwnedChildren::default(),
+            scenario_permission_mode_quirk_reported,
+        )
+        .await;
+        run_scenario(
+            "approve allows with the echoed input",
+            OwnedChildren::default(),
+            scenario_approve_allows_with_echoed_input,
+        )
+        .await;
+        run_scenario(
+            "approve redacts tool input secrets in committed details",
+            OwnedChildren::default(),
+            scenario_approve_redacts_tool_input_secrets,
+        )
+        .await;
+        run_scenario(
+            "deny denies with a message",
+            OwnedChildren::default(),
+            scenario_deny_denies_with_message,
+        )
+        .await;
+        run_scenario(
+            "reply guards reject without a rewrite",
+            OwnedChildren::default(),
+            scenario_reply_guards_reject_without_rewrite,
+        )
+        .await;
+        run_scenario(
+            "unreplied request closes with the turn",
+            OwnedChildren::default(),
+            scenario_unreplied_request_closes_with_the_turn,
+        )
+        .await;
+        run_scenario(
+            "lost reply is unknown without a rewrite",
+            OwnedChildren::default(),
+            scenario_lost_reply_is_unknown_without_rewrite,
+        )
+        .await;
     });
     println!("claude_plugin: all scenarios passed");
 }
@@ -176,13 +236,16 @@ struct FakeClaude {
     script: String,
     report_path: PathBuf,
     argv_session: String,
+    argv_resume: String,
     argv_model: String,
+    argv_permission_mode: String,
     argv: Vec<String>,
     controls: HashMap<String, u64>,
     user_inputs: u64,
     /// Set only on an exit path, so the scenario can verify this exact CLI
     /// died with it instead of leaking (note 61).
     exit: Option<String>,
+    permission_replies: Vec<Value>,
 }
 
 fn fake_claude_main(script: &str) {
@@ -201,11 +264,14 @@ fn fake_claude_main(script: &str) {
         script: script.to_owned(),
         report_path,
         argv_session: flag("--session-id"),
+        argv_resume: flag("--resume"),
         argv_model: flag("--model"),
+        argv_permission_mode: flag("--permission-mode"),
         argv,
         controls: HashMap::new(),
         user_inputs: 0,
         exit: None,
+        permission_replies: Vec::new(),
     };
     fake.write_report();
     let _panic_marker = PanicMarker {
@@ -296,11 +362,12 @@ impl FakeClaude {
                             }),
                         );
                         // SessionStart hook lines carry the session id before
-                        // any input, exactly like the installed CLI.
+                        // any input, exactly like the installed CLI. A resumed
+                        // CLI re-announces the same retained id.
                         let session_id = if self.script == "session-mismatch" {
                             "00000000-0000-0000-0000-000000000000".to_owned()
                         } else {
-                            self.argv_session.clone()
+                            self.session_id()
                         };
                         self.emit(
                             stdout,
@@ -335,6 +402,39 @@ impl FakeClaude {
                             self.emit_turn_result(stdout, "interrupted");
                         }
                     }
+                    "set_model" => {
+                        // Success with no readback payload, like the CLI.
+                        self.emit(
+                            stdout,
+                            json!({
+                                "type": "control_response",
+                                "response": {
+                                    "subtype": "success",
+                                    "request_id": request_id,
+                                    "response": {},
+                                },
+                            }),
+                        );
+                    }
+                    "set_permission_mode" => {
+                        // Success echoing the applied mode, like the CLI.
+                        let mode = frame
+                            .get("request")
+                            .and_then(|request| request.get("mode"))
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        self.emit(
+                            stdout,
+                            json!({
+                                "type": "control_response",
+                                "response": {
+                                    "subtype": "success",
+                                    "request_id": request_id,
+                                    "response": {"mode": mode},
+                                },
+                            }),
+                        );
+                    }
                     _ => {
                         self.emit(
                             stdout,
@@ -348,6 +448,33 @@ impl FakeClaude {
                             }),
                         );
                     }
+                }
+                true
+            }
+            Some("control_response") => {
+                // A permission decision for one asked `can_use_tool`.
+                let body = frame.get("response").cloned().unwrap_or(Value::Null);
+                self.permission_replies.push(json!({
+                    "request_id": body.get("request_id").cloned().unwrap_or(Value::Null),
+                    "subtype": body.get("subtype").cloned().unwrap_or(Value::Null),
+                    "result": body.get("response").cloned().unwrap_or(Value::Null),
+                }));
+                self.write_report();
+                if matches!(self.script.as_str(), "approve" | "approve-secret" | "deny") {
+                    // The decided turn runs to its terminal once the reply
+                    // lands, like the CLI continuing past the prompt.
+                    let allowed = body
+                        .get("response")
+                        .and_then(|result| result.get("behavior"))
+                        .and_then(Value::as_str)
+                        == Some("allow");
+                    let text = if allowed {
+                        "fake reply after decision. "
+                    } else {
+                        "fake reply after denial. "
+                    };
+                    self.emit_assistant(stdout, text);
+                    self.emit_turn_result(stdout, "completed");
                 }
                 true
             }
@@ -380,7 +507,7 @@ impl FakeClaude {
                     json!({
                         "type": "system",
                         "subtype": "init",
-                        "session_id": self.argv_session,
+                        "session_id": self.session_id(),
                     }),
                 );
                 self.emit(
@@ -409,6 +536,29 @@ impl FakeClaude {
                     );
                     return true;
                 }
+                if matches!(
+                    self.script.as_str(),
+                    "approve" | "approve-secret" | "deny" | "drop-reply"
+                ) {
+                    // Park the turn on its permission ask: the terminal only
+                    // follows the decision (or never, for the dropped reply).
+                    self.emit_permission_request(stdout);
+                    if self.script == "drop-reply" {
+                        stdout.flush().expect("fixture stdout");
+                        self.exit = Some("scripted-drop".to_owned());
+                        self.write_report();
+                        std::process::exit(0);
+                    }
+                    return true;
+                }
+                if self.script == "request-close" {
+                    // The turn ends with its ask unanswered: opened, then the
+                    // terminal with no decision in between.
+                    self.emit_permission_request(stdout);
+                    self.emit_assistant(stdout, "fake reply with an open ask. ");
+                    self.emit_turn_result(stdout, "completed");
+                    return true;
+                }
                 let texts: Vec<String> = match self.script.as_str() {
                     "two-messages" => {
                         vec!["fake part one. ".to_owned(), "fake part two.".to_owned()]
@@ -434,6 +584,38 @@ impl FakeClaude {
         }
     }
 
+    /// The owned session: `--resume` continues the retained id, otherwise
+    /// the minted `--session-id`.
+    fn session_id(&self) -> String {
+        if !self.argv_resume.is_empty() {
+            self.argv_resume.clone()
+        } else {
+            self.argv_session.clone()
+        }
+    }
+
+    /// One documented-shape `can_use_tool` ask on the active turn.
+    fn emit_permission_request(&self, stdout: &mut std::io::StdoutLock) {
+        let input = if self.script == "approve-secret" {
+            json!({"command": "deploy token-abc-123"})
+        } else {
+            json!({"command": "ls /tmp"})
+        };
+        self.emit(
+            stdout,
+            json!({
+                "type": "control_request",
+                "request_id": "fake-perm-1",
+                "request": {
+                    "subtype": "can_use_tool",
+                    "tool_name": "Bash",
+                    "tool_use_id": "fake-tooluse-1",
+                    "input": input,
+                },
+            }),
+        );
+    }
+
     fn initialize_response(&self) -> Value {
         let models = if self.script == "model-mismatch" {
             json!([{"value": "other-model", "resolvedModel": "other-model"}])
@@ -445,9 +627,16 @@ impl FakeClaude {
         } else {
             "idle"
         };
+        // The CLI echoes its launch permission mode; the drift and quirk
+        // scripts pin a readback that differs from the requested one.
+        let current_permission_mode = match self.script.as_str() {
+            "resume-realign" | "quirk-manual" => "default".to_owned(),
+            _ if !self.argv_permission_mode.is_empty() => self.argv_permission_mode.clone(),
+            _ => "default".to_owned(),
+        };
         json!({
             "models": models,
-            "current_permission_mode": "default",
+            "current_permission_mode": current_permission_mode,
             "pid": std::process::id(),
             "session_state": session_state,
             "account": {"uuid": "fake-account"},
@@ -459,7 +648,7 @@ impl FakeClaude {
             stdout,
             json!({
                 "type": "assistant",
-                "session_id": self.argv_session,
+                "session_id": self.session_id(),
                 "message": {
                     "role": "assistant",
                     "content": [{"type": "text", "text": text}],
@@ -474,7 +663,7 @@ impl FakeClaude {
             json!({
                 "type": "result",
                 "subtype": "success",
-                "session_id": self.argv_session,
+                "session_id": self.session_id(),
                 "terminal_reason": terminal_reason,
                 "total_cost_usd": 0.01,
                 "usage": {"input_tokens": 10, "output_tokens": 20},
@@ -495,10 +684,13 @@ impl FakeClaude {
         let report = json!({
             "argv": self.argv,
             "session_id": self.argv_session,
+            "resume": self.argv_resume,
             "model": self.argv_model,
+            "permission_mode": self.argv_permission_mode,
             "controls": self.controls,
             "user_inputs": self.user_inputs,
             "exit": self.exit,
+            "permission_replies": self.permission_replies,
         });
         let text = serde_json::to_string(&report).expect("report JSON");
         let tmp = self.report_path.with_extension("tmp");
@@ -786,10 +978,18 @@ impl Host {
         // Like the daemon, close the plugin's stdin after shutdown: the
         // plugin's reader teardown completes on EOF.
         drop(self.writes.take());
-        let status = tokio::time::timeout(OP_TIMEOUT, self.child.wait())
-            .await
-            .expect("plugin exit deadline")
-            .expect("plugin wait");
+        // Note 61: never leave the child behind. If it does not exit, kill
+        // it explicitly (the deadline assert below still fails the run).
+        let status = match tokio::time::timeout(OP_TIMEOUT, self.child.wait()).await {
+            Ok(status) => status.expect("plugin wait"),
+            Err(_) => {
+                let _ = self.child.start_kill();
+                tokio::time::timeout(OP_TIMEOUT, self.child.wait())
+                    .await
+                    .expect("plugin kill deadline")
+                    .expect("plugin wait")
+            }
+        };
         assert!(status.success(), "plugin exit status: {status}");
         self.stderr.take().unwrap().await.unwrap_or_default()
     }
@@ -801,51 +1001,61 @@ struct Scenario {
     host: Host,
 }
 
+struct StartConfig {
+    script: String,
+    profile: Value,
+    agent_id: Option<String>,
+    generation: i64,
+    resume_from: Value,
+    source_state: Value,
+    extra_env: Vec<(String, String)>,
+    expect_ready: bool,
+    requested_mode: Option<String>,
+    effective_mode: String,
+}
+
+impl StartConfig {
+    fn fresh(script: &str, profile: Value) -> Self {
+        Self {
+            script: script.to_owned(),
+            profile,
+            agent_id: None,
+            generation: 1,
+            resume_from: Value::Null,
+            source_state: Value::Null,
+            extra_env: Vec::new(),
+            expect_ready: true,
+            requested_mode: None,
+            effective_mode: "default".to_owned(),
+        }
+    }
+}
+
 impl Scenario {
     async fn start(script: &str, profile: Value, owned: &OwnedChildren) -> Self {
-        let (scenario, _) = Self::start_raw(script, profile, true, owned).await;
-        scenario
-    }
-
-    /// Start under an explicit agent id. The oversized-send scenario pins a
-    /// 1-char id to shrink the `agent.command` frame it measures and fits.
-    async fn start_with_agent(
-        script: &str,
-        profile: Value,
-        owned: &OwnedChildren,
-        agent_id: &str,
-    ) -> Self {
-        let (scenario, _) =
-            Self::start_raw_with_agent(script, profile, true, owned, agent_id.to_owned()).await;
+        let (scenario, _) = Self::start_full(StartConfig::fresh(script, profile), owned).await;
         scenario
     }
 
     /// `expect_ready` pumps `process.put` plus (on success) the `session.ready`
     /// batch while `agent.start` is in flight. Returns the scenario and the
     /// start result on success, or the scenario parts with the error text.
-    async fn start_raw(
-        script: &str,
-        profile: Value,
-        expect_ready: bool,
+    async fn start_full(
+        config: StartConfig,
         owned: &OwnedChildren,
     ) -> (Self, Result<(Value, Value), String>) {
-        Self::start_raw_with_agent(
+        let StartConfig {
             script,
             profile,
+            agent_id,
+            generation,
+            resume_from,
+            source_state,
+            extra_env,
             expect_ready,
-            owned,
-            ulid::Ulid::new().to_string(),
-        )
-        .await
-    }
-
-    async fn start_raw_with_agent(
-        script: &str,
-        profile: Value,
-        expect_ready: bool,
-        owned: &OwnedChildren,
-        agent_id: String,
-    ) -> (Self, Result<(Value, Value), String>) {
+            requested_mode,
+            effective_mode,
+        } = config;
         let root: PathBuf = std::env::temp_dir().join(format!(
             "eliot-claude-plugin-test-{}",
             ulid::Ulid::new().to_string().to_lowercase()
@@ -854,6 +1064,8 @@ impl Scenario {
         std::fs::create_dir_all(root.join("data")).unwrap();
         std::fs::create_dir_all(root.join("instance")).unwrap();
         std::fs::create_dir_all(root.join("workspace")).unwrap();
+        // A resumed generation keeps its Agent id; a fresh one mints it.
+        let agent_id = agent_id.unwrap_or_else(|| ulid::Ulid::new().to_string());
         let mut host = Host::spawn(&root).await;
         let manifest = host
             .call(
@@ -874,33 +1086,45 @@ impl Scenario {
         );
         assert_eq!(
             manifest["verbs"],
-            json!(["launch", "send", "stop", "interrupt"])
+            json!([
+                "launch",
+                "resume",
+                "send",
+                "interrupt",
+                "approve",
+                "deny",
+                "stop"
+            ])
         );
         assert_eq!(
             manifest["sources"]["controlled"],
-            json!({"message": "stream", "session": "stream", "turn": "stream"})
+            json!({"message": "stream", "request": "stream", "session": "stream", "turn": "stream"})
         );
         let start_id = ulid::Ulid::new().to_string();
         let self_exe = std::env::current_exe().expect("test executable");
         let mut full_profile = profile;
         full_profile["cmd"] = Value::String(self_exe.to_string_lossy().into_owned());
+        let mut target_environment = json!({
+            "ELIOT_FAKE_CLAUDE_SCRIPT": script,
+            "ELIOT_FAKE_CLAUDE_REPORT": root.join("report.json").to_string_lossy(),
+        });
+        for (name, value) in &extra_env {
+            target_environment[name] = Value::String(value.clone());
+        }
         let rx = host
             .begin_call(
                 "agent.start",
                 json!({
                     "agent_id": agent_id,
-                    "generation": 1,
+                    "generation": generation,
                     "command_id": start_id,
                     "profile": full_profile,
                     "workspace": root.join("workspace").to_string_lossy(),
-                    "target_environment": {
-                        "ELIOT_FAKE_CLAUDE_SCRIPT": script,
-                        "ELIOT_FAKE_CLAUDE_REPORT": root.join("report.json").to_string_lossy(),
-                    },
+                    "target_environment": target_environment,
                     "note": null,
-                    "source_plan": {"session": "stream", "turn": "stream", "message": "stream"},
-                    "source_state": null,
-                    "resume_from": null,
+                    "source_plan": {"session": "stream", "turn": "stream", "message": "stream", "request": "stream"},
+                    "source_state": source_state,
+                    "resume_from": resume_from,
                     "initial": null,
                 }),
             )
@@ -923,7 +1147,7 @@ impl Scenario {
                             assert_eq!(request.params.get("role").and_then(Value::as_str), Some("harness"));
                             host.respond(&request.id, json!({
                                 "identity": {"host_boot_id": "test-boot", "pid": pid, "start_time": 1},
-                                "owner": format!("agent:{agent_id}#1"),
+                                "owner": format!("agent:{agent_id}#{generation}"),
                                 "role": "harness",
                                 "state": "running",
                                 "exit_code": null,
@@ -969,7 +1193,10 @@ impl Scenario {
                     ready.get("agent_id").and_then(Value::as_str),
                     Some(scenario.agent_id.as_str())
                 );
-                assert_eq!(ready.get("generation").and_then(Value::as_i64), Some(1));
+                assert_eq!(
+                    ready.get("generation").and_then(Value::as_i64),
+                    Some(generation)
+                );
                 assert_eq!(
                     ready.get("command_id").and_then(Value::as_str),
                     Some(start_id.as_str())
@@ -1004,7 +1231,7 @@ impl Scenario {
                     ready["requested"]
                         .get("permission_mode")
                         .and_then(Value::as_str),
-                    Some("workspace-write")
+                    requested_mode.as_deref()
                 );
                 assert_eq!(
                     ready["effective"].get("model").and_then(Value::as_str),
@@ -1014,7 +1241,7 @@ impl Scenario {
                     ready["effective"]
                         .get("permission_mode")
                         .and_then(Value::as_str),
-                    Some("default")
+                    Some(effective_mode.as_str())
                 );
                 assert_eq!(
                     ready["effective"]
@@ -1073,6 +1300,221 @@ fn claude_profile() -> Value {
     })
 }
 
+fn claude_profile_with_mode(mode: &str) -> Value {
+    let mut profile = claude_profile();
+    profile["permission_mode"] = Value::String(mode.to_owned());
+    profile
+}
+
+/// Valid retained readback for resuming `agent_id` into generation 2.
+fn resume_source_state(agent_id: &str) -> Value {
+    json!({
+        "retained_generation": 1,
+        "retained_source": {
+            "agent_id": agent_id,
+            "generation": 1,
+            "source": "stream",
+            "families": ["session", "turn", "message"],
+        },
+        "current_turn": null,
+    })
+}
+
+/// Run a full generation 1 (start, one turn, stop, shutdown) and return the
+/// retained `(agent id, native scope, native ref)` for a resume scenario.
+async fn retained_subject(owned: &OwnedChildren) -> (String, String, String) {
+    let (mut gen1, outcome) =
+        Scenario::start_full(StartConfig::fresh("ok", claude_profile()), owned).await;
+    let (ready, _) = outcome.expect("gen1 ready");
+    let agent_id = gen1.agent_id.clone();
+    let native_scope = ready["native_scope"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let native_ref = ready["native_ref"].as_str().unwrap_or_default().to_owned();
+    assert!(!native_scope.is_empty() && is_uuid(&native_ref));
+    send_turn(&mut gen1.host, &agent_id, 1, "hello").await;
+    stop_agent(&mut gen1.host, &agent_id, 1).await;
+    gen1.host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    gen1.host.shutdown_child().await;
+    (agent_id, native_scope, native_ref)
+}
+
+/// Begin a send and pump until the applied response AND the exact
+/// `request.opened` batch both land. The native commit may arrive on either
+/// side of the response (note 48). Returns `(send id, turn id, opened data)`.
+async fn send_until_permission_asked(
+    host: &mut Host,
+    agent_id: &str,
+    generation: i64,
+    text: &str,
+) -> (String, String, Value) {
+    let send_id = ulid::Ulid::new().to_string();
+    let rx = host
+        .begin_call(
+            "agent.command",
+            json!({
+                "agent_id": agent_id,
+                "generation": generation,
+                "command_id": send_id,
+                "verb": "send",
+                "args": {"text": text},
+                "turn_id": null,
+                "request_id": null,
+            }),
+        )
+        .await;
+    let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
+    let mut applied: Option<Value> = None;
+    let mut kinds: Vec<String> = Vec::new();
+    let mut opened: Option<Value> = None;
+    loop {
+        if applied.is_some() && opened.is_some() {
+            break;
+        }
+        tokio::select! {
+            biased;
+            request = host.next_request() => {
+                assert_eq!(request.method, "events.put");
+                let events = request.params.get("events").and_then(Value::as_array).cloned().unwrap_or_default();
+                assert_eq!(events.len(), 1, "one native record per batch");
+                let kind = events[0].get("kind").and_then(Value::as_str).unwrap_or_default().to_owned();
+                if kind == "request.opened" {
+                    opened = Some(events[0].get("data").cloned().unwrap_or(Value::Null));
+                }
+                kinds.push(kind);
+                let first = host.next_seq;
+                host.next_seq += 1;
+                host.respond(&request.id, json!({
+                    "first_seq": first, "last_seq": first,
+                    "cursor": request.params.get("cursor").cloned().unwrap_or(Value::Null),
+                })).await;
+            }
+            // Guarded: polling the spent response a second time panics.
+            result = &mut rx, if applied.is_none() => {
+                applied = Some(result
+                    .expect("send deadline")
+                    .expect("send response channel")
+                    .expect("send applied"));
+            }
+        }
+    }
+    let applied = applied.expect("send applied");
+    assert_eq!(
+        applied.get("state").and_then(Value::as_str),
+        Some("applied")
+    );
+    let turn_id = applied
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .expect("applied turn uuid")
+        .to_owned();
+    // The association commits before anything the turn asks for.
+    assert_eq!(
+        kinds.first().map(String::as_str),
+        Some("turn.started"),
+        "association commits before the ask: {kinds:?}"
+    );
+    assert_eq!(kinds.last().map(String::as_str), Some("request.opened"));
+    let opened = opened.expect("request.opened batch");
+    assert_eq!(
+        opened.get("command_id").and_then(Value::as_str),
+        Some(send_id.as_str())
+    );
+    assert_eq!(
+        opened.get("turn_id").and_then(Value::as_str),
+        Some(turn_id.as_str())
+    );
+    (send_id, turn_id, opened)
+}
+
+/// Send one approve/deny and pump until the reply value lands, collecting
+/// every committed batch on either side of it (note 48). The resolution
+/// always commits before its own ack, so an applied reply collects
+/// `request.resolved` first, possibly followed by the decided turn's own
+/// facts racing the response; rejected and unknown collect nothing.
+/// Returns the reply value, the collected batches in order, and the reply id.
+async fn reply_for_permission(
+    host: &mut Host,
+    agent_id: &str,
+    generation: i64,
+    verb: &str,
+    args: Value,
+    request_id: &str,
+    turn_id: &str,
+) -> (Value, Vec<(String, Value)>, String) {
+    let reply_id = ulid::Ulid::new().to_string();
+    let rx = host
+        .begin_call(
+            "agent.command",
+            json!({
+                "agent_id": agent_id,
+                "generation": generation,
+                "command_id": reply_id,
+                "verb": verb,
+                "args": args,
+                "turn_id": turn_id,
+                "request_id": request_id,
+            }),
+        )
+        .await;
+    let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
+    let mut collected: Vec<(String, Value)> = Vec::new();
+    let reply = loop {
+        tokio::select! {
+            biased;
+            request = host.next_request() => {
+                assert_eq!(request.method, "events.put");
+                let events = request.params.get("events").and_then(Value::as_array).cloned().unwrap_or_default();
+                assert_eq!(events.len(), 1, "one native record per batch");
+                collected.push((
+                    events[0].get("kind").and_then(Value::as_str).unwrap_or_default().to_owned(),
+                    events[0].get("data").cloned().unwrap_or(Value::Null),
+                ));
+                let first = host.next_seq;
+                host.next_seq += 1;
+                host.respond(&request.id, json!({
+                    "first_seq": first, "last_seq": first,
+                    "cursor": request.params.get("cursor").cloned().unwrap_or(Value::Null),
+                })).await;
+            }
+            result = &mut rx => {
+                break result
+                    .expect("reply deadline")
+                    .expect("reply response channel")
+                    .expect("reply value");
+            }
+        }
+    };
+    (reply, collected, reply_id)
+}
+
+/// Drain the rest of one decided turn: `collected` holds batches the reply
+/// pump already gathered, and reading continues until `turn.completed`.
+/// Returns every batch in commit order.
+async fn drain_decided_turn(
+    host: &mut Host,
+    agent_id: &str,
+    collected: Vec<(String, Value)>,
+) -> Vec<(String, Value)> {
+    let mut committed = collected;
+    while committed.last().map(|(kind, _)| kind.as_str()) != Some("turn.completed") {
+        let (kind, data) = host.answer_any_events_put(agent_id).await;
+        assert!(
+            matches!(
+                kind.as_str(),
+                "request.resolved" | "message.completed" | "turn.completed"
+            ),
+            "decided turn facts out of order: {kind}"
+        );
+        committed.push((kind, data));
+    }
+    committed
+}
+
 /// One send round trip. The plugin only answers `agent.command` after the
 /// exact `command_lifecycle` association commits `turn.started`, so inbound
 /// batches are acked while the call is in flight; the remaining turn facts
@@ -1081,6 +1523,7 @@ fn claude_profile() -> Value {
 async fn send_turn(
     host: &mut Host,
     agent_id: &str,
+    generation: i64,
     text: &str,
 ) -> (String, String, Vec<(String, Value)>) {
     let send_id = ulid::Ulid::new().to_string();
@@ -1089,7 +1532,7 @@ async fn send_turn(
             "agent.command",
             json!({
                 "agent_id": agent_id,
-                "generation": 1,
+                "generation": generation,
                 "command_id": send_id,
                 "verb": "send",
                 "args": {"text": text},
@@ -1170,14 +1613,14 @@ async fn send_turn(
     (send_id, turn_id, committed)
 }
 
-async fn stop_agent(host: &mut Host, agent_id: &str) {
+async fn stop_agent(host: &mut Host, agent_id: &str, generation: i64) {
     let stop_id = ulid::Ulid::new().to_string();
     let rx = host
         .begin_call(
             "agent.stop",
             json!({
                 "agent_id": agent_id,
-                "generation": 1,
+                "generation": generation,
                 "command_id": stop_id,
                 "force": false,
             }),
@@ -1192,8 +1635,13 @@ async fn stop_agent(host: &mut Host, agent_id: &str) {
                 assert_eq!(request.method, "events.put");
                 let events = request.params.get("events").and_then(Value::as_array).cloned().unwrap_or_default();
                 assert_eq!(events.len(), 1, "one native record per batch");
-                assert_eq!(events[0].get("kind").and_then(Value::as_str), Some("session.ended"));
-                ended = true;
+                // Retained asks close before the terminal session fact.
+                let kind = events[0].get("kind").and_then(Value::as_str).unwrap_or_default();
+                assert!(
+                    kind == "session.ended" || kind == "request.closed",
+                    "stop commits only closes and the session end: {kind}"
+                );
+                ended = ended || kind == "session.ended";
                 let first = host.next_seq;
                 host.next_seq += 1;
                 host.respond(&request.id, json!({
@@ -1292,7 +1740,7 @@ async fn drain_interrupted_turn(host: &mut Host, agent_id: &str, turn_id: &str) 
 async fn scenario_launch_send_snapshot_stop(owned: OwnedChildren) {
     let mut scenario = Scenario::start("ok", claude_profile(), &owned).await;
     let agent_id = scenario.agent_id.clone();
-    let (send_id, turn_id, committed) = send_turn(&mut scenario.host, &agent_id, "hello").await;
+    let (send_id, turn_id, committed) = send_turn(&mut scenario.host, &agent_id, 1, "hello").await;
     assert_eq!(
         committed
             .iter()
@@ -1346,8 +1794,8 @@ async fn scenario_launch_send_snapshot_stop(owned: OwnedChildren) {
         snapshot.get("result_known").and_then(Value::as_bool),
         Some(true)
     );
-    // Steer, inject and approve stay unsupported in PR1.
-    for verb in ["steer", "inject", "approve"] {
+    // Steer, inject and answer stay unsupported: no exact native mechanism.
+    for verb in ["steer", "inject", "answer"] {
         let error = scenario
             .host
             .call(
@@ -1366,7 +1814,7 @@ async fn scenario_launch_send_snapshot_stop(owned: OwnedChildren) {
             .expect_err("verb must be unsupported");
         assert!(error.contains("unsupported"), "{verb}: {error}");
     }
-    stop_agent(&mut scenario.host, &agent_id).await;
+    stop_agent(&mut scenario.host, &agent_id, 1).await;
     scenario.assert_cli_exit("stdin-eof");
     // The CLI ran with the exact stream-json surface and the minted ids.
     let report = scenario.report();
@@ -1413,7 +1861,7 @@ async fn scenario_launch_send_snapshot_stop(owned: OwnedChildren) {
 async fn scenario_two_assistant_messages_snapshot_matches_stream(owned: OwnedChildren) {
     let mut scenario = Scenario::start("two-messages", claude_profile(), &owned).await;
     let agent_id = scenario.agent_id.clone();
-    let (send_id, _, committed) = send_turn(&mut scenario.host, &agent_id, "hello").await;
+    let (send_id, _, committed) = send_turn(&mut scenario.host, &agent_id, 1, "hello").await;
     let messages: Vec<&str> = committed
         .iter()
         .filter(|(kind, _)| kind == "message.completed")
@@ -1448,7 +1896,7 @@ async fn scenario_two_assistant_messages_snapshot_matches_stream(owned: OwnedChi
             .and_then(Value::as_str),
         Some("fake part one. fake part two.")
     );
-    stop_agent(&mut scenario.host, &agent_id).await;
+    stop_agent(&mut scenario.host, &agent_id, 1).await;
     scenario.assert_cli_exit("stdin-eof");
     scenario
         .host
@@ -1461,7 +1909,7 @@ async fn scenario_two_assistant_messages_snapshot_matches_stream(owned: OwnedChi
 async fn scenario_failed_turn_reports_terminal_reason(owned: OwnedChildren) {
     let mut scenario = Scenario::start("failed-turn", claude_profile(), &owned).await;
     let agent_id = scenario.agent_id.clone();
-    let (_, _, committed) = send_turn(&mut scenario.host, &agent_id, "hello").await;
+    let (_, _, committed) = send_turn(&mut scenario.host, &agent_id, 1, "hello").await;
     let terminal = committed
         .iter()
         .find(|(kind, _)| kind == "turn.completed")
@@ -1471,7 +1919,7 @@ async fn scenario_failed_turn_reports_terminal_reason(owned: OwnedChildren) {
         terminal.get("status").and_then(Value::as_str),
         Some("failed")
     );
-    stop_agent(&mut scenario.host, &agent_id).await;
+    stop_agent(&mut scenario.host, &agent_id, 1).await;
     scenario.assert_cli_exit("stdin-eof");
     scenario
         .host
@@ -1484,7 +1932,7 @@ async fn scenario_failed_turn_reports_terminal_reason(owned: OwnedChildren) {
 async fn scenario_terminal_reason_is_redacted(owned: OwnedChildren) {
     let mut scenario = Scenario::start("secret-reason", claude_profile(), &owned).await;
     let agent_id = scenario.agent_id.clone();
-    let (_, _, committed) = send_turn(&mut scenario.host, &agent_id, "hello").await;
+    let (_, _, committed) = send_turn(&mut scenario.host, &agent_id, 1, "hello").await;
     let terminal = committed
         .iter()
         .find(|(kind, _)| kind == "turn.completed")
@@ -1494,7 +1942,7 @@ async fn scenario_terminal_reason_is_redacted(owned: OwnedChildren) {
         terminal.get("status").and_then(Value::as_str),
         Some("completed [REDACTED]")
     );
-    stop_agent(&mut scenario.host, &agent_id).await;
+    stop_agent(&mut scenario.host, &agent_id, 1).await;
     scenario.assert_cli_exit("stdin-eof");
     scenario
         .host
@@ -1553,7 +2001,7 @@ async fn scenario_cancelled_input_is_rejected_without_rewrite(owned: OwnedChildr
         scenario.report().get("user_inputs").and_then(Value::as_u64),
         Some(1)
     );
-    stop_agent(&mut scenario.host, &agent_id).await;
+    stop_agent(&mut scenario.host, &agent_id, 1).await;
     scenario.assert_cli_exit("stdin-eof");
     scenario
         .host
@@ -1566,7 +2014,7 @@ async fn scenario_cancelled_input_is_rejected_without_rewrite(owned: OwnedChildr
 async fn scenario_cancelled_active_turn_reaches_terminal(owned: OwnedChildren) {
     let mut scenario = Scenario::start("cancel-active", claude_profile(), &owned).await;
     let agent_id = scenario.agent_id.clone();
-    let (send_id, _, committed) = send_turn(&mut scenario.host, &agent_id, "hello").await;
+    let (send_id, _, committed) = send_turn(&mut scenario.host, &agent_id, 1, "hello").await;
     assert_eq!(
         committed
             .iter()
@@ -1602,7 +2050,7 @@ async fn scenario_cancelled_active_turn_reaches_terminal(owned: OwnedChildren) {
         snapshot["last_turn"].get("status").and_then(Value::as_str),
         Some("cancelled")
     );
-    let (_, _, recommitted) = send_turn(&mut scenario.host, &agent_id, "again").await;
+    let (_, _, recommitted) = send_turn(&mut scenario.host, &agent_id, 1, "again").await;
     assert_eq!(
         recommitted
             .iter()
@@ -1610,7 +2058,7 @@ async fn scenario_cancelled_active_turn_reaches_terminal(owned: OwnedChildren) {
             .collect::<Vec<_>>(),
         vec!["turn.started", "turn.completed"]
     );
-    stop_agent(&mut scenario.host, &agent_id).await;
+    stop_agent(&mut scenario.host, &agent_id, 1).await;
     scenario.assert_cli_exit("stdin-eof");
     scenario
         .host
@@ -1670,7 +2118,7 @@ async fn scenario_dropped_input_is_unknown_without_rewrite(owned: OwnedChildren)
         scenario.report().get("user_inputs").and_then(Value::as_u64),
         Some(1)
     );
-    stop_agent(&mut scenario.host, &agent_id).await;
+    stop_agent(&mut scenario.host, &agent_id, 1).await;
     scenario.assert_cli_exit("scripted-drop");
     scenario
         .host
@@ -1689,7 +2137,9 @@ async fn scenario_rejected_send_does_not_wedge_session(owned: OwnedChildren) {
     // must fit the 1 MiB plugin frame while its native user-input encoding
     // exceeds the 1 MiB native frame, so the host envelope must be the
     // smaller of the two. `turn_id`/`request_id` are omitted (`#[serde(default)]`).
-    let mut scenario = Scenario::start_with_agent("ok", claude_profile(), &owned, "a").await;
+    let mut start = StartConfig::fresh("ok", claude_profile());
+    start.agent_id = Some("a".to_owned());
+    let (mut scenario, _) = Scenario::start_full(start, &owned).await;
     let agent_id = scenario.agent_id.clone();
     const MAX_FRAME_BYTES: usize = 1024 * 1024;
     const MAX_TEXT_BYTES: usize = 512 * 1024;
@@ -1850,7 +2300,7 @@ async fn scenario_interrupt_applied_then_stale(owned: OwnedChildren) {
             .and_then(Value::as_u64),
         Some(1)
     );
-    stop_agent(&mut scenario.host, &agent_id).await;
+    stop_agent(&mut scenario.host, &agent_id, 1).await;
     scenario.assert_cli_exit("stdin-eof");
     scenario
         .host
@@ -1893,7 +2343,7 @@ async fn scenario_interrupt_reports_nonempty_still_queued(owned: OwnedChildren) 
         Some(&json!(["queued-turn-1"]))
     );
     drain_interrupted_turn(&mut scenario.host, &agent_id, &turn_id).await;
-    stop_agent(&mut scenario.host, &agent_id).await;
+    stop_agent(&mut scenario.host, &agent_id, 1).await;
     scenario.assert_cli_exit("stdin-eof");
     scenario
         .host
@@ -1904,8 +2354,9 @@ async fn scenario_interrupt_reports_nonempty_still_queued(owned: OwnedChildren) 
 }
 
 async fn scenario_model_not_in_catalogue_rejected_before_ready(owned: OwnedChildren) {
-    let (mut scenario, outcome) =
-        Scenario::start_raw("model-mismatch", claude_profile(), false, &owned).await;
+    let mut config = StartConfig::fresh("model-mismatch", claude_profile());
+    config.expect_ready = false;
+    let (mut scenario, outcome) = Scenario::start_full(config, &owned).await;
     let error = outcome.expect_err("unknown model must fail start");
     assert!(error.contains("profile_error"), "{error}");
     assert_eq!(
@@ -1923,8 +2374,9 @@ async fn scenario_model_not_in_catalogue_rejected_before_ready(owned: OwnedChild
 }
 
 async fn scenario_session_mismatch_is_unknown_with_gap(owned: OwnedChildren) {
-    let (mut scenario, outcome) =
-        Scenario::start_raw("session-mismatch", claude_profile(), false, &owned).await;
+    let mut config = StartConfig::fresh("session-mismatch", claude_profile());
+    config.expect_ready = false;
+    let (mut scenario, outcome) = Scenario::start_full(config, &owned).await;
     let error = outcome.expect_err("session mismatch must fail start");
     assert!(error.contains("unknown"), "{error}");
     // Shutdown still settles the owned session: `session.ended` commits
@@ -1963,8 +2415,9 @@ async fn scenario_session_mismatch_is_unknown_with_gap(owned: OwnedChildren) {
 }
 
 async fn scenario_not_idle_rejected_before_ready(owned: OwnedChildren) {
-    let (mut scenario, outcome) =
-        Scenario::start_raw("not-idle", claude_profile(), false, &owned).await;
+    let mut config = StartConfig::fresh("not-idle", claude_profile());
+    config.expect_ready = false;
+    let (mut scenario, outcome) = Scenario::start_full(config, &owned).await;
     let error = outcome.expect_err("non-idle initialize must fail start");
     assert!(error.contains("profile_error"), "{error}");
     scenario
@@ -2014,7 +2467,7 @@ async fn scenario_invalid_profile_rejected_before_spawn(_owned: OwnedChildren) {
                     "workspace": root.join("workspace").to_string_lossy(),
                     "target_environment": {},
                     "note": null,
-                    "source_plan": {"session": "stream", "turn": "stream", "message": "stream"},
+                    "source_plan": {"session": "stream", "turn": "stream", "message": "stream", "request": "stream"},
                     "source_state": null,
                     "resume_from": null,
                     "initial": null,
@@ -2031,4 +2484,714 @@ async fn scenario_invalid_profile_rejected_before_spawn(_owned: OwnedChildren) {
         "no native process spawns for an invalid profile"
     );
     let _ = std::fs::remove_dir_all(&root);
+}
+
+async fn scenario_resume_realigns_drifted_settings_and_sends(owned: OwnedChildren) {
+    let (agent_id, native_scope, native_ref) = retained_subject(&owned).await;
+    // Generation 2 resumes the exact retained session id.
+    let config = StartConfig {
+        script: "resume-realign".to_owned(),
+        profile: claude_profile_with_mode("plan"),
+        agent_id: Some(agent_id.clone()),
+        generation: 2,
+        resume_from: json!({"native_scope": native_scope, "native_ref": native_ref}),
+        source_state: resume_source_state(&agent_id),
+        extra_env: Vec::new(),
+        expect_ready: true,
+        requested_mode: Some("plan".to_owned()),
+        effective_mode: "plan".to_owned(),
+    };
+    let (mut gen2, outcome) = Scenario::start_full(config, &owned).await;
+    let (ready, _) = outcome.expect("gen2 ready");
+    assert_eq!(
+        ready.get("native_ref").and_then(Value::as_str),
+        Some(native_ref.as_str())
+    );
+    assert_eq!(
+        ready.get("native_scope").and_then(Value::as_str),
+        Some(native_scope.as_str())
+    );
+    // The old prompt is never resent: no input before the new send.
+    assert_eq!(
+        gen2.report().get("user_inputs").and_then(Value::as_u64),
+        Some(0)
+    );
+    // The drifted permission mode is realigned via setters; the model always
+    // is. The CLI runs under `--resume` with no minted `--session-id`.
+    let report = gen2.report();
+    assert_eq!(
+        report["controls"].get("initialize").and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        report["controls"].get("set_model").and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        report["controls"]
+            .get("set_permission_mode")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        report.get("resume").and_then(Value::as_str),
+        Some(native_ref.as_str())
+    );
+    let argv = report
+        .get("argv")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let argv: Vec<&str> = argv.iter().filter_map(Value::as_str).collect();
+    for flag in [
+        "--resume",
+        "--permission-prompt-tool",
+        "stdio",
+        "--permission-mode",
+        "plan",
+        "--model",
+    ] {
+        assert!(argv.contains(&flag), "resume argv carries {flag}: {argv:?}");
+    }
+    assert!(
+        !argv.contains(&"--session-id"),
+        "resume never mints a session id: {argv:?}"
+    );
+    send_turn(&mut gen2.host, &agent_id, 2, "continue").await;
+    assert_eq!(
+        gen2.report().get("user_inputs").and_then(Value::as_u64),
+        Some(1)
+    );
+    stop_agent(&mut gen2.host, &agent_id, 2).await;
+    gen2.assert_cli_exit("stdin-eof");
+    gen2.host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    gen2.host.shutdown_child().await;
+}
+
+async fn scenario_resume_without_drift_skips_permission_setter(owned: OwnedChildren) {
+    let (agent_id, native_scope, native_ref) = retained_subject(&owned).await;
+    let config = StartConfig {
+        script: "resume-ok".to_owned(),
+        profile: claude_profile_with_mode("plan"),
+        agent_id: Some(agent_id.clone()),
+        generation: 2,
+        resume_from: json!({"native_scope": native_scope, "native_ref": native_ref}),
+        source_state: resume_source_state(&agent_id),
+        extra_env: Vec::new(),
+        expect_ready: true,
+        requested_mode: Some("plan".to_owned()),
+        effective_mode: "plan".to_owned(),
+    };
+    let (mut gen2, outcome) = Scenario::start_full(config, &owned).await;
+    outcome.expect("gen2 ready");
+    // The mode already matches: only the model setter runs.
+    let report = gen2.report();
+    assert_eq!(
+        report["controls"].get("set_model").and_then(Value::as_u64),
+        Some(1)
+    );
+    assert!(
+        report["controls"].get("set_permission_mode").is_none(),
+        "no permission setter without drift: {:?}",
+        report["controls"]
+    );
+    stop_agent(&mut gen2.host, &agent_id, 2).await;
+    gen2.assert_cli_exit("stdin-eof");
+    gen2.host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    gen2.host.shutdown_child().await;
+}
+
+async fn scenario_resume_scope_mismatch_rejected_before_spawn(owned: OwnedChildren) {
+    let (agent_id, _, native_ref) = retained_subject(&owned).await;
+    let config = StartConfig {
+        script: "resume-ok".to_owned(),
+        profile: claude_profile_with_mode("plan"),
+        agent_id: Some(agent_id.clone()),
+        generation: 2,
+        resume_from: json!({
+            "native_scope": "claude-config:/elsewhere",
+            "native_ref": native_ref,
+        }),
+        source_state: resume_source_state(&agent_id),
+        extra_env: Vec::new(),
+        expect_ready: false,
+        requested_mode: Some("plan".to_owned()),
+        effective_mode: "plan".to_owned(),
+    };
+    let (mut gen2, outcome) = Scenario::start_full(config, &owned).await;
+    let error = outcome.expect_err("foreign scope must fail resume");
+    assert!(
+        error.contains("outside the authenticated native scope"),
+        "{error}"
+    );
+    gen2.host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    gen2.host.shutdown_child().await;
+    assert!(
+        !gen2.root.join("report.json").exists(),
+        "no native process spawns for a foreign resume subject"
+    );
+}
+
+async fn scenario_permission_mode_quirk_reported(owned: OwnedChildren) {
+    // The installed CLI reads `manual` back as `default`: requested vs
+    // effective is reported, never forced, and no setter runs on a fresh
+    // start.
+    let config = StartConfig {
+        script: "quirk-manual".to_owned(),
+        profile: claude_profile_with_mode("manual"),
+        agent_id: None,
+        generation: 1,
+        resume_from: Value::Null,
+        source_state: Value::Null,
+        extra_env: Vec::new(),
+        expect_ready: true,
+        requested_mode: Some("manual".to_owned()),
+        effective_mode: "default".to_owned(),
+    };
+    let (mut scenario, outcome) = Scenario::start_full(config, &owned).await;
+    outcome.expect("ready reports the quirk");
+    let report = scenario.report();
+    assert_eq!(
+        report.get("permission_mode").and_then(Value::as_str),
+        Some("manual")
+    );
+    assert!(
+        report["controls"].get("set_model").is_none()
+            && report["controls"].get("set_permission_mode").is_none(),
+        "fresh start applies settings via argv only: {:?}",
+        report["controls"]
+    );
+    let agent_id = scenario.agent_id.clone();
+    stop_agent(&mut scenario.host, &agent_id, 1).await;
+    scenario.assert_cli_exit("stdin-eof");
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+}
+
+async fn scenario_approve_allows_with_echoed_input(owned: OwnedChildren) {
+    let mut scenario = Scenario::start("approve", claude_profile(), &owned).await;
+    let agent_id = scenario.agent_id.clone();
+    let (_, turn_id, opened) =
+        send_until_permission_asked(&mut scenario.host, &agent_id, 1, "list files").await;
+    assert_eq!(
+        opened.get("request_id").and_then(Value::as_str),
+        Some("fake-perm-1")
+    );
+    assert_eq!(
+        opened.get("kind").and_then(Value::as_str),
+        Some("permission")
+    );
+    assert_eq!(
+        opened["details"].get("tool_name").and_then(Value::as_str),
+        Some("Bash")
+    );
+    assert_eq!(
+        opened["details"]["input"]
+            .get("command")
+            .and_then(Value::as_str),
+        Some("ls /tmp")
+    );
+    let (reply, collected, reply_id) = reply_for_permission(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "approve",
+        json!({}),
+        "fake-perm-1",
+        &turn_id,
+    )
+    .await;
+    assert_eq!(reply.get("state").and_then(Value::as_str), Some("applied"));
+    assert_eq!(
+        reply.get("request_id").and_then(Value::as_str),
+        Some("fake-perm-1")
+    );
+    // The resolution binds the exact reply and carries no open details.
+    assert_eq!(
+        collected.first().map(|(kind, _)| kind.as_str()),
+        Some("request.resolved")
+    );
+    let resolved = &collected
+        .first()
+        .map(|(_, data)| data)
+        .expect("resolved data");
+    assert_eq!(
+        resolved.get("command_id").and_then(Value::as_str),
+        Some(reply_id.as_str())
+    );
+    assert_eq!(
+        resolved.get("request_id").and_then(Value::as_str),
+        Some("fake-perm-1")
+    );
+    assert_eq!(
+        resolved.get("turn_id").and_then(Value::as_str),
+        Some(turn_id.as_str())
+    );
+    assert!(resolved.get("kind").is_none() && resolved.get("details").is_none());
+    let committed = drain_decided_turn(&mut scenario.host, &agent_id, collected).await;
+    assert_eq!(
+        committed
+            .iter()
+            .map(|(kind, _)| kind.as_str())
+            .collect::<Vec<_>>(),
+        vec!["request.resolved", "message.completed", "turn.completed"]
+    );
+    assert_eq!(
+        committed[2].1.get("final_text").and_then(Value::as_str),
+        Some("fake reply after decision. ")
+    );
+    // The native decision echoes the asked input back as `updatedInput`.
+    let replies = scenario
+        .report()
+        .get("permission_replies")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        replies.as_slice(),
+        &[json!({
+            "request_id": "fake-perm-1",
+            "subtype": "success",
+            "result": {"behavior": "allow", "updatedInput": {"command": "ls /tmp"}},
+        })]
+    );
+    stop_agent(&mut scenario.host, &agent_id, 1).await;
+    scenario.assert_cli_exit("stdin-eof");
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+}
+
+async fn scenario_approve_redacts_tool_input_secrets(owned: OwnedChildren) {
+    let config = StartConfig {
+        script: "approve-secret".to_owned(),
+        profile: claude_profile(),
+        agent_id: None,
+        generation: 1,
+        resume_from: Value::Null,
+        source_state: Value::Null,
+        extra_env: vec![("FAKE_CLAUDE_TOKEN".to_owned(), "token-abc-123".to_owned())],
+        expect_ready: true,
+        requested_mode: None,
+        effective_mode: "default".to_owned(),
+    };
+    let (mut scenario, outcome) = Scenario::start_full(config, &owned).await;
+    outcome.expect("ready");
+    let agent_id = scenario.agent_id.clone();
+    let (_, turn_id, opened) =
+        send_until_permission_asked(&mut scenario.host, &agent_id, 1, "deploy").await;
+    // The committed details redact the registered secret ...
+    let committed_command = opened["details"]["input"]
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        committed_command.contains("[REDACTED]") && !committed_command.contains("token-abc-123"),
+        "committed input redacts the secret: {committed_command}"
+    );
+    let (reply, collected, _) = reply_for_permission(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "approve",
+        json!({}),
+        "fake-perm-1",
+        &turn_id,
+    )
+    .await;
+    assert_eq!(reply.get("state").and_then(Value::as_str), Some("applied"));
+    drain_decided_turn(&mut scenario.host, &agent_id, collected).await;
+    // ... while the native decision still echoes the original input.
+    let replies = scenario
+        .report()
+        .get("permission_replies")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(
+        replies[0]["result"]["updatedInput"]
+            .get("command")
+            .and_then(Value::as_str),
+        Some("deploy token-abc-123")
+    );
+    stop_agent(&mut scenario.host, &agent_id, 1).await;
+    scenario.assert_cli_exit("stdin-eof");
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+}
+
+async fn scenario_deny_denies_with_message(owned: OwnedChildren) {
+    let mut scenario = Scenario::start("deny", claude_profile(), &owned).await;
+    let agent_id = scenario.agent_id.clone();
+    let (_, turn_id, _) =
+        send_until_permission_asked(&mut scenario.host, &agent_id, 1, "list files").await;
+    let (reply, collected, reply_id) = reply_for_permission(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "deny",
+        json!({}),
+        "fake-perm-1",
+        &turn_id,
+    )
+    .await;
+    assert_eq!(reply.get("state").and_then(Value::as_str), Some("applied"));
+    assert_eq!(
+        collected.first().map(|(kind, _)| kind.as_str()),
+        Some("request.resolved")
+    );
+    assert_eq!(
+        collected
+            .first()
+            .map(|(_, data)| data)
+            .and_then(|data| data.get("command_id"))
+            .and_then(Value::as_str),
+        Some(reply_id.as_str())
+    );
+    let committed = drain_decided_turn(&mut scenario.host, &agent_id, collected).await;
+    assert_eq!(
+        committed.last().map(|(kind, _)| kind.as_str()),
+        Some("turn.completed")
+    );
+    let replies = scenario
+        .report()
+        .get("permission_replies")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        replies.as_slice(),
+        &[json!({
+            "request_id": "fake-perm-1",
+            "subtype": "success",
+            "result": {"behavior": "deny", "message": "Eliot denied this tool call."},
+        })]
+    );
+    stop_agent(&mut scenario.host, &agent_id, 1).await;
+    scenario.assert_cli_exit("stdin-eof");
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+}
+
+async fn scenario_reply_guards_reject_without_rewrite(owned: OwnedChildren) {
+    let mut scenario = Scenario::start("approve", claude_profile(), &owned).await;
+    let agent_id = scenario.agent_id.clone();
+    let (_, turn_id, _) =
+        send_until_permission_asked(&mut scenario.host, &agent_id, 1, "list files").await;
+    // An unknown request, non-empty args, and a foreign turn all refuse
+    // without a native write and without touching the open ask.
+    for (verb, args, request_id, turn) in [
+        (
+            "approve",
+            json!({}),
+            "no-such-request".to_owned(),
+            turn_id.clone(),
+        ),
+        (
+            "approve",
+            json!({"choice": "x"}),
+            "fake-perm-1".to_owned(),
+            turn_id.clone(),
+        ),
+        (
+            "approve",
+            json!({}),
+            "fake-perm-1".to_owned(),
+            ulid::Ulid::new().to_string(),
+        ),
+    ] {
+        let (reply, collected, _) = reply_for_permission(
+            &mut scenario.host,
+            &agent_id,
+            1,
+            verb,
+            args,
+            &request_id,
+            &turn,
+        )
+        .await;
+        assert_eq!(
+            reply.get("state").and_then(Value::as_str),
+            Some("rejected"),
+            "{verb} guard must refuse"
+        );
+        assert!(collected.is_empty(), "refused reply commits nothing");
+    }
+    // The exact reply still applies afterwards.
+    let (reply, collected, _) = reply_for_permission(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "approve",
+        json!({}),
+        "fake-perm-1",
+        &turn_id,
+    )
+    .await;
+    assert_eq!(reply.get("state").and_then(Value::as_str), Some("applied"));
+    // A second decision finds nothing pending and refuses without a rewrite.
+    let (again, collected_again, _) = reply_for_permission(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "deny",
+        json!({}),
+        "fake-perm-1",
+        &turn_id,
+    )
+    .await;
+    assert_eq!(again.get("state").and_then(Value::as_str), Some("rejected"));
+    // The second pump may already hold the decided turn's facts; fold them
+    // into the drain so nothing is lost.
+    let mut collected_all = collected;
+    collected_all.extend(collected_again);
+    let committed = drain_decided_turn(&mut scenario.host, &agent_id, collected_all).await;
+    assert_eq!(
+        committed.last().map(|(kind, _)| kind.as_str()),
+        Some("turn.completed")
+    );
+    let replies = scenario
+        .report()
+        .get("permission_replies")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(replies.len(), 1, "exactly one native decision");
+    stop_agent(&mut scenario.host, &agent_id, 1).await;
+    scenario.assert_cli_exit("stdin-eof");
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+}
+
+async fn scenario_unreplied_request_closes_with_the_turn(owned: OwnedChildren) {
+    let mut scenario = Scenario::start("request-close", claude_profile(), &owned).await;
+    let agent_id = scenario.agent_id.clone();
+    let send_id = ulid::Ulid::new().to_string();
+    let rx = scenario
+        .host
+        .begin_call(
+            "agent.command",
+            json!({
+                "agent_id": agent_id,
+                "generation": 1,
+                "command_id": send_id,
+                "verb": "send",
+                "args": {"text": "hello"},
+                "turn_id": null,
+                "request_id": null,
+            }),
+        )
+        .await;
+    let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
+    let mut committed: Vec<(String, Value)> = Vec::new();
+    let applied = loop {
+        tokio::select! {
+            biased;
+            request = scenario.host.next_request() => {
+                assert_eq!(request.method, "events.put");
+                let events = request.params.get("events").and_then(Value::as_array).cloned().unwrap_or_default();
+                assert_eq!(events.len(), 1, "one native record per batch");
+                committed.push((
+                    events[0].get("kind").and_then(Value::as_str).unwrap_or_default().to_owned(),
+                    events[0].get("data").cloned().unwrap_or(Value::Null),
+                ));
+                let first = scenario.host.next_seq;
+                scenario.host.next_seq += 1;
+                scenario.host.respond(&request.id, json!({
+                    "first_seq": first, "last_seq": first,
+                    "cursor": request.params.get("cursor").cloned().unwrap_or(Value::Null),
+                })).await;
+            }
+            result = &mut rx => break result,
+        }
+    };
+    let applied = applied
+        .expect("send deadline")
+        .expect("send response channel")
+        .expect("send applied");
+    let turn_id = applied
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .expect("applied turn uuid")
+        .to_owned();
+    while committed.last().map(|(kind, _)| kind.as_str()) != Some("turn.completed") {
+        let (kind, data) = scenario.host.answer_any_events_put(&agent_id).await;
+        committed.push((kind, data));
+    }
+    assert_eq!(
+        committed
+            .iter()
+            .map(|(kind, _)| kind.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "turn.started",
+            "request.opened",
+            "message.completed",
+            "request.closed",
+            "turn.completed"
+        ]
+    );
+    let closed = committed
+        .iter()
+        .find(|(kind, _)| kind == "request.closed")
+        .map(|(_, data)| data)
+        .expect("closed data");
+    assert_eq!(
+        closed.get("request_id").and_then(Value::as_str),
+        Some("fake-perm-1")
+    );
+    assert_eq!(
+        closed.get("turn_id").and_then(Value::as_str),
+        Some(turn_id.as_str())
+    );
+    assert!(
+        closed.get("command_id").is_none(),
+        "close carries no command binding"
+    );
+    stop_agent(&mut scenario.host, &agent_id, 1).await;
+    scenario.assert_cli_exit("stdin-eof");
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+}
+
+async fn scenario_lost_reply_is_unknown_without_rewrite(owned: OwnedChildren) {
+    let mut scenario = Scenario::start("drop-reply", claude_profile(), &owned).await;
+    let agent_id = scenario.agent_id.clone();
+    // The turn associates and asks, then the CLI dies: the ask commits, then
+    // the stream loss gaps. The send response may land on either side.
+    let send_id = ulid::Ulid::new().to_string();
+    let rx = scenario
+        .host
+        .begin_call(
+            "agent.command",
+            json!({
+                "agent_id": agent_id,
+                "generation": 1,
+                "command_id": send_id,
+                "verb": "send",
+                "args": {"text": "hello"},
+                "turn_id": null,
+                "request_id": null,
+            }),
+        )
+        .await;
+    let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
+    let mut applied: Option<Value> = None;
+    let mut kinds: Vec<String> = Vec::new();
+    let mut gapped = false;
+    loop {
+        if applied.is_some() && kinds.iter().any(|kind| kind == "request.opened") && gapped {
+            break;
+        }
+        tokio::select! {
+            biased;
+            request = scenario.host.next_request() => {
+                match request.method.as_str() {
+                    "events.put" => {
+                        let events = request.params.get("events").and_then(Value::as_array).cloned().unwrap_or_default();
+                        assert_eq!(events.len(), 1, "one native record per batch");
+                        kinds.push(events[0].get("kind").and_then(Value::as_str).unwrap_or_default().to_owned());
+                        let first = scenario.host.next_seq;
+                        scenario.host.next_seq += 1;
+                        scenario.host.respond(&request.id, json!({
+                            "first_seq": first, "last_seq": first,
+                            "cursor": request.params.get("cursor").cloned().unwrap_or(Value::Null),
+                        })).await;
+                    }
+                    "source.gap" => {
+                        gapped = true;
+                        let gap_id = request.params.get("gap_id").and_then(Value::as_str).unwrap_or_default().to_owned();
+                        scenario.host.respond(&request.id, json!({"gap_id": gap_id, "seq": scenario.host.next_seq})).await;
+                        scenario.host.next_seq += 1;
+                    }
+                    other => panic!("unexpected host request: {other}"),
+                }
+            }
+            // Guarded: polling the spent response a second time panics.
+            result = &mut rx, if applied.is_none() => {
+                applied = Some(result
+                    .expect("send deadline")
+                    .expect("send response channel")
+                    .expect("send applied"));
+            }
+        }
+    }
+    let applied = applied.expect("send applied");
+    let turn_id = applied
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .expect("applied turn uuid")
+        .to_owned();
+    assert_eq!(kinds.as_slice(), ["turn.started", "request.opened"]);
+    // The reply write dies with the stream: unknown, twice, with no decision
+    // ever delivered.
+    for verb in ["approve", "deny"] {
+        let (reply, collected, _) = reply_for_permission(
+            &mut scenario.host,
+            &agent_id,
+            1,
+            verb,
+            json!({}),
+            "fake-perm-1",
+            &turn_id,
+        )
+        .await;
+        assert_eq!(
+            reply.get("state").and_then(Value::as_str),
+            Some("unknown"),
+            "{verb} after stream loss stays unknown"
+        );
+        assert!(collected.is_empty(), "unknown reply commits nothing");
+    }
+    let report = scenario.report();
+    assert_eq!(report.get("user_inputs").and_then(Value::as_u64), Some(1));
+    assert_eq!(
+        report
+            .get("permission_replies")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+    // Stop still settles: the unanswered ask closes before `session.ended`.
+    stop_agent(&mut scenario.host, &agent_id, 1).await;
+    scenario.assert_cli_exit("scripted-drop");
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
 }

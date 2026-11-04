@@ -632,10 +632,10 @@ pub(super) fn submit_tx(
             if let Some(path) = &agent.workspace {
                 workspace::require_managed_path_ready(tx, path)?;
             }
-            if !matches!(agent.harness.as_str(), "codex" | "fake" | "muse") {
+            if !matches!(agent.harness.as_str(), "codex" | "fake" | "muse" | "claude") {
                 return Err(Error::new(
                     "unsupported",
-                    "resume is only supported for Codex, Muse, or Fake Agents with a retained native subject",
+                    "resume is only supported for Codex, Muse, Claude, or Fake Agents with a retained native subject",
                 ));
             }
             if let Some(expected) = request.expected_generation

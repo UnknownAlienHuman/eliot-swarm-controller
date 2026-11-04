@@ -83,7 +83,7 @@ fn initial_source_families_match_fake_and_codex_harness_boundaries() {
     );
     assert_eq!(
         super::source_families_for_harness("claude").unwrap(),
-        &["session", "turn", "message"][..]
+        &["session", "turn", "message", "request"][..]
     );
     assert_eq!(
         super::source_families_for_harness("opencode").unwrap(),
@@ -9242,8 +9242,8 @@ fn muse_resume_gates_refuse_an_unlisted_harness() {
     let mut store = Store::open(Path::new(":memory:")).expect("open Store");
     let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
 
-    // Admission refuses resume for a harness outside codex/fake/muse even
-    // when the old generation is terminal with a retained native subject.
+    // Admission refuses resume for a harness outside codex/fake/muse/claude
+    // even when the old generation is terminal with a retained native subject.
     let (agent, _, _, _) = ready_muse_agent(
         &mut store,
         "muse-harness-refusal",
@@ -9555,14 +9555,17 @@ fn muse_replies_and_turn_controls_pass_admission_and_dispatch() {
     }
 }
 
-/// Launch a `claude`-harness Agent through generation-1 readiness.
+/// Launch a `claude`-harness Agent through generation-1 readiness,
+/// returning the Agent, its launch command, and its retained native
+/// subject. The session stays live; tests end it with
+/// `end_claude_session` when they need a terminal old generation.
 fn ready_claude_agent(
     store: &mut Store,
     project: &str,
     profile: &str,
     workspace: &str,
     now: i64,
-) -> (String, String) {
+) -> (String, String, String, String) {
     let mut launch = SubmitCommand::new(Ulid::new().to_string(), "launch");
     launch.args = json!({
         "project": project,
@@ -9579,6 +9582,8 @@ fn ready_claude_agent(
         .command
         .target
         .expect("claude launch Agent");
+    let native_scope = format!("{project}:{agent}:scope");
+    let native_ref = format!("{project}:{agent}:session");
     store
         .dispatch(&launch_id, now + 1)
         .expect("dispatch claude launch");
@@ -9595,8 +9600,8 @@ fn ready_claude_agent(
                     native_id: format!("{project}:ready"),
                     data: json!({
                         "command_id": launch_id.as_str(),
-                        "native_scope": format!("{project}:{agent}:scope"),
-                        "native_ref": format!("{project}:{agent}:session"),
+                        "native_scope": native_scope.as_str(),
+                        "native_ref": native_ref.as_str(),
                     }),
                 }],
                 cursor: None,
@@ -9607,15 +9612,36 @@ fn ready_claude_agent(
     store
         .settle(&launch_id, CommandState::Applied, None, now + 3)
         .expect("settle claude launch");
-    (agent, launch_id)
+    (agent, launch_id, native_scope, native_ref)
+}
+
+fn end_claude_session(store: &mut Store, agent: &str, project: &str, now: i64) {
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("{project}:ended"),
+                agent_id: agent.to_owned(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ended".to_owned(),
+                    native_id: format!("{project}:ended"),
+                    data: json!({}),
+                }],
+                cursor: None,
+            },
+            now,
+        )
+        .expect("commit claude terminal session fact");
 }
 
 #[test]
-fn claude_interrupt_passes_admission_and_dispatch_while_other_controls_refuse() {
+fn claude_replies_and_interrupt_pass_admission_and_dispatch() {
     let mut store = Store::open(Path::new(":memory:")).expect("open Store");
     let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
     let project = "claude-interrupt-gates";
-    let (agent, _) = ready_claude_agent(
+    let (agent, _, _, _) = ready_claude_agent(
         &mut store,
         project,
         "claude-test",
@@ -9666,8 +9692,63 @@ fn claude_interrupt_passes_admission_and_dispatch_while_other_controls_refuse() 
         CommandState::Dispatched
     );
 
-    // Steer, approve, deny and answer stay unconnected in PR1.
-    for verb in ["steer", "approve", "deny", "answer"] {
+    let open_request = |native_id: &str, request_id: &str| NativeEvent {
+        ts: None,
+        kind: "request.opened".to_owned(),
+        native_id: native_id.to_owned(),
+        data: json!({
+            "command_id": send_id,
+            "request_id": request_id,
+            "turn_id": turn_id,
+            "kind": "permission",
+            "details": {"tool_name": "Bash", "input": {"command": "ls"}},
+        }),
+    };
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: Ulid::new().to_string(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![
+                    open_request("claude-reply-approve", "claude-request-approve"),
+                    open_request("claude-reply-deny", "claude-request-deny"),
+                ],
+                cursor: None,
+            },
+            now + 8,
+        )
+        .expect("commit claude pending permission requests");
+
+    // PR2 connects approve/deny for `claude`: each admits against its
+    // exact pending request and dispatches to the plugin's agent.command.
+    for (verb, request_id) in [
+        ("approve", "claude-request-approve"),
+        ("deny", "claude-request-deny"),
+    ] {
+        let mut reply = SubmitCommand::new(Ulid::new().to_string(), verb);
+        reply.target = Some(agent.clone());
+        reply.expected_generation = Some(1);
+        reply.expected_turn_id = Some(turn_id.clone());
+        reply.request_id = Some(request_id.to_owned());
+        let reply_id = reply.id.clone();
+        let admission = store
+            .submit("owner", reply, now + 9)
+            .unwrap_or_else(|error| panic!("admit claude {verb}: {error:?}"));
+        assert_eq!(admission.command.state, CommandState::Accepted);
+        assert_eq!(
+            store
+                .dispatch(&reply_id, now + 10)
+                .unwrap_or_else(|error| panic!("dispatch claude {verb}: {error:?}"))
+                .value
+                .state,
+            CommandState::Dispatched
+        );
+    }
+
+    // Steer and answer stay unconnected: no exact native mechanism.
+    for verb in ["steer", "answer"] {
         let mut control = SubmitCommand::new(Ulid::new().to_string(), verb);
         control.target = Some(agent.clone());
         control.expected_generation = Some(1);
@@ -9675,9 +9756,305 @@ fn claude_interrupt_passes_admission_and_dispatch_while_other_controls_refuse() 
         if verb == "steer" {
             control.args = json!({"text": "follow-up"});
         } else {
-            control.request_id = Some(format!("claude-request-{verb}"));
+            control.request_id = Some("claude-request-approve".to_owned());
         }
-        let error = store.submit("owner", control, now + 10).unwrap_err();
+        let error = store.submit("owner", control, now + 11).unwrap_err();
         assert_eq!(error.code, "unsupported", "claude {verb} must refuse");
     }
+}
+
+#[test]
+fn claude_resume_passes_admission_and_dispatch_gates_with_exact_linked_input() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let project = "claude-resume-gates";
+    let (agent, _, native_scope, native_ref) = ready_claude_agent(
+        &mut store,
+        project,
+        "claude-test",
+        "synthetic-claude-resume",
+        now,
+    );
+    assert_eq!(store.get_agent(&agent).unwrap().unwrap().harness, "claude");
+
+    // Eliot's own terminal gate for the old generation. A resume while
+    // generation 1 is still running is refused before any native I/O.
+    let mut early = SubmitCommand::new(Ulid::new().to_string(), "resume");
+    early.target = Some(agent.clone());
+    early.expected_generation = Some(1);
+    early.args = json!({"text": "too early"});
+    assert_eq!(
+        store
+            .submit("owner", early, now + 5)
+            .expect_err("live generation refuses resume")
+            .code,
+        "bad_state"
+    );
+    end_claude_session(&mut store, &agent, project, now + 6);
+
+    // Admission mints the linked SEND id before any write: the exact
+    // `{resume}/send` handle the new generation will dispatch, carrying the
+    // exact linked text while the parent keeps empty args.
+    let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
+    resume.target = Some(agent.clone());
+    resume.expected_generation = Some(1);
+    resume.args = json!({"text": "continue in the new generation"});
+    let resume_id = resume.id.clone();
+    let admission = store
+        .submit("owner", resume, now + 7)
+        .expect("admit claude resume with linked input");
+    assert_eq!(admission.command.state, CommandState::Accepted);
+    assert_eq!(admission.command.generation, Some(1));
+    assert_eq!(admission.command.args, json!({}));
+    let linked = admission
+        .linked_command
+        .as_ref()
+        .expect("resume text is stored as its linked SEND");
+    let send_id = linked.id.clone();
+    assert_eq!(send_id, format!("{resume_id}/send"));
+    assert_eq!(linked.verb, "send");
+    assert_eq!(linked.expected_generation, Some(2));
+    assert_eq!(linked.generation, Some(2));
+    assert_eq!(linked.state, CommandState::Queued);
+    assert_eq!(linked.args["text"], "continue in the new generation");
+
+    assert_eq!(
+        store
+            .dispatch(&resume_id, now + 8)
+            .expect("dispatch claude resume")
+            .value
+            .state,
+        CommandState::Dispatched
+    );
+    let starting = store.get_agent(&agent).unwrap().unwrap();
+    assert_eq!(starting.generation, 2);
+    assert_eq!(starting.state, AgentState::Starting);
+    assert_eq!(
+        starting.native_scope.as_deref(),
+        Some(native_scope.as_str())
+    );
+    assert_eq!(starting.native_ref.as_deref(), Some(native_ref.as_str()));
+
+    // Generation-1 output after the resume is rejected, never applied to
+    // generation 2. The old host's batch cannot land new rows once the
+    // Agent has advanced.
+    let gen1_rows = gen1_event_rows(&store, &agent);
+    assert_eq!(
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: format!("{project}:stale-turn"),
+                    agent_id: agent.clone(),
+                    generation: 1,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "turn.started".to_owned(),
+                        native_id: format!("{project}:stale-turn"),
+                        data: json!({"command_id": "gen1-command", "turn_id": "gen1-turn"}),
+                    }],
+                    cursor: None,
+                },
+                now + 9,
+            )
+            .expect_err("stale generation-1 batch is rejected")
+            .code,
+        "stale_generation"
+    );
+    assert_eq!(gen1_event_rows(&store, &agent), gen1_rows);
+
+    // Generation-2 readiness binds the exact resume command id minted before
+    // the write; a forged command id proves nothing.
+    assert_eq!(
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: format!("{project}:wrong-command"),
+                    agent_id: agent.clone(),
+                    generation: 2,
+                    source: "stream".to_owned(),
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "session.ready".to_owned(),
+                        native_id: format!("{project}:wrong-command"),
+                        data: json!({
+                            "command_id": "not-the-resume-command",
+                            "native_scope": native_scope.as_str(),
+                            "native_ref": native_ref.as_str(),
+                        }),
+                    }],
+                    cursor: None,
+                },
+                now + 10,
+            )
+            .expect_err("forged readiness command is rejected")
+            .code,
+        "source_integrity"
+    );
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("{project}:ready-2"),
+                agent_id: agent.clone(),
+                generation: 2,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ready".to_owned(),
+                    native_id: format!("{project}:ready-2"),
+                    data: json!({
+                        "command_id": resume_id.as_str(),
+                        "native_scope": native_scope.as_str(),
+                        "native_ref": native_ref.as_str(),
+                    }),
+                }],
+                cursor: None,
+            },
+            now + 11,
+        )
+        .expect("commit generation-2 readiness");
+    store
+        .settle(&resume_id, CommandState::Applied, None, now + 12)
+        .expect("settle claude resume");
+    assert_eq!(
+        store
+            .dispatch(&send_id, now + 13)
+            .expect("dispatch linked claude input")
+            .value
+            .state,
+        CommandState::Dispatched
+    );
+    let turn_id = format!("claude-resume-turn-{}", Ulid::new());
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("{project}:turn-2"),
+                agent_id: agent.clone(),
+                generation: 2,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "turn.started".to_owned(),
+                    native_id: format!("{project}:turn-2-started"),
+                    data: json!({
+                        "command_id": send_id.as_str(),
+                        "turn_id": turn_id.as_str(),
+                    }),
+                }],
+                cursor: None,
+            },
+            now + 14,
+        )
+        .expect("associate the exact linked claude input");
+    let applied = store.get_command(&send_id).unwrap().unwrap();
+    assert_eq!(applied.state, CommandState::Applied);
+    assert_eq!(applied.turn_id.as_deref(), Some(turn_id.as_str()));
+    assert_eq!(
+        store.get_turn(&agent, 2, &turn_id).unwrap().unwrap().state,
+        TurnState::Running
+    );
+}
+
+#[test]
+fn claude_project_resume_passes_the_projects_gate_with_linked_input() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let project = "claude-project-resume";
+    let checkout = "/synthetic-claude-project-resume";
+    let principal = format!("project:{project}");
+    store
+        .upsert_project_registration(
+            "owner",
+            &ProjectRegistrationInput {
+                id: project.to_owned(),
+                checkout: checkout.to_owned(),
+                repo_common_dir: format!("{checkout}/.git"),
+                git: None,
+                profiles: vec!["claude-profile".to_owned()],
+                actions: vec!["resume".to_owned(), "send".to_owned()],
+                interpreters: BTreeMap::new(),
+                run_env: Vec::new(),
+            },
+            now,
+        )
+        .expect("register project resume and linked send");
+    let (agent, _, native_scope, native_ref) =
+        ready_claude_agent(&mut store, project, "claude-profile", checkout, now + 1);
+    end_claude_session(&mut store, &agent, project, now + 6);
+
+    // The project principal's linked SEND passes the projects resume binding
+    // gate (`projects.rs`), which admits the `claude` harness like
+    // Codex/Fake/Muse.
+    let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
+    resume.target = Some(agent.clone());
+    resume.expected_generation = Some(1);
+    resume.args = json!({"text": "project resume input"});
+    let resume_id = resume.id.clone();
+    let admission = store
+        .submit(&principal, resume, now + 7)
+        .expect("admit project claude resume with linked input");
+    let send_id = admission
+        .linked_command
+        .as_ref()
+        .expect("project resume text is stored as its linked SEND")
+        .id
+        .clone();
+    assert_eq!(send_id, format!("{resume_id}/send"));
+    store
+        .dispatch(&resume_id, now + 8)
+        .expect("dispatch project claude resume");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("{project}:ready-2"),
+                agent_id: agent.clone(),
+                generation: 2,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ready".to_owned(),
+                    native_id: format!("{project}:ready-2"),
+                    data: json!({
+                        "command_id": resume_id.as_str(),
+                        "native_scope": native_scope.as_str(),
+                        "native_ref": native_ref.as_str(),
+                    }),
+                }],
+                cursor: None,
+            },
+            now + 9,
+        )
+        .expect("commit project generation-2 readiness");
+    store
+        .settle(&resume_id, CommandState::Applied, None, now + 10)
+        .expect("settle project claude resume");
+    store
+        .dispatch(&send_id, now + 11)
+        .expect("dispatch linked project input against its next-generation binding");
+    let turn_id = format!("claude-project-resume-turn-{}", Ulid::new());
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("{project}:turn-2"),
+                agent_id: agent.clone(),
+                generation: 2,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "turn.started".to_owned(),
+                    native_id: format!("{project}:turn-2-started"),
+                    data: json!({
+                        "command_id": send_id.as_str(),
+                        "turn_id": turn_id.as_str(),
+                    }),
+                }],
+                cursor: None,
+            },
+            now + 12,
+        )
+        .expect("associate the exact linked project input");
+    assert_eq!(
+        store.get_command(&send_id).unwrap().unwrap().state,
+        CommandState::Applied
+    );
 }

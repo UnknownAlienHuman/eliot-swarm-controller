@@ -1,5 +1,5 @@
 use crate::{
-    events::{self, EventConfig, EventHandle, TurnOutcome},
+    events::{self, EventConfig, EventHandle, TurnOutcome, unknown_control},
     native::{
         ClaudeClient, ClaudeProcess, native_no_write,
         types::{InitializeReadback, OutboundUserInput, OutboundUserMessage},
@@ -67,6 +67,7 @@ struct AgentSession {
     interrupt_applied: HashMap<String, String>,
     interrupted_turns: HashSet<String>,
     unknown_interrupt_turns: HashSet<String>,
+    reply_outcomes: HashMap<String, ReplyOutcome>,
     stop_command_id: Option<String>,
 }
 
@@ -81,7 +82,18 @@ struct StartPlan {
     credential: String,
     session_id: String,
     requested_model: String,
-    requested_permission_mode: Value,
+    requested_permission_mode: Option<String>,
+    resume_ref: Option<String>,
+}
+
+/// Retained approve/deny outcome for exact command-id replay. The stored
+/// value is returned verbatim; a reused id with another binding is an
+/// integrity error.
+struct ReplyOutcome {
+    verb: String,
+    request_id: String,
+    turn_id: String,
+    result: Value,
 }
 
 struct TargetEnvironment {
@@ -266,12 +278,18 @@ impl ClaudePlugin {
                 "Claude start does not accept input; send it as a separate command",
             ));
         }
-        if params.resume_from.is_some() {
-            return Err(Error::new(
-                "unsupported",
-                "Claude resume is not connected in this slice",
-            ));
-        }
+        let resume_subject = params
+            .resume_from
+            .as_ref()
+            .map(|resume| {
+                parse_resume_subject(
+                    resume,
+                    params.source_state.as_ref(),
+                    &params.agent_id,
+                    params.generation,
+                )
+            })
+            .transpose()?;
         validate_source_plan(params.source_plan.as_ref())?;
         let frozen_profile = params.profile.as_ref().ok_or_else(|| {
             Error::new("profile_error", "Claude requires a frozen profile object")
@@ -293,10 +311,9 @@ impl ClaudePlugin {
                 Error::new("profile_error", "Claude profile requires an exact model id")
             })?
             .to_owned();
-        // Requested permission posture next to the CLI's effective mode: PR1
-        // passes no permission-mode flag, so the readback is the CLI default
-        // until PR2 configures it.
-        let requested_permission_mode = profile.get("permissions").cloned().unwrap_or(Value::Null);
+        // The daemon freezes the closed CLI permission-mode vocabulary here;
+        // unset means the CLI-default posture.
+        let requested_permission_mode = optional_profile_text(profile, "permission_mode")?;
         let workspace = params
             .workspace
             .as_deref()
@@ -329,9 +346,23 @@ impl ClaudePlugin {
             config_dir,
         } = target_environment(params.target_environment.as_ref(), profile.get("pass_env"))?;
         secrets.push(initialized.credential.clone());
-        // Eliot mints the session id and pre-assigns it: SessionStart hook
-        // lines carry it before any input, so no `start_requires_input`.
-        let session_id = new_uuid();
+        if let Some(subject) = resume_subject.as_ref()
+            && subject.native_scope != claude_scope(config_dir.as_deref())
+        {
+            return Err(Error::new(
+                "profile_error",
+                "Claude resume subject is outside the authenticated native scope",
+            ));
+        }
+        // Fresh: Eliot mints the session id and pre-assigns it; SessionStart
+        // hook lines carry it before any input, so no `start_requires_input`.
+        // Resume: the CLI continues the exact retained session id; the old
+        // prompt is never resent.
+        let session_id = match resume_subject.as_ref() {
+            Some(subject) => subject.native_ref.clone(),
+            None => new_uuid(),
+        };
+        let resume_ref = resume_subject.map(|subject| subject.native_ref);
         Ok(StartPlan {
             workspace,
             program,
@@ -342,6 +373,7 @@ impl ClaudePlugin {
             session_id,
             requested_model,
             requested_permission_mode,
+            resume_ref,
         })
     }
 
@@ -397,11 +429,13 @@ impl ClaudePlugin {
 
     /// Run `initialize` and check the effective profile BEFORE readiness: on
     /// any mismatch no `session.ready` is published and no session is kept.
+    /// A resume realigns the retained session with the frozen profile after
+    /// the idle preflight.
     async fn read_effective_profile(
         &mut self,
         session: &mut AgentSession,
         params: &AgentStartParams,
-        requested_model: &str,
+        plan: &StartPlan,
     ) -> Result<Value> {
         let readback = match session
             .native_client
@@ -439,8 +473,8 @@ impl ClaudePlugin {
             }
         };
         let model_available = readback.models.iter().any(|model| {
-            model.value.as_deref() == Some(requested_model)
-                || model.resolved_model.as_deref() == Some(requested_model)
+            model.value.as_deref() == Some(plan.requested_model.as_str())
+                || model.resolved_model.as_deref() == Some(plan.requested_model.as_str())
         });
         if !model_available || readback.session_state.as_deref() != Some("idle") {
             return Err(self
@@ -454,9 +488,32 @@ impl ClaudePlugin {
                 )
                 .await);
         }
+        // Resume realigns the retained session with the frozen profile. The
+        // initialize idle readback above is only the preflight: the old
+        // generation is terminal by Eliot's own Store gates (admission refuses
+        // resume on a live generation and dispatch rechecks it), never by
+        // this readback alone.
+        let mut effective_mode = readback.current_permission_mode.clone();
+        if plan.resume_ref.is_some() {
+            match realign_resumed_settings(
+                &session.native_client,
+                &plan.requested_model,
+                plan.requested_permission_mode.as_deref(),
+                effective_mode.clone(),
+            )
+            .await
+            {
+                Ok(mode) => effective_mode = mode,
+                Err(error) => {
+                    return Err(self.reject_start(session, params, error).await);
+                }
+            }
+        }
+        // Requested vs effective permission mode is reported, never forced:
+        // launching with `manual` reads back `default` on the installed CLI.
         Ok(json!({
-            "model": requested_model,
-            "permission_mode": readback.current_permission_mode,
+            "model": plan.requested_model.clone(),
+            "permission_mode": effective_mode,
             "session_state": readback.session_state,
             "pid": readback.pid,
         }))
@@ -532,7 +589,7 @@ impl ClaudePlugin {
         }
 
         let effective = self
-            .read_effective_profile(&mut session, &params, &plan.requested_model)
+            .read_effective_profile(&mut session, &params, &plan)
             .await?;
         self.commit_readiness(session, &params, &plan, effective)
             .await
@@ -544,6 +601,7 @@ impl ClaudePlugin {
         match params.verb.as_str() {
             "send" => self.send_command(params).await,
             "interrupt" => self.interrupt_command(params).await,
+            "approve" | "deny" => self.reply_request(params).await,
             _ => Err(Error::new(
                 "unsupported",
                 "Claude plugin command verb is not implemented",
@@ -671,6 +729,80 @@ impl ClaudePlugin {
             applied["still_queued"] = still_queued;
         }
         Ok(applied)
+    }
+
+    async fn reply_request(&mut self, params: AgentCommandParams) -> Result<Value> {
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| Error::new("bad_state", "Claude Agent session has not started"))?;
+        validate_binding(session, &params.agent_id, params.generation)?;
+        if session.phase != SessionPhase::Ready {
+            return Err(Error::new(
+                "unknown",
+                "Claude session or event source outcome is unresolved",
+            ));
+        }
+        let turn_id = params
+            .turn_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                Error::new(
+                    "stale_turn",
+                    "Claude request reply needs its captured turn id",
+                )
+            })?;
+        let request_id = params
+            .request_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                Error::new(
+                    "not_found",
+                    "Claude request reply needs its captured request id",
+                )
+            })?;
+        if let Some(previous) = session.reply_outcomes.get(&params.command_id) {
+            if previous.verb != params.verb
+                || previous.request_id != request_id
+                || previous.turn_id != turn_id
+            {
+                return Err(Error::new(
+                    "source_integrity",
+                    "Claude command id was reused for another request reply",
+                ));
+            }
+            return Ok(previous.result.clone());
+        }
+        // The event task owns no transport client: the native decision
+        // travels on this call, serialized behind queued frames.
+        let native = session.native_client.clone();
+        let result = match session
+            .events
+            .reply_request(
+                params.command_id.clone(),
+                request_id.to_owned(),
+                turn_id.to_owned(),
+                params.verb.clone(),
+                params.args.clone(),
+                native,
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => unknown_control("Claude request reply outcome is unknown"),
+        };
+        session.reply_outcomes.insert(
+            params.command_id.clone(),
+            ReplyOutcome {
+                verb: params.verb,
+                request_id: request_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                result: result.clone(),
+            },
+        );
+        Ok(result)
     }
 
     async fn snapshot(&mut self, raw: &Value) -> Result<Value> {
@@ -1028,20 +1160,38 @@ async fn launch_session(
     params: &AgentStartParams,
     peer: &PeerClient,
 ) -> Result<AgentSession> {
+    // Approvals always travel over stdio so every `can_use_tool` ask
+    // reaches Eliot. Resume continues the exact retained session id; the
+    // old prompt is never resent.
+    let mut argv = vec![
+        OsString::from("-p"),
+        OsString::from("--input-format"),
+        OsString::from("stream-json"),
+        OsString::from("--output-format"),
+        OsString::from("stream-json"),
+        OsString::from("--verbose"),
+        OsString::from("--permission-prompt-tool"),
+        OsString::from("stdio"),
+    ];
+    match plan.resume_ref.as_ref() {
+        Some(native_ref) => {
+            argv.push(OsString::from("--resume"));
+            argv.push(OsString::from(native_ref));
+        }
+        None => {
+            argv.push(OsString::from("--session-id"));
+            argv.push(OsString::from(&plan.session_id));
+        }
+    }
+    argv.push(OsString::from("--model"));
+    argv.push(OsString::from(&plan.requested_model));
+    if let Some(mode) = plan.requested_permission_mode.as_deref() {
+        argv.push(OsString::from("--permission-mode"));
+        argv.push(OsString::from(mode));
+    }
     let launch = NativeLaunch {
         program: plan.program.clone(),
-        args: vec![
-            OsString::from("-p"),
-            OsString::from("--input-format"),
-            OsString::from("stream-json"),
-            OsString::from("--output-format"),
-            OsString::from("stream-json"),
-            OsString::from("--verbose"),
-            OsString::from("--session-id"),
-            OsString::from(&plan.session_id),
-            OsString::from("--model"),
-            OsString::from(&plan.requested_model),
-        ],
+        args: argv,
         cwd: plan.workspace.clone(),
         environment: plan.environment.clone(),
     };
@@ -1079,6 +1229,7 @@ async fn launch_session(
         interrupt_applied: HashMap::new(),
         interrupted_turns: HashSet::new(),
         unknown_interrupt_turns: HashSet::new(),
+        reply_outcomes: HashMap::new(),
         stop_command_id: None,
     })
 }
@@ -1149,9 +1300,163 @@ async fn discard_failed_start(session: &mut AgentSession, error: Error) -> Error
     session.native_client.diagnostic_error(error)
 }
 
+#[derive(Debug)]
+struct ResumeSubject {
+    native_scope: String,
+    native_ref: String,
+}
+
+/// Validate the retained resume subject and its generation continuity. The
+/// retained source must still bind this Agent's previous generation on the
+/// stream; the request family is new in this generation, so only the
+/// session/turn/message ownership is required of the retained source.
+fn parse_resume_subject(
+    resume: &Value,
+    source_state: Option<&Value>,
+    agent_id: &str,
+    generation: i64,
+) -> Result<ResumeSubject> {
+    let resume = resume
+        .as_object()
+        .ok_or_else(|| Error::new("invalid", "Claude resume_from must be an object"))?;
+    if resume.len() != 2
+        || !resume.contains_key("native_scope")
+        || !resume.contains_key("native_ref")
+    {
+        return Err(Error::new(
+            "invalid",
+            "Claude resume_from must contain only native_scope and native_ref",
+        ));
+    }
+    let native_scope = resume
+        .get("native_scope")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| Error::new("invalid", "Claude resume_from requires native_scope"))?
+        .to_owned();
+    let native_ref = resume
+        .get("native_ref")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| Error::new("invalid", "Claude resume_from requires native_ref"))?
+        .to_owned();
+    let source_state = source_state
+        .and_then(Value::as_object)
+        .ok_or_else(|| Error::new("unknown", "Claude resume requires retained native readback"))?;
+    let retained_generation = source_state
+        .get("retained_generation")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| {
+            Error::new(
+                "unknown",
+                "Claude resume readback omitted its retained generation",
+            )
+        })?;
+    if retained_generation.checked_add(1) != Some(generation) {
+        return Err(Error::new(
+            "stale_generation",
+            "Claude resume generation does not follow the retained source generation",
+        ));
+    }
+    let retained_source = source_state
+        .get("retained_source")
+        .and_then(Value::as_object)
+        .ok_or_else(|| Error::new("unknown", "Claude resume omitted retained source state"))?;
+    if retained_source.get("agent_id").and_then(Value::as_str) != Some(agent_id)
+        || retained_source.get("generation").and_then(Value::as_i64) != Some(retained_generation)
+        || retained_source.get("source").and_then(Value::as_str) != Some("stream")
+    {
+        return Err(Error::new(
+            "stale_generation",
+            "Claude resume source state does not match the retained Agent generation",
+        ));
+    }
+    let families = retained_source
+        .get("families")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::new("unknown", "Claude resume source state omitted its families"))?;
+    if ["session", "turn", "message"]
+        .iter()
+        .any(|family| !families.iter().any(|value| value.as_str() == Some(family)))
+    {
+        return Err(Error::new(
+            "unknown",
+            "Claude retained source did not own the required event families",
+        ));
+    }
+    if !source_state.contains_key("current_turn") {
+        return Err(Error::new(
+            "unknown",
+            "Claude resume readback omitted current_turn",
+        ));
+    }
+    Ok(ResumeSubject {
+        native_scope,
+        native_ref,
+    })
+}
+
+/// Realign a resumed session with the frozen profile before readiness. The
+/// model setter has no readback payload, so its success is the application
+/// proof; the permission setter echoes its mode, which must match. A lost or
+/// timed-out setter reply is `unknown`, never a silent keep.
+async fn realign_resumed_settings(
+    client: &ClaudeClient,
+    requested_model: &str,
+    requested_mode: Option<&str>,
+    current_mode: Option<String>,
+) -> Result<Option<String>> {
+    client
+        .control(
+            "set_model",
+            json!({"model": requested_model}),
+            Instant::now() + RPC_TIMEOUT,
+        )
+        .await
+        .map_err(|error| setter_error(error, "set_model"))?;
+    let mut effective_mode = current_mode;
+    if let Some(requested) = requested_mode
+        && effective_mode.as_deref() != Some(requested)
+    {
+        let echo = client
+            .control(
+                "set_permission_mode",
+                json!({"mode": requested}),
+                Instant::now() + RPC_TIMEOUT,
+            )
+            .await
+            .map_err(|error| setter_error(error, "set_permission_mode"))?;
+        if echo.get("mode").and_then(Value::as_str) != Some(requested) {
+            return Err(Error::new(
+                "profile_error",
+                "Claude set_permission_mode did not echo the requested mode",
+            ));
+        }
+        effective_mode = Some(requested.to_owned());
+    }
+    Ok(effective_mode)
+}
+
+fn setter_error(error: Error, subtype: &str) -> Error {
+    if native_no_write(&error.code) {
+        contextual_error(
+            error,
+            "profile_error",
+            format!("Claude {subtype} was not dispatched"),
+        )
+    } else {
+        contextual_error(
+            error,
+            "unknown",
+            format!("Claude {subtype} may have changed native state; it will not be repeated"),
+        )
+    }
+}
+
 fn claude_manifest() -> PluginManifest {
     let controlled = BTreeMap::from([
         ("message".to_owned(), "stream".to_owned()),
+        ("request".to_owned(), "stream".to_owned()),
         ("session".to_owned(), "stream".to_owned()),
         ("turn".to_owned(), "stream".to_owned()),
     ]);
@@ -1164,9 +1469,12 @@ fn claude_manifest() -> PluginManifest {
         mode: "per_agent".to_owned(),
         verbs: vec![
             "launch".to_owned(),
+            "resume".to_owned(),
             "send".to_owned(),
-            "stop".to_owned(),
             "interrupt".to_owned(),
+            "approve".to_owned(),
+            "deny".to_owned(),
+            "stop".to_owned(),
         ],
         child_verbs: Vec::new(),
         features: eliot_plugin::protocol::ManifestFeatures {
@@ -1226,6 +1534,7 @@ fn known_command(session: &AgentSession, command_id: &str) -> bool {
     session.start_command_id == command_id
         || session.command_inputs.contains_key(command_id)
         || session.interrupt_applied.contains_key(command_id)
+        || session.reply_outcomes.contains_key(command_id)
         || session.stop_command_id.as_deref() == Some(command_id)
 }
 
@@ -1260,16 +1569,30 @@ fn validate_source_plan(source_plan: Option<&Value>) -> Result<()> {
             "Claude start requires an installed stream source plan",
         ));
     };
-    if ["session", "turn", "message"]
+    if ["session", "turn", "message", "request"]
         .iter()
         .any(|family| plan.get(*family).and_then(Value::as_str) != Some("stream"))
     {
         return Err(Error::new(
             "unsupported",
-            "Claude start requires stream ownership for session, turn, and message",
+            "Claude start requires stream ownership for session, turn, message, and request",
         ));
     }
     Ok(())
+}
+
+fn optional_profile_text(
+    profile: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<String>> {
+    match profile.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(value.clone())),
+        Some(_) => Err(Error::new(
+            "profile_error",
+            format!("Claude profile field {key} must be a non-empty string"),
+        )),
+    }
 }
 
 fn contextual_error(error: Error, code: impl Into<String>, message: impl Into<String>) -> Error {
@@ -1350,7 +1673,9 @@ fn is_secret_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{claude_manifest, claude_scope, new_uuid, validate_source_plan};
+    use super::{
+        claude_manifest, claude_scope, new_uuid, parse_resume_subject, validate_source_plan,
+    };
     use serde_json::json;
     use std::collections::{BTreeMap, HashSet};
 
@@ -1373,7 +1698,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_advertises_the_pr1_slice() {
+    fn manifest_advertises_the_pr2_slice() {
         let manifest = claude_manifest();
         assert_eq!(manifest.name, "claude");
         assert_eq!(manifest.protocol, "eliot-plugin/1");
@@ -1381,9 +1706,12 @@ mod tests {
             manifest.verbs,
             vec![
                 "launch".to_owned(),
+                "resume".to_owned(),
                 "send".to_owned(),
+                "interrupt".to_owned(),
+                "approve".to_owned(),
+                "deny".to_owned(),
                 "stop".to_owned(),
-                "interrupt".to_owned()
             ]
         );
         assert!(!manifest.features.start_requires_input);
@@ -1391,6 +1719,7 @@ mod tests {
             manifest.sources["controlled"],
             BTreeMap::from([
                 ("message".to_owned(), "stream".to_owned()),
+                ("request".to_owned(), "stream".to_owned()),
                 ("session".to_owned(), "stream".to_owned()),
                 ("turn".to_owned(), "stream".to_owned()),
             ])
@@ -1415,6 +1744,7 @@ mod tests {
                 "session": "stream",
                 "turn": "stream",
                 "message": "stream",
+                "request": "stream",
             })))
             .is_ok()
         );
@@ -1422,8 +1752,100 @@ mod tests {
             validate_source_plan(Some(&json!({
                 "session": "stream",
                 "turn": "stream",
+                "message": "stream",
             })))
             .is_err()
+        );
+    }
+
+    fn resume_source_state(agent_id: &str) -> serde_json::Value {
+        json!({
+            "retained_generation": 1,
+            "retained_source": {
+                "agent_id": agent_id,
+                "generation": 1,
+                "source": "stream",
+                "families": ["session", "turn", "message"],
+            },
+            "current_turn": null,
+        })
+    }
+
+    #[test]
+    fn resume_subject_requires_exact_scope_ref_and_continuity() {
+        let agent_id = "agent-1";
+        let state = resume_source_state(agent_id);
+        let subject = parse_resume_subject(
+            &json!({"native_scope": "scope-1", "native_ref": "ref-1"}),
+            Some(&state),
+            agent_id,
+            2,
+        )
+        .expect("valid resume subject");
+        assert_eq!(subject.native_scope, "scope-1");
+        assert_eq!(subject.native_ref, "ref-1");
+
+        // Shape violations are invalid; continuity violations are stale or
+        // unknown, never silently adopted.
+        assert!(
+            parse_resume_subject(
+                &json!({"native_scope": "scope-1"}),
+                Some(&state),
+                agent_id,
+                2,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_resume_subject(
+                &json!({"native_scope": "scope-1", "native_ref": "  "}),
+                Some(&state),
+                agent_id,
+                2,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            parse_resume_subject(
+                &json!({"native_scope": "scope-1", "native_ref": "ref-1"}),
+                Some(&state),
+                agent_id,
+                3,
+            )
+            .unwrap_err()
+            .code,
+            "stale_generation"
+        );
+        assert_eq!(
+            parse_resume_subject(
+                &json!({"native_scope": "scope-1", "native_ref": "ref-1"}),
+                None,
+                agent_id,
+                2,
+            )
+            .unwrap_err()
+            .code,
+            "unknown"
+        );
+        assert_eq!(
+            parse_resume_subject(
+                &json!({"native_scope": "scope-1", "native_ref": "ref-1"}),
+                Some(&json!({
+                    "retained_generation": 1,
+                    "retained_source": {
+                        "agent_id": "another-agent",
+                        "generation": 1,
+                        "source": "stream",
+                        "families": ["session", "turn", "message"],
+                    },
+                    "current_turn": null,
+                })),
+                agent_id,
+                2,
+            )
+            .unwrap_err()
+            .code,
+            "stale_generation"
         );
     }
 }

@@ -30,9 +30,10 @@ effort = "medium"
 # Claude Code CLI (per-Agent `claude -p` stream-json). Point cmd at the
 # installed native executable, not a wrapper, so stop ends the owned CLI.
 # The model id must exist in the initialize models catalogue; Eliot mints
-# the session id and each turn uuid. Permission modes, approvals, resume
-# and configure land in the follow-up slice.
+# the session id and each turn uuid. The optional approval is the CLI
+# permission-mode vocabulary; unset means the CLI-default posture.
 [profiles.claude]
 harness = "claude"
 cmd = "C:/Users/test/.local/bin/claude.exe"
 model = "claude-opus-4-6"
+# approval = "plan"
