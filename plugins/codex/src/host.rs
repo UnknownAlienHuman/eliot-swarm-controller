@@ -719,6 +719,24 @@ impl CodexPlugin {
             Ok((effort, scope)) => (effort, scope),
             Err(error) => {
                 let error = discard_failed_start(&mut session, error).await;
+                if session.phase == SessionPhase::Unknown {
+                    self.session = Some(session);
+                    return Err(unconfirmed_pre_dispatch_error(
+                        error,
+                        "owned app-server cleanup is unconfirmed; no thread or input was sent",
+                    ));
+                }
+                // Residual unknown from any missed read path becomes deterministic
+                // after confirmed cleanup; no thread/resume/input was dispatched.
+                let error = if error.code == "unknown" {
+                    let message = format!(
+                        "Codex pre-dispatch metadata read failed before thread dispatch: {}",
+                        error.message
+                    );
+                    pre_dispatch_read_error(error, "profile_error", &message)
+                } else {
+                    error
+                };
                 self.failed_start = Some(FailedStart {
                     agent_id: params.agent_id,
                     generation: params.generation,
@@ -761,8 +779,16 @@ impl CodexPlugin {
                     "Codex resume preflight failed before thread/resume dispatch: {}",
                     error.message
                 );
-                let error = contextual_error(error, "native_readback", message);
+                // Only prerequisite reads ran; native thread effects were not dispatched.
+                let error = pre_dispatch_read_error(error, "native_readback", &message);
                 let error = discard_failed_start(&mut session, error).await;
+                if session.phase == SessionPhase::Unknown {
+                    self.session = Some(session);
+                    return Err(unconfirmed_pre_dispatch_error(
+                        error,
+                        "owned app-server cleanup is unconfirmed; no thread/resume or input was sent",
+                    ));
+                }
                 self.failed_start = Some(FailedStart {
                     agent_id: params.agent_id,
                     generation: params.generation,
@@ -1013,7 +1039,12 @@ impl CodexPlugin {
                 .call("initialize", init_value, Instant::now() + RPC_TIMEOUT)
                 .await
                 .map_err(|error| {
-                    contextual_error(error, "profile_error", "Codex app-server initialize failed")
+                    // Only prerequisite reads ran; no thread or input was dispatched.
+                    pre_dispatch_read_error(
+                        error,
+                        "profile_error",
+                        "Codex app-server initialize failed",
+                    )
                 })?,
         )
         .map_err(|_| {
@@ -1041,7 +1072,8 @@ impl CodexPlugin {
             .notify("initialized", None, Instant::now() + RPC_TIMEOUT)
             .await
             .map_err(|error| {
-                contextual_error(
+                // Only prerequisite reads ran; no thread or input was dispatched.
+                pre_dispatch_read_error(
                     error,
                     "profile_error",
                     "Codex app-server did not accept initialized",
@@ -1056,7 +1088,19 @@ impl CodexPlugin {
             context.metadata_secrets,
             Instant::now() + RPC_TIMEOUT,
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            // Only prerequisite reads ran; no thread or input was dispatched.
+            if error.code == "unknown" {
+                pre_dispatch_read_error(
+                    error,
+                    "native_scope_unverified",
+                    "Codex native store selection could not be verified",
+                )
+            } else {
+                error
+            }
+        })?;
         let native_scope = context.store.native_scope.clone();
 
         if context.route.requires_chatgpt() {
@@ -1068,7 +1112,8 @@ impl CodexPlugin {
                 )
                 .await
                 .map_err(|error| {
-                    contextual_error(error, "profile_error", "Codex account/read failed")
+                    // Only prerequisite reads ran; no thread or input was dispatched.
+                    pre_dispatch_read_error(error, "profile_error", "Codex account/read failed")
                 })?;
             if account
                 .get("account")
@@ -1094,7 +1139,8 @@ impl CodexPlugin {
             )
             .await
             .map_err(|error| {
-                contextual_error(
+                // Only prerequisite reads ran; no thread or input was dispatched.
+                pre_dispatch_read_error(
                     error,
                     "profile_error",
                     "Codex config/read could not verify the per-process route",
@@ -1886,11 +1932,14 @@ async fn terminate_session(session: &mut AgentSession, force: bool) -> Result<()
 
 async fn discard_unstarted(session: &mut AgentSession) {
     session.events.close().await;
-    let _ = session
+    session.phase = match session
         .native
         .terminate(true, Instant::now() + RPC_TIMEOUT)
-        .await;
-    session.phase = SessionPhase::Stopped;
+        .await
+    {
+        Ok(_) => SessionPhase::Stopped,
+        Err(_) => SessionPhase::Unknown,
+    };
 }
 
 async fn discard_failed_start(session: &mut AgentSession, error: Error) -> Error {
@@ -1917,7 +1966,8 @@ async fn discover_model(client: &NativeClient, requested_model: &str) -> Result<
             )
             .await
             .map_err(|error| {
-                contextual_error(
+                // Only prerequisite reads ran; no thread or input was dispatched.
+                pre_dispatch_read_error(
                     error,
                     "profile_error",
                     "Codex model/list did not return a catalogue page",
@@ -2456,6 +2506,25 @@ pub(crate) fn contextual_error(
     eliot_plugin::session::contextual_error(error, code, message)
 }
 
+/// Recode a pre-dispatch read failure to its deterministic code after proven
+/// no native effect. Only prerequisite reads ran; no thread/resume/input was
+/// dispatched. Unlike `contextual_error` (which preserves unknown for uncertain
+/// writes), this forcibly recodes even transport-unknown reads, because the
+/// read proved no native write. Callers retain failed_start only after
+/// confirmed cleanup; unconfirmed custody retains session+unknown separately.
+fn pre_dispatch_read_error(error: Error, code: &str, message: &str) -> Error {
+    error.with_code(code).with_message(message)
+}
+
+/// Recode any pre-dispatch failure to unknown when owned cleanup is
+/// unconfirmed. No thread/resume/input was dispatched, but the child may still
+/// hold custody, so the session is retained and the daemon must not treat this
+/// as settled.
+fn unconfirmed_pre_dispatch_error(error: Error, context: &str) -> Error {
+    let message = format!("{}; {context}", error.message);
+    error.with_code("unknown").with_message(message)
+}
+
 fn optional_profile_text(
     profile: &serde_json::Map<String, Value>,
     key: &str,
@@ -2585,10 +2654,11 @@ fn codex_manifest() -> PluginManifest {
 #[cfg(test)]
 mod tests {
     use super::{
-        CodexPlugin, CodexRoute, Initialized, NativeLaunch, codex_manifest, frozen_store_binding,
-        target_environment, validate_resume_preflight,
+        CodexPlugin, CodexRoute, FailedStart, Initialized, NativeLaunch, codex_manifest,
+        contextual_error, frozen_store_binding, pre_dispatch_read_error, target_environment,
+        unconfirmed_pre_dispatch_error, validate_resume_preflight,
     };
-    use eliot_core::SecretPolicy;
+    use eliot_core::{Error, SecretPolicy, StderrSnapshot, StderrSource};
     use serde_json::json;
     use std::{ffi::OsString, path::PathBuf};
 
@@ -2826,5 +2896,164 @@ mod tests {
         }
         let unretained_newest = Some(("unretained", "completed"));
         assert!(validate_resume_preflight(Some("notLoaded"), None, unretained_newest).is_err());
+    }
+
+    fn dummy_diagnostics() -> (StderrSnapshot, StderrSnapshot) {
+        let snapshot = StderrSnapshot {
+            text: "dummy diagnostic".to_owned(),
+            truncated: false,
+            eof: true,
+            read_error: false,
+        };
+        (snapshot.clone(), snapshot)
+    }
+
+    #[test]
+    fn pre_dispatch_read_recodes_unknown_to_deterministic_with_diagnostics() {
+        let (plugin_tail, harness_tail) = dummy_diagnostics();
+        // Each pre-dispatch read owns its deterministic code; transport-unknown
+        // before thread dispatch becomes that code after confirmed cleanup.
+        for (code, message) in [
+            ("profile_error", "Codex app-server initialize failed"),
+            ("profile_error", "Codex account/read failed"),
+            (
+                "profile_error",
+                "Codex config/read could not verify the per-process route",
+            ),
+            (
+                "profile_error",
+                "Codex model/list did not return a catalogue page",
+            ),
+            (
+                "native_scope_unverified",
+                "Codex native store selection could not be verified",
+            ),
+        ] {
+            let unknown = Error::new("unknown", "dummy transport unknown")
+                .with_stderr(StderrSource::Plugin, plugin_tail.clone())
+                .with_stderr(StderrSource::Harness, harness_tail.clone());
+            let recoded = pre_dispatch_read_error(unknown, code, message);
+            assert_eq!(recoded.code, code);
+            assert_eq!(recoded.message, message);
+            assert_eq!(recoded.diagnostics.len(), 2);
+            // The write guard would preserve unknown verbatim; reads must not.
+            let preserved = contextual_error(
+                Error::new("unknown", "dummy transport unknown"),
+                code,
+                message,
+            );
+            assert_eq!(preserved.code, "unknown");
+        }
+        // Preflight preserves its cause for debugging while still recoding.
+        let unknown = Error::new("unknown", "dummy transport unknown");
+        let message = format!(
+            "Codex resume preflight failed before thread/resume dispatch: {}",
+            unknown.message
+        );
+        let recoded = pre_dispatch_read_error(unknown, "native_readback", &message);
+        assert_eq!(recoded.code, "native_readback");
+        assert!(recoded.message.contains("before thread/resume dispatch"));
+        assert!(recoded.message.contains("dummy transport unknown"));
+    }
+
+    #[test]
+    fn unconfirmed_pre_dispatch_cleanup_retains_unknown_with_no_thread_proof() {
+        let (plugin_tail, harness_tail) = dummy_diagnostics();
+        for context in [
+            "owned app-server cleanup is unconfirmed; no thread or input was sent",
+            "owned app-server cleanup is unconfirmed; no thread/resume or input was sent",
+        ] {
+            for error in [
+                Error::new("profile_error", "dummy deterministic read failure"),
+                Error::new("unknown", "dummy transport unknown"),
+            ] {
+                let error = error
+                    .with_stderr(StderrSource::Plugin, plugin_tail.clone())
+                    .with_stderr(StderrSource::Harness, harness_tail.clone());
+                let unconfirmed = unconfirmed_pre_dispatch_error(error, context);
+                assert_eq!(unconfirmed.code, "unknown");
+                assert!(unconfirmed.message.contains("cleanup is unconfirmed"));
+                assert!(unconfirmed.message.contains("no thread"));
+                assert_eq!(unconfirmed.diagnostics.len(), 2);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_start_retry_replays_deterministic_read_without_io() {
+        // The writer task pends unwritten; failed-start replay returns before
+        // any peer use, spawn, or native call, so no fixture I/O is needed.
+        let peer = eliot_plugin::Peer::stdio();
+        let client = peer.client();
+        let read_error = pre_dispatch_read_error(
+            Error::new("unknown", "dummy transport unknown"),
+            "profile_error",
+            "Codex account/read failed",
+        );
+        assert_eq!(read_error.code, "profile_error");
+        let mut plugin = CodexPlugin {
+            failed_start: Some(FailedStart {
+                agent_id: "a1".to_owned(),
+                generation: 1,
+                command_id: "cmd-1".to_owned(),
+                error: read_error.clone(),
+            }),
+            ..CodexPlugin::default()
+        };
+        // No initialized state is installed; replay still answers from retention.
+        let params = json!({"agent_id": "a1", "generation": 1, "command_id": "cmd-1"});
+        let replayed = plugin
+            .start(&params, &client)
+            .await
+            .expect_err("retained read failure replays");
+        assert_eq!(replayed.code, read_error.code);
+        assert_eq!(replayed.message, read_error.message);
+        assert!(plugin.session.is_none(), "zero thread/input retained");
+        assert!(plugin.failed_start.is_some(), "retained exactly once");
+        // A different start command is refused without new native I/O.
+        let params = json!({"agent_id": "a1", "generation": 1, "command_id": "cmd-2"});
+        let refused = plugin
+            .start(&params, &client)
+            .await
+            .expect_err("different start is refused");
+        assert_eq!(refused.code, "bad_state");
+        assert!(
+            plugin.session.is_none(),
+            "zero create/resume/input on refusal"
+        );
+    }
+
+    #[test]
+    fn lost_write_stays_unknown_exactly_once_via_guard() {
+        let (plugin_tail, harness_tail) = dummy_diagnostics();
+        // A lost thread/start reply preserves unknown verbatim; the daemon sees
+        // unknown and skips its settled cleanup, while the plugin retains the
+        // session so the write is never repeated.
+        let unknown = Error::new("unknown", "dummy uncertain thread/start outcome")
+            .with_stderr(StderrSource::Plugin, plugin_tail.clone())
+            .with_stderr(StderrSource::Harness, harness_tail.clone());
+        let before = serde_json::to_value(&unknown).expect("serialize unknown");
+        let preserved = contextual_error(
+            unknown,
+            "unknown",
+            "Codex thread/start may have changed native state; it will not be repeated",
+        );
+        assert_eq!(preserved.code, "unknown");
+        assert_eq!(preserved.message, "dummy uncertain thread/start outcome");
+        assert_eq!(preserved.diagnostics.len(), 2);
+        assert_eq!(
+            serde_json::to_value(&preserved).expect("serialize preserved"),
+            before
+        );
+        // A proven rejection still recodes; only uncertain writes stay unknown.
+        let rejected = Error::new("native_rejected", "native refused admission");
+        let recoded = contextual_error(rejected, "profile_error", "context message");
+        assert_eq!(recoded.code, "profile_error");
+        // The retained-session retry names its exactly-once guard explicitly.
+        let retry = Error::new(
+            "unknown",
+            "Codex thread/start outcome is unresolved; it will not be repeated",
+        );
+        assert!(retry.message.contains("will not be repeated"));
     }
 }

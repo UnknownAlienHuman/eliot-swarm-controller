@@ -119,6 +119,8 @@ fn main() {
         println!("ok - controls are rejected once the source is unknown");
         scenario_lost_setter_reply_is_unknown_without_rewrite().await;
         println!("ok - lost setter reply is unknown without a second write");
+        scenario_model_list_failure_is_profile_error_without_write().await;
+        println!("ok - model/list failure is profile_error without a write");
         scenario_launch_approval_is_adopted_and_verified().await;
         println!("ok - launch approval is adopted and verified");
         scenario_approval_mismatch_is_rejected_before_ready().await;
@@ -309,7 +311,13 @@ impl FakeMsp {
                 );
                 self.reply(stdout, &id, self.initialize_result())
             }
-            "model/list" => self.reply(stdout, &id, self.model_list_result()),
+            "model/list" => {
+                if self.script == "model-list-internal-error" {
+                    self.reply_error(stdout, &id, -32603, "Internal error");
+                    return true;
+                }
+                self.reply(stdout, &id, self.model_list_result())
+            }
             "session/start" => {
                 let session_id = format!("fake-session-{}", self.counts["session/start"]);
                 self.session_id = Some(session_id.clone());
@@ -4723,6 +4731,59 @@ async fn scenario_lost_setter_reply_is_unknown_without_rewrite() {
         attempt.report()["counts"]["session/setReasoningEffort"],
         json!(1)
     );
+    let _ = std::fs::remove_dir_all(&attempt.root);
+}
+
+/// A read-only `model/list` internal error is `profile_error`, never
+/// `unknown`: no session/start/resume/input was dispatched, and confirmed
+/// cleanup retains only the failed start for daemon cleanup.
+async fn scenario_model_list_failure_is_profile_error_without_write() {
+    let agent_id = ulid::Ulid::new().to_string();
+    let (pending, rx) = Scenario::setup_start(
+        "model-list-internal-error",
+        muse_profile(),
+        agent_id,
+        1,
+        Value::Null,
+        Value::Null,
+    )
+    .await;
+    let mut attempt = pending.finish_expecting_error(rx, "profile_error").await;
+
+    // Read-only catalog query ran once; no session effect was dispatched.
+    let report = attempt.report();
+    assert_eq!(report["counts"]["model/list"], json!(1));
+    assert_eq!(report["session_starts"], json!(0));
+    assert_eq!(report["session_resumes"], json!(0));
+    assert_eq!(report["turn_starts"], json!(0));
+
+    // Retained retry replays the stored error without new native I/O.
+    attempt.retry("profile_error").await;
+    assert_eq!(attempt.report()["counts"]["model/list"], json!(1));
+    assert_eq!(attempt.report()["session_starts"], json!(0));
+
+    // Confirmed cleanup retained only the failed start: no owned session.
+    let stop = attempt
+        .host
+        .call(
+            "agent.stop",
+            json!({
+                "agent_id": attempt.agent_id.clone(),
+                "generation": 1,
+                "command_id": ulid::Ulid::new().to_string(),
+                "force": false,
+            }),
+        )
+        .await;
+    assert_eq!(stop, Err("not_found".to_owned()));
+
+    attempt
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    attempt.host.shutdown_child().await;
+    assert_eq!(attempt.report()["counts"]["model/list"], json!(1));
     let _ = std::fs::remove_dir_all(&attempt.root);
 }
 

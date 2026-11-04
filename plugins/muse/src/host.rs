@@ -489,6 +489,14 @@ impl MusePlugin {
             Ok(initialized) => initialized,
             Err(error) => {
                 let error = discard_failed_start(&mut session, error).await;
+                if session.phase == SessionPhase::Unknown {
+                    let message = format!(
+                        "{}; owned session host cleanup is unconfirmed; no session/start/resume or input was sent",
+                        error.message
+                    );
+                    self.session = Some(session);
+                    return Err(error.with_code("unknown").with_message(message));
+                }
                 return Err(self.retain_failed_start(&params, error));
             }
         };
@@ -2015,11 +2023,14 @@ async fn discover_model(
         )
         .await
         .map_err(|error| {
-            contextual_error(
-                error,
-                "profile_error",
-                "Muse model/list did not return a catalogue",
-            )
+            // Read-only catalog query before any session effect: even a
+            // transport/internal `unknown` proves no session/start/resume/input
+            // was dispatched. Confirmed cleanup reports `profile_error`.
+            let message = format!(
+                "Muse model/list did not return a catalogue before session/start/resume/input: {}",
+                error.message
+            );
+            error.with_code("profile_error").with_message(message)
         })?;
     let catalog: NativeModelListResult = serde_json::from_value(response).map_err(|_| {
         Error::new(
