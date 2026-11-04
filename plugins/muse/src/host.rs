@@ -687,13 +687,33 @@ impl MusePlugin {
                 .await
             {
                 Ok(value) => value,
-                Err(error) => {
+                Err(error) if error.code == "native_rejected" => {
                     let error = discard_failed_start(
                         &mut session,
                         contextual_error(
                             error,
                             "profile_error",
                             "Muse session/setReasoningEffort did not admit the profile effort",
+                        ),
+                    )
+                    .await;
+                    return Err(self.retain_failed_start(&params, error));
+                }
+                Err(error) if native_no_write(&error.code) => {
+                    let message = "Muse session/setReasoningEffort was not dispatched".to_owned();
+                    let code = error.code.clone();
+                    let error =
+                        discard_failed_start(&mut session, contextual_error(error, code, message))
+                            .await;
+                    return Err(self.retain_failed_start(&params, error));
+                }
+                Err(error) => {
+                    let error = discard_failed_start(
+                        &mut session,
+                        contextual_error(
+                            error,
+                            "unknown",
+                            "Muse session/setReasoningEffort may have changed native state; it will not be repeated",
                         ),
                     )
                     .await;
@@ -774,13 +794,33 @@ impl MusePlugin {
                 .await
             {
                 Ok(value) => value,
-                Err(error) => {
+                Err(error) if error.code == "native_rejected" => {
                     let error = discard_failed_start(
                         &mut session,
                         contextual_error(
                             error,
                             "profile_error",
                             "Muse session/setModel did not admit the profile model",
+                        ),
+                    )
+                    .await;
+                    return Err(self.retain_failed_start(&params, error));
+                }
+                Err(error) if native_no_write(&error.code) => {
+                    let message = "Muse session/setModel was not dispatched".to_owned();
+                    let code = error.code.clone();
+                    let error =
+                        discard_failed_start(&mut session, contextual_error(error, code, message))
+                            .await;
+                    return Err(self.retain_failed_start(&params, error));
+                }
+                Err(error) => {
+                    let error = discard_failed_start(
+                        &mut session,
+                        contextual_error(
+                            error,
+                            "unknown",
+                            "Muse session/setModel may have changed native state; it will not be repeated",
                         ),
                     )
                     .await;
@@ -844,13 +884,33 @@ impl MusePlugin {
                 .await
             {
                 Ok(value) => value,
-                Err(error) => {
+                Err(error) if error.code == "native_rejected" => {
                     let error = discard_failed_start(
                         &mut session,
                         contextual_error(
                             error,
                             "profile_error",
                             "Muse session/setApprovalMode did not admit the profile approval mode",
+                        ),
+                    )
+                    .await;
+                    return Err(self.retain_failed_start(&params, error));
+                }
+                Err(error) if native_no_write(&error.code) => {
+                    let message = "Muse session/setApprovalMode was not dispatched".to_owned();
+                    let code = error.code.clone();
+                    let error =
+                        discard_failed_start(&mut session, contextual_error(error, code, message))
+                            .await;
+                    return Err(self.retain_failed_start(&params, error));
+                }
+                Err(error) => {
+                    let error = discard_failed_start(
+                        &mut session,
+                        contextual_error(
+                            error,
+                            "unknown",
+                            "Muse session/setApprovalMode may have changed native state; it will not be repeated",
                         ),
                     )
                     .await;
@@ -927,7 +987,7 @@ impl MusePlugin {
             "cwd": native_session.workspace_root.clone(),
             "effort": initialized_native.effort.clone(),
             "effort_verified": effort_verified,
-            "approval": requested_approval.clone(),
+            "approval": effective_approval.clone(),
             "approval_verified": approval_verified,
             "schema_fingerprint": initialized_native.fingerprint.clone(),
         });
@@ -1347,13 +1407,11 @@ impl MusePlugin {
             }
         };
         if !live {
-            let result = rejected_control("Muse steer does not match a healthy active turn");
-            settle_control(
-                session,
-                &params.command_id,
-                ControlOutcome::Rejected(result.clone()),
-            );
-            return Ok(result);
+            abandon_control(session, &params.command_id);
+            return Err(Error::new(
+                "stale_turn",
+                "Muse turn/steer does not match the exact active turn",
+            ));
         }
         let Some(native_session) = session.session_id.clone() else {
             let result = unknown_control("Muse session identity is unresolved");
@@ -1373,8 +1431,14 @@ impl MusePlugin {
             }],
             session_id: native_session,
         };
-        let encoded = serde_json::to_value(steer_params)
-            .map_err(|_| Error::new("internal", "Muse turn/steer params could not be encoded"))?;
+        let encoded = match serde_json::to_value(steer_params) {
+            Ok(encoded) => encoded,
+            Err(_) => {
+                let result = unknown_control("Muse turn/steer params could not be encoded");
+                settle_control(session, &params.command_id, ControlOutcome::Unknown);
+                return Ok(result);
+            }
+        };
         let response = session
             .native_client
             .call("turn/steer", encoded, Instant::now() + RPC_TIMEOUT)
@@ -1399,8 +1463,14 @@ impl MusePlugin {
                 Ok(result)
             }
             Ok(value) => {
-                let steered: NativeTurnSteerResult = serde_json::from_value(value)
-                    .map_err(|_| Error::new("internal", "Muse turn/steer response was invalid"))?;
+                let steered: NativeTurnSteerResult = match serde_json::from_value(value) {
+                    Ok(steered) => steered,
+                    Err(_) => {
+                        let result = unknown_control("Muse turn/steer response was invalid");
+                        settle_control(session, &params.command_id, ControlOutcome::Unknown);
+                        return Ok(result);
+                    }
+                };
                 if steered.command_id != native_command_id
                     || steered.status != "accepted"
                     || steered.turn_id != turn_id
@@ -1451,6 +1521,15 @@ impl MusePlugin {
                 "Muse plugin is stopping; no further input is accepted",
             ));
         }
+        if session.phase != SessionPhase::Ready || session.events.status().source_unknown {
+            let result = rejected_control("Muse interrupt does not match a healthy active turn");
+            settle_control(
+                session,
+                &params.command_id,
+                ControlOutcome::Rejected(result.clone()),
+            );
+            return Ok(result);
+        }
         // The turn itself is gated authoritatively: the event task owns the
         // active turn and answers behind the terminal commit, so an interrupt
         // that arrives after the terminal batch sees `stale_turn` instead of
@@ -1486,8 +1565,14 @@ impl MusePlugin {
             session_id: native_session,
             turn_id: Some(turn_id.to_owned()),
         };
-        let encoded = serde_json::to_value(cancel_params)
-            .map_err(|_| Error::new("internal", "Muse turn/cancel params could not be encoded"))?;
+        let encoded = match serde_json::to_value(cancel_params) {
+            Ok(encoded) => encoded,
+            Err(_) => {
+                let result = unknown_control("Muse turn/cancel params could not be encoded");
+                settle_control(session, &params.command_id, ControlOutcome::Unknown);
+                return Ok(result);
+            }
+        };
         let response = session
             .native_client
             .call("turn/cancel", encoded, Instant::now() + RPC_TIMEOUT)
@@ -1512,8 +1597,14 @@ impl MusePlugin {
                 Ok(result)
             }
             Ok(value) => {
-                let cancelled: NativeTurnCancelResult = serde_json::from_value(value)
-                    .map_err(|_| Error::new("internal", "Muse turn/cancel response was invalid"))?;
+                let cancelled: NativeTurnCancelResult = match serde_json::from_value(value) {
+                    Ok(cancelled) => cancelled,
+                    Err(_) => {
+                        let result = unknown_control("Muse turn/cancel response was invalid");
+                        settle_control(session, &params.command_id, ControlOutcome::Unknown);
+                        return Ok(result);
+                    }
+                };
                 if cancelled.command_id != native_command_id
                     || cancelled.status != "accepted"
                     || cancelled.turn_id != turn_id

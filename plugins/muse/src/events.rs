@@ -1846,7 +1846,19 @@ async fn run(
 ) {
     loop {
         let accept_frames = processor.accept_frames;
+        // Frames win over controls when both are ready: a `CheckTurn`
+        // arriving after the queued terminal frame must see the finished
+        // turn, never a still-live one.
         tokio::select! {
+            biased;
+            frame = frames.recv(), if accept_frames => {
+                if frame.is_none() {
+                    let current = *stream.borrow_and_update();
+                    processor.handle_stream_state(current).await;
+                }
+                processor.handle_frame(frame).await;
+                processor.report_gap_if_queue_empty(frames.is_empty()).await;
+            }
             changed = stream.changed(), if accept_frames => {
                 let current = match changed {
                     Ok(()) => *stream.borrow_and_update(),
@@ -1861,17 +1873,14 @@ async fn run(
                         if !processor.handle_control(control).await {
                             break;
                         }
+                        // Associate flushes buffered frames inline and request
+                        // handling defers loss the same way frames do; report
+                        // here too so a deferred gap never waits on a frame
+                        // that never comes.
+                        processor.report_gap_if_queue_empty(frames.is_empty()).await;
                     }
                     None => break,
                 }
-            }
-            frame = frames.recv(), if accept_frames => {
-                if frame.is_none() {
-                    let current = *stream.borrow_and_update();
-                    processor.handle_stream_state(current).await;
-                }
-                processor.handle_frame(frame).await;
-                processor.report_gap_if_queue_empty(frames.is_empty()).await;
             }
         }
         let _ = status_tx.send(processor.status.clone());

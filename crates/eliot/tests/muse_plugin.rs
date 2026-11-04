@@ -98,8 +98,12 @@ fn main() {
         println!("ok - interrupt after terminal is stale");
         scenario_control_interrupt_stale_retry_reevaluates().await;
         println!("ok - stale interrupt retry re-evaluates without a slot leak");
-        scenario_control_steer_rejected_for_stale_turn().await;
-        println!("ok - steer for a stale turn is rejected");
+        scenario_control_steer_stale_turn_is_an_error().await;
+        println!("ok - steer for a stale turn is stale_turn");
+        scenario_control_steer_after_terminal_is_stale().await;
+        println!("ok - steer after terminal on the finished turn is stale_turn");
+        scenario_control_terminal_race_refuses_both_controls().await;
+        println!("ok - queued terminal refuses interrupt and steer without a write");
         scenario_control_steer_missing_text_is_invalid().await;
         println!("ok - steer without text is invalid");
         scenario_control_steer_forwards_text_to_exact_turn().await;
@@ -108,6 +112,12 @@ fn main() {
         println!("ok - interrupt cancels a turn waiting on a request");
         scenario_control_steer_lost_reply_is_unknown_without_rewrite().await;
         println!("ok - lost steer reply is unknown without a second write");
+        scenario_control_bad_ack_is_unknown_without_rewrite().await;
+        println!("ok - bad control ack is unknown without a second write");
+        scenario_control_rejected_when_source_unknown().await;
+        println!("ok - controls are rejected once the source is unknown");
+        scenario_lost_setter_reply_is_unknown_without_rewrite().await;
+        println!("ok - lost setter reply is unknown without a second write");
         scenario_launch_approval_is_adopted_and_verified().await;
         println!("ok - launch approval is adopted and verified");
         scenario_approval_mismatch_is_rejected_before_ready().await;
@@ -350,6 +360,11 @@ impl FakeMsp {
                 self.emit(stdout, "session/started", json!({"session": session}));
             }
             "session/setReasoningEffort" => {
+                if self.script == "drop-effort-setter" {
+                    // Lost reply: exit without answering. The report already
+                    // records this receipt.
+                    std::process::exit(0);
+                }
                 let command = params.get("commandId").cloned().unwrap_or(Value::Null);
                 self.reply(
                     stdout,
@@ -641,6 +656,7 @@ impl FakeMsp {
                         | "decide-lost-reply"
                         | "turn-controls"
                         | "control-lost"
+                        | "control-bad-ack"
                 ) {
                     // Parked turn: the request opens now and the completion
                     // lands only after the scenario answers it. The bare
@@ -648,7 +664,7 @@ impl FakeMsp {
                     // and interrupts the live turn itself.
                     self.approval_stage = 1;
                     match self.script.as_str() {
-                        "turn-controls" | "control-lost" => {}
+                        "turn-controls" | "control-lost" | "control-bad-ack" => {}
                         "request-prompt" => {
                             let first = self.user_input_request_params(
                                 &session_id,
@@ -885,6 +901,16 @@ impl FakeMsp {
                     // records this receipt.
                     std::process::exit(0);
                 }
+                if self.script == "control-bad-ack" {
+                    // Malformed ack: valid JSON-RPC, but the result omits the
+                    // absorbing turn, so the plugin cannot prove what stopped.
+                    self.reply(
+                        stdout,
+                        &id,
+                        json!({"commandId": command, "status": "accepted"}),
+                    );
+                    return true;
+                }
                 self.reply(
                     stdout,
                     &id,
@@ -928,6 +954,17 @@ impl FakeMsp {
                     // Lost reply: exit without answering. The report already
                     // records this receipt.
                     std::process::exit(0);
+                }
+                if self.script == "control-bad-ack" {
+                    // Malformed ack: valid JSON-RPC, but the result omits the
+                    // absorbing turn, so the plugin cannot prove what absorbed
+                    // the text.
+                    self.reply(
+                        stdout,
+                        &id,
+                        json!({"commandId": command, "status": "accepted"}),
+                    );
+                    return true;
                 }
                 self.reply(
                     stdout,
@@ -3082,6 +3119,20 @@ async fn control(
     (command_id, result, committed)
 }
 
+/// Acknowledge one `source.gap` host request.
+async fn answer_source_gap(host: &mut Host, request: &HostRequest) {
+    let gap_id = request
+        .params
+        .get("gap_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let seq = host.next_seq;
+    host.next_seq += 1;
+    host.respond(&request.id, json!({"gap_id": gap_id, "seq": seq}))
+        .await;
+}
+
 /// Like `control_with_id`, but tolerates the dead host's stream gap arriving
 /// around the control: acknowledge it and keep waiting for the outcome.
 async fn control_tolerating_gaps(
@@ -3656,9 +3707,10 @@ async fn scenario_control_interrupt_stale_retry_reevaluates() {
     finish_scenario(scenario, false).await;
 }
 
-/// Steer against a turn that is not active: rejected locally, nothing
-/// commits, and the native lane is never touched.
-async fn scenario_control_steer_rejected_for_stale_turn() {
+/// Steer against a turn that is not active: the call itself fails
+/// `stale_turn` like interrupt, nothing commits, and the native lane is
+/// never touched.
+async fn scenario_control_steer_stale_turn_is_an_error() {
     let mut scenario = Scenario::start("turn-controls", muse_profile()).await;
     let agent_id = scenario.agent_id.clone();
 
@@ -3674,7 +3726,7 @@ async fn scenario_control_steer_rejected_for_stale_turn() {
         json!({"text": "stale does not steer"}),
     )
     .await;
-    assert_eq!(result.expect("steer responds")["state"], json!("rejected"));
+    assert_eq!(result, Err("stale_turn".to_owned()));
     assert!(committed.is_empty(), "stale steer must commit nothing");
     assert_eq!(scenario.report()["steers"], json!(0));
     let (_, end, mut committed) = control(
@@ -3688,6 +3740,226 @@ async fn scenario_control_steer_rejected_for_stale_turn() {
     .await;
     assert_eq!(end.expect("interrupt responds")["state"], json!("applied"));
     drain_turn_completed(&mut scenario.host, &agent_id, 1, &mut committed).await;
+    finish_scenario(scenario, false).await;
+}
+
+/// Steer after the terminal on the finished turn id: the call itself fails
+/// `stale_turn` with no native I/O, and the exact-command retry re-evaluates
+/// instead of replaying a leaked entry.
+async fn scenario_control_steer_after_terminal_is_stale() {
+    let mut scenario = Scenario::start("turn-controls", muse_profile()).await;
+    let agent_id = scenario.agent_id.clone();
+
+    let (_send_id, turn_id, _) =
+        send_parked(&mut scenario.host, &agent_id, 1, "Count the stars.", 0).await;
+    let (_, first, mut committed) = control(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "interrupt",
+        &turn_id,
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        first.expect("interrupt responds")["state"],
+        json!("applied")
+    );
+    drain_turn_completed(&mut scenario.host, &agent_id, 1, &mut committed).await;
+    let stale_id = ulid::Ulid::new().to_string();
+    let args = json!({"text": "too late to steer"});
+    let (second, committed) = control_with_id(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        &stale_id,
+        "steer",
+        &turn_id,
+        args.clone(),
+    )
+    .await;
+    assert_eq!(second, Err("stale_turn".to_owned()));
+    assert!(committed.is_empty(), "no batches may commit after terminal");
+    let (retry, committed) = control_with_id(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        &stale_id,
+        "steer",
+        &turn_id,
+        args,
+    )
+    .await;
+    assert_eq!(retry, Err("stale_turn".to_owned()));
+    assert!(
+        committed.is_empty(),
+        "the retry re-evaluates without writing"
+    );
+    assert_eq!(scenario.report()["steers"], json!(0));
+    assert_eq!(scenario.report()["interrupts"], json!(1));
+    finish_scenario(scenario, false).await;
+}
+
+/// The note-44 race: the fake's `turn/completed` is queued while the
+/// `message.completed` commit round-trips, and both controls are sent before
+/// the terminal commit is drained. Frames win, so both are refused with no
+/// native write.
+async fn scenario_control_terminal_race_refuses_both_controls() {
+    let mut scenario = Scenario::start("happy", muse_profile()).await;
+    let agent_id = scenario.agent_id.clone();
+
+    let send_id = ulid::Ulid::new().to_string();
+    let send_rx = scenario
+        .host
+        .begin_call(
+            "agent.command",
+            json!({
+                "agent_id": agent_id,
+                "generation": 1,
+                "command_id": send_id,
+                "verb": "send",
+                "args": {"text": "Say hello."},
+                "turn_id": null,
+                "request_id": null,
+            }),
+        )
+        .await;
+    let mut send_rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, send_rx));
+    // Pump until `message.completed` is answered: the send only applies
+    // after associate, and associate flushes whatever frames buffered
+    // early, so awaiting the applied response without pumping would stall
+    // the flush's ack. Answering `message.completed` proves associate
+    // finished, so the applied response needs no further test input. The
+    // loop breaks before the terminal put is touched: the fake emitted
+    // `turn/completed` with this batch and it waits queued.
+    let mut kinds: Vec<String> = Vec::new();
+    let mut applied = None;
+    while !kinds.iter().any(|kind| kind == "message.completed") {
+        tokio::select! {
+            biased;
+            request = scenario.host.next_request() => {
+                assert_eq!(request.method, "events.put");
+                let events = request
+                    .params
+                    .get("events")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                assert_eq!(events.len(), 1, "one native record per batch");
+                kinds.push(
+                    events[0]
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                );
+                let first = scenario.host.next_seq;
+                scenario.host.next_seq += 1;
+                scenario
+                    .host
+                    .respond(
+                        &request.id,
+                        json!({
+                            "first_seq": first,
+                            "last_seq": first,
+                            "cursor": request.params.get("cursor").cloned().unwrap_or(Value::Null),
+                        }),
+                    )
+                    .await;
+            }
+            result = &mut send_rx, if applied.is_none() => {
+                applied = Some(
+                    result
+                        .expect("send deadline")
+                        .expect("send response channel")
+                        .expect("send applied"),
+                );
+            }
+        }
+    }
+    assert_eq!(
+        kinds,
+        vec!["turn.started".to_owned(), "message.completed".to_owned()]
+    );
+    let applied = match applied {
+        Some(applied) => applied,
+        None => send_rx
+            .await
+            .expect("send deadline")
+            .expect("send response channel")
+            .expect("send applied"),
+    };
+    assert_eq!(
+        applied.get("state").and_then(Value::as_str),
+        Some("applied")
+    );
+    let turn_id = applied
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .expect("applied turn id")
+        .to_owned();
+    let interrupt_rx = scenario
+        .host
+        .begin_call(
+            "agent.command",
+            json!({
+                "agent_id": agent_id,
+                "generation": 1,
+                "command_id": ulid::Ulid::new().to_string(),
+                "verb": "interrupt",
+                "args": {},
+                "turn_id": turn_id,
+                "request_id": null,
+            }),
+        )
+        .await;
+    let interrupt_rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, interrupt_rx));
+    let steer_rx = scenario
+        .host
+        .begin_call(
+            "agent.command",
+            json!({
+                "agent_id": agent_id,
+                "generation": 1,
+                "command_id": ulid::Ulid::new().to_string(),
+                "verb": "steer",
+                "args": {"text": "too late to steer"},
+                "turn_id": turn_id,
+                "request_id": null,
+            }),
+        )
+        .await;
+    let steer_rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, steer_rx));
+    let terminal = scenario
+        .host
+        .answer_events_put(&agent_id, 1, "turn.completed")
+        .await;
+    assert_eq!(
+        terminal[0]
+            .get("data")
+            .and_then(|data| data.get("turn_id"))
+            .and_then(Value::as_str),
+        Some(turn_id.as_str())
+    );
+    assert_eq!(
+        terminal[0]
+            .get("data")
+            .and_then(|data| data.get("status"))
+            .and_then(Value::as_str),
+        Some("completed")
+    );
+    let interrupt = interrupt_rx
+        .await
+        .expect("interrupt deadline")
+        .expect("interrupt response channel");
+    assert_eq!(interrupt, Err("stale_turn".to_owned()));
+    let steer = steer_rx
+        .await
+        .expect("steer deadline")
+        .expect("steer response channel");
+    assert_eq!(steer, Err("stale_turn".to_owned()));
+    assert_eq!(scenario.report()["interrupts"], json!(0));
+    assert_eq!(scenario.report()["steers"], json!(0));
     finish_scenario(scenario, false).await;
 }
 
@@ -3839,6 +4111,160 @@ async fn scenario_control_steer_lost_reply_is_unknown_without_rewrite() {
     )
     .await;
     assert_eq!(retry["state"], json!("unknown"));
+    assert_eq!(scenario.report()["steers"], json!(1));
+    finish_scenario(scenario, true).await;
+}
+
+/// A malformed ack after the native write settles `unknown`, never a leaked
+/// `Pending`: the exact-command retry replays the retained unknown outcome
+/// without touching the native lane a second time. Both lanes share the
+/// settlement, so both are proved.
+async fn scenario_control_bad_ack_is_unknown_without_rewrite() {
+    let mut scenario = Scenario::start("control-bad-ack", muse_profile()).await;
+    let agent_id = scenario.agent_id.clone();
+
+    let (_send_id, turn_id, _) =
+        send_parked(&mut scenario.host, &agent_id, 1, "Count the stars.", 0).await;
+    let steer_id = ulid::Ulid::new().to_string();
+    let args = json!({"text": "absorb this"});
+    let (steer, committed) = control_with_id(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        &steer_id,
+        "steer",
+        &turn_id,
+        args.clone(),
+    )
+    .await;
+    assert_eq!(steer.expect("steer responds")["state"], json!("unknown"));
+    assert!(committed.is_empty(), "a bad ack commits nothing");
+    let (retry, committed) = control_with_id(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        &steer_id,
+        "steer",
+        &turn_id,
+        args,
+    )
+    .await;
+    assert_eq!(
+        retry.expect("steer retry responds")["state"],
+        json!("unknown")
+    );
+    assert!(committed.is_empty(), "the retry replays without writing");
+    assert_eq!(scenario.report()["steers"], json!(1));
+    let interrupt_id = ulid::Ulid::new().to_string();
+    let (interrupt, committed) = control_with_id(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        &interrupt_id,
+        "interrupt",
+        &turn_id,
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        interrupt.expect("interrupt responds")["state"],
+        json!("unknown")
+    );
+    assert!(committed.is_empty(), "a bad ack commits nothing");
+    let (retry, committed) = control_with_id(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        &interrupt_id,
+        "interrupt",
+        &turn_id,
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        retry.expect("interrupt retry responds")["state"],
+        json!("unknown")
+    );
+    assert!(committed.is_empty(), "the retry replays without writing");
+    assert_eq!(scenario.report()["interrupts"], json!(1));
+    finish_scenario(scenario, false).await;
+}
+
+/// Once the event source is unknown, both controls hit the readiness gate:
+/// `rejected` without a native write, even for the exact live turn.
+async fn scenario_control_rejected_when_source_unknown() {
+    let mut scenario = Scenario::start("control-lost", muse_profile()).await;
+    let agent_id = scenario.agent_id.clone();
+
+    let (_send_id, turn_id, _) =
+        send_parked(&mut scenario.host, &agent_id, 1, "Count the stars.", 0).await;
+    let lost_rx = scenario
+        .host
+        .begin_call(
+            "agent.command",
+            json!({
+                "agent_id": agent_id,
+                "generation": 1,
+                "command_id": ulid::Ulid::new().to_string(),
+                "verb": "steer",
+                "args": {"text": "lost on the wire"},
+                "turn_id": turn_id,
+                "request_id": null,
+            }),
+        )
+        .await;
+    let mut lost_rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, lost_rx));
+    // The dead host's stream gap lands on either side of the lost outcome;
+    // answer it wherever it falls, then wait for it if it has not arrived,
+    // so the readiness gate below reads the settled source state.
+    let mut saw_gap = false;
+    let lost = loop {
+        tokio::select! {
+            biased;
+            request = scenario.host.next_request() => {
+                assert_eq!(request.method, "source.gap");
+                answer_source_gap(&mut scenario.host, &request).await;
+                saw_gap = true;
+            }
+            result = &mut lost_rx => break result,
+        }
+    };
+    let lost = lost
+        .expect("steer deadline")
+        .expect("steer response channel")
+        .expect("steer responds");
+    assert_eq!(lost["state"], json!("unknown"));
+    if !saw_gap {
+        let request = scenario.host.next_request().await;
+        assert_eq!(request.method, "source.gap");
+        answer_source_gap(&mut scenario.host, &request).await;
+    }
+    let (_, interrupt, committed) = control(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "interrupt",
+        &turn_id,
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        interrupt.expect("interrupt responds")["state"],
+        json!("rejected")
+    );
+    assert!(committed.is_empty(), "a gated control commits nothing");
+    let (_, steer, committed) = control(
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "steer",
+        &turn_id,
+        json!({"text": "gated too"}),
+    )
+    .await;
+    assert_eq!(steer.expect("steer responds")["state"], json!("rejected"));
+    assert!(committed.is_empty(), "a gated control commits nothing");
+    assert_eq!(scenario.report()["interrupts"], json!(0));
     assert_eq!(scenario.report()["steers"], json!(1));
     finish_scenario(scenario, true).await;
 }
@@ -4259,6 +4685,51 @@ async fn scenario_lost_resume_reply_is_unknown_with_one_write() {
         .expect("shutdown");
     attempt.host.shutdown_child().await;
     assert_eq!(attempt.report()["session_resumes"], json!(1));
+    let _ = std::fs::remove_dir_all(&attempt.root);
+}
+
+/// A lost setter reply surfaces `unknown`, never `profile_error`: the write
+/// may have landed. The retained retry replays the stored error without a
+/// second native write.
+async fn scenario_lost_setter_reply_is_unknown_without_rewrite() {
+    let agent_id = ulid::Ulid::new().to_string();
+    let (pending, rx) = Scenario::setup_start(
+        "drop-effort-setter",
+        muse_profile(),
+        agent_id,
+        1,
+        Value::Null,
+        Value::Null,
+    )
+    .await;
+    let mut attempt = pending.finish_expecting_error(rx, "unknown").await;
+    assert_eq!(attempt.report()["session_starts"], json!(1));
+    assert_eq!(
+        attempt.report()["counts"]["session/setReasoningEffort"],
+        json!(1)
+    );
+
+    // The unknown setter is never dispatched again.
+    attempt.retry("unknown").await;
+    assert_eq!(attempt.report()["session_starts"], json!(1));
+    assert_eq!(
+        attempt.report()["counts"]["session/setReasoningEffort"],
+        json!(1)
+    );
+
+    // The discarded start installed no session, so there is nothing to
+    // stop: shut the plugin down like a pre-ready mismatch and confirm the
+    // setter went out exactly once.
+    attempt
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    attempt.host.shutdown_child().await;
+    assert_eq!(
+        attempt.report()["counts"]["session/setReasoningEffort"],
+        json!(1)
+    );
     let _ = std::fs::remove_dir_all(&attempt.root);
 }
 
