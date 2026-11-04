@@ -35,6 +35,33 @@ fn error_snippet(stderr: &str) -> String {
 
 /// Bounded readiness fact: whether the daemon published its endpoint record,
 /// without IPC or credentials. PIDs and endpoint lengths only.
+/// The last startup log codes with their timestamps (codes only, never record
+/// payloads), so a readiness timeout names the phase that stalled.
+fn daemon_log_phases(data: &Path) -> String {
+    let Ok(log) = fs::read_to_string(data.join("logs").join("daemon.log")) else {
+        return "absent".to_owned();
+    };
+    let records: Vec<(String, i64)> = log
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|record| {
+            Some((
+                record.get("code")?.as_str()?.to_owned(),
+                record.get("ts")?.as_i64()?,
+            ))
+        })
+        .collect();
+    let Some(&(_, first)) = records.first() else {
+        return "empty".to_owned();
+    };
+    let start = records.len().saturating_sub(12);
+    records[start..]
+        .iter()
+        .map(|(code, ts)| format!("{code}@+{}ms", ts - first))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn daemon_info_snippet(data: &Path) -> String {
     let bytes = match fs::read(data.join("daemon.json")) {
         Ok(bytes) => bytes,
@@ -319,7 +346,7 @@ impl Fixture {
             }
             assert!(
                 Instant::now() < deadline,
-                "daemon readiness deadline (start #{}, {polls} status polls in {:?}): child={}; daemon.json={}; first_error={}; last_error={}",
+                "daemon readiness deadline (start #{}, {polls} status polls in {:?}): child={}; daemon.json={}; first_error={}; last_error={}; log={}",
                 self.starts,
                 started.elapsed(),
                 match self.daemon.as_mut().unwrap().child.try_wait() {
@@ -330,6 +357,7 @@ impl Fixture {
                 daemon_info_snippet(&self.data),
                 first_error.as_deref().unwrap_or("none"),
                 error_snippet(&response.stderr),
+                daemon_log_phases(&self.data),
             );
             thread::sleep(Duration::from_millis(50));
         }

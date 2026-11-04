@@ -60,6 +60,8 @@ async fn run_owned(
 ) -> Result<()> {
     let store_path = data_dir.path().join("eliot.db");
     let store = eliot_store::Store::open(&store_path)?;
+    // Startup phase markers: a readiness timeout names the phase that stalled.
+    logging::record(&policy, "daemon.store_opened", &[], None);
     let store = std::sync::Arc::new(Mutex::new(store));
     let bus = Bus::new(1_024);
     // Invalid `[mail]` fails startup like invalid retention; the Router keeps
@@ -80,6 +82,7 @@ async fn run_owned(
         events
     };
     router.note_events(&recovered);
+    logging::record(&policy, "daemon.recovered", &[], None);
     let (namespace, retained) = restart_capacity::retained(&store).await?;
     let capacity = restart_capacity::Reconcile {
         store: Arc::clone(&store),
@@ -89,6 +92,7 @@ async fn run_owned(
         namespace,
     };
     let retained = restart_capacity::reconcile(&capacity, retained, true).await;
+    logging::record(&policy, "daemon.capacity_reconciled", &[], None);
     let automation_config = crate::config::load_automation_config(data_dir.path())?;
     let daemon_config = crate::config::load_daemon_config(data_dir.path())?;
     // Install `[daemon.limits]` once, before IPC binds: every launch and
@@ -102,8 +106,10 @@ async fn run_owned(
         automation::initialize_global_rules(&router, data_dir.path(), &policy).await?;
     let project_rule_namespaces =
         automation::initialize_project_rules(&router, data_dir.path(), &policy).await?;
+    logging::record(&policy, "daemon.rules_loaded", &[], None);
 
     let mut listener = IpcListener::bind(data_dir, daemon_lock).await?;
+    logging::record(&policy, "daemon.ipc_bound", &[], None);
     let info =
         data_dir.publish_daemon(daemon_lock, listener.endpoint(), env!("CARGO_PKG_VERSION"))?;
     logging::record(&policy, "daemon.ready", &[("boot_id", &info.boot_id)], None);
