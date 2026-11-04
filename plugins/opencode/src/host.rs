@@ -10,8 +10,9 @@ use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
     session::{
-        TargetEnvironment, contextual_error, target_environment, unknown_snapshot,
-        validate_binding, validate_identity,
+        TargetEnvironment, contextual_error, decode, known_command, not_initialized, paths_equal,
+        target_environment, unknown_snapshot, validate_binding, validate_identity,
+        validate_source_plan,
     },
 };
 use serde_json::{Value, json};
@@ -271,114 +272,12 @@ impl OpenCodePlugin {
             &params.command_id,
             "OpenCode",
         )?;
-        if let Some(session) = &self.session {
-            if session.agent_id == params.agent_id
-                && session.generation == params.generation
-                && session.start_command_id == params.command_id
-            {
-                return Ok(StartAdmission::Replay(match session.phase {
-                    SessionPhase::Ready => session.start_result.clone().ok_or_else(|| {
-                        Error::new("unknown", "OpenCode start result was not retained")
-                    }),
-                    SessionPhase::Unknown => Err(Error::new(
-                        "unknown",
-                        "OpenCode session/start outcome is unresolved; it will not be repeated",
-                    )),
-                    SessionPhase::Stopped => Err(Error::new(
-                        "bad_state",
-                        "OpenCode Agent generation has already stopped",
-                    )),
-                }));
-            }
-            return Err(Error::new(
-                "stale_generation",
-                "OpenCode plugin is already bound to another Agent generation",
-            ));
+        if let Some(replay) = self.start_replay_admission(&params)? {
+            return Ok(replay);
         }
-        if let Some(failed) = &self.failed_start {
-            if failed.agent_id == params.agent_id
-                && failed.generation == params.generation
-                && failed.command_id == params.command_id
-            {
-                return Err(failed.error.clone());
-            }
-            return Err(Error::new(
-                "bad_state",
-                "OpenCode plugin already settled a different start command",
-            ));
-        }
-        let initialized = self.initialized.as_ref().ok_or_else(not_initialized)?;
-        if params.initial.is_some() {
-            return Err(Error::new(
-                "unsupported",
-                "OpenCode start does not accept input; send it as a separate command",
-            ));
-        }
-        if params.resume_from.is_some() {
-            return Err(Error::new(
-                "unsupported",
-                "OpenCode resume is not connected in this PR",
-            ));
-        }
-        validate_source_plan(params.source_plan.as_ref())?;
-        let frozen_profile = params.profile.as_ref().ok_or_else(|| {
-            Error::new("profile_error", "OpenCode requires a frozen profile object")
-        })?;
-        let profile = frozen_profile.as_object().ok_or_else(|| {
-            Error::new("profile_error", "OpenCode requires a frozen profile object")
-        })?;
-        if profile.get("harness").and_then(Value::as_str) != Some("opencode") {
-            return Err(Error::new(
-                "profile_error",
-                "OpenCode plugin received a profile for another harness",
-            ));
-        }
-        let requested_model = profile
-            .get("model")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                Error::new(
-                    "profile_error",
-                    "OpenCode profile requires an exact model id",
-                )
-            })?
-            .to_owned();
-        let model_ref = split_model(&requested_model).ok_or_else(|| {
-            Error::new(
-                "profile_error",
-                "OpenCode profile model must be provider/model",
-            )
-        })?;
-        let workspace = params
-            .workspace
-            .as_deref()
-            .filter(|path| !path.trim().is_empty())
-            .map(PathBuf::from)
-            .ok_or_else(|| {
-                Error::new("profile_error", "OpenCode requires an existing workspace")
-            })?;
-        if !workspace.is_dir() {
-            return Err(Error::new(
-                "profile_error",
-                "OpenCode workspace must be an existing directory",
-            ));
-        }
-        // No PATH default and no script wrapper: the frozen profile must name
-        // the native `opencode` executable (the Muse treatment — stop and
-        // process registration address the exact spawned PID, and a `.cmd`
-        // chain would interpose `cmd.exe` between Eliot and the server).
-        let program = profile
-            .get("cmd")
-            .and_then(Value::as_str)
-            .filter(|program| !program.trim().is_empty())
-            .map(OsString::from)
-            .ok_or_else(|| {
-                Error::new(
-                    "profile_error",
-                    "OpenCode profile requires an explicit cmd naming one executable path",
-                )
-            })?;
+        let (initialized, profile) = self.start_prereqs(&params)?;
+        let (requested_model, model_ref) = start_model_ref(profile)?;
+        let (workspace, program) = start_paths(profile, &params)?;
         let TargetEnvironment {
             variables: environment,
             mut secrets,
@@ -399,6 +298,91 @@ impl OpenCodePlugin {
             credential: initialized.credential.clone(),
             instance_dir: initialized.instance_dir.clone(),
         })))
+    }
+
+    /// Start admission replays: the bound generation answers its own start
+    /// command without new native I/O; anything else is refused.
+    fn start_replay_admission(&self, params: &AgentStartParams) -> Result<Option<StartAdmission>> {
+        if let Some(session) = &self.session {
+            if session.agent_id == params.agent_id
+                && session.generation == params.generation
+                && session.start_command_id == params.command_id
+            {
+                return Ok(Some(StartAdmission::Replay(match session.phase {
+                    SessionPhase::Ready => session.start_result.clone().ok_or_else(|| {
+                        Error::new("unknown", "OpenCode start result was not retained")
+                    }),
+                    SessionPhase::Unknown => Err(Error::new(
+                        "unknown",
+                        "OpenCode session/start outcome is unresolved; it will not be repeated",
+                    )),
+                    SessionPhase::Stopped => Err(Error::new(
+                        "bad_state",
+                        "OpenCode Agent generation has already stopped",
+                    )),
+                })));
+            }
+            return Err(Error::new(
+                "stale_generation",
+                "OpenCode plugin is already bound to another Agent generation",
+            ));
+        }
+        if let Some(failed) = &self.failed_start {
+            if failed.agent_id == params.agent_id
+                && failed.generation == params.generation
+                && failed.command_id == params.command_id
+            {
+                return Err(failed.error.clone());
+            }
+            return Err(Error::new(
+                "bad_state",
+                "OpenCode plugin already settled a different start command",
+            ));
+        }
+        Ok(None)
+    }
+
+    /// Start prerequisites: the plugin is initialized, the start carries no
+    /// input and no resume, the source plan is the installed stream plan, and
+    /// the frozen profile names this harness.
+    fn start_prereqs<'a, 'b>(
+        &'a self,
+        params: &'b AgentStartParams,
+    ) -> Result<(&'a Initialized, &'b serde_json::Map<String, Value>)> {
+        let initialized = self
+            .initialized
+            .as_ref()
+            .ok_or_else(|| not_initialized("OpenCode"))?;
+        if params.initial.is_some() {
+            return Err(Error::new(
+                "unsupported",
+                "OpenCode start does not accept input; send it as a separate command",
+            ));
+        }
+        if params.resume_from.is_some() {
+            return Err(Error::new(
+                "unsupported",
+                "OpenCode resume is not connected in this PR",
+            ));
+        }
+        validate_source_plan(
+            "OpenCode",
+            &["session", "turn", "message"],
+            params.source_plan.as_ref(),
+        )?;
+        let frozen_profile = params.profile.as_ref().ok_or_else(|| {
+            Error::new("profile_error", "OpenCode requires a frozen profile object")
+        })?;
+        let profile = frozen_profile.as_object().ok_or_else(|| {
+            Error::new("profile_error", "OpenCode requires a frozen profile object")
+        })?;
+        if profile.get("harness").and_then(Value::as_str) != Some("opencode") {
+            return Err(Error::new(
+                "profile_error",
+                "OpenCode plugin received a profile for another harness",
+            ));
+        }
+        Ok((initialized, profile))
     }
 
     /// Start phase 2, launch: spawn the owned server, subscribe the event
@@ -1003,7 +987,12 @@ impl OpenCodePlugin {
         {
             return Err("OpenCode command has no proof for the requested native turn");
         }
-        if !known_command(session, &params.command_id) {
+        if !known_command(
+            &session.start_command_id,
+            &session.command_inputs,
+            &session.stop_command_id,
+            &params.command_id,
+        ) {
             return Err("OpenCode command identity is not retained");
         }
         if session.phase == SessionPhase::Stopped {
@@ -1121,6 +1110,65 @@ impl OpenCodePlugin {
     }
 }
 
+/// The frozen profile model: an exact `provider/id` selection plus its
+/// native reference.
+fn start_model_ref(profile: &serde_json::Map<String, Value>) -> Result<(String, ModelRef)> {
+    let requested_model = profile
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                "profile_error",
+                "OpenCode profile requires an exact model id",
+            )
+        })?
+        .to_owned();
+    let model_ref = split_model(&requested_model).ok_or_else(|| {
+        Error::new(
+            "profile_error",
+            "OpenCode profile model must be provider/model",
+        )
+    })?;
+    Ok((requested_model, model_ref))
+}
+
+/// The frozen start paths: an existing workspace directory and the explicit
+/// native executable.
+fn start_paths(
+    profile: &serde_json::Map<String, Value>,
+    params: &AgentStartParams,
+) -> Result<(PathBuf, OsString)> {
+    let workspace = params
+        .workspace
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| Error::new("profile_error", "OpenCode requires an existing workspace"))?;
+    if !workspace.is_dir() {
+        return Err(Error::new(
+            "profile_error",
+            "OpenCode workspace must be an existing directory",
+        ));
+    }
+    // No PATH default and no script wrapper: the frozen profile must name
+    // the native `opencode` executable (the Muse treatment — stop and
+    // process registration address the exact spawned PID, and a `.cmd`
+    // chain would interpose `cmd.exe` between Eliot and the server).
+    let program = profile
+        .get("cmd")
+        .and_then(Value::as_str)
+        .filter(|program| !program.trim().is_empty())
+        .map(OsString::from)
+        .ok_or_else(|| {
+            Error::new(
+                "profile_error",
+                "OpenCode profile requires an explicit cmd naming one executable path",
+            )
+        })?;
+    Ok((workspace, program))
+}
+
 /// Stop proves the native session ended, then ends the owned server:
 /// `DELETE /api/session/{id}` (204 removed, 404 already gone) followed by
 /// a `GET` that must 404. Only the readback decides: proven absent
@@ -1224,31 +1272,6 @@ async fn discard_failed_start(session: &mut AgentSession, error: Error) -> Error
     session.server.diagnostic_error(error)
 }
 
-fn validate_source_plan(source_plan: Option<&Value>) -> Result<()> {
-    let Some(plan) = source_plan.and_then(Value::as_object) else {
-        return Err(Error::new(
-            "unsupported",
-            "OpenCode start requires an installed stream source plan",
-        ));
-    };
-    if ["session", "turn", "message"]
-        .iter()
-        .any(|family| plan.get(*family).and_then(Value::as_str) != Some("stream"))
-    {
-        return Err(Error::new(
-            "unsupported",
-            "OpenCode start requires stream ownership for session, turn, and message",
-        ));
-    }
-    Ok(())
-}
-
-fn known_command(session: &AgentSession, command_id: &str) -> bool {
-    session.start_command_id == command_id
-        || session.command_inputs.contains_key(command_id)
-        || session.stop_command_id.as_deref() == Some(command_id)
-}
-
 /// Installed model-id syntax is `providerID/id`, slashes included.
 fn split_model(model: &str) -> Option<ModelRef> {
     let (provider_id, id) = model.split_once('/')?;
@@ -1260,18 +1283,6 @@ fn split_model(model: &str) -> Option<ModelRef> {
         provider_id: provider_id.to_owned(),
         variant: None,
     })
-}
-
-/// Canonicalizing path comparison shared with the server readiness proof.
-pub(crate) fn paths_equal(left: &Path, right: &Path) -> bool {
-    let left = std::fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
-    let right = std::fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
-    if cfg!(windows) {
-        left.to_string_lossy()
-            .eq_ignore_ascii_case(&right.to_string_lossy())
-    } else {
-        left == right
-    }
 }
 
 pub(crate) fn opencode_scope(data_dir: &Path) -> String {
@@ -1315,19 +1326,14 @@ fn opencode_manifest() -> PluginManifest {
     }
 }
 
-fn decode<T: serde::de::DeserializeOwned>(raw: &Value, message: &str) -> Result<T> {
-    serde_json::from_value(raw.clone()).map_err(|_| Error::new("invalid", message))
-}
-
-fn not_initialized() -> Error {
-    Error::new("bad_state", "OpenCode plugin has not been initialized")
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{opencode_manifest, opencode_scope, split_model, validate_source_plan};
+    use super::{opencode_manifest, opencode_scope, split_model};
+    use eliot_plugin::session::validate_source_plan;
     use serde_json::json;
     use std::path::PathBuf;
+
+    const FAMILIES: &[&str] = &["session", "turn", "message"];
 
     #[test]
     fn manifest_advertises_the_connected_pr1_verbs() {
@@ -1349,18 +1355,26 @@ mod tests {
 
     #[test]
     fn source_plan_requires_the_connected_stream_families() {
-        assert!(validate_source_plan(None).is_err());
+        assert!(validate_source_plan("OpenCode", FAMILIES, None).is_err());
         assert!(
-            validate_source_plan(Some(&json!({
-                "session": "stream", "turn": "stream", "message": "stream",
-            })))
+            validate_source_plan(
+                "OpenCode",
+                FAMILIES,
+                Some(&json!({
+                    "session": "stream", "turn": "stream", "message": "stream",
+                }))
+            )
             .is_ok()
         );
         assert!(
-            validate_source_plan(Some(&json!({
-                "session": "stream", "turn": "stream", "message": "stream",
-                "request": "stream",
-            })))
+            validate_source_plan(
+                "OpenCode",
+                FAMILIES,
+                Some(&json!({
+                    "session": "stream", "turn": "stream", "message": "stream",
+                    "request": "stream",
+                }))
+            )
             .is_ok(),
             "extra families are tolerated; the host installs the connected plan"
         );

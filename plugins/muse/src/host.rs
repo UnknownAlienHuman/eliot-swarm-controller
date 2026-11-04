@@ -28,8 +28,8 @@ use eliot_plugin::{
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
     protocol::MAX_CREDENTIAL_BYTES,
     session::{
-        TargetEnvironment, target_environment, unknown_snapshot, validate_binding,
-        validate_identity,
+        TargetEnvironment, decode, known_command, not_initialized, paths_equal, target_environment,
+        unknown_snapshot, validate_binding, validate_identity, validate_source_plan,
     },
 };
 use serde_json::{Value, json};
@@ -298,7 +298,10 @@ impl MusePlugin {
                 "Muse plugin already settled a different start command",
             ));
         }
-        let initialized = self.initialized.as_ref().ok_or_else(not_initialized)?;
+        let initialized = self
+            .initialized
+            .as_ref()
+            .ok_or_else(|| not_initialized("Muse"))?;
         if params.initial.is_some() {
             return Err(Error::new(
                 "unsupported",
@@ -323,7 +326,11 @@ impl MusePlugin {
                 }
                 error
             })?;
-        validate_source_plan(params.source_plan.as_ref())?;
+        validate_source_plan(
+            "Muse",
+            &["session", "turn", "message", "request"],
+            params.source_plan.as_ref(),
+        )?;
         let frozen_profile = params
             .profile
             .as_ref()
@@ -1808,7 +1815,12 @@ impl MusePlugin {
                 "Muse command has no proof for the requested native turn",
             );
         }
-        if !known_command(session, &params.command_id) {
+        if !known_command(
+            &session.start_command_id,
+            &session.command_inputs,
+            &session.stop_command_id,
+            &params.command_id,
+        ) {
             return unknown_snapshot(&params, "Muse command identity is not retained");
         }
         if session.phase == SessionPhase::Stopped {
@@ -2621,12 +2633,6 @@ async fn adopt_resume_snapshot(
     true
 }
 
-fn known_command(session: &AgentSession, command_id: &str) -> bool {
-    session.start_command_id == command_id
-        || session.command_inputs.contains_key(command_id)
-        || session.stop_command_id.as_deref() == Some(command_id)
-}
-
 fn control_replay(
     session: &mut AgentSession,
     params: &AgentCommandParams,
@@ -2683,25 +2689,6 @@ fn abandon_control(session: &mut AgentSession, command_id: &str) {
     session.control_commands.remove(command_id);
 }
 
-fn validate_source_plan(source_plan: Option<&Value>) -> Result<()> {
-    let Some(plan) = source_plan.and_then(Value::as_object) else {
-        return Err(Error::new(
-            "unsupported",
-            "Muse start requires an installed stream source plan",
-        ));
-    };
-    if ["session", "turn", "message", "request"]
-        .iter()
-        .any(|family| plan.get(*family).and_then(Value::as_str) != Some("stream"))
-    {
-        return Err(Error::new(
-            "unsupported",
-            "Muse start requires stream ownership for session, turn, message, and request",
-        ));
-    }
-    Ok(())
-}
-
 /// Shared contextual error, kept under the local path for the
 /// `native::client` test that pins `crate::host::contextual_error`.
 pub(crate) fn contextual_error(
@@ -2723,17 +2710,6 @@ fn optional_profile_text(
             "profile_error",
             format!("Muse profile field {key} must be a non-empty string"),
         )),
-    }
-}
-
-fn paths_equal(left: &Path, right: &Path) -> bool {
-    let left = std::fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
-    let right = std::fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
-    if cfg!(windows) {
-        left.to_string_lossy()
-            .eq_ignore_ascii_case(&right.to_string_lossy())
-    } else {
-        left == right
     }
 }
 
@@ -2807,20 +2783,11 @@ fn muse_manifest() -> PluginManifest {
     }
 }
 
-fn decode<T: serde::de::DeserializeOwned>(raw: &Value, message: &str) -> Result<T> {
-    serde_json::from_value(raw.clone()).map_err(|_| Error::new("invalid", message))
-}
-
-fn not_initialized() -> Error {
-    Error::new("bad_state", "Muse plugin has not been initialized")
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        muse_manifest, muse_scope, new_command_id, validate_resume_preflight, validate_source_plan,
-    };
+    use super::{muse_manifest, muse_scope, new_command_id, validate_resume_preflight};
     use crate::native::types::NativeSession;
+    use eliot_plugin::session::validate_source_plan;
     use serde_json::json;
 
     fn preflight_session(
@@ -2897,31 +2864,48 @@ mod tests {
 
     #[test]
     fn source_plan_requires_the_connected_stream_families() {
-        assert!(validate_source_plan(None).is_err());
+        const FAMILIES: &[&str] = &["session", "turn", "message", "request"];
+        assert!(validate_source_plan("Muse", FAMILIES, None).is_err());
         assert!(
-            validate_source_plan(Some(&json!({
-                "session": "stream", "turn": "stream", "message": "stream",
-                "request": "stream",
-            })))
+            validate_source_plan(
+                "Muse",
+                FAMILIES,
+                Some(&json!({
+                    "session": "stream", "turn": "stream", "message": "stream",
+                    "request": "stream",
+                }))
+            )
             .is_ok()
         );
         assert!(
-            validate_source_plan(Some(&json!({
-                "session": "stream", "turn": "stream", "message": "stream",
-                "request": "stream", "tool": "stream",
-            })))
+            validate_source_plan(
+                "Muse",
+                FAMILIES,
+                Some(&json!({
+                    "session": "stream", "turn": "stream", "message": "stream",
+                    "request": "stream", "tool": "stream",
+                }))
+            )
             .is_ok()
         );
         assert!(
-            validate_source_plan(Some(&json!({
-                "session": "stream", "turn": "stream", "message": "stream",
-            })))
+            validate_source_plan(
+                "Muse",
+                FAMILIES,
+                Some(&json!({
+                    "session": "stream", "turn": "stream", "message": "stream",
+                }))
+            )
             .is_err()
         );
         assert!(
-            validate_source_plan(Some(&json!({
-                "session": "stream", "turn": "stream",
-            })))
+            validate_source_plan(
+                "Muse",
+                FAMILIES,
+                Some(&json!({
+                    "session": "stream", "turn": "stream",
+                }))
+            )
             .is_err()
         );
     }

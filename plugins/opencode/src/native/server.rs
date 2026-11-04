@@ -9,6 +9,9 @@
 //! v2.0.32 server), which holds a generated per-Agent `opencode.jsonc`.
 //! Authentication is a generated per-generation `OPENCODE_PASSWORD`; a
 //! preset password also suppresses the `server password` stdout line.
+//! The child inherits the daemon-allowlisted plugin environment plus the
+//! shared target environment, exactly like the Codex/Muse stdio servers
+//! (`native_stdio.rs`): there is no third allowlist here.
 
 use std::{
     ffi::OsString,
@@ -17,7 +20,7 @@ use std::{
 };
 
 use eliot_core::{Error, Result, SecretPolicy};
-use eliot_plugin::{StderrCapture, spawn_stderr};
+use eliot_plugin::{StderrCapture, session::paths_equal, spawn_stderr};
 use tokio::{
     net::TcpListener,
     process::{Child, Command},
@@ -31,9 +34,8 @@ const READINESS_POLL: Duration = Duration::from_millis(250);
 /// The generated per-Agent config: the frozen profile model plus an
 /// explicitly empty MCP set. No permissions, providers, plugins or
 /// credentials: the Agent runs the server defaults, and provider keys can
-/// only arrive through the target environment the host passes (the child
-/// starts from `env_clear` plus the operational minimum below, never the
-/// owner's full environment).
+/// only arrive through the target environment the host passes on top of the
+/// daemon-allowlisted plugin environment the child inherits.
 fn agent_config_json(model: &str) -> String {
     serde_json::json!({
         "$schema": "https://opencode.ai/config.json",
@@ -64,11 +66,11 @@ pub struct OwnedServer {
 impl OwnedServer {
     /// Write the per-Agent config, reserve a loopback port, spawn the
     /// server, and wait for readiness. Any failure leaves no running
-    /// child behind. The child environment is closed: `env_clear`, then
-    /// the operational minimum, the target environment the host built,
-    /// the generated password, and the per-Agent XDG roots. The owner's
-    /// full environment is never inherited, however the plugin itself
-    /// was launched.
+    /// child behind. The child inherits the daemon-allowlisted plugin
+    /// environment plus the shared target environment the host built, the
+    /// generated password, and the per-Agent XDG roots — exactly like the
+    /// Codex/Muse stdio servers, with no `env_clear` and no third
+    /// allowlist.
     pub async fn spawn(launch: ServerLaunch, secrets: &[String]) -> Result<Self> {
         let config_dir = launch.instance_dir.join("config").join("opencode");
         let data_dir = launch.instance_dir.join("data");
@@ -128,8 +130,6 @@ impl OwnedServer {
             .arg("--port")
             .arg(port.to_string())
             .current_dir(&launch.workspace)
-            .env_clear()
-            .envs(minimal_child_environment())
             .envs(launch.environment)
             .env("OPENCODE_PASSWORD", &password)
             .env("XDG_CONFIG_HOME", launch.instance_dir.join("config"))
@@ -305,31 +305,6 @@ impl OwnedServer {
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Operational minimum every child needs, mirrored from the daemon's
-/// `plugin_host/host.rs` (`minimal_plugin_environment`; keep in sync):
-/// notably `SystemRoot` for Winsock on Windows. Values are operational,
-/// never provider keys, which arrive only via the target environment.
-#[cfg(windows)]
-const BASE_ENVIRONMENT_NAMES: &[&str] = &[
-    "USERPROFILE",
-    "HOME",
-    "LOCALAPPDATA",
-    "SystemRoot",
-    "PATHEXT",
-    "PATH",
-    "TEMP",
-];
-
-#[cfg(not(windows))]
-const BASE_ENVIRONMENT_NAMES: &[&str] = &["HOME", "PATH", "TEMP"];
-
-fn minimal_child_environment() -> Vec<(OsString, OsString)> {
-    BASE_ENVIRONMENT_NAMES
-        .iter()
-        .filter_map(|name| std::env::var_os(name).map(|value| (OsString::from(*name), value)))
-        .collect()
-}
-
 /// Our config document path must appear among the effective documents:
 /// this proves the server honors the per-Agent `XDG_CONFIG_HOME` and is
 /// not serving the owner's global config.
@@ -340,7 +315,7 @@ fn serves_our_config(config_dir: &Path, documents: &[crate::native::types::Confi
             && entry
                 .path
                 .as_deref()
-                .is_some_and(|path| crate::host::paths_equal(Path::new(path), &wanted))
+                .is_some_and(|path| paths_equal(Path::new(path), &wanted))
     })
 }
 

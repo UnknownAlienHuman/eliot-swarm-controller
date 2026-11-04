@@ -14,7 +14,7 @@ use eliot_core::{Error, Result, SecretPolicy};
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
     native_stdio::StreamState,
-    session::{EVENT_DEADLINE, StreamSource, attach_native_error, event_id},
+    session::{EVENT_DEADLINE, StreamSource, attach_final_text, attach_native_error, event_id},
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -1108,53 +1108,6 @@ struct TerminalReadback {
     outcome: String,
     idle_error: Option<StructuredError>,
     final_text: Option<String>,
-}
-
-fn attach_final_text(data: &mut Value, final_text: &str, failed: bool, policy: &SecretPolicy) {
-    let mut candidate = data.clone();
-    let Some(fields) = candidate.as_object_mut() else {
-        return;
-    };
-    fields.insert(
-        "final_text".to_owned(),
-        Value::String(final_text.to_owned()),
-    );
-    let exceeds_event_bound =
-        serde_json::to_vec(&candidate).map_or(true, |encoded| encoded.len() > MAX_EVENT_BYTES);
-    if failed && exceeds_event_bound {
-        attach_final_text_unavailable(data, policy);
-        return;
-    }
-    *data = candidate;
-}
-
-fn attach_final_text_unavailable(data: &mut Value, policy: &SecretPolicy) {
-    if ["final_text_unavailable", "event_budget"]
-        .iter()
-        .any(|literal| policy.contains_text(literal))
-        || data
-            .as_object()
-            .is_none_or(|fields| fields.contains_key("final_text_unavailable"))
-    {
-        return;
-    }
-    let mut candidate = data.clone();
-    let Some(fields) = candidate.as_object_mut() else {
-        return;
-    };
-    fields.insert(
-        "final_text_unavailable".to_owned(),
-        Value::String("event_budget".to_owned()),
-    );
-    if serde_json::to_vec(&candidate).map_or(true, |encoded| encoded.len() > MAX_EVENT_BYTES) {
-        return;
-    }
-    if let Some(fields) = data.as_object_mut() {
-        fields.insert(
-            "final_text_unavailable".to_owned(),
-            Value::String("event_budget".to_owned()),
-        );
-    }
 }
 
 async fn run(

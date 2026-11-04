@@ -1,15 +1,17 @@
 //! Shared per-Agent session helpers for the stream-owning harness plugins.
 //!
-//! Codex, Muse and OpenCode bind one Agent generation to one owned native
-//! server: the target-environment mapping, identity/binding validation,
-//! unknown snapshots, contextual errors, stream event commits/gaps and the
-//! bounded native-error attachment are identical up to the harness name.
-//! This module holds the single copy; each plugin passes its own display
-//! name (`"Codex"`, `"Muse"`, `"OpenCode"`) and id prefix (`"codex"`,
-//! `"muse"`, `"opencode"`). No trait: the shared state is passed by
-//! reference through [`StreamSource`].
+//! Muse and OpenCode bind one Agent generation to one owned native server
+//! through this module: the target-environment mapping, identity/binding
+//! validation, unknown snapshots, contextual errors, stream event
+//! commits/gaps and the bounded native-error/final-text attachments are
+//! identical up to the harness name. This module holds the single copy;
+//! each plugin passes its own display name (`"Muse"`, `"OpenCode"`) and id
+//! prefix (`"muse"`, `"opencode"`). Codex uses only the target-environment
+//! mapping here and still carries its own copies of the rest; it converts
+//! in a follow-up. No trait: the shared state is passed by reference
+//! through [`StreamSource`].
 
-use std::{ffi::OsString, time::Duration};
+use std::{collections::HashMap, ffi::OsString, path::Path, time::Duration};
 
 use eliot_core::{Error, NativeEvent, Result, SecretPolicy, SourceBatch};
 use serde_json::{Value, json};
@@ -136,6 +138,89 @@ pub fn validate_identity(
     Ok(())
 }
 
+/// Decode typed plugin params, mapping any shape mismatch to `invalid`.
+pub fn decode<T: serde::de::DeserializeOwned>(raw: &Value, message: &str) -> Result<T> {
+    serde_json::from_value(raw.clone()).map_err(|_| Error::new("invalid", message))
+}
+
+/// `bad_state` for a request that arrived before `initialize`.
+pub fn not_initialized(harness: &str) -> Error {
+    Error::new(
+        "bad_state",
+        format!("{harness} plugin has not been initialized"),
+    )
+}
+
+/// Require the installed stream source plan for exactly `families`.
+/// `harness` names the caller in diagnostics; extra families stay tolerated
+/// (the host installs the connected plan, which may carry more).
+pub fn validate_source_plan(
+    harness: &str,
+    families: &[&str],
+    source_plan: Option<&Value>,
+) -> Result<()> {
+    let Some(plan) = source_plan.and_then(Value::as_object) else {
+        return Err(Error::new(
+            "unsupported",
+            format!("{harness} start requires an installed stream source plan"),
+        ));
+    };
+    if families
+        .iter()
+        .any(|family| plan.get(*family).and_then(Value::as_str) != Some("stream"))
+    {
+        return Err(Error::new(
+            "unsupported",
+            format!(
+                "{harness} start requires stream ownership for {}",
+                join_families(families)
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Oxford-join a family list exactly as the per-harness messages spelled it
+/// (`"session, turn, and message"`).
+fn join_families(families: &[&str]) -> String {
+    match families {
+        [] => String::new(),
+        [only] => (*only).to_owned(),
+        [first, second] => format!("{first} and {second}"),
+        _ => {
+            let (last, rest) = families.split_last().expect("non-empty families");
+            format!("{} and {last}", rest.join(", "))
+        }
+    }
+}
+
+/// Whether `command_id` is a retained command of this generation: the start,
+/// a dispatched input, or the stop. The session fields are passed by
+/// reference because each plugin owns its own `AgentSession` type.
+pub fn known_command(
+    start_command_id: &str,
+    command_inputs: &HashMap<String, String>,
+    stop_command_id: &Option<String>,
+    command_id: &str,
+) -> bool {
+    start_command_id == command_id
+        || command_inputs.contains_key(command_id)
+        || stop_command_id.as_deref() == Some(command_id)
+}
+
+/// Canonicalizing path comparison shared by the server readiness proofs:
+/// same file on case-insensitive Windows, byte equality elsewhere.
+pub fn paths_equal(left: &Path, right: &Path) -> bool {
+    let left = std::fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
+    let right = std::fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
+    if cfg!(windows) {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    } else {
+        left == right
+    }
+}
+
 /// Unknown agent snapshot: the read proved nothing about the requested turn.
 pub fn unknown_snapshot(params: &AgentSnapshotParams, reason: &str) -> Result<Value> {
     Ok(json!({
@@ -225,6 +310,59 @@ pub fn attach_native_error(data: &mut Value, message: Option<&str>, policy: &Sec
         let (safe, _) = policy.redact_prefix(&message.as_bytes()[..end], false);
         message = String::from_utf8_lossy(&safe).into_owned();
         truncated = true;
+    }
+}
+
+/// Attach terminal `final_text` to committed turn data. A failed turn whose
+/// text would exceed the event bound records `final_text_unavailable`
+/// instead; anything else keeps the text as committed.
+pub fn attach_final_text(data: &mut Value, final_text: &str, failed: bool, policy: &SecretPolicy) {
+    let mut candidate = data.clone();
+    let Some(fields) = candidate.as_object_mut() else {
+        return;
+    };
+    fields.insert(
+        "final_text".to_owned(),
+        Value::String(final_text.to_owned()),
+    );
+    let exceeds_event_bound =
+        serde_json::to_vec(&candidate).map_or(true, |encoded| encoded.len() > MAX_EVENT_BYTES);
+    if failed && exceeds_event_bound {
+        attach_final_text_unavailable(data, policy);
+        return;
+    }
+    *data = candidate;
+}
+
+/// Record that terminal text exists but exceeded the event bound. Refuses to
+/// write when the marker words collide with a redacted secret or the field
+/// is already present, and when even the marker would exceed the bound.
+pub fn attach_final_text_unavailable(data: &mut Value, policy: &SecretPolicy) {
+    if ["final_text_unavailable", "event_budget"]
+        .iter()
+        .any(|literal| policy.contains_text(literal))
+        || data
+            .as_object()
+            .is_none_or(|fields| fields.contains_key("final_text_unavailable"))
+    {
+        return;
+    }
+    let mut candidate = data.clone();
+    let Some(fields) = candidate.as_object_mut() else {
+        return;
+    };
+    fields.insert(
+        "final_text_unavailable".to_owned(),
+        Value::String("event_budget".to_owned()),
+    );
+    if serde_json::to_vec(&candidate).map_or(true, |encoded| encoded.len() > MAX_EVENT_BYTES) {
+        return;
+    }
+    if let Some(fields) = data.as_object_mut() {
+        fields.insert(
+            "final_text_unavailable".to_owned(),
+            Value::String("event_budget".to_owned()),
+        );
     }
 }
 
