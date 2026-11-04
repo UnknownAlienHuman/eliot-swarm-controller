@@ -18,8 +18,10 @@ use tokio::{
 use crate::native::{
     sse::{SseFrame, SseParser},
     types::{
-        ConfigEntry, DataEnvelope, ErrorBody, InboxUser, LocationRef, MessagePage, ModelRef,
-        PromptRequest, SessionCreateRequest, SessionInfo,
+        AgentList, ConfigEntry, DataEnvelope, ErrorBody, FormInfo, FormReplyRequest, InboxPage,
+        InboxUser, InterruptResponse, LocationRef, MessagePage, ModelRef, PermissionReplyRequest,
+        PermissionRequest, PromptRequest, SessionCreateRequest, SessionInfo, SwitchAgentRequest,
+        SwitchModelRequest,
     },
 };
 
@@ -155,9 +157,11 @@ impl OpenCodeHttp {
         Err(readback_error("session", &response))
     }
 
-    /// Exact absence readback: `Ok(true)` only on a 404 with a
-    /// `SessionNotFoundError` body, `Ok(false)` on 200, `Err` on anything
-    /// ambiguous (a transport failure never proves absence).
+    /// Exact absence readback: `Ok(true)` on a 404, `Ok(false)` on
+    /// 200, `Err` on anything ambiguous (a transport failure never proves
+    /// absence). The installed server answers a missing session with an
+    /// EMPTY 404 on every session route; a tagged `SessionNotFoundError`
+    /// body proves the same absence where one is sent.
     pub async fn session_absent(&self, session_id: &str, deadline: Instant) -> Result<bool> {
         let path = format!(
             "/api/session/{}",
@@ -171,13 +175,7 @@ impl OpenCodeHttp {
         if response.status == 200 {
             return Ok(false);
         }
-        if response.status == 404
-            && serde_json::from_slice::<ErrorBody>(&response.body)
-                .ok()
-                .and_then(|body| body.tag)
-                .as_deref()
-                == Some("SessionNotFoundError")
-        {
+        if response.status == 404 {
             return Ok(true);
         }
         Err(readback_error("session absence", &response))
@@ -232,6 +230,264 @@ impl OpenCodeHttp {
             return Ok(envelope.data);
         }
         Err(map_write_error("session/prompt", &response))
+    }
+
+    /// `POST /api/session/{id}/interrupt` (`session.interrupt`):
+    /// abort the session's current execution. The 200 body is unwrapped
+    /// (`{"interrupted": bool}`), unlike every other success body: `true`
+    /// means an execution owned by this server was interrupted, `false`
+    /// proves no execution was running, never an error. A 404 proves the
+    /// session is gone (no effect).
+    pub async fn interrupt(
+        &self,
+        session_id: &str,
+        deadline: Instant,
+    ) -> std::result::Result<bool, HttpOutcome> {
+        let path = format!("/api/session/{}/interrupt", verified_segment(session_id)?);
+        let response = self
+            .send(reqwest::Method::POST, &path, &[], None, deadline)
+            .await?;
+        if response.status == 200 {
+            let body: InterruptResponse = serde_json::from_slice(&response.body)
+                .map_err(|_| HttpOutcome::unknown("OpenCode interrupt answer was invalid"))?;
+            return Ok(body.interrupted);
+        }
+        Err(map_write_error("session/interrupt", &response))
+    }
+
+    /// `GET /api/session/{id}/permission` (`session.permission.list`):
+    /// pending permission requests. A read, so any failure is
+    /// `native_readback`, never `unknown`.
+    pub async fn list_permissions(
+        &self,
+        session_id: &str,
+        deadline: Instant,
+    ) -> Result<Vec<PermissionRequest>> {
+        let path = format!(
+            "/api/session/{}/permission",
+            verified_segment(session_id)
+                .map_err(|_| Error::new("invalid", "OpenCode session identity is invalid"))?
+        );
+        let response = self
+            .send(reqwest::Method::GET, &path, &[], None, deadline)
+            .await
+            .map_err(readback_outcome_as_error)?;
+        if response.status == 200 {
+            let envelope: DataEnvelope<Vec<PermissionRequest>> =
+                serde_json::from_slice(&response.body).map_err(|_| {
+                    Error::new(
+                        "native_readback",
+                        "OpenCode permission readback was invalid",
+                    )
+                })?;
+            return Ok(envelope.data);
+        }
+        Err(readback_error("permission list", &response))
+    }
+
+    /// `POST /api/session/{id}/permission/{requestID}/reply`
+    /// (`session.permission.reply`): decide one pending permission request.
+    /// 204 applies; 400/404 prove the reply was not admitted (invalid
+    /// decision, or the request settled or never existed — both answered
+    /// with an empty body by the installed server).
+    pub async fn reply_permission(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        decision: &str,
+        message: Option<String>,
+        deadline: Instant,
+    ) -> std::result::Result<(), HttpOutcome> {
+        let path = format!(
+            "/api/session/{}/permission/{}/reply",
+            verified_segment(session_id)?,
+            verified_segment(request_id)?,
+        );
+        let body = serde_json::to_value(PermissionReplyRequest {
+            decision: decision.to_owned(),
+            message,
+        })
+        .map_err(|_| HttpOutcome::unknown("OpenCode reply params could not be encoded"))?;
+        let response = self
+            .send(reqwest::Method::POST, &path, &[], Some(body), deadline)
+            .await?;
+        if response.status == 204 {
+            return Ok(());
+        }
+        Err(map_write_error("session.permission.reply", &response))
+    }
+
+    /// `GET /api/session/{id}/form` (`session.form.list`): pending forms.
+    /// A read, so any failure is `native_readback`, never `unknown`.
+    pub async fn list_forms(&self, session_id: &str, deadline: Instant) -> Result<Vec<FormInfo>> {
+        let path = format!(
+            "/api/session/{}/form",
+            verified_segment(session_id)
+                .map_err(|_| Error::new("invalid", "OpenCode session identity is invalid"))?
+        );
+        let response = self
+            .send(reqwest::Method::GET, &path, &[], None, deadline)
+            .await
+            .map_err(readback_outcome_as_error)?;
+        if response.status == 200 {
+            let envelope: DataEnvelope<Vec<FormInfo>> = serde_json::from_slice(&response.body)
+                .map_err(|_| Error::new("native_readback", "OpenCode form readback was invalid"))?;
+            return Ok(envelope.data);
+        }
+        Err(readback_error("form list", &response))
+    }
+
+    /// `POST /api/session/{id}/form/{formID}/reply` (`session.form.reply`):
+    /// answer one pending form. 204 applies; 400 proves the answer was
+    /// refused (not among the offered schema), 404/409 prove the form is
+    /// gone or already settled — all answered with an empty body.
+    pub async fn reply_form(
+        &self,
+        session_id: &str,
+        form_id: &str,
+        answer: serde_json::Map<String, serde_json::Value>,
+        deadline: Instant,
+    ) -> std::result::Result<(), HttpOutcome> {
+        let path = format!(
+            "/api/session/{}/form/{}/reply",
+            verified_segment(session_id)?,
+            verified_segment(form_id)?,
+        );
+        let body = serde_json::to_value(FormReplyRequest { answer })
+            .map_err(|_| HttpOutcome::unknown("OpenCode reply params could not be encoded"))?;
+        let response = self
+            .send(reqwest::Method::POST, &path, &[], Some(body), deadline)
+            .await?;
+        if response.status == 204 {
+            return Ok(());
+        }
+        if response.status == 409 {
+            return Err(HttpOutcome::Rejected {
+                status: Some(409),
+                reason: "OpenCode refused the write (already_settled): the form is already settled"
+                    .to_owned(),
+            });
+        }
+        Err(map_write_error("session.form.reply", &response))
+    }
+
+    /// `DELETE /api/session/{id}/form/{formID}`: cancel one pending form
+    /// (the native deny). 204 applies; 404 proves the form is already gone
+    /// and 409 (`FormAlreadySettledError`) proves it is already settled.
+    pub async fn delete_form(
+        &self,
+        session_id: &str,
+        form_id: &str,
+        deadline: Instant,
+    ) -> std::result::Result<(), HttpOutcome> {
+        let path = format!(
+            "/api/session/{}/form/{}",
+            verified_segment(session_id)?,
+            verified_segment(form_id)?,
+        );
+        let response = self
+            .send(reqwest::Method::DELETE, &path, &[], None, deadline)
+            .await?;
+        if response.status == 204 {
+            return Ok(());
+        }
+        if response.status == 409 {
+            return Err(HttpOutcome::Rejected {
+                status: Some(409),
+                reason: "OpenCode refused the write (already_settled): the form is already settled"
+                    .to_owned(),
+            });
+        }
+        Err(map_write_error("session.form.delete", &response))
+    }
+
+    /// `GET /api/session/{id}/inbox` (`session.inbox.list`): durable
+    /// enqueued work not yet delivered. A read, so any failure is
+    /// `native_readback`, never `unknown`.
+    pub async fn list_inbox(
+        &self,
+        session_id: &str,
+        deadline: Instant,
+    ) -> Result<Vec<serde_json::Value>> {
+        let path = format!(
+            "/api/session/{}/inbox",
+            verified_segment(session_id)
+                .map_err(|_| Error::new("invalid", "OpenCode session identity is invalid"))?
+        );
+        let response = self
+            .send(reqwest::Method::GET, &path, &[], None, deadline)
+            .await
+            .map_err(readback_outcome_as_error)?;
+        if response.status == 200 {
+            let page: InboxPage = serde_json::from_slice(&response.body).map_err(|_| {
+                Error::new("native_readback", "OpenCode inbox readback was invalid")
+            })?;
+            return Ok(page.data);
+        }
+        Err(readback_error("inbox list", &response))
+    }
+
+    /// `POST /api/session/{id}/model` (`session.switchModel`): set the
+    /// session model. 204 applies; the caller proves the effective value
+    /// with `session.get` (the installed server validates nothing).
+    pub async fn switch_model(
+        &self,
+        session_id: &str,
+        model: &ModelRef,
+        deadline: Instant,
+    ) -> std::result::Result<(), HttpOutcome> {
+        let path = format!("/api/session/{}/model", verified_segment(session_id)?,);
+        let body = serde_json::to_value(SwitchModelRequest {
+            model: model.clone(),
+        })
+        .map_err(|_| HttpOutcome::unknown("OpenCode switch params could not be encoded"))?;
+        let response = self
+            .send(reqwest::Method::POST, &path, &[], Some(body), deadline)
+            .await?;
+        if response.status == 204 {
+            return Ok(());
+        }
+        Err(map_write_error("session.switchModel", &response))
+    }
+
+    /// `POST /api/session/{id}/agent` (`session.switchAgent`): set the
+    /// session agent. 204 applies; the caller proves the effective value
+    /// with `session.get`.
+    pub async fn switch_agent(
+        &self,
+        session_id: &str,
+        agent: &str,
+        deadline: Instant,
+    ) -> std::result::Result<(), HttpOutcome> {
+        let path = format!("/api/session/{}/agent", verified_segment(session_id)?,);
+        let body = serde_json::to_value(SwitchAgentRequest {
+            agent: agent.to_owned(),
+        })
+        .map_err(|_| HttpOutcome::unknown("OpenCode switch params could not be encoded"))?;
+        let response = self
+            .send(reqwest::Method::POST, &path, &[], Some(body), deadline)
+            .await?;
+        if response.status == 204 {
+            return Ok(());
+        }
+        Err(map_write_error("session.switchAgent", &response))
+    }
+
+    /// `GET /api/agent`: installed agent ids for the membership check
+    /// before `session.switchAgent`. A read, so any failure is
+    /// `native_readback`, never `unknown`.
+    pub async fn list_agents(&self, deadline: Instant) -> Result<Vec<String>> {
+        let response = self
+            .send(reqwest::Method::GET, "/api/agent", &[], None, deadline)
+            .await
+            .map_err(readback_outcome_as_error)?;
+        if response.status == 200 {
+            let list: AgentList = serde_json::from_slice(&response.body).map_err(|_| {
+                Error::new("native_readback", "OpenCode agent readback was invalid")
+            })?;
+            return Ok(list.data.into_iter().map(|entry| entry.id).collect());
+        }
+        Err(readback_error("agent list", &response))
     }
 
     /// `GET /api/session/{id}/message`: newest-first message page.
@@ -409,12 +665,14 @@ fn transport_noun(error: &reqwest::Error) -> &'static str {
     }
 }
 
-/// Map a non-2xx write response from its complete error body. Only errors
-/// the installed API documents as not admitted prove rejection: 400
-/// `InvalidRequestError` (validation), 404 `SessionNotFoundError` /
-/// `LocationNotFoundError` (no such subject, so no effect) and 401
-/// `UnauthorizedError` (refused before admission). 409 conflict, 5xx and
-/// unknown shapes stay `Unknown`.
+/// Map a non-2xx write response. On the owned loopback server (no
+/// proxy, auth gate first) the app answers validation refusals with 400,
+/// missing subjects with 404, and gate refusals with 401 — usually with an
+/// EMPTY body (verified on every session/permission/form route), sometimes
+/// with a tagged body (`InvalidRequestError`, `SessionNotFoundError`,
+/// `PermissionNotFoundError`, `FormInvalidAnswerError`, ...). Any 400/401/404
+/// therefore proves the write was not admitted. 409 conflict, 5xx and anything
+/// else stay `Unknown` (the form-reply caller maps its own 409 explicitly).
 fn map_write_error(method: &str, response: &RawResponse) -> HttpOutcome {
     let body: Option<ErrorBody> = serde_json::from_slice(&response.body).ok();
     let tag = body.as_ref().and_then(|body| body.tag.as_deref());
@@ -423,14 +681,9 @@ fn map_write_error(method: &str, response: &RawResponse) -> HttpOutcome {
         .and_then(|body| body.message.as_deref())
         .filter(|message| !message.trim().is_empty())
         .unwrap_or("no message");
-    match (response.status, tag) {
-        (400, Some("InvalidRequestError"))
-        | (404, Some("SessionNotFoundError" | "LocationNotFoundError"))
-        | (401, Some("UnauthorizedError")) => {
-            HttpOutcome::rejected(response.status, tag.unwrap_or("error"), message)
-        }
-        (404, None) if response.body.is_empty() => {
-            HttpOutcome::rejected(response.status, "not_found", "empty 404 body")
+    match response.status {
+        400 | 401 | 404 => {
+            HttpOutcome::rejected(response.status, tag.unwrap_or("refused"), message)
         }
         _ => HttpOutcome::unknown(format!(
             "OpenCode {method} answered HTTP {} ({}); its write outcome is unknown",
@@ -545,34 +798,47 @@ mod tests {
 
     #[test]
     fn installed_write_errors_classify() {
-        let invalid = RawResponse {
-            status: 400,
-            body: br#"{"_tag":"InvalidRequestError","message":"Expected a valid JSON body","kind":"Payload"}"#.to_vec(),
-        };
-        assert!(matches!(
-            map_write_error("session/prompt", &invalid),
-            HttpOutcome::Rejected { .. }
-        ));
-        let gone = RawResponse {
-            status: 404,
-            body: br#"{"_tag":"SessionNotFoundError","sessionID":"s","message":"gone"}"#.to_vec(),
-        };
-        assert!(matches!(
-            map_write_error("session/prompt", &gone),
-            HttpOutcome::Rejected { .. }
-        ));
-        let auth = RawResponse {
-            status: 401,
-            body: br#"{"_tag":"UnauthorizedError","message":"Authentication required"}"#.to_vec(),
-        };
-        assert!(matches!(
-            map_write_error("session/prompt", &auth),
-            HttpOutcome::Rejected { .. }
-        ));
+        // Tagged bodies (the documented shapes) and empty bodies (the
+        // installed reality on session/permission/form routes) both prove
+        // non-admission on 400/401/404.
+        for (status, body) in [
+            (
+                400,
+                r#"{"_tag":"InvalidRequestError","message":"Expected a valid JSON body","kind":"Payload"}"#,
+            ),
+            (
+                404,
+                r#"{"_tag":"SessionNotFoundError","sessionID":"s","message":"gone"}"#,
+            ),
+            (
+                404,
+                r#"{"_tag":"PermissionNotFoundError","requestID":"per_x","message":"gone"}"#,
+            ),
+            (
+                401,
+                r#"{"_tag":"UnauthorizedError","message":"Authentication required"}"#,
+            ),
+            (400, ""),
+            (401, ""),
+            (404, ""),
+        ] {
+            let response = RawResponse {
+                status,
+                body: body.as_bytes().to_vec(),
+            };
+            assert!(
+                matches!(
+                    map_write_error("session/prompt", &response),
+                    HttpOutcome::Rejected { .. }
+                ),
+                "status={status} body={body}"
+            );
+        }
         for (status, body) in [
             (409, r#"{"_tag":"SessionBusyError","message":"busy"}"#),
+            (409, ""),
             (500, r#"{"_tag":"UnknownError","message":"boom"}"#),
-            (400, r#"{"unexpected":"shape"}"#),
+            (500, ""),
             (204, ""),
         ] {
             let response = RawResponse {

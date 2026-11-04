@@ -10,9 +10,10 @@ use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
     session::{
-        TargetEnvironment, contextual_error, decode, known_command, native_no_write,
-        not_initialized, paths_equal, register_native_process, target_environment,
-        unknown_snapshot, validate_binding, validate_identity, validate_source_plan,
+        ResumeSubject, TargetEnvironment, contextual_error, decode, known_command, native_no_write,
+        not_initialized, optional_profile_text, parse_resume_subject, paths_equal,
+        register_native_process, target_environment, unknown_snapshot, validate_binding,
+        validate_identity, validate_source_plan,
     },
 };
 use serde_json::{Value, json};
@@ -25,6 +26,8 @@ use tokio::{sync::mpsc, time::Instant};
 
 const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const MAX_COMMANDS_PER_GENERATION: usize = 32;
+const RESUME_DRAIN_ROUNDS: usize = 20;
+const RESUME_DRAIN_BEAT: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[derive(Default)]
 struct OpenCodePlugin {
@@ -68,6 +71,19 @@ struct AgentSession {
     unknown_commands: HashSet<String>,
     rejected_commands: HashSet<String>,
     stop_command_id: Option<String>,
+    control_bindings: HashMap<String, ControlBinding>,
+    control_results: HashMap<String, Value>,
+}
+
+/// One retained control (interrupt/reply) command: its exact binding for
+/// replay integrity. Applied and rejected results replay byte-identical;
+/// unknown replays unknown without rewriting; a rebinding is a
+/// source_integrity error, never a second write.
+struct ControlBinding {
+    verb: String,
+    turn_id: Option<String>,
+    request_id: Option<String>,
+    args: Value,
 }
 
 /// A start request that passed admission: decoded params plus the validated
@@ -76,12 +92,14 @@ struct ParsedStart {
     params: AgentStartParams,
     requested_model: String,
     model_ref: ModelRef,
+    requested_agent: Option<String>,
     workspace: PathBuf,
     program: OsString,
     environment: Vec<(OsString, OsString)>,
     secrets: Vec<String>,
     credential: String,
     instance_dir: String,
+    resume: Option<ResumeSubject>,
 }
 
 /// Outcome of start admission: a replayed start response, or a parsed
@@ -96,6 +114,18 @@ enum StartAdmission {
 enum SendAdmission {
     Replay(Value),
     New { command_id: String, text: String },
+}
+
+/// Outcome of control (interrupt/reply) admission: a replayed response, or
+/// a new control ready for its native write.
+enum ControlAdmission {
+    Replay(Value),
+    New {
+        command_id: String,
+        turn_id: Option<String>,
+        request_id: Option<String>,
+        args: Value,
+    },
 }
 
 /// Outcome of the native prompt write: a known rejection, or an admitted
@@ -257,6 +287,9 @@ impl OpenCodePlugin {
             Err(error) => return Err(self.retain_failed_start(&parsed.params, error)),
         };
         let session = self.register_start_session(peer, &parsed, session).await?;
+        if parsed.resume.is_some() {
+            return self.resume_start_session(*parsed, session).await;
+        }
         let (session, created, effective) = self.create_start_session(&parsed, session).await?;
         self.ready_start_session(*parsed, session, created, effective)
             .await
@@ -276,7 +309,23 @@ impl OpenCodePlugin {
             return Ok(replay);
         }
         let (initialized, profile) = self.start_prereqs(&params)?;
+        // The retained subject validates through the shared Muse/Claude
+        // helper: same continuity rules and codes, no local copy.
+        let resume = params
+            .resume_from
+            .as_ref()
+            .map(|resume| {
+                parse_resume_subject(
+                    resume,
+                    params.source_state.as_ref(),
+                    &params.agent_id,
+                    params.generation,
+                    "OpenCode",
+                )
+            })
+            .transpose()?;
         let (requested_model, model_ref) = start_model_ref(profile)?;
+        let requested_agent = optional_profile_text(profile, "agent", "OpenCode")?;
         let (workspace, program) = start_paths(profile, &params)?;
         let TargetEnvironment {
             variables: environment,
@@ -291,12 +340,14 @@ impl OpenCodePlugin {
             params,
             requested_model,
             model_ref,
+            requested_agent,
             workspace,
             program,
             environment,
             secrets,
             credential: initialized.credential.clone(),
             instance_dir: initialized.instance_dir.clone(),
+            resume,
         })))
     }
 
@@ -343,8 +394,8 @@ impl OpenCodePlugin {
     }
 
     /// Start prerequisites: the plugin is initialized, the start carries no
-    /// input and no resume, the source plan is the installed stream plan, and
-    /// the frozen profile names this harness.
+    /// input, the source plan is the installed stream plan, and the frozen
+    /// profile names this harness.
     fn start_prereqs<'a, 'b>(
         &'a self,
         params: &'b AgentStartParams,
@@ -359,15 +410,9 @@ impl OpenCodePlugin {
                 "OpenCode start does not accept input; send it as a separate command",
             ));
         }
-        if params.resume_from.is_some() {
-            return Err(Error::new(
-                "unsupported",
-                "OpenCode resume is not connected in this PR",
-            ));
-        }
         validate_source_plan(
             "OpenCode",
-            &["session", "turn", "message"],
+            &["session", "turn", "message", "request"],
             params.source_plan.as_ref(),
         )?;
         let frozen_profile = params.profile.as_ref().ok_or_else(|| {
@@ -393,6 +438,7 @@ impl OpenCodePlugin {
                 program: parsed.program.clone(),
                 workspace: parsed.workspace.clone(),
                 instance_dir: PathBuf::from(&parsed.instance_dir),
+                agent_id: parsed.params.agent_id.clone(),
                 environment: parsed.environment.clone(),
                 model: parsed.requested_model.clone(),
             },
@@ -443,6 +489,8 @@ impl OpenCodePlugin {
             unknown_commands: HashSet::new(),
             rejected_commands: HashSet::new(),
             stop_command_id: None,
+            control_bindings: HashMap::new(),
+            control_results: HashMap::new(),
         };
 
         Ok(session)
@@ -609,6 +657,425 @@ impl OpenCodePlugin {
         Ok((session, created, effective))
     }
 
+    /// Resume: reattach to the exact retained native session in this new
+    /// generation. No prompt is ever replayed: the new server serves the
+    /// same per-Agent store, the preflight proves the retained session
+    /// exists and is idle, the model/agent realign to the frozen profile
+    /// with an effective readback, and readiness adopts the live edge.
+    async fn resume_start_session(
+        &mut self,
+        parsed: ParsedStart,
+        mut session: AgentSession,
+    ) -> Result<Value> {
+        let resume = parsed.resume.as_ref().expect("resume subject admitted");
+        session.native_scope = opencode_scope(session.server.data_dir());
+        if session.native_scope != resume.native_scope {
+            let error = discard_failed_start(
+                &mut session,
+                Error::new(
+                    "profile_error",
+                    "OpenCode resume subject is outside the authenticated native scope",
+                ),
+            )
+            .await;
+            return Err(self.retain_failed_start(&parsed.params, error));
+        }
+        let retained = match Self::resume_read_retained(&session, &resume.native_ref).await {
+            Ok(retained) => retained,
+            Err(error) => return Err(self.fail_resume(&parsed, session, error).await),
+        };
+        session.session_id = Some(retained.id.clone());
+        if let Err(error) = Self::resume_quiesce(&session, &retained.id).await {
+            return Err(self.stash_resume_unknown(session, error.message).await);
+        }
+        if let Err(error) = Self::resume_verify_idle(&session, &retained.id).await {
+            return Err(self.stash_resume_unknown(session, error.message).await);
+        }
+        let effective = match Self::resume_configure(&parsed, &session, &retained.id).await {
+            Ok(effective) => effective,
+            Err(error) if error.code == "unknown" => {
+                return Err(self.stash_resume_unknown(session, error.message).await);
+            }
+            Err(error) => return Err(self.fail_resume(&parsed, session, error).await),
+        };
+        if let Err(error) = session
+            .events
+            .resume_ready(
+                session.native_scope.clone(),
+                retained.id.clone(),
+                effective.clone(),
+            )
+            .await
+        {
+            return Err(self.stash_resume_unknown(session, error.message).await);
+        }
+        session.phase = SessionPhase::Ready;
+        let result = json!({
+            "agent_id": parsed.params.agent_id,
+            "generation": parsed.params.generation,
+            "command_id": parsed.params.command_id,
+            "state": "ready",
+            "native_scope": session.native_scope.clone(),
+            "native_ref": retained.id,
+            "requested": {
+                "model": parsed.requested_model,
+                "cwd": parsed.workspace.to_string_lossy(),
+            },
+            "effective": effective,
+        });
+        session.start_result = Some(result.clone());
+        self.session = Some(session);
+        Ok(result)
+    }
+
+    /// Resume read: the retained session must still exist under its exact
+    /// id. Proven absence is `not_found` (a stopped generation deleted it —
+    /// there is nothing to resume); anything ambiguous is `unknown`.
+    async fn resume_read_retained(session: &AgentSession, native_ref: &str) -> Result<SessionInfo> {
+        let deadline = Instant::now() + RPC_TIMEOUT;
+        let absent = session
+            .http
+            .session_absent(native_ref, deadline)
+            .await
+            .map_err(|error| {
+                Error::new(
+                    "unknown",
+                    format!(
+                        "OpenCode retained session read is unresolved ({})",
+                        error.message
+                    ),
+                )
+            })?;
+        if absent {
+            return Err(Error::new(
+                "not_found",
+                "OpenCode retained session no longer exists",
+            ));
+        }
+        let retained = session
+            .http
+            .get_session(native_ref, deadline)
+            .await
+            .map_err(|error| {
+                Error::new(
+                    "unknown",
+                    format!(
+                        "OpenCode retained session read is unresolved ({})",
+                        error.message
+                    ),
+                )
+            })?;
+        if retained.id != native_ref {
+            return Err(Error::new(
+                "source_integrity",
+                "OpenCode retained session answered with another identity",
+            ));
+        }
+        Ok(retained)
+    }
+
+    /// Resume quiesce: one `session.interrupt` must report no running
+    /// execution. A running retained execution is aborted (refusing would
+    /// wedge crash-recovery resume) and its settle is awaited on a bounded
+    /// leg poll; anything else refuses the resume as unknown. The native
+    /// idle proof is this interrupt plus the empty inbox/permission/form
+    /// lists, not served history.
+    async fn resume_quiesce(session: &AgentSession, session_id: &str) -> Result<()> {
+        let interrupted = match session
+            .http
+            .interrupt(session_id, Instant::now() + RPC_TIMEOUT)
+            .await
+        {
+            Ok(interrupted) => interrupted,
+            Err(outcome) => {
+                let reason = match outcome {
+                    HttpOutcome::Rejected { reason, .. } => reason,
+                    HttpOutcome::Unknown { reason } | HttpOutcome::NotDispatched { reason } => {
+                        reason
+                    }
+                };
+                return Err(Error::new(
+                    "unknown",
+                    format!("OpenCode resume quiesce is unresolved ({reason})"),
+                ));
+            }
+        };
+        if !interrupted {
+            return Ok(());
+        }
+        for _ in 0..RESUME_DRAIN_ROUNDS {
+            tokio::time::sleep(RESUME_DRAIN_BEAT).await;
+            if !Self::resume_legs_quiet(session, session_id).await? {
+                continue;
+            }
+            match session
+                .http
+                .interrupt(session_id, Instant::now() + RPC_TIMEOUT)
+                .await
+            {
+                Ok(false) => return Ok(()),
+                Ok(true) => continue,
+                Err(outcome) => {
+                    let reason = match outcome {
+                        HttpOutcome::Rejected { reason, .. } => reason,
+                        HttpOutcome::Unknown { reason } | HttpOutcome::NotDispatched { reason } => {
+                            reason
+                        }
+                    };
+                    return Err(Error::new(
+                        "unknown",
+                        format!("OpenCode resume quiesce is unresolved ({reason})"),
+                    ));
+                }
+            }
+        }
+        Err(Error::new(
+            "unknown",
+            "OpenCode retained session did not settle after its interrupt",
+        ))
+    }
+
+    /// Resume idle legs: the inbox, permission and form lists must all be
+    /// empty. Anything pending means a retained execution that this
+    /// generation must not adopt.
+    async fn resume_verify_idle(session: &AgentSession, session_id: &str) -> Result<()> {
+        let (inbox, permissions, forms) = Self::resume_leg_counts(session, session_id).await?;
+        if inbox > 0 {
+            return Err(Error::new(
+                "unknown",
+                "OpenCode retained session still has queued input",
+            ));
+        }
+        if permissions > 0 {
+            return Err(Error::new(
+                "unknown",
+                "OpenCode retained session still has pending permission requests",
+            ));
+        }
+        if forms > 0 {
+            return Err(Error::new(
+                "unknown",
+                "OpenCode retained session still has pending forms",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Await-helper for the quiesce drain: all three legs quiet.
+    async fn resume_legs_quiet(session: &AgentSession, session_id: &str) -> Result<bool> {
+        let (inbox, permissions, forms) = Self::resume_leg_counts(session, session_id).await?;
+        Ok(inbox == 0 && permissions == 0 && forms == 0)
+    }
+
+    /// Read the three idle legs as pending counts. Any read failure is
+    /// unknown: the preflight cannot prove the retained session idle.
+    async fn resume_leg_counts(
+        session: &AgentSession,
+        session_id: &str,
+    ) -> Result<(usize, usize, usize)> {
+        let deadline = Instant::now() + RPC_TIMEOUT;
+        let inbox = session
+            .http
+            .list_inbox(session_id, deadline)
+            .await
+            .map_err(|error| {
+                Error::new(
+                    "unknown",
+                    format!(
+                        "OpenCode resume inbox read is unresolved ({})",
+                        error.message
+                    ),
+                )
+            })?;
+        let permissions = session
+            .http
+            .list_permissions(session_id, deadline)
+            .await
+            .map_err(|error| {
+                Error::new(
+                    "unknown",
+                    format!(
+                        "OpenCode resume permission read is unresolved ({})",
+                        error.message
+                    ),
+                )
+            })?;
+        let forms = session
+            .http
+            .list_forms(session_id, deadline)
+            .await
+            .map_err(|error| {
+                Error::new(
+                    "unknown",
+                    format!(
+                        "OpenCode resume form read is unresolved ({})",
+                        error.message
+                    ),
+                )
+            })?;
+        Ok((inbox.len(), permissions.len(), forms.len()))
+    }
+
+    /// Resume configure: realign the retained session's model and agent
+    /// to the frozen profile, then prove the effective values with a fresh
+    /// `session.get`. The location must be the workspace; the requested
+    /// agent must be installed (the switch validates nothing itself).
+    async fn resume_configure(
+        parsed: &ParsedStart,
+        session: &AgentSession,
+        session_id: &str,
+    ) -> Result<Value> {
+        let deadline = Instant::now() + RPC_TIMEOUT;
+        let current = session
+            .http
+            .get_session(session_id, deadline)
+            .await
+            .map_err(|error| {
+                Error::new(
+                    "unknown",
+                    format!(
+                        "OpenCode resume configure read is unresolved ({})",
+                        error.message
+                    ),
+                )
+            })?;
+        let location_ok = current
+            .location
+            .as_ref()
+            .and_then(|location| {
+                if location.directory.trim().is_empty() {
+                    None
+                } else {
+                    Some(paths_equal(
+                        Path::new(&location.directory),
+                        &parsed.workspace,
+                    ))
+                }
+            })
+            .unwrap_or(false);
+        if !location_ok {
+            return Err(Error::new(
+                "profile_error",
+                "OpenCode retained session directory is not the frozen workspace",
+            ));
+        }
+        let model_needed = current
+            .model
+            .as_ref()
+            .map(|model| format!("{}/{}", model.provider_id.trim(), model.id.trim()))
+            != Some(parsed.requested_model.clone());
+        let agent_needed = parsed
+            .requested_agent
+            .as_ref()
+            .is_some_and(|agent| current.agent.as_ref() != Some(agent));
+        if agent_needed {
+            let wanted = parsed.requested_agent.clone().expect("agent needed");
+            let installed = session.http.list_agents(deadline).await.map_err(|error| {
+                Error::new(
+                    "unknown",
+                    format!(
+                        "OpenCode resume agent read is unresolved ({})",
+                        error.message
+                    ),
+                )
+            })?;
+            if !installed.iter().any(|agent| agent == &wanted) {
+                return Err(Error::new(
+                    "profile_error",
+                    format!("OpenCode profile agent {wanted} is not installed"),
+                ));
+            }
+            Self::resume_switch(
+                session
+                    .http
+                    .switch_agent(session_id, &wanted, deadline)
+                    .await,
+                "agent",
+            )?;
+        }
+        if model_needed {
+            Self::resume_switch(
+                session
+                    .http
+                    .switch_model(session_id, &parsed.model_ref, deadline)
+                    .await,
+                "model",
+            )?;
+        }
+        let effective = session
+            .http
+            .get_session(session_id, deadline)
+            .await
+            .map_err(|error| {
+                Error::new(
+                    "unknown",
+                    format!(
+                        "OpenCode resume configure readback is unresolved ({})",
+                        error.message
+                    ),
+                )
+            })?;
+        let model_verified = effective
+            .model
+            .as_ref()
+            .map(|model| format!("{}/{}", model.provider_id.trim(), model.id.trim()))
+            == Some(parsed.requested_model.clone());
+        let agent_verified = parsed
+            .requested_agent
+            .as_ref()
+            .is_none_or(|agent| effective.agent.as_ref() == Some(agent));
+        if !model_verified || !agent_verified {
+            return Err(Error::new(
+                "unknown",
+                "OpenCode effective model or agent contradicts the applied configuration",
+            ));
+        }
+        Ok(json!({
+            "model": effective.model.as_ref().map(|model| format!("{}/{}", model.provider_id.trim(), model.id.trim())),
+            "model_verified": model_verified,
+            "agent": effective.agent.clone(),
+            "agent_verified": agent_verified,
+            "cwd": effective.location.as_ref().map(|location| location.directory.clone()),
+        }))
+    }
+
+    /// One resume setter: only its 204 applies. The session existed
+    /// moments ago, so any refusal or loss is unknown, never a profile
+    /// verdict — the readback decides.
+    fn resume_switch(outcome: std::result::Result<(), HttpOutcome>, what: &str) -> Result<()> {
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(HttpOutcome::Rejected { reason, .. })
+            | Err(HttpOutcome::Unknown { reason })
+            | Err(HttpOutcome::NotDispatched { reason }) => Err(Error::new(
+                "unknown",
+                format!("OpenCode resume {what} switch is unresolved ({reason})"),
+            )),
+        }
+    }
+
+    /// Discard the server after a resume failure that wrote nothing and
+    /// retain the failure for replay.
+    async fn fail_resume(
+        &mut self,
+        parsed: &ParsedStart,
+        mut session: AgentSession,
+        error: Error,
+    ) -> Error {
+        let error = discard_failed_start(&mut session, error).await;
+        self.retain_failed_start(&parsed.params, error)
+    }
+
+    /// Stash a resume-ambiguous session as unknown: the server and stream
+    /// stay for the snapshot, and the resume is never repeated.
+    async fn stash_resume_unknown(&mut self, session: AgentSession, message: String) -> Error {
+        self.session = Some(session);
+        Error::new(
+            "unknown",
+            format!("OpenCode resume is unresolved ({message})"),
+        )
+    }
+
     /// Start phase 5, readiness: publish `session.ready` and retain the
     /// result. A lost acknowledgement stashes the known session as unknown.
     async fn ready_start_session(
@@ -666,6 +1133,8 @@ impl OpenCodePlugin {
         )?;
         match params.verb.as_str() {
             "send" => self.send_command(params).await,
+            "interrupt" => self.interrupt_command(params).await,
+            "approve" | "deny" | "answer" => self.reply_command(params).await,
             _ => Err(Error::new(
                 "unsupported",
                 "OpenCode plugin command verb is not implemented",
@@ -691,7 +1160,7 @@ impl OpenCodePlugin {
                 "OpenCode session or event source outcome is unresolved",
             ));
         }
-        let (command_id, text) = match Self::admit_send_command(session, &params)? {
+        let (command_id, text) = match Self::admit_send_command(session, &params).await? {
             SendAdmission::Replay(value) => return Ok(value),
             SendAdmission::New { command_id, text } => (command_id, text),
         };
@@ -712,8 +1181,12 @@ impl OpenCodePlugin {
     }
 
     /// Send phase 1, admission: validate the input, replay a retained
-    /// outcome without new native I/O, or record the new command.
-    fn admit_send_command(
+    /// outcome without new native I/O, or record the new command. The
+    /// idle check reads the event task's current status through the
+    /// control queue, serialized behind the terminal commit: the watch
+    /// snapshot still shows the finished turn when a send follows its
+    /// `turn.completed` immediately.
+    async fn admit_send_command(
         session: &mut AgentSession,
         params: &AgentCommandParams,
     ) -> Result<SendAdmission> {
@@ -757,7 +1230,12 @@ impl OpenCodePlugin {
                 "OpenCode command was already dispatched without a retained exact outcome",
             ));
         }
-        let event_status = session.events.status();
+        let event_status = session.events.current_status().await.map_err(|_| {
+            Error::new(
+                "unknown",
+                "OpenCode event status is unavailable; the send cannot prove the turn idle",
+            )
+        })?;
         if let Some(reason) = event_status.failure {
             return Err(Error::new("unknown", reason));
         }
@@ -868,6 +1346,308 @@ impl OpenCodePlugin {
                 ))
             }
         }
+    }
+
+    /// Interrupt the exact active turn: the authoritative event-task gate
+    /// binds the command first, then one `session.interrupt` write runs.
+    /// `interrupted: true` applies (the `interrupted` terminal settles the
+    /// turn on the stream); `false` re-checks the gate — a finished turn is
+    /// stale, a still-active one contradicts the server and stays unknown.
+    async fn interrupt_command(&mut self, params: AgentCommandParams) -> Result<Value> {
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| Error::new("bad_state", "OpenCode Agent session has not started"))?;
+        validate_binding(
+            &session.agent_id,
+            session.generation,
+            &params.agent_id,
+            params.generation,
+            "OpenCode",
+        )?;
+        if session.phase != SessionPhase::Ready {
+            return Err(Error::new(
+                "unknown",
+                "OpenCode session or event source outcome is unresolved",
+            ));
+        }
+        let admitted = match Self::admit_control_command(session, &params, false)? {
+            ControlAdmission::Replay(value) => return Ok(value),
+            ControlAdmission::New {
+                command_id,
+                turn_id,
+                ..
+            } => (command_id, turn_id),
+        };
+        let (command_id, turn_id) = admitted;
+        let Some(turn_id) = turn_id else {
+            Self::abandon_control(session, &command_id);
+            return Err(Error::new(
+                "stale_turn",
+                "OpenCode interrupt requires the exact turn id",
+            ));
+        };
+        let live = match session.events.check_turn(&turn_id).await {
+            Ok(live) => live,
+            // The gate itself is unresolved (the event task is gone): the
+            // turn may still be live, so this is unknown, never stale.
+            Err(_) => {
+                Self::abandon_control(session, &command_id);
+                return Err(Error::new(
+                    "unknown",
+                    "OpenCode interrupt turn check is unresolved",
+                ));
+            }
+        };
+        if !live {
+            Self::abandon_control(session, &command_id);
+            return Err(Error::new(
+                "stale_turn",
+                "OpenCode interrupt named a finished turn",
+            ));
+        }
+        let session_id = session
+            .session_id
+            .clone()
+            .ok_or_else(|| Error::new("unknown", "OpenCode session identity is unresolved"))?;
+        let outcome = session
+            .http
+            .interrupt(&session_id, Instant::now() + RPC_TIMEOUT)
+            .await;
+        Self::finish_interrupt(session, &command_id, &turn_id, outcome).await
+    }
+
+    /// Settle an interrupt after its one write: applied on
+    /// `interrupted: true`, rejected when the session is provably gone,
+    /// stale when the turn finished underneath, unknown otherwise. Unknown
+    /// never latches the session: the turn lifecycle stays on the stream,
+    /// where the snapshot reveals the truth.
+    async fn finish_interrupt(
+        session: &mut AgentSession,
+        command_id: &str,
+        turn_id: &str,
+        outcome: std::result::Result<bool, HttpOutcome>,
+    ) -> Result<Value> {
+        match outcome {
+            Ok(true) => {
+                let result = json!({
+                    "state": "applied",
+                    "command_id": command_id,
+                    "turn_id": turn_id,
+                });
+                Self::settle_control(session, command_id, result.clone());
+                Ok(result)
+            }
+            Ok(false) => {
+                let live = match session.events.check_turn(turn_id).await {
+                    Ok(live) => live,
+                    // The write went out but the gate is unresolved (the
+                    // event task is gone): unknown, never stale.
+                    Err(_) => {
+                        session.unknown_commands.insert(command_id.to_owned());
+                        Self::abandon_control(session, command_id);
+                        return Err(Error::new(
+                            "unknown",
+                            "OpenCode interrupt turn check is unresolved",
+                        ));
+                    }
+                };
+                if live {
+                    session.unknown_commands.insert(command_id.to_owned());
+                    Self::abandon_control(session, command_id);
+                    Err(Error::new(
+                        "unknown",
+                        "OpenCode server reports no running execution but the turn is still active",
+                    ))
+                } else {
+                    Self::abandon_control(session, command_id);
+                    Err(Error::new(
+                        "stale_turn",
+                        "OpenCode interrupt named a finished turn",
+                    ))
+                }
+            }
+            Err(HttpOutcome::Rejected { reason, .. }) => {
+                let result = json!({
+                    "state": "rejected",
+                    "command_id": command_id,
+                    "turn_id": turn_id,
+                    "reason": reason,
+                });
+                Self::settle_control(session, command_id, result.clone());
+                Ok(result)
+            }
+            Err(HttpOutcome::Unknown { reason } | HttpOutcome::NotDispatched { reason }) => {
+                // The binding stays: an exact retry is answered `unknown` and
+                // never re-sends `/interrupt` (decision D-14).
+                session.unknown_commands.insert(command_id.to_owned());
+                Err(Error::new(
+                    "unknown",
+                    format!("OpenCode interrupt outcome is unresolved ({reason})"),
+                ))
+            }
+        }
+    }
+
+    /// Reply to one exact retained native request. The event task stages
+    /// the choice against the current offer and performs the one write;
+    /// this side only retains the outcome for replay.
+    async fn reply_command(&mut self, params: AgentCommandParams) -> Result<Value> {
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| Error::new("bad_state", "OpenCode Agent session has not started"))?;
+        validate_binding(
+            &session.agent_id,
+            session.generation,
+            &params.agent_id,
+            params.generation,
+            "OpenCode",
+        )?;
+        if session.phase != SessionPhase::Ready {
+            return Err(Error::new(
+                "unknown",
+                "OpenCode session or event source outcome is unresolved",
+            ));
+        }
+        let admitted = match Self::admit_control_command(session, &params, true)? {
+            ControlAdmission::Replay(value) => return Ok(value),
+            ControlAdmission::New {
+                command_id,
+                turn_id,
+                request_id,
+                args,
+            } => (command_id, turn_id, request_id, args),
+        };
+        let (command_id, turn_id, request_id, args) = admitted;
+        let (Some(turn_id), Some(request_id)) = (turn_id, request_id) else {
+            Self::abandon_control(session, &command_id);
+            return Err(Error::new(
+                "not_found",
+                "OpenCode reply requires the exact turn and request ids",
+            ));
+        };
+        let verb = params.verb.clone();
+        match session
+            .events
+            .reply_request(command_id.clone(), request_id, turn_id, verb, args)
+            .await
+        {
+            Ok(result) => {
+                if result.get("state").and_then(Value::as_str) == Some("unknown") {
+                    session.unknown_commands.insert(command_id.clone());
+                }
+                Self::settle_control(session, &command_id, result.clone());
+                Ok(result)
+            }
+            Err(error) => {
+                // Guard failures (stale, missing, already decided, busy)
+                // ran no write and pass through; only a lost control is
+                // unknown.
+                if matches!(
+                    error.code.as_str(),
+                    "not_found" | "stale_turn" | "rejected" | "busy"
+                ) || native_no_write(&error.code)
+                {
+                    Self::abandon_control(session, &command_id);
+                    return Err(error);
+                }
+                // The binding stays so an exact retry is answered `unknown`.
+                session.unknown_commands.insert(command_id.clone());
+                Err(Error::new(
+                    "unknown",
+                    format!("OpenCode reply outcome is unresolved ({})", error.message),
+                ))
+            }
+        }
+    }
+
+    /// Control admission: replay a retained outcome without new native I/O,
+    /// refuse a rebinding, or record the new control. Replies additionally
+    /// require their request id here; the exact offer binding happens on
+    /// the event task.
+    fn admit_control_command(
+        session: &mut AgentSession,
+        params: &AgentCommandParams,
+        needs_request: bool,
+    ) -> Result<ControlAdmission> {
+        if session.unknown_commands.contains(&params.command_id)
+            && !session.control_bindings.contains_key(&params.command_id)
+        {
+            return Err(Error::new(
+                "unknown",
+                "OpenCode control outcome is unresolved and will not be repeated",
+            ));
+        }
+        if let Some(binding) = session.control_bindings.get(&params.command_id) {
+            if binding.verb != params.verb
+                || binding.turn_id != params.turn_id
+                || binding.request_id != params.request_id
+                || binding.args != params.args
+            {
+                return Err(Error::new(
+                    "source_integrity",
+                    "OpenCode command id was reused with a different control",
+                ));
+            }
+            if let Some(result) = session.control_results.get(&params.command_id) {
+                return Ok(ControlAdmission::Replay(result.clone()));
+            }
+            if session.unknown_commands.contains(&params.command_id) {
+                return Err(Error::new(
+                    "unknown",
+                    "OpenCode control outcome is unresolved and will not be repeated",
+                ));
+            }
+            return Err(Error::new(
+                "unknown",
+                "OpenCode command was already dispatched without a retained exact outcome",
+            ));
+        }
+        if needs_request && params.request_id.as_deref().is_none_or(str::is_empty) {
+            return Err(Error::new(
+                "not_found",
+                "OpenCode reply requires the exact request id",
+            ));
+        }
+        if session.command_inputs.len() + session.control_bindings.len()
+            >= MAX_COMMANDS_PER_GENERATION
+        {
+            return Err(Error::new(
+                "unsupported",
+                "OpenCode L6.2 per-generation command history bound has been reached",
+            ));
+        }
+        session.control_bindings.insert(
+            params.command_id.clone(),
+            ControlBinding {
+                verb: params.verb.clone(),
+                turn_id: params.turn_id.clone(),
+                request_id: params.request_id.clone(),
+                args: params.args.clone(),
+            },
+        );
+        Ok(ControlAdmission::New {
+            command_id: params.command_id.clone(),
+            turn_id: params.turn_id.clone(),
+            request_id: params.request_id.clone(),
+            args: params.args.clone(),
+        })
+    }
+
+    /// Retain an applied or rejected control result for byte-identical
+    /// replay.
+    fn settle_control(session: &mut AgentSession, command_id: &str, result: Value) {
+        session
+            .control_results
+            .insert(command_id.to_owned(), result);
+    }
+
+    /// Forget a control binding whose outcome left no result (stale,
+    /// unknown): nothing may replay from it.
+    fn abandon_control(session: &mut AgentSession, command_id: &str) {
+        session.control_bindings.remove(command_id);
+        session.control_results.remove(command_id);
     }
 
     async fn snapshot(&mut self, raw: &Value) -> Result<Value> {
@@ -1001,7 +1781,8 @@ impl OpenCodePlugin {
             &session.command_inputs,
             &session.stop_command_id,
             &params.command_id,
-        ) {
+        ) && !session.control_bindings.contains_key(&params.command_id)
+        {
             return Err("OpenCode command identity is not retained");
         }
         if session.phase == SessionPhase::Stopped {
@@ -1257,6 +2038,7 @@ pub(crate) fn opencode_scope(data_dir: &Path) -> String {
 fn opencode_manifest() -> PluginManifest {
     let controlled = BTreeMap::from([
         ("message".to_owned(), "stream".to_owned()),
+        ("request".to_owned(), "stream".to_owned()),
         ("session".to_owned(), "stream".to_owned()),
         ("turn".to_owned(), "stream".to_owned()),
     ]);
@@ -1267,7 +2049,16 @@ fn opencode_manifest() -> PluginManifest {
         harness_version: "2.0.32".to_owned(),
         available: true,
         mode: "per_agent".to_owned(),
-        verbs: vec!["launch".to_owned(), "send".to_owned(), "stop".to_owned()],
+        verbs: vec![
+            "launch".to_owned(),
+            "resume".to_owned(),
+            "send".to_owned(),
+            "interrupt".to_owned(),
+            "approve".to_owned(),
+            "deny".to_owned(),
+            "answer".to_owned(),
+            "stop".to_owned(),
+        ],
         child_verbs: Vec::new(),
         features: eliot_plugin::protocol::ManifestFeatures {
             discover: false,
@@ -1283,21 +2074,36 @@ fn opencode_manifest() -> PluginManifest {
 #[cfg(test)]
 mod tests {
     use super::{opencode_manifest, opencode_scope, split_model};
-    use eliot_plugin::session::validate_source_plan;
+    use eliot_core::{AgentStartParams, Result};
+    use eliot_plugin::session::{
+        ResumeSubject, optional_profile_text, parse_resume_subject, validate_source_plan,
+    };
     use serde_json::json;
     use std::path::PathBuf;
 
-    const FAMILIES: &[&str] = &["session", "turn", "message"];
+    const FAMILIES: &[&str] = &["session", "turn", "message", "request"];
 
     #[test]
-    fn manifest_advertises_the_connected_pr1_verbs() {
+    fn manifest_advertises_the_connected_pr2_verbs() {
         let manifest = opencode_manifest();
         assert_eq!(manifest.name, "opencode");
         assert_eq!(manifest.protocol, "eliot-plugin/1");
         assert_eq!(manifest.harness_version, "2.0.32");
         assert!(manifest.available);
         assert_eq!(manifest.mode, "per_agent");
-        assert_eq!(manifest.verbs, ["launch", "send", "stop"]);
+        assert_eq!(
+            manifest.verbs,
+            [
+                "launch",
+                "resume",
+                "send",
+                "interrupt",
+                "approve",
+                "deny",
+                "answer",
+                "stop"
+            ]
+        );
         assert!(manifest.child_verbs.is_empty());
         assert!(!manifest.features.start_requires_input);
         assert!(!manifest.features.native_children);
@@ -1318,7 +2124,8 @@ mod tests {
                     "session": "stream", "turn": "stream", "message": "stream",
                 }))
             )
-            .is_ok()
+            .is_err(),
+            "PR2 connects the request family, so PR1 plans no longer admit"
         );
         assert!(
             validate_source_plan(
@@ -1329,8 +2136,7 @@ mod tests {
                     "request": "stream",
                 }))
             )
-            .is_ok(),
-            "extra families are tolerated; the host installs the connected plan"
+            .is_ok()
         );
     }
 
@@ -1353,5 +2159,125 @@ mod tests {
         );
         assert_ne!(scope, opencode_scope(&PathBuf::from("/eliot/other/data")));
         assert!(scope.starts_with("opencode-store:"));
+    }
+
+    fn resume_params() -> AgentStartParams {
+        let mut params = AgentStartParams::new("a7", 2, "resume-1");
+        params.resume_from = Some(json!({"native_scope": "scope-1", "native_ref": "ses_1"}));
+        params.source_state = Some(json!({
+            "retained_generation": 1,
+            "retained_source": {
+                "agent_id": "a7", "generation": 1, "source": "stream",
+                "families": ["session", "turn", "message"],
+            },
+            "current_turn": serde_json::Value::Null,
+        }));
+        params
+    }
+
+    fn validate_resume(params: &AgentStartParams) -> Result<ResumeSubject> {
+        parse_resume_subject(
+            params.resume_from.as_ref().expect("resume fixture"),
+            params.source_state.as_ref(),
+            &params.agent_id,
+            params.generation,
+            "OpenCode",
+        )
+    }
+
+    #[test]
+    fn resume_subject_binds_scope_ref_and_continuity() {
+        let subject = validate_resume(&resume_params()).expect("valid subject");
+        assert_eq!(subject.native_scope, "scope-1");
+        assert_eq!(subject.native_ref, "ses_1");
+        assert_eq!(subject.retained_turn, None);
+        // A PR2 retained source (owning the request family) binds too:
+        // only session/turn/message ownership is required.
+        let mut params = resume_params();
+        params.source_state = Some(json!({
+            "retained_generation": 1,
+            "retained_source": {
+                "agent_id": "a7", "generation": 1, "source": "stream",
+                "families": ["session", "turn", "message", "request"],
+            },
+            "current_turn": {
+                "turn_id": "t", "state": "completed", "status": "completed",
+                "started_at": 1, "completed_at": 2,
+            },
+        }));
+        let subject = validate_resume(&params).expect("valid");
+        assert_eq!(subject.retained_turn.as_deref(), Some("t"));
+    }
+
+    #[test]
+    fn resume_subject_rejects_broken_continuity() {
+        let mut params = resume_params();
+        params.generation = 3;
+        assert_eq!(
+            validate_resume(&params).expect_err("skip").code,
+            "stale_generation"
+        );
+        let mut params = resume_params();
+        params.resume_from = Some(json!({"native_scope": "scope-1"}));
+        assert_eq!(
+            validate_resume(&params).expect_err("no ref").code,
+            "invalid"
+        );
+        let mut params = resume_params();
+        params.source_state = Some(json!({
+            "retained_generation": 1,
+            "retained_source": {
+                "agent_id": "a7", "generation": 1, "source": "stream",
+                "families": ["session"],
+            },
+            "current_turn": serde_json::Value::Null,
+        }));
+        assert_eq!(
+            validate_resume(&params).expect_err("families").code,
+            "unknown"
+        );
+        // The daemon names the retained stream source "stream".
+        let mut params = resume_params();
+        params.source_state = Some(json!({
+            "retained_generation": 1,
+            "retained_source": {
+                "agent_id": "a7", "generation": 1, "source": "controlled",
+                "families": ["session", "turn", "message"],
+            },
+            "current_turn": serde_json::Value::Null,
+        }));
+        assert_eq!(
+            validate_resume(&params).expect_err("source name").code,
+            "stale_generation"
+        );
+    }
+
+    #[test]
+    fn profile_agent_is_optional_but_typed() {
+        let profile = serde_json::Map::new();
+        assert_eq!(
+            optional_profile_text(&profile, "agent", "OpenCode").expect("absent"),
+            None
+        );
+        let profile = json!({"agent": "general"})
+            .as_object()
+            .expect("object")
+            .clone();
+        assert_eq!(
+            optional_profile_text(&profile, "agent", "OpenCode").expect("present"),
+            Some("general".to_owned())
+        );
+        let profile = json!({"agent": null}).as_object().expect("object").clone();
+        assert_eq!(
+            optional_profile_text(&profile, "agent", "OpenCode").expect("null"),
+            None
+        );
+        let profile = json!({"agent": 7}).as_object().expect("object").clone();
+        assert_eq!(
+            optional_profile_text(&profile, "agent", "OpenCode")
+                .expect_err("typed")
+                .code,
+            "profile_error"
+        );
     }
 }

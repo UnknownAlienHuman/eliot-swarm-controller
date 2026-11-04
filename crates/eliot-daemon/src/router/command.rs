@@ -1409,3 +1409,70 @@ fn unknown_cause(error: &Error) -> String {
         "plugin_outcome_unknown".to_owned()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Command, validate_retained_resume_agent};
+    use eliot_core::{Agent, AgentState, CommandState};
+    use serde_json::json;
+
+    fn resume_command(agent_id: &str) -> Command {
+        Command {
+            id: "resume-fixture".to_owned(),
+            principal: "owner".to_owned(),
+            method: "command.submit".to_owned(),
+            verb: "resume".to_owned(),
+            target: Some(agent_id.to_owned()),
+            selector: None,
+            expected_generation: Some(2),
+            generation: Some(2),
+            args: json!({}),
+            state: CommandState::Accepted,
+            turn_id: None,
+            request_id: None,
+            outcome: None,
+            created_at: 0,
+            updated_at: 0,
+            probe: false,
+        }
+    }
+
+    fn retained_agent(harness: &str) -> Agent {
+        let mut agent = Agent::new("a7", "descriptive-project", harness, "profile", 10);
+        agent.generation = 2;
+        agent.state = AgentState::Stopped;
+        agent.native_scope = Some(format!("{harness}-scope-a7"));
+        agent.native_ref = Some(format!("{harness}-subject-a7"));
+        agent
+    }
+
+    #[test]
+    fn resume_capture_admits_connected_harnesses_next_to_fake() {
+        let resume = resume_command("a7");
+        for harness in ["fake", "muse", "claude", "opencode"] {
+            let agent = retained_agent(harness);
+            assert_eq!(
+                validate_retained_resume_agent(&agent, &resume).unwrap(),
+                2,
+                "{harness} resume captures its retained generation"
+            );
+        }
+        // A Codex binding on a non-Codex agent is still refused.
+        let mut agent = retained_agent("opencode");
+        agent.profile_snapshot = json!({"native_store_binding": {"home": "h"}});
+        assert_eq!(
+            validate_retained_resume_agent(&agent, &resume)
+                .unwrap_err()
+                .code,
+            "source_integrity"
+        );
+        // Harnesses without a connected resume stay unsupported.
+        let agent = retained_agent("acp");
+        assert_eq!(
+            validate_retained_resume_agent(&agent, &resume)
+                .unwrap_err()
+                .code,
+            "unsupported"
+        );
+    }
+}

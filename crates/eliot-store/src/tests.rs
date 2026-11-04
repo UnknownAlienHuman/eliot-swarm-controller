@@ -87,7 +87,7 @@ fn initial_source_families_match_fake_and_codex_harness_boundaries() {
     );
     assert_eq!(
         super::source_families_for_harness("opencode").unwrap(),
-        &["session", "turn", "message"][..]
+        &["session", "turn", "message", "request"][..]
     );
     assert_eq!(
         super::source_families_for_harness("other")
@@ -8840,13 +8840,6 @@ fn opencode_launch_passes_admission_and_dispatch_gates() {
         store.get_agent(&agent).unwrap().unwrap().harness,
         "opencode"
     );
-
-    // PR1 connects launch/send/stop only: resume stays unsupported for the
-    // opencode harness until its exact reattachment lands.
-    let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
-    resume.target = Some(agent.clone());
-    let error = store.submit("owner", resume, now + 4).unwrap_err();
-    assert_eq!(error.code, "unsupported");
 }
 
 /// Launch a `muse`-harness Agent through generation-1 readiness, returning
@@ -9553,6 +9546,267 @@ fn muse_replies_and_turn_controls_pass_admission_and_dispatch() {
             CommandState::Dispatched
         );
     }
+}
+
+/// Launch an `opencode`-harness Agent through generation-1 readiness.
+fn ready_opencode_agent(
+    store: &mut Store,
+    project: &str,
+    profile: &str,
+    workspace: &str,
+    now: i64,
+) -> (String, String, String, String) {
+    let mut launch = SubmitCommand::new(Ulid::new().to_string(), "launch");
+    launch.args = json!({
+        "project": project,
+        "harness": "opencode",
+        "profile": profile,
+        "profile_snapshot": {"harness": "opencode", "model": "test-provider/test-model"},
+        "workspace": workspace,
+    });
+    launch.expected_generation = Some(0);
+    let launch_id = launch.id.clone();
+    let agent = store
+        .submit("owner", launch, now)
+        .expect("admit opencode launch")
+        .command
+        .target
+        .expect("opencode launch Agent");
+    let native_scope = format!("{project}:{agent}:scope");
+    let native_ref = format!("{project}:{agent}:session");
+    store
+        .dispatch(&launch_id, now + 1)
+        .expect("dispatch opencode launch");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("{project}:ready"),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ready".to_owned(),
+                    native_id: format!("{project}:ready"),
+                    data: json!({
+                        "command_id": launch_id.as_str(),
+                        "native_scope": native_scope.as_str(),
+                        "native_ref": native_ref.as_str(),
+                    }),
+                }],
+                cursor: None,
+            },
+            now + 2,
+        )
+        .expect("commit opencode session readiness");
+    store
+        .settle(&launch_id, CommandState::Applied, None, now + 3)
+        .expect("settle opencode launch");
+    (agent, launch_id, native_scope, native_ref)
+}
+
+fn end_opencode_session(store: &mut Store, agent: &str, project: &str, now: i64) {
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("{project}:ended"),
+                agent_id: agent.to_owned(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ended".to_owned(),
+                    native_id: format!("{project}:ended"),
+                    data: json!({}),
+                }],
+                cursor: None,
+            },
+            now,
+        )
+        .expect("commit opencode terminal session fact");
+}
+
+#[test]
+fn opencode_resume_passes_admission_and_dispatch_gates() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let project = "opencode-resume-gates";
+    let (agent, _, native_scope, native_ref) = ready_opencode_agent(
+        &mut store,
+        project,
+        "opencode-test",
+        "synthetic-opencode-resume",
+        now,
+    );
+    assert_eq!(
+        store.get_agent(&agent).unwrap().unwrap().harness,
+        "opencode"
+    );
+
+    let mut early = SubmitCommand::new(Ulid::new().to_string(), "resume");
+    early.target = Some(agent.clone());
+    early.expected_generation = Some(1);
+    assert_eq!(
+        store
+            .submit("owner", early, now + 5)
+            .expect_err("live generation refuses resume")
+            .code,
+        "bad_state"
+    );
+    end_opencode_session(&mut store, &agent, project, now + 6);
+
+    let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
+    resume.target = Some(agent.clone());
+    resume.expected_generation = Some(1);
+    let resume_id = resume.id.clone();
+    let admission = store
+        .submit("owner", resume, now + 7)
+        .expect("admit opencode resume");
+    assert_eq!(admission.command.state, CommandState::Accepted);
+    assert_eq!(admission.command.generation, Some(1));
+    assert_eq!(
+        store
+            .dispatch(&resume_id, now + 8)
+            .expect("dispatch opencode resume")
+            .value
+            .state,
+        CommandState::Dispatched
+    );
+    let starting = store.get_agent(&agent).unwrap().unwrap();
+    assert_eq!(starting.generation, 2);
+    assert_eq!(starting.state, AgentState::Starting);
+    assert_eq!(
+        starting.native_scope.as_deref(),
+        Some(native_scope.as_str())
+    );
+    assert_eq!(starting.native_ref.as_deref(), Some(native_ref.as_str()));
+}
+
+#[test]
+fn opencode_replies_and_interrupt_pass_admission_and_dispatch() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let project = "opencode-request-replies";
+    let (agent, _, _, _) = ready_opencode_agent(
+        &mut store,
+        project,
+        "opencode-test",
+        "synthetic-opencode-request-replies",
+        now,
+    );
+    let send = send_request(&agent, 1, "open a request turn");
+    let send_id = send.id.clone();
+    store.submit("owner", send, now + 5).unwrap();
+    store.dispatch(&send_id, now + 6).unwrap();
+    let turn_id = format!("opencode-request-turn-{}", Ulid::new());
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: Ulid::new().to_string(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "turn.started".to_owned(),
+                    native_id: Ulid::new().to_string(),
+                    data: json!({"command_id":send_id, "turn_id":turn_id}),
+                }],
+                cursor: None,
+            },
+            now + 7,
+        )
+        .expect("commit the opencode request turn");
+    let open_request = |native_id: &str, request_id: &str, kind: &str| NativeEvent {
+        ts: None,
+        kind: "request.opened".to_owned(),
+        native_id: native_id.to_owned(),
+        data: json!({
+            "command_id":send_id,
+            "request_id":request_id,
+            "turn_id":turn_id,
+            "kind":kind,
+            "details":{"permission_id":request_id},
+        }),
+    };
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: Ulid::new().to_string(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![
+                    open_request("opencode-reply-approve", "per_approve", "approval"),
+                    open_request("opencode-reply-deny", "per_deny", "approval"),
+                    open_request("opencode-reply-answer", "frm_answer", "question"),
+                ],
+                cursor: None,
+            },
+            now + 8,
+        )
+        .expect("commit opencode pending requests");
+
+    for (verb, request_id) in [
+        ("approve", "per_approve"),
+        ("deny", "per_deny"),
+        ("answer", "frm_answer"),
+    ] {
+        let mut reply = SubmitCommand::new(Ulid::new().to_string(), verb);
+        reply.target = Some(agent.clone());
+        reply.expected_generation = Some(1);
+        reply.expected_turn_id = Some(turn_id.clone());
+        reply.request_id = Some(request_id.to_owned());
+        let reply_id = reply.id.clone();
+        let admission = store
+            .submit("owner", reply, now + 9)
+            .unwrap_or_else(|error| panic!("admit opencode {verb}: {error:?}"));
+        assert_eq!(admission.command.state, CommandState::Accepted);
+        assert_eq!(
+            store
+                .dispatch(&reply_id, now + 10)
+                .unwrap_or_else(|error| panic!("dispatch opencode {verb}: {error:?}"))
+                .value
+                .state,
+            CommandState::Dispatched
+        );
+    }
+
+    let mut interrupt = SubmitCommand::new(Ulid::new().to_string(), "interrupt");
+    interrupt.target = Some(agent.clone());
+    interrupt.expected_generation = Some(1);
+    interrupt.expected_turn_id = Some(turn_id.clone());
+    let interrupt_id = interrupt.id.clone();
+    assert_eq!(
+        store
+            .submit("owner", interrupt, now + 11)
+            .expect("admit opencode interrupt")
+            .command
+            .state,
+        CommandState::Accepted
+    );
+    assert_eq!(
+        store
+            .dispatch(&interrupt_id, now + 12)
+            .expect("dispatch opencode interrupt")
+            .value
+            .state,
+        CommandState::Dispatched
+    );
+
+    // Steer has no installed OpenCode method and stays unsupported.
+    let mut steer = SubmitCommand::new(Ulid::new().to_string(), "steer");
+    steer.target = Some(agent.clone());
+    steer.expected_generation = Some(1);
+    steer.expected_turn_id = Some(turn_id.clone());
+    steer.args = json!({"text": "follow-up"});
+    assert_eq!(
+        store
+            .submit("owner", steer, now + 13)
+            .expect_err("opencode steer is unsupported")
+            .code,
+        "unsupported"
+    );
 }
 
 /// Launch a `claude`-harness Agent through generation-1 readiness,

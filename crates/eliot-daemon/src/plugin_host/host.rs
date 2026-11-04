@@ -2137,7 +2137,7 @@ fn manifest_source_plan(manifest: &PluginManifest, harness: &str) -> Result<Valu
         .get("controlled")
         .ok_or_else(unsupported_manifest)?;
     let tool_expected = harness == "codex";
-    let request_expected = matches!(harness, "fake" | "codex" | "muse" | "claude");
+    let request_expected = matches!(harness, "fake" | "codex" | "muse" | "claude" | "opencode");
     let expected_count = expected_families.len()
         + if tool_expected { 1 } else { 0 }
         + if request_expected { 1 } else { 0 };
@@ -2852,6 +2852,31 @@ mod tests {
                 .code,
             "unsupported"
         );
+    }
+
+    #[test]
+    fn controlled_opencode_manifest_requires_request_stream_family() {
+        let mut opencode = eliot_plugin::protocol::fake_manifest();
+        opencode.name = "opencode".to_owned();
+        opencode.harness_version = "2.0.32".to_owned();
+        // Without the request family the PR2 plugin contract refuses.
+        assert_eq!(
+            manifest_source_plan(&opencode, "opencode")
+                .unwrap_err()
+                .code,
+            "unsupported"
+        );
+        opencode
+            .sources
+            .get_mut("controlled")
+            .expect("controlled sources")
+            .insert("request".to_owned(), "stream".to_owned());
+        let plan = manifest_source_plan(&opencode, "opencode")
+            .expect("OpenCode request stream is supported");
+        assert_eq!(plan.as_object().unwrap().len(), 4);
+        for family in ["message", "request", "session", "turn"] {
+            assert_eq!(plan[family], "stream");
+        }
     }
 
     const SECRET: &str = "__payload_guard_secret__";

@@ -2,10 +2,11 @@
 //!
 //! Source: `GET /openapi.json` of `opencode serve` v2.0.32 (OpenAPI 3.1.0,
 //! `opencode HttpApi version=0.0.1`, all routes under `/api/...`) plus the
-//! `session-event.ts` / `session-status-event.ts` event definitions at tag
+//! `session-event.ts` / `permission.ts` / `form.ts` event definitions at tag
 //! `v2.0.32` of `anomalyco/opencode`, verified against a locally started
-//! server. Unknown JSON fields are ignored on deserialize for forward
-//! compatibility. DTOs only: no I/O, no process spawning, no config access.
+//! server with no model call. Unknown JSON fields are ignored on deserialize
+//! for forward compatibility. DTOs only: no I/O, no process spawning, no
+//! config access.
 
 use serde::{Deserialize, Serialize};
 
@@ -47,12 +48,15 @@ pub struct LocationRef {
     pub directory: String,
 }
 
-/// `Session.Info` subset used by PR1: identity, model, location. Times,
-/// tokens, cost and the rest are ignored.
+/// `Session.Info` subset: identity, agent, model, location. Times,
+/// tokens, cost and the rest are ignored. `agent` and `model` are absent
+/// until set; PR2 reads both back after the resume setters.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionInfo {
     pub id: String,
+    #[serde(default)]
+    pub agent: Option<String>,
     #[serde(default)]
     pub model: Option<ModelRef>,
     #[serde(default)]
@@ -87,6 +91,146 @@ pub struct InboxUser {
     pub id: String,
     #[serde(rename = "sessionID")]
     pub session_id: String,
+}
+
+// ---------------------------------------------------------------------------
+// Interrupt, permissions, forms, inbox, agents (PR2 readback and replies)
+// ---------------------------------------------------------------------------
+
+/// `POST /api/session/{id}/interrupt` (`session.interrupt`) 200 response.
+/// Unlike every other success body it is NOT wrapped in `{"data": ...}`:
+/// the installed server answers `{"interrupted": false}` on an idle
+/// session. `interrupted` tells whether an active execution owned by this
+/// server process was interrupted.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InterruptResponse {
+    pub interrupted: bool,
+}
+
+/// `session.permission.list` / `session.permission.get`
+/// (`Permission.Request`): `{id, sessionID, action, resources, save?,
+/// metadata?, source?, message?}`. The `permission.asked` SSE data carries
+/// these same fields inline.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionRequest {
+    pub id: String,
+    #[serde(rename = "sessionID")]
+    pub session_id: String,
+    pub action: String,
+    #[serde(default)]
+    pub resources: Vec<String>,
+    #[serde(default)]
+    pub save: Vec<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+/// `POST /api/session/{id}/permission/{requestID}/reply`
+/// (`session.permission.reply`) body: `{decision, message?}` with
+/// `decision` one of `once`, `always`, `reject`. Answers 204 with an empty
+/// body. Installed behavior: `reject` settles every pending permission of
+/// the session, while `once`/`always` settle only the targeted request.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionReplyRequest {
+    pub decision: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// `session.form.list` (`Form.Info`): `{id, sessionID, title, metadata?,
+/// fields}`. `sessionID` is a plain string on the wire (the upstream
+/// schema notes a `"global"` sentinel owner for MCP elicitation); the
+/// plugin only binds entries naming its exact session.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FormInfo {
+    pub id: String,
+    #[serde(rename = "sessionID")]
+    pub session_id: String,
+    pub title: String,
+    #[serde(default)]
+    pub fields: Vec<FormField>,
+}
+
+/// `Form.Field` structural subset: identity, kind, offered options and the
+/// `custom` escape. Members the plugin never decides from (`when`,
+/// `required`, formats, bounds, defaults) are ignored; the native reply
+/// endpoint enforces them and answers 400 when the answer violates them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FormField {
+    pub key: String,
+    #[serde(rename = "type")]
+    pub field_type: String,
+    #[serde(default)]
+    pub options: Vec<FormOption>,
+    #[serde(default)]
+    pub custom: bool,
+}
+
+/// `Form.Option`: `{value, label, description?}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FormOption {
+    pub value: String,
+    pub label: String,
+}
+
+/// `POST /api/session/{id}/form/{formID}/reply` (`session.form.reply`)
+/// body: `{answer}` with `answer` mapping field keys to values (string,
+/// number, boolean, or string array). Answers 204 with an empty body.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FormReplyRequest {
+    pub answer: serde_json::Map<String, serde_json::Value>,
+}
+
+/// `session.inbox.list`: `{"data": [...]}` of durable enqueued work not
+/// yet delivered. Items are uninterpreted: the resume preflight only needs
+/// their absence, never their shape.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InboxPage {
+    #[serde(default)]
+    pub data: Vec<serde_json::Value>,
+}
+
+/// `GET /api/agent`: `{location, data}` with one entry per installed
+/// agent. Only the entry `id` is interpreted (the resume agent-membership
+/// check); the ambient `location` (the server process cwd) is ignored.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentList {
+    #[serde(default)]
+    pub data: Vec<AgentEntry>,
+}
+
+/// Installed agent entry subset: the `build`/`general` style id.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentEntry {
+    pub id: String,
+}
+
+/// `POST /api/session/{id}/model` (`session.switchModel`) body. The
+/// installed server validates nothing (a bogus model 204s and echoes
+/// back); the echo readback is the proof.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SwitchModelRequest {
+    pub model: ModelRef,
+}
+
+/// `POST /api/session/{id}/agent` (`session.switchAgent`) body. Like the
+/// model switch it validates nothing; the requested id must first be a
+/// member of the installed `GET /api/agent` list.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SwitchAgentRequest {
+    pub agent: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -297,6 +441,71 @@ pub struct SessionLifecycleData {
     pub session_id: String,
 }
 
+/// `session.model.selected` data: `{sessionID, model, previous?}`. Durable.
+/// The plugin ignores it (the synchronous 204 plus `session.get` readback
+/// already prove the switch); it exists here so the shape stays pinned.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelSelectedData {
+    #[serde(rename = "sessionID")]
+    pub session_id: String,
+    pub model: ModelRef,
+}
+
+/// `session.agent.selected` data: `{sessionID, agent, previous?}`. Durable,
+/// ignored like the model event: the readback is the proof.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSelectedData {
+    #[serde(rename = "sessionID")]
+    pub session_id: String,
+    pub agent: String,
+}
+
+/// `permission.asked` data: the `Permission.Request` fields inline
+/// (`{id, sessionID, action, resources, ...}`). Ephemeral: no `durable`
+/// block, so a dropped ask is invisible and the execution waits until the
+/// owner interrupts or answers a re-issue.
+pub type PermissionAskedData = PermissionRequest;
+
+/// `permission.replied` data: `{sessionID, requestID, reply}` with `reply`
+/// one of `once`, `always`, `reject`. Ephemeral.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionRepliedData {
+    #[serde(rename = "sessionID")]
+    pub session_id: String,
+    #[serde(rename = "requestID")]
+    pub request_id: String,
+    pub reply: String,
+}
+
+/// `form.created` data: `{form}` with the full `Form.Info`. Ephemeral.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FormCreatedData {
+    pub form: FormInfo,
+}
+
+/// `form.replied` data: `{id, sessionID, answer}`. Ephemeral.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FormRepliedData {
+    pub id: String,
+    #[serde(rename = "sessionID")]
+    pub session_id: String,
+    pub answer: serde_json::Value,
+}
+
+/// `form.cancelled` data: `{id, sessionID}`. Ephemeral.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FormCancelledData {
+    pub id: String,
+    #[serde(rename = "sessionID")]
+    pub session_id: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,6 +601,118 @@ mod tests {
             }
             other => panic!("expected assistant, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn interrupt_response_is_unwrapped_and_idle_is_false() {
+        // Installed `POST .../interrupt` on an idle session (v2.0.32).
+        let idle: InterruptResponse = serde_json::from_value(serde_json::json!({
+            "interrupted": false,
+        }))
+        .expect("unwrapped interrupt response decodes");
+        assert!(!idle.interrupted);
+    }
+
+    #[test]
+    fn permission_asked_and_replied_match_the_installed_shapes() {
+        // `permission.asked` as received on `GET /api/event` (ephemeral: no
+        // durable block, `location` ignored).
+        let asked: SseEnvelope = serde_json::from_value(serde_json::json!({
+            "id": "evt_live_asked",
+            "created": 1793798123067i64,
+            "type": "permission.asked",
+            "location": {"directory": "C:\\probe"},
+            "data": {"id": "per_live1", "sessionID": "ses_live",
+                     "action": "read", "resources": ["C:/probe/other.env"]},
+        }))
+        .expect("installed asked envelope decodes");
+        assert!(asked.durable.is_none());
+        let data: PermissionAskedData =
+            serde_json::from_value(asked.data).expect("asked data decodes");
+        assert_eq!(data.id, "per_live1");
+        assert_eq!(data.session_id, "ses_live");
+        assert_eq!(data.action, "read");
+        assert_eq!(data.resources, ["C:/probe/other.env"]);
+
+        let replied: PermissionRepliedData = serde_json::from_value(serde_json::json!({
+            "sessionID": "ses_live", "requestID": "per_live1", "reply": "reject",
+        }))
+        .expect("installed replied data decodes");
+        assert_eq!(replied.reply, "reject");
+
+        // `session.permission.reply` body spelling.
+        let body = serde_json::to_value(&PermissionReplyRequest {
+            decision: "once".to_owned(),
+            message: None,
+        })
+        .expect("reply body encodes");
+        assert_eq!(body, serde_json::json!({"decision": "once"}));
+    }
+
+    #[test]
+    fn form_created_replied_and_cancelled_match_the_installed_shapes() {
+        let created: FormCreatedData = serde_json::from_value(serde_json::json!({
+            "form": {"id": "frm_live1", "sessionID": "ses_live", "title": "probe question",
+                     "fields": [{"key": "choice", "title": "Pick one", "type": "string",
+                                 "options": [{"value": "a", "label": "Alpha"},
+                                             {"value": "b", "label": "Beta"}]}]},
+        }))
+        .expect("installed form.created data decodes");
+        assert_eq!(created.form.fields.len(), 1);
+        assert_eq!(created.form.fields[0].key, "choice");
+        assert_eq!(created.form.fields[0].options.len(), 2);
+        assert!(!created.form.fields[0].custom);
+
+        let replied: FormRepliedData = serde_json::from_value(serde_json::json!({
+            "id": "frm_live1", "sessionID": "ses_live", "answer": {"yn": true},
+        }))
+        .expect("installed form.replied data decodes");
+        assert_eq!(replied.answer, serde_json::json!({"yn": true}));
+
+        let cancelled: FormCancelledData = serde_json::from_value(serde_json::json!({
+            "id": "frm_live1", "sessionID": "ses_live",
+        }))
+        .expect("installed form.cancelled data decodes");
+        assert_eq!(cancelled.id, "frm_live1");
+    }
+
+    #[test]
+    fn model_and_agent_selected_carry_the_effective_values() {
+        // Durable configure confirmations; the plugin proves the switch by
+        // readback and ignores these, but the shape stays pinned.
+        let model: ModelSelectedData = serde_json::from_value(serde_json::json!({
+            "sessionID": "ses_live",
+            "model": {"id": "m3", "providerID": "p"},
+            "previous": {"id": "m2", "providerID": "p", "variant": "default"},
+        }))
+        .expect("installed model.selected data decodes");
+        assert_eq!(model.model.id, "m3");
+        let agent: AgentSelectedData = serde_json::from_value(serde_json::json!({
+            "sessionID": "ses_live", "agent": "build", "previous": "general",
+        }))
+        .expect("installed agent.selected data decodes");
+        assert_eq!(agent.agent, "build");
+    }
+
+    #[test]
+    fn switch_bodies_use_the_installed_spellings() {
+        let model = serde_json::to_value(&SwitchModelRequest {
+            model: ModelRef {
+                id: "m".to_owned(),
+                provider_id: "p".to_owned(),
+                variant: None,
+            },
+        })
+        .expect("switch model encodes");
+        assert_eq!(
+            model,
+            serde_json::json!({"model": {"id": "m", "providerID": "p"}})
+        );
+        let agent = serde_json::to_value(&SwitchAgentRequest {
+            agent: "general".to_owned(),
+        })
+        .expect("switch agent encodes");
+        assert_eq!(agent, serde_json::json!({"agent": "general"}));
     }
 
     #[test]
