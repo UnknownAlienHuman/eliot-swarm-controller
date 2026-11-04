@@ -4868,7 +4868,32 @@ fn cli_event_rule_matching_reload_and_invalid_retention_survive_restart() {
         let state = read_rule(&fixture);
         if let Some(retiring_revision) = state.retiring_revision {
             assert_eq!(retiring_revision, initial.revision);
-            assert_eq!(state.retire_through, Some(boundary));
+            // A CI run once saw retire_through one past the captured
+            // high-water; name the events that landed after it (identity
+            // fields only, no payloads) so the next failure explains itself.
+            if state.retire_through != Some(boundary) {
+                let late: Vec<String> = fixture
+                    .events()
+                    .into_iter()
+                    .filter(|event| event["seq"].as_i64().is_some_and(|seq| seq > boundary))
+                    .take(8)
+                    .map(|event| {
+                        format!(
+                            "seq={} kind={} agent={} generation={} command_id={}",
+                            event["seq"],
+                            event["kind"],
+                            event["agent"],
+                            event["generation"],
+                            event["data"]["command_id"]
+                        )
+                    })
+                    .collect();
+                panic!(
+                    "retire_through {:?} != captured high-water {boundary}; later events:\n{}",
+                    state.retire_through,
+                    late.join("\n")
+                );
+            }
             assert!(state.retiring_cursor.is_some());
         }
         if state.revision > initial.revision
