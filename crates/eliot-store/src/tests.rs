@@ -6258,11 +6258,13 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
              DROP TABLE messages; DROP TABLE vars; DROP TABLE mail_notices;
              DELETE FROM schema_migrations WHERE version = 21;
              DROP TABLE claims;
-             DELETE FROM schema_migrations WHERE version = 24;",
+             DELETE FROM schema_migrations WHERE version = 24;
+             DROP TABLE owned_exits;
+             DELETE FROM schema_migrations WHERE version = 25;",
         )
         .expect("roll back to schema 16");
     drop(store);
-    let mut store = Store::open(&path).expect("migrate 16 to 24");
+    let mut store = Store::open(&path).expect("migrate 16 to 25");
     store.recover_on_restart(now + 2).expect("recover");
     let retained = store
         .restart_retained_generations(None)
@@ -7978,6 +7980,141 @@ fn stop_and_source_closure_alone_do_not_release_capacity_or_fail_host_settlement
     assert!(events.iter().any(|event| event.kind == "capacity.released"));
     assert_eq!(capacity_generation(&store, &agent), None);
     assert!(numeric_agent > 0);
+}
+
+/// A force-stopped generation that never committed `session.ended`, with its
+/// plugin process recorded as exited; returns the Agent id. The stop already
+/// closed its native sources administratively.
+fn stopped_capacity_agent_without_session_end(
+    store: &mut Store,
+    project: &str,
+    now: i64,
+) -> String {
+    let (agent, _) = ready_capacity_agent(store, project, now);
+    store
+        .ensure_process_source(&agent, 1, now + 1)
+        .expect("install OS process source");
+    let stop_id = Ulid::new().to_string();
+    store
+        .submit(
+            "owner",
+            SubmitCommand {
+                id: stop_id.clone(),
+                target: Some(agent.clone()),
+                selector: None,
+                verb: "stop".to_owned(),
+                args: json!({"force": true}),
+                expected_generation: Some(1),
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now + 2,
+        )
+        .expect("admit forced stop");
+    store.dispatch(&stop_id, now + 2).unwrap();
+    store
+        .settle(&stop_id, CommandState::Applied, None, now + 3)
+        .expect("forced stop applied without session.ended");
+    store
+        .connection
+        .execute(
+            "INSERT INTO processes(host_boot_id, pid, start_time, owner, role, state, exit_code, updated_at)
+             VALUES ('capacity-order-boot', 81003, 1, ?1, 'plugin', 'exited', 0, ?2)",
+            rusqlite::params![format!("agent:{agent}#1"), now + 4],
+        )
+        .expect("persist exact exited plugin process");
+    assert_eq!(capacity_generation(store, &agent), Some(1));
+    agent
+}
+
+#[test]
+fn owned_exit_capacity_releases_when_the_os_source_closes_last() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let agent = stopped_capacity_agent_without_session_end(&mut store, "capacity-os-last", now);
+    // The host proves exit and drain before the monitor's next sweep closes `os`.
+    assert!(
+        store
+            .record_owned_control_exit(&agent, 1, now + 5)
+            .expect("owned exit with OS still open")
+            .is_empty()
+    );
+    assert_eq!(capacity_generation(&store, &agent), Some(1));
+    let events = store
+        .set_process_source_status(&agent, 1, "ok", true, now + 6)
+        .expect("monitor closes the OS source");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "capacity.released")
+            .count(),
+        1,
+        "the last exit fact releases the reservation: {events:?}"
+    );
+    assert_eq!(capacity_generation(&store, &agent), None);
+    let repeated = store
+        .set_process_source_status(&agent, 1, "ok", true, now + 7)
+        .expect("repeated closure");
+    assert!(
+        repeated
+            .iter()
+            .all(|event| event.kind != "capacity.released")
+    );
+}
+
+#[test]
+fn os_closure_without_a_host_drain_proof_keeps_capacity() {
+    // A forced stop whose reader never drained: the host records no owned-exit
+    // proof, so closing `os` must not release although the stop closed the
+    // native sources administratively.
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let agent = stopped_capacity_agent_without_session_end(&mut store, "capacity-no-drain", now);
+    let events = store
+        .set_process_source_status(&agent, 1, "ok", true, now + 5)
+        .expect("monitor closes the OS source");
+    assert!(events.iter().all(|event| event.kind != "capacity.released"));
+    assert_eq!(capacity_generation(&store, &agent), Some(1));
+    let released = store
+        .record_owned_control_exit(&agent, 1, now + 6)
+        .expect("the host drain proof arrives last");
+    assert!(
+        released
+            .iter()
+            .any(|event| event.kind == "capacity.released")
+    );
+    assert_eq!(capacity_generation(&store, &agent), None);
+}
+
+#[test]
+fn restart_reconciles_a_stopped_generation_that_kept_its_reservation() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let agent =
+        stopped_capacity_agent_without_session_end(&mut store, "capacity-restart-stopped", now);
+    store.recover_on_restart(now + 5).expect("recover");
+    let retained = store
+        .restart_retained_generations(None)
+        .expect("read retained generations");
+    assert_eq!(
+        retained.len(),
+        1,
+        "a stopped generation still holding capacity is retained"
+    );
+    assert_eq!(
+        (retained[0].agent.as_str(), retained[0].generation),
+        (agent.as_str(), 1)
+    );
+    let released = store
+        .release_restart_closed_generation(&agent, 1, "windows_job_closed", false, now + 6)
+        .expect("release verified closure");
+    assert!(
+        released
+            .iter()
+            .any(|event| event.kind == "capacity.released")
+    );
+    assert_eq!(capacity_generation(&store, &agent), None);
 }
 
 #[test]

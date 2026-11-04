@@ -1,6 +1,6 @@
 //! Restart capacity recovery. A generation that a daemon replacement left
-//! `lost` keeps its reservation until a later daemon verifies, outside the
-//! Store lock, that its custody closed.
+//! `lost` or `stopped` keeps its reservation until a later daemon verifies,
+//! outside the Store lock, that its custody closed.
 
 use crate::{
     bus::Bus,

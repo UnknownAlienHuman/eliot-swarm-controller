@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 24;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 25;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -622,6 +622,22 @@ impl Store {
                  );
                  CREATE INDEX claims_expiry ON claims(expires_at);
                  INSERT INTO schema_migrations(version) VALUES (24);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 25 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE TABLE owned_exits (
+                     agent INTEGER NOT NULL, generation INTEGER NOT NULL,
+                     proven_at INTEGER NOT NULL,
+                     PRIMARY KEY(agent, generation)
+                 );
+                 INSERT INTO schema_migrations(version) VALUES (25);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

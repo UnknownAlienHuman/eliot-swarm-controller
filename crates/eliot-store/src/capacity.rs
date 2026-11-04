@@ -5,8 +5,9 @@ use eliot_core::CapacityScope;
 const MIGRATION_BATCH_SIZE: i64 = 128;
 const RETAINED_PAGE_SIZE: i64 = 128;
 
-/// A controlled generation left `lost` by a daemon replacement while it still
-/// reserves capacity, with the process identities recorded in its custody.
+/// A controlled generation left `lost` or `stopped` by a daemon replacement
+/// while it still reserves capacity, with the process identities recorded in
+/// its custody.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RetainedGeneration {
     pub agent: String,
@@ -37,8 +38,9 @@ impl Store {
             .map_err(sql_error)
     }
 
-    /// One page, ordered by Agent, of lost generations that still hold their
-    /// reservation. Call it at startup before any new generation can start.
+    /// One page, ordered by Agent, of lost or stopped generations that still
+    /// hold their reservation (a forced stop records no `session.ended`). Call it
+    /// at startup before any new generation can start.
     pub fn restart_retained_generations(
         &self,
         after: Option<&str>,
@@ -48,7 +50,7 @@ impl Store {
             .connection
             .prepare(
                 "SELECT id, generation FROM agents
-                 WHERE id > ?1 AND observe_only = 0 AND state = 'lost'
+                 WHERE id > ?1 AND observe_only = 0 AND state IN ('lost', 'stopped')
                    AND capacity_generation = generation
                  ORDER BY id LIMIT ?2",
             )
@@ -117,7 +119,8 @@ impl Store {
 
     /// Commit custody closure that the daemon verified outside the Store lock,
     /// then release or transfer that generation's reservation in the same
-    /// transaction. A newer reservation or a non-lost Agent is left unchanged.
+    /// transaction. A newer reservation or an Agent that is neither lost nor
+    /// stopped is left unchanged.
     pub fn release_restart_closed_generation(
         &mut self,
         agent: &str,
@@ -136,7 +139,7 @@ impl Store {
             let current = load_agent_by_num(&tx, agent_num)?
                 .ok_or_else(|| Error::new("not_found", "restart capacity Agent was not found"))?;
             observer::require_controlled(&current)?;
-            if current.state != AgentState::Lost
+            if !matches!(current.state, AgentState::Lost | AgentState::Stopped)
                 || current.generation != generation
                 || reservation_generation_tx(&tx, agent_num)? != Some(generation)
             {
@@ -396,6 +399,48 @@ pub(super) fn release_owned_exit_tx(
     release_proven_generation_tx(tx, agent, generation)
 }
 
+/// Record the plugin host's proof that it saw the generation's plugin exit and
+/// drained its reader. Stop and lost transitions close native sources without
+/// a drain, so only this record proves one.
+pub(super) fn record_owned_exit_proof_tx(
+    tx: &Transaction<'_>,
+    agent: i64,
+    generation: i64,
+    now: i64,
+) -> Result<()> {
+    tx.execute(
+        "INSERT OR IGNORE INTO owned_exits(agent, generation, proven_at) VALUES (?1, ?2, ?3)",
+        params![agent, generation, now],
+    )
+    .map_err(sql_error)?;
+    Ok(())
+}
+
+/// Release the slot as soon as the exit proof is complete. The host's drain
+/// record and the monitor's OS-source closure arrive in either order; each of
+/// them calls this, and whichever lands last releases.
+pub(super) fn release_owned_exit_event_tx(
+    tx: &Transaction<'_>,
+    agent: i64,
+    generation: i64,
+    reason: &str,
+    now: i64,
+) -> Result<Option<Event>> {
+    if !release_owned_exit_tx(tx, agent, generation)? {
+        return Ok(None);
+    }
+    insert_daemon_event(
+        tx,
+        now,
+        "capacity.released",
+        "source",
+        Some(agent),
+        Some(generation),
+        json!({ "reason": reason }),
+    )
+    .map(Some)
+}
+
 pub(super) fn migrate_reservations_tx(tx: &Transaction<'_>) -> Result<()> {
     let mut after = 0_i64;
     loop {
@@ -432,7 +477,7 @@ pub(super) fn migrate_reservations_tx(tx: &Transaction<'_>) -> Result<()> {
                 pending_launch_tx(tx, agent)?.then_some(1)
             } else if generation > 0 {
                 if has_terminal_session_tx(tx, agent, generation)?
-                    || has_owned_exit_and_reader_drain_tx(tx, agent, generation)?
+                    || has_physical_exit_tx(tx, agent, generation)?
                     || has_rejected_dispatched_start_tx(tx, agent, generation)?
                 {
                     if pending_resume_tx(tx, agent, generation)? {
@@ -555,13 +600,27 @@ fn has_rejected_dispatched_start_tx(
     .map_err(sql_error)
 }
 
-// Shared by migration and live release so neither treats source closure alone
-// as custody proof.
+/// Live release proof: physical exit plus the plugin host's drain record.
 fn has_owned_exit_and_reader_drain_tx(
     tx: &Transaction<'_>,
     agent: i64,
     generation: i64,
 ) -> Result<bool> {
+    if !has_physical_exit_tx(tx, agent, generation)? {
+        return Ok(false);
+    }
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM owned_exits WHERE agent = ?1 AND generation = ?2)",
+        params![agent, generation],
+        |row| row.get(0),
+    )
+    .map_err(sql_error)
+}
+
+// Physical exit facts, shared by the reservation migration (which predates the
+// drain record) and live release, so neither treats source closure alone as
+// custody proof.
+fn has_physical_exit_tx(tx: &Transaction<'_>, agent: i64, generation: i64) -> Result<bool> {
     let os_closed: bool = tx
         .query_row(
             "SELECT EXISTS(

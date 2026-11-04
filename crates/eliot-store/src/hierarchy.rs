@@ -668,7 +668,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(version, super::super::schema::CURRENT_SCHEMA_VERSION);
-        assert_eq!(version, 24);
+        assert_eq!(version, 25);
         let mut columns: Vec<String> = store
             .connection
             .prepare("SELECT name FROM pragma_table_info('agents')")
@@ -1276,7 +1276,7 @@ mod tests {
         ));
         {
             let legacy_store = Store::open(&path).unwrap();
-            assert_eq!(super::super::schema::CURRENT_SCHEMA_VERSION, 24);
+            assert_eq!(super::super::schema::CURRENT_SCHEMA_VERSION, 25);
             drop(legacy_store);
             // Downgrade to the v22 shape with two legacy rows, then reopen so
             // the v23 block backfills them exactly as it would on upgrade.
@@ -1295,6 +1295,8 @@ mod tests {
                      DELETE FROM schema_migrations WHERE version = 23;
                      DROP TABLE claims;
                      DELETE FROM schema_migrations WHERE version = 24;
+                     DROP TABLE owned_exits;
+                     DELETE FROM schema_migrations WHERE version = 25;
                      INSERT INTO agents(generation, project, harness, profile,
                                         workspace, state, created_at, updated_at)
                      VALUES (1, 'legacy', 'fake', 'fake',
@@ -1317,7 +1319,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 24);
+        assert_eq!(version, 25);
         for id in ["a1", "a2"] {
             let agent = store.get_agent(id).unwrap().expect("legacy row");
             assert_eq!(agent.root, id);
