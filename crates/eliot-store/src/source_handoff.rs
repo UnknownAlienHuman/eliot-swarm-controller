@@ -547,6 +547,15 @@ impl Store {
                 json!({"source":source}),
             )?);
         }
+        if !events.is_empty() {
+            events.extend(capacity::release_owned_exit_event_tx(
+                &tx,
+                agent_num,
+                generation,
+                "owned_exit_reader_drained",
+                now,
+            )?);
+        }
         commit_transaction(tx, &self.write_faulted)?;
         Ok(events)
     }

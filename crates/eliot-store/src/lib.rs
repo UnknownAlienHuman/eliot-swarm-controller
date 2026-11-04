@@ -1341,18 +1341,15 @@ impl Store {
                     "owned-exit generation does not exist",
                 ));
             }
-            let mut events = Vec::new();
-            if capacity::release_owned_exit_tx(&tx, agent_num, generation)? {
-                events.push(insert_daemon_event(
-                    &tx,
-                    now,
-                    "capacity.released",
-                    "source",
-                    Some(agent_num),
-                    Some(generation),
-                    json!({"reason": "owned_control_exit"}),
-                )?);
-            }
+            let events = capacity::release_owned_exit_event_tx(
+                &tx,
+                agent_num,
+                generation,
+                "owned_control_exit",
+                now,
+            )?
+            .into_iter()
+            .collect();
             commit_transaction(tx, &self.write_faulted).map(|()| events)
         })();
         self.fault_on_persistence_error(&result);
@@ -1667,6 +1664,15 @@ impl Store {
                 Some(agent_num),
                 Some(generation),
                 json!({"source": scope.source(), "state": state, "health": health}),
+            )?);
+        }
+        if closed && matches!(scope, ProcessSourceKind::Agent) {
+            events.extend(capacity::release_owned_exit_event_tx(
+                &tx,
+                agent_num,
+                generation,
+                "owned_exit_os_closed",
+                now,
             )?);
         }
         commit_transaction(tx, &self.write_faulted)?;

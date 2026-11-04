@@ -37,8 +37,9 @@ impl Store {
             .map_err(sql_error)
     }
 
-    /// One page, ordered by Agent, of lost generations that still hold their
-    /// reservation. Call it at startup before any new generation can start.
+    /// One page, ordered by Agent, of lost or stopped generations that still
+    /// hold their reservation (a forced stop records no `session.ended`). Call it
+    /// at startup before any new generation can start.
     pub fn restart_retained_generations(
         &self,
         after: Option<&str>,
@@ -48,7 +49,7 @@ impl Store {
             .connection
             .prepare(
                 "SELECT id, generation FROM agents
-                 WHERE id > ?1 AND observe_only = 0 AND state = 'lost'
+                 WHERE id > ?1 AND observe_only = 0 AND state IN ('lost', 'stopped')
                    AND capacity_generation = generation
                  ORDER BY id LIMIT ?2",
             )
@@ -136,7 +137,7 @@ impl Store {
             let current = load_agent_by_num(&tx, agent_num)?
                 .ok_or_else(|| Error::new("not_found", "restart capacity Agent was not found"))?;
             observer::require_controlled(&current)?;
-            if current.state != AgentState::Lost
+            if !matches!(current.state, AgentState::Lost | AgentState::Stopped)
                 || current.generation != generation
                 || reservation_generation_tx(&tx, agent_num)? != Some(generation)
             {
@@ -394,6 +395,31 @@ pub(super) fn release_owned_exit_tx(
         return Ok(false);
     }
     release_proven_generation_tx(tx, agent, generation)
+}
+
+/// Release the slot as soon as the exit proof is complete. The OS source
+/// closure, the native reader drain and the host's owned-exit record arrive in
+/// any order; each of them calls this, and whichever lands last releases.
+pub(super) fn release_owned_exit_event_tx(
+    tx: &Transaction<'_>,
+    agent: i64,
+    generation: i64,
+    reason: &str,
+    now: i64,
+) -> Result<Option<Event>> {
+    if !release_owned_exit_tx(tx, agent, generation)? {
+        return Ok(None);
+    }
+    super::insert_daemon_event(
+        tx,
+        now,
+        "capacity.released",
+        "source",
+        Some(agent),
+        Some(generation),
+        json!({ "reason": reason }),
+    )
+    .map(Some)
 }
 
 pub(super) fn migrate_reservations_tx(tx: &Transaction<'_>) -> Result<()> {
