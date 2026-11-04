@@ -228,7 +228,7 @@ Read [coordination](spec/coordination.md). Use two Codex Agents initially.
       `daemon.retention.mail_days` is pruned in bounded retention batches (unread mail is
       never pruned; a removed message id older than the retry window reads
       `history_gap`).
-- [ ] **L5.2 Work attribution.** `who` reads L3 Git/edit projections; claims are
+- [x] **L5.2 Work attribution.** `who` reads L3 Git/edit projections; claims are
       advisory. No second ownership database or file-lock promise.
 - [ ] **L5.3 Hierarchy.** Controller-launched children and tree selectors, then native
       child discovery/control where supported. An existing child is never hidden by a

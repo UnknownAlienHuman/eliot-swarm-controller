@@ -16,10 +16,11 @@ use eliot_core::{
         MailSendRequest, MailSendResponse, VarGetRequest, VarGetResponse, VarSetRequest,
     },
 };
+use eliot_store::{NoticeKind, NoticePending};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-fn decode_coordination_request<T>(
+pub(super) fn decode_coordination_request<T>(
     params: &Value,
     secrets: &crate::plugin_host::SecretSet,
     method: &str,
@@ -47,8 +48,12 @@ fn wake_enabled(snapshot: &Value) -> bool {
         .unwrap_or(true)
 }
 
-fn notice_text(unread: i64) -> String {
-    format!("{unread} unread messages; run swarm inbox")
+fn notice_text(kind: NoticeKind, count: i64) -> String {
+    match kind {
+        NoticeKind::Mail => format!("{count} unread messages; run swarm inbox"),
+        NoticeKind::Claim if count == 1 => "1 overlapping work claim; run swarm who".to_owned(),
+        NoticeKind::Claim => format!("{count} overlapping work claims; run swarm who"),
+    }
 }
 
 impl Router {
@@ -168,39 +173,49 @@ impl Router {
 
     async fn wake_recipients(&self, response: &MailSendResponse) {
         for delivery in &response.deliveries {
-            self.wake_recipient(&delivery.recipient).await;
+            self.offer_notice(&delivery.recipient, NoticePending::Mail)
+                .await;
         }
     }
 
-    /// Offer one generic wake to a routed recipient. Every gate — disabled
-    /// flag, no live plugin owner, the Store's atomic claim, or the ordinary
-    /// send admission (provider hold, drain, unknown gates) — skips the
-    /// notice; a skipped wake never fails the queued delivery. When the
-    /// claimed `send` is not admitted, the claim is released so the failure
-    /// does not consume the notice cooldown.
-    async fn wake_recipient(&self, recipient: &str) {
-        let snapshot = {
+    /// Offer one generic notice to a routed recipient through the shared
+    /// Store gate. Every gate — the per-kind routing pre-check, no live
+    /// plugin owner, the Store's atomic claim, or the ordinary send
+    /// admission (provider hold, drain, unknown gates) — skips the notice;
+    /// a skipped notice never fails the admitted write. When the claimed
+    /// `send` is not admitted, the claim is released so the failure does
+    /// not consume the notice cooldown.
+    pub(super) async fn offer_notice(&self, recipient: &str, pending: NoticePending) {
+        let agent = {
             let store = self.inner.store.lock().await;
             match store.get_agent(recipient) {
-                Ok(Some(agent)) => (wake_enabled(&agent.profile_snapshot), agent.generation),
+                Ok(Some(agent)) => agent,
                 _ => return,
             }
         };
         // Generation 0 never dispatched: no live generation is routed yet.
-        if !snapshot.0 || snapshot.1 < 1 {
-            return;
+        // Mail honors the recipient's wake flag; claims stop at terminal
+        // state instead, since a terminal holder's claims already released.
+        match pending.kind() {
+            NoticeKind::Mail if !wake_enabled(&agent.profile_snapshot) || agent.generation < 1 => {
+                return;
+            }
+            NoticeKind::Claim if agent.state.is_terminal() || agent.generation < 1 => {
+                return;
+            }
+            _ => {}
         }
         if !self
             .inner
             .plugin_host
-            .controls_generation(recipient, snapshot.1)
+            .controls_generation(recipient, agent.generation)
         {
             return;
         }
         let notice_id = ulid::Ulid::new().to_string();
         let claim = {
             let mut store = self.inner.store.lock().await;
-            match store.mail_notice_claim(recipient, &notice_id, now_ms()) {
+            match store.notice_claim(recipient, &notice_id, pending, now_ms()) {
                 Ok(claim) => claim,
                 Err(_) => return,
             }
@@ -213,11 +228,11 @@ impl Router {
             "target": recipient,
             "verb": "send",
             "expected_generation": claim.generation,
-            "args": {"text": notice_text(claim.unread)},
+            "args": {"text": notice_text(claim.kind, claim.count)},
         });
         if self.submit(&params, &Principal::Owner).await.is_err() {
             let mut store = self.inner.store.lock().await;
-            let _ = store.mail_notice_release(recipient, &notice_id);
+            let _ = store.notice_release(recipient, &notice_id);
         }
     }
 }
@@ -574,7 +589,7 @@ mod tests {
         // recorded for any of them.
         let store = router.inner.store.lock().await;
         for recipient in [&a, &quiet, &pending] {
-            assert_eq!(store.mail_notice_state(recipient).unwrap(), None);
+            assert_eq!(store.notice_state(recipient).unwrap(), None);
         }
         for recipient in [&a, &quiet, &pending] {
             let inbox = store

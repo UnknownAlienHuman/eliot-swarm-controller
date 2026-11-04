@@ -28,13 +28,18 @@ pub use agent_views::{
     UnsettledCommandSummary, WorkspaceCustodyView,
 };
 pub use coordination::{
+    ClaimConflict, ClaimListRequest, ClaimListResponse, ClaimReleaseRequest, ClaimReleaseResponse,
+    ClaimSetRequest, ClaimSetResponse, ClaimView, DEFAULT_CLAIM_TTL_SECS,
     DEFAULT_MAX_UNREAD_BYTES_PER_AGENT, DEFAULT_MAX_UNREAD_MESSAGES_PER_AGENT,
-    MAIL_NOTICE_COOLDOWN_MS, MAX_MAIL_ACK_IDS, MAX_MAIL_INBOX_ROWS, MAX_MAIL_RECIPIENTS,
+    MAIL_NOTICE_COOLDOWN_MS, MAX_CLAIM_GLOB_BYTES, MAX_CLAIM_NOTE_BYTES, MAX_CLAIM_TTL_SECS,
+    MAX_CLAIMS_PER_AGENT, MAX_MAIL_ACK_IDS, MAX_MAIL_INBOX_ROWS, MAX_MAIL_RECIPIENTS,
     MAX_MAIL_TEXT_BYTES, MAX_MAIL_THREAD_BYTES, MAX_VAR_KEY_BYTES, MAX_VAR_NOTE_BYTES,
-    MAX_VAR_SCOPE_BYTES, MAX_VAR_VALUE_BYTES, MailAckRequest, MailAckResponse, MailDelivery,
-    MailDeliverySummary, MailInboxRequest, MailInboxResponse, MailLimits, MailMode,
-    MailReadRequest, MailSendRequest, MailSendResponse, VarGetRequest, VarGetResponse, VarScope,
-    VarSetRequest, VarSetResponse, parse_var_scope,
+    MAX_VAR_SCOPE_BYTES, MAX_VAR_VALUE_BYTES, MAX_WHO_PATHS, MAX_WHO_WORKERS, MailAckRequest,
+    MailAckResponse, MailDelivery, MailDeliverySummary, MailInboxRequest, MailInboxResponse,
+    MailLimits, MailMode, MailReadRequest, MailSendRequest, MailSendResponse, VarGetRequest,
+    VarGetResponse, VarScope, VarSetRequest, VarSetResponse, WhoRequest, WhoResponse,
+    WhoSharedWorkspace, WhoWorker, claim_glob_matches, claim_globs_overlap,
+    claim_globs_overlap_normalized, normalize_claim_glob, parse_var_scope,
 };
 pub use git::{
     DEFAULT_GIT_FETCH_TIMEOUT_MS, FrozenGitFetch, GitFetchDefinitionArgs, GitFetchOutcome,

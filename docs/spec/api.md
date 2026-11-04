@@ -100,7 +100,7 @@ rule actions have bounded derived ids. No general receipt/floor framework.
 | `agent.history` | owner-only bounded history of an exact observed subject |
 | `hook.event` | later exact request/deadline decision |
 | `mail.send/inbox/read/ack`, `var.set/get` | addressed queued mail with separate acknowledgement, shared variables with CAS |
-| `who`, `claim.*` | later coordination |
+| `who`, `claim.set/list/release` | current-worker file areas plus advisory claims with coalesced conflict notices |
 | `rule.*` except `rule.get/catch_up` | later automation; effects remain commands |
 
 Canonical public wire types are re-exported by
@@ -125,13 +125,13 @@ preserve the intended future contract, but do not imply current availability.
 | Timer schedules and requests | [timers.rs](../../crates/eliot-core/src/api/timers.rs) |
 | Goal definitions, views and rounds | [goals.rs](../../crates/eliot-core/src/api/goals.rs) |
 | Discovery/history queries and pages | [native_requests.rs](../../crates/eliot-core/src/api/native_requests.rs), [native_pages.rs](../../crates/eliot-core/src/api/native_pages.rs) |
-| Mail and variable requests, deliveries and pages | [coordination.rs](../../crates/eliot-core/src/api/coordination.rs) |
+| Mail, variable, claim and `who` requests, deliveries and pages | [coordination.rs](../../crates/eliot-core/src/api/coordination.rs) |
 | Event queries, filters and pages | [api.rs](../../crates/eliot-core/src/api.rs) |
 
 Errors include
 `not_found`, `unsupported`, `not_allowed`, `bad_state`, `stale_generation`, `invalid`,
 `busy`, `unavailable`, `capacity_unavailable`, `provider_held`, `history_gap`, `source_integrity`,
-`secret_in_payload`, `frame_too_large`, `mailbox_full`, `version_conflict`, `internal`.
+`secret_in_payload`, `frame_too_large`, `mailbox_full`, `version_conflict`, `claim_limit`, `internal`.
 
 `capacity_unavailable` is a pre-effect rejection from a retained prior-generation
 reservation or a configured Eliot `max_live` scope, not a vendor quota or entitlement
@@ -692,12 +692,67 @@ increments the version, records `set_by`, and emits `var.changed`.
 
 A routed recipient with `wake_on_mail` (profile snapshot, default true) may
 receive one generic coalesced wake per minute with at most one open notice
-command: `N unread messages; run swarm inbox`. The notice never contains
+command per recipient across mail and claims: `N unread messages; run swarm inbox`.
+The notice never contains
 the body, is sent through the ordinary owner `send` path bound to the
 recipient's current generation, and is skipped — never retried — while a
 notice command is open or unknown, a provider hold, pending request or
 unknown command/turn stands, the daemon is draining, or no live plugin
 owner exists. See [coordination](coordination.md#modes-and-wake).
+
+## Work attribution
+
+`claim.set` records one advisory claim — a project-relative glob with an
+optional note and a TTL — owned by an Agent generation. Globs use `/`
+separators with `*`, `**` and `?` only, at most 1024 bytes and at most 8
+`**` segments (the cap keeps the overlap scan against every live claim
+cheap); absolute paths, `..` segments, bracket/brace metacharacters and
+a ninth `**` segment are `invalid`. The
+TTL is 1 second to one day (default one hour). An Agent caller claims
+only its own current generation; the owner names the Agent explicitly and
+cannot claim for a terminal Agent (`bad_state`). One generation holds at
+most 100 live claims; beyond that the write is rejected with
+`claim_limit`. Re-setting the same glob refreshes its note and TTL. Both
+writes bind their ULID idempotently to principal, method and semantic
+payload; set and release each emit `claim.changed`. `claim.release`
+removes one live claim; absent, expired and prior-generation claims read
+`not_found`.
+
+A claim is live only while its generation still matches the holder's
+current generation, the holder is not terminal, and the TTL has not
+passed. Generation change, terminal state and detach therefore release
+by construction; expiry filters on read and is purged in a bounded batch
+by the next claim write. A conflict — two globs that may overlap after
+normalization (segments are compatible when equal or either side carries
+a wildcard, with `**` realigning across directories), in the same project
+— is reported in-band in the `claim.set` response and routes at most one
+coalesced generic notice per holder: `1 overlapping work claim` /
+`N overlapping work claims`, plus `; run swarm who`. Detection is
+conservative: a false positive only adds an
+advisory notice. The in-band list holds at most 100 conflicts;
+`truncated` signals the scan or report cap engaged. The notice shares the
+mail-wake gate (one per minute, at most one open notice command per
+recipient across mail and claims, same unknown/hold/request suppression,
+ordinary owner `send` bound to the holder's current generation); there is
+no `wake_on_mail` flag for claims, and a replayed `claim.set` (no new
+event) never re-notifies. A conflict is never a lock, a reassignment, or
+a second ownership database. `claim.list` pages live claims, optionally
+filtered by project and Agent; an Agent caller reads only its own project.
+
+`who` composes existing L3 projections per current worker: the roster
+holds every non-terminal Agent in scope (at most 100, oldest first, with
+a `truncated` flag instead of a cursor). Each worker carries its
+current-generation verified edits whose paths are still dirty in the
+cached Git view, the dirty files of its worktree when exactly one
+non-terminal Agent admits that checkout (counted across projects),
+committed paths against the frozen base the workspace records, its live
+claims, and optional bounded recent history (`history: true`). Old
+generations and terminal Agents are never shown as current workers;
+dirty files of a shared checkout stay unattributed under `shared`, which
+lists only checkouts with two or more in-scope owners. An Agent caller
+reads only its own project; the owner may filter by project or read all.
+See [coordination](coordination.md#who-works-on-this) and
+[coordination](coordination.md#claims-and-hierarchy).
 
 ## Drain and shutdown
 
@@ -752,7 +807,7 @@ swarm configure ... | compact|fork|background ...
 swarm cmd show|children|cancel|resolve ...
 swarm events [--since SEQ] [--allow-gap]
 swarm msg send ... | msg show ... | msg ack ... | inbox [AGENT] [--wait SECS]
-swarm var set ... | var get ... | who ... | claim ... | release ...
+swarm var set ... | var get ... | who [--project P] [--history] | claim set|list|release ...
 swarm project list | show ID
 swarm rule show ID [--project PROJECT]
 swarm rule catch-up ID --after SEQ [--through SEQ] [--project PROJECT]

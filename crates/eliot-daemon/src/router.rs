@@ -1,3 +1,4 @@
+mod attribution;
 mod command;
 mod coordination;
 mod goals;
@@ -274,6 +275,10 @@ impl Router {
             "mail.ack" => self.mail_ack(&params, &principal).await,
             "var.set" => self.var_set(&params, &principal).await,
             "var.get" => self.var_get(&params, &principal).await,
+            "who" => self.who(&params, &principal).await,
+            "claim.set" => self.claim_set(&params, &principal).await,
+            "claim.list" => self.claim_list(&params, &principal).await,
+            "claim.release" => self.claim_release(&params, &principal).await,
             _ => Err(Error::new(
                 "unsupported",
                 format!("daemon method {method} is not implemented"),

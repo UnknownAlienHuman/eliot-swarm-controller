@@ -1,14 +1,15 @@
-//! Addressed mail, wake-notice claims and shared variables (L5.1).
+//! Addressed mail, the shared notice gate and shared variables (L5.1).
 //!
 //! One row is one concrete recipient delivery; selector expansion snapshots
 //! concrete recipients once, inside the admission transaction, and mailbox
 //! bounds are checked for every recipient before any row is written, so an
 //! overfull mailbox rejects without a partial fanout. Reads never mark
 //! state; only an explicit ack over exact delivery ids does, idempotently.
-//! A notice claim is an atomic check-and-set: at most one generic wake per
-//! recipient per minute with at most one open (or unknown) notice command.
-//! Variable writes are compare-and-swap on an incrementing version; an
-//! absent row reads as version 0, so `expect_version: 0` creates.
+//! A notice claim is an atomic check-and-set: at most one generic notice per
+//! recipient per minute with at most one open (or unknown) notice command,
+//! shared by mail wakes and claim-conflict notices. Variable writes are
+//! compare-and-swap on an incrementing version; an absent row reads as
+//! version 0, so `expect_version: 0` creates.
 
 use super::{
     Change, Error, MAX_EVENT_BYTES, Result, Store, canonical, command_binding, commit_transaction,
@@ -17,7 +18,7 @@ use super::{
     validate_id_age, write_binding,
 };
 use eliot_core::{
-    CommandState, TurnState,
+    Agent, CommandState, TurnState,
     api::{
         MAIL_NOTICE_COOLDOWN_MS, MailAckRequest, MailAckResponse, MailDelivery,
         MailDeliverySummary, MailInboxRequest, MailInboxResponse, MailLimits, MailMode,
@@ -33,22 +34,49 @@ const MAIL_SEND_METHOD: &str = "mail.send";
 const MAIL_ACK_METHOD: &str = "mail.ack";
 const VAR_SET_METHOD: &str = "var.set";
 
-/// A claimed wake: the unread count for the generic notice text and the
+/// Which advisory channel a coalesced notice speaks for. Mail and claims
+/// share one gate — one cooldown, one open notice command per recipient —
+/// and differ only in the pending proof and the generic text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoticeKind {
+    Mail,
+    Claim,
+}
+
+/// The pending proof a notice claim carries: mail counts unread rows inside
+/// the claim transaction, claims arrive with their overlap count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoticePending {
+    Mail,
+    Claim { overlapping: i64 },
+}
+
+impl NoticePending {
+    pub fn kind(self) -> NoticeKind {
+        match self {
+            NoticePending::Mail => NoticeKind::Mail,
+            NoticePending::Claim { .. } => NoticeKind::Claim,
+        }
+    }
+}
+
+/// A claimed notice: the pending count for the generic notice text and the
 /// recipient generation the notice command must bind.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MailNoticeClaim {
-    pub unread: i64,
+pub struct NoticeClaim {
+    pub kind: NoticeKind,
+    pub count: i64,
     pub generation: i64,
 }
 
-/// Durable wake state for one recipient mailbox.
+/// Durable notice state for one recipient.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MailNoticeState {
+pub struct NoticeState {
     pub last_notice_at: i64,
     pub open_notice_command: Option<String>,
 }
 
-enum Sender {
+pub(super) enum Sender {
     Owner,
     Agent {
         num: i64,
@@ -57,20 +85,26 @@ enum Sender {
     },
 }
 
-fn parse_sender(principal: &str) -> Result<Sender> {
+pub(super) fn parse_sender(principal: &str, domain: &str) -> Result<Sender> {
     if principal == "owner" {
         return Ok(Sender::Owner);
     }
     if let Some(rest) = principal.strip_prefix("agent:") {
         let Some((id, generation)) = rest.split_once(':') else {
-            return Err(Error::new("not_allowed", "mail principal is not an Agent"));
+            return Err(Error::new(
+                "not_allowed",
+                format!("{domain} principal is not an Agent"),
+            ));
         };
         let num = parse_agent_id(id)?;
-        let generation = generation
-            .parse::<i64>()
-            .map_err(|_| Error::new("not_allowed", "mail principal is not an Agent"))?;
+        let generation = generation.parse::<i64>().map_err(|_| {
+            Error::new("not_allowed", format!("{domain} principal is not an Agent"))
+        })?;
         if generation < 0 {
-            return Err(Error::new("not_allowed", "mail principal is not an Agent"));
+            return Err(Error::new(
+                "not_allowed",
+                format!("{domain} principal is not an Agent"),
+            ));
         }
         return Ok(Sender::Agent {
             num,
@@ -249,24 +283,27 @@ impl Store {
         Ok(response)
     }
 
-    /// Atomically claim one generic wake for a recipient, or suppress it.
+    /// Atomically claim one generic notice for a recipient, or suppress it.
     /// Suppression (cooldown, an open or unknown notice command, an unknown
-    /// command or turn, a pending request, a provider hold, or an empty
-    /// mailbox) returns `Ok(None)` and records nothing.
-    pub fn mail_notice_claim(
+    /// command or turn, a pending request, a provider hold, or nothing
+    /// pending) returns `Ok(None)` and records nothing. The gate is shared:
+    /// a mail wake and a claim-conflict notice for the same recipient
+    /// coalesce into one cooldown and one open notice command.
+    pub fn notice_claim(
         &mut self,
         recipient: &str,
         notice_command: &str,
+        pending: NoticePending,
         now: i64,
-    ) -> Result<Option<MailNoticeClaim>> {
+    ) -> Result<Option<NoticeClaim>> {
         self.ensure_writer_healthy()?;
-        let result = self.mail_notice_claim_inner(recipient, notice_command, now);
+        let result = self.notice_claim_inner(recipient, notice_command, pending, now);
         self.fault_on_persistence_error(&result);
         result
     }
 
-    /// Read durable wake state for one recipient mailbox.
-    pub fn mail_notice_state(&self, recipient: &str) -> Result<Option<MailNoticeState>> {
+    /// Read durable notice state for one recipient.
+    pub fn notice_state(&self, recipient: &str) -> Result<Option<NoticeState>> {
         let num = parse_agent_id(recipient)?;
         let row: Option<(i64, Option<String>)> = self
             .connection
@@ -278,26 +315,26 @@ impl Store {
             .optional()
             .map_err(sql_error)?;
         Ok(
-            row.map(|(last_notice_at, open_notice_command)| MailNoticeState {
+            row.map(|(last_notice_at, open_notice_command)| NoticeState {
                 last_notice_at,
                 open_notice_command,
             }),
         )
     }
 
-    /// Release a claimed wake whose notice command was never admitted, so a
+    /// Release a claimed notice whose notice command was never admitted, so a
     /// failed `send` does not consume the notice cooldown. Only clears when
     /// the stored open command still names this notice; a newer claim is
     /// never disturbed.
-    pub fn mail_notice_release(&mut self, recipient: &str, notice_command: &str) -> Result<()> {
+    pub fn notice_release(&mut self, recipient: &str, notice_command: &str) -> Result<()> {
         self.ensure_writer_healthy()?;
-        let result = self.mail_notice_release_inner(recipient, notice_command);
+        let result = self.notice_release_inner(recipient, notice_command);
         self.fault_on_persistence_error(&result);
         result
     }
 
     fn resolve_mailbox(&self, principal: &str, agent: Option<&str>) -> Result<i64> {
-        match parse_sender(principal)? {
+        match parse_sender(principal, "mail")? {
             Sender::Owner => {
                 let Some(agent) = agent else {
                     return Err(Error::new(
@@ -345,7 +382,7 @@ impl Store {
         scope: Option<&str>,
         write: bool,
     ) -> Result<VarScope> {
-        let sender = parse_sender(principal)?;
+        let sender = parse_sender(principal, "mail")?;
         if let Sender::Agent {
             num, generation, ..
         } = &sender
@@ -464,7 +501,7 @@ impl Store {
                 "only queued mail is connected; presentation modes are not",
             ));
         }
-        let sender = parse_sender(principal)?;
+        let sender = parse_sender(principal, "mail")?;
         let sender_agent = match &sender {
             Sender::Owner => None,
             Sender::Agent {
@@ -924,15 +961,24 @@ impl Store {
         })
     }
 
-    fn mail_notice_claim_inner(
+    fn notice_claim_inner(
         &mut self,
         recipient: &str,
         notice_command: &str,
+        pending: NoticePending,
         now: i64,
-    ) -> Result<Option<MailNoticeClaim>> {
+    ) -> Result<Option<NoticeClaim>> {
         let num = parse_agent_id(recipient)?;
         if notice_command.trim().is_empty() {
             return Err(Error::new("invalid", "notice command id must not be empty"));
+        }
+        if let NoticePending::Claim { overlapping } = pending
+            && overlapping < 1
+        {
+            return Err(Error::new(
+                "invalid",
+                "claim notice needs a command id and a conflict",
+            ));
         }
         let tx = self
             .connection
@@ -943,94 +989,16 @@ impl Store {
             commit_transaction(tx, &self.write_faulted)?;
             return Ok(None);
         };
-        let unread: i64 = tx
-            .query_row(
-                "SELECT COUNT(*) FROM messages WHERE recipient = ?1 AND read_at IS NULL",
-                params![num],
-                |row| row.get(0),
-            )
-            .map_err(sql_error)?;
-        if unread == 0 {
-            commit_transaction(tx, &self.write_faulted)?;
-            return Ok(None);
-        }
-        let notice: Option<(i64, Option<String>)> = tx
-            .query_row(
-                "SELECT last_notice_at, open_notice_command FROM mail_notices WHERE recipient = ?1",
-                params![num],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(sql_error)?;
-        if notice
-            .as_ref()
-            .is_some_and(|(last, _)| now.saturating_sub(*last) < MAIL_NOTICE_COOLDOWN_MS)
-        {
-            commit_transaction(tx, &self.write_faulted)?;
-            return Ok(None);
-        }
-        if let Some((_, Some(open))) = notice.as_ref() {
-            let blocking = load_command_record(&tx, open)?.is_some_and(|record| {
-                matches!(
-                    record.state,
-                    CommandState::Accepted
-                        | CommandState::Queued
-                        | CommandState::Dispatched
-                        | CommandState::Unknown
-                )
-            });
-            if blocking {
+        let count = match notice_pending_count_tx(&tx, pending, num)? {
+            Some(count) => count,
+            None => {
                 commit_transaction(tx, &self.write_faulted)?;
                 return Ok(None);
             }
-        }
-        let unknown_command: bool = tx
-            .query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM commands WHERE target = ?1 AND state = 'unknown'
-                 )",
-                params![num],
-                |row| row.get(0),
-            )
-            .map_err(sql_error)?;
-        if unknown_command {
+        };
+        if notice_suppressed_tx(&tx, num, &agent, now)? {
             commit_transaction(tx, &self.write_faulted)?;
             return Ok(None);
-        }
-        let unknown_turn: bool = tx
-            .query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM turns WHERE agent = ?1 AND state = ?2
-                 )",
-                params![num, turn_state_name(TurnState::Unknown)],
-                |row| row.get(0),
-            )
-            .map_err(sql_error)?;
-        if unknown_turn {
-            commit_transaction(tx, &self.write_faulted)?;
-            return Ok(None);
-        }
-        let pending_request: bool = tx
-            .query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM pending_requests
-                     WHERE agent = ?1 AND generation = ?2 AND state = 'pending'
-                 )",
-                params![num, agent.generation],
-                |row| row.get(0),
-            )
-            .map_err(sql_error)?;
-        if pending_request {
-            commit_transaction(tx, &self.write_faulted)?;
-            return Ok(None);
-        }
-        match provider_holds::require_unheld_tx(&tx, &agent) {
-            Ok(()) => {}
-            Err(error) if error.code == "provider_held" => {
-                commit_transaction(tx, &self.write_faulted)?;
-                return Ok(None);
-            }
-            Err(error) => return Err(error),
         }
         db!(tx.execute(
             "INSERT INTO mail_notices(recipient, last_notice_at, open_notice_command)
@@ -1041,13 +1009,14 @@ impl Store {
             params![num, now, notice_command],
         ));
         commit_transaction(tx, &self.write_faulted)?;
-        Ok(Some(MailNoticeClaim {
-            unread,
+        Ok(Some(NoticeClaim {
+            kind: pending.kind(),
+            count,
             generation: agent.generation,
         }))
     }
 
-    fn mail_notice_release_inner(&mut self, recipient: &str, notice_command: &str) -> Result<()> {
+    fn notice_release_inner(&mut self, recipient: &str, notice_command: &str) -> Result<()> {
         let num = parse_agent_id(recipient)?;
         let tx = self
             .connection
@@ -1059,6 +1028,105 @@ impl Store {
         ));
         commit_transaction(tx, &self.write_faulted)?;
         Ok(())
+    }
+}
+
+/// Resolve the pending proof inside the claim transaction: mail counts
+/// its unread rows, claims arrive with their overlap count. `None`
+/// suppresses the notice without recording anything.
+fn notice_pending_count_tx(
+    tx: &Transaction<'_>,
+    pending: NoticePending,
+    num: i64,
+) -> Result<Option<i64>> {
+    match pending {
+        NoticePending::Mail => {
+            let unread: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM messages WHERE recipient = ?1 AND read_at IS NULL",
+                    params![num],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?;
+            Ok((unread != 0).then_some(unread))
+        }
+        NoticePending::Claim { overlapping } => Ok(Some(overlapping)),
+    }
+}
+
+/// Whether the shared suppression gates skip this notice: the cooldown, an
+/// open or unknown notice command, an unknown command or turn, a pending
+/// request, or a provider hold. A suppression records nothing.
+fn notice_suppressed_tx(tx: &Transaction<'_>, num: i64, agent: &Agent, now: i64) -> Result<bool> {
+    let notice: Option<(i64, Option<String>)> = tx
+        .query_row(
+            "SELECT last_notice_at, open_notice_command FROM mail_notices WHERE recipient = ?1",
+            params![num],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    if notice
+        .as_ref()
+        .is_some_and(|(last, _)| now.saturating_sub(*last) < MAIL_NOTICE_COOLDOWN_MS)
+    {
+        return Ok(true);
+    }
+    if let Some((_, Some(open))) = notice.as_ref() {
+        let blocking = load_command_record(tx, open)?.is_some_and(|record| {
+            matches!(
+                record.state,
+                CommandState::Accepted
+                    | CommandState::Queued
+                    | CommandState::Dispatched
+                    | CommandState::Unknown
+            )
+        });
+        if blocking {
+            return Ok(true);
+        }
+    }
+    let unknown_command: bool = tx
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM commands WHERE target = ?1 AND state = 'unknown'
+             )",
+            params![num],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if unknown_command {
+        return Ok(true);
+    }
+    let unknown_turn: bool = tx
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM turns WHERE agent = ?1 AND state = ?2
+             )",
+            params![num, turn_state_name(TurnState::Unknown)],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if unknown_turn {
+        return Ok(true);
+    }
+    let pending_request: bool = tx
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pending_requests
+                 WHERE agent = ?1 AND generation = ?2 AND state = 'pending'
+             )",
+            params![num, agent.generation],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if pending_request {
+        return Ok(true);
+    }
+    match provider_holds::require_unheld_tx(tx, agent) {
+        Ok(()) => Ok(false),
+        Err(error) if error.code == "provider_held" => Ok(true),
+        Err(error) => Err(error),
     }
 }
 
@@ -1096,7 +1164,7 @@ fn absent_delivery_error(delivery_id: &str, mailbox: i64, now: i64) -> Error {
     }
 }
 
-fn retain_write_tx(
+pub(super) fn retain_write_tx(
     tx: &Transaction<'_>,
     id: &str,
     principal: &str,
@@ -1241,7 +1309,7 @@ mod tests {
     }
 
     #[test]
-    fn mail_migration_installs_v22_tables_and_prune_index() {
+    fn mail_migration_installs_v24_tables_and_prune_index() {
         let store = store();
         let version: i64 = store
             .connection
@@ -1250,8 +1318,8 @@ mod tests {
             })
             .expect("read Store migration version");
         assert_eq!(version, super::super::schema::CURRENT_SCHEMA_VERSION);
-        assert_eq!(version, 23);
-        for table in ["messages", "vars", "mail_notices"] {
+        assert_eq!(version, 24);
+        for table in ["messages", "vars", "mail_notices", "claims"] {
             let found: i64 = store
                 .connection
                 .query_row(
@@ -1262,16 +1330,17 @@ mod tests {
                 .expect("count coordination table");
             assert_eq!(found, 1, "missing {table}");
         }
-        let index: i64 = store
-            .connection
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master
-                 WHERE type = 'index' AND name = 'messages_prune_acked'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("count prune index");
-        assert_eq!(index, 1, "missing messages_prune_acked");
+        for index in ["messages_prune_acked", "claims_expiry"] {
+            let found: i64 = store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    params![index],
+                    |row| row.get(0),
+                )
+                .expect("count coordination index");
+            assert_eq!(found, 1, "missing {index}");
+        }
     }
 
     #[test]
@@ -2502,13 +2571,13 @@ mod tests {
         // An empty mailbox never claims.
         assert_eq!(
             store
-                .mail_notice_claim(&a, &Ulid::new().to_string(), now)
+                .notice_claim(&a, &Ulid::new().to_string(), NoticePending::Mail, now)
                 .unwrap(),
             None
         );
         assert_eq!(
             store
-                .mail_notice_claim("a999", &Ulid::new().to_string(), now)
+                .notice_claim("a999", &Ulid::new().to_string(), NoticePending::Mail, now)
                 .unwrap(),
             None
         );
@@ -2523,18 +2592,24 @@ mod tests {
 
         let notice = Ulid::new().to_string();
         let claim = store
-            .mail_notice_claim(&a, &notice, now)
+            .notice_claim(&a, &notice, NoticePending::Mail, now)
             .expect("claim notice")
             .expect("first wake");
-        assert_eq!(claim.unread, 1);
+        assert_eq!(claim.kind, NoticeKind::Mail);
+        assert_eq!(claim.count, 1);
         assert_eq!(claim.generation, 1);
-        let state = store.mail_notice_state(&a).unwrap().expect("notice state");
+        let state = store.notice_state(&a).unwrap().expect("notice state");
         assert_eq!(state.last_notice_at, now);
         assert_eq!(state.open_notice_command.as_deref(), Some(notice.as_str()));
         // The cooldown suppresses an immediate second wake.
         assert_eq!(
             store
-                .mail_notice_claim(&a, &Ulid::new().to_string(), now + 1_000)
+                .notice_claim(
+                    &a,
+                    &Ulid::new().to_string(),
+                    NoticePending::Mail,
+                    now + 1_000
+                )
                 .unwrap(),
             None
         );
@@ -2547,7 +2622,12 @@ mod tests {
         store.submit("owner", send, now).expect("admit notice");
         assert_eq!(
             store
-                .mail_notice_claim(&a, &Ulid::new().to_string(), now + 61_000)
+                .notice_claim(
+                    &a,
+                    &Ulid::new().to_string(),
+                    NoticePending::Mail,
+                    now + 61_000
+                )
                 .unwrap(),
             None,
             "open notice command suppresses"
@@ -2559,7 +2639,12 @@ mod tests {
             .expect("notice goes unknown");
         assert_eq!(
             store
-                .mail_notice_claim(&a, &Ulid::new().to_string(), now + 122_000)
+                .notice_claim(
+                    &a,
+                    &Ulid::new().to_string(),
+                    NoticePending::Mail,
+                    now + 122_000
+                )
                 .unwrap(),
             None,
             "unknown commands gate new wakes"
@@ -2580,7 +2665,7 @@ mod tests {
         let later = now + 183_000;
         assert!(
             store
-                .mail_notice_claim(&a, &Ulid::new().to_string(), later)
+                .notice_claim(&a, &Ulid::new().to_string(), NoticePending::Mail, later)
                 .unwrap()
                 .is_some()
         );
@@ -2598,7 +2683,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
-                .mail_notice_claim(&a, &Ulid::new().to_string(), later + 61_000)
+                .notice_claim(
+                    &a,
+                    &Ulid::new().to_string(),
+                    NoticePending::Mail,
+                    later + 61_000
+                )
                 .unwrap(),
             None
         );
@@ -2622,7 +2712,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
-                .mail_notice_claim(&a, &Ulid::new().to_string(), later + 122_000)
+                .notice_claim(
+                    &a,
+                    &Ulid::new().to_string(),
+                    NoticePending::Mail,
+                    later + 122_000
+                )
                 .unwrap(),
             None
         );
@@ -2647,7 +2742,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
-                .mail_notice_claim(&a, &Ulid::new().to_string(), later + 183_000)
+                .notice_claim(
+                    &a,
+                    &Ulid::new().to_string(),
+                    NoticePending::Mail,
+                    later + 183_000
+                )
                 .unwrap(),
             None
         );
@@ -2668,32 +2768,29 @@ mod tests {
             .expect("queue mail");
         let first = Ulid::new().to_string();
         store
-            .mail_notice_claim(&a, &first, now)
+            .notice_claim(&a, &first, NoticePending::Mail, now)
             .expect("claim")
             .expect("first wake");
-        assert!(store.mail_notice_state(&a).unwrap().is_some());
+        assert!(store.notice_state(&a).unwrap().is_some());
         // A failed send releases the claim: no cooldown remains.
         store
-            .mail_notice_release(&a, &first)
+            .notice_release(&a, &first)
             .expect("release failed claim");
-        assert_eq!(store.mail_notice_state(&a).unwrap(), None);
+        assert_eq!(store.notice_state(&a).unwrap(), None);
         // An immediate retry can claim again.
         let second = Ulid::new().to_string();
         store
-            .mail_notice_claim(&a, &second, now + 1)
+            .notice_claim(&a, &second, NoticePending::Mail, now + 1)
             .expect("reclaim")
             .expect("retry wake");
         // Releasing the stale first notice leaves the newer claim standing.
         store
-            .mail_notice_release(&a, &first)
+            .notice_release(&a, &first)
             .expect("release stale notice");
-        let state = store
-            .mail_notice_state(&a)
-            .unwrap()
-            .expect("newer claim stands");
+        let state = store.notice_state(&a).unwrap().expect("newer claim stands");
         assert_eq!(state.open_notice_command.as_deref(), Some(second.as_str()));
         // Releasing an unknown recipient id is a parse error, not a panic.
-        assert!(store.mail_notice_release("a0", &second).is_err());
+        assert!(store.notice_release("a0", &second).is_err());
     }
 
     #[test]
@@ -2727,7 +2824,7 @@ mod tests {
             .expect("queue mail");
         let notice = Ulid::new().to_string();
         let claim = store
-            .mail_notice_claim(&a, &notice, now)
+            .notice_claim(&a, &notice, NoticePending::Mail, now)
             .expect("claim")
             .expect("busy recipient still wakes");
         assert_eq!(claim.generation, 1);
@@ -2741,11 +2838,16 @@ mod tests {
         // The cooldown stands: a second wake is suppressed by the open command.
         assert_eq!(
             store
-                .mail_notice_claim(&a, &Ulid::new().to_string(), now + 61_000)
+                .notice_claim(
+                    &a,
+                    &Ulid::new().to_string(),
+                    NoticePending::Mail,
+                    now + 61_000
+                )
                 .unwrap(),
             None
         );
-        let state = store.mail_notice_state(&a).unwrap().expect("notice state");
+        let state = store.notice_state(&a).unwrap().expect("notice state");
         assert_eq!(state.open_notice_command.as_deref(), Some(notice.as_str()));
     }
 }

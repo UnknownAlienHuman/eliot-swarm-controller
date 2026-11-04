@@ -6,21 +6,23 @@ use eliot_core::{
         AgentDiscoverRequest, AgentEditsRequest, AgentEditsResponse, AgentGetRequest,
         AgentGetResponse, AgentGitRequest, AgentGitResponse, AgentHistoryRequest, AgentListRequest,
         AgentListResponse, AgentProcessesRequest, AgentProcessesResponse, AgentResultRequest,
-        AgentResultResponse, AgentStatsRequest, AgentStatsResponse, CommandChildrenRequest,
-        CommandChildrenResponse, CommandGetRequest, CommandResolution, CommandResolveRequest,
-        CommandResolveResponse, CommandSubmitResponse, DEFAULT_GOAL_CHECK_TIMEOUT_MS,
-        DaemonShutdownRequest, DaemonShutdownResponse, DaemonStatusRequest, DaemonStatusResponse,
-        DiscoverPage, EventsFilter, EventsReadRequest, EventsReadResponse, EventsSubscribeRequest,
-        EventsSubscribeResponse, GoalClearRequest, GoalDefinition, GoalGetRequest, GoalMode,
-        GoalPauseRequest, GoalResumeRequest, GoalRoundRequest, GoalRoundResponse, GoalSetRequest,
-        GoalView, MailAckRequest, MailAckResponse, MailDelivery, MailInboxRequest,
-        MailInboxResponse, MailMode, MailReadRequest, MailSendRequest, MailSendResponse,
-        ObservationPage, ProjectRegistrationView, ProviderClearHoldRequest,
-        ProviderClearHoldResponse, ProviderCorrectiveEvidence, ProviderHoldsRequest,
-        ProviderHoldsResponse, RuleCatchUpRequest, RuleGetRequest, RuleStateView, ShutdownMode,
-        TimerGetRequest, TimerRunRequest, TimerStateView, TurnGetRequest, TurnResolveRequest,
-        TurnResolveResponse, TurnResolveStatus, VarGetRequest, VarGetResponse, VarSetRequest,
-        VarSetResponse,
+        AgentResultResponse, AgentStatsRequest, AgentStatsResponse, ClaimListRequest,
+        ClaimListResponse, ClaimReleaseRequest, ClaimReleaseResponse, ClaimSetRequest,
+        ClaimSetResponse, CommandChildrenRequest, CommandChildrenResponse, CommandGetRequest,
+        CommandResolution, CommandResolveRequest, CommandResolveResponse, CommandSubmitResponse,
+        DEFAULT_GOAL_CHECK_TIMEOUT_MS, DaemonShutdownRequest, DaemonShutdownResponse,
+        DaemonStatusRequest, DaemonStatusResponse, DiscoverPage, EventsFilter, EventsReadRequest,
+        EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse, GoalClearRequest,
+        GoalDefinition, GoalGetRequest, GoalMode, GoalPauseRequest, GoalResumeRequest,
+        GoalRoundRequest, GoalRoundResponse, GoalSetRequest, GoalView, MailAckRequest,
+        MailAckResponse, MailDelivery, MailInboxRequest, MailInboxResponse, MailMode,
+        MailReadRequest, MailSendRequest, MailSendResponse, ObservationPage,
+        ProjectRegistrationView, ProviderClearHoldRequest, ProviderClearHoldResponse,
+        ProviderCorrectiveEvidence, ProviderHoldsRequest, ProviderHoldsResponse,
+        RuleCatchUpRequest, RuleGetRequest, RuleStateView, ShutdownMode, TimerGetRequest,
+        TimerRunRequest, TimerStateView, TurnGetRequest, TurnResolveRequest, TurnResolveResponse,
+        TurnResolveStatus, VarGetRequest, VarGetResponse, VarSetRequest, VarSetResponse,
+        WhoRequest, WhoResponse,
     },
 };
 use serde_json::{Value, json};
@@ -380,6 +382,19 @@ enum CliCommand {
         #[command(subcommand)]
         command: VarCommand,
     },
+    /// Show current workers and their file areas.
+    Who {
+        #[arg(long, value_name = "PROJECT")]
+        project: Option<String>,
+        /// Include bounded recent Git history per worker.
+        #[arg(long)]
+        history: bool,
+    },
+    /// Set, list or release advisory work claims.
+    Claim {
+        #[command(subcommand)]
+        command: ClaimCommand,
+    },
     /// Internal plugin entry point used by the daemon.
     #[command(hide = true)]
     Plugin {
@@ -504,6 +519,36 @@ enum VarCommand {
         key: String,
         #[arg(long, value_name = "SCOPE")]
         scope: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ClaimCommand {
+    /// Claim a project-relative glob for an Agent generation.
+    Set {
+        #[arg(value_name = "GLOB")]
+        glob: String,
+        #[arg(long, value_name = "AGENT")]
+        agent: Option<String>,
+        #[arg(long, value_name = "TEXT")]
+        note: Option<String>,
+        /// Claim lifetime in seconds (1 to 86400, default 3600).
+        #[arg(long, value_name = "SECS")]
+        ttl_secs: Option<u64>,
+    },
+    /// List live claims in scope.
+    List {
+        #[arg(long, value_name = "PROJECT")]
+        project: Option<String>,
+        #[arg(long, value_name = "AGENT")]
+        agent: Option<String>,
+    },
+    /// Release one live claim.
+    Release {
+        #[arg(value_name = "GLOB")]
+        glob: String,
+        #[arg(long, value_name = "AGENT")]
+        agent: Option<String>,
     },
 }
 
@@ -706,6 +751,7 @@ impl Failure {
                 | "mailbox_full"
                 | "fanout_limit"
                 | "version_conflict"
+                | "claim_limit"
                 | "id_conflict"
                 | "id_expired"
                 | "profile_error" => 3,
@@ -752,7 +798,21 @@ impl Failure {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cli = Cli::parse();
+    // The derived CLI parser overflows the 1 MiB Windows main-thread stack
+    // once the `who`/`claim` subcommands are added, so parse on a roomy
+    // thread instead. Measured in a debug build with a direct `Cli::parse`:
+    // the pre-PR parser prints `swarm --version` and exits 0, while with
+    // `who`/`claim` every probe (`--version`, `status`, `who`, `claim list`,
+    // `--help`) dies in `Cli::parse` with STATUS_STACK_OVERFLOW before any
+    // output. Help/version still exit from the parser. A `/STACK` link arg
+    // for the binary is a later follow-up.
+    let cli = std::thread::Builder::new()
+        .name("cli-parse".to_owned())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(Cli::parse)
+        .expect("spawn CLI parser")
+        .join()
+        .expect("CLI parser panicked");
     let data_dir = match resolve_data_dir(cli.data_dir.as_deref()) {
         Ok(path) => path,
         Err(failure) => return report_failure(failure),
@@ -1872,6 +1932,12 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 Ok(0)
             }
         },
+        CliCommand::Who { project, history } => {
+            run_who_command(&data_dir, json_output, project, history).await
+        }
+        CliCommand::Claim { command } => {
+            run_claim_command(&data_dir, json_output, id, command).await
+        }
         CliCommand::Plugin { command } => match command {
             PluginCommand::Fake => {
                 eliot_plugin::run_fake()
@@ -1892,6 +1958,107 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
                 Ok(0)
             }
         },
+    }
+}
+
+async fn run_who_command(
+    data_dir: &Path,
+    json_output: bool,
+    project: Option<String>,
+    history: bool,
+) -> Result<u8, Failure> {
+    let request = WhoRequest {
+        project,
+        history: Some(history),
+    };
+    request
+        .validate()
+        .map_err(|error| Failure::from_core(error, false))?;
+    let response: WhoResponse = eliot_daemon::client_call_typed(data_dir, "who", &request)
+        .await
+        .map_err(|error| Failure::from_core(error, false))?;
+    request
+        .validate_response(&response)
+        .map_err(|_| Failure::new(4, "who response is invalid"))?;
+    let value =
+        serde_json::to_value(response).map_err(|_| Failure::new(4, "who response is invalid"))?;
+    print_value(&value, json_output);
+    Ok(0)
+}
+
+async fn run_claim_command(
+    data_dir: &Path,
+    json_output: bool,
+    id: Option<String>,
+    command: ClaimCommand,
+) -> Result<u8, Failure> {
+    match command {
+        ClaimCommand::Set {
+            glob,
+            agent,
+            note,
+            ttl_secs,
+        } => {
+            let request = ClaimSetRequest {
+                id: mutation_id(id)?,
+                agent,
+                glob,
+                note,
+                ttl_secs,
+            };
+            request
+                .validate()
+                .map_err(|error| Failure::from_core(error, true))?;
+            let response: ClaimSetResponse =
+                eliot_daemon::client_call_typed(data_dir, "claim.set", &request)
+                    .await
+                    .map_err(|error| Failure::from_core(error, true))?;
+            request
+                .validate_response(&response)
+                .map_err(|_| Failure::new(4, "claim.set response is invalid"))?;
+            let value = serde_json::to_value(response)
+                .map_err(|_| Failure::new(4, "claim.set response is invalid"))?;
+            print_value(&value, json_output);
+            Ok(0)
+        }
+        ClaimCommand::List { project, agent } => {
+            let request = ClaimListRequest { project, agent };
+            request
+                .validate()
+                .map_err(|error| Failure::from_core(error, false))?;
+            let response: ClaimListResponse =
+                eliot_daemon::client_call_typed(data_dir, "claim.list", &request)
+                    .await
+                    .map_err(|error| Failure::from_core(error, false))?;
+            request
+                .validate_response(&response)
+                .map_err(|_| Failure::new(4, "claim.list response is invalid"))?;
+            let value = serde_json::to_value(response)
+                .map_err(|_| Failure::new(4, "claim.list response is invalid"))?;
+            print_value(&value, json_output);
+            Ok(0)
+        }
+        ClaimCommand::Release { glob, agent } => {
+            let request = ClaimReleaseRequest {
+                id: mutation_id(id)?,
+                agent,
+                glob,
+            };
+            request
+                .validate()
+                .map_err(|error| Failure::from_core(error, true))?;
+            let response: ClaimReleaseResponse =
+                eliot_daemon::client_call_typed(data_dir, "claim.release", &request)
+                    .await
+                    .map_err(|error| Failure::from_core(error, true))?;
+            request
+                .validate_response(&response)
+                .map_err(|_| Failure::new(4, "claim.release response is invalid"))?;
+            let value = serde_json::to_value(response)
+                .map_err(|_| Failure::new(4, "claim.release response is invalid"))?;
+            print_value(&value, json_output);
+            Ok(0)
+        }
     }
 }
 

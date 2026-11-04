@@ -6248,11 +6248,13 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
              DROP INDEX messages_prune_acked;
              DELETE FROM schema_migrations WHERE version = 22;
              DROP TABLE messages; DROP TABLE vars; DROP TABLE mail_notices;
-             DELETE FROM schema_migrations WHERE version = 21;",
+             DELETE FROM schema_migrations WHERE version = 21;
+             DROP TABLE claims;
+             DELETE FROM schema_migrations WHERE version = 24;",
         )
         .expect("roll back to schema 16");
     drop(store);
-    let mut store = Store::open(&path).expect("migrate 16 to 23");
+    let mut store = Store::open(&path).expect("migrate 16 to 24");
     store.recover_on_restart(now + 2).expect("recover");
     let retained = store
         .restart_retained_generations(None)
