@@ -8,7 +8,7 @@
 //!
 //! Fixture payloads follow the controller-verified CLI behavior (note 47,
 //! Claude Code 2.1.278); the plugin under test is the real
-//! `eliot plugin claude` binary driven over the Eliot plugin protocol, with
+//! `swarm plugin claude` binary driven over the Eliot plugin protocol, with
 //! this file emulating the host side (`process.put`, `events.put`,
 //! `source.gap`).
 
@@ -20,7 +20,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
-const CLI: &str = env!("CARGO_BIN_EXE_eliot");
+const CLI: &str = env!("CARGO_BIN_EXE_swarm");
 const MODEL: &str = "claude-opus-4-6";
 const OP_TIMEOUT: Duration = Duration::from_secs(15);
 
