@@ -76,10 +76,12 @@ pub struct NativeChild {
 }
 
 /// One stdin writer queue. Cloned into the protocol client; every write and
-/// close serializes on the queue with the caller's absolute deadline.
+/// close serializes on the queue with the caller's absolute deadline. The
+/// queue empties only through [`NativeWriter::shutdown_input`], which drops
+/// the stdin handle so the child really sees EOF.
 #[derive(Clone)]
 pub struct NativeWriter {
-    writer: Arc<tokio::sync::Mutex<FramedWrite<ChildStdin, LinesCodec>>>,
+    writer: Arc<tokio::sync::Mutex<Option<FramedWrite<ChildStdin, LinesCodec>>>>,
     labels: NativeLabels,
 }
 
@@ -243,10 +245,30 @@ impl NativeChild {
         result
     }
 
-    /// Close input, then end the owned process. The graceful close only fires
+    /// Flush input, then end the owned process. The graceful close only fires
     /// when the process is still running; the kill path only fires when the
     /// graceful close cannot be confirmed.
     pub async fn terminate(&mut self, force: bool, deadline: Instant) -> Result<ExitStatus> {
+        self.terminate_inner(force, deadline, false).await
+    }
+
+    /// Drop stdin so the child really sees EOF, then end the owned process.
+    /// Same sequence as [`NativeChild::terminate`], but the graceful close
+    /// delivers EOF instead of only flushing.
+    pub async fn terminate_dropping_input(
+        &mut self,
+        force: bool,
+        deadline: Instant,
+    ) -> Result<ExitStatus> {
+        self.terminate_inner(force, deadline, true).await
+    }
+
+    async fn terminate_inner(
+        &mut self,
+        force: bool,
+        deadline: Instant,
+        drop_input: bool,
+    ) -> Result<ExitStatus> {
         if let Some(status) = self.child.try_wait().map_err(|error| {
             Error::new(
                 "native_process",
@@ -259,7 +281,11 @@ impl NativeChild {
 
         if !force {
             let close_deadline = (Instant::now() + Duration::from_millis(500)).min(deadline);
-            let _ = self.writer.close_input(close_deadline).await;
+            if drop_input {
+                let _ = self.writer.shutdown_input(close_deadline).await;
+            } else {
+                let _ = self.writer.close_input(close_deadline).await;
+            }
             let grace_deadline = (Instant::now() + Duration::from_secs(2)).min(deadline);
             if let Ok(Ok(status)) = timeout_at(grace_deadline, self.child.wait()).await {
                 self.await_output_drained(deadline).await?;
@@ -328,10 +354,10 @@ impl Drop for NativeChild {
 impl NativeWriter {
     pub fn new(stdin: ChildStdin, labels: NativeLabels) -> Self {
         Self {
-            writer: Arc::new(tokio::sync::Mutex::new(FramedWrite::new(
+            writer: Arc::new(tokio::sync::Mutex::new(Some(FramedWrite::new(
                 stdin,
                 LinesCodec::new(),
-            ))),
+            )))),
             labels,
         }
     }
@@ -352,6 +378,15 @@ impl NativeWriter {
                 ));
             }
         };
+        let Some(writer) = writer.as_mut() else {
+            return Err(Error::new(
+                "native_not_dispatched",
+                format!(
+                    "{} stdin is shut down; write was not dispatched",
+                    self.labels.short
+                ),
+            ));
+        };
         if Instant::now() >= deadline {
             return Err(Error::new(
                 "native_not_dispatched",
@@ -370,6 +405,8 @@ impl NativeWriter {
         }
     }
 
+    /// Flush input. This does not close the pipe: the stdin handle stays
+    /// queued until [`NativeWriter::shutdown_input`] drops it.
     pub async fn close_input(&self, deadline: Instant) -> Result<()> {
         let mut writer = match timeout_at(deadline, self.writer.lock()).await {
             Ok(writer) => writer,
@@ -383,6 +420,9 @@ impl NativeWriter {
                 ));
             }
         };
+        let Some(writer) = writer.as_mut() else {
+            return Ok(());
+        };
         if Instant::now() >= deadline {
             return Err(Error::new(
                 "native_not_dispatched",
@@ -392,13 +432,37 @@ impl NativeWriter {
                 ),
             ));
         }
-        match timeout_at(deadline, SinkExt::<String>::close(&mut *writer)).await {
+        match timeout_at(deadline, SinkExt::<String>::close(writer)).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(_)) | Err(_) => Err(Error::new(
                 "unknown",
                 format!("{} input close outcome is unknown", self.labels.server),
             )),
         }
+    }
+
+    /// Flush input and drop the stdin handle so the child really sees EOF.
+    /// Idempotent: input stays shut. The flush result is irrelevant — after
+    /// the drop the pipe is closed either way.
+    pub async fn shutdown_input(&self, deadline: Instant) -> Result<()> {
+        let mut guard = match timeout_at(deadline, self.writer.lock()).await {
+            Ok(guard) => guard,
+            Err(_) => {
+                return Err(Error::new(
+                    "native_not_dispatched",
+                    format!(
+                        "{} input shutdown deadline elapsed before dispatch",
+                        self.labels.short
+                    ),
+                ));
+            }
+        };
+        let Some(writer) = guard.as_mut() else {
+            return Ok(());
+        };
+        let _ = timeout_at(deadline, SinkExt::<String>::close(writer)).await;
+        *guard = None;
+        Ok(())
     }
 }
 

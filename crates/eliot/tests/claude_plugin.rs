@@ -949,6 +949,17 @@ impl Scenario {
         let text = std::fs::read_to_string(self.root.join("report.json")).expect("fake CLI report");
         serde_json::from_str(&text).expect("fake CLI report JSON")
     }
+
+    /// Assert the fake CLI exited the expected way. Deterministic after
+    /// stop: the plugin reaps the fake by handle before answering, and the
+    /// marker write happens before the fake's exit.
+    fn assert_cli_exit(&self, expected: &str) {
+        assert_eq!(
+            self.report().get("exit").and_then(Value::as_str),
+            Some(expected),
+            "fake CLI exit marker"
+        );
+    }
 }
 
 fn is_uuid(value: &str) -> bool {
@@ -1189,6 +1200,7 @@ async fn scenario_launch_send_snapshot_stop(owned: OwnedChildren) {
         assert!(error.contains("unsupported"), "{verb}: {error}");
     }
     stop_agent(&mut scenario.host, &agent_id).await;
+    scenario.assert_cli_exit("stdin-eof");
     // The CLI ran with the exact stream-json surface and the minted ids.
     let report = scenario.report();
     let argv = report
@@ -1270,6 +1282,7 @@ async fn scenario_two_assistant_messages_snapshot_matches_stream(owned: OwnedChi
         Some("fake part one. fake part two.")
     );
     stop_agent(&mut scenario.host, &agent_id).await;
+    scenario.assert_cli_exit("stdin-eof");
     scenario
         .host
         .call("shutdown", json!({}))
@@ -1292,6 +1305,7 @@ async fn scenario_failed_turn_reports_terminal_reason(owned: OwnedChildren) {
         Some("failed")
     );
     stop_agent(&mut scenario.host, &agent_id).await;
+    scenario.assert_cli_exit("stdin-eof");
     scenario
         .host
         .call("shutdown", json!({}))
@@ -1350,6 +1364,7 @@ async fn scenario_cancelled_input_is_rejected_without_rewrite(owned: OwnedChildr
         Some(1)
     );
     stop_agent(&mut scenario.host, &agent_id).await;
+    scenario.assert_cli_exit("stdin-eof");
     scenario
         .host
         .call("shutdown", json!({}))
@@ -1409,6 +1424,7 @@ async fn scenario_dropped_input_is_unknown_without_rewrite(owned: OwnedChildren)
         Some(1)
     );
     stop_agent(&mut scenario.host, &agent_id).await;
+    scenario.assert_cli_exit("scripted-drop");
     scenario
         .host
         .call("shutdown", json!({}))
@@ -1543,6 +1559,7 @@ async fn scenario_interrupt_applied_then_stale(owned: OwnedChildren) {
         Some(1)
     );
     stop_agent(&mut scenario.host, &agent_id).await;
+    scenario.assert_cli_exit("stdin-eof");
     scenario
         .host
         .call("shutdown", json!({}))

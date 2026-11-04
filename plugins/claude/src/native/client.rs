@@ -111,10 +111,13 @@ impl ClaudeProcess {
         self.transport.await_output_drained(deadline).await
     }
 
-    /// Close input, then end the owned tree. `claude -p` exits on stdin EOF;
-    /// the kill path only fires when the graceful close cannot be confirmed.
+    /// Drop stdin so `claude -p` sees EOF and exits, then end the owned
+    /// tree. The kill path only fires when the graceful close cannot be
+    /// confirmed.
     pub async fn terminate(&mut self, force: bool, deadline: Instant) -> Result<ExitStatus> {
-        self.transport.terminate(force, deadline).await
+        self.transport
+            .terminate_dropping_input(force, deadline)
+            .await
     }
 }
 
