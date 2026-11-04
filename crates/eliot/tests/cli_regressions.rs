@@ -14474,3 +14474,214 @@ fn cli_hierarchy_fanout_limit_rejects_extra_children() {
     }
     fixture.stop(false);
 }
+
+#[test]
+fn attribution_who_claims_and_conflict_notice() {
+    let mut fixture = Fixture::new("attribution who");
+    assert!(
+        fixture
+            .git(&["init", "--initial-branch=main"])
+            .status
+            .success()
+    );
+    fs::write(fixture.workspace.join("seed.txt"), "project baseline\n")
+        .expect("write project baseline");
+    assert!(fixture.git(&["add", "--", "seed.txt"]).status.success());
+    assert!(
+        fixture
+            .git(&["commit", "-m", "attribution fixture"])
+            .status
+            .success()
+    );
+    fixture.start();
+    let workspace = fixture.workspace.to_str().unwrap().to_owned();
+    let first = fixture.json(&[
+        "launch",
+        "--profile",
+        "fake",
+        "--workspace",
+        &workspace,
+        "--wait",
+    ]);
+    let a = first["target"].as_str().expect("fake Agent").to_owned();
+
+    // A edits: the dirty file has no native authorship hint, so it shows
+    // only through single ownership of the checkout.
+    fs::write(fixture.workspace.join("note.txt"), "a's draft\n").expect("dirty the checkout");
+    let seen = {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let status = fixture.json(&["git-status", &a]);
+            let dirty = status["dirty"].as_array().cloned().unwrap_or_default();
+            if status["available"] == true && dirty.iter().any(|path| path["path"] == "note.txt") {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "git monitor dirty deadline");
+            thread::sleep(Duration::from_millis(100));
+        }
+    };
+    assert_eq!(seen["complete"], true);
+
+    let set = fixture.json(&[
+        "claim", "set", "--agent", &a, "--note", "drafting", "docs/**",
+    ]);
+    assert_eq!(set["agent"], a);
+    assert_eq!(set["generation"], 1);
+    assert_eq!(set["glob"], "docs/**");
+    assert!(set["conflicts"].as_array().expect("conflicts").is_empty());
+
+    // B reads who and sees A's area: the singly owned dirty file plus the
+    // advisory claim.
+    let who = fixture.json(&["who"]);
+    let workers = who["workers"].as_array().expect("who workers");
+    assert_eq!(workers.len(), 1);
+    assert_eq!(workers[0]["agent"], a);
+    assert_eq!(workers[0]["singly_owned"], true);
+    assert_eq!(workers[0]["git_available"], true);
+    let dirty: Vec<_> = workers[0]["dirty"].as_array().expect("dirty").to_vec();
+    assert!(dirty.iter().any(|path| path == "note.txt"));
+    assert_eq!(workers[0]["claims"].as_array().expect("claims").len(), 1);
+    assert_eq!(workers[0]["claims"][0]["glob"], "docs/**");
+    assert!(who["shared"].as_array().expect("shared").is_empty());
+
+    // A second Agent in the same checkout shares it: raw dirty files stay
+    // unattributed but visible, while claims still show their holders.
+    let second = fixture.json(&[
+        "launch",
+        "--profile",
+        "fake",
+        "--workspace",
+        &workspace,
+        "--wait",
+    ]);
+    let b = second["target"].as_str().expect("fake Agent").to_owned();
+    let who = fixture.json(&["who"]);
+    let workers = who["workers"].as_array().expect("who workers");
+    assert_eq!(workers.len(), 2);
+    for worker in workers {
+        assert_eq!(worker["singly_owned"], false);
+        assert!(worker["dirty"].as_array().expect("dirty").is_empty());
+    }
+    let shared = who["shared"].as_array().expect("shared");
+    assert_eq!(shared.len(), 1);
+    assert_eq!(shared[0]["agents"], json!([a, b]));
+    assert!(
+        shared[0]["dirty"]
+            .as_array()
+            .expect("shared dirty")
+            .iter()
+            .any(|path| path == "note.txt")
+    );
+
+    // B's overlapping claim reports A's area in-band and routes exactly one
+    // coalesced generic notice to A; the immediate second overlap is
+    // suppressed by the cooldown.
+    let overlap = fixture.json(&["claim", "set", "--agent", &b, "docs/guide.md"]);
+    let conflicts = overlap["conflicts"].as_array().expect("conflicts");
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0]["agent"], a);
+    fixture.json(&["claim", "set", "--agent", &b, "docs/other.md"]);
+    let events = fixture.events();
+    let mut notices = Vec::new();
+    for event in &events {
+        if event["kind"] != "command.accepted" {
+            continue;
+        }
+        let Some(id) = event["data"]["command_id"].as_str() else {
+            continue;
+        };
+        let command = fixture.json(&["cmd", "show", id]);
+        if command["verb"] != "send" {
+            continue;
+        }
+        let text = command["args"]["text"].as_str().unwrap_or("");
+        if text.contains("overlapping work claims; run eliot who") {
+            assert!(
+                !text.contains("docs/"),
+                "notice must never contain claimed paths"
+            );
+            notices.push((
+                command["target"].as_str().unwrap_or("").to_owned(),
+                text.to_owned(),
+            ));
+        }
+    }
+    assert_eq!(
+        notices,
+        vec![(
+            a.clone(),
+            "1 overlapping work claims; run eliot who".to_owned()
+        )]
+    );
+
+    // A one-second claim expires out of reads without any explicit release.
+    fixture.json(&["claim", "set", "--agent", &b, "--ttl-secs", "1", "tmp/**"]);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let listed = fixture.json(&["claim", "list"]);
+        let live: Vec<_> = listed["claims"]
+            .as_array()
+            .expect("claims")
+            .iter()
+            .filter(|claim| claim["glob"] == "tmp/**")
+            .collect();
+        if live.is_empty() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "claim expiry deadline");
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    // Explicit release clears the holder; stop and resume move B to a new
+    // generation whose roster row carries no old claim.
+    fixture.json(&["claim", "release", "--agent", &a, "docs/**"]);
+    let project = fixture.json(&["who"])["workers"]
+        .as_array()
+        .expect("workers")
+        .iter()
+        .find(|worker| worker["agent"] == a)
+        .expect("A rostered")
+        .get("project")
+        .expect("worker project")
+        .as_str()
+        .expect("project string")
+        .to_owned();
+    let who = fixture.json(&["who", "--project", &project]);
+    let worker_a = who["workers"]
+        .as_array()
+        .expect("workers")
+        .iter()
+        .find(|worker| worker["agent"] == a)
+        .expect("A still rostered")
+        .clone();
+    assert!(worker_a["claims"].as_array().expect("claims").is_empty());
+    let stop = fixture.json(&["stop", &b]);
+    fixture.wait_command(
+        stop["command_id"].as_str().expect("stop command"),
+        "applied",
+    );
+    let resume_id = ulid::Ulid::new().to_string();
+    let resume = cli(&fixture.data, &["--id", &resume_id, "resume", &b]);
+    assert!(resume.status.success(), "resume B: {}", resume.stderr);
+    let resumed = fixture.wait_command(&resume_id, "applied");
+    assert_eq!(resumed["generation"], 2);
+    let who = fixture.json(&["who"]);
+    let worker_b = who["workers"]
+        .as_array()
+        .expect("workers")
+        .iter()
+        .find(|worker| worker["agent"] == b)
+        .expect("B still rostered")
+        .clone();
+    assert_eq!(worker_b["generation"], 2);
+    assert!(worker_b["claims"].as_array().expect("claims").is_empty());
+
+    for agent in [&a, &b] {
+        let stop = fixture.json(&["stop", agent]);
+        fixture.wait_command(
+            stop["command_id"].as_str().expect("stop command"),
+            "applied",
+        );
+    }
+    fixture.stop(false);
+}

@@ -48,7 +48,7 @@ pub struct MailNoticeState {
     pub open_notice_command: Option<String>,
 }
 
-enum Sender {
+pub(super) enum Sender {
     Owner,
     Agent {
         num: i64,
@@ -57,20 +57,26 @@ enum Sender {
     },
 }
 
-fn parse_sender(principal: &str) -> Result<Sender> {
+pub(super) fn parse_sender(principal: &str) -> Result<Sender> {
     if principal == "owner" {
         return Ok(Sender::Owner);
     }
     if let Some(rest) = principal.strip_prefix("agent:") {
         let Some((id, generation)) = rest.split_once(':') else {
-            return Err(Error::new("not_allowed", "mail principal is not an Agent"));
+            return Err(Error::new(
+                "not_allowed",
+                "coordination principal is not an Agent",
+            ));
         };
         let num = parse_agent_id(id)?;
         let generation = generation
             .parse::<i64>()
-            .map_err(|_| Error::new("not_allowed", "mail principal is not an Agent"))?;
+            .map_err(|_| Error::new("not_allowed", "coordination principal is not an Agent"))?;
         if generation < 0 {
-            return Err(Error::new("not_allowed", "mail principal is not an Agent"));
+            return Err(Error::new(
+                "not_allowed",
+                "coordination principal is not an Agent",
+            ));
         }
         return Ok(Sender::Agent {
             num,
@@ -1096,7 +1102,7 @@ fn absent_delivery_error(delivery_id: &str, mailbox: i64, now: i64) -> Error {
     }
 }
 
-fn retain_write_tx(
+pub(super) fn retain_write_tx(
     tx: &Transaction<'_>,
     id: &str,
     principal: &str,
@@ -1241,7 +1247,7 @@ mod tests {
     }
 
     #[test]
-    fn mail_migration_installs_v22_tables_and_prune_index() {
+    fn mail_migration_installs_v24_tables_and_prune_index() {
         let store = store();
         let version: i64 = store
             .connection
@@ -1250,8 +1256,14 @@ mod tests {
             })
             .expect("read Store migration version");
         assert_eq!(version, super::super::schema::CURRENT_SCHEMA_VERSION);
-        assert_eq!(version, 23);
-        for table in ["messages", "vars", "mail_notices"] {
+        assert_eq!(version, 24);
+        for table in [
+            "messages",
+            "vars",
+            "mail_notices",
+            "claims",
+            "claim_notices",
+        ] {
             let found: i64 = store
                 .connection
                 .query_row(
@@ -1262,16 +1274,17 @@ mod tests {
                 .expect("count coordination table");
             assert_eq!(found, 1, "missing {table}");
         }
-        let index: i64 = store
-            .connection
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master
-                 WHERE type = 'index' AND name = 'messages_prune_acked'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("count prune index");
-        assert_eq!(index, 1, "missing messages_prune_acked");
+        for index in ["messages_prune_acked", "claims_expiry"] {
+            let found: i64 = store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    params![index],
+                    |row| row.get(0),
+                )
+                .expect("count coordination index");
+            assert_eq!(found, 1, "missing {index}");
+        }
     }
 
     #[test]

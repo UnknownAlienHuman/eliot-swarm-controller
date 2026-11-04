@@ -9,6 +9,7 @@ mod provider_holds;
 mod rules;
 mod scripts;
 
+pub use attribution::{ClaimNoticeClaim, ClaimNoticeState, WhoWorkerRow};
 pub use capacity::{RecordedProcess, RetainedGeneration};
 pub use command_children::{CommandChildrenPage, history_expired};
 pub use coordination::{MailNoticeClaim, MailNoticeState};
@@ -88,6 +89,7 @@ macro_rules! db {
 }
 
 mod admission;
+mod attribution;
 mod command_children;
 mod coordination;
 mod dispatch;

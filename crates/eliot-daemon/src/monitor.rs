@@ -656,6 +656,23 @@ impl Monitoring {
         Ok(value)
     }
 
+    /// Test-only: install a fresh Git snapshot for one workspace so `who`
+    /// tests can cover dirty attribution without a live Git probe.
+    #[cfg(test)]
+    pub(crate) fn inject_git_snapshot(&self, workspace: &str, snapshot: GitSnapshot) {
+        let target = self
+            .inner
+            .git_workspaces
+            .lock_recover()
+            .entry(workspace.to_owned())
+            .or_default()
+            .clone();
+        let mut cache = target.cache.lock_recover();
+        cache.snapshot = Some(snapshot);
+        cache.error = None;
+        cache.next_attempt = Instant::now();
+    }
+
     fn check_git_value(&self, mut value: Value) -> Result<()> {
         let secrets: Vec<_> = self.inner.secrets.lock_recover().iter().cloned().collect();
         if crate::redaction::redact_value(&mut value, &secrets) {

@@ -6,7 +6,7 @@
 //! optional compare-and-swap version; an absent row reads as version 0.
 
 use super::mutations::nullable;
-use crate::{Error, Result, parse_agent_id};
+use crate::{AgentState, Error, GitCommit, Result, parse_agent_id};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -640,6 +640,561 @@ fn unproven() -> Error {
     )
 }
 
+/// Project-relative claim globs stay small enough for list output.
+pub const MAX_CLAIM_GLOB_BYTES: usize = 1024;
+/// Optional claim notes stay small.
+pub const MAX_CLAIM_NOTE_BYTES: usize = 1024;
+/// Live claims per Agent generation stay bounded.
+pub const MAX_CLAIMS_PER_AGENT: usize = 100;
+/// Claims expire one hour after admission unless the caller says otherwise.
+pub const DEFAULT_CLAIM_TTL_SECS: u64 = 3_600;
+/// Claims live at most one day; refresh explicitly instead.
+pub const MAX_CLAIM_TTL_SECS: u64 = 24 * 3_600;
+/// One holder receives at most one generic claim-conflict notice per minute.
+pub const CLAIM_NOTICE_COOLDOWN_MS: i64 = 60 * 1000;
+/// `who` returns at most this many current workers.
+pub const MAX_WHO_WORKERS: usize = 100;
+/// Each `who` path list is truncated to this many entries.
+pub const MAX_WHO_PATHS: usize = 100;
+
+/// Normalize a project-relative claim glob: collapse duplicate slashes, drop
+/// leading `./` segments and one trailing slash. Absolute paths, `..`
+/// segments, NUL, backslashes and bracket/brace metacharacters are rejected:
+/// globs use `/` separators with `*`, `**` and `?` only.
+pub fn normalize_claim_glob(glob: &str) -> Result<String> {
+    if glob.len() > MAX_CLAIM_GLOB_BYTES || glob.contains('\0') || glob.trim().is_empty() {
+        return Err(Error::new("invalid", "claim glob is invalid"));
+    }
+    if glob.contains('\\')
+        || glob.contains('[')
+        || glob.contains(']')
+        || glob.contains('{')
+        || glob.contains('}')
+    {
+        return Err(Error::new(
+            "invalid",
+            "claim globs use / separators with *, ** and ? only",
+        ));
+    }
+    if glob.starts_with('/')
+        || glob.starts_with("~/")
+        || (glob.len() >= 2
+            && glob.as_bytes()[0].is_ascii_alphabetic()
+            && glob.as_bytes()[1] == b':')
+    {
+        return Err(Error::new("invalid", "claim globs are project-relative"));
+    }
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in glob.split('/') {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        if segment == ".." {
+            return Err(Error::new(
+                "invalid",
+                "claim globs must not escape the project",
+            ));
+        }
+        segments.push(segment);
+    }
+    if segments.is_empty() {
+        return Err(Error::new("invalid", "claim glob is invalid"));
+    }
+    Ok(segments.join("/"))
+}
+
+fn is_literal_glob(normalized: &str) -> bool {
+    !normalized.contains(['*', '?'])
+}
+
+fn segment_matches(pattern: &str, text: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    let mut states = vec![false; text.len() + 1];
+    states[0] = true;
+    for token in pattern {
+        let mut next = vec![false; text.len() + 1];
+        if token == '*' {
+            let mut run = false;
+            for (index, slot) in next.iter_mut().enumerate() {
+                run = run || states[index];
+                *slot = run;
+            }
+        } else {
+            for (index, slot) in next.iter_mut().enumerate().skip(1) {
+                *slot = states[index - 1] && (token == '?' || token == text[index - 1]);
+            }
+        }
+        states = next;
+    }
+    states[text.len()]
+}
+
+/// Match a normalized glob against a normalized project-relative path. A
+/// `**` segment crosses directories; a trailing `/**` also matches the
+/// directory itself. Inputs that fail normalization never match.
+pub fn claim_glob_matches(pattern: &str, path: &str) -> bool {
+    let Ok(pattern) = normalize_claim_glob(pattern) else {
+        return false;
+    };
+    let Ok(path) = normalize_claim_glob(path) else {
+        return false;
+    };
+    if is_literal_glob(&pattern) {
+        return pattern == path;
+    }
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in pattern.split('/') {
+        if segment == "**" && segments.last() == Some(&"**") {
+            continue;
+        }
+        segments.push(segment);
+    }
+    let parts: Vec<&str> = path.split('/').collect();
+    match_segments(&segments, &parts)
+}
+
+fn match_segments(pattern: &[&str], path: &[&str]) -> bool {
+    if pattern.is_empty() {
+        return path.is_empty();
+    }
+    if pattern[0] == "**" {
+        for skip in 0..=path.len() {
+            if match_segments(&pattern[1..], &path[skip..]) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if path.is_empty() {
+        return false;
+    }
+    segment_matches(pattern[0], path[0]) && match_segments(&pattern[1..], &path[1..])
+}
+
+/// Whether two claim globs overlap: equal after normalization, or one side
+/// is a literal path matched by the other's glob. Two different wildcards
+/// whose languages merely intersect are not detected; both claims stay
+/// visible in `who`, so the overlap is still advisory-visible to a reader.
+pub fn claim_globs_overlap(left: &str, right: &str) -> Result<bool> {
+    let left = normalize_claim_glob(left)?;
+    let right = normalize_claim_glob(right)?;
+    if left == right {
+        return Ok(true);
+    }
+    if is_literal_glob(&left) && claim_glob_matches(&right, &left) {
+        return Ok(true);
+    }
+    if is_literal_glob(&right) && claim_glob_matches(&left, &right) {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn validate_claim_note(note: &str) -> Result<()> {
+    if note.len() > MAX_CLAIM_NOTE_BYTES || note.contains('\0') {
+        return Err(Error::new("invalid", "claim note is invalid"));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimSetRequest {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    pub glob: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_secs: Option<u64>,
+}
+
+impl ClaimSetRequest {
+    pub fn effective_ttl_secs(&self) -> u64 {
+        self.ttl_secs.unwrap_or(DEFAULT_CLAIM_TTL_SECS)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        validate_write_id(&self.id)?;
+        if self
+            .agent
+            .as_deref()
+            .is_some_and(|agent| parse_agent_id(agent).is_err())
+        {
+            return Err(Error::new("invalid", "claim Agent must name an Agent"));
+        }
+        normalize_claim_glob(&self.glob)?;
+        if let Some(note) = self.note.as_deref() {
+            validate_claim_note(note)?;
+        }
+        if self
+            .ttl_secs
+            .is_some_and(|ttl| ttl == 0 || ttl > MAX_CLAIM_TTL_SECS)
+        {
+            return Err(Error::new(
+                "invalid",
+                "claim TTL must be between 1 second and one day",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_response(&self, response: &ClaimSetResponse) -> Result<()> {
+        if self.validate().is_err() {
+            return Err(unproven());
+        }
+        if response.glob != normalize_claim_glob(&self.glob).map_err(|_| unproven())?
+            || response.note.as_deref() != self.note.as_deref()
+            || response.expires_at <= response.admitted_at
+            || response.conflicts.len() > MAX_WHO_WORKERS
+        {
+            return Err(unproven());
+        }
+        parse_agent_id(&response.agent).map_err(|_| unproven())?;
+        if self
+            .agent
+            .as_deref()
+            .is_some_and(|agent| agent != response.agent)
+            || response.generation < 0
+        {
+            return Err(unproven());
+        }
+        for conflict in &response.conflicts {
+            conflict.validate().map_err(|_| unproven())?;
+            if conflict.agent == response.agent {
+                return Err(unproven());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimConflict {
+    pub agent: String,
+    pub generation: i64,
+    pub glob: String,
+}
+
+impl ClaimConflict {
+    pub fn validate(&self) -> Result<()> {
+        parse_agent_id(&self.agent)?;
+        if self.generation < 0 {
+            return Err(Error::new(
+                "invalid",
+                "claim conflict carries invalid stamps",
+            ));
+        }
+        normalize_claim_glob(&self.glob)?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimSetResponse {
+    pub agent: String,
+    pub generation: i64,
+    pub glob: String,
+    #[serde(deserialize_with = "nullable")]
+    pub note: Option<String>,
+    pub expires_at: i64,
+    pub admitted_at: i64,
+    pub conflicts: Vec<ClaimConflict>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimView {
+    pub agent: String,
+    pub generation: i64,
+    pub glob: String,
+    #[serde(deserialize_with = "nullable")]
+    pub note: Option<String>,
+    pub expires_at: i64,
+    pub created_at: i64,
+}
+
+impl ClaimView {
+    pub fn validate(&self) -> Result<()> {
+        parse_agent_id(&self.agent)?;
+        if self.generation < 0 || self.created_at < 0 || self.expires_at <= self.created_at {
+            return Err(Error::new("invalid", "claim carries invalid stamps"));
+        }
+        normalize_claim_glob(&self.glob)?;
+        if let Some(note) = self.note.as_deref() {
+            validate_claim_note(note)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimListRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+}
+
+impl ClaimListRequest {
+    pub fn validate(&self) -> Result<()> {
+        if self
+            .project
+            .as_deref()
+            .is_some_and(|project| project.trim().is_empty())
+        {
+            return Err(Error::new("invalid", "claim project filter is invalid"));
+        }
+        if self
+            .agent
+            .as_deref()
+            .is_some_and(|agent| parse_agent_id(agent).is_err())
+        {
+            return Err(Error::new(
+                "invalid",
+                "claim Agent filter must name an Agent",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_response(&self, response: &ClaimListResponse) -> Result<()> {
+        if self.validate().is_err() {
+            return Err(unproven());
+        }
+        let mut previous: Option<(i64, &str)> = None;
+        for claim in &response.claims {
+            claim.validate().map_err(|_| unproven())?;
+            if self
+                .agent
+                .as_deref()
+                .is_some_and(|agent| agent != claim.agent)
+            {
+                return Err(unproven());
+            }
+            let key = (
+                parse_agent_id(&claim.agent).map_err(|_| unproven())?,
+                claim.glob.as_str(),
+            );
+            if previous.is_some_and(|prior| prior >= key) {
+                return Err(unproven());
+            }
+            previous = Some(key);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimListResponse {
+    pub claims: Vec<ClaimView>,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimReleaseRequest {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    pub glob: String,
+}
+
+impl ClaimReleaseRequest {
+    pub fn validate(&self) -> Result<()> {
+        validate_write_id(&self.id)?;
+        if self
+            .agent
+            .as_deref()
+            .is_some_and(|agent| parse_agent_id(agent).is_err())
+        {
+            return Err(Error::new("invalid", "claim Agent must name an Agent"));
+        }
+        normalize_claim_glob(&self.glob)?;
+        Ok(())
+    }
+
+    pub fn validate_response(&self, response: &ClaimReleaseResponse) -> Result<()> {
+        if self.validate().is_err() {
+            return Err(unproven());
+        }
+        if response.glob != normalize_claim_glob(&self.glob).map_err(|_| unproven())?
+            || response.generation < 0
+        {
+            return Err(unproven());
+        }
+        parse_agent_id(&response.agent).map_err(|_| unproven())?;
+        if self
+            .agent
+            .as_deref()
+            .is_some_and(|agent| agent != response.agent)
+        {
+            return Err(unproven());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimReleaseResponse {
+    pub agent: String,
+    pub generation: i64,
+    pub glob: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WhoRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<bool>,
+}
+
+impl WhoRequest {
+    pub fn want_history(&self) -> bool {
+        self.history.unwrap_or(false)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self
+            .project
+            .as_deref()
+            .is_some_and(|project| project.trim().is_empty())
+        {
+            return Err(Error::new("invalid", "who project filter is invalid"));
+        }
+        Ok(())
+    }
+
+    pub fn validate_response(&self, response: &WhoResponse) -> Result<()> {
+        if self.validate().is_err() || response.workers.len() > MAX_WHO_WORKERS {
+            return Err(unproven());
+        }
+        for worker in &response.workers {
+            worker.validate().map_err(|_| unproven())?;
+            if self
+                .project
+                .as_deref()
+                .is_some_and(|project| project != worker.project)
+            {
+                return Err(unproven());
+            }
+            if !self.want_history() && !worker.recent_history.is_empty() {
+                return Err(unproven());
+            }
+        }
+        for shared in &response.shared {
+            shared.validate().map_err(|_| unproven())?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WhoWorker {
+    pub agent: String,
+    pub generation: i64,
+    pub state: AgentState,
+    pub project: String,
+    #[serde(deserialize_with = "nullable")]
+    pub workspace: Option<String>,
+    pub singly_owned: bool,
+    pub git_available: bool,
+    pub attribution_complete: bool,
+    pub edits_truncated: bool,
+    pub attributed_edits: Vec<String>,
+    pub dirty: Vec<String>,
+    pub committed_paths: Vec<String>,
+    #[serde(deserialize_with = "nullable")]
+    pub base_oid: Option<String>,
+    pub claims: Vec<ClaimView>,
+    pub recent_history: Vec<GitCommit>,
+}
+
+impl WhoWorker {
+    pub fn validate(&self) -> Result<()> {
+        parse_agent_id(&self.agent)?;
+        if self.generation < 0 {
+            return Err(Error::new("invalid", "who worker carries invalid stamps"));
+        }
+        if self.state.is_terminal() {
+            return Err(Error::new(
+                "invalid",
+                "terminal Agents are never current workers",
+            ));
+        }
+        if self.project.trim().is_empty() {
+            return Err(Error::new("invalid", "who worker project is invalid"));
+        }
+        if !self.singly_owned && !self.dirty.is_empty() {
+            return Err(Error::new(
+                "invalid",
+                "shared checkouts never attribute dirty files",
+            ));
+        }
+        if self.workspace.is_none() && (self.singly_owned || self.git_available) {
+            return Err(Error::new("invalid", "who worker without a workspace"));
+        }
+        if self.attributed_edits.len() > MAX_WHO_PATHS
+            || self.dirty.len() > MAX_WHO_PATHS
+            || self.committed_paths.len() > MAX_WHO_PATHS
+            || self.claims.len() > MAX_CLAIMS_PER_AGENT
+        {
+            return Err(Error::new(
+                "invalid",
+                "who worker lists exceed their bounds",
+            ));
+        }
+        for claim in &self.claims {
+            claim.validate()?;
+            if claim.agent != self.agent || claim.generation != self.generation {
+                return Err(Error::new("invalid", "who worker carries a foreign claim"));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WhoSharedWorkspace {
+    pub workspace: String,
+    pub agents: Vec<String>,
+    pub dirty: Vec<String>,
+}
+
+impl WhoSharedWorkspace {
+    pub fn validate(&self) -> Result<()> {
+        if self.workspace.trim().is_empty() || self.agents.len() < 2 {
+            return Err(Error::new("invalid", "shared workspace needs two owners"));
+        }
+        for agent in &self.agents {
+            parse_agent_id(agent)?;
+        }
+        if self.dirty.len() > MAX_WHO_PATHS {
+            return Err(Error::new("invalid", "shared dirty list exceeds its bound"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WhoResponse {
+    pub workers: Vec<WhoWorker>,
+    pub shared: Vec<WhoSharedWorkspace>,
+    pub truncated: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1037,5 +1592,357 @@ mod tests {
             .is_err()
         );
         assert!(serde_json::from_value::<VarSetRequest>(json!({"unexpected": 1})).is_err());
+    }
+
+    fn claim_set_request() -> ClaimSetRequest {
+        ClaimSetRequest {
+            id: "01J0000000000000000000003".to_owned(),
+            agent: None,
+            glob: "src/**".to_owned(),
+            note: Some("refactor".to_owned()),
+            ttl_secs: None,
+        }
+    }
+
+    fn claim_view(agent: &str) -> ClaimView {
+        ClaimView {
+            agent: agent.to_owned(),
+            generation: 1,
+            glob: "src/**".to_owned(),
+            note: None,
+            expires_at: 3_601_000,
+            created_at: 1_000,
+        }
+    }
+
+    fn who_worker(agent: &str) -> WhoWorker {
+        WhoWorker {
+            agent: agent.to_owned(),
+            generation: 1,
+            state: AgentState::Idle,
+            project: "app".to_owned(),
+            workspace: Some("/repo".to_owned()),
+            singly_owned: true,
+            git_available: true,
+            attribution_complete: true,
+            edits_truncated: false,
+            attributed_edits: vec!["src/main.rs".to_owned()],
+            dirty: vec!["src/main.rs".to_owned()],
+            committed_paths: Vec::new(),
+            base_oid: None,
+            claims: Vec::new(),
+            recent_history: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn claim_globs_normalize_match_and_detect_literal_overlap() {
+        assert_eq!(
+            normalize_claim_glob("./src//main.rs").unwrap(),
+            "src/main.rs"
+        );
+        assert_eq!(normalize_claim_glob("src/").unwrap(), "src");
+        assert_eq!(normalize_claim_glob("**").unwrap(), "**");
+        for bad in [
+            "",
+            "  ",
+            "/abs/path",
+            "~/home",
+            "C:/win/path",
+            "c:relative",
+            "src/../escape",
+            "..",
+            "src\\win.rs",
+            "src/[ab].rs",
+            "src/{a,b}",
+            "src/\0.rs",
+            &"x".repeat(MAX_CLAIM_GLOB_BYTES + 1),
+        ] {
+            assert!(normalize_claim_glob(bad).is_err(), "glob accepted: {bad:?}");
+        }
+
+        assert!(claim_glob_matches("src/**", "src/main.rs"));
+        assert!(claim_glob_matches("src/**", "src"));
+        assert!(claim_glob_matches("src/**", "src/a/b.rs"));
+        assert!(claim_glob_matches("**", "src/a/b.rs"));
+        assert!(claim_glob_matches("src/*.rs", "src/main.rs"));
+        assert!(!claim_glob_matches("src/*.rs", "src/a/main.rs"));
+        assert!(claim_glob_matches("src/ma?n.rs", "src/main.rs"));
+        assert!(!claim_glob_matches("src/ma?n.rs", "src/man.rs"));
+        assert!(claim_glob_matches("src/main.rs", "src/main.rs"));
+        assert!(!claim_glob_matches("src/main.rs", "src/other.rs"));
+        assert!(!claim_glob_matches("other/**", "src/main.rs"));
+        assert!(!claim_glob_matches("src/**", "/abs/path"));
+
+        assert!(claim_globs_overlap("src/**", "./src/**").unwrap());
+        assert!(claim_globs_overlap("src/**", "src/main.rs").unwrap());
+        assert!(claim_globs_overlap("src/main.rs", "src/**").unwrap());
+        assert!(!claim_globs_overlap("src/**", "other/**").unwrap());
+        // Two different wildcards with intersecting languages stay
+        // undetected; both remain visible in `who`.
+        assert!(!claim_globs_overlap("src/*.rs", "src/m*").unwrap());
+        assert!(claim_globs_overlap("src/**", "../escape").is_err());
+    }
+
+    #[test]
+    fn claim_requests_validate_bounds_and_response_bindings() {
+        let request = claim_set_request();
+        assert_eq!(request.effective_ttl_secs(), DEFAULT_CLAIM_TTL_SECS);
+        request.validate().unwrap();
+        request
+            .validate_response(&ClaimSetResponse {
+                agent: "a1".to_owned(),
+                generation: 1,
+                glob: "src/**".to_owned(),
+                note: Some("refactor".to_owned()),
+                expires_at: 3_601_000,
+                admitted_at: 1_000,
+                conflicts: vec![ClaimConflict {
+                    agent: "a2".to_owned(),
+                    generation: 1,
+                    glob: "src/main.rs".to_owned(),
+                }],
+            })
+            .unwrap();
+        assert!(
+            request
+                .validate_response(&ClaimSetResponse {
+                    agent: "a1".to_owned(),
+                    generation: 1,
+                    glob: "src/other.rs".to_owned(),
+                    note: Some("refactor".to_owned()),
+                    expires_at: 3_601_000,
+                    admitted_at: 1_000,
+                    conflicts: Vec::new(),
+                })
+                .is_err()
+        );
+        // A self-conflict is never proven.
+        assert!(
+            request
+                .validate_response(&ClaimSetResponse {
+                    agent: "a1".to_owned(),
+                    generation: 1,
+                    glob: "src/**".to_owned(),
+                    note: Some("refactor".to_owned()),
+                    expires_at: 3_601_000,
+                    admitted_at: 1_000,
+                    conflicts: vec![ClaimConflict {
+                        agent: "a1".to_owned(),
+                        generation: 1,
+                        glob: "src/**".to_owned(),
+                    }],
+                })
+                .is_err()
+        );
+
+        for request in [
+            ClaimSetRequest {
+                id: "  ".to_owned(),
+                ..claim_set_request()
+            },
+            ClaimSetRequest {
+                agent: Some("nope".to_owned()),
+                ..claim_set_request()
+            },
+            ClaimSetRequest {
+                glob: "../escape".to_owned(),
+                ..claim_set_request()
+            },
+            ClaimSetRequest {
+                note: Some("n".repeat(MAX_CLAIM_NOTE_BYTES + 1)),
+                ..claim_set_request()
+            },
+            ClaimSetRequest {
+                ttl_secs: Some(0),
+                ..claim_set_request()
+            },
+            ClaimSetRequest {
+                ttl_secs: Some(MAX_CLAIM_TTL_SECS + 1),
+                ..claim_set_request()
+            },
+        ] {
+            assert!(request.validate().is_err());
+        }
+        assert!(serde_json::from_value::<ClaimSetRequest>(json!({"unexpected": 1})).is_err());
+
+        claim_view("a1").validate().unwrap();
+        let mut expired = claim_view("a1");
+        expired.expires_at = expired.created_at;
+        assert!(expired.validate().is_err());
+
+        let list = ClaimListRequest {
+            project: Some("app".to_owned()),
+            agent: None,
+        };
+        list.validate().unwrap();
+        list.validate_response(&ClaimListResponse {
+            claims: vec![claim_view("a1"), claim_view("a2")],
+            truncated: false,
+        })
+        .unwrap();
+        // Numeric agent order: a2 sorts before a10.
+        list.validate_response(&ClaimListResponse {
+            claims: vec![claim_view("a2"), claim_view("a10")],
+            truncated: false,
+        })
+        .unwrap();
+        assert!(
+            list.validate_response(&ClaimListResponse {
+                claims: vec![claim_view("a10"), claim_view("a2")],
+                truncated: false,
+            })
+            .is_err()
+        );
+        assert!(
+            list.validate_response(&ClaimListResponse {
+                claims: vec![claim_view("a2"), claim_view("a1")],
+                truncated: false,
+            })
+            .is_err()
+        );
+        assert!(
+            ClaimListRequest {
+                agent: Some("a1".to_owned()),
+                ..Default::default()
+            }
+            .validate_response(&ClaimListResponse {
+                claims: vec![claim_view("a2")],
+                truncated: false,
+            })
+            .is_err()
+        );
+
+        let release = ClaimReleaseRequest {
+            id: "01J0000000000000000000004".to_owned(),
+            agent: None,
+            glob: "src/**".to_owned(),
+        };
+        release.validate().unwrap();
+        release
+            .validate_response(&ClaimReleaseResponse {
+                agent: "a1".to_owned(),
+                generation: 1,
+                glob: "src/**".to_owned(),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn who_responses_bind_project_history_and_attribution_rules() {
+        let request = WhoRequest {
+            project: Some("app".to_owned()),
+            history: None,
+        };
+        request.validate().unwrap();
+        request
+            .validate_response(&WhoResponse {
+                workers: vec![who_worker("a1")],
+                shared: Vec::new(),
+                truncated: false,
+            })
+            .unwrap();
+
+        // History appears only when asked.
+        let with_history = WhoRequest {
+            project: None,
+            history: Some(true),
+        };
+        let mut worker = who_worker("a1");
+        worker.recent_history = vec![crate::GitCommit {
+            oid: "abc".to_owned(),
+            paths: vec!["src/main.rs".to_owned()],
+        }];
+        with_history
+            .validate_response(&WhoResponse {
+                workers: vec![worker.clone()],
+                shared: Vec::new(),
+                truncated: false,
+            })
+            .unwrap();
+        assert!(
+            request
+                .validate_response(&WhoResponse {
+                    workers: vec![worker],
+                    shared: Vec::new(),
+                    truncated: false,
+                })
+                .is_err()
+        );
+
+        // Terminal Agents, foreign projects, shared dirty attribution and
+        // foreign claims are never proven.
+        let mut terminal = who_worker("a1");
+        terminal.state = AgentState::Stopped;
+        assert!(
+            request
+                .validate_response(&WhoResponse {
+                    workers: vec![terminal],
+                    shared: Vec::new(),
+                    truncated: false,
+                })
+                .is_err()
+        );
+        let mut foreign = who_worker("a1");
+        foreign.project = "other".to_owned();
+        assert!(
+            request
+                .validate_response(&WhoResponse {
+                    workers: vec![foreign],
+                    shared: Vec::new(),
+                    truncated: false,
+                })
+                .is_err()
+        );
+        let mut shared_dirty = who_worker("a1");
+        shared_dirty.singly_owned = false;
+        assert!(
+            request
+                .validate_response(&WhoResponse {
+                    workers: vec![shared_dirty],
+                    shared: Vec::new(),
+                    truncated: false,
+                })
+                .is_err()
+        );
+        let mut foreign_claim = who_worker("a1");
+        foreign_claim.claims = vec![claim_view("a2")];
+        assert!(
+            request
+                .validate_response(&WhoResponse {
+                    workers: vec![foreign_claim],
+                    shared: Vec::new(),
+                    truncated: false,
+                })
+                .is_err()
+        );
+        let mut no_workspace = who_worker("a1");
+        no_workspace.workspace = None;
+        assert!(
+            request
+                .validate_response(&WhoResponse {
+                    workers: vec![no_workspace],
+                    shared: Vec::new(),
+                    truncated: false,
+                })
+                .is_err()
+        );
+
+        WhoSharedWorkspace {
+            workspace: "/repo".to_owned(),
+            agents: vec!["a1".to_owned(), "a2".to_owned()],
+            dirty: Vec::new(),
+        }
+        .validate()
+        .unwrap();
+        assert!(
+            WhoSharedWorkspace {
+                workspace: "/repo".to_owned(),
+                agents: vec!["a1".to_owned()],
+                dirty: Vec::new(),
+            }
+            .validate()
+            .is_err()
+        );
     }
 }

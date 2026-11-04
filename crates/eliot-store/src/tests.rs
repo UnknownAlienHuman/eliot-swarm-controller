@@ -6248,7 +6248,9 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
              DROP INDEX messages_prune_acked;
              DELETE FROM schema_migrations WHERE version = 22;
              DROP TABLE messages; DROP TABLE vars; DROP TABLE mail_notices;
-             DELETE FROM schema_migrations WHERE version = 21;",
+             DELETE FROM schema_migrations WHERE version = 21;
+             DROP TABLE claims; DROP TABLE claim_notices;
+             DELETE FROM schema_migrations WHERE version = 23;",
         )
         .expect("roll back to schema 16");
     drop(store);
