@@ -1802,7 +1802,9 @@ impl Host {
     }
 
     /// Send a call and return its owned response receiver, so pumps can poll
-    /// inbound host requests while the call is in flight.
+    /// inbound host requests while the call is in flight. Poll or drop the
+    /// receiver before waiting on a plugin request the plugin writes after
+    /// this response: the reader holds later requests until it is consumed.
     async fn begin_call(&mut self, method: &str, params: Value) -> CallRx {
         self.next_id += 1;
         let id = format!("host-call-{}", self.next_id);
@@ -1831,7 +1833,9 @@ impl Host {
             .expect("plugin request channel")
     }
 
-    /// Answer one `events.put`, returning its committed events.
+    /// Answer one `events.put`, returning its committed events. A batch a
+    /// reply pump already acked in flight is checked here without a second
+    /// ack.
     async fn answer_events_put(
         &mut self,
         agent_id: &str,
@@ -5199,7 +5203,7 @@ async fn scenario_unknown_choice_is_rejected_without_write() {
         json!(2)
     );
 
-    let (_, stale, _) = reply(
+    let (_, stale, in_flight) = reply(
         &mut scenario.host,
         &agent_id,
         1,
@@ -5210,6 +5214,10 @@ async fn scenario_unknown_choice_is_rejected_without_write() {
     )
     .await;
     assert_eq!(stale["state"], json!("rejected"));
+    assert!(
+        in_flight.is_empty(),
+        "a locally rejected reply commits nothing"
+    );
     assert_eq!(scenario.report()["decides"], json!(0));
 
     let (reply_id, result, _) = reply(
