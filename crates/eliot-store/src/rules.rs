@@ -898,14 +898,15 @@ impl Store {
         // submit_tx validates and admits the ordinary rule action. Its verb path
         // performs the normal deterministic checks before inserting the child;
         // the surrounding transaction rolls every write back on persistence failure.
-        let (parent, child_admission, events) = match admit_rule_action_tx(&tx, &key, request, now)
-        {
-            Ok(admission) => admission,
-            Err(error) if core::is_deterministic_pre_admission_rejection(&error.code) => {
-                return reject_rule_event(tx, &self.write_faulted, &key, &error.code, now);
-            }
-            Err(error) => return Err(error),
-        };
+        let limits = self.hierarchy_limits;
+        let (parent, child_admission, events) =
+            match admit_rule_action_tx(&tx, &key, request, now, limits) {
+                Ok(admission) => admission,
+                Err(error) if core::is_deterministic_pre_admission_rejection(&error.code) => {
+                    return reject_rule_event(tx, &self.write_faulted, &key, &error.code, now);
+                }
+                Err(error) => return Err(error),
+            };
         let view = update_rule_cursor_tx(&tx, key.principal, &stored.view, event_seq, now)?;
         commit_transaction(tx, &self.write_faulted)?;
 
@@ -935,7 +936,7 @@ impl Store {
             .prepare(
                 "SELECT id, principal, method, target, expected_generation, generation,
                         expected_turn_id, turn_id, request_id, verb, args, state, outcome,
-                        created_at, updated_at, probe
+                        created_at, updated_at, probe, selector
                  FROM commands
                  WHERE link_kind = 'rule_action' AND ordinal IS NOT NULL
                    AND (
@@ -2735,6 +2736,7 @@ fn insert_rule_parent(
         method: COMMAND_METHOD,
         payload_digest: &digest,
         target: None,
+        selector: None,
         expected_generation: None,
         generation: None,
         expected_turn_id: None,
@@ -2759,6 +2761,7 @@ fn insert_rule_parent(
             method: COMMAND_METHOD.to_owned(),
             verb: key.verb.to_owned(),
             target: None,
+            selector: None,
             expected_generation: None,
             generation: None,
             args: (*args).clone(),
@@ -2779,11 +2782,13 @@ fn admit_rule_action_tx(
     key: &RuleFiringKey<'_>,
     mut request: SubmitCommand,
     now: i64,
+    limits: core::api::HierarchyLimits,
 ) -> Result<(Command, Admission, Vec<Event>)> {
     let parent_cause = key.command_cause(&key.parent_id)?;
     let child_cause = key.command_cause(&key.child_id)?;
     request.id = key.child_id.clone();
-    let mut child_admission = admission::submit_tx(tx, key.principal, request, None, now, true)?;
+    let mut child_admission =
+        admission::submit_tx(tx, key.principal, request, None, now, true, limits)?;
     if !child_admission.is_new {
         return Err(Error::new(
             "source_integrity",
@@ -3343,6 +3348,7 @@ mod tests {
             method: COMMAND_METHOD,
             payload_digest: &payload_digest,
             target: None,
+            selector: None,
             expected_generation: None,
             generation: None,
             expected_turn_id: None,
@@ -3373,6 +3379,7 @@ mod tests {
             method: COMMAND_METHOD,
             payload_digest: &payload_digest,
             target: Some(target_agent),
+            selector: None,
             expected_generation: Some(generation),
             generation: Some(generation),
             expected_turn_id: None,
@@ -7060,6 +7067,7 @@ mod tests {
                 SubmitCommand {
                     id: Ulid::new().to_string(),
                     target: Some(agent_id),
+                    selector: None,
                     verb: "send".to_owned(),
                     args: json!({"text": "over depth bound"}),
                     expected_generation: Some(1),

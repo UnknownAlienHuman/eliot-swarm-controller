@@ -293,17 +293,92 @@ fn default_max_unread_messages_per_agent() -> i64 {
     core::api::DEFAULT_MAX_UNREAD_MESSAGES_PER_AGENT
 }
 
+/// Hierarchy fanout bounds consumed by launch/selector admission. See
+/// docs/spec/configuration.md: daemon limits. Unlike retention windows,
+/// these always apply: an unset value keeps its coordination-contract
+/// default.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LimitsConfig {
+    #[serde(default = "default_max_depth")]
+    pub(crate) max_depth: i64,
+    #[serde(default = "default_max_children_per_agent")]
+    pub(crate) max_children_per_agent: i64,
+    #[serde(default = "default_max_tree_agents")]
+    pub(crate) max_tree_agents: i64,
+    #[serde(default = "default_max_selector_targets")]
+    pub(crate) max_selector_targets: i64,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_depth: default_max_depth(),
+            max_children_per_agent: default_max_children_per_agent(),
+            max_tree_agents: default_max_tree_agents(),
+            max_selector_targets: default_max_selector_targets(),
+        }
+    }
+}
+
+impl LimitsConfig {
+    fn validate(self) -> core::Result<Self> {
+        for (name, value) in [
+            ("max_depth", self.max_depth),
+            ("max_children_per_agent", self.max_children_per_agent),
+            ("max_tree_agents", self.max_tree_agents),
+            ("max_selector_targets", self.max_selector_targets),
+        ] {
+            if value <= 0 {
+                return Err(core::Error::new(
+                    "profile_error",
+                    format!("config.toml: daemon.limits.{name} must be a positive integer"),
+                ));
+            }
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn limits(&self) -> core::api::HierarchyLimits {
+        core::api::HierarchyLimits {
+            max_depth: self.max_depth,
+            max_children_per_agent: self.max_children_per_agent,
+            max_tree_agents: self.max_tree_agents,
+            max_selector_targets: self.max_selector_targets,
+        }
+    }
+}
+
+fn default_max_depth() -> i64 {
+    core::api::DEFAULT_MAX_DEPTH
+}
+
+fn default_max_children_per_agent() -> i64 {
+    core::api::DEFAULT_MAX_CHILDREN_PER_AGENT
+}
+
+fn default_max_tree_agents() -> i64 {
+    core::api::DEFAULT_MAX_TREE_AGENTS
+}
+
+fn default_max_selector_targets() -> i64 {
+    core::api::DEFAULT_MAX_SELECTOR_TARGETS
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DaemonConfig {
     #[serde(default)]
     pub(crate) retention: RetentionConfig,
+    #[serde(default)]
+    pub(crate) limits: LimitsConfig,
 }
 
 impl DaemonConfig {
     fn validate(self) -> core::Result<Self> {
         Ok(Self {
             retention: self.retention.validate()?,
+            limits: self.limits.validate()?,
         })
     }
 }
@@ -354,6 +429,8 @@ struct ProfileEntry {
     permissions: Option<String>,
     #[serde(default)]
     approval_policy: Option<String>,
+    #[serde(default)]
+    control: Option<String>,
     #[serde(default)]
     pass_env: Option<Vec<String>>,
     #[serde(default)]
@@ -911,6 +988,7 @@ fn fake_profile_snapshot() -> Value {
         "harness": "fake",
         "permissions": PERMISSION_WORKSPACE_WRITE,
         "approval_policy": APPROVAL_POLICY_NEVER,
+        "control": "self",
         "pass_env": [],
         "scratch": default_scratch(),
     })
@@ -930,6 +1008,7 @@ fn snapshot_from_entry(
             || entry.collaboration_mode.is_some()
             || entry.permissions.is_some()
             || entry.approval_policy.is_some()
+            || entry.control.is_some()
             || entry.approval.is_some()
             || entry.pass_env.is_some()
             || !entry.setup.is_empty()
@@ -1032,6 +1111,7 @@ fn snapshot_from_entry(
             "profile_error",
         ));
     }
+    let control = validated_control(name, entry.control.as_deref(), source, table_offset)?;
     let pass_env = match entry.pass_env.as_deref() {
         Some(names) => validate_pass_env(name, names, source, table_offset)?,
         None => Vec::new(),
@@ -1083,6 +1163,7 @@ fn snapshot_from_entry(
         "approval_policy".to_owned(),
         Value::String(approval_policy.to_owned()),
     );
+    snapshot.insert("control".to_owned(), Value::String(control.to_owned()));
     snapshot.insert(
         "pass_env".to_owned(),
         Value::Array(pass_env.into_iter().map(Value::String).collect()),
@@ -1195,6 +1276,7 @@ fn muse_snapshot_from_entry(
             "unsupported",
         ));
     }
+    let control = validated_control(name, entry.control.as_deref(), source, table_offset)?;
     let pass_env = match entry.pass_env.as_deref() {
         Some(names) => validate_pass_env(name, names, source, table_offset)?,
         None => Vec::new(),
@@ -1255,6 +1337,7 @@ fn muse_snapshot_from_entry(
         "approval_policy".to_owned(),
         Value::String(APPROVAL_POLICY_NEVER.to_owned()),
     );
+    snapshot.insert("control".to_owned(), Value::String(control.to_owned()));
     snapshot.insert(
         "pass_env".to_owned(),
         Value::Array(pass_env.into_iter().map(Value::String).collect()),
@@ -1541,6 +1624,28 @@ fn validate_pass_env(
     }
     Ok(out)
 }
+/// Frozen command scope of Agents launched from this profile: `self`
+/// (default), `tree`, or `project`. Stored on the Agent row at launch.
+fn validated_control<'a>(
+    profile: &str,
+    control: Option<&'a str>,
+    source: &str,
+    offset: usize,
+) -> core::Result<&'a str> {
+    let control = control.map(str::trim).unwrap_or("self");
+    if !matches!(control, "self" | "tree" | "project") {
+        return Err(profile_field_error(
+            source,
+            offset,
+            profile,
+            "control",
+            "must be self, tree, or project",
+            "profile_error",
+        ));
+    }
+    Ok(control)
+}
+
 /// The Muse plugin stops its host by PID, so a script wrapper would leave the
 /// real `muse serve` running; Codex lives in an Agent Job that ends the tree.
 fn reject_script_wrapper(
@@ -1875,6 +1980,7 @@ mod tests {
                     commands_days: Some(14),
                     mail_days: Some(21),
                 },
+                limits: LimitsConfig::default(),
             }
         );
 
@@ -1887,7 +1993,93 @@ mod tests {
                     commands_days: None,
                     mail_days: None,
                 },
+                limits: LimitsConfig::default(),
             }
+        );
+    }
+
+    #[test]
+    fn daemon_limits_default_and_validate() {
+        let fixture = AutomationConfigFixture::new();
+        fixture.write("[daemon]\nretention.events_days = 7\n");
+        let config = load_daemon_config(&fixture.root).unwrap();
+        assert_eq!(config.limits, LimitsConfig::default());
+        assert_eq!(
+            config.limits.limits(),
+            core::api::HierarchyLimits {
+                max_depth: 8,
+                max_children_per_agent: 20,
+                max_tree_agents: 100,
+                max_selector_targets: 1000,
+            }
+        );
+        fixture.write(
+            "[daemon]\nlimits.max_depth = 4\nlimits.max_children_per_agent = 5\n\
+             limits.max_tree_agents = 40\nlimits.max_selector_targets = 50\n",
+        );
+        let config = load_daemon_config(&fixture.root).unwrap();
+        assert_eq!(
+            config.limits.limits(),
+            core::api::HierarchyLimits {
+                max_depth: 4,
+                max_children_per_agent: 5,
+                max_tree_agents: 40,
+                max_selector_targets: 50,
+            }
+        );
+        for source in [
+            "[daemon]\nlimits.max_depth = 0\n",
+            "[daemon]\nlimits.max_children_per_agent = -1\n",
+            "[daemon]\nlimits.max_tree_agents = 0\n",
+            "[daemon]\nlimits.max_selector_targets = 0\n",
+            "[daemon]\nlimits.max_depth = \"8\"\n",
+            "[daemon]\nlimits.unknown = 1\n",
+        ] {
+            fixture.write(source);
+            let error = load_daemon_config(&fixture.root).unwrap_err();
+            assert_eq!(error.code, "profile_error", "source: {source}");
+        }
+    }
+
+    #[test]
+    fn profile_control_freezes_and_validates() {
+        let fixture = AutomationConfigFixture::new();
+        fixture.write(
+            "[profiles.manager]\nharness = \"codex\"\nmodel = \"fixture-model\"\ncontrol = \"tree\"\n",
+        );
+        let snapshot = resolve_profile(&fixture.root, "manager").unwrap();
+        assert_eq!(
+            snapshot.get("control").and_then(Value::as_str),
+            Some("tree")
+        );
+        fixture.write("[profiles.solo]\nharness = \"codex\"\nmodel = \"fixture-model\"\n");
+        let snapshot = resolve_profile(&fixture.root, "solo").unwrap();
+        assert_eq!(
+            snapshot.get("control").and_then(Value::as_str),
+            Some("self")
+        );
+        fixture.write(
+            "[profiles.muse-manager]\nharness = \"muse\"\nmodel = \"fixture-model\"\ncontrol = \"project\"\n\
+             cmd = \"C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe\"\n",
+        );
+        let snapshot = resolve_profile(&fixture.root, "muse-manager").unwrap();
+        assert_eq!(
+            snapshot.get("control").and_then(Value::as_str),
+            Some("project")
+        );
+        fixture.write(
+            "[profiles.fleet]\nharness = \"codex\"\nmodel = \"fixture-model\"\ncontrol = \"fleet\"\n",
+        );
+        let error = resolve_profile(&fixture.root, "fleet").unwrap_err();
+        assert_eq!(error.code, "profile_error");
+        assert!(error.message.contains("control"), "{}", error.message);
+        fixture.write("[profiles.named-fake]\nharness = \"fake\"\ncontrol = \"tree\"\n");
+        let error = resolve_profile(&fixture.root, "named-fake").unwrap_err();
+        assert_eq!(error.code, "profile_error");
+        let snapshot = resolve_profile(&fixture.root, "fake").unwrap();
+        assert_eq!(
+            snapshot.get("control").and_then(Value::as_str),
+            Some("self")
         );
     }
 

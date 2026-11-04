@@ -1586,6 +1586,7 @@ mod tests {
                 SubmitCommand {
                     id: command_id.to_owned(),
                     target: Some(agent.to_owned()),
+                    selector: None,
                     verb: "send".to_owned(),
                     args: json!({"text": "retention second batch"}),
                     expected_generation: Some(1),
@@ -2098,6 +2099,7 @@ mod tests {
                 SubmitCommand {
                     id: command_id.to_owned(),
                     target: Some(agent.to_owned()),
+                    selector: None,
                     verb: "send".to_owned(),
                     args: json!({"text": "retention probe input"}),
                     expected_generation: Some(1),

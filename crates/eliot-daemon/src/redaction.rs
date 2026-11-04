@@ -139,6 +139,7 @@ mod tests {
                 eliot_core::SubmitCommand {
                     id: id.clone(),
                     target: None,
+                    selector: None,
                     verb: "launch".to_owned(),
                     args: json!({"project": "diagnostic-budget", "workspace": "synthetic-workspace"}),
                     expected_generation: Some(0),

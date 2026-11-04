@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 22;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 23;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -584,6 +584,27 @@ impl Store {
                 "CREATE INDEX messages_prune_acked ON messages(read_at, delivery_id)
                      WHERE read_at IS NOT NULL;
                  INSERT INTO schema_migrations(version) VALUES (22);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 23 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE agents ADD COLUMN parent INTEGER REFERENCES agents(id);
+                 ALTER TABLE agents ADD COLUMN root INTEGER REFERENCES agents(id);
+                 ALTER TABLE agents ADD COLUMN depth INTEGER NOT NULL DEFAULT 0
+                     CHECK(depth >= 0);
+                 ALTER TABLE agents ADD COLUMN control TEXT NOT NULL DEFAULT 'self'
+                     CHECK(control IN ('self', 'tree', 'project'));
+                 UPDATE agents SET root = id WHERE root IS NULL;
+                 ALTER TABLE commands ADD COLUMN selector TEXT;
+                 CREATE INDEX agents_parent ON agents(parent);
+                 CREATE INDEX agents_root ON agents(root);
+                 INSERT INTO schema_migrations(version) VALUES (23);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

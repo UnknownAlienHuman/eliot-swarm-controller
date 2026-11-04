@@ -243,12 +243,13 @@ process statistics nor model progress.
 
 `command.submit` uses `CommandSubmitRequest` (the Core `SubmitCommand` alias) and
 `CommandSubmitResponse` from the canonical mutation DTOs. `id` and `verb` are required;
-unknown fields and wrong types are `invalid`. Optional `target`, `expected_generation`,
-`expected_turn_id` and `request_id`
+unknown fields and wrong types are `invalid`. Optional `target`, `selector`,
+`expected_generation`, `expected_turn_id` and `request_id`
 may be omitted or `null` to mean absent. `args` defaults to `{}` only when omitted and
 must be a JSON object; explicit `null` or another type is `invalid`. Absent expectations
 remain absent. All six response members remain present, including nullable binding,
 outcome and linked-command values; `fanout` is not part of the current response. A
+selector parent reply carries no agent, generation, or linked command. A
 `verb:"run"` request is targetless: `target`, generation/turn/request bindings are absent
 or `null`, and `probe` is false. Its script inputs stay in `args` and follow the owning
 [automation contract](automation.md#frozen-script-inputs).
@@ -272,11 +273,15 @@ rebinds that caller ID. Store's read-only
 gates or native I/O; same-ID concurrent winner/error replay returns the retained command
 result without refreezing or fetching again.
 
-The current request does not accept `selector`; unknown request fields are `invalid`.
-The optional `probe` intent defaults to false; false is omitted on the wire, and true is
+The request accepts one tree selector instead of a target: `selector:"tree:<agent>"`
+with `send` or `stop`, no `target`, and no generation/turn/request/probe binding;
+anything else combining a selector is `invalid`, other verbs with a selector are
+`unsupported`, and unknown selector kinds are `unsupported`. The optional `probe`
+intent defaults to false; false is omitted on the wire, and true is
 valid only for `send`. It is control metadata, never native input text or arguments.
 `provider_held` is a pre-effect rejection (CLI exit 3); queued sends also recheck the
-hold at dispatch before native I/O.
+hold at dispatch before native I/O. Over-limit hierarchy admission reads `fanout_limit`
+(CLI exit 3) and persists nothing.
 
 The current `command.submit` request has no `wait_ms`, and the daemon does not expose an
 `agent.wait` method. CLI `--wait` follows command and turn readbacks with a bounded client
@@ -295,7 +300,7 @@ Worktree creation is opt-in on the same launch command:
 
 ```text
 command.submit {id, verb:"launch",
-  args:{profile, workspace, worktree?:BRANCH, base?:REF, text?}}
+  args:{profile, workspace, worktree?:BRANCH, base?:REF, parent?:AGENT, text?}}
 ```
 
 Without `worktree`, `workspace` remains the existing execution directory. With it,
@@ -306,6 +311,11 @@ unchanged and does not resolve refs, create directories or run Git. Same-ID retr
 the retained preparation and frozen base instead of resolving a moved ref or replaying
 uncertain work. Native launch waits for preparation ready in the exact target generation;
 the existing readiness/linked-input wait semantics above are unchanged.
+
+With `parent`, the launch creates a child of that Agent: an Agent principal launches
+only its own children (the Router defaults an absent parent to the caller), the child
+inherits the parent's project label and tree root, and the configured fanout limits
+are checked at admission (see [coordination](coordination.md#claims-and-hierarchy)).
 
 Removal uses the same command admission and readback path:
 
@@ -322,12 +332,14 @@ It reads the exact command to settlement with a bounded 30-second wait; timeout 
 not cancel or retry removal. Same-ID retries return the retained outcome even after
 the directory has gone.
 
-When selector support is added, a parent snapshots/sorts concrete ids and generations in
-a bounded transaction; children settle independently. Parent applied means expansion only.
-`command.children` pages that fixed set. Retain/prune parent sets transactionally so a
-caller never sees a partly pruned expansion; after removal return `history_gap`. Ordered
-rule actions reuse the same representation with a distinct link kind, not selector
-execution semantics.
+A tree selector snapshots its members once at admission: the parent snapshots/sorts
+concrete ids in one bounded transaction (bounded by `max_selector_targets`) and reads
+applied for the expansion itself; children settle independently with the ordinary
+per-target gates. Parent applied means expansion only. `command.children` pages that
+fixed set; a child created after admission is never part of it. Retain/prune parent
+sets transactionally so a caller never sees a partly pruned expansion; after removal
+return `history_gap`. Ordered rule actions reuse the same representation with a
+distinct link kind, not selector execution semantics.
 
 `command.children` is implemented for retained expansions through Core
 [`CommandChildrenRequest`/`CommandChildrenResponse`](../../crates/eliot-core/src/api/reads.rs).
@@ -717,7 +729,7 @@ The synopsis is target grammar; later-layer forms are not an inventory of curren
 swarm daemon [--foreground]
 swarm daemon stop [--drain|--force]
 swarm status
-swarm launch --profile P --workspace PATH [--worktree BRANCH [--base REF]] [PROMPT] [--wait]
+swarm launch --profile P --workspace PATH [--worktree BRANCH [--base REF]] [--parent AGENT] [PROMPT] [--wait]
 swarm worktree remove AGENT [--generation N]
 swarm ls | show A | watch [A|SELECTOR] | top
 swarm processes A [--scope agent|workspace] [--generation N] [--after CURSOR] [--limit N]
@@ -727,7 +739,7 @@ swarm edits A [--generation N] [--after PATH] [--limit N]
 swarm send A TEXT [--probe] [--wait] [--generation N]
 swarm steer|inject A TEXT [--generation N] [--turn ID]
 swarm interrupt|abort A [--generation N] [--turn ID]
-swarm stop A [--force] [--tree] [--generation N]
+swarm stop A [--force] [--tree | --generation N]
 swarm resume A [PROMPT] [--wait]
 swarm wait TARGET... [--for turn|idle|stopped|goal] [--after-command ID]
 swarm result A [--generation N] [--turns N]

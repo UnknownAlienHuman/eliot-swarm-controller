@@ -18,8 +18,21 @@ impl CommandSubmitRequest {
             }
             return Ok(());
         }
-        // Every currently admitted verb resolves a concrete Agent. Generation 0
-        // is valid before dispatch or after failed workspace preparation.
+        // A selector parent is targetless: no concrete Agent, no generation,
+        // no linked input. Its members read back via command.children.
+        if self.selector.is_some() {
+            if response.command_id != self.id
+                || response.agent.is_some()
+                || response.generation.is_some()
+                || response.linked_command.is_some()
+            {
+                return Err(binding_mismatch());
+            }
+            return Ok(());
+        }
+        // Every other currently admitted verb resolves a concrete Agent.
+        // Generation 0 is valid before dispatch or after failed workspace
+        // preparation.
         if response.command_id != self.id
             || response
                 .agent
@@ -104,6 +117,7 @@ mod tests {
         CommandSubmitRequest {
             id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
             target: target.map(str::to_owned),
+            selector: None,
             verb: verb.to_owned(),
             args: text.map_or_else(|| json!({}), |text| json!({"text":text})),
             expected_generation: None,
@@ -132,6 +146,41 @@ mod tests {
             "mutation response does not match the requested binding"
         );
         assert!(error.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn selector_response_is_targetless_without_a_linked_send() {
+        let mut request = request("stop", None, None);
+        request.selector = Some("tree:a1".to_owned());
+        let reply = CommandSubmitResponse {
+            command_id: request.id.clone(),
+            agent: None,
+            generation: None,
+            state: CommandState::Applied,
+            outcome: Some(json!({"children": [format!("{}/a1", request.id)]})),
+            linked_command: None,
+        };
+        request.validate_response(&reply).unwrap();
+        for bad in [
+            CommandSubmitResponse {
+                agent: Some("a1".to_owned()),
+                ..reply.clone()
+            },
+            CommandSubmitResponse {
+                generation: Some(1),
+                ..reply.clone()
+            },
+            CommandSubmitResponse {
+                linked_command: Some(format!("{}/send", request.id)),
+                ..reply.clone()
+            },
+            CommandSubmitResponse {
+                command_id: "other".to_owned(),
+                ..reply.clone()
+            },
+        ] {
+            assert_unknown(request.validate_response(&bad));
+        }
     }
 
     #[test]

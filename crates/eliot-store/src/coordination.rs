@@ -1149,6 +1149,7 @@ mod tests {
                 SubmitCommand {
                     id: launch_id.clone(),
                     target: None,
+                    selector: None,
                     verb: "launch".to_owned(),
                     args: json!({"project":project, "workspace":"synthetic-workspace"}),
                     expected_generation: Some(0),
@@ -1249,7 +1250,7 @@ mod tests {
             })
             .expect("read Store migration version");
         assert_eq!(version, super::super::schema::CURRENT_SCHEMA_VERSION);
-        assert_eq!(version, 22);
+        assert_eq!(version, 23);
         for table in ["messages", "vars", "mail_notices"] {
             let found: i64 = store
                 .connection

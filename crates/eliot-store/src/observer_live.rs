@@ -268,6 +268,7 @@ mod tests {
                 SubmitCommand {
                     id: id.clone(),
                     target: None,
+                    selector: None,
                     verb: "attach".to_owned(),
                     args: attach_args(),
                     expected_generation: None,
@@ -703,6 +704,7 @@ mod tests {
                 SubmitCommand {
                     id: detach.clone(),
                     target: Some(agent.clone()),
+                    selector: None,
                     verb: "detach".to_owned(),
                     args: json!({}),
                     expected_generation: Some(1),
@@ -741,6 +743,7 @@ mod tests {
                 SubmitCommand {
                     id: attach.clone(),
                     target: None,
+                    selector: None,
                     verb: "attach".to_owned(),
                     args: attach_args(),
                     expected_generation: None,

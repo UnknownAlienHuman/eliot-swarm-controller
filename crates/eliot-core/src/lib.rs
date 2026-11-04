@@ -296,6 +296,39 @@ pub enum AgentOrigin {
     External,
 }
 
+/// Frozen command scope of an Agent principal, from its profile `control`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentControl {
+    #[default]
+    #[serde(rename = "self")]
+    Slf,
+    Tree,
+    Project,
+}
+
+impl AgentControl {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Slf => "self",
+            Self::Tree => "tree",
+            Self::Project => "project",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "self" => Ok(Self::Slf),
+            "tree" => Ok(Self::Tree),
+            "project" => Ok(Self::Project),
+            _ => Err(Error::new(
+                "invalid",
+                "Agent control must be self, tree, or project",
+            )),
+        }
+    }
+}
+
 impl AgentState {
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Stopped | Self::Failed | Self::Lost)
@@ -321,6 +354,14 @@ pub struct Agent {
     pub observe_only: bool,
     #[serde(default)]
     pub own_identity: bool,
+    #[serde(default)]
+    pub parent: Option<String>,
+    #[serde(default)]
+    pub root: String,
+    #[serde(default)]
+    pub depth: i64,
+    #[serde(default)]
+    pub control: AgentControl,
     pub name: Option<String>,
     pub project: String,
     pub harness: String,
@@ -358,12 +399,17 @@ impl Agent {
         profile: impl Into<String>,
         now: i64,
     ) -> Self {
+        let id = id.into();
         Self {
-            id: id.into(),
+            root: id.clone(),
+            id,
             generation: 0,
             origin: AgentOrigin::Eliot,
             observe_only: false,
             own_identity: false,
+            parent: None,
+            depth: 0,
+            control: AgentControl::Slf,
             name: None,
             project: project.into(),
             harness: harness.into(),
@@ -441,6 +487,8 @@ pub struct Command {
     pub method: String,
     pub verb: String,
     pub target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
     pub expected_generation: Option<i64>,
     pub generation: Option<i64>,
     pub args: Value,
@@ -526,6 +574,8 @@ pub struct Turn {
 pub struct SubmitCommand {
     pub id: String,
     pub target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
     pub verb: String,
     #[serde(default = "empty_object")]
     pub args: Value,

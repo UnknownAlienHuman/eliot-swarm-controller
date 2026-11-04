@@ -332,11 +332,12 @@ pub(super) fn admit(
                 ));
             }
             db!(tx.execute(
-                "INSERT INTO agents(generation,project,harness,profile,profile_snapshot,native_scope,native_ref,state,origin,observe_only,created_at,updated_at)
-                 VALUES (0,?1,?2,?3,?4,?5,?6,'unknown','external',1,?7,?7)",
+                "INSERT INTO agents(generation,project,harness,profile,profile_snapshot,native_scope,native_ref,state,origin,observe_only,depth,control,created_at,updated_at)
+                 VALUES (0,?1,?2,?3,?4,?5,?6,'unknown','external',1,0,'self',?7,?7)",
                 params![project, harness, profile, encode_json(snapshot)?, scope, native_ref, now],
             ));
             let id = tx.last_insert_rowid();
+            db!(tx.execute("UPDATE agents SET root = ?1 WHERE id = ?1", [id],));
             events.push(insert_daemon_event(tx, now, "agent.created", "agent", Some(id), Some(0),
                 json!({"agent_id": format_agent_id(id), "origin": "external", "observe_only": true, "own_identity": false}))?);
             load_agent_by_num(tx, id)?

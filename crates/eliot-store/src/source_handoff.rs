@@ -751,7 +751,7 @@ mod tests {
             "synthetic-codex"
         };
         let admitted = store.submit("owner", SubmitCommand {
-            id: command_id.clone(), target: None, verb: "launch".to_owned(),
+            id: command_id.clone(), target: None, selector: None, verb: "launch".to_owned(),
             args: json!({"project":"synthetic-handoff", "harness":harness, "profile":profile,
                 "profile_snapshot":{}, "workspace":"synthetic-handoff-workspace"}),
             expected_generation: Some(0), expected_turn_id: None, request_id: None, probe: false,
@@ -818,6 +818,7 @@ mod tests {
                 SubmitCommand {
                     id: id.clone(),
                     target: Some(agent.to_owned()),
+                    selector: None,
                     verb: "send".to_owned(),
                     args: json!({"text":"synthetic"}),
                     expected_generation: Some(1),
@@ -1537,6 +1538,7 @@ mod tests {
                 SubmitCommand {
                     id: resume_id.clone(),
                     target: Some(agent.clone()),
+                    selector: None,
                     verb: "resume".to_owned(),
                     args: json!({}),
                     expected_generation: Some(1),

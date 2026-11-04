@@ -1019,6 +1019,7 @@ impl Store {
                 let request = SubmitCommand {
                     id: continuation.id.clone(),
                     target: Some(commit.agent.clone()),
+                    selector: None,
                     verb: "send".to_owned(),
                     args: json!({"text": continuation.text}),
                     expected_generation: Some(row.generation),
@@ -1026,7 +1027,8 @@ impl Store {
                     request_id: None,
                     probe: false,
                 };
-                let send = admission::submit_tx(&tx, "owner", request, None, now, false)?;
+                let limits = self.hierarchy_limits;
+                let send = admission::submit_tx(&tx, "owner", request, None, now, false, limits)?;
                 let outcome = GoalCommitOutcome::Continued {
                     command_id: send.command.id.clone(),
                 };

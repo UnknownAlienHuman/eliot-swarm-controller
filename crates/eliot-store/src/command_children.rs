@@ -14,12 +14,12 @@ use super::*;
 const LIST_COMMAND_CHILDREN_FIRST_SQL: &str =
     "SELECT id, principal, method, target, expected_generation,
             generation, expected_turn_id, turn_id, request_id, verb, args,
-            state, outcome, created_at, updated_at, probe
+            state, outcome, created_at, updated_at, probe, selector
      FROM commands WHERE parent_command = ?1 ORDER BY ordinal LIMIT ?2";
 const LIST_COMMAND_CHILDREN_CURSOR_SQL: &str =
     "SELECT id, principal, method, target, expected_generation,
             generation, expected_turn_id, turn_id, request_id, verb, args,
-            state, outcome, created_at, updated_at, probe
+            state, outcome, created_at, updated_at, probe, selector
      FROM commands WHERE parent_command = ?1 AND ordinal > ?2
      ORDER BY ordinal LIMIT ?3";
 

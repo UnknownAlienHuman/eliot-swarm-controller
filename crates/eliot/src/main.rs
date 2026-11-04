@@ -151,6 +151,9 @@ enum CliCommand {
         worktree: Option<String>,
         #[arg(long, value_name = "REF", requires = "worktree")]
         base: Option<String>,
+        /// Launch as a child of this Agent; the child inherits its project.
+        #[arg(long, value_name = "AGENT")]
+        parent: Option<String>,
         #[arg(value_name = "PROMPT")]
         prompt: Option<String>,
         #[arg(long)]
@@ -328,6 +331,9 @@ enum CliCommand {
         agent: String,
         #[arg(long)]
         force: bool,
+        /// Stop the Agent's whole subtree instead of just the Agent.
+        #[arg(long, conflicts_with = "generation")]
+        tree: bool,
         #[command(flatten)]
         generation: GenerationArgs,
     },
@@ -698,6 +704,7 @@ impl Failure {
                 | "frame_too_large"
                 | "secret_in_payload"
                 | "mailbox_full"
+                | "fanout_limit"
                 | "version_conflict"
                 | "id_conflict"
                 | "id_expired"
@@ -1219,6 +1226,7 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             workspace,
             worktree,
             base,
+            parent,
             prompt,
             wait,
             timeout_seconds,
@@ -1237,6 +1245,9 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             }
             if let Some(base) = base {
                 args["base"] = Value::String(base);
+            }
+            if let Some(parent) = parent {
+                args["parent"] = Value::String(parent);
             }
             if let Some(prompt) = &prompt {
                 args["text"] = Value::String(prompt.clone());
@@ -1529,10 +1540,15 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
         CliCommand::Stop {
             agent,
             force,
+            tree,
             generation: GenerationArgs { generation },
         } => {
             let mut params = submit_request(id, Some(agent), "stop", json!({ "force": force }))?;
-            params.expected_generation = generation;
+            if tree {
+                params.selector = params.target.take().map(|agent| format!("tree:{agent}"));
+            } else {
+                params.expected_generation = generation;
+            }
             submit_and_print(&data_dir, &params, json_output).await
         }
         CliCommand::Worktree { command } => match command {

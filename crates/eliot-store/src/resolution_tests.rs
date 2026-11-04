@@ -32,6 +32,7 @@ fn ready_agent(store: &mut Store, project: &str, now: i64) -> String {
             SubmitCommand {
                 id: launch_id.clone(),
                 target: None,
+                selector: None,
                 verb: "launch".to_owned(),
                 args: json!({"project":project, "workspace":"synthetic-workspace"}),
                 expected_generation: Some(0),
@@ -432,6 +433,7 @@ fn resolve_unknown_launch_leaves_agent_and_capacity_untouched() {
             SubmitCommand {
                 id: launch_id.clone(),
                 target: None,
+                selector: None,
                 verb: "launch".to_owned(),
                 args: json!({"project":"resolve-launch", "workspace":"synthetic-workspace"}),
                 expected_generation: Some(0),
@@ -1317,6 +1319,7 @@ fn attach_request() -> SubmitCommand {
     SubmitCommand {
         id: Ulid::new().to_string(),
         target: None,
+        selector: None,
         verb: "attach".to_owned(),
         args: json!({"mode":"observe","profile":"fake","harness":"fake",
             "native_scope":"fixture:scope","native_ref":"fixture-native",
@@ -1616,6 +1619,7 @@ fn resolve_command_allows_launch_and_resume_only_as_failed() {
             SubmitCommand {
                 id: launch_id.clone(),
                 target: None,
+                selector: None,
                 verb: "launch".to_owned(),
                 args: json!({"project":"resolve-start-rule", "workspace":"synthetic-workspace"}),
                 expected_generation: Some(0),

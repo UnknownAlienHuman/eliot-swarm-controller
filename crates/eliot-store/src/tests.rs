@@ -30,6 +30,7 @@ fn ready_agent(store: &mut Store, project: &str, now: i64) -> String {
             SubmitCommand {
                 id: launch_id.clone(),
                 target: None,
+                selector: None,
                 verb: "launch".to_owned(),
                 args: json!({"project":project, "workspace":"synthetic-workspace"}),
                 expected_generation: Some(0),
@@ -116,6 +117,7 @@ fn ready_managed_codex_agent(
             SubmitCommand {
                 id: start_id.clone(),
                 target: None,
+                selector: None,
                 verb: "launch".to_owned(),
                 args: json!({
                     "project": checkout,
@@ -528,6 +530,7 @@ fn project_command_binding_is_captured_and_revalidated_before_dispatch() {
             SubmitCommand {
                 id: stop_id.clone(),
                 target: Some(agent.clone()),
+                selector: None,
                 verb: "stop".to_owned(),
                 args: json!({}),
                 expected_generation: Some(1),
@@ -617,6 +620,7 @@ fn project_stop_rejects_setup_ready_next_generation() {
             SubmitCommand {
                 id: start_id.clone(),
                 target: None,
+                selector: None,
                 verb: "launch".to_owned(),
                 args: json!({
                     "project": checkout,
@@ -685,6 +689,7 @@ fn project_stop_rejects_setup_ready_next_generation() {
             SubmitCommand {
                 id: stop_id.clone(),
                 target: Some(agent),
+                selector: None,
                 verb: "stop".to_owned(),
                 args: json!({}),
                 expected_generation: Some(0),
@@ -739,6 +744,7 @@ fn project_stop_cannot_cancel_a_new_workspace_generation_after_dispatch_admissio
             SubmitCommand {
                 id: launch_id.clone(),
                 target: None,
+                selector: None,
                 verb: "launch".to_owned(),
                 args: json!({
                     "project": checkout,
@@ -847,6 +853,7 @@ fn project_stop_cannot_cancel_a_new_workspace_generation_after_dispatch_admissio
             SubmitCommand {
                 id: stop_id.clone(),
                 target: Some(agent.clone()),
+                selector: None,
                 verb: "stop".to_owned(),
                 args: json!({}),
                 expected_generation: Some(1),
@@ -877,6 +884,7 @@ fn project_stop_cannot_cancel_a_new_workspace_generation_after_dispatch_admissio
             SubmitCommand {
                 id: resume_id.clone(),
                 target: Some(agent.clone()),
+                selector: None,
                 verb: "resume".to_owned(),
                 args: json!({}),
                 expected_generation: Some(1),
@@ -974,6 +982,7 @@ fn project_approved_send_uses_existing_store_admission_and_dispatch() {
             SubmitCommand {
                 id: send_id.clone(),
                 target: Some(agent),
+                selector: None,
                 verb: "send".to_owned(),
                 args: json!({"text":"project-scoped-send"}),
                 expected_generation: Some(1),
@@ -1976,6 +1985,7 @@ fn project_send_requires_the_approved_action_and_rejects_unknown_registration_ac
             SubmitCommand {
                 id: send_id.clone(),
                 target: Some(agent),
+                selector: None,
                 verb: "send".to_owned(),
                 args: json!({"text":"denied-project-send"}),
                 expected_generation: Some(1),
@@ -2492,6 +2502,7 @@ fn project_run_registration_roundtrips_and_rechecks_targetless_approval() {
         method: "command.submit",
         payload_digest: &payload_digest,
         target: None,
+        selector: None,
         expected_generation: None,
         generation: None,
         expected_turn_id: None,
@@ -2798,6 +2809,7 @@ fn session_end_keeps_dispatched_stop_pending_until_exact_reply() {
             SubmitCommand {
                 id: stop_id.clone(),
                 target: Some(agent.clone()),
+                selector: None,
                 verb: "stop".to_owned(),
                 args: json!({}),
                 expected_generation: Some(1),
@@ -3016,6 +3028,7 @@ fn generic_generation_loss_keeps_dispatched_stop_unknown() {
             SubmitCommand {
                 id: stop_id.clone(),
                 target: Some(agent.clone()),
+                selector: None,
                 verb: "stop".to_owned(),
                 args: json!({}),
                 expected_generation: Some(1),
@@ -3070,7 +3083,7 @@ fn workspace_exceptions_stay_marker_bound_across_unknown_readback() {
         frozen_setup: Vec::new(),
     };
     let start = store.submit_with_workspace("owner", SubmitCommand {
-        id: start_id.clone(), target: None, verb: "launch".to_owned(),
+        id: start_id.clone(), target: None, selector: None, verb: "launch".to_owned(),
         args: json!({"project":input.project,"workspace":input.repo_path,"worktree":input.requested_branch,
             "harness":"fake","profile":"fake",
             "profile_snapshot":{"capacity_scopes":[{"scope":"profile:fake","max_live":1}]}}),
@@ -3166,6 +3179,7 @@ fn workspace_exceptions_stay_marker_bound_across_unknown_readback() {
             SubmitCommand {
                 id: stop_id.clone(),
                 target: Some(agent.clone()),
+                selector: None,
                 verb: "stop".to_owned(),
                 args: json!({}),
                 expected_generation: Some(0),
@@ -3252,6 +3266,7 @@ fn send_association_emits_applied_once_with_native_batch_ack() {
             SubmitCommand {
                 id: launch_id.clone(),
                 target: None,
+                selector: None,
                 verb: "launch".to_owned(),
                 args: json!({"project":"send-event", "workspace":"synthetic-workspace"}),
                 expected_generation: Some(0),
@@ -3292,6 +3307,7 @@ fn send_association_emits_applied_once_with_native_batch_ack() {
             SubmitCommand {
                 id: send_id.clone(),
                 target: Some(agent.clone()),
+                selector: None,
                 verb: "send".to_owned(),
                 args: json!({"text":"hello"}),
                 expected_generation: Some(1),
@@ -3419,6 +3435,7 @@ fn secret_question_answer_is_rejected_before_command_persistence() {
             SubmitCommand {
                 id: launch_id.clone(),
                 target: None,
+                selector: None,
                 verb: "launch".to_owned(),
                 args: json!({
                     "project": "secret-answer-regression",
@@ -3479,6 +3496,7 @@ fn secret_question_answer_is_rejected_before_command_persistence() {
             SubmitCommand {
                 id: send_id.clone(),
                 target: Some(agent_id.clone()),
+                selector: None,
                 verb: "send".to_owned(),
                 args: json!({"text": "trigger synthetic request"}),
                 expected_generation: Some(1),
@@ -3563,6 +3581,7 @@ fn secret_question_answer_is_rejected_before_command_persistence() {
             SubmitCommand {
                 id: answer_id.clone(),
                 target: Some(agent_id.clone()),
+                selector: None,
                 verb: "answer".to_owned(),
                 args: json!({"answers":{"q1":{"answers":[marker]}}}),
                 expected_generation: None,
@@ -4563,6 +4582,7 @@ fn native_request_cleanup_does_not_acknowledge_reply() {
     let command = |verb: &str, target, args, request_id| SubmitCommand {
         id: Ulid::new().to_string(),
         target,
+        selector: None,
         verb: verb.to_owned(),
         args,
         expected_generation: None,
@@ -4816,6 +4836,7 @@ fn provider_send_request(agent: &str, id: &str, probe: bool) -> SubmitCommand {
     SubmitCommand {
         id: id.to_owned(),
         target: Some(agent.to_owned()),
+        selector: None,
         verb: "send".to_owned(),
         args: json!({"text":"synthetic provider hold input"}),
         expected_generation: Some(1),
@@ -6210,7 +6231,12 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
     store
         .connection
         .execute_batch(
-            "DROP TABLE store_identity; DELETE FROM schema_migrations WHERE version = 17;
+            "DROP INDEX agents_parent; DROP INDEX agents_root;
+             ALTER TABLE agents DROP COLUMN parent; ALTER TABLE agents DROP COLUMN root;
+             ALTER TABLE agents DROP COLUMN depth; ALTER TABLE agents DROP COLUMN control;
+             ALTER TABLE commands DROP COLUMN selector;
+             DELETE FROM schema_migrations WHERE version = 23;
+             DROP TABLE store_identity; DELETE FROM schema_migrations WHERE version = 17;
              DROP INDEX commands_unsettled_created;
              DROP INDEX processes_owner_identity;
              CREATE INDEX commands_open ON commands(state)
@@ -6226,7 +6252,7 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
         )
         .expect("roll back to schema 16");
     drop(store);
-    let mut store = Store::open(&path).expect("migrate 16 to 22");
+    let mut store = Store::open(&path).expect("migrate 16 to 23");
     store.recover_on_restart(now + 2).expect("recover");
     let retained = store
         .restart_retained_generations(None)
@@ -7879,6 +7905,7 @@ fn stop_and_source_closure_alone_do_not_release_capacity_or_fail_host_settlement
             SubmitCommand {
                 id: stop_id.clone(),
                 target: Some(agent.clone()),
+                selector: None,
                 verb: "stop".to_owned(),
                 args: json!({}),
                 expected_generation: Some(1),
@@ -8048,8 +8075,16 @@ fn typed_command_cause_updates_persisted_and_returned_event_without_legacy_backf
         .connection
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .unwrap();
-    let mut admission =
-        super::admission::submit_tx(&tx, "owner", request.clone(), None, now + 1, false).unwrap();
+    let mut admission = super::admission::submit_tx(
+        &tx,
+        "owner",
+        request.clone(),
+        None,
+        now + 1,
+        false,
+        eliot_core::api::HierarchyLimits::default(),
+    )
+    .unwrap();
     let event_index = admission
         .events
         .iter()

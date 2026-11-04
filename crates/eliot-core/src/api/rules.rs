@@ -208,6 +208,7 @@ mod tests {
             method: "rule.catch_up".to_owned(),
             verb: "rule.catch_up".to_owned(),
             target: None,
+            selector: None,
             expected_generation: None,
             generation: None,
             args: json!({

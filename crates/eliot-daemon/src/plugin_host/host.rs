@@ -2687,6 +2687,7 @@ mod tests {
             method: "command.submit".to_owned(),
             verb: "resume".to_owned(),
             target: Some("a7".to_owned()),
+            selector: None,
             expected_generation: None,
             generation: Some(3),
             args: json!({}),
@@ -3064,6 +3065,7 @@ mod tests {
                 SubmitCommand {
                     id: command_id.clone(),
                     target: None,
+                    selector: None,
                     verb: "launch".to_owned(),
                     args: json!({"project":"payload-guard", "workspace":"synthetic-workspace"}),
                     expected_generation: Some(0),
@@ -3196,6 +3198,7 @@ mod tests {
                 SubmitCommand {
                     id: command_id.clone(),
                     target: None,
+                    selector: None,
                     verb: "launch".to_owned(),
                     args: json!({"project":"handoff-boundary", "workspace":"synthetic-workspace"}),
                     expected_generation: Some(0),
@@ -3432,6 +3435,7 @@ mod tests {
                     SubmitCommand {
                         id: send_id.clone(),
                         target: Some(agent_id.clone()),
+                        selector: None,
                         verb: "send".to_owned(),
                         args: json!({"text":"successor fact"}),
                         expected_generation: Some(1),
@@ -3527,6 +3531,7 @@ mod tests {
                 SubmitCommand {
                     id: id.clone(),
                     target: None,
+                    selector: None,
                     verb: "attach".to_owned(),
                     args: json!({"profile":"observer-fixture", "harness":"fake", "mode":"observe",
                 "native_scope":"fixture-scope", "native_ref":"fixture-ref", "profile_snapshot":{}}),
@@ -3573,6 +3578,7 @@ mod tests {
                 SubmitCommand {
                     id: attach_id.clone(),
                     target: None,
+                    selector: None,
                     verb: "attach".to_owned(),
                     args: json!({"profile":"observer-fixture", "harness":"codex", "mode":"observe",
                 "native_scope":"fixture-scope", "native_ref":"fixture-ref", "profile_snapshot":{}}),
@@ -3870,6 +3876,7 @@ mod tests {
                 SubmitCommand {
                     id: start_id.clone(),
                     target: None,
+                    selector: None,
                     verb: "launch".to_owned(),
                     args: json!({"project":"source-exit", "workspace":"synthetic-workspace",
                 "harness":harness, "profile":profile, "profile_snapshot":{}}),
@@ -4070,6 +4077,7 @@ mod tests {
                     SubmitCommand {
                         id: resume_id.clone(),
                         target: Some(key.id.clone()),
+                        selector: None,
                         verb: "resume".to_owned(),
                         args: json!({}),
                         expected_generation: Some(1),
@@ -4197,6 +4205,7 @@ mod tests {
                     SubmitCommand {
                         id: id.clone(),
                         target: Some(key.id.clone()),
+                        selector: None,
                         verb: "stop".to_owned(),
                         args: json!({}),
                         expected_generation: Some(1),
@@ -4323,6 +4332,7 @@ mod tests {
             method: "command.submit".to_owned(),
             verb: "launch".to_owned(),
             target: Some(agent_id.to_owned()),
+            selector: None,
             expected_generation: None,
             generation: Some(generation),
             args: json!({}),
@@ -4354,6 +4364,7 @@ mod tests {
                 SubmitCommand {
                     id: Ulid::new().to_string(),
                     target: None,
+                    selector: None,
                     verb: "launch".to_owned(),
                     args: json!({"project": project, "workspace": workspace}),
                     expected_generation: Some(0),

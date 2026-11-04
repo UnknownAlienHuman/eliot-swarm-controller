@@ -1184,6 +1184,7 @@ fn submit_command(
     SubmitCommand {
         id: String::new(),
         target: Some(target),
+        selector: None,
         verb: verb.to_owned(),
         args,
         expected_generation: Some(generation),

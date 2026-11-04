@@ -916,6 +916,7 @@ impl WorkspaceManager {
                 let request = SubmitCommand {
                     id: id.clone(),
                     target: Some(agent.id),
+                    selector: None,
                     verb: "stop".to_owned(),
                     args: json!({"force": true}),
                     expected_generation: Some(agent.generation),
@@ -1609,6 +1610,7 @@ mod tests {
         let request = SubmitCommand {
             id: id.clone(),
             target: None,
+            selector: None,
             verb: "launch".to_owned(),
             args: json!({
                 "project": frozen.repo_path.clone(),
