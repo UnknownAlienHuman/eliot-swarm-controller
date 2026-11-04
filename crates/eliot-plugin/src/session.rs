@@ -189,7 +189,7 @@ fn join_families(families: &[&str]) -> String {
         [first, second] => format!("{first} and {second}"),
         _ => {
             let (last, rest) = families.split_last().expect("non-empty families");
-            format!("{} and {last}", rest.join(", "))
+            format!("{}, and {last}", rest.join(", "))
         }
     }
 }
@@ -514,6 +514,50 @@ impl StreamSource<'_> {
                     format!("{} source gap acknowledgement is unknown", self.harness),
                 ))
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_source_plan;
+    use serde_json::json;
+
+    /// The shared source-plan check spells every harness message exactly as
+    /// the per-plugin copies did (pure move, incl. the Codex shape its
+    /// follow-up conversion will use).
+    #[test]
+    fn source_plan_messages_match_the_per_harness_originals() {
+        for (harness, families, joined) in [
+            (
+                "OpenCode",
+                &["session", "turn", "message"][..],
+                "session, turn, and message",
+            ),
+            (
+                "Muse",
+                &["session", "turn", "message", "request"][..],
+                "session, turn, message, and request",
+            ),
+            (
+                "Codex",
+                &["session", "turn", "message", "tool", "request"][..],
+                "session, turn, message, tool, and request",
+            ),
+        ] {
+            let error = validate_source_plan(harness, families, None).expect_err("missing plan");
+            assert_eq!(error.code, "unsupported");
+            assert_eq!(
+                error.message,
+                format!("{harness} start requires an installed stream source plan")
+            );
+            let error = validate_source_plan(harness, families, Some(&json!({})))
+                .expect_err("unowned families");
+            assert_eq!(error.code, "unsupported");
+            assert_eq!(
+                error.message,
+                format!("{harness} start requires stream ownership for {joined}")
+            );
         }
     }
 }

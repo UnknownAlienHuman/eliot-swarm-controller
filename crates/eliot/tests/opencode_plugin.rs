@@ -1126,7 +1126,9 @@ impl Host {
             }
         };
         let outcome = outcome
-            .expect("host call deadline")
+            .unwrap_or_else(|_| {
+                panic!("host call deadline during {method}: no response or inbound for {timeout:?}")
+            })
             .expect("host response channel");
         match quiesce {
             Quiesce::UntilKind(kind) => {
