@@ -97,6 +97,9 @@ enum Control {
     Close {
         reply: oneshot::Sender<()>,
     },
+    SnapshotStatus {
+        reply: oneshot::Sender<EventStatus>,
+    },
 }
 
 #[derive(Clone)]
@@ -261,6 +264,26 @@ impl EventHandle {
         }
     }
 
+    /// The event task's CURRENT status, read synchronously through the
+    /// control queue: a snapshot racing the close publish must observe
+    /// post-commit state, not the last published watch value (which can
+    /// still show the active turn after the caller already observed
+    /// turn.completed).
+    pub async fn current_status(&self) -> Result<EventStatus> {
+        let (reply, response) = oneshot::channel();
+        timeout_at(
+            Instant::now() + EVENT_DEADLINE,
+            self.control.send(Control::SnapshotStatus { reply }),
+        )
+        .await
+        .map_err(|_| Error::new("unknown", "OpenCode event-control queue deadline elapsed"))?
+        .map_err(|_| Error::new("unknown", "OpenCode event processor stopped"))?;
+        timeout_at(Instant::now() + EVENT_DEADLINE, response)
+            .await
+            .map_err(|_| Error::new("unknown", "OpenCode event-control outcome is unknown"))?
+            .map_err(|_| Error::new("unknown", "OpenCode event-control response was lost"))
+    }
+
     async fn send(&self, build: impl FnOnce(oneshot::Sender<Result<()>>) -> Control) -> Result<()> {
         let (reply, response) = oneshot::channel();
         timeout_at(
@@ -366,6 +389,10 @@ impl EventProcessor {
                 }
                 let _ = reply.send(());
                 false
+            }
+            Control::SnapshotStatus { reply } => {
+                let _ = reply.send(self.status.clone());
+                true
             }
         }
     }
@@ -1172,7 +1199,7 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::{EventHandle, EventStatus, TurnFacts};
+    use super::{Control, EventConfig, EventHandle, EventProcessor, EventStatus, TurnFacts};
     use tokio::time::Instant;
 
     fn handle_with(status: EventStatus) -> EventHandle {
@@ -1182,6 +1209,46 @@ mod tests {
             control,
             status: watcher,
         }
+    }
+
+    /// The snapshot status read observes CURRENT processor state through
+    /// the control queue — never a stale published watch value.
+    #[tokio::test]
+    async fn snapshot_status_reads_current_processor_state() {
+        let http = crate::native::client::OpenCodeHttp::new(1, "pw".to_owned()).expect("client");
+        let peer = eliot_plugin::Peer::stdio();
+        let mut processor = EventProcessor::new(
+            http,
+            peer.client(),
+            EventConfig {
+                credential: "cred".to_owned(),
+                agent_id: "agent".to_owned(),
+                generation: 1,
+                secrets: Vec::new(),
+            },
+        );
+        processor.status.active_turn_id = Some("turn-1".to_owned());
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(1);
+        let (reply, response) = tokio::sync::oneshot::channel();
+        control_tx
+            .send(Control::SnapshotStatus { reply })
+            .await
+            .expect("control queue");
+        let control = control_rx.recv().await.expect("control");
+        assert!(processor.handle_control(control).await);
+        let status = response.await.expect("status reply");
+        assert_eq!(status.active_turn_id.as_deref(), Some("turn-1"));
+    }
+
+    /// A dead event task surfaces unknown, never a stale read.
+    #[tokio::test]
+    async fn current_status_reports_a_stopped_processor() {
+        let handle = handle_with(EventStatus::default());
+        let error = handle
+            .current_status()
+            .await
+            .expect_err("stopped processor");
+        assert_eq!(error.code, "unknown");
     }
 
     /// When the terminal flushes synchronously inside `AssociateInbox`, open

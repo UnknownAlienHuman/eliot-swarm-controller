@@ -886,8 +886,12 @@ impl OpenCodePlugin {
             params.generation,
             "OpenCode",
         )?;
-        let mut event_status = session.events.status();
-        settle_completed_turn(&mut event_status, &params.command_id);
+        let event_status = match session.events.current_status().await {
+            Ok(status) => status,
+            Err(_) => {
+                return unknown_snapshot(&params, "OpenCode event status is unavailable");
+            }
+        };
         if let Some(receipt) = Self::snapshot_stop_receipt(session, &params, &event_status) {
             return Ok(receipt);
         }
@@ -1273,23 +1277,6 @@ async fn discard_failed_start(session: &mut AgentSession, error: Error) -> Error
     session.server.diagnostic_error(error)
 }
 
-/// Clear a stale active turn once its command's terminal facts are
-/// retained: the active flag clears right after the turn.completed commit
-/// the caller already observed, but the close publish can still be in
-/// flight when a snapshot reads the status. The retained terminal turn
-/// proves no live turn exists for the command, so the snapshot observes
-/// idle instead of a stale busy.
-fn settle_completed_turn(status: &mut EventStatus, command_id: &str) {
-    if status
-        .last_turn
-        .as_ref()
-        .is_some_and(|turn| turn.command_id == command_id && turn.terminal)
-    {
-        status.active_turn_id = None;
-        status.active_command_id = None;
-    }
-}
-
 /// Installed model-id syntax is `providerID/id`, slashes included.
 fn split_model(model: &str) -> Option<ModelRef> {
     let (provider_id, id) = model.split_once('/')?;
@@ -1346,10 +1333,7 @@ fn opencode_manifest() -> PluginManifest {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        EventStatus, TurnFacts, opencode_manifest, opencode_scope, settle_completed_turn,
-        split_model,
-    };
+    use super::{opencode_manifest, opencode_scope, split_model};
     use eliot_plugin::session::validate_source_plan;
     use serde_json::json;
     use std::path::PathBuf;
@@ -1409,43 +1393,6 @@ mod tests {
         for bad in ["", "noprovider", "/noid", "provider/", "a/b/c", "/"] {
             assert!(split_model(bad).is_none(), "{bad:?}");
         }
-    }
-
-    #[test]
-    fn snapshot_settles_a_completed_turn_despite_a_stale_active_flag() {
-        let completed = || EventStatus {
-            active_command_id: Some("cmd-1".to_owned()),
-            active_turn_id: Some("turn-1".to_owned()),
-            last_turn: Some(TurnFacts {
-                command_id: "cmd-1".to_owned(),
-                turn_id: "turn-1".to_owned(),
-                status: Some("completed".to_owned()),
-                final_text: None,
-                terminal: true,
-            }),
-            ..EventStatus::default()
-        };
-        let mut settled = completed();
-        settle_completed_turn(&mut settled, "cmd-1");
-        assert!(settled.active_turn_id.is_none());
-        assert!(settled.active_command_id.is_none());
-        // Another command's retained turn, or a non-terminal stop snapshot,
-        // keeps the active flag: only our own terminal turn settles it.
-        let mut foreign = completed();
-        settle_completed_turn(&mut foreign, "cmd-2");
-        assert!(foreign.active_turn_id.is_some());
-        let mut open = EventStatus {
-            last_turn: Some(TurnFacts {
-                command_id: "cmd-1".to_owned(),
-                turn_id: "turn-1".to_owned(),
-                status: None,
-                final_text: None,
-                terminal: false,
-            }),
-            ..completed()
-        };
-        settle_completed_turn(&mut open, "cmd-1");
-        assert!(open.active_turn_id.is_some());
     }
 
     #[test]
