@@ -1,10 +1,10 @@
 use eliot_core::{Error, ProviderRestriction, Result, SecretPolicy};
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
-    protocol::MAX_COMMAND_ID_BYTES,
     session::{
         EVENT_DEADLINE, StreamSource, attach_final_text, attach_native_error,
-        event_id as shared_event_id, native_no_write,
+        event_id as shared_event_id, native_no_write, rejected_control, request_event_id,
+        unknown_control,
     },
 };
 use serde::Serialize;
@@ -841,7 +841,7 @@ impl EventProcessor {
             self.defer_gap("Muse normalized request exceeded the persisted-event bound");
             return Ok(());
         }
-        let native_id = match request_event_id(&request_id, "request.opened") {
+        let native_id = match request_event_id(&request_id, "request.opened", "muse", "Muse") {
             Ok(native_id) => native_id,
             Err(_) => {
                 self.defer_gap("Muse native request event identity exceeded its bound");
@@ -1118,7 +1118,7 @@ impl EventProcessor {
             self.defer_gap("Muse pulled request exceeded the persisted-event bound");
             return Ok(());
         }
-        let native_id = match request_event_id(&entry.id, "request.opened") {
+        let native_id = match request_event_id(&entry.id, "request.opened", "muse", "Muse") {
             Ok(native_id) => native_id,
             Err(_) => {
                 self.defer_gap("Muse native request event identity exceeded its bound");
@@ -1532,7 +1532,7 @@ impl EventProcessor {
                 }),
             ),
         };
-        let commit_id = request_event_id(&request_id, kind)?;
+        let commit_id = request_event_id(&request_id, kind, "muse", "Muse")?;
         self.commit_event(kind, commit_id, data).await?;
         self.pending_requests.remove(&request_id);
         self.native_index.remove(native_id);
@@ -1653,7 +1653,7 @@ impl EventProcessor {
                 }),
             ),
         };
-        let commit_id = request_event_id(&request_id, kind)?;
+        let commit_id = request_event_id(&request_id, kind, "muse", "Muse")?;
         self.commit_event(kind, commit_id, data).await?;
         self.pending_requests.remove(&request_id);
         self.native_index.remove(native_id);
@@ -1874,36 +1874,6 @@ fn pending_native_id(request: &CorePending) -> Option<&str> {
     }
 }
 
-fn request_event_id(request_id: &str, kind: &str) -> Result<String> {
-    let prefix = match kind {
-        "request.opened" => "muse-o:",
-        "request.resolved" => "muse-r:",
-        "request.closed" => "muse-c:",
-        _ => {
-            return Err(Error::new(
-                "invalid",
-                "Muse request event kind is unsupported",
-            ));
-        }
-    };
-    let native_id = format!("{prefix}{request_id}");
-    if native_id.len() > MAX_COMMAND_ID_BYTES || request_id.trim().is_empty() {
-        return Err(Error::new(
-            "source_integrity",
-            "Muse native request event identity exceeded its bound",
-        ));
-    }
-    Ok(native_id)
-}
-
-pub(crate) fn rejected_control(reason: &str) -> Value {
-    json!({"state": "rejected", "reason": reason})
-}
-
-pub(crate) fn unknown_control(reason: &str) -> Value {
-    json!({"state": "unknown", "reason": reason})
-}
-
 /// Map the MSP terminal to the stored turn status. `cancelled` folds to
 /// `interrupted`, matching the Codex path; an unknown wire terminal settles
 /// nothing and the caller records a gap instead.
@@ -1968,6 +1938,7 @@ fn attach_provider_restriction(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eliot_plugin::protocol::MAX_COMMAND_ID_BYTES;
 
     #[test]
     fn terminal_mapping_cancels_to_interrupted() {

@@ -1339,10 +1339,13 @@ fn muse_snapshot_from_entry(
     Ok(Value::Object(snapshot))
 }
 
-/// Freeze a Claude profile. The PR1 slice carries an exact model id and a
+/// Freeze a Claude profile. The PR2 slice carries an exact model id, a
 /// required explicit native `cmd` (no PATH default: a resolved wrapper would
-/// orphan the real CLI on stop). Permission modes, approvals and reasoning
-/// effort stay rejected until their native mappings land.
+/// orphan the real CLI on stop), the CLI permission modes mapped from
+/// `approval`, and approve/deny replies through the stdio permission
+/// callback. Reasoning effort, collaboration presets, non-default
+/// permissions, and a non-`never` Eliot-side `approval_policy` stay rejected
+/// until their mappings land.
 fn claude_snapshot_from_entry(
     name: &str,
     entry: &ProfileEntry,
@@ -1379,20 +1382,24 @@ fn claude_snapshot_from_entry(
             "unsupported",
         ));
     }
-    if entry
-        .approval
-        .as_deref()
-        .is_some_and(|mode| !mode.trim().is_empty())
-    {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
-            "approval",
-            "the Claude slice leaves approvals unconnected",
-            "unsupported",
-        ));
-    }
+    let permission_mode = match entry.approval.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(mode) => match mode {
+            "acceptEdits" | "auto" | "bypassPermissions" | "manual" | "dontAsk" | "plan" => {
+                Some(mode.to_owned())
+            }
+            _ => {
+                return Err(profile_field_error(
+                    source,
+                    table_offset,
+                    name,
+                    "approval",
+                    "unknown Claude permission mode (acceptEdits, auto, bypassPermissions, manual, dontAsk, or plan)",
+                    "profile_error",
+                ));
+            }
+        },
+    };
     if entry.collaboration_mode.is_some() {
         return Err(profile_field_error(
             source,
@@ -1492,6 +1499,9 @@ fn claude_snapshot_from_entry(
         "approval_policy".to_owned(),
         Value::String(APPROVAL_POLICY_NEVER.to_owned()),
     );
+    if let Some(mode) = permission_mode {
+        snapshot.insert("permission_mode".to_owned(), Value::String(mode));
+    }
     snapshot.insert(
         "pass_env".to_owned(),
         Value::Array(pass_env.into_iter().map(Value::String).collect()),
@@ -3219,12 +3229,27 @@ pass_env = ["EXAMPLE_API_KEY"]
         assert_eq!(snapshot["model"], "claude-opus-4-6");
         assert_eq!(snapshot["permissions"], "workspace-write");
         assert_eq!(snapshot["approval_policy"], "never");
+        assert!(snapshot.get("permission_mode").is_none());
         assert_eq!(snapshot["pass_env"], json!(["EXAMPLE_API_KEY"]));
+
+        // The approval vocabulary is the CLI permission-mode vocabulary and
+        // freezes under the CLI-exact key. Both cases use the platform-native
+        // cmd so Unix rejects (or accepts) for the approval value, not the path.
+        let source = format!(
+            "[profiles.claude]\nharness = \"claude\"\ncmd = '{cmd}'\nmodel = \"claude-opus-4-6\"\napproval = \"plan\"\n"
+        );
+        let snapshot = resolve_text_profile(&source, "claude").unwrap();
+        assert_eq!(snapshot["permission_mode"], "plan");
+        let source = format!(
+            "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\ncmd='{cmd}'\napproval='promptUnmatched'\n"
+        );
+        let error =
+            resolve_text_profile(&source, "claude").expect_err("unknown permission mode must fail");
+        assert_eq!(error.code, "profile_error");
 
         for source in [
             "[profiles.claude]\nharness='claude'\n",
             "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\neffort='high'\n",
-            "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\napproval='promptUnmatched'\n",
             "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\ncollaboration_mode='plan'\n",
             "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\npermissions='read-only'\n",
             "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\napproval_policy='on-request'\n",

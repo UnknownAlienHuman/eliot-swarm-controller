@@ -699,7 +699,7 @@ fn project_start_input_binding_tx(
         agent.generation == old_generation
             && agent.is_terminal()
             && agent.active_turn.is_none()
-            && matches!(agent.harness.as_str(), "codex" | "fake" | "muse")
+            && matches!(agent.harness.as_str(), "codex" | "fake" | "muse" | "claude")
             && agent
                 .native_scope
                 .as_deref()

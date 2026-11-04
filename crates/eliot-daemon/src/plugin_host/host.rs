@@ -2137,7 +2137,7 @@ fn manifest_source_plan(manifest: &PluginManifest, harness: &str) -> Result<Valu
         .get("controlled")
         .ok_or_else(unsupported_manifest)?;
     let tool_expected = harness == "codex";
-    let request_expected = matches!(harness, "fake" | "codex" | "muse");
+    let request_expected = matches!(harness, "fake" | "codex" | "muse" | "claude");
     let expected_count = expected_families.len()
         + if tool_expected { 1 } else { 0 }
         + if request_expected { 1 } else { 0 };

@@ -21,11 +21,14 @@ use eliot_plugin::{
     StderrView,
     native_transport::{
         NativeChild, NativeLabels, NativeLaunch, NativeWriter, PendingCalls, PumpAction,
-        StreamState, encode_frame, native_frame_channel, pump_framed_lines,
+        StreamState, encode_frame, spawn_pumped,
     },
 };
 
-use crate::native::types::{ControlResponse, OutboundControlRequest, OutboundUserInput};
+use crate::native::types::{
+    ControlResponse, OutboundControlRequest, OutboundControlResponse, OutboundControlResponseBody,
+    OutboundUserInput, PermissionResult,
+};
 
 const LABELS: NativeLabels = NativeLabels {
     short: "Claude",
@@ -55,25 +58,20 @@ pub(crate) struct ClaudeProcess {
 
 impl ClaudeProcess {
     pub async fn spawn(launch: NativeLaunch, policy: SecretPolicy) -> Result<Self> {
-        let (mut transport, stdout) = NativeChild::spawn(launch, policy.clone(), LABELS).await?;
-        let pending = PendingCalls::new(ID_PREFIX, LABELS);
+        let (transport, pending, frame_rx, stream_rx) = spawn_pumped(
+            launch,
+            policy.clone(),
+            LABELS,
+            ID_PREFIX,
+            classify_claude_frame,
+        )
+        .await?;
         let client = ClaudeClient {
             writer: transport.writer(),
-            pending: pending.clone(),
+            pending,
             stderr: transport.stderr_view(),
             policy,
         };
-        let (frame_tx, frame_rx) = native_frame_channel();
-        let (stream_tx, stream_rx) = watch::channel(StreamState::Open);
-        let output_reader = tokio::spawn(pump_framed_lines(
-            stdout,
-            frame_tx,
-            stream_tx,
-            pending,
-            LABELS.server,
-            classify_claude_frame,
-        ));
-        transport.set_output_reader(output_reader);
 
         Ok(Self {
             transport,
@@ -131,6 +129,35 @@ impl ClaudeClient {
         self.control_inner(subtype, request, deadline)
             .await
             .map_err(|error| self.diagnostic_error(error))
+    }
+
+    /// Answer one CLI `control_request` (a `can_use_tool` permission reply).
+    /// There is no transport ack: a queued write is the delivery. It never
+    /// touches the pending map — replies are responses, not requests.
+    pub async fn respond_control(
+        &self,
+        request_id: &str,
+        result: PermissionResult,
+        deadline: Instant,
+    ) -> Result<()> {
+        if request_id.trim().is_empty() {
+            return Err(Error::new(
+                "invalid",
+                "Claude permission reply requires the exact native request id",
+            ));
+        }
+        let encoded = encode_frame(
+            LABELS.server,
+            &OutboundControlResponse {
+                kind: "control_response",
+                response: OutboundControlResponseBody {
+                    subtype: "success",
+                    request_id: request_id.to_owned(),
+                    response: result,
+                },
+            },
+        )?;
+        self.write_encoded(encoded, deadline).await
     }
 
     /// One stdin `user` record. There is no transport ack: a queued write is

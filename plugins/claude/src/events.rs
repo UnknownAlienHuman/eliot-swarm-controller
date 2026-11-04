@@ -1,22 +1,30 @@
-use eliot_core::{Error, NativeEvent, Result, SecretPolicy, SourceBatch};
-use eliot_plugin::{CommitSink, MAX_EVENT_BYTES, PeerClient, native_stdio::StreamState};
+use eliot_core::{Error, Result, SecretPolicy};
+use eliot_plugin::{
+    CommitSink, MAX_EVENT_BYTES, PeerClient,
+    native_stdio::StreamState,
+    session::{
+        EVENT_DEADLINE, StreamSource, attach_final_text, rejected_control, request_event_id,
+        unknown_control,
+    },
+};
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::{collections::VecDeque, time::Duration};
+use std::collections::{HashMap, VecDeque};
 use tokio::{
     sync::{mpsc, oneshot, watch},
     time::{Instant, timeout_at},
 };
 
 use crate::native::{
-    ClaudeFrame,
-    types::{CommandLifecycle, ResultRecord, assistant_text},
+    ClaudeClient, ClaudeFrame,
+    types::{CanUseToolBody, CommandLifecycle, PermissionResult, ResultRecord, assistant_text},
 };
 
-const EVENT_DEADLINE: Duration = Duration::from_secs(30);
 const CONTROL_QUEUE: usize = 16;
 const EARLY_EVENT_LIMIT: usize = 128;
 const EARLY_EVENT_BYTES: usize = 256 * 1024;
+const MAX_PENDING_REQUESTS: usize = 16;
+const DENY_MESSAGE: &str = "Eliot denied this tool call.";
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EventStatus {
@@ -64,6 +72,7 @@ enum Control {
         native_scope: String,
         session_id: String,
         effective: Value,
+        native: ClaudeClient,
         reply: oneshot::Sender<Result<()>>,
     },
     ExpectTurn {
@@ -79,6 +88,15 @@ enum Control {
     CheckTurn {
         turn_id: String,
         reply: oneshot::Sender<bool>,
+    },
+    ReplyRequest {
+        command_id: String,
+        request_id: String,
+        turn_id: String,
+        verb: String,
+        args: Value,
+        native: ClaudeClient,
+        reply: oneshot::Sender<Result<Value>>,
     },
     BeginStop {
         reply: oneshot::Sender<Result<()>>,
@@ -103,6 +121,25 @@ struct PendingTurn {
     outcome: Option<oneshot::Sender<TurnOutcome>>,
 }
 
+/// One open `can_use_tool` permission, keyed by the CLI's exact native
+/// `request_id`. `input` is the original asked value (allow echoes it back
+/// verbatim); only the redacted copy is ever committed.
+struct PendingNativeRequest {
+    turn_id: String,
+    tool_name: String,
+    tool_use_id: Option<String>,
+    input: Value,
+    reply_command_id: Option<String>,
+    reply_state: NativeReplyState,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeReplyState {
+    Available,
+    Writing,
+    Unknown,
+}
+
 struct EventProcessor {
     host: PeerClient,
     sink: CommitSink,
@@ -115,6 +152,7 @@ struct EventProcessor {
     buffer_bytes: usize,
     gap_number: u64,
     pending_turn: Option<PendingTurn>,
+    pending_requests: HashMap<String, PendingNativeRequest>,
     message_seq: u64,
     accept_frames: bool,
     planned_stop: bool,
@@ -124,6 +162,7 @@ struct EventProcessor {
     gap_reported: bool,
     final_text: Option<String>,
     closed: bool,
+    native: Option<ClaudeClient>,
     status_tx: watch::Sender<EventStatus>,
 }
 
@@ -143,12 +182,15 @@ pub(crate) fn spawn(
 impl EventHandle {
     /// Commit readiness only after the SessionStart proof is observed: the
     /// initialize reply and the session_start record race, and readiness
-    /// must compare against the observed session, never assume it.
+    /// must compare against the observed session, never assume it. The
+    /// native client travels with readiness so a permission ask outside the
+    /// exact active turn still gets its explicit deny.
     pub async fn ready(
         &mut self,
         native_scope: String,
         session_id: String,
         effective: Value,
+        native: ClaudeClient,
     ) -> Result<()> {
         let deadline = Instant::now() + EVENT_DEADLINE;
         loop {
@@ -178,6 +220,7 @@ impl EventHandle {
             native_scope,
             session_id,
             effective,
+            native,
             reply,
         })
         .await
@@ -244,6 +287,37 @@ impl EventHandle {
             return false;
         }
         reply_rx.await.unwrap_or(false)
+    }
+
+    /// Decide one open `can_use_tool` permission. Runs on the event task,
+    /// serialized behind queued frames, so a reply racing the terminal sees
+    /// the finished turn. Returns the outcome value (`applied`, `rejected`
+    /// or `unknown` state); only a lost task surfaces as `Err`.
+    pub async fn reply_request(
+        &self,
+        command_id: String,
+        request_id: String,
+        turn_id: String,
+        verb: String,
+        args: Value,
+        native: ClaudeClient,
+    ) -> Result<Value> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.control
+            .send(Control::ReplyRequest {
+                command_id,
+                request_id,
+                turn_id,
+                verb,
+                args,
+                native,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| Error::new("unknown", "Claude event task is unavailable"))?;
+        reply_rx
+            .await
+            .map_err(|_| Error::new("unknown", "Claude event task is unavailable"))?
     }
 
     pub async fn begin_stop(&self) -> Result<()> {
@@ -324,54 +398,8 @@ async fn run(
             }
             request = control.recv() => {
                 let Some(request) = request else { break };
-                match request {
-                    Control::Ready { native_scope, session_id, effective, reply } => {
-                        let result = processor.ready(native_scope, session_id, effective).await;
-                        publish(&processor, &status);
-                        let _ = reply.send(result);
-                    }
-                    Control::ExpectTurn { command_id, turn_id, registered, outcome } => {
-                        let result = processor.register_turn(command_id, turn_id, outcome);
-                        publish(&processor, &status);
-                        let _ = registered.send(result);
-                    }
-                    Control::CancelTurn { command_id, reply } => {
-                        processor.cancel_turn(&command_id);
-                        publish(&processor, &status);
-                        let _ = reply.send(());
-                    }
-                    Control::CheckTurn { turn_id, reply } => {
-                        let live = processor.status.active_turn_id.as_deref() == Some(turn_id.as_str())
-                            && processor.status.failure.is_none()
-                            && !processor.status.stopped;
-                        let _ = reply.send(live);
-                    }
-                    Control::BeginStop { reply } => {
-                        processor.planned_stop = true;
-                        processor.accept_frames = false;
-                        publish(&processor, &status);
-                        let _ = reply.send(Ok(()));
-                    }
-                    Control::EndStop { reply } => {
-                        if processor.frames_drained {
-                            let result = processor.finish_stop().await;
-                            publish(&processor, &status);
-                            let _ = reply.send(result);
-                        } else if processor.pending_end_stop.is_some() {
-                            let _ = reply.send(Err(Error::new(
-                                "unknown",
-                                "Claude stop settlement is already pending",
-                            )));
-                        } else {
-                            processor.pending_end_stop = Some(reply);
-                        }
-                    }
-                    Control::Close { reply } => {
-                        processor.closed = true;
-                        processor.finish_pending_end_stop().await;
-                        let _ = reply.send(());
-                        break;
-                    }
+                if dispatch_control(&mut processor, &status, request).await {
+                    break;
                 }
             }
         }
@@ -382,6 +410,92 @@ async fn run(
 
 fn publish(processor: &EventProcessor, status: &watch::Sender<EventStatus>) {
     let _ = status.send_replace(processor.status.clone());
+}
+
+/// Serve one control behind any queued frame. True ends the run loop.
+async fn dispatch_control(
+    processor: &mut EventProcessor,
+    status: &watch::Sender<EventStatus>,
+    request: Control,
+) -> bool {
+    match request {
+        Control::Ready {
+            native_scope,
+            session_id,
+            effective,
+            native,
+            reply,
+        } => {
+            let result = processor
+                .ready(native_scope, session_id, effective, native)
+                .await;
+            publish(processor, status);
+            let _ = reply.send(result);
+        }
+        Control::ExpectTurn {
+            command_id,
+            turn_id,
+            registered,
+            outcome,
+        } => {
+            let result = processor.register_turn(command_id, turn_id, outcome);
+            publish(processor, status);
+            let _ = registered.send(result);
+        }
+        Control::CancelTurn { command_id, reply } => {
+            processor.cancel_turn(&command_id);
+            publish(processor, status);
+            let _ = reply.send(());
+        }
+        Control::CheckTurn { turn_id, reply } => {
+            let live = processor.status.active_turn_id.as_deref() == Some(turn_id.as_str())
+                && processor.status.failure.is_none()
+                && !processor.status.stopped;
+            let _ = reply.send(live);
+        }
+        Control::ReplyRequest {
+            command_id,
+            request_id,
+            turn_id,
+            verb,
+            args,
+            native,
+            reply,
+        } => {
+            let result = processor
+                .reply_request(&command_id, &request_id, &turn_id, &verb, &args, &native)
+                .await;
+            publish(processor, status);
+            let _ = reply.send(result);
+        }
+        Control::BeginStop { reply } => {
+            processor.planned_stop = true;
+            processor.accept_frames = false;
+            publish(processor, status);
+            let _ = reply.send(Ok(()));
+        }
+        Control::EndStop { reply } => {
+            if processor.frames_drained {
+                let result = processor.finish_stop().await;
+                publish(processor, status);
+                let _ = reply.send(result);
+            } else if processor.pending_end_stop.is_some() {
+                let _ = reply.send(Err(Error::new(
+                    "unknown",
+                    "Claude stop settlement is already pending",
+                )));
+            } else {
+                processor.pending_end_stop = Some(reply);
+            }
+        }
+        Control::Close { reply } => {
+            processor.closed = true;
+            processor.finish_pending_end_stop().await;
+            let _ = reply.send(());
+            return true;
+        }
+    }
+    false
 }
 
 impl EventProcessor {
@@ -399,6 +513,7 @@ impl EventProcessor {
             buffer_bytes: 0,
             gap_number: 0,
             pending_turn: None,
+            pending_requests: HashMap::new(),
             message_seq: 0,
             accept_frames: true,
             planned_stop: false,
@@ -408,6 +523,7 @@ impl EventProcessor {
             gap_reported: false,
             final_text: None,
             closed: false,
+            native: None,
             status_tx,
         }
     }
@@ -425,6 +541,7 @@ impl EventProcessor {
         native_scope: String,
         session_id: String,
         effective: Value,
+        native: ClaudeClient,
     ) -> Result<()> {
         if self.status.ready || session_id.trim().is_empty() || !effective.is_object() {
             return Err(Error::new(
@@ -457,6 +574,7 @@ impl EventProcessor {
                 format!("Claude event source failed before readiness: {failure}"),
             ));
         }
+        self.native = Some(native);
         self.status.session_id = Some(session_id.clone());
         let native_id = format!("claude:{session_id}:session.ready");
         self.commit_event(
@@ -592,11 +710,26 @@ impl EventProcessor {
     }
 
     /// Assistant text may arrive before its lifecycle association; hold it
-    /// until the exact turn binds. Everything else is processed inline.
+    /// until the exact turn binds. A permission ask may likewise arrive while
+    /// its association is still in flight; hold it for the same reason. A
+    /// permission with no association in flight is processed inline (and gaps
+    /// outside the exact active turn). Everything else is processed inline.
     fn should_buffer(&self, record: &Value) -> bool {
-        record.get("type").and_then(Value::as_str) == Some("assistant")
-            && (!self.status.ready
-                || (self.status.active_turn_id.is_none() && self.pending_turn.is_some()))
+        let kind = record.get("type").and_then(Value::as_str);
+        if kind == Some("assistant") {
+            return !self.status.ready
+                || (self.status.active_turn_id.is_none() && self.pending_turn.is_some());
+        }
+        if kind == Some("control_request")
+            && record
+                .get("request")
+                .and_then(|request| request.get("subtype"))
+                .and_then(Value::as_str)
+                == Some("can_use_tool")
+        {
+            return self.status.active_turn_id.is_none() && self.pending_turn.is_some();
+        }
+        false
     }
 
     async fn handle_record(&mut self, record: Value) {
@@ -630,10 +763,7 @@ impl EventProcessor {
             "assistant" => self.observe_assistant(&record).await,
             "result" => self.complete_turn(&record).await,
             "user" => Ok(()),
-            "control_request" => {
-                self.record_gap("Claude native request type is unconnected in this slice")
-                    .await
-            }
+            "control_request" => self.observe_control_request(&record).await,
             _ => Ok(()),
         }
     }
@@ -826,6 +956,314 @@ impl EventProcessor {
             .await
     }
 
+    /// Deny a permission ask that has no exact active turn to bind to.
+    /// The CLI unblocks on the explicit deny; the uncommitted ask is still a
+    /// stream gap (recorded by the caller). Best-effort before readiness or
+    /// after stop, when no client or live session remains.
+    async fn deny_stray_request(&self, request_id: &str) {
+        let Some(native) = self.native.as_ref() else {
+            return;
+        };
+        if self.status.session_id.is_none() || self.status.stopped {
+            return;
+        }
+        let _ = native
+            .respond_control(
+                request_id,
+                PermissionResult::Deny {
+                    message: DENY_MESSAGE.to_owned(),
+                },
+                Instant::now() + EVENT_DEADLINE,
+            )
+            .await;
+    }
+
+    /// One CLI `control_request`: only the `can_use_tool` permission ask is
+    /// connected. It binds to the exact active turn and opens a retained
+    /// request under the CLI's exact native `request_id`; any other subtype
+    /// is an explicit gap, as before.
+    async fn observe_control_request(&mut self, record: &Value) -> Result<()> {
+        let body = record
+            .get("request")
+            .cloned()
+            .map(serde_json::from_value::<CanUseToolBody>)
+            .ok_or_else(|| {
+                Error::new(
+                    "native_protocol",
+                    "Claude control_request omitted its request body",
+                )
+            })?
+            .map_err(|_| {
+                Error::new(
+                    "native_protocol",
+                    "Claude control_request did not match its envelope",
+                )
+            })?;
+        if body.subtype != "can_use_tool" {
+            return self
+                .record_gap("Claude native request type is unconnected in this slice")
+                .await;
+        }
+        let request_id = record
+            .get("request_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| {
+                Error::new(
+                    "native_protocol",
+                    "Claude can_use_tool omitted its exact native request id",
+                )
+            })?;
+        if body.tool_name.trim().is_empty() || body.input.is_none() {
+            return Err(Error::new(
+                "native_protocol",
+                "Claude can_use_tool omitted its tool name or input",
+            ));
+        }
+        // A re-issued open is idempotent when it repeats the retained ask;
+        // the same native id with another ask is an integrity gap.
+        if let Some(existing) = self.pending_requests.get(request_id) {
+            let same = existing.tool_name == body.tool_name
+                && existing.tool_use_id == body.tool_use_id
+                && Some(&existing.input) == body.input.as_ref();
+            if same {
+                return Ok(());
+            }
+            return self
+                .record_gap("Claude permission ask reused its native request id")
+                .await;
+        }
+        if self.pending_requests.len() >= MAX_PENDING_REQUESTS {
+            return self
+                .record_gap("Claude pending native request bound was exceeded")
+                .await;
+        }
+        let (Some(command_id), Some(turn_id)) = (
+            self.status.active_command_id.clone(),
+            self.status.active_turn_id.clone(),
+        ) else {
+            self.deny_stray_request(request_id).await;
+            return self
+                .record_gap("Claude permission ask arrived outside the exact active turn")
+                .await;
+        };
+        let policy = SecretPolicy::new(self.secrets.iter().cloned());
+        let mut details = json!({
+            "tool_name": body.tool_name.clone(),
+            "tool_use_id": body.tool_use_id.clone(),
+            "input": body.input.clone().unwrap_or(Value::Null),
+        });
+        policy.redact_values(&mut details);
+        let data = json!({
+            "command_id": command_id.clone(),
+            "request_id": request_id,
+            "turn_id": turn_id.clone(),
+            "kind": "permission",
+            "details": details,
+        });
+        if serde_json::to_vec(&data).map_or(usize::MAX, |bytes| bytes.len()) > MAX_EVENT_BYTES {
+            return self
+                .record_gap("Claude normalized request exceeded the persisted-event bound")
+                .await;
+        }
+        let native_id = match request_event_id(request_id, "request.opened", "claude", "Claude") {
+            Ok(native_id) => native_id,
+            Err(_) => {
+                return self
+                    .record_gap("Claude native request event identity exceeded its bound")
+                    .await;
+            }
+        };
+        self.commit_event("request.opened", native_id, data).await?;
+        self.pending_requests.insert(
+            request_id.to_owned(),
+            PendingNativeRequest {
+                turn_id,
+                tool_name: body.tool_name,
+                tool_use_id: body.tool_use_id,
+                input: body.input.unwrap_or(Value::Null),
+                reply_command_id: None,
+                reply_state: NativeReplyState::Available,
+            },
+        );
+        Ok(())
+    }
+
+    /// Refuse a stale, unbound, or malformed request reply before any
+    /// native write, else plan the exact `control_response` decision. `Err`
+    /// is the early outcome value to answer with.
+    fn check_request_reply(
+        &self,
+        request_id: &str,
+        turn_id: &str,
+        verb: &str,
+        args: &Value,
+    ) -> std::result::Result<PermissionResult, Value> {
+        let Some(entry) = self.pending_requests.get(request_id) else {
+            return Err(rejected_control("Claude request is no longer pending"));
+        };
+        if entry.turn_id != turn_id {
+            return Err(rejected_control(
+                "Claude request reply does not match the captured turn",
+            ));
+        }
+        if self.status.active_turn_id.as_deref() != Some(turn_id) {
+            return Err(rejected_control(
+                "Claude request is no longer attached to the active turn",
+            ));
+        }
+        match entry.reply_state {
+            NativeReplyState::Writing | NativeReplyState::Unknown => {
+                return Err(unknown_control(
+                    "Claude request reply outcome is unresolved and will not be repeated",
+                ));
+            }
+            NativeReplyState::Available => {}
+        }
+        if self.status.session_id.is_none() || self.status.stopped {
+            return Err(rejected_control(
+                "Claude request session is no longer writable",
+            ));
+        }
+        if !matches!(verb, "approve" | "deny") {
+            return Err(rejected_control(
+                "Claude request reply verb is not implemented",
+            ));
+        }
+        if !args.as_object().is_some_and(|args| args.is_empty()) {
+            return Err(rejected_control(
+                "Claude approval replies accept only empty arguments",
+            ));
+        }
+        Ok(match verb {
+            "approve" => PermissionResult::Allow {
+                updated_input: entry.input.clone(),
+            },
+            _ => PermissionResult::Deny {
+                message: DENY_MESSAGE.to_owned(),
+            },
+        })
+    }
+
+    /// Decide one open permission: write the exact `control_response`, then
+    /// commit the exact `request.resolved`. The write has no transport ack,
+    /// so a queued write is the delivery; only a proven no-write keeps the
+    /// ask available, anything uncertain latches unknown without a rewrite.
+    async fn reply_request(
+        &mut self,
+        command_id: &str,
+        request_id: &str,
+        turn_id: &str,
+        verb: &str,
+        args: &Value,
+        native: &ClaudeClient,
+    ) -> Result<Value> {
+        if command_id.trim().is_empty() || request_id.trim().is_empty() || turn_id.trim().is_empty()
+        {
+            return Err(Error::new(
+                "invalid",
+                "Claude request reply requires exact command, request, and turn ids",
+            ));
+        }
+        let result = match self.check_request_reply(request_id, turn_id, verb, args) {
+            Ok(result) => result,
+            Err(outcome) => return Ok(outcome),
+        };
+        let Some(entry) = self.pending_requests.get_mut(request_id) else {
+            return Ok(rejected_control("Claude request is no longer pending"));
+        };
+        entry.reply_state = NativeReplyState::Writing;
+        if let Err(error) = native
+            .respond_control(request_id, result, Instant::now() + EVENT_DEADLINE)
+            .await
+        {
+            // Proven not written (bound, encode, or deadline before
+            // dispatch): the ask stays available for a later reply.
+            if matches!(
+                error.code.as_str(),
+                "native_not_dispatched" | "frame_too_large" | "native_encode"
+            ) {
+                if let Some(entry) = self.pending_requests.get_mut(request_id) {
+                    entry.reply_state = NativeReplyState::Available;
+                    entry.reply_command_id = None;
+                }
+                return Ok(rejected_control("Claude request reply was not admitted"));
+            }
+            if let Some(entry) = self.pending_requests.get_mut(request_id) {
+                entry.reply_state = NativeReplyState::Unknown;
+                entry.reply_command_id = Some(command_id.to_owned());
+            }
+            return Ok(unknown_control(
+                "Claude request reply may have been dispatched; it will not be repeated",
+            ));
+        }
+        // The decision is delivered: bind the exact resolution to this reply.
+        // A failed commit still latches unknown without a rewrite — the CLI
+        // already holds the decision.
+        let data = json!({
+            "command_id": command_id,
+            "request_id": request_id,
+            "turn_id": turn_id,
+        });
+        let native_id = match request_event_id(request_id, "request.resolved", "claude", "Claude") {
+            Ok(native_id) => native_id,
+            Err(_) => {
+                if let Some(entry) = self.pending_requests.get_mut(request_id) {
+                    entry.reply_state = NativeReplyState::Unknown;
+                    entry.reply_command_id = Some(command_id.to_owned());
+                }
+                self.record_gap("Claude native request event identity exceeded its bound")
+                    .await?;
+                return Ok(unknown_control(
+                    "Claude request resolution identity exceeded its bound",
+                ));
+            }
+        };
+        if let Err(error) = self.commit_event("request.resolved", native_id, data).await {
+            if let Some(entry) = self.pending_requests.get_mut(request_id) {
+                entry.reply_state = NativeReplyState::Unknown;
+                entry.reply_command_id = Some(command_id.to_owned());
+            }
+            return Ok(unknown_control(&format!(
+                "Claude request resolution was not committed: {}",
+                error.message
+            )));
+        }
+        self.pending_requests.remove(request_id);
+        Ok(json!({
+            "state": "applied",
+            "command_id": command_id,
+            "request_id": request_id,
+            "turn_id": turn_id,
+        }))
+    }
+
+    /// Close every retained ask of one finished turn (or of the stopped
+    /// session) without a command binding: the CLI ended the turn without
+    /// consuming them, so they resolve to nothing. Runs before the terminal
+    /// commit it precedes.
+    async fn close_pending_requests(&mut self, turn_id: Option<&str>) -> Result<()> {
+        let ids: Vec<String> = self
+            .pending_requests
+            .iter()
+            .filter(|(_, entry)| turn_id.is_none_or(|turn| entry.turn_id == turn))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for request_id in ids {
+            let Some(entry) = self.pending_requests.get(&request_id) else {
+                continue;
+            };
+            let data = json!({
+                "request_id": request_id,
+                "turn_id": entry.turn_id,
+            });
+            let native_id = request_event_id(&request_id, "request.closed", "claude", "Claude")?;
+            self.commit_event("request.closed", native_id, data).await?;
+            self.pending_requests.remove(&request_id);
+        }
+        Ok(())
+    }
+
     async fn complete_turn(&mut self, record: &Value) -> Result<()> {
         let parsed: ResultRecord = serde_json::from_value(record.clone()).map_err(|_| {
             Error::new(
@@ -854,6 +1292,9 @@ impl EventProcessor {
                 .record_gap("Claude terminal record did not match the exact active turn")
                 .await;
         };
+        // Unanswered asks die with their turn: close them before the terminal
+        // commit, without a command binding.
+        self.close_pending_requests(Some(&turn_id)).await?;
         if self
             .status
             .last_turn
@@ -870,7 +1311,9 @@ impl EventProcessor {
             "status": terminal_reason.clone(),
         });
         if let Some(text) = self.final_text.as_ref() {
-            attach_final_text(&mut data, text, &secrets);
+            // Stream-json carries no failed flag: keep the PR1 omit-on-overflow
+            // behavior for every terminal by reporting the bound case as failed.
+            attach_final_text(&mut data, &secrets.redact_text(text), true, &secrets);
         }
         let session_id = self.status.session_id.as_deref().unwrap_or_default();
         let native_id = format!("claude:{session_id}:{turn_id}:turn.completed");
@@ -964,6 +1407,9 @@ impl EventProcessor {
                 "Claude source acknowledgement is unresolved",
             ));
         }
+        // The stopped session consumes no more asks: close every retained one
+        // before `session.ended`.
+        self.close_pending_requests(None).await?;
         let native_id = format!(
             "claude:{}:session.ended",
             self.status.session_id.as_deref().unwrap_or("unresolved")
@@ -1003,139 +1449,33 @@ impl EventProcessor {
     }
 
     async fn commit_event(&mut self, kind: &str, native_id: String, data: Value) -> Result<()> {
-        if self.writes_blocked {
-            return Err(Error::new(
-                "unknown",
-                "Claude event acknowledgement is unresolved",
-            ));
-        }
-        let batch = SourceBatch {
-            batch_id: format!("{native_id}:batch"),
-            agent_id: self.agent_id.clone(),
-            generation: self.generation,
-            source: "stream".to_owned(),
-            events: vec![NativeEvent {
-                kind: kind.to_owned(),
-                native_id,
-                data,
-                ts: None,
-            }],
-            cursor: None,
-        };
-        let error = match self
-            .sink
-            .commit(batch, Instant::now() + EVENT_DEADLINE)
+        self.stream_source()
+            .commit_event(kind, native_id, data)
             .await
-        {
-            Ok(_) => return Ok(()),
-            Err(error) => error,
-        };
-        if self.sink.is_unknown() {
-            self.writes_blocked = true;
-            self.status.source_unknown = true;
-            self.status.failure = Some("Claude event batch acknowledgement is unknown".to_owned());
-            self.status.batch_unknown = true;
-            return Err(Error::new(
-                "unknown",
-                "Claude event batch acknowledgement is unknown",
-            ));
-        }
-        let reason = format!("{kind} could not be committed: {}", error.code);
-        self.record_gap(&reason).await?;
-        Err(Error::new(
-            "unknown",
-            "Claude native fact was not committed; no replay is allowed",
-        ))
     }
 
     async fn record_gap(&mut self, reason: &str) -> Result<()> {
-        if self.writes_blocked {
-            self.status.source_unknown = true;
-            return Err(Error::new(
-                "unknown",
-                "Claude event acknowledgement is unresolved; no source gap was issued",
-            ));
-        }
-        if self.gap_reported {
-            return Err(Error::new(
-                "unknown",
-                "Claude source already has an unresolved gap",
-            ));
-        }
-        self.status.source_unknown = true;
-        self.gap_reported = true;
-        self.gap_number = self.gap_number.saturating_add(1);
-        let gap_id = format!(
-            "claude:{}:{}:gap-{}",
-            self.agent_id, self.generation, self.gap_number
-        );
-        let ack_id = gap_id.clone();
-        let result = self
-            .host
-            .call(
-                "source.gap",
-                json!({
-                    "credential": self.credential,
-                    "agent_id": self.agent_id,
-                    "generation": self.generation,
-                    "source": "stream",
-                    "gap_id": gap_id,
-                    "families": ["session", "turn", "message"],
-                    "reason": reason,
-                    "from": null,
-                    "to": null,
-                }),
-                Instant::now() + EVENT_DEADLINE,
-            )
-            .await;
-        match result {
-            Ok(ack)
-                if ack.get("gap_id").and_then(Value::as_str) == Some(ack_id.as_str())
-                    && ack
-                        .get("seq")
-                        .and_then(Value::as_i64)
-                        .is_some_and(|seq| seq > 0) =>
-            {
-                self.status.failure = Some(format!("{reason}; terminal outcome is unknown"));
-                Ok(())
-            }
-            Ok(_) | Err(_) => {
-                self.writes_blocked = true;
-                self.status.source_unknown = true;
-                self.status.batch_unknown = true;
-                self.status.failure =
-                    Some("Claude source gap acknowledgement is unknown".to_owned());
-                Err(Error::new(
-                    "unknown",
-                    "Claude source gap acknowledgement is unknown",
-                ))
-            }
-        }
+        self.stream_source().record_gap(reason).await
     }
-}
 
-/// Bounded terminal text: when the accumulated reply cannot fit the persisted
-/// event, omit it with the explicit marker instead of truncating.
-fn attach_final_text(data: &mut Value, text: &str, secrets: &SecretPolicy) {
-    let redacted = secrets.redact_text(text);
-    let candidate = json!({
-        "command_id": data.get("command_id").cloned().unwrap_or(Value::Null),
-        "turn_id": data.get("turn_id").cloned().unwrap_or(Value::Null),
-        "status": data.get("status").cloned().unwrap_or(Value::Null),
-        "final_text": redacted,
-    });
-    if serde_json::to_vec(&candidate).map_or(usize::MAX, |bytes| bytes.len()) <= MAX_EVENT_BYTES {
-        data["final_text"] = Value::String(redacted);
-        return;
-    }
-    let marker = json!({
-        "command_id": data.get("command_id").cloned().unwrap_or(Value::Null),
-        "turn_id": data.get("turn_id").cloned().unwrap_or(Value::Null),
-        "status": data.get("status").cloned().unwrap_or(Value::Null),
-        "final_text_unavailable": "event_budget",
-    });
-    if serde_json::to_vec(&marker).map_or(usize::MAX, |bytes| bytes.len()) <= MAX_EVENT_BYTES {
-        data["final_text_unavailable"] = Value::String("event_budget".to_owned());
+    /// The shared stream-commit half of this processor.
+    fn stream_source(&mut self) -> StreamSource<'_> {
+        StreamSource {
+            sink: &mut self.sink,
+            host: &self.host,
+            credential: &self.credential,
+            agent_id: &self.agent_id,
+            generation: self.generation,
+            harness: "Claude",
+            id_prefix: "claude",
+            families: &["session", "turn", "message", "request"],
+            writes_blocked: &mut self.writes_blocked,
+            gap_reported: &mut self.gap_reported,
+            gap_number: &mut self.gap_number,
+            source_unknown: &mut self.status.source_unknown,
+            batch_unknown: &mut self.status.batch_unknown,
+            failure: &mut self.status.failure,
+        }
     }
 }
 

@@ -19,6 +19,53 @@ pub(crate) struct OutboundControlRequest {
     pub request: Value,
 }
 
+/// Outbound stdin `control_response` answering one CLI `control_request`
+/// (the `can_use_tool` permission reply). The CLI asks on stdout; Eliot
+/// answers on stdin with the documented SDK `PermissionResult`.
+#[derive(Serialize)]
+pub(crate) struct OutboundControlResponse {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub response: OutboundControlResponseBody,
+}
+
+#[derive(Serialize)]
+pub(crate) struct OutboundControlResponseBody {
+    pub subtype: &'static str,
+    pub request_id: String,
+    pub response: PermissionResult,
+}
+
+/// Documented SDK permission decision (camelCase wire names). Allow must
+/// echo the asked `input` back as `updatedInput`; deny carries a bounded
+/// message. Live verification is pending the owner login (note 47).
+#[derive(Serialize)]
+#[serde(tag = "behavior")]
+pub(crate) enum PermissionResult {
+    #[serde(rename = "allow")]
+    Allow {
+        #[serde(rename = "updatedInput")]
+        updated_input: Value,
+    },
+    #[serde(rename = "deny")]
+    Deny { message: String },
+}
+
+/// Inbound `can_use_tool` request body (the `request` object of a CLI
+/// `control_request`). Only the decision fields are consumed; suggestions
+/// and reasons stay out of the persisted details.
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct CanUseToolBody {
+    #[serde(default)]
+    pub subtype: String,
+    #[serde(default)]
+    pub tool_name: String,
+    #[serde(default)]
+    pub tool_use_id: Option<String>,
+    #[serde(default)]
+    pub input: Option<Value>,
+}
+
 /// Outbound stdin user-input record. `uuid` (Eliot-minted) is the exact turn
 /// association; the CLI echoes it as `command_lifecycle.command_uuid`.
 #[derive(Serialize)]
@@ -142,6 +189,62 @@ mod tests {
         });
         assert_eq!(assistant_text(&record), "hello world");
         assert_eq!(assistant_text(&json!({"type": "assistant"})), "");
+    }
+
+    #[test]
+    fn permission_reply_uses_the_documented_sdk_shape() {
+        let allow = OutboundControlResponse {
+            kind: "control_response",
+            response: OutboundControlResponseBody {
+                subtype: "success",
+                request_id: "req-1".to_owned(),
+                response: PermissionResult::Allow {
+                    updated_input: json!({"command": "ls"}),
+                },
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&allow).expect("allow reply"),
+            json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": "req-1",
+                    "response": {"behavior": "allow", "updatedInput": {"command": "ls"}},
+                },
+            })
+        );
+        let deny = OutboundControlResponse {
+            kind: "control_response",
+            response: OutboundControlResponseBody {
+                subtype: "success",
+                request_id: "req-2".to_owned(),
+                response: PermissionResult::Deny {
+                    message: "Eliot denied this tool call.".to_owned(),
+                },
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&deny).expect("deny reply")["response"]["response"],
+            json!({"behavior": "deny", "message": "Eliot denied this tool call."})
+        );
+    }
+
+    #[test]
+    fn can_use_tool_decodes_the_documented_fields() {
+        let raw = json!({
+            "subtype": "can_use_tool",
+            "tool_name": "Bash",
+            "tool_use_id": "tool-1",
+            "input": {"command": "ls"},
+            "permission_suggestions": [],
+            "decision_reason": "wants to list files",
+        });
+        let body: CanUseToolBody = serde_json::from_value(raw).expect("can_use_tool");
+        assert_eq!(body.subtype, "can_use_tool");
+        assert_eq!(body.tool_name, "Bash");
+        assert_eq!(body.tool_use_id.as_deref(), Some("tool-1"));
+        assert_eq!(body.input, Some(json!({"command": "ls"})));
     }
 
     #[test]

@@ -1,21 +1,23 @@
 //! Shared per-Agent session helpers for the stream-owning harness plugins.
 //!
-//! Muse, OpenCode and Codex bind one Agent generation to one owned native
-//! server through this module: the target-environment mapping,
+//! Muse, OpenCode, Codex and Claude bind one Agent generation to one owned
+//! native server through this module: the target-environment mapping,
 //! identity/binding validation, unknown snapshots, contextual errors,
 //! native process registration, the no-write code predicate, stream event
-//! commits/gaps and the bounded native-error/final-text attachments are
-//! identical up to the harness name. This module holds the single copy;
+//! commits/gaps, the bounded native-error/final-text attachments, control
+//! outcomes, request event ids, optional profile text, and resume subjects
+//! are identical up to the harness name. This module holds the single copy;
 //! each plugin passes its own display name (`"Muse"`, `"OpenCode"`,
-//! `"Codex"`) and id prefix (`"muse"`, `"opencode"`, `"codex"`). No trait:
-//! the shared state is passed by reference through [`StreamSource`].
+//! `"Codex"`, `"Claude"`) and id prefix (`"muse"`, `"opencode"`, `"codex"`,
+//! `"claude"`). No trait: the shared state is passed by reference through
+//! [`StreamSource`].
 
 use std::{collections::HashMap, ffi::OsString, path::Path, time::Duration};
 
 use eliot_core::{
     Error, NativeEvent, ProcessRecord, ProcessState, Result, SecretPolicy, SourceBatch,
 };
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tokio::time::Instant;
 
 use crate::{
@@ -201,6 +203,200 @@ fn join_families(families: &[&str]) -> String {
     }
 }
 
+/// Read one optional frozen-profile text field: absent or null is unset, a
+/// non-empty string is kept, anything else is a profile error.
+pub fn optional_profile_text(
+    profile: &Map<String, Value>,
+    key: &str,
+    harness: &str,
+) -> Result<Option<String>> {
+    match profile.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(value.clone())),
+        Some(_) => Err(Error::new(
+            "profile_error",
+            format!("{harness} profile field {key} must be a non-empty string"),
+        )),
+    }
+}
+
+/// A validated retained resume subject: the exact native session to continue
+/// plus the retained generation's last turn summary, when it had one. The
+/// request family is new in the resuming generation, so only the
+/// session/turn/message ownership is required of the retained source.
+#[derive(Debug)]
+pub struct ResumeSubject {
+    pub native_scope: String,
+    pub native_ref: String,
+    pub retained_turn: Option<String>,
+}
+
+/// Validate the retained resume subject and its generation continuity. The
+/// retained source must still bind this Agent's previous generation on the
+/// stream, and the retained `current_turn` summary must be complete: a
+/// malformed summary is `unknown`, never silently adopted.
+pub fn parse_resume_subject(
+    resume: &Value,
+    source_state: Option<&Value>,
+    agent_id: &str,
+    generation: i64,
+    harness: &str,
+) -> Result<ResumeSubject> {
+    let resume = resume.as_object().ok_or_else(|| {
+        Error::new(
+            "invalid",
+            format!("{harness} resume_from must be an object"),
+        )
+    })?;
+    if resume.len() != 2
+        || !resume.contains_key("native_scope")
+        || !resume.contains_key("native_ref")
+    {
+        return Err(Error::new(
+            "invalid",
+            format!("{harness} resume_from must contain only native_scope and native_ref"),
+        ));
+    }
+    let native_scope = resume
+        .get("native_scope")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                "invalid",
+                format!("{harness} resume_from requires native_scope"),
+            )
+        })?
+        .to_owned();
+    let native_ref = resume
+        .get("native_ref")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                "invalid",
+                format!("{harness} resume_from requires native_ref"),
+            )
+        })?
+        .to_owned();
+    let source_state = source_state.and_then(Value::as_object).ok_or_else(|| {
+        Error::new(
+            "unknown",
+            format!("{harness} resume requires retained native readback"),
+        )
+    })?;
+    let retained_generation = source_state
+        .get("retained_generation")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| {
+            Error::new(
+                "unknown",
+                format!("{harness} resume readback omitted its retained generation"),
+            )
+        })?;
+    if retained_generation.checked_add(1) != Some(generation) {
+        return Err(Error::new(
+            "stale_generation",
+            format!("{harness} resume generation does not follow the retained source generation"),
+        ));
+    }
+    let retained_source = source_state
+        .get("retained_source")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            Error::new(
+                "unknown",
+                format!("{harness} resume omitted retained source state"),
+            )
+        })?;
+    if retained_source.get("agent_id").and_then(Value::as_str) != Some(agent_id)
+        || retained_source.get("generation").and_then(Value::as_i64) != Some(retained_generation)
+        || retained_source.get("source").and_then(Value::as_str) != Some("stream")
+    {
+        return Err(Error::new(
+            "stale_generation",
+            format!("{harness} resume source state does not match the retained Agent generation"),
+        ));
+    }
+    let families = retained_source
+        .get("families")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            Error::new(
+                "unknown",
+                format!("{harness} resume source state omitted its families"),
+            )
+        })?;
+    if ["session", "turn", "message"]
+        .iter()
+        .any(|family| !families.iter().any(|value| value.as_str() == Some(family)))
+    {
+        return Err(Error::new(
+            "unknown",
+            format!("{harness} retained source did not own the required event families"),
+        ));
+    }
+    let current_turn = source_state.get("current_turn").ok_or_else(|| {
+        Error::new(
+            "unknown",
+            format!("{harness} resume readback omitted current_turn"),
+        )
+    })?;
+    let retained_turn = match current_turn {
+        Value::Null => None,
+        Value::Object(turn) => {
+            if !["state", "status", "started_at", "completed_at"]
+                .iter()
+                .all(|field| turn.contains_key(*field))
+                || !matches!(
+                    turn.get("state").and_then(Value::as_str),
+                    Some("running" | "completed" | "unknown")
+                )
+                || !matches!(
+                    turn.get("status"),
+                    Some(value) if value.is_null() || value.as_str().is_some()
+                )
+                || !matches!(
+                    turn.get("started_at"),
+                    Some(value) if value.is_null() || value.as_i64().is_some()
+                )
+                || !matches!(
+                    turn.get("completed_at"),
+                    Some(value) if value.is_null() || value.as_i64().is_some()
+                )
+            {
+                return Err(Error::new(
+                    "unknown",
+                    format!("{harness} resume current_turn summary is incomplete"),
+                ));
+            }
+            Some(
+                turn.get("turn_id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| {
+                        Error::new(
+                            "unknown",
+                            format!("{harness} resume current_turn omitted its exact turn id"),
+                        )
+                    })?
+                    .to_owned(),
+            )
+        }
+        _ => {
+            return Err(Error::new(
+                "unknown",
+                format!("{harness} resume current_turn readback is malformed"),
+            ));
+        }
+    };
+    Ok(ResumeSubject {
+        native_scope,
+        native_ref,
+        retained_turn,
+    })
+}
+
 /// Whether `command_id` is a retained command of this generation: the start,
 /// a dispatched input, or the stop. The session fields are passed by
 /// reference because each plugin owns its own `AgentSession` type.
@@ -264,8 +460,9 @@ pub fn unknown_control(reason: &str) -> Value {
 
 /// Register the owned native process as the `harness` role under this
 /// Agent generation. `harness` is the display name (`"Muse"`,
-/// `"OpenCode"`, `"Codex"`); `process_noun` is the owned child
-/// (`"session host"`, `"server"`, `"app-server"`); `scope_noun` is the
+/// `"OpenCode"`, `"Codex"`, `"Claude"`); `process_noun` is the owned
+/// child (`"session host"`, `"server"`, `"app-server"`, `"CLI"`);
+/// `scope_noun` is the
 /// native scope no input was sent to (`"session"`, or `"thread"` for
 /// Codex). The caller resolves the pid through its own child handle; a
 /// missing or zero pid fails before any session or input is sent.
@@ -331,6 +528,36 @@ pub async fn register_native_process(
         ));
     }
     Ok(())
+}
+
+/// Native identity for one request event under the exact native `request_id`,
+/// bounded like every command identity. `id_prefix` is the harness id
+/// prefix (`"muse"`, `"claude"`); `harness` names it in diagnostics.
+pub fn request_event_id(
+    request_id: &str,
+    kind: &str,
+    id_prefix: &str,
+    harness: &str,
+) -> Result<String> {
+    let short = match kind {
+        "request.opened" => "o",
+        "request.resolved" => "r",
+        "request.closed" => "c",
+        _ => {
+            return Err(Error::new(
+                "invalid",
+                format!("{harness} request event kind is unsupported"),
+            ));
+        }
+    };
+    let native_id = format!("{id_prefix}-{short}:{request_id}");
+    if native_id.len() > MAX_COMMAND_ID_BYTES || request_id.trim().is_empty() {
+        return Err(Error::new(
+            "source_integrity",
+            format!("{harness} native request event identity exceeded its bound"),
+        ));
+    }
+    Ok(native_id)
 }
 
 /// Native event identity for one stream-owned fact.
@@ -608,7 +835,7 @@ impl StreamSource<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_source_plan;
+    use super::{optional_profile_text, request_event_id, validate_source_plan};
     use serde_json::json;
 
     /// The shared source-plan check spells every harness message exactly as
@@ -623,6 +850,11 @@ mod tests {
             ),
             (
                 "Muse",
+                &["session", "turn", "message", "request"][..],
+                "session, turn, message, and request",
+            ),
+            (
+                "Claude",
                 &["session", "turn", "message", "request"][..],
                 "session, turn, message, and request",
             ),
@@ -644,6 +876,45 @@ mod tests {
             assert_eq!(
                 error.message,
                 format!("{harness} start requires stream ownership for {joined}")
+            );
+        }
+    }
+
+    /// The shared request ids and profile texts spell every harness exactly
+    /// as the per-plugin copies did (pure move).
+    #[test]
+    fn request_ids_and_profile_text_match_the_per_harness_originals() {
+        for (harness, id_prefix) in [("Muse", "muse"), ("Claude", "claude")] {
+            for (kind, short) in [
+                ("request.opened", "o"),
+                ("request.resolved", "r"),
+                ("request.closed", "c"),
+            ] {
+                assert_eq!(
+                    request_event_id("req-1", kind, id_prefix, harness).expect("request id"),
+                    format!("{id_prefix}-{short}:req-1")
+                );
+            }
+            let error = request_event_id("req-1", "request.unknown", id_prefix, harness)
+                .expect_err("unsupported kind");
+            assert_eq!(error.code, "invalid");
+            assert_eq!(
+                error.message,
+                format!("{harness} request event kind is unsupported")
+            );
+            let error = request_event_id("", "request.opened", id_prefix, harness)
+                .expect_err("empty request id");
+            assert_eq!(error.code, "source_integrity");
+            let profile = json!({"mode": 7}).as_object().cloned().unwrap();
+            let error = optional_profile_text(&profile, "mode", harness).expect_err("non-string");
+            assert_eq!(error.code, "profile_error");
+            assert_eq!(
+                error.message,
+                format!("{harness} profile field mode must be a non-empty string")
+            );
+            assert_eq!(
+                optional_profile_text(&profile, "absent", harness).expect("absent"),
+                None
             );
         }
     }

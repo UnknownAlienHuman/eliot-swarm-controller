@@ -548,6 +548,43 @@ pub fn encode_frame(server: &'static str, message: &impl Serialize) -> Result<St
     Ok(encoded)
 }
 
+/// Spawn a native child with its stdout pump armed in one step: process
+/// birth, the correlated-call map, the bounded frame queue, the stream-state
+/// watch and the reader task handed back for drain ownership. Both protocol
+/// layers (JSON-RPC and stream-json) use this so the wiring exists exactly
+/// once; each builds its own client over the returned writer/pending pair.
+pub async fn spawn_pumped<Frame, Classify>(
+    launch: NativeLaunch,
+    policy: SecretPolicy,
+    labels: NativeLabels,
+    id_prefix: &'static str,
+    classify: Classify,
+) -> Result<(
+    NativeChild,
+    PendingCalls,
+    mpsc::Receiver<Frame>,
+    watch::Receiver<StreamState>,
+)>
+where
+    Frame: Send + 'static,
+    Classify: FnMut(Value) -> PumpAction<Frame> + Send + 'static,
+{
+    let (mut transport, stdout) = NativeChild::spawn(launch, policy, labels).await?;
+    let pending = PendingCalls::new(id_prefix, labels);
+    let (frame_tx, frame_rx) = native_frame_channel();
+    let (stream_tx, stream_rx) = watch::channel(StreamState::Open);
+    let output_reader = tokio::spawn(pump_framed_lines(
+        stdout,
+        frame_tx,
+        stream_tx,
+        pending.clone(),
+        labels.server,
+        classify,
+    ));
+    transport.set_output_reader(output_reader);
+    Ok((transport, pending, frame_rx, stream_rx))
+}
+
 /// Bounded stdout line pump: length-checked NDJSON lines, protocol
 /// classification of each parsed record, one overflow gap, output drained
 /// before any loss conclusion. The classifier owns every protocol decision;
