@@ -411,6 +411,7 @@ dependencies = [
  "eliot-core",
  "eliot-daemon",
  "eliot-plugin",
+ "eliot-plugin-claude",
  "eliot-plugin-codex",
  "eliot-plugin-muse",
  "serde_json",
@@ -468,6 +469,20 @@ dependencies = [
  "tokio",
  "tokio-util",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "eliot-plugin-claude"
+version = "0.2.0-dev"
+dependencies = [
+ "eliot-core",
+ "eliot-plugin",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "ulid",
 ]
 
 [[package]]

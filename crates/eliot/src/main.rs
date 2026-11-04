@@ -713,6 +713,9 @@ enum PluginCommand {
     /// Internal Muse plugin entry point (hidden).
     #[command(hide = true)]
     Muse,
+    /// Internal Claude plugin entry point (hidden).
+    #[command(hide = true)]
+    Claude,
 }
 
 struct Failure {
@@ -1953,6 +1956,12 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             }
             PluginCommand::Muse => {
                 eliot_plugin_muse::run_muse()
+                    .await
+                    .map_err(|error| Failure::new(1, error.to_string()))?;
+                Ok(0)
+            }
+            PluginCommand::Claude => {
+                eliot_plugin_claude::run_claude()
                     .await
                     .map_err(|error| Failure::new(1, error.to_string()))?;
                 Ok(0)

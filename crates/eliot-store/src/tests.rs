@@ -82,6 +82,10 @@ fn initial_source_families_match_fake_and_codex_harness_boundaries() {
         &["session", "turn", "message", "request"][..]
     );
     assert_eq!(
+        super::source_families_for_harness("claude").unwrap(),
+        &["session", "turn", "message"][..]
+    );
+    assert_eq!(
         super::source_families_for_harness("other")
             .unwrap_err()
             .code,
@@ -9346,5 +9350,132 @@ fn muse_replies_and_turn_controls_pass_admission_and_dispatch() {
                 .state,
             CommandState::Dispatched
         );
+    }
+}
+
+/// Launch a `claude`-harness Agent through generation-1 readiness.
+fn ready_claude_agent(
+    store: &mut Store,
+    project: &str,
+    profile: &str,
+    workspace: &str,
+    now: i64,
+) -> (String, String) {
+    let mut launch = SubmitCommand::new(Ulid::new().to_string(), "launch");
+    launch.args = json!({
+        "project": project,
+        "harness": "claude",
+        "profile": profile,
+        "profile_snapshot": {"harness": "claude", "model": "claude-test-model"},
+        "workspace": workspace,
+    });
+    launch.expected_generation = Some(0);
+    let launch_id = launch.id.clone();
+    let agent = store
+        .submit("owner", launch, now)
+        .expect("admit claude launch")
+        .command
+        .target
+        .expect("claude launch Agent");
+    store
+        .dispatch(&launch_id, now + 1)
+        .expect("dispatch claude launch");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("{project}:ready"),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ready".to_owned(),
+                    native_id: format!("{project}:ready"),
+                    data: json!({
+                        "command_id": launch_id.as_str(),
+                        "native_scope": format!("{project}:{agent}:scope"),
+                        "native_ref": format!("{project}:{agent}:session"),
+                    }),
+                }],
+                cursor: None,
+            },
+            now + 2,
+        )
+        .expect("commit claude session readiness");
+    store
+        .settle(&launch_id, CommandState::Applied, None, now + 3)
+        .expect("settle claude launch");
+    (agent, launch_id)
+}
+
+#[test]
+fn claude_interrupt_passes_admission_and_dispatch_while_other_controls_refuse() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let project = "claude-interrupt-gates";
+    let (agent, _) = ready_claude_agent(
+        &mut store,
+        project,
+        "claude-test",
+        "synthetic-claude-interrupt",
+        now,
+    );
+    let send = send_request(&agent, 1, "run a turn");
+    let send_id = send.id.clone();
+    store.submit("owner", send, now + 5).unwrap();
+    store.dispatch(&send_id, now + 6).unwrap();
+    let turn_id = format!("claude-turn-{}", Ulid::new());
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: Ulid::new().to_string(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "turn.started".to_owned(),
+                    native_id: Ulid::new().to_string(),
+                    data: json!({"command_id":send_id, "turn_id":turn_id}),
+                }],
+                cursor: None,
+            },
+            now + 7,
+        )
+        .expect("commit the claude turn");
+
+    // PR1 connects interrupt for `claude`: it admits against the exact
+    // active turn and dispatches to the plugin's agent.command.
+    let mut control = SubmitCommand::new(Ulid::new().to_string(), "interrupt");
+    control.target = Some(agent.clone());
+    control.expected_generation = Some(1);
+    control.expected_turn_id = Some(turn_id.clone());
+    let control_id = control.id.clone();
+    let admission = store
+        .submit("owner", control, now + 8)
+        .expect("admit claude interrupt");
+    assert_eq!(admission.command.state, CommandState::Accepted);
+    assert_eq!(
+        store
+            .dispatch(&control_id, now + 9)
+            .expect("dispatch claude interrupt")
+            .value
+            .state,
+        CommandState::Dispatched
+    );
+
+    // Steer, approve, deny and answer stay unconnected in PR1.
+    for verb in ["steer", "approve", "deny", "answer"] {
+        let mut control = SubmitCommand::new(Ulid::new().to_string(), verb);
+        control.target = Some(agent.clone());
+        control.expected_generation = Some(1);
+        control.expected_turn_id = Some(turn_id.clone());
+        if verb == "steer" {
+            control.args = json!({"text": "follow-up"});
+        } else {
+            control.request_id = Some(format!("claude-request-{verb}"));
+        }
+        let error = store.submit("owner", control, now + 10).unwrap_err();
+        assert_eq!(error.code, "unsupported", "claude {verb} must refuse");
     }
 }

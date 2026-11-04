@@ -7,6 +7,7 @@ members = [
     "crates/eliot-daemon",
     "plugins/codex",
     "plugins/muse",
+    "plugins/claude",
 ]
 resolver = "3"
 
@@ -22,6 +23,7 @@ eliot-plugin = { path = "crates/eliot-plugin" }
 eliot-daemon = { path = "crates/eliot-daemon" }
 eliot-plugin-codex = { path = "plugins/codex" }
 eliot-plugin-muse = { path = "plugins/muse" }
+eliot-plugin-claude = { path = "plugins/claude" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "io-util", "io-std", "net", "process", "sync", "time", "signal"] }

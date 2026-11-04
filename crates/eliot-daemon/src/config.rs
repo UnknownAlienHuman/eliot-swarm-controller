@@ -960,7 +960,7 @@ fn snapshot_from_entry(
         }
         return Ok(fake_profile_snapshot());
     }
-    if harness != "codex" && harness != "muse" {
+    if harness != "codex" && harness != "muse" && harness != "claude" {
         return Err(profile_field_error(
             source,
             table_offset,
@@ -972,6 +972,9 @@ fn snapshot_from_entry(
     }
     if harness == "muse" {
         return muse_snapshot_from_entry(name, entry, table_offset, source);
+    }
+    if harness == "claude" {
+        return claude_snapshot_from_entry(name, entry, table_offset, source);
     }
     let model = entry
         .model
@@ -1298,6 +1301,169 @@ fn muse_snapshot_from_entry(
     Ok(Value::Object(snapshot))
 }
 
+/// Freeze a Claude profile. The PR1 slice carries an exact model id and a
+/// required explicit native `cmd` (no PATH default: a resolved wrapper would
+/// orphan the real CLI on stop). Permission modes, approvals and reasoning
+/// effort stay rejected until their native mappings land.
+fn claude_snapshot_from_entry(
+    name: &str,
+    entry: &ProfileEntry,
+    table_offset: usize,
+    source: &str,
+) -> core::Result<Value> {
+    let model = entry
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .ok_or_else(|| {
+            profile_field_error(
+                source,
+                table_offset,
+                name,
+                "model",
+                "required non-empty model is missing",
+                "profile_error",
+            )
+        })?;
+    validate_model(name, model, source, table_offset)?;
+    if entry
+        .effort
+        .as_deref()
+        .is_some_and(|effort| !effort.trim().is_empty())
+    {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "effort",
+            "the Claude slice has no reasoning-effort mapping",
+            "unsupported",
+        ));
+    }
+    if entry
+        .approval
+        .as_deref()
+        .is_some_and(|mode| !mode.trim().is_empty())
+    {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "approval",
+            "the Claude slice leaves approvals unconnected",
+            "unsupported",
+        ));
+    }
+    if entry.collaboration_mode.is_some() {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "collaboration_mode",
+            "the Claude slice has no collaboration preset mapping",
+            "unsupported",
+        ));
+    }
+    if entry
+        .permissions
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|permissions| permissions != PERMISSION_WORKSPACE_WRITE)
+    {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "permissions",
+            "the Claude slice runs the CLI-default permission posture",
+            "unsupported",
+        ));
+    }
+    if entry
+        .approval_policy
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|policy| policy != APPROVAL_POLICY_NEVER)
+    {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "approval_policy",
+            "the Claude slice leaves approvals unconnected",
+            "unsupported",
+        ));
+    }
+    let pass_env = match entry.pass_env.as_deref() {
+        Some(names) => validate_pass_env(name, names, source, table_offset)?,
+        None => Vec::new(),
+    };
+    let cmd = match entry.cmd.as_deref() {
+        Some(cmd) => reject_script_wrapper(
+            name,
+            validate_cmd(name, cmd, source, table_offset)?,
+            source,
+            table_offset,
+        )?,
+        None => {
+            return Err(profile_field_error(
+                source,
+                table_offset,
+                name,
+                "cmd",
+                "required explicit cmd is missing",
+                "profile_error",
+            ));
+        }
+    };
+    crate::setup::validate_entries(&entry.setup).map_err(|error| {
+        profile_field_error(
+            source,
+            table_offset,
+            name,
+            "setup",
+            &error.message,
+            "profile_error",
+        )
+    })?;
+    let scratch = normalize_scratch(&entry.scratch).map_err(|error| {
+        profile_field_error(
+            source,
+            table_offset,
+            name,
+            "scratch",
+            &error.message,
+            "profile_error",
+        )
+    })?;
+    let mut snapshot = serde_json::Map::new();
+    snapshot.insert("harness".to_owned(), Value::String("claude".to_owned()));
+    snapshot.insert("cmd".to_owned(), Value::String(cmd));
+    snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
+    snapshot.insert(
+        "permissions".to_owned(),
+        Value::String(PERMISSION_WORKSPACE_WRITE.to_owned()),
+    );
+    snapshot.insert(
+        "approval_policy".to_owned(),
+        Value::String(APPROVAL_POLICY_NEVER.to_owned()),
+    );
+    snapshot.insert(
+        "pass_env".to_owned(),
+        Value::Array(pass_env.into_iter().map(Value::String).collect()),
+    );
+    snapshot.insert("scratch".to_owned(), json!(scratch));
+    if !entry.setup.is_empty() {
+        snapshot.insert(
+            "setup".to_owned(),
+            serde_json::to_value(&entry.setup)
+                .map_err(|_| core::Error::new("profile_error", "setup could not be encoded"))?,
+        );
+    }
+    Ok(Value::Object(snapshot))
+}
+
 fn bind_route_and_capacity(
     profile_name: &str,
     entry: &ProfileEntry,
@@ -1605,8 +1771,9 @@ fn insert_control(
     Ok(())
 }
 
-/// The Muse plugin stops its host by PID, so a script wrapper would leave the
-/// real `muse serve` running; Codex lives in an Agent Job that ends the tree.
+/// The Muse and Claude plugins own their native child by handle, so a script
+/// wrapper would leave the real host/CLI running on stop; Codex lives in an
+/// Agent Job that ends the tree.
 fn reject_script_wrapper(
     profile: &str,
     cmd: String,
@@ -2862,6 +3029,46 @@ pass_env = ["EXAMPLE_API_KEY"]
             "[profiles.muse]\nharness='muse'\nmodel='muse-spark-1.3-contributor'\ncmd='C:/Tools/MuseCode/launch.ps1'\n",
         ] {
             let error = resolve_text_profile(source, "muse").expect_err("must reject");
+            assert_eq!(error.code, "profile_error", "{source}");
+        }
+    }
+
+    #[test]
+    fn claude_profile_freezes_model_and_cmd() {
+        let source = r#"
+[profiles.claude]
+harness = "claude"
+cmd = "C:/Users/test/.local/bin/claude.exe"
+model = "claude-opus-4-6"
+pass_env = ["EXAMPLE_API_KEY"]
+"#;
+        let snapshot = resolve_text_profile(source, "claude").unwrap();
+        assert_eq!(snapshot["harness"], "claude");
+        assert_eq!(snapshot["cmd"], "C:/Users/test/.local/bin/claude.exe");
+        assert_eq!(snapshot["model"], "claude-opus-4-6");
+        assert_eq!(snapshot["permissions"], "workspace-write");
+        assert_eq!(snapshot["approval_policy"], "never");
+        assert_eq!(snapshot["pass_env"], json!(["EXAMPLE_API_KEY"]));
+
+        for source in [
+            "[profiles.claude]\nharness='claude'\n",
+            "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\neffort='high'\n",
+            "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\napproval='promptUnmatched'\n",
+            "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\ncollaboration_mode='plan'\n",
+            "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\npermissions='read-only'\n",
+            "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\napproval_policy='on-request'\n",
+        ] {
+            assert!(resolve_text_profile(source, "claude").is_err(), "{source}");
+        }
+        // No PATH default: an explicit native cmd is required, and script
+        // wrappers are rejected (their PID would orphan the CLI on stop).
+        for source in [
+            "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\n",
+            "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\ncmd='C:/Tools/Claude/claude.cmd'\n",
+            "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\ncmd='C:/Tools/Claude/claude.bat'\n",
+            "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\ncmd='C:/Tools/Claude/launch.ps1'\n",
+        ] {
+            let error = resolve_text_profile(source, "claude").expect_err("must reject");
             assert_eq!(error.code, "profile_error", "{source}");
         }
     }

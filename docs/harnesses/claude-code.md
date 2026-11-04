@@ -1,8 +1,9 @@
 # Claude Code
 
-L6 adapter, after automation/coordination already work on Codex. Start with the
-TypeScript Agent SDK in one per-Agent plugin/native process tree; a later Rust
-stream-json replacement must remove the old executor rather than coexist with it.
+L6 adapter, after automation/coordination already work on Codex. Owner decision
+2026-11-03: a Rust plugin over `claude -p --input-format stream-json
+--output-format stream-json --verbose` in one per-Agent plugin/native process
+tree; no TypeScript Agent SDK, no Node.
 
 ## Sources and unresolved facts
 
@@ -22,14 +23,18 @@ environment; no independent Eliot token without actual isolated environment supp
 
 ## Transport
 
-Use `query({prompt: AsyncIterable<SDKUserMessage>, options})` with exact cwd/model/
-permissions, interrupt and permission callbacks. Arm the message reader before input.
-Verify whether init/session id arrives before input; otherwise declare
-`start_requires_input` and retain separate linked-session/input outcomes.
+Run the installed native `claude` executable with `-p --input-format stream-json
+--output-format stream-json --verbose` and an Eliot-minted `--session-id`; pass
+`--model` for the frozen profile model and `--resume` only for explicit resume.
+Speak NDJSON on stdin/stdout: `control_request` envelopes (`initialize`,
+`set_model`, `set_permission_mode`, `interrupt`) with `request_id` correlation,
+`user` input records whose Eliot-minted `uuid` is the exact turn association,
+and the `command_lifecycle` / `assistant` / `system` / `result` stream records.
+Arm the message reader before input. SessionStart hook lines carry the minted
+session id before any input, so the adapter declares no `start_requires_input`.
 
-The alternative CLI is explicit print/stream-json input/output with resume/session flags,
-not a hidden fallback. Avoid modes that disable required hooks/instructions. Resolve
-Windows executables explicitly; never insert an unrequested shell wrapper.
+Resolve Windows executables explicitly; never insert an unrequested shell wrapper.
+Avoid modes that disable required hooks/instructions.
 
 ## Native mapping
 

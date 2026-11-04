@@ -26,3 +26,13 @@ cmd = "C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe"
 model = "muse-spark-1.3-contributor"
 effort = "medium"
 # approval = "promptUnmatched"
+
+# Claude Code CLI (per-Agent `claude -p` stream-json). Point cmd at the
+# installed native executable, not a wrapper, so stop ends the owned CLI.
+# The model id must exist in the initialize models catalogue; Eliot mints
+# the session id and each turn uuid. Permission modes, approvals, resume
+# and configure land in the follow-up slice.
+[profiles.claude]
+harness = "claude"
+cmd = "C:/Users/test/.local/bin/claude.exe"
+model = "claude-opus-4-6"
