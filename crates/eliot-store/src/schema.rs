@@ -575,7 +575,7 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
-        if current < CURRENT_SCHEMA_VERSION {
+        if current < 22 {
             let tx = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
