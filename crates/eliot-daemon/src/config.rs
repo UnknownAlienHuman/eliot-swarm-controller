@@ -1125,6 +1125,94 @@ fn snapshot_from_entry(
     Ok(Value::Object(snapshot))
 }
 
+/// Validated profile tail shared by the Muse and OpenCode slices: an
+/// explicit pass_env list, a required explicit native `cmd` (no script
+/// wrapper), and validated setup/scratch. Each harness snapshot validates
+/// its own head (model, effort, ...) then folds this tail in.
+struct ProfileTail {
+    pass_env: Vec<String>,
+    cmd: String,
+    scratch: Vec<String>,
+}
+
+fn validate_profile_tail(
+    name: &str,
+    entry: &ProfileEntry,
+    table_offset: usize,
+    source: &str,
+) -> core::Result<ProfileTail> {
+    let pass_env = match entry.pass_env.as_deref() {
+        Some(names) => validate_pass_env(name, names, source, table_offset)?,
+        None => Vec::new(),
+    };
+    let cmd = match entry.cmd.as_deref() {
+        Some(cmd) => reject_script_wrapper(
+            name,
+            validate_cmd(name, cmd, source, table_offset)?,
+            source,
+            table_offset,
+        )?,
+        None => {
+            return Err(profile_field_error(
+                source,
+                table_offset,
+                name,
+                "cmd",
+                "required explicit cmd is missing",
+                "profile_error",
+            ));
+        }
+    };
+    crate::setup::validate_entries(&entry.setup).map_err(|error| {
+        profile_field_error(
+            source,
+            table_offset,
+            name,
+            "setup",
+            &error.message,
+            "profile_error",
+        )
+    })?;
+    let scratch = normalize_scratch(&entry.scratch).map_err(|error| {
+        profile_field_error(
+            source,
+            table_offset,
+            name,
+            "scratch",
+            &error.message,
+            "profile_error",
+        )
+    })?;
+    Ok(ProfileTail {
+        pass_env,
+        cmd,
+        scratch,
+    })
+}
+
+/// Fold the validated tail into the harness snapshot: the required cmd,
+/// pass_env, scratch, and setup (when non-empty).
+fn insert_profile_tail(
+    snapshot: &mut serde_json::Map<String, Value>,
+    tail: ProfileTail,
+    setup: &[crate::setup::SetupEntry],
+) -> core::Result<()> {
+    snapshot.insert("cmd".to_owned(), Value::String(tail.cmd));
+    snapshot.insert(
+        "pass_env".to_owned(),
+        Value::Array(tail.pass_env.into_iter().map(Value::String).collect()),
+    );
+    snapshot.insert("scratch".to_owned(), json!(tail.scratch));
+    if !setup.is_empty() {
+        snapshot.insert(
+            "setup".to_owned(),
+            serde_json::to_value(setup)
+                .map_err(|_| core::Error::new("profile_error", "setup could not be encoded"))?,
+        );
+    }
+    Ok(())
+}
+
 /// Freeze a Muse profile. The PR1 slice carries an explicit model id, a
 /// required explicit native `cmd` (no PATH default: resolving `muse` would
 /// land on the launcher wrapper and orphan the host on stop) and an optional
@@ -1222,51 +1310,9 @@ fn muse_snapshot_from_entry(
             "unsupported",
         ));
     }
-    let pass_env = match entry.pass_env.as_deref() {
-        Some(names) => validate_pass_env(name, names, source, table_offset)?,
-        None => Vec::new(),
-    };
-    let cmd = match entry.cmd.as_deref() {
-        Some(cmd) => reject_script_wrapper(
-            name,
-            validate_cmd(name, cmd, source, table_offset)?,
-            source,
-            table_offset,
-        )?,
-        None => {
-            return Err(profile_field_error(
-                source,
-                table_offset,
-                name,
-                "cmd",
-                "required explicit cmd is missing",
-                "profile_error",
-            ));
-        }
-    };
-    crate::setup::validate_entries(&entry.setup).map_err(|error| {
-        profile_field_error(
-            source,
-            table_offset,
-            name,
-            "setup",
-            &error.message,
-            "profile_error",
-        )
-    })?;
-    let scratch = normalize_scratch(&entry.scratch).map_err(|error| {
-        profile_field_error(
-            source,
-            table_offset,
-            name,
-            "scratch",
-            &error.message,
-            "profile_error",
-        )
-    })?;
+    let tail = validate_profile_tail(name, entry, table_offset, source)?;
     let mut snapshot = serde_json::Map::new();
     snapshot.insert("harness".to_owned(), Value::String("muse".to_owned()));
-    snapshot.insert("cmd".to_owned(), Value::String(cmd));
     snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
     if let Some(effort) = effort {
         snapshot.insert("effort".to_owned(), Value::String(effort.to_owned()));
@@ -1289,18 +1335,7 @@ fn muse_snapshot_from_entry(
         source,
         table_offset,
     )?;
-    snapshot.insert(
-        "pass_env".to_owned(),
-        Value::Array(pass_env.into_iter().map(Value::String).collect()),
-    );
-    snapshot.insert("scratch".to_owned(), json!(scratch));
-    if !entry.setup.is_empty() {
-        snapshot.insert(
-            "setup".to_owned(),
-            serde_json::to_value(&entry.setup)
-                .map_err(|_| core::Error::new("profile_error", "setup could not be encoded"))?,
-        );
-    }
+    insert_profile_tail(&mut snapshot, tail, &entry.setup)?;
     Ok(Value::Object(snapshot))
 }
 
@@ -1539,64 +1574,18 @@ fn opencode_snapshot_from_entry(
             ));
         }
     }
-    let pass_env = match entry.pass_env.as_deref() {
-        Some(names) => validate_pass_env(name, names, source, table_offset)?,
-        None => Vec::new(),
-    };
-    let cmd = match entry.cmd.as_deref() {
-        Some(cmd) => reject_script_wrapper(
-            name,
-            validate_cmd(name, cmd, source, table_offset)?,
-            source,
-            table_offset,
-        )?,
-        None => {
-            return Err(profile_field_error(
-                source,
-                table_offset,
-                name,
-                "cmd",
-                "required explicit cmd is missing",
-                "profile_error",
-            ));
-        }
-    };
-    crate::setup::validate_entries(&entry.setup).map_err(|error| {
-        profile_field_error(
-            source,
-            table_offset,
-            name,
-            "setup",
-            &error.message,
-            "profile_error",
-        )
-    })?;
-    let scratch = normalize_scratch(&entry.scratch).map_err(|error| {
-        profile_field_error(
-            source,
-            table_offset,
-            name,
-            "scratch",
-            &error.message,
-            "profile_error",
-        )
-    })?;
+    let tail = validate_profile_tail(name, entry, table_offset, source)?;
     let mut snapshot = serde_json::Map::new();
     snapshot.insert("harness".to_owned(), Value::String("opencode".to_owned()));
-    snapshot.insert("cmd".to_owned(), Value::String(cmd));
     snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
-    snapshot.insert(
-        "pass_env".to_owned(),
-        Value::Array(pass_env.into_iter().map(Value::String).collect()),
-    );
-    snapshot.insert("scratch".to_owned(), json!(scratch));
-    if !entry.setup.is_empty() {
-        snapshot.insert(
-            "setup".to_owned(),
-            serde_json::to_value(&entry.setup)
-                .map_err(|_| core::Error::new("profile_error", "setup could not be encoded"))?,
-        );
-    }
+    insert_control(
+        &mut snapshot,
+        name,
+        entry.control.as_deref(),
+        source,
+        table_offset,
+    )?;
+    insert_profile_tail(&mut snapshot, tail, &entry.setup)?;
     Ok(Value::Object(snapshot))
 }
 

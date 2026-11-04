@@ -491,7 +491,8 @@ fn readback_error(what: &str, response: &RawResponse) -> Error {
 }
 
 /// Path segments carry only server-issued ids; anything else is refused
-/// before it can reach the URL.
+/// before it can reach the URL. No byte was sent, so this is provably
+/// not dispatched, never unknown.
 fn verified_segment(segment: &str) -> std::result::Result<&str, HttpOutcome> {
     if segment.trim().is_empty()
         || segment.len() > 256
@@ -499,9 +500,9 @@ fn verified_segment(segment: &str) -> std::result::Result<&str, HttpOutcome> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
     {
-        return Err(HttpOutcome::unknown(
-            "OpenCode request carried an invalid identity",
-        ));
+        return Err(HttpOutcome::NotDispatched {
+            reason: "OpenCode request carried an invalid identity".to_owned(),
+        });
     }
     Ok(segment)
 }
@@ -595,7 +596,13 @@ mod tests {
             "ses_abc123.X-9"
         );
         for bad in ["", " ", "a/b", "a?b", "a%b", "ses id", &"x".repeat(257)] {
-            assert!(verified_segment(bad).is_err(), "{bad:?}");
+            assert!(
+                matches!(
+                    verified_segment(bad),
+                    Err(HttpOutcome::NotDispatched { .. })
+                ),
+                "{bad:?}"
+            );
         }
     }
 }

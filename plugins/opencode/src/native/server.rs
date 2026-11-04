@@ -31,7 +31,9 @@ const READINESS_POLL: Duration = Duration::from_millis(250);
 /// The generated per-Agent config: the frozen profile model plus an
 /// explicitly empty MCP set. No permissions, providers, plugins or
 /// credentials: the Agent runs the server defaults, and provider keys can
-/// only arrive through the target environment the host passes.
+/// only arrive through the target environment the host passes (the child
+/// starts from `env_clear` plus the operational minimum below, never the
+/// owner's full environment).
 fn agent_config_json(model: &str) -> String {
     serde_json::json!({
         "$schema": "https://opencode.ai/config.json",
@@ -62,8 +64,12 @@ pub struct OwnedServer {
 impl OwnedServer {
     /// Write the per-Agent config, reserve a loopback port, spawn the
     /// server, and wait for readiness. Any failure leaves no running
-    /// child behind.
-    pub async fn spawn(launch: ServerLaunch, policy: &SecretPolicy) -> Result<Self> {
+    /// child behind. The child environment is closed: `env_clear`, then
+    /// the operational minimum, the target environment the host built,
+    /// the generated password, and the per-Agent XDG roots. The owner's
+    /// full environment is never inherited, however the plugin itself
+    /// was launched.
+    pub async fn spawn(launch: ServerLaunch, secrets: &[String]) -> Result<Self> {
         let config_dir = launch.instance_dir.join("config").join("opencode");
         let data_dir = launch.instance_dir.join("data");
         std::fs::create_dir_all(&config_dir).map_err(|error| {
@@ -107,6 +113,12 @@ impl OwnedServer {
             })?
             .port();
         let password = format!("eliot-{}-{}", ulid::Ulid::new(), ulid::Ulid::new());
+        // The capture policy covers the host secrets plus the generated
+        // password before any pipe is read: a compromised server must not
+        // leak its own credential through the retained tails.
+        let mut capture = secrets.to_vec();
+        capture.push(password.clone());
+        let capture = SecretPolicy::new(capture);
 
         let mut command = Command::new(&launch.program);
         command
@@ -116,6 +128,8 @@ impl OwnedServer {
             .arg("--port")
             .arg(port.to_string())
             .current_dir(&launch.workspace)
+            .env_clear()
+            .envs(minimal_child_environment())
             .envs(launch.environment)
             .env("OPENCODE_PASSWORD", &password)
             .env("XDG_CONFIG_HOME", launch.instance_dir.join("config"))
@@ -127,7 +141,7 @@ impl OwnedServer {
         let mut child = command.spawn().map_err(|error| {
             Error::new(
                 "native_spawn",
-                policy.redact_text(&format!(
+                capture.redact_text(&format!(
                     "could not start the configured OpenCode serve: {error}"
                 )),
             )
@@ -142,9 +156,9 @@ impl OwnedServer {
             .ok_or_else(|| Error::new("native_spawn", "OpenCode serve stderr was not piped"))?;
         // Both pipes drain continuously with the shared redacting tail;
         // stdout carries the `server listening` line and MCP spawn notes.
-        let policy = std::sync::Arc::new(policy.clone());
-        let stdout = spawn_stderr(stdout, policy.clone());
-        let stderr = spawn_stderr(stderr, policy);
+        let capture = std::sync::Arc::new(capture);
+        let stdout = spawn_stderr(stdout, capture.clone());
+        let stderr = spawn_stderr(stderr, capture);
 
         let http = OpenCodeHttp::new(port, password)?;
         let mut server = Self {
@@ -291,6 +305,31 @@ impl OwnedServer {
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Operational minimum every child needs, mirrored from the daemon's
+/// `plugin_host/host.rs` (`minimal_plugin_environment`; keep in sync):
+/// notably `SystemRoot` for Winsock on Windows. Values are operational,
+/// never provider keys, which arrive only via the target environment.
+#[cfg(windows)]
+const BASE_ENVIRONMENT_NAMES: &[&str] = &[
+    "USERPROFILE",
+    "HOME",
+    "LOCALAPPDATA",
+    "SystemRoot",
+    "PATHEXT",
+    "PATH",
+    "TEMP",
+];
+
+#[cfg(not(windows))]
+const BASE_ENVIRONMENT_NAMES: &[&str] = &["HOME", "PATH", "TEMP"];
+
+fn minimal_child_environment() -> Vec<(OsString, OsString)> {
+    BASE_ENVIRONMENT_NAMES
+        .iter()
+        .filter_map(|name| std::env::var_os(name).map(|value| (OsString::from(*name), value)))
+        .collect()
+}
+
 /// Our config document path must appear among the effective documents:
 /// this proves the server honors the per-Agent `XDG_CONFIG_HOME` and is
 /// not serving the owner's global config.
@@ -301,19 +340,8 @@ fn serves_our_config(config_dir: &Path, documents: &[crate::native::types::Confi
             && entry
                 .path
                 .as_deref()
-                .is_some_and(|path| paths_equal(Path::new(path), &wanted))
+                .is_some_and(|path| crate::host::paths_equal(Path::new(path), &wanted))
     })
-}
-
-fn paths_equal(left: &Path, right: &Path) -> bool {
-    let left = std::fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
-    let right = std::fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
-    if cfg!(windows) {
-        left.to_string_lossy()
-            .eq_ignore_ascii_case(&right.to_string_lossy())
-    } else {
-        left == right
-    }
 }
 
 #[cfg(test)]

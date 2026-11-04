@@ -503,6 +503,7 @@ async fn route(
         }
         if method == "POST" && tail == "/prompt" {
             if fixture.script.prompt_drop {
+                fixture.log_marker(0).await;
                 return None;
             }
             if fixture.script.prompt_status != 200 {
@@ -511,6 +512,7 @@ async fn route(
                     "message": "scripted prompt refusal",
                     "kind": "Payload",
                 });
+                fixture.log_marker(0).await;
                 return Some((fixture.script.prompt_status, payload.to_string()));
             }
             let request: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
@@ -532,6 +534,7 @@ async fn route(
                 // Admit the input, then lose the stream before any
                 // association fact flows: the send must settle unknown.
                 let _ = fixture.sse_close.send(());
+                fixture.log_marker(0).await;
                 let payload = json!({"data": {
                     "id": inbox_id,
                     "sessionID": id,
@@ -547,7 +550,7 @@ async fn route(
             let delivered_seq = next_seq(fixture, id).await;
             let terminal_seq = next_seq(fixture, id).await;
             let started_id = format!("evt_{id}_started_{enqueued_seq}");
-            for envelope in [
+            let envelopes = [
                 json!({
                     "id": format!("evt_{id}_enqueued_{enqueued_seq}"),
                     "created": 2000,
@@ -571,9 +574,12 @@ async fn route(
                     "durable": {"aggregateID": id, "seq": delivered_seq, "version": 1},
                 }),
                 terminal_envelope(fixture, id, terminal_seq),
-            ] {
+            ];
+            let emitted = envelopes.len();
+            for envelope in envelopes {
                 let _ = fixture.events.send(envelope.to_string());
             }
+            fixture.log_marker(emitted).await;
             let payload = json!({"data": {
                 "id": inbox_id,
                 "sessionID": id,
@@ -692,6 +698,21 @@ impl Fixture {
         };
         let _ = file.write_all(format!("{entry}\n").as_bytes());
     }
+
+    /// Quiesce marker for the prompt handler: proves the handler ran and how
+    /// many SSE envelopes it emitted, so the test drains deterministically.
+    async fn log_marker(&self, emitted: usize) {
+        use std::io::Write;
+        let entry = json!({"marker": "prompt-quiesced", "emitted": emitted});
+        let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log_path)
+        else {
+            return;
+        };
+        let _ = file.write_all(format!("{entry}\n").as_bytes());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -708,6 +729,24 @@ struct Host {
     next_seq: i64,
     child: tokio::process::Child,
     stderr: Option<tokio::task::JoinHandle<String>>,
+    /// Fake server request log: quiesce markers are polled from here.
+    log: PathBuf,
+}
+
+/// What proves the plugin is quiescent after the call response arrived.
+/// No fixed sleeps: every drain ends on a causal signal.
+#[derive(Clone, Copy)]
+enum Quiesce {
+    /// Drain inbound until this commit kind arrives (bounded by OP_TIMEOUT).
+    UntilKind(&'static str),
+    /// The fake logged its prompt marker for this call and the plugin emits
+    /// nothing for it: wait for a marker past the pre-call log end, assert
+    /// it emitted nothing, then inbound must already be empty.
+    SilenceAfterMarker,
+    /// No fake I/O and no plugin output are possible for this call, so
+    /// inbound must already be empty. Used for replays (no second write),
+    /// reads, local validation, and calls after a full drain.
+    SilenceNow,
 }
 
 struct HostRequest {
@@ -824,6 +863,7 @@ impl Host {
             next_seq: 1,
             child,
             stderr: Some(stderr_task),
+            log: root.join("requests.jsonl"),
         }
     }
 
@@ -834,13 +874,16 @@ impl Host {
     /// Pump one host call, acking every inbound batch while it is in
     /// flight. Native commits may land on either side of the response, so
     /// the pumped `(kind, data)` pairs return with the outcome and the
-    /// scenario asserts on both.
+    /// scenario asserts on both. After the response, `quiesce` proves the
+    /// plugin emitted everything it will for this call.
     async fn pump_call(
         &mut self,
         method: &str,
         params: Value,
         timeout: Duration,
+        quiesce: Quiesce,
     ) -> (Result<Value, String>, Vec<(String, Value)>) {
+        let log_lines = log_line_count(&self.log);
         let rx = self.begin_call(method, params).await;
         // One deadline for the whole call: inbound traffic and the response
         // share it, so a legitimately slow call (the lost-reply script)
@@ -853,17 +896,9 @@ impl Host {
                 biased;
                 request = tokio::time::timeout_at(deadline, self.inbound.recv()) => {
                     match request {
-                        Ok(Some(request)) => match request.method.as_str() {
-                            "events.put" => committed.push(ack_events_put(self, &request).await),
-                            "source.gap" => {
-                                let gap_id = request.params.get("gap_id").and_then(Value::as_str).unwrap_or_default().to_owned();
-                                let seq = self.next_seq;
-                                self.next_seq += 1;
-                                self.respond(&request.id, json!({"gap_id": gap_id, "seq": seq})).await;
-                                committed.push(("source.gap".to_owned(), request.params));
-                            }
-                            other => panic!("unexpected host request during {method}: {other}"),
-                        },
+                        Ok(Some(request)) => {
+                            committed.push(ack_inbound(self, &request, method).await);
+                        }
                         Ok(None) => panic!("plugin request channel closed during {method}"),
                         Err(_) => break (&mut rx).await,
                     }
@@ -874,34 +909,47 @@ impl Host {
         let outcome = outcome
             .expect("host call deadline")
             .expect("host response channel");
-        // Drain any commit that raced the response onto the wire after it.
-        while let Ok(request) =
-            tokio::time::timeout(Duration::from_millis(200), self.inbound.recv()).await
-        {
-            let Some(request) = request else { break };
-            match request.method.as_str() {
-                "events.put" => committed.push(ack_events_put(self, &request).await),
-                "source.gap" => {
-                    let gap_id = request
-                        .params
-                        .get("gap_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned();
-                    let seq = self.next_seq;
-                    self.next_seq += 1;
-                    self.respond(&request.id, json!({"gap_id": gap_id, "seq": seq}))
-                        .await;
-                    committed.push(("source.gap".to_owned(), request.params));
+        match quiesce {
+            Quiesce::UntilKind(kind) => {
+                // Commits causally after the response (the terminal pair
+                // follows `applied`): drain until the terminal kind lands.
+                while committed.last().map(|(kind, _)| kind.as_str()) != Some(kind) {
+                    let request = tokio::time::timeout(OP_TIMEOUT, self.inbound.recv())
+                        .await
+                        .expect("quiescent commit deadline")
+                        .expect("plugin request channel");
+                    committed.push(ack_inbound(self, &request, method).await);
                 }
-                other => panic!("unexpected host request racing {method}: {other}"),
+            }
+            Quiesce::SilenceAfterMarker => {
+                // The refused/dropped prompt emits nothing natively: the
+                // fake marker proves the handler ran without emitting, so
+                // inbound must already be empty.
+                let marker = wait_for_prompt_marker(&self.log, log_lines, timeout).await;
+                assert_eq!(
+                    marker.get("emitted").and_then(Value::as_u64),
+                    Some(0),
+                    "refused prompt emits no envelopes: {marker}"
+                );
+                assert!(
+                    self.inbound.try_recv().is_err(),
+                    "expected no commits during {method}"
+                );
+            }
+            Quiesce::SilenceNow => {
+                assert!(
+                    self.inbound.try_recv().is_err(),
+                    "expected no commits during {method}"
+                );
             }
         }
         (outcome, committed)
     }
 
     async fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
-        let (outcome, committed) = self.pump_call(method, params, OP_TIMEOUT).await;
+        let (outcome, committed) = self
+            .pump_call(method, params, OP_TIMEOUT, Quiesce::SilenceNow)
+            .await;
         assert!(
             committed.is_empty(),
             "expected no commits during {method}: {committed:?}"
@@ -946,6 +994,56 @@ impl Host {
 }
 
 /// Ack one `events.put` batch, returning its single `(kind, data)`.
+/// Ack one inbound plugin request during a pumped call, returning its
+/// committed `(kind, data)` pair.
+async fn ack_inbound(host: &mut Host, request: &HostRequest, method: &str) -> (String, Value) {
+    match request.method.as_str() {
+        "events.put" => ack_events_put(host, request).await,
+        "source.gap" => {
+            let gap_id = request
+                .params
+                .get("gap_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let seq = host.next_seq;
+            host.next_seq += 1;
+            host.respond(&request.id, json!({"gap_id": gap_id, "seq": seq}))
+                .await;
+            ("source.gap".to_owned(), request.params.clone())
+        }
+        other => panic!("unexpected host request during {method}: {other}"),
+    }
+}
+
+fn log_line_count(log: &Path) -> usize {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .count()
+}
+
+/// Wait for the fake's prompt marker past `after_lines`: the fixture proves
+/// its prompt handler ran (and how many envelopes it emitted) instead of
+/// the test guessing with a sleep.
+async fn wait_for_prompt_marker(log: &Path, after_lines: usize, timeout: Duration) -> Value {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let text = std::fs::read_to_string(log).unwrap_or_default();
+        for line in text.lines().skip(after_lines) {
+            if let Ok(entry) = serde_json::from_str::<Value>(line)
+                && entry.get("marker").and_then(Value::as_str) == Some("prompt-quiesced")
+            {
+                return entry;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("fake prompt marker did not arrive");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 async fn ack_events_put(host: &mut Host, request: &HostRequest) -> (String, Value) {
     let events = request
         .params
@@ -984,6 +1082,7 @@ struct PendingStart {
 }
 
 struct FailedAttempt {
+    root: PathBuf,
     host: Host,
     params: Value,
 }
@@ -1216,6 +1315,7 @@ impl PendingStart {
             .expect("agent.start response channel");
         assert_eq!(outcome, Err(expected_code.to_owned()));
         FailedAttempt {
+            root: self.root,
             host: self.host,
             params: self.params,
         }
@@ -1306,6 +1406,7 @@ async fn send_turn(scenario: &mut Scenario, text: &str) -> (String, String, Vec<
                 "request_id": null,
             }),
             OP_TIMEOUT,
+            Quiesce::UntilKind("turn.completed"),
         )
         .await;
     let applied = outcome.expect("send applies");
@@ -1336,6 +1437,7 @@ async fn stop_agent(scenario: &mut Scenario, force: bool) -> Vec<(String, Value)
                 "force": force,
             }),
             OP_TIMEOUT,
+            Quiesce::UntilKind("session.ended"),
         )
         .await;
     let stopped = outcome.expect("stop applies");
@@ -1534,6 +1636,29 @@ async fn scenario_model_mismatch_is_rejected_before_ready() {
     let (pending, rx) = Scenario::setup_start(&script, opencode_profile(), agent_id, 1).await;
     let mut failed = pending.finish_expecting_error(rx, "profile_error").await;
     failed.retry("profile_error").await;
+    // The readback mismatch best-effort deletes the created session: the
+    // fake saw the native close for exactly one created session.
+    let text = std::fs::read_to_string(failed.root.join("requests.jsonl")).unwrap_or_default();
+    let mut creates = 0;
+    let mut deletes = 0;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let entry: Value = serde_json::from_str(line).expect("request log JSON");
+        let method = entry
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let path = entry
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if method == "POST" && path == "/api/session" {
+            creates += 1;
+        }
+        if method == "DELETE" && path.starts_with("/api/session/") {
+            deletes += 1;
+        }
+    }
+    assert_eq!((creates, deletes), (1, 1));
 }
 
 async fn scenario_location_mismatch_is_rejected_before_ready() {
@@ -1562,10 +1687,17 @@ async fn scenario_prompt_400_is_rejected_without_rewrite() {
         "turn_id": null,
         "request_id": null,
     });
-    for _ in 0..2 {
+    for attempt in 0..2 {
+        // The first prompt hits the fake (its marker proves it emitted
+        // nothing); the replay sends no second write.
+        let quiesce = if attempt == 0 {
+            Quiesce::SilenceAfterMarker
+        } else {
+            Quiesce::SilenceNow
+        };
         let (outcome, committed) = scenario
             .host
-            .pump_call("agent.command", params.clone(), OP_TIMEOUT)
+            .pump_call("agent.command", params.clone(), OP_TIMEOUT, quiesce)
             .await;
         let rejected = outcome.expect("rejected prompt answers");
         assert_eq!(
@@ -1607,14 +1739,19 @@ async fn scenario_lost_prompt_reply_is_unknown_without_rewrite() {
     });
     let (outcome, committed) = scenario
         .host
-        .pump_call("agent.command", params.clone(), OP_TIMEOUT)
+        .pump_call(
+            "agent.command",
+            params.clone(),
+            OP_TIMEOUT,
+            Quiesce::SilenceAfterMarker,
+        )
         .await;
     assert_eq!(outcome, Err("unknown".to_owned()));
     assert!(committed.is_empty());
     // The replay is unknown without new native I/O.
     let (outcome, _) = scenario
         .host
-        .pump_call("agent.command", params, OP_TIMEOUT)
+        .pump_call("agent.command", params, OP_TIMEOUT, Quiesce::SilenceNow)
         .await;
     assert_eq!(outcome, Err("unknown".to_owned()));
     let prompts = scenario
@@ -1631,7 +1768,12 @@ async fn scenario_lost_prompt_reply_is_unknown_without_rewrite() {
     // Shutdown ends the unstopped generation, so it commits session.ended.
     let (outcome, committed) = scenario
         .host
-        .pump_call("shutdown", json!({}), OP_TIMEOUT)
+        .pump_call(
+            "shutdown",
+            json!({}),
+            OP_TIMEOUT,
+            Quiesce::UntilKind("session.ended"),
+        )
         .await;
     assert_eq!(
         outcome
@@ -1757,6 +1899,7 @@ async fn scenario_sse_loss_during_send_gaps() {
                 "request_id": null,
             }),
             OP_TIMEOUT,
+            Quiesce::UntilKind("source.gap"),
         )
         .await;
     assert_eq!(outcome, Err("unknown".to_owned()));
@@ -1789,7 +1932,12 @@ async fn scenario_sse_loss_during_send_gaps() {
     // Shutdown ends the unstopped generation, so it commits session.ended.
     let (outcome, committed) = scenario
         .host
-        .pump_call("shutdown", json!({}), OP_TIMEOUT)
+        .pump_call(
+            "shutdown",
+            json!({}),
+            OP_TIMEOUT,
+            Quiesce::UntilKind("session.ended"),
+        )
         .await;
     assert_eq!(
         outcome

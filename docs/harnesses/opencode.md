@@ -37,7 +37,7 @@ Catalogue preflight may retry only before any session/input may have been admitt
 | steer | exact-current-execution method only; queueing another prompt is not steer |
 | inject | verified safe point or explicit next-send prepend |
 | interrupt | captured session/execution abort, with installed child scope verified |
-| stop | installed `DELETE /api/session/{id}` (`204` removed, `404` already gone) plus a `404` session readback proving the session is gone, then the owned per-Agent server ends through the generation's process custody; abort-plus-detach is **not** stop (PR1, fake-server verified) |
+| stop | installed `DELETE /api/session/{id}` (`204` removed, `404` already gone) plus a `404` session readback proving the session is gone, then the owned per-Agent server ends through the generation's process custody; stop ends the directly spawned `serve` child while the generation Job owns any descendants it spawned; abort-plus-detach is **not** stop (PR1, fake-server verified) |
 | detach | explicitly stop controlling/observing as defined, leaving native service/session alive |
 | resume | installed exact native session reattachment/resume; no old input replay |
 | approve/deny/answer | exact native permission/input id and offered response schema |

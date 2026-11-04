@@ -4,14 +4,16 @@
 //! comment heartbeats (`: heartbeat`), and blank-line dispatch. Only
 //! `data:` payloads are surfaced; `event:`/`id:`/`retry:` fields are
 //! ignored because the envelope carries its own `id` and `type`.
-//! A payload larger than [`MAX_SSE_BYTES`] ends the stream as malformed
+//! A payload larger than [`MAX_SSE_BYTES`], a line that never terminates
+//! within that bound, or a non-UTF-8 line ends the stream as malformed
 //! rather than growing without bound.
 
 use crate::native::types::SseEnvelope;
 
 /// Largest single SSE payload accepted before the stream is declared
 /// malformed. Envelopes are small control records; message bodies travel
-/// over the readback endpoints, never the stream.
+/// over the readback endpoints, never the stream. The same bound caps one
+/// unterminated line in the pending buffer.
 pub const MAX_SSE_BYTES: usize = 256 * 1024;
 
 /// One parsed stream item: either an envelope or a malformed payload
@@ -27,7 +29,7 @@ pub enum SseFrame {
 pub struct SseParser {
     buffer: Vec<u8>,
     data: Vec<String>,
-    oversize: bool,
+    spent: bool,
 }
 
 impl SseParser {
@@ -39,6 +41,9 @@ impl SseParser {
     /// After [`SseFrame::Malformed`] the parser is spent and yields nothing
     /// further.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<SseFrame> {
+        if self.spent {
+            return Vec::new();
+        }
         let mut frames = Vec::new();
         self.buffer.extend_from_slice(bytes);
         while let Some(end) = find_line_end(&self.buffer) {
@@ -51,14 +56,17 @@ impl SseParser {
             let line = raw
                 .strip_suffix(b"\r")
                 .map_or(raw.as_slice(), |stripped| stripped);
-            if self.oversize {
-                // The stream is already declared malformed; discard the rest.
-                continue;
-            }
             if line.is_empty() {
                 if let Some(frame) = self.dispatch() {
                     frames.push(frame);
                 }
+                continue;
+            }
+            if std::str::from_utf8(line).is_err() {
+                // The stream framing is byte-oriented, but every line the
+                // installed server sends is UTF-8; anything else is
+                // corruption, never a skippable line.
+                self.declare_malformed(&mut frames);
                 continue;
             }
             if line.starts_with(b":") {
@@ -71,14 +79,28 @@ impl SseParser {
                 continue;
             }
             if self.data_bytes().saturating_add(field.value.len()) > MAX_SSE_BYTES {
-                self.oversize = true;
-                self.data.clear();
-                frames.push(SseFrame::Malformed);
+                self.declare_malformed(&mut frames);
                 continue;
             }
             self.data.push(field.value);
         }
+        if find_line_end(&self.buffer).is_none() && self.buffer.len() > MAX_SSE_BYTES {
+            // An unterminated line past the bound: the stream will never
+            // produce a parseable line from this buffer again.
+            self.declare_malformed(&mut frames);
+        }
         frames
+    }
+
+    /// Declare the stream malformed exactly once and discard the rest.
+    fn declare_malformed(&mut self, frames: &mut Vec<SseFrame>) {
+        if self.spent {
+            return;
+        }
+        self.spent = true;
+        self.data.clear();
+        self.buffer.clear();
+        frames.push(SseFrame::Malformed);
     }
 
     fn data_bytes(&self) -> usize {
@@ -188,5 +210,43 @@ mod tests {
         let mut parser = SseParser::new();
         let frames = feed_all(&mut parser, &[b"data: {\"id\":\"\",\"type\":\"t\"}\n\n"]);
         assert_eq!(frames, vec![SseFrame::Malformed]);
+    }
+
+    #[test]
+    fn unterminated_line_past_the_bound_is_malformed_and_spent() {
+        let mut parser = SseParser::new();
+        // 300 KiB with no newline, fed in two chunks: the pending buffer
+        // must trip the bound instead of growing without limit.
+        let line = "x".repeat(300 * 1024);
+        let frames = feed_all(
+            &mut parser,
+            &[
+                &line.as_bytes()[..200 * 1024],
+                &line.as_bytes()[200 * 1024..],
+            ],
+        );
+        assert_eq!(frames, vec![SseFrame::Malformed]);
+        let later = feed_all(
+            &mut parser,
+            &[b"data: {\"id\":\"evt_1\",\"type\":\"t\",\"data\":{}}\n\n"],
+        );
+        assert!(later.is_empty());
+    }
+
+    #[test]
+    fn non_utf8_lines_are_malformed_not_dropped() {
+        for chunk in [
+            b"data: \xff\xfe invalid\n\n".as_slice(),
+            b": \xff heartbeat\n\n".as_slice(),
+        ] {
+            let mut parser = SseParser::new();
+            let frames = feed_all(&mut parser, &[chunk]);
+            assert_eq!(frames, vec![SseFrame::Malformed], "{chunk:?}");
+            let later = feed_all(
+                &mut parser,
+                &[b"data: {\"id\":\"evt_1\",\"type\":\"t\",\"data\":{}}\n\n"],
+            );
+            assert!(later.is_empty());
+        }
     }
 }

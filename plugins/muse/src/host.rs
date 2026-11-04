@@ -26,7 +26,11 @@ use eliot_core::{Error, ProcessRecord, ProcessState, Result, SecretPolicy};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
-    protocol::{MAX_COMMAND_ID_BYTES, MAX_CREDENTIAL_BYTES},
+    protocol::MAX_CREDENTIAL_BYTES,
+    session::{
+        TargetEnvironment, target_environment, unknown_snapshot, validate_binding,
+        validate_identity,
+    },
 };
 use serde_json::{Value, json};
 use std::{
@@ -101,11 +105,6 @@ enum ControlOutcome {
     Applied(Value),
     Rejected(Value),
     Unknown,
-}
-
-struct TargetEnvironment {
-    variables: Vec<(OsString, OsString)>,
-    secrets: Vec<String>,
 }
 
 struct ResumeSubject {
@@ -256,7 +255,12 @@ impl MusePlugin {
 
     async fn start(&mut self, raw: &Value, peer: &PeerClient) -> Result<Value> {
         let params: AgentStartParams = decode(raw, "Muse agent.start params are invalid")?;
-        validate_identity(&params.agent_id, params.generation, &params.command_id)?;
+        validate_identity(
+            &params.agent_id,
+            params.generation,
+            &params.command_id,
+            "Muse",
+        )?;
         if let Some(session) = &self.session {
             if session.agent_id == params.agent_id
                 && session.generation == params.generation
@@ -386,7 +390,11 @@ impl MusePlugin {
         let TargetEnvironment {
             variables: environment,
             mut secrets,
-        } = target_environment(params.target_environment.as_ref(), profile.get("pass_env"))?;
+        } = target_environment(
+            params.target_environment.as_ref(),
+            profile.get("pass_env"),
+            "Muse",
+        )?;
         secrets.push(initialized.credential.clone());
         // Sandbox posture is fixed at host birth (`muse serve` flags) and stays
         // the host default until a permissions mapping lands; approval mode is
@@ -1166,7 +1174,12 @@ impl MusePlugin {
 
     async fn command(&mut self, raw: &Value) -> Result<Value> {
         let params: AgentCommandParams = decode(raw, "Muse agent.command params are invalid")?;
-        validate_identity(&params.agent_id, params.generation, &params.command_id)?;
+        validate_identity(
+            &params.agent_id,
+            params.generation,
+            &params.command_id,
+            "Muse",
+        )?;
         match params.verb.as_str() {
             "send" => self.send_command(params).await,
             "steer" => self.steer_command(params).await,
@@ -1184,7 +1197,13 @@ impl MusePlugin {
             .session
             .as_mut()
             .ok_or_else(|| Error::new("bad_state", "Muse Agent session has not started"))?;
-        validate_binding(session, &params.agent_id, params.generation)?;
+        validate_binding(
+            &session.agent_id,
+            session.generation,
+            &params.agent_id,
+            params.generation,
+            "Muse",
+        )?;
         if session.phase != SessionPhase::Ready {
             return Err(Error::new(
                 "unknown",
@@ -1357,7 +1376,13 @@ impl MusePlugin {
             .session
             .as_mut()
             .ok_or_else(|| Error::new("bad_state", "Muse Agent session has not started"))?;
-        validate_binding(session, &params.agent_id, params.generation)?;
+        validate_binding(
+            &session.agent_id,
+            session.generation,
+            &params.agent_id,
+            params.generation,
+            "Muse",
+        )?;
         if params.request_id.is_some() {
             return Err(Error::new(
                 "invalid",
@@ -1499,7 +1524,13 @@ impl MusePlugin {
             .session
             .as_mut()
             .ok_or_else(|| Error::new("bad_state", "Muse Agent session has not started"))?;
-        validate_binding(session, &params.agent_id, params.generation)?;
+        validate_binding(
+            &session.agent_id,
+            session.generation,
+            &params.agent_id,
+            params.generation,
+            "Muse",
+        )?;
         let turn_id = params
             .turn_id
             .as_deref()
@@ -1633,7 +1664,13 @@ impl MusePlugin {
             .session
             .as_mut()
             .ok_or_else(|| Error::new("bad_state", "Muse Agent session has not started"))?;
-        validate_binding(session, &params.agent_id, params.generation)?;
+        validate_binding(
+            &session.agent_id,
+            session.generation,
+            &params.agent_id,
+            params.generation,
+            "Muse",
+        )?;
         let turn_id = params
             .turn_id
             .as_deref()
@@ -1715,12 +1752,23 @@ impl MusePlugin {
 
     async fn snapshot(&mut self, raw: &Value) -> Result<Value> {
         let params: AgentSnapshotParams = decode(raw, "Muse agent.snapshot params are invalid")?;
-        validate_identity(&params.agent_id, params.generation, &params.command_id)?;
+        validate_identity(
+            &params.agent_id,
+            params.generation,
+            &params.command_id,
+            "Muse",
+        )?;
         let session = self
             .session
             .as_mut()
             .ok_or_else(|| Error::new("not_found", "Muse Agent session is not retained"))?;
-        validate_binding(session, &params.agent_id, params.generation)?;
+        validate_binding(
+            &session.agent_id,
+            session.generation,
+            &params.agent_id,
+            params.generation,
+            "Muse",
+        )?;
         if session.stop_command_id.as_deref() == Some(params.command_id.as_str())
             && session.phase == SessionPhase::Stopped
             && params.turn_id.is_none()
@@ -1831,12 +1879,23 @@ impl MusePlugin {
 
     async fn stop(&mut self, raw: &Value) -> Result<Value> {
         let params: AgentStopParams = decode(raw, "Muse agent.stop params are invalid")?;
-        validate_identity(&params.agent_id, params.generation, &params.command_id)?;
+        validate_identity(
+            &params.agent_id,
+            params.generation,
+            &params.command_id,
+            "Muse",
+        )?;
         let session = self
             .session
             .as_mut()
             .ok_or_else(|| Error::new("not_found", "Muse Agent session is not retained"))?;
-        validate_binding(session, &params.agent_id, params.generation)?;
+        validate_binding(
+            &session.agent_id,
+            session.generation,
+            &params.agent_id,
+            params.generation,
+            "Muse",
+        )?;
         if session.phase == SessionPhase::Stopped
             && session.stop_command_id.as_deref() == Some(params.command_id.as_str())
         {
@@ -2488,20 +2547,6 @@ fn session_state(session: &NativeSession) -> &'static str {
     }
 }
 
-fn unknown_snapshot(params: &AgentSnapshotParams, reason: &str) -> Result<Value> {
-    Ok(json!({
-        "agent_id": params.agent_id,
-        "generation": params.generation,
-        "command_id": params.command_id,
-        "state": "unknown",
-        "active_turn": null,
-        "last_turn": null,
-        "source_unknown": true,
-        "result_known": false,
-        "reason": reason,
-    }))
-}
-
 /// Adopt a resume late-joiner pointer set. The observation counter is
 /// captured before the pull, the pulled full params are described
 /// (shape-validated; turn liveness is checked when the event path applies
@@ -2638,30 +2683,6 @@ fn abandon_control(session: &mut AgentSession, command_id: &str) {
     session.control_commands.remove(command_id);
 }
 
-fn validate_binding(session: &AgentSession, agent_id: &str, generation: i64) -> Result<()> {
-    if session.agent_id != agent_id || session.generation != generation {
-        return Err(Error::new(
-            "stale_generation",
-            "Muse request does not match the bound Agent generation",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_identity(agent_id: &str, generation: i64, command_id: &str) -> Result<()> {
-    if agent_id.trim().is_empty()
-        || generation <= 0
-        || command_id.trim().is_empty()
-        || command_id.len() > MAX_COMMAND_ID_BYTES
-    {
-        return Err(Error::new(
-            "invalid",
-            "Muse request requires a bounded Agent, generation, and command identity",
-        ));
-    }
-    Ok(())
-}
-
 fn validate_source_plan(source_plan: Option<&Value>) -> Result<()> {
     let Some(plan) = source_plan.and_then(Value::as_object) else {
         return Err(Error::new(
@@ -2681,12 +2702,14 @@ fn validate_source_plan(source_plan: Option<&Value>) -> Result<()> {
     Ok(())
 }
 
+/// Shared contextual error, kept under the local path for the
+/// `native::client` test that pins `crate::host::contextual_error`.
 pub(crate) fn contextual_error(
     error: Error,
     code: impl Into<String>,
     message: impl Into<String>,
 ) -> Error {
-    error.with_code(code).with_message(message)
+    eliot_plugin::session::contextual_error(error, code, message)
 }
 
 fn optional_profile_text(
@@ -2701,61 +2724,6 @@ fn optional_profile_text(
             format!("Muse profile field {key} must be a non-empty string"),
         )),
     }
-}
-
-fn target_environment(
-    environment: Option<&Value>,
-    pass_env: Option<&Value>,
-) -> Result<TargetEnvironment> {
-    let Some(environment) = environment else {
-        return Ok(TargetEnvironment {
-            variables: Vec::new(),
-            secrets: Vec::new(),
-        });
-    };
-    let object = environment
-        .as_object()
-        .ok_or_else(|| Error::new("profile_error", "Muse target_environment must be an object"))?;
-    let pass_env = pass_env.and_then(Value::as_array);
-    let mut vars = Vec::with_capacity(object.len());
-    let mut secrets = Vec::new();
-    for (name, value) in object {
-        if name.is_empty() || name.contains('=') || name.contains('\0') {
-            return Err(Error::new(
-                "profile_error",
-                "Muse environment contains an invalid variable name",
-            ));
-        }
-        let value = value.as_str().ok_or_else(|| {
-            Error::new("profile_error", "Muse environment values must be strings")
-        })?;
-        let explicitly_passed = pass_env.is_some_and(|names| {
-            names.iter().filter_map(Value::as_str).any(|passed| {
-                if cfg!(windows) {
-                    name.eq_ignore_ascii_case(passed)
-                } else {
-                    name == passed
-                }
-            })
-        });
-        if (is_secret_name(name) || explicitly_passed) && !value.is_empty() {
-            secrets.push(value.to_owned());
-        }
-        vars.push((OsString::from(name), OsString::from(value)));
-    }
-    Ok(TargetEnvironment {
-        variables: vars,
-        secrets,
-    })
-}
-
-fn is_secret_name(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    upper.contains("TOKEN")
-        || upper.contains("SECRET")
-        || upper.contains("PASSWORD")
-        || upper.contains("API_KEY")
-        || upper.contains("AUTH")
 }
 
 fn paths_equal(left: &Path, right: &Path) -> bool {
