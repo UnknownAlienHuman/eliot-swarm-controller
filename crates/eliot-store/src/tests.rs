@@ -9193,7 +9193,7 @@ fn muse_unknown_resume_is_never_redriven() {
 }
 
 #[test]
-fn muse_request_replies_pass_admission_and_dispatch_while_turn_controls_wait() {
+fn muse_replies_and_turn_controls_pass_admission_and_dispatch() {
     let mut store = Store::open(Path::new(":memory:")).expect("open Store");
     let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
     let project = "muse-request-replies";
@@ -9284,22 +9284,28 @@ fn muse_request_replies_pass_admission_and_dispatch_while_turn_controls_wait() {
         );
     }
 
-    // Steer and interrupt stay unsupported for `muse` until A2 connects the
-    // exact-current-turn native controls.
+    // A2 connects steer/interrupt for `muse`: each admits against the exact
+    // active turn and dispatches to the plugin's agent.command.
     for verb in ["steer", "interrupt"] {
         let mut control = SubmitCommand::new(Ulid::new().to_string(), verb);
         control.target = Some(agent.clone());
         control.expected_generation = Some(1);
         control.expected_turn_id = Some(turn_id.clone());
         if verb == "steer" {
-            control.args = json!({"text": "not yet connected"});
+            control.args = json!({"text": "follow-up"});
         }
+        let control_id = control.id.clone();
+        let admission = store
+            .submit("owner", control, now + 11)
+            .unwrap_or_else(|error| panic!("admit muse {verb}: {error:?}"));
+        assert_eq!(admission.command.state, CommandState::Accepted);
         assert_eq!(
             store
-                .submit("owner", control, now + 11)
-                .expect_err("muse turn control waits for A2")
-                .code,
-            "unsupported"
+                .dispatch(&control_id, now + 12)
+                .unwrap_or_else(|error| panic!("dispatch muse {verb}: {error:?}"))
+                .value
+                .state,
+            CommandState::Dispatched
         );
     }
 }

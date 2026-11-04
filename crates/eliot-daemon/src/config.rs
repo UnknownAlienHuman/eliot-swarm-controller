@@ -283,6 +283,8 @@ struct ProfileEntry {
     #[serde(default)]
     effort: Option<String>,
     #[serde(default)]
+    approval: Option<String>,
+    #[serde(default)]
     collaboration_mode: Option<String>,
     #[serde(default)]
     permissions: Option<String>,
@@ -857,6 +859,7 @@ fn snapshot_from_entry(
             || entry.collaboration_mode.is_some()
             || entry.permissions.is_some()
             || entry.approval_policy.is_some()
+            || entry.approval.is_some()
             || entry.pass_env.is_some()
             || !entry.setup.is_empty()
             || entry.scratch != default_scratch()
@@ -1065,6 +1068,22 @@ fn muse_snapshot_from_entry(
             "profile_error",
         ));
     }
+    let approval = entry.approval.as_deref().map(str::trim);
+    if approval.is_some_and(|mode| {
+        !matches!(
+            mode,
+            "allowAll" | "promptUnmatched" | "onRequest" | "denyUnmatched"
+        )
+    }) {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "approval",
+            "must be allowAll, promptUnmatched, onRequest or denyUnmatched",
+            "profile_error",
+        ));
+    }
     if entry.collaboration_mode.is_some() {
         return Err(profile_field_error(
             source,
@@ -1153,6 +1172,9 @@ fn muse_snapshot_from_entry(
     snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
     if let Some(effort) = effort {
         snapshot.insert("effort".to_owned(), Value::String(effort.to_owned()));
+    }
+    if let Some(approval) = approval {
+        snapshot.insert("approval".to_owned(), Value::String(approval.to_owned()));
     }
     snapshot.insert(
         "permissions".to_owned(),
@@ -2508,6 +2530,7 @@ harness = "muse"
 cmd = "C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe"
 model = "muse-spark-1.3-contributor"
 effort = "medium"
+approval = "promptUnmatched"
 pass_env = ["EXAMPLE_API_KEY"]
 "#;
         let snapshot = resolve_text_profile(source, "muse").unwrap();
@@ -2518,6 +2541,7 @@ pass_env = ["EXAMPLE_API_KEY"]
         );
         assert_eq!(snapshot["model"], "muse-spark-1.3-contributor");
         assert_eq!(snapshot["effort"], "medium");
+        assert_eq!(snapshot["approval"], "promptUnmatched");
         assert_eq!(snapshot["permissions"], "workspace-write");
         assert_eq!(snapshot["approval_policy"], "never");
         assert_eq!(snapshot["pass_env"], json!(["EXAMPLE_API_KEY"]));
@@ -2527,6 +2551,8 @@ pass_env = ["EXAMPLE_API_KEY"]
             "[profiles.muse]\nharness='muse'\nmodel='muse-spark-1.3-contributor'\ncollaboration_mode='plan'\n",
             "[profiles.muse]\nharness='muse'\nmodel='muse-spark-1.3-contributor'\npermissions='read-only'\n",
             "[profiles.muse]\nharness='muse'\nmodel='muse-spark-1.3-contributor'\napproval_policy='on-request'\n",
+            "[profiles.muse]\nharness='muse'\nmodel='muse-spark-1.3-contributor'\napproval='sometimes'\n",
+            "[profiles.muse]\nharness='muse'\nmodel='muse-spark-1.3-contributor'\napproval=''\n",
         ] {
             assert!(resolve_text_profile(source, "muse").is_err(), "{source}");
         }

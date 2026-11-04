@@ -5315,7 +5315,8 @@ fn supports_control_verb(harness: &str, verb: &str) -> bool {
     harness == "codex"
         || (harness == "fake"
             && matches!(verb, "interrupt" | "steer" | "approve" | "deny" | "answer"))
-        || (harness == "muse" && matches!(verb, "approve" | "deny" | "answer"))
+        || (harness == "muse"
+            && matches!(verb, "approve" | "deny" | "answer" | "steer" | "interrupt"))
 }
 
 fn contains_secret_marker(value: &Value) -> bool {

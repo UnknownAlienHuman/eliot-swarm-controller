@@ -92,6 +92,10 @@ enum Control {
         args: Value,
         reply: oneshot::Sender<Result<Value>>,
     },
+    CheckTurn {
+        turn_id: String,
+        reply: oneshot::Sender<bool>,
+    },
     AdoptPulled {
         entries: Vec<CorePending>,
         expected: Vec<String>,
@@ -258,6 +262,28 @@ impl EventHandle {
             .map_err(|_| Error::new("unknown", "Muse event-control response was lost"))?
     }
 
+    /// Authoritative exact-turn gate for steer/interrupt: the check runs
+    /// on the event task, serialized behind the terminal commit, so a
+    /// control that arrives after the terminal batch always sees the
+    /// finished turn even though the watch snapshot still lags it.
+    pub async fn check_turn(&self, turn_id: &str) -> Result<bool> {
+        let (reply, response) = oneshot::channel();
+        timeout_at(
+            Instant::now() + EVENT_DEADLINE,
+            self.control.send(Control::CheckTurn {
+                turn_id: turn_id.to_owned(),
+                reply,
+            }),
+        )
+        .await
+        .map_err(|_| Error::new("unknown", "Muse event-control queue deadline elapsed"))?
+        .map_err(|_| Error::new("unknown", "Muse event processor stopped"))?;
+        timeout_at(Instant::now() + EVENT_DEADLINE, response)
+            .await
+            .map_err(|_| Error::new("unknown", "Muse event-control outcome is unknown"))?
+            .map_err(|_| Error::new("unknown", "Muse event-control response was lost"))
+    }
+
     pub async fn adopt_pulled(
         &self,
         entries: Vec<CorePending>,
@@ -382,6 +408,10 @@ impl EventProcessor {
                     .reply_request(&command_id, &request_id, &turn_id, &verb, &args)
                     .await;
                 let _ = reply.send(result);
+                true
+            }
+            Control::CheckTurn { turn_id, reply } => {
+                let _ = reply.send(self.status.active_turn_id.as_deref() == Some(turn_id.as_str()));
                 true
             }
             Control::AdoptPulled {
@@ -1816,7 +1846,19 @@ async fn run(
 ) {
     loop {
         let accept_frames = processor.accept_frames;
+        // Frames win over controls when both are ready: a `CheckTurn`
+        // arriving after the queued terminal frame must see the finished
+        // turn, never a still-live one.
         tokio::select! {
+            biased;
+            frame = frames.recv(), if accept_frames => {
+                if frame.is_none() {
+                    let current = *stream.borrow_and_update();
+                    processor.handle_stream_state(current).await;
+                }
+                processor.handle_frame(frame).await;
+                processor.report_gap_if_queue_empty(frames.is_empty()).await;
+            }
             changed = stream.changed(), if accept_frames => {
                 let current = match changed {
                     Ok(()) => *stream.borrow_and_update(),
@@ -1831,17 +1873,14 @@ async fn run(
                         if !processor.handle_control(control).await {
                             break;
                         }
+                        // Associate flushes buffered frames inline and request
+                        // handling defers loss the same way frames do; report
+                        // here too so a deferred gap never waits on a frame
+                        // that never comes.
+                        processor.report_gap_if_queue_empty(frames.is_empty()).await;
                     }
                     None => break,
                 }
-            }
-            frame = frames.recv(), if accept_frames => {
-                if frame.is_none() {
-                    let current = *stream.borrow_and_update();
-                    processor.handle_stream_state(current).await;
-                }
-                processor.handle_frame(frame).await;
-                processor.report_gap_if_queue_empty(frames.is_empty()).await;
             }
         }
         let _ = status_tx.send(processor.status.clone());
