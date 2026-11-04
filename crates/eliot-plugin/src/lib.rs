@@ -1,6 +1,7 @@
 mod fake;
 mod file_identity;
 pub mod native_stdio;
+pub mod native_transport;
 pub mod peer;
 pub mod protocol;
 mod stderr;

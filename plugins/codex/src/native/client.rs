@@ -103,7 +103,7 @@ mod tests {
             },
         ));
         assert_eq!(error.code, "unknown");
-        assert!(native.stderr.is_none());
+        assert!(native.transport.stderr.is_none());
         let snapshot = client.stderr_snapshot();
         assert!(snapshot.eof);
         assert!(!snapshot.read_error);
