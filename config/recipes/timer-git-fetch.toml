@@ -13,8 +13,8 @@
 #   fetch_remotes = { origin = "https://github.com/example/app.git" }
 #
 # The timer fires hourly. Verify with:
-#   eliot timer show refresh-origin-main
-#   eliot timer run refresh-origin-main   # immediate manual firing, same action
+#   swarm timer show refresh-origin-main
+#   swarm timer run refresh-origin-main   # immediate manual firing, same action
 #
 # CI runs this exact rule file against the Fake profile; its registration swaps
 # the profile, the checkout path and the fetch endpoint for a local test remote.

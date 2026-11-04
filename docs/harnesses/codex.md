@@ -101,24 +101,24 @@ independently of the collaboration mode.
 Example lifecycle:
 
 ```powershell
-& $eliot --data-dir $dataDir launch --profile codex-luna --workspace $workspace "Create hello.txt containing exactly hello without a newline." --wait
+& $swarm --data-dir $dataDir launch --profile codex-luna --workspace $workspace "Create hello.txt containing exactly hello without a newline." --wait
 $agent = 'AGENT_ID_FROM_OUTPUT'
-& $eliot --data-dir $dataDir result $agent
-& $eliot --data-dir $dataDir send $agent "Append world to hello.txt without adding a newline." --wait
-& $eliot --data-dir $dataDir stop $agent
-& $eliot --data-dir $dataDir resume $agent "Read hello.txt and reply with exactly its contents." --wait
-& $eliot --data-dir $dataDir stop $agent
+& $swarm --data-dir $dataDir result $agent
+& $swarm --data-dir $dataDir send $agent "Append world to hello.txt without adding a newline." --wait
+& $swarm --data-dir $dataDir stop $agent
+& $swarm --data-dir $dataDir resume $agent "Read hello.txt and reply with exactly its contents." --wait
+& $swarm --data-dir $dataDir stop $agent
 ```
 
 Turn controls require an active turn; request replies require a pending native request.
 The native exercises above used this control surface:
 
 ```powershell
-& $eliot --data-dir $dataDir steer $agent "Adjust course." --generation 1 --turn TURN_ID
-& $eliot --data-dir $dataDir interrupt $agent --generation 1 --turn TURN_ID
-& $eliot --data-dir $dataDir approve $agent --request REQUEST_ID
-& $eliot --data-dir $dataDir deny $agent --request REQUEST_ID
-& $eliot --data-dir $dataDir answer $agent --answers-file answers.json --request REQUEST_ID
+& $swarm --data-dir $dataDir steer $agent "Adjust course." --generation 1 --turn TURN_ID
+& $swarm --data-dir $dataDir interrupt $agent --generation 1 --turn TURN_ID
+& $swarm --data-dir $dataDir approve $agent --request REQUEST_ID
+& $swarm --data-dir $dataDir deny $agent --request REQUEST_ID
+& $swarm --data-dir $dataDir answer $agent --answers-file answers.json --request REQUEST_ID
 ```
 
 Flags map to `command.submit`: `--generation` to `expected_generation`,
@@ -151,8 +151,8 @@ the project in `<data_dir>/config.toml` (the file header shows an example
 `[projects.app]` snippet). Verify, then fire immediately with the same action:
 
 ```powershell
-& $eliot --data-dir $dataDir timer show refresh-origin-main
-& $eliot --data-dir $dataDir timer run refresh-origin-main
+& $swarm --data-dir $dataDir timer show refresh-origin-main
+& $swarm --data-dir $dataDir timer run refresh-origin-main
 ```
 
 ### 2. Resume on an exact stop
@@ -161,7 +161,7 @@ Copy `config/recipes/event-resume-after-stop.toml` to `<data_dir>/rules/`,
 replace `YOUR_STOP_COMMAND_ID` with a ULID, then stop with that id:
 
 ```powershell
-& $eliot --data-dir $dataDir --id YOUR_STOP_COMMAND_ID stop $agent --generation 1
+& $swarm --data-dir $dataDir --id YOUR_STOP_COMMAND_ID stop $agent --generation 1
 ```
 
 When that exact stop is applied, the rule resumes the agent into a new
@@ -170,7 +170,7 @@ generation. Verify with `rule show resume-after-known-stop`.
 ### 3. Bounded Eliot-mode Goal
 
 ```powershell
-& $eliot --data-dir $dataDir goal set $agent --text keep-green --max-rounds 5 --check git --version
+& $swarm --data-dir $dataDir goal set $agent --text keep-green --max-rounds 5 --check git --version
 ```
 
 The daemon rounds automatically on the next idle event; `git --version` is an

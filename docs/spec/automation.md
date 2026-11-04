@@ -141,8 +141,8 @@ catch_up = "none"
 do = [{ action = "send", target = "a1", expected_generation = 1, text = "scheduled echo" }]
 ```
 
-`eliot timer run periodic-send` manually invokes the same SEND action with a generated
-external ULID; `eliot --id ULID timer run periodic-send` supplies one explicitly.
+`swarm timer run periodic-send` manually invokes the same SEND action with a generated
+external ULID; `swarm --id ULID timer run periodic-send` supplies one explicitly.
 Scheduled and manual timer actions have no event or subject context, so Agent-action
 `target` and `expected_generation` values are literal. For example, a timer rule may use
 `do = [{ action = "resume", target = "a1", expected_generation = 4, text = "Continue" }]`;

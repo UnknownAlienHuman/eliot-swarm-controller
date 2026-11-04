@@ -48,7 +48,7 @@ fn wake_enabled(snapshot: &Value) -> bool {
 }
 
 fn notice_text(unread: i64) -> String {
-    format!("{unread} unread messages; run eliot inbox")
+    format!("{unread} unread messages; run swarm inbox")
 }
 
 impl Router {

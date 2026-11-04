@@ -63,7 +63,7 @@ struct PageArgs {
 
 #[derive(Parser)]
 #[command(
-    name = "eliot",
+    name = "swarm",
     version,
     about = "Local controller for coding-agent sessions"
 )]

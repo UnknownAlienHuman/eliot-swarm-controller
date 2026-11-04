@@ -85,7 +85,7 @@ is implemented, capability is `degraded`:
 - graceful stop and best-effort kill of known group members;
 - no claim that every descendant died;
 - `stop --force` reports possible orphans rather than clean exact success;
-- `eliot doctor` surfaces them.
+- `swarm doctor` surfaces them.
 
 ### Adopted/shared services
 

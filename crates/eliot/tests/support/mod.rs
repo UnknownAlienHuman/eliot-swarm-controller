@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const CLI: &str = env!("CARGO_BIN_EXE_eliot");
+pub const CLI: &str = env!("CARGO_BIN_EXE_swarm");
 const WAIT: Duration = Duration::from_secs(20);
 // Bounded first-line CLI stderr snippets in failure diagnostics. Full outcome
 // text stays out; the daemon's timestamped log in the retained fixture has it.

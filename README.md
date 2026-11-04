@@ -63,20 +63,20 @@ Agent placeholders with your values:
 
 ```powershell
 cargo build --locked -p eliot
-$eliot = '.\target\debug\eliot.exe'
+$swarm = '.\target\debug\swarm.exe'
 $workspace = 'PATH_TO_EXISTING_WORKSPACE'
 $dataDir = 'PATH_TO_PRIVATE_ELIOT_DATA_DIR'
-& $eliot --data-dir $dataDir daemon
-& $eliot --data-dir $dataDir status
-& $eliot --data-dir $dataDir launch --profile fake --workspace $workspace 'hello-one' --wait
-& $eliot --data-dir $dataDir ls
+& $swarm --data-dir $dataDir daemon
+& $swarm --data-dir $dataDir status
+& $swarm --data-dir $dataDir launch --profile fake --workspace $workspace 'hello-one' --wait
+& $swarm --data-dir $dataDir ls
 $agent = 'AGENT_ID_FROM_OUTPUT'
-& $eliot --data-dir $dataDir send $agent 'hello-two' --wait
-& $eliot --data-dir $dataDir watch $agent     # Ctrl+C stops watching
-& $eliot --data-dir $dataDir events --since 0
-& $eliot --data-dir $dataDir result $agent
-& $eliot --data-dir $dataDir stop $agent
-& $eliot --data-dir $dataDir daemon stop --drain  # or --force
+& $swarm --data-dir $dataDir send $agent 'hello-two' --wait
+& $swarm --data-dir $dataDir watch $agent     # Ctrl+C stops watching
+& $swarm --data-dir $dataDir events --since 0
+& $swarm --data-dir $dataDir result $agent
+& $swarm --data-dir $dataDir stop $agent
+& $swarm --data-dir $dataDir daemon stop --drain  # or --force
 ```
 
 On Unix, the built binary is `./target/debug/eliot`; pass the same `--data-dir` to each
@@ -92,22 +92,22 @@ For Codex, copy [the example profile](config/controller.example.toml) to
 Example lifecycle:
 
 ```powershell
-& $eliot --data-dir $dataDir launch --profile codex-luna --workspace $workspace 'Create hello.txt containing exactly hello without a newline.' --wait
+& $swarm --data-dir $dataDir launch --profile codex-luna --workspace $workspace 'Create hello.txt containing exactly hello without a newline.' --wait
 $agent = 'AGENT_ID_FROM_OUTPUT'
-& $eliot --data-dir $dataDir send $agent 'Append world to hello.txt without adding a newline.' --wait
-& $eliot --data-dir $dataDir stop $agent
-& $eliot --data-dir $dataDir resume $agent 'Read hello.txt and reply with exactly its contents.' --wait
-& $eliot --data-dir $dataDir stop $agent
+& $swarm --data-dir $dataDir send $agent 'Append world to hello.txt without adding a newline.' --wait
+& $swarm --data-dir $dataDir stop $agent
+& $swarm --data-dir $dataDir resume $agent 'Read hello.txt and reply with exactly its contents.' --wait
+& $swarm --data-dir $dataDir stop $agent
 ```
 
 Turn controls require an active turn; request replies require a pending native request:
 
 ```powershell
-& $eliot --data-dir $dataDir steer $agent 'adjust course' --generation 1 --turn TURN_ID
-& $eliot --data-dir $dataDir interrupt $agent --generation 1 --turn TURN_ID
-& $eliot --data-dir $dataDir approve $agent --request REQUEST_ID
-& $eliot --data-dir $dataDir deny $agent --request REQUEST_ID
-& $eliot --data-dir $dataDir answer $agent --answers-file answers.json --request REQUEST_ID
+& $swarm --data-dir $dataDir steer $agent 'adjust course' --generation 1 --turn TURN_ID
+& $swarm --data-dir $dataDir interrupt $agent --generation 1 --turn TURN_ID
+& $swarm --data-dir $dataDir approve $agent --request REQUEST_ID
+& $swarm --data-dir $dataDir deny $agent --request REQUEST_ID
+& $swarm --data-dir $dataDir answer $agent --answers-file answers.json --request REQUEST_ID
 ```
 
 `--generation` maps to `expected_generation`, `--turn` maps to
@@ -124,10 +124,10 @@ a source proves cleanup, not acknowledgement of an answer.
 An optional managed checkout uses the source repository as `--workspace`:
 
 ```powershell
-& $eliot --data-dir $dataDir launch --profile codex-luna --workspace $workspace --worktree codex/worker-demo --base HEAD 'Inspect the project without changing files.' --wait
+& $swarm --data-dir $dataDir launch --profile codex-luna --workspace $workspace --worktree codex/worker-demo --base HEAD 'Inspect the project without changing files.' --wait
 $agent = 'AGENT_ID_FROM_OUTPUT'
-& $eliot --data-dir $dataDir stop $agent
-& $eliot --data-dir $dataDir worktree remove $agent
+& $swarm --data-dir $dataDir stop $agent
+& $swarm --data-dir $dataDir worktree remove $agent
 ```
 
 Use an unused branch name. Setup file-argument syntax and scratch policy are documented

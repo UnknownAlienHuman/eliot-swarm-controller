@@ -8,6 +8,10 @@ publish = false
 [lints]
 workspace = true
 
+[[bin]]
+name = "swarm"
+path = "src/main.rs"
+
 [[test]]
 name = "muse_plugin"
 path = "tests/muse_plugin.rs"

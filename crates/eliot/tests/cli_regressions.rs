@@ -3522,7 +3522,7 @@ fn foreground_startup_and_cli_help() {
         command.arg(argument);
         let reply = run(command);
         assert!(reply.status.success(), "{}", reply.stderr);
-        assert!(reply.stdout.contains("eliot"));
+        assert!(reply.stdout.contains("swarm"));
     }
     let mut fixture = Fixture::new("foreground capture");
     fixture.start();
@@ -13440,7 +13440,7 @@ fn cli_goal_round_completes_idle_fake_agent() {
         shown["counters"]["last_observation"]
             .as_str()
             .unwrap_or("")
-            .contains("eliot"),
+            .contains("swarm"),
         "completed round retains its check observation"
     );
     let stop = fixture.json(&["stop", &agent]);
@@ -14268,7 +14268,7 @@ fn mail_wake_notice_coalesces_to_one_generic_command() {
             continue;
         }
         let text = command["args"]["text"].as_str().unwrap_or("");
-        if text.contains("unread messages; run eliot inbox") {
+        if text.contains("unread messages; run swarm inbox") {
             assert!(
                 !text.contains("wake-body"),
                 "notice must never contain the body"
@@ -14281,12 +14281,12 @@ fn mail_wake_notice_coalesces_to_one_generic_command() {
     assert!(
         notices
             .iter()
-            .any(|(target, text)| target == &a && text == "1 unread messages; run eliot inbox")
+            .any(|(target, text)| target == &a && text == "1 unread messages; run swarm inbox")
     );
     assert!(
         notices
             .iter()
-            .any(|(target, text)| target == &b && text == "1 unread messages; run eliot inbox")
+            .any(|(target, text)| target == &b && text == "1 unread messages; run swarm inbox")
     );
     for agent in [&a, &b] {
         let stop = fixture.json(&["stop", agent]);
