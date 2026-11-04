@@ -14410,7 +14410,10 @@ fn cli_hierarchy_launches_children_and_stops_subtrees() {
 #[test]
 fn cli_hierarchy_fanout_limit_rejects_extra_children() {
     let mut fixture = Fixture::new("hierarchy fanout");
-    fs::create_dir_all(&fixture.data).unwrap();
+    // Let the daemon create and protect the Windows private data root before
+    // the fixture writes owner configuration.
+    fixture.start();
+    fixture.stop(false);
     fs::write(
         fixture.data.join("config.toml"),
         "[daemon]\nlimits.max_children_per_agent = 1\n",
