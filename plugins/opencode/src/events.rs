@@ -8,7 +8,7 @@
 //! deltas, steps, usage, ephemeral status) is intentionally folded into
 //! the terminal message readback, never published as its own facts.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use eliot_core::{Error, Result, SecretPolicy};
 use eliot_plugin::{
@@ -24,11 +24,17 @@ use tokio::{
 };
 
 use crate::native::{
-    client::OpenCodeHttp,
+    client::{HttpOutcome, OpenCodeHttp},
+    requests::{
+        CorePending, ReplyRoute, StagedReply, describe_form, describe_permission,
+        redact_details_for_commit, reply_for,
+    },
     sse::SseFrame,
     types::{
-        AssistantContent, ExecutionEventData, InboxEventData, Message, SessionLifecycleData,
-        SseEnvelope, StructuredError,
+        AgentSelectedData, AssistantContent, ExecutionEventData, FormCancelledData,
+        FormCreatedData, FormRepliedData, InboxEventData, Message, ModelSelectedData,
+        PermissionAskedData, PermissionRepliedData, SessionLifecycleData, SseEnvelope,
+        StructuredError,
     },
 };
 
@@ -36,6 +42,9 @@ const CONTROL_QUEUE: usize = 16;
 const EARLY_EVENT_LIMIT: usize = 128;
 const EARLY_EVENT_BYTES: usize = 256 * 1024;
 const MAX_MESSAGE_PAGES: usize = 4;
+const MAX_PENDING_REQUESTS: usize = 128;
+const MAX_RESOLVED_REQUESTS: usize = 128;
+const REPLY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EventStatus {
@@ -79,6 +88,24 @@ enum Control {
         effective: Value,
         reply: oneshot::Sender<Result<()>>,
     },
+    ResumeReady {
+        native_scope: String,
+        session_id: String,
+        effective: Value,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    ReplyRequest {
+        command_id: String,
+        request_id: String,
+        turn_id: String,
+        verb: String,
+        args: Value,
+        reply: oneshot::Sender<Result<Value>>,
+    },
+    CheckTurn {
+        turn_id: String,
+        reply: oneshot::Sender<bool>,
+    },
     AssociateInbox {
         command_id: String,
         inbox_id: String,
@@ -113,6 +140,28 @@ struct PendingInbox {
     inbox_id: String,
 }
 
+/// One retained open native request: the exact offered snapshot the owner
+/// decides from, plus the reply lane state. The public request id IS the
+/// native `per_...`/`frm_...` id, so no index map is needed.
+struct PendingNativeRequest {
+    request: CorePending,
+    reply_command_id: Option<String>,
+    reply_state: NativeReplyState,
+    /// True when the staged write is a native cancel (form deny): the
+    /// settle commits `request.closed` without a command binding, never
+    /// `request.resolved` — a cancel is not an answer.
+    reply_is_cancel: bool,
+}
+
+/// Reply lane: at most one native write per request, ever.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeReplyState {
+    Available,
+    Writing,
+    Written,
+    Unknown,
+}
+
 struct EventProcessor {
     http: OpenCodeHttp,
     host: PeerClient,
@@ -143,9 +192,23 @@ struct EventProcessor {
     /// At most one: a second unclaimed start is unmodelled native behavior.
     stashed_started: Option<String>,
     /// Next expected durable sequence of our session aggregate. `Some(0)`
-    /// from readiness: our aggregate starts at `session.created` seq 0 and
-    /// every durable event reaches every subscriber in order.
+    /// from launch readiness: our aggregate starts at `session.created`
+    /// seq 0 and every durable event reaches every subscriber in order.
+    /// `None` from resume readiness: the live edge is adopted from the
+    /// first observed durable event (the unobserved prefix is history, not
+    /// a gap).
     expected_seq: Option<u64>,
+    /// Open native requests by public (= native) id.
+    pending_requests: HashMap<String, PendingNativeRequest>,
+    /// Terminally resolved native ids (bounded): a re-issued ask after
+    /// resolution gaps, it never reopens.
+    resolved_native_ids: HashSet<String>,
+    resolved_native_order: VecDeque<String>,
+    /// True once a resumed session finished readiness: pre-send terminals
+    /// are the dead generation's close and drop instead of gapping.
+    resumed: bool,
+    /// True once a send associated in this generation.
+    saw_send: bool,
 }
 
 pub(crate) fn spawn(
@@ -185,6 +248,72 @@ impl EventHandle {
             reply,
         })
         .await
+    }
+
+    pub async fn resume_ready(
+        &self,
+        native_scope: String,
+        session_id: String,
+        effective: Value,
+    ) -> Result<()> {
+        self.send(|reply| Control::ResumeReady {
+            native_scope,
+            session_id,
+            effective,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn reply_request(
+        &self,
+        command_id: String,
+        request_id: String,
+        turn_id: String,
+        verb: String,
+        args: Value,
+    ) -> Result<Value> {
+        let (reply, response) = oneshot::channel();
+        timeout_at(
+            Instant::now() + EVENT_DEADLINE,
+            self.control.send(Control::ReplyRequest {
+                command_id,
+                request_id,
+                turn_id,
+                verb,
+                args,
+                reply,
+            }),
+        )
+        .await
+        .map_err(|_| Error::new("unknown", "OpenCode event-control queue deadline elapsed"))?
+        .map_err(|_| Error::new("unknown", "OpenCode event processor stopped"))?;
+        timeout_at(Instant::now() + EVENT_DEADLINE, response)
+            .await
+            .map_err(|_| Error::new("unknown", "OpenCode event-control outcome is unknown"))?
+            .map_err(|_| Error::new("unknown", "OpenCode event-control response was lost"))?
+    }
+
+    /// Authoritative exact-turn gate for interrupt: the check runs on the
+    /// event task, serialized behind the terminal commit, so a control that
+    /// arrives after the terminal batch always sees the finished turn even
+    /// though the watch snapshot still lags it.
+    pub async fn check_turn(&self, turn_id: &str) -> Result<bool> {
+        let (reply, response) = oneshot::channel();
+        timeout_at(
+            Instant::now() + EVENT_DEADLINE,
+            self.control.send(Control::CheckTurn {
+                turn_id: turn_id.to_owned(),
+                reply,
+            }),
+        )
+        .await
+        .map_err(|_| Error::new("unknown", "OpenCode event-control queue deadline elapsed"))?
+        .map_err(|_| Error::new("unknown", "OpenCode event processor stopped"))?;
+        timeout_at(Instant::now() + EVENT_DEADLINE, response)
+            .await
+            .map_err(|_| Error::new("unknown", "OpenCode event-control outcome is unknown"))?
+            .map_err(|_| Error::new("unknown", "OpenCode event-control response was lost"))
     }
 
     pub async fn abandon_association(&self, command_id: String) {
@@ -327,6 +456,11 @@ impl EventProcessor {
             seen_inbox: HashSet::new(),
             stashed_started: None,
             expected_seq: None,
+            pending_requests: HashMap::new(),
+            resolved_native_ids: HashSet::new(),
+            resolved_native_order: VecDeque::new(),
+            resumed: false,
+            saw_send: false,
         }
     }
 
@@ -340,6 +474,34 @@ impl EventProcessor {
             } => {
                 let result = self.ready(native_scope, session_id, effective).await;
                 let _ = reply.send(result);
+                true
+            }
+            Control::ResumeReady {
+                native_scope,
+                session_id,
+                effective,
+                reply,
+            } => {
+                let result = self.resume_ready(native_scope, session_id, effective).await;
+                let _ = reply.send(result);
+                true
+            }
+            Control::ReplyRequest {
+                command_id,
+                request_id,
+                turn_id,
+                verb,
+                args,
+                reply,
+            } => {
+                let result = self
+                    .reply_request(&command_id, &request_id, &turn_id, &verb, &args)
+                    .await;
+                let _ = reply.send(result);
+                true
+            }
+            Control::CheckTurn { turn_id, reply } => {
+                let _ = reply.send(self.status.active_turn_id.as_deref() == Some(turn_id.as_str()));
                 true
             }
             Control::AssociateInbox {
@@ -491,13 +653,24 @@ impl EventProcessor {
         if !self.status.ready {
             return event_type != "server.connected";
         }
-        matches!(
+        if matches!(
             event_type,
             "session.inbox.cancelled"
                 | "session.execution.succeeded"
                 | "session.execution.failed"
                 | "session.execution.interrupted"
-        ) && self.status.active_turn_id.is_none()
+        ) {
+            return self.status.active_turn_id.is_none();
+        }
+        // An ask racing our send association buffers until the turn opens:
+        // with a send in flight, or a started execution awaiting its
+        // association (frames beat the AssociateInbox control), the ask
+        // belongs to our execution. With neither it is foreign and drops
+        // at processing instead of buffering.
+        if matches!(event_type, "permission.asked" | "form.created") {
+            return self.pending.is_some() || self.stashed_started.is_some();
+        }
+        false
     }
 
     fn buffer_envelope(&mut self, envelope: SseEnvelope) {
@@ -522,6 +695,64 @@ impl EventProcessor {
         session_id: String,
         effective: Value,
     ) -> Result<()> {
+        self.commit_ready(native_scope, session_id, effective, Some(0))
+            .await
+    }
+
+    /// Resume readiness: like launch readiness, except the durable live
+    /// edge is adopted (not reset to 0) and any inbox, execution-start or
+    /// request fact buffered during the host preflight refuses the resume:
+    /// native activity while no send is in flight means the retained
+    /// session was not idle. Frames win over this control, so activity
+    /// racing the readback is always buffered first. Buffered terminals
+    /// still flush: the dead generation's close drops instead of gapping.
+    async fn resume_ready(
+        &mut self,
+        native_scope: String,
+        session_id: String,
+        effective: Value,
+    ) -> Result<()> {
+        if self.stashed_started.is_some()
+            || !self.seen_inbox.is_empty()
+            || self.preflight_activity()
+        {
+            return Err(Error::new(
+                "unknown",
+                "OpenCode retained session showed native activity during resume",
+            ));
+        }
+        self.resumed = true;
+        self.commit_ready(native_scope, session_id, effective, None)
+            .await
+    }
+
+    /// Pre-readiness envelopes proving the retained session is not idle:
+    /// inbox, execution-start and request facts. Terminals, lifecycle and
+    /// status/detail events are history, not activity.
+    fn preflight_activity(&self) -> bool {
+        self.buffer.iter().any(|frame| {
+            matches!(
+                frame.envelope.event_type.as_str(),
+                "session.inbox.enqueued"
+                    | "session.inbox.delivered"
+                    | "session.inbox.cancelled"
+                    | "session.execution.started"
+                    | "permission.asked"
+                    | "permission.replied"
+                    | "form.created"
+                    | "form.replied"
+                    | "form.cancelled"
+            )
+        })
+    }
+
+    async fn commit_ready(
+        &mut self,
+        native_scope: String,
+        session_id: String,
+        effective: Value,
+        expected_seq: Option<u64>,
+    ) -> Result<()> {
         if self.status.ready || session_id.trim().is_empty() || !effective.is_object() {
             return Err(Error::new(
                 "invalid",
@@ -535,7 +766,7 @@ impl EventProcessor {
             ));
         }
         self.status.session_id = Some(session_id.clone());
-        self.expected_seq = Some(0);
+        self.expected_seq = expected_seq;
         let native_id = format!("opencode:{session_id}:session.ready");
         self.commit_event(
             "session.ready",
@@ -591,6 +822,7 @@ impl EventProcessor {
             command_id,
             inbox_id,
         });
+        self.saw_send = true;
         self.try_open_turn().await?;
         self.flush_buffer().await
     }
@@ -661,6 +893,14 @@ impl EventProcessor {
             "session.execution.succeeded"
             | "session.execution.failed"
             | "session.execution.interrupted" => self.complete_turn(&envelope).await,
+            "permission.asked" => self.open_permission(&envelope.data).await,
+            "permission.replied" => self.settle_permission(&envelope.data).await,
+            "form.created" => self.open_form(&envelope.data).await,
+            "form.replied" => self.settle_form(&envelope.data).await,
+            "form.cancelled" => self.cancel_form(&envelope.data).await,
+            "session.model.selected" | "session.agent.selected" => {
+                self.observe_selected(&envelope).await
+            }
             // Streaming detail (text/reasoning/tool deltas, steps, usage),
             // ephemeral status, and any future type fold into the terminal
             // readback or stay unconnected; they are never gaps.
@@ -671,6 +911,8 @@ impl EventProcessor {
     /// Durable envelopes of our session aggregate carry a contiguous
     /// per-aggregate sequence. A forward skip proves transport loss;
     /// anything else (ephemeral events, foreign aggregates) is untracked.
+    /// After resume readiness the live edge is adopted from the first
+    /// observed durable event instead.
     async fn check_sequence(&mut self, envelope: &SseEnvelope) -> Result<()> {
         let Some(session_id) = self.status.session_id.clone() else {
             return Ok(());
@@ -682,6 +924,11 @@ impl EventProcessor {
             return Ok(());
         }
         match self.expected_seq {
+            None => {
+                // Resume live edge: the unobserved prefix is history.
+                self.expected_seq = Some(durable.seq.saturating_add(1));
+                Ok(())
+            }
             Some(expected) if durable.seq == expected => {
                 self.expected_seq = Some(expected.saturating_add(1));
                 Ok(())
@@ -844,8 +1091,11 @@ impl EventProcessor {
             self.status.active_turn_id.clone(),
         ) {
             (Some(command_id), Some(turn_id)) => (command_id, turn_id),
-            // Buffered until association; reaching here unassociated means a
-            // terminal with no turn, which is a transcript gap.
+            // Before this generation's first send a resumed terminal is the
+            // dead generation's close: drop it, never attribute it. After a
+            // send (or on a fresh session) a terminal with no turn is a
+            // transcript gap.
+            _ if self.resumed && !self.saw_send => return Ok(()),
             _ => {
                 self.record_gap("OpenCode terminal event matched no exact active turn")
                     .await?;
@@ -932,6 +1182,9 @@ impl EventProcessor {
             "OpenCode",
         )?;
         self.commit_event("turn.completed", native_id, data).await?;
+        // The completed turn clears its Eliot pendings; drop the retained
+        // native offers with it so a later ask reopens instead of reviving.
+        self.drop_turn_requests(&turn_id);
         self.status.last_turn = Some(TurnFacts {
             command_id,
             turn_id: turn_id.clone(),
@@ -1098,6 +1351,7 @@ impl EventProcessor {
         self.pending = None;
         self.open_inbox_id = None;
         self.stashed_started = None;
+        self.pending_requests.clear();
         Ok(())
     }
 
@@ -1117,6 +1371,488 @@ impl EventProcessor {
             .await
     }
 
+    /// `session.model.selected` / `session.agent.selected`: the switch
+    /// is already proven by its synchronous 204 plus the `session.get`
+    /// readback, so the shape is pinned and the event ignored. A corrupt
+    /// payload for a foreign or malformed selection never gaps: nothing we
+    /// consume changed.
+    async fn observe_selected(&mut self, envelope: &SseEnvelope) -> Result<()> {
+        let session_id = if envelope.event_type == "session.model.selected" {
+            serde_json::from_value::<ModelSelectedData>(envelope.data.clone())
+                .ok()
+                .map(|data| data.session_id)
+        } else {
+            serde_json::from_value::<AgentSelectedData>(envelope.data.clone())
+                .ok()
+                .map(|data| data.session_id)
+        };
+        if session_id.as_deref() != self.status.session_id.as_deref() {
+            return Ok(());
+        }
+        Ok(())
+    }
+
+    /// `permission.asked`: open an `approval` request bound to the exact
+    /// session, the active turn and the native request id. An ask with no
+    /// active turn is foreign or pre-readiness and drops (the resume legs
+    /// prove no pre-readiness ask is pending); a re-ask of an open id is
+    /// idempotent when the offer is identical and a gap when it changed
+    /// (offers are static — no updated event exists); a re-ask after
+    /// resolution gaps, it never reopens.
+    async fn open_permission(&mut self, data: &Value) -> Result<()> {
+        let asked: PermissionAskedData = serde_json::from_value(data.clone()).map_err(|_| {
+            Error::new(
+                "native_protocol",
+                "OpenCode permission ask omitted its exact identity",
+            )
+        })?;
+        let Some(turn_id) = self.status.active_turn_id.clone() else {
+            return Ok(());
+        };
+        let Some(session_id) = self.status.session_id.clone() else {
+            return Ok(());
+        };
+        if asked.session_id != session_id {
+            return Ok(());
+        }
+        let pending = describe_permission(&asked, &session_id, &turn_id)
+            .map_err(|error| Error::new(error.code, format!("OpenCode {}", error.message)))?;
+        self.open_request(pending).await
+    }
+
+    /// `form.created`: open a `question` request under the same binding
+    /// and idempotency rules as a permission ask.
+    async fn open_form(&mut self, data: &Value) -> Result<()> {
+        let created: FormCreatedData = serde_json::from_value(data.clone()).map_err(|_| {
+            Error::new(
+                "native_protocol",
+                "OpenCode form creation omitted its exact identity",
+            )
+        })?;
+        let Some(turn_id) = self.status.active_turn_id.clone() else {
+            return Ok(());
+        };
+        let Some(session_id) = self.status.session_id.clone() else {
+            return Ok(());
+        };
+        if created.form.session_id != session_id {
+            return Ok(());
+        }
+        let pending = describe_form(&created.form, &session_id, &turn_id)
+            .map_err(|error| Error::new(error.code, format!("OpenCode {}", error.message)))?;
+        self.open_request(pending).await
+    }
+
+    /// Durably open a described native request. Details commit redacted;
+    /// the raw offer stays in memory for choice matching.
+    async fn open_request(&mut self, pending: CorePending) -> Result<()> {
+        if self.resolved_native_ids.contains(&pending.id) {
+            self.record_gap("OpenCode native request was re-issued after resolution")
+                .await?;
+            return Err(Error::new(
+                "unknown",
+                "OpenCode native request identity is ambiguous",
+            ));
+        }
+        if let Some(existing) = self.pending_requests.get(&pending.id) {
+            if existing.request.turn_id != pending.turn_id
+                || existing.request.kind != pending.kind
+                || existing.request.details != pending.details
+            {
+                self.record_gap("OpenCode native request offer changed after opening")
+                    .await?;
+                return Err(Error::new(
+                    "unknown",
+                    "OpenCode native request identity is ambiguous",
+                ));
+            }
+            return Ok(());
+        }
+        if self.pending_requests.len() >= MAX_PENDING_REQUESTS {
+            self.record_gap("OpenCode pending native requests overflowed their bound")
+                .await?;
+            return Err(Error::new(
+                "unknown",
+                "OpenCode native request overflowed its bound",
+            ));
+        }
+        let Some(session_id) = self.status.session_id.clone() else {
+            return Err(Error::new("unknown", "OpenCode session is unresolved"));
+        };
+        let native_id = event_id(
+            &session_id,
+            &pending.turn_id,
+            &pending.id,
+            "request.opened",
+            "opencode",
+            "OpenCode",
+        )?;
+        let secrets = SecretPolicy::new(self.secrets.iter().cloned());
+        let committed = redact_details_for_commit(&pending.details, &secrets);
+        self.commit_event(
+            "request.opened",
+            native_id,
+            json!({
+                "request_id": pending.id,
+                "turn_id": pending.turn_id,
+                "kind": pending.kind,
+                "details": committed,
+            }),
+        )
+        .await?;
+        self.pending_requests.insert(
+            pending.id.clone(),
+            PendingNativeRequest {
+                request: pending,
+                reply_command_id: None,
+                reply_state: NativeReplyState::Available,
+                reply_is_cancel: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// `permission.replied`: settle the retained open request. Our own
+    /// written reply resolves with its command binding; anything else (the
+    /// owner, or a sibling swept up by a `reject`, which the installed
+    /// server settles alongside) closes without a command binding. Unknown
+    /// ids ignore: the ask predates our subscription or never opened.
+    async fn settle_permission(&mut self, data: &Value) -> Result<()> {
+        let replied: PermissionRepliedData =
+            serde_json::from_value(data.clone()).map_err(|_| {
+                Error::new(
+                    "native_protocol",
+                    "OpenCode permission reply omitted its exact identity",
+                )
+            })?;
+        if self.status.session_id.as_deref() != Some(replied.session_id.as_str()) {
+            return Ok(());
+        }
+        self.settle_request(&replied.request_id).await
+    }
+
+    /// `form.replied`: settle under the same rules as a permission reply.
+    async fn settle_form(&mut self, data: &Value) -> Result<()> {
+        let replied: FormRepliedData = serde_json::from_value(data.clone()).map_err(|_| {
+            Error::new(
+                "native_protocol",
+                "OpenCode form reply omitted its exact identity",
+            )
+        })?;
+        if self.status.session_id.as_deref() != Some(replied.session_id.as_str()) {
+            return Ok(());
+        }
+        self.settle_request(&replied.id).await
+    }
+
+    /// `form.cancelled`: settle under the same rules as a form reply (the
+    /// native cancel may be ours, the owner's, or the dead execution's).
+    /// Our own cancel write still closes without a command binding: a
+    /// cancel is not an answer.
+    async fn cancel_form(&mut self, data: &Value) -> Result<()> {
+        let cancelled: FormCancelledData = serde_json::from_value(data.clone()).map_err(|_| {
+            Error::new(
+                "native_protocol",
+                "OpenCode form cancellation omitted its exact identity",
+            )
+        })?;
+        if self.status.session_id.as_deref() != Some(cancelled.session_id.as_str()) {
+            return Ok(());
+        }
+        self.settle_request(&cancelled.id).await
+    }
+
+    /// Settle one retained open request from its native settle event.
+    async fn settle_request(&mut self, native_id: &str) -> Result<()> {
+        let Some(pending) = self.pending_requests.remove(native_id) else {
+            return Ok(());
+        };
+        let Some(session_id) = self.status.session_id.clone() else {
+            self.pending_requests.insert(
+                native_id.to_owned(),
+                PendingNativeRequest {
+                    request: pending.request,
+                    reply_command_id: pending.reply_command_id,
+                    reply_state: pending.reply_state,
+                    reply_is_cancel: pending.reply_is_cancel,
+                },
+            );
+            return Err(Error::new("unknown", "OpenCode session is unresolved"));
+        };
+        let turn_id = pending.request.turn_id.clone();
+        if pending.reply_state == NativeReplyState::Written
+            && !pending.reply_is_cancel
+            && let Some(command_id) = pending.reply_command_id.clone()
+        {
+            let native_event = event_id(
+                &session_id,
+                &turn_id,
+                native_id,
+                "request.resolved",
+                "opencode",
+                "OpenCode",
+            )?;
+            self.commit_event(
+                "request.resolved",
+                native_event,
+                json!({
+                    "command_id": command_id,
+                    "request_id": native_id,
+                    "turn_id": turn_id,
+                }),
+            )
+            .await?;
+        } else {
+            let native_event = event_id(
+                &session_id,
+                &turn_id,
+                native_id,
+                "request.closed",
+                "opencode",
+                "OpenCode",
+            )?;
+            self.commit_event(
+                "request.closed",
+                native_event,
+                json!({
+                    "request_id": native_id,
+                    "turn_id": turn_id,
+                }),
+            )
+            .await?;
+        }
+        self.remember_resolved(native_id);
+        Ok(())
+    }
+
+    /// Drop this turn's retained offers at turn end. `turn.completed`
+    /// clears the Eliot pendings; the native offers drop with them.
+    fn drop_turn_requests(&mut self, turn_id: &str) {
+        self.pending_requests
+            .retain(|_, pending| pending.request.turn_id != turn_id);
+    }
+
+    fn remember_resolved(&mut self, native_id: &str) {
+        if self.resolved_native_ids.insert(native_id.to_owned()) {
+            self.resolved_native_order.push_back(native_id.to_owned());
+        }
+        while self.resolved_native_order.len() > MAX_RESOLVED_REQUESTS {
+            if let Some(evicted) = self.resolved_native_order.pop_front() {
+                self.resolved_native_ids.remove(&evicted);
+            }
+        }
+    }
+
+    /// Stage and write one native reply. Guards bind the command to the
+    /// exact retained offer; the write runs once per request, ever: 204
+    /// applies and the native settle event resolves, 400/404/409 prove
+    /// non-admission and reject (a gone target also closes the retained
+    /// offer), and a lost reply settles unknown and is never rewritten.
+    async fn reply_request(
+        &mut self,
+        command_id: &str,
+        request_id: &str,
+        turn_id: &str,
+        verb: &str,
+        args: &Value,
+    ) -> Result<Value> {
+        let pending = self.pending_requests.get(request_id).ok_or_else(|| {
+            Error::new("not_found", "OpenCode native request is no longer pending")
+        })?;
+        if pending.request.turn_id != turn_id {
+            return Err(Error::new(
+                "stale_turn",
+                "OpenCode reply named a finished turn",
+            ));
+        }
+        match pending.reply_state {
+            NativeReplyState::Available => {}
+            NativeReplyState::Written | NativeReplyState::Unknown => {
+                return Err(Error::new(
+                    "rejected",
+                    "OpenCode native request already has a native decision",
+                ));
+            }
+            NativeReplyState::Writing => {
+                return Err(Error::new(
+                    "busy",
+                    "OpenCode native request reply is already running",
+                ));
+            }
+        }
+        let staged = match reply_for(&pending.request, verb, args) {
+            Ok(staged) => staged,
+            // A staging failure is a rejected reply, never an error: the
+            // caller's choice did not match the offered set, no write ran,
+            // and the lane stays available for the offered answer.
+            Err(error) => {
+                return Ok(json!({
+                    "state": "rejected",
+                    "command_id": command_id,
+                    "request_id": request_id,
+                    "turn_id": turn_id,
+                    "reason": format!("OpenCode reply was not admitted: {}", error.message),
+                }));
+            }
+        };
+        let pending = self
+            .pending_requests
+            .get_mut(request_id)
+            .expect("retained offer survives staging");
+        pending.reply_state = NativeReplyState::Writing;
+        pending.reply_command_id = Some(command_id.to_owned());
+        pending.reply_is_cancel = matches!(staged.route, ReplyRoute::FormCancel);
+        let outcome = self.write_staged_reply(&staged).await;
+        self.finish_reply_write(request_id, command_id, turn_id, outcome)
+            .await
+    }
+
+    /// Perform the one native write a staged reply names.
+    async fn write_staged_reply(
+        &self,
+        staged: &StagedReply,
+    ) -> std::result::Result<(), HttpOutcome> {
+        let Some(session_id) = self.status.session_id.clone() else {
+            return Err(HttpOutcome::Unknown {
+                reason: "OpenCode session is unresolved".to_owned(),
+            });
+        };
+        let deadline = Instant::now() + REPLY_DEADLINE;
+        match &staged.route {
+            ReplyRoute::Permission { decision, message } => {
+                self.http
+                    .reply_permission(
+                        &session_id,
+                        &staged.native_id,
+                        decision,
+                        message.clone(),
+                        deadline,
+                    )
+                    .await
+            }
+            ReplyRoute::Form { answer } => {
+                self.http
+                    .reply_form(&session_id, &staged.native_id, answer.clone(), deadline)
+                    .await
+            }
+            ReplyRoute::FormCancel => {
+                self.http
+                    .delete_form(&session_id, &staged.native_id, deadline)
+                    .await
+            }
+        }
+    }
+
+    /// Settle the reply lane after its one write: applied on 204, rejected
+    /// on proven non-admission (closing the retained offer when the target
+    /// is gone), unknown on anything ambiguous.
+    async fn finish_reply_write(
+        &mut self,
+        request_id: &str,
+        command_id: &str,
+        turn_id: &str,
+        outcome: std::result::Result<(), HttpOutcome>,
+    ) -> Result<Value> {
+        match outcome {
+            Ok(()) => {
+                if let Some(pending) = self.pending_requests.get_mut(request_id) {
+                    pending.reply_state = NativeReplyState::Written;
+                }
+                Ok(json!({
+                    "state": "applied",
+                    "command_id": command_id,
+                    "request_id": request_id,
+                    "turn_id": turn_id,
+                }))
+            }
+            Err(HttpOutcome::Rejected { status, reason }) => {
+                let gone = matches!(status, Some(404) | Some(409));
+                if gone {
+                    self.close_gone_request(request_id).await?;
+                } else if let Some(pending) = self.pending_requests.get_mut(request_id) {
+                    pending.reply_state = NativeReplyState::Available;
+                    pending.reply_command_id = None;
+                    pending.reply_is_cancel = false;
+                }
+                Ok(json!({
+                    "state": "rejected",
+                    "command_id": command_id,
+                    "request_id": request_id,
+                    "turn_id": turn_id,
+                    "reason": reason,
+                }))
+            }
+            Err(HttpOutcome::Unknown { reason }) => {
+                self.latch_reply_unknown(request_id);
+                Ok(json!({
+                    "state": "unknown",
+                    "command_id": command_id,
+                    "request_id": request_id,
+                    "turn_id": turn_id,
+                    "reason": reason,
+                }))
+            }
+            Err(HttpOutcome::NotDispatched { reason }) => {
+                self.latch_reply_unknown(request_id);
+                Ok(json!({
+                    "state": "unknown",
+                    "command_id": command_id,
+                    "request_id": request_id,
+                    "turn_id": turn_id,
+                    "reason": reason,
+                }))
+            }
+        }
+    }
+
+    /// Latch a reply lane unknown after an ambiguous write: the reply is
+    /// never written again for this request.
+    fn latch_reply_unknown(&mut self, request_id: &str) {
+        if let Some(pending) = self.pending_requests.get_mut(request_id) {
+            pending.reply_state = NativeReplyState::Unknown;
+        }
+    }
+
+    /// Close a retained offer the native side proved gone (404/409 on
+    /// reply): nobody can answer it anymore, so it closes without a
+    /// command binding instead of rotting open.
+    async fn close_gone_request(&mut self, request_id: &str) -> Result<()> {
+        let Some(pending) = self.pending_requests.remove(request_id) else {
+            return Ok(());
+        };
+        let Some(session_id) = self.status.session_id.clone() else {
+            self.pending_requests.insert(
+                request_id.to_owned(),
+                PendingNativeRequest {
+                    request: pending.request,
+                    reply_command_id: pending.reply_command_id,
+                    reply_state: pending.reply_state,
+                    reply_is_cancel: pending.reply_is_cancel,
+                },
+            );
+            return Err(Error::new("unknown", "OpenCode session is unresolved"));
+        };
+        let native_event = event_id(
+            &session_id,
+            &pending.request.turn_id,
+            request_id,
+            "request.closed",
+            "opencode",
+            "OpenCode",
+        )?;
+        self.commit_event(
+            "request.closed",
+            native_event,
+            json!({
+                "request_id": request_id,
+                "turn_id": pending.request.turn_id,
+            }),
+        )
+        .await?;
+        self.remember_resolved(request_id);
+        Ok(())
+    }
+
     async fn record_gap(&mut self, reason: &str) -> Result<()> {
         self.stream_source().record_gap(reason).await
     }
@@ -1131,7 +1867,7 @@ impl EventProcessor {
             generation: self.generation,
             harness: "OpenCode",
             id_prefix: "opencode",
-            families: &["session", "turn", "message"],
+            families: &["session", "turn", "message", "request"],
             writes_blocked: &mut self.writes_blocked,
             gap_reported: &mut self.gap_reported,
             gap_number: &mut self.gap_number,

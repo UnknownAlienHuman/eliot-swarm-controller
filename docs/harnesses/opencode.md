@@ -36,12 +36,12 @@ Catalogue preflight may retry only before any session/input may have been admitt
 | send | installed `POST /api/session/{id}/prompt`; the 200 inbox id is intermediate, applied needs the exact input-to-execution association on SSE (`session.inbox.enqueued`/`delivered` plus `session.execution.started`; turn id is the exact `started` event id) (PR1, fake-server verified) |
 | steer | exact-current-execution method only; queueing another prompt is not steer |
 | inject | verified safe point or explicit next-send prepend |
-| interrupt | captured session/execution abort, with installed child scope verified |
+| interrupt | installed `POST /api/session/{id}/interrupt` (`{"interrupted": bool}`); the exact-turn gate refuses a finished turn as stale without a write, `interrupted:true` applies and the terminal pair settles the turn (PR2, fake-server verified) |
 | stop | installed `DELETE /api/session/{id}` (`204` removed, `404` already gone) plus a `404` session readback proving the session is gone, then the owned per-Agent server ends through the generation's process custody; stop ends the directly spawned `serve` child while the generation Job owns any descendants it spawned; abort-plus-detach is **not** stop (PR1, fake-server verified) |
 | detach | explicitly stop controlling/observing as defined, leaving native service/session alive |
-| resume | installed exact native session reattachment/resume; no old input replay |
-| approve/deny/answer | exact native permission/input id and offered response schema |
-| configure | supported session/prompt setters, effective readback and application point |
+| resume | installed exact native session reattachment: `GET /api/session/{id}` proves the retained session, the `inbox`/`permission`/`form` list preflight proves it idle (anything pending refuses the resume); never replays the prompt (PR2, fake-server verified) |
+| approve/deny/answer | installed `POST .../permission/{id}/reply` (`once`/`always`/`reject`), `POST .../form/{id}/reply` (`answer` map), `DELETE .../form/{id}` for deny; the public request id is the native id, choices stage against the offered schema (a miss rejects before any write), a lost reply is unknown and never rewritten (PR2, fake-server verified) |
+| configure | resume-time only: installed `POST .../model` / `POST .../agent` setters realign the retained session with `session.get` effective readback (a refused switch fails the resume as unknown); no mid-turn configure verb (PR2, fake-server verified) |
 | fork/background | installed native method and exact resulting identity/state |
 | goal | explicitly selected Eliot Goal; no assumed native Goal |
 

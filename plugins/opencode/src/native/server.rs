@@ -4,14 +4,21 @@
 //! custody: the plugin process runs inside the generation's Windows Job, so
 //! the server child (spawned directly, never through a `.cmd` wrapper) and
 //! anything it spawns die with the generation. The server never sees the
-//! owner's global config or data: `XDG_CONFIG_HOME` and `XDG_DATA_HOME`
-//! point into the plugin instance directory (verified on the installed
-//! v2.0.32 server), which holds a generated per-Agent `opencode.jsonc`.
-//! Authentication is a generated per-generation `OPENCODE_PASSWORD`; a
-//! preset password also suppresses the `server password` stdout line.
+//! owner's global config or data (verified on the installed v2.0.32
+//! server). Authentication is a generated per-generation `OPENCODE_PASSWORD`;
+//! a preset password also suppresses the `server password` stdout line.
 //! The child inherits the daemon-allowlisted plugin environment plus the
 //! shared target environment, exactly like the Codex/Muse stdio servers
 //! (`native_stdio.rs`): there is no third allowlist here.
+//!
+//! Store layout: the generated `opencode.jsonc` is per generation (under the
+//! plugin instance directory), but the session store (`XDG_DATA_HOME`) is
+//! per Agent — `opencode-{agent_id}` next to the instance directories — so
+//! a resumed generation serves the exact retained native session instead of
+//! an empty store. Generations of one Agent never run concurrently (the old
+//! one is terminal before resume), so one server owns the store at a time;
+//! a stale server from a lost generation can only idle (its plugin is dead)
+//! and the resume preflight refuses a non-idle retained session.
 
 use std::{
     ffi::OsString,
@@ -49,6 +56,7 @@ pub struct ServerLaunch {
     pub program: OsString,
     pub workspace: PathBuf,
     pub instance_dir: PathBuf,
+    pub agent_id: String,
     pub environment: Vec<(OsString, OsString)>,
     pub model: String,
 }
@@ -64,16 +72,16 @@ pub struct OwnedServer {
 }
 
 impl OwnedServer {
-    /// Write the per-Agent config, reserve a loopback port, spawn the
-    /// server, and wait for readiness. Any failure leaves no running
-    /// child behind. The child inherits the daemon-allowlisted plugin
-    /// environment plus the shared target environment the host built, the
-    /// generated password, and the per-Agent XDG roots — exactly like the
-    /// Codex/Muse stdio servers, with no `env_clear` and no third
-    /// allowlist.
+    /// Write the per-generation config, reserve a loopback port, spawn the
+    /// server on the per-Agent store, and wait for readiness. Any failure
+    /// leaves no running child behind. The child inherits the
+    /// daemon-allowlisted plugin environment plus the shared target
+    /// environment the host built, the generated password, and the XDG
+    /// roots — exactly like the Codex/Muse stdio servers, with no
+    /// `env_clear` and no third allowlist.
     pub async fn spawn(launch: ServerLaunch, secrets: &[String]) -> Result<Self> {
         let config_dir = launch.instance_dir.join("config").join("opencode");
-        let data_dir = launch.instance_dir.join("data");
+        let data_dir = stable_store_dir(&launch.instance_dir, &launch.agent_id)?;
         std::fs::create_dir_all(&config_dir).map_err(|error| {
             Error::new(
                 "native_spawn",
@@ -305,6 +313,36 @@ impl OwnedServer {
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The per-Agent session store: `opencode-{agent_id}/data` next to the
+/// plugin instance directories. The daemon creates every instance directory
+/// directly under `{data_root}/plugins`
+/// (`plugin_host/host.rs::create_instance_dir_with`), so the instance
+/// parent is that directory; a missing parent fails the start honestly
+/// instead of serving an unrelated store. The agent id allowlist keeps the
+/// derived segment a single safe path component (`a12`, ULIDs).
+fn stable_store_dir(instance_dir: &Path, agent_id: &str) -> Result<PathBuf> {
+    if agent_id.is_empty()
+        || agent_id.len() > 64
+        || !agent_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(Error::new(
+            "invalid",
+            "OpenCode Agent id cannot name a stable session store",
+        ));
+    }
+    let plugins_dir = instance_dir.parent().ok_or_else(|| {
+        Error::new(
+            "invalid",
+            "OpenCode instance directory has no plugin parent",
+        )
+    })?;
+    Ok(plugins_dir
+        .join(format!("opencode-{agent_id}"))
+        .join("data"))
+}
+
 /// Our config document path must appear among the effective documents:
 /// this proves the server honors the per-Agent `XDG_CONFIG_HOME` and is
 /// not serving the owner's global config.
@@ -334,6 +372,35 @@ mod tests {
             3,
             "no other keys: {parsed}"
         );
+    }
+
+    #[test]
+    fn stable_store_is_per_agent_beside_the_instance_dirs() {
+        let instance = PathBuf::from("/eliot/plugins/a12-g1-01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let store = stable_store_dir(&instance, "a12").expect("stable store");
+        assert_eq!(store, PathBuf::from("/eliot/plugins/opencode-a12/data"));
+        // A later generation of the same Agent serves the same store.
+        let instance2 = PathBuf::from("/eliot/plugins/a12-g2-01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        assert_eq!(
+            stable_store_dir(&instance2, "a12").expect("stable store"),
+            store
+        );
+        // Another Agent gets another store.
+        assert_ne!(
+            stable_store_dir(&instance, "a13").expect("stable store"),
+            store
+        );
+        // Uppercase ULID agent ids (the plugin-test shape) are safe too.
+        assert!(
+            stable_store_dir(&instance, "01ARZ3NDEKTSV4RRFFQ69G5FAV").is_ok(),
+            "ULID agent id"
+        );
+        for bad in ["", "a/12", "a\\12", "..", "a 12", &"a".repeat(65)] {
+            assert!(
+                stable_store_dir(&instance, bad).is_err(),
+                "unsafe agent id {bad:?}"
+            );
+        }
     }
 
     #[test]

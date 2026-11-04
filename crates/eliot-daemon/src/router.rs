@@ -3658,11 +3658,11 @@ fn validate_retained_resume_agent(agent: &Agent, command: &Command) -> Result<i6
                 ));
             }
         }
-        "fake" => {
+        "fake" | "muse" | "opencode" => {
             if agent.profile_snapshot.get("native_store_binding").is_some() {
                 return Err(Error::new(
                     "source_integrity",
-                    "Fake resume cannot use a Codex native store binding",
+                    "non-Codex resume cannot use a Codex native store binding",
                 ));
             }
         }

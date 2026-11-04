@@ -91,6 +91,71 @@ fn main() {
             scenario_sse_loss_during_send_gaps,
         )
         .await;
+        run_scenario(
+            "resume reattaches the retained session on the stable store",
+            scenario_resume_reattaches_retained_session,
+        )
+        .await;
+        run_scenario(
+            "resume of a deleted session is not_found",
+            scenario_resume_of_deleted_session_is_not_found,
+        )
+        .await;
+        run_scenario(
+            "resume refuses pending native requests",
+            scenario_resume_refuses_pending_requests,
+        )
+        .await;
+        run_scenario(
+            "resume realigns model and agent with readback",
+            scenario_resume_realigns_model_and_agent,
+        )
+        .await;
+        run_scenario(
+            "permission approve and deny round trip",
+            scenario_permission_approve_deny_roundtrip,
+        )
+        .await;
+        run_scenario(
+            "form answer applies and deny cancels",
+            scenario_form_answer_and_deny_cancel,
+        )
+        .await;
+        run_scenario(
+            "stale choice is rejected before any write",
+            scenario_stale_choice_rejected_without_write,
+        )
+        .await;
+        run_scenario(
+            "server-refused answer is rejected and retryable",
+            scenario_server_refused_answer_is_rejected,
+        )
+        .await;
+        run_scenario(
+            "lost reply is unknown without a second write",
+            scenario_lost_reply_is_unknown_without_rewrite,
+        )
+        .await;
+        run_scenario(
+            "reply to a settled request closes it",
+            scenario_reply_to_settled_request_closes_it,
+        )
+        .await;
+        run_scenario(
+            "interrupt applies and the terminal settles",
+            scenario_interrupt_applies_and_terminal_settles,
+        )
+        .await;
+        run_scenario(
+            "interrupt after the terminal is stale",
+            scenario_interrupt_after_terminal_is_stale,
+        )
+        .await;
+        run_scenario(
+            "request details commit redacted",
+            scenario_request_details_commit_redacted,
+        )
+        .await;
     });
     println!("opencode_plugin: all scenarios passed");
 }
@@ -100,7 +165,7 @@ fn main() {
 /// assumed); on timeout they are killed by exact recorded PID and the run
 /// fails with the scenario name. The plugin child itself always dies by
 /// handle: dropping the timed-out future drops every `Host`, whose
-/// `kill_on_drop` child ends it — on every exit path, including panics.
+/// `kill_on_drop` child ends it Ã¢â‚¬â€ on every exit path, including panics.
 async fn run_scenario<F, Fut>(name: &'static str, make: F)
 where
     F: FnOnce(OwnedChildren) -> Fut,
@@ -285,6 +350,30 @@ struct Script {
     error: Option<Value>,
     delete_status: u16,
     drop_sse_on_prompt: bool,
+    /// One ask bundle per prompt (1-based): `{permission?, form?}` emitted
+    /// between the started and terminal envelopes of that prompt.
+    asks: Vec<Value>,
+    /// Prompt admits and starts the execution but emits no terminal; the
+    /// execution stays live until `session.interrupt` aborts it.
+    manual_terminal: bool,
+    /// Prompt emits no terminal; the first applied reply or cancel emits
+    /// the scripted terminal instead (the execution resumes past the
+    /// request and completes). Implies the prompt holds its terminal.
+    terminal_on_reply: bool,
+    /// A retained session the fake boots with (the stable-store stand-in
+    /// for resume): `{id, model_id, provider_id, agent?, directory, seq}`.
+    seed_session: Option<Value>,
+    /// Pending permission seeds at boot: `{id, action, resources, message?}`.
+    seed_permissions: Vec<Value>,
+    /// Pending form seeds at boot: `{id, title, fields}`.
+    seed_forms: Vec<Value>,
+    /// Settle asked requests natively at once without emitting their
+    /// settle events (the lost-ephemeral case for reply-to-gone).
+    ghost_settle: bool,
+    /// Drop reply/cancel connections without a response (lost reply).
+    reply_drop: bool,
+    /// Installed agent ids for `GET /api/agent`.
+    agents: Vec<String>,
 }
 
 impl Script {
@@ -317,6 +406,30 @@ impl Script {
             },
             delete_status: get("delete_status").as_u64().unwrap_or(204) as u16,
             drop_sse_on_prompt: get("drop_sse_on_prompt").as_bool().unwrap_or(false),
+            asks: get("asks").as_array().cloned().unwrap_or_default(),
+            manual_terminal: get("manual_terminal").as_bool().unwrap_or(false),
+            terminal_on_reply: get("terminal_on_reply").as_bool().unwrap_or(false),
+            seed_session: match get("seed_session") {
+                Value::Null => None,
+                seed => Some(seed),
+            },
+            seed_permissions: get("seed_permissions")
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
+            seed_forms: get("seed_forms").as_array().cloned().unwrap_or_default(),
+            ghost_settle: get("ghost_settle").as_bool().unwrap_or(false),
+            reply_drop: get("reply_drop").as_bool().unwrap_or(false),
+            agents: get("agents")
+                .as_array()
+                .map(|agents| {
+                    agents
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_else(|| vec!["build".to_owned(), "general".to_owned()]),
         }
     }
 }
@@ -327,6 +440,9 @@ struct Fixture {
     log_path: PathBuf,
     sessions: Mutex<HashMap<String, FixtureSession>>,
     deleted: Mutex<std::collections::HashSet<String>>,
+    permissions: Mutex<HashMap<String, Vec<Value>>>,
+    forms: Mutex<HashMap<String, Vec<Value>>>,
+    settled_forms: Mutex<std::collections::HashSet<(String, String)>>,
     inbox_counter: Mutex<u64>,
     events: broadcast::Sender<String>,
     sse_close: broadcast::Sender<()>,
@@ -335,10 +451,12 @@ struct Fixture {
 
 struct FixtureSession {
     model: Value,
+    agent: Option<String>,
     directory: String,
     seq: u64,
     inbox_id: Option<String>,
     terminal: Option<String>,
+    live: bool,
 }
 
 fn fake_server_main(script_raw: &str) {
@@ -416,11 +534,15 @@ fn fake_server_main(script_raw: &str) {
             log_path,
             sessions: Mutex::new(HashMap::new()),
             deleted: Mutex::new(std::collections::HashSet::new()),
+            permissions: Mutex::new(HashMap::new()),
+            forms: Mutex::new(HashMap::new()),
+            settled_forms: Mutex::new(std::collections::HashSet::new()),
             inbox_counter: Mutex::new(0),
             events,
             sse_close,
             config_path: config_path.to_string_lossy().into_owned(),
         });
+        seed_fixture(&fixture).await;
         // The installed server prints its listening line on stdout.
         println!("server listening on http://127.0.0.1:{port}");
         loop {
@@ -651,10 +773,12 @@ async fn route(
             id.clone(),
             FixtureSession {
                 model: model.clone(),
+                agent: None,
                 directory: directory.clone(),
                 seq: seq + 1,
                 inbox_id: None,
                 terminal: None,
+                live: false,
             },
         );
         drop(sessions);
@@ -689,13 +813,228 @@ async fn route(
         if method == "GET" && tail.is_empty() {
             let sessions = fixture.sessions.lock().await;
             let session = sessions.get(id).expect("fixture session");
-            let payload = json!({"data": {
+            let mut info = json!({
                 "id": id,
                 "model": session.model,
                 "time": {"created": 1000, "updated": 1000},
                 "location": {"directory": session.directory},
-            }});
+            });
+            if let Some(agent) = session.agent.clone() {
+                info["agent"] = Value::String(agent);
+            }
+            let payload = json!({"data": info});
             return Some((200, payload.to_string()));
+        }
+        if method == "POST" && tail == "/interrupt" {
+            let live = {
+                let sessions = fixture.sessions.lock().await;
+                sessions.get(id).expect("fixture session").live
+            };
+            if !live {
+                return Some((200, json!({"interrupted": false}).to_string()));
+            }
+            {
+                let mut sessions = fixture.sessions.lock().await;
+                let session = sessions.get_mut(id).expect("fixture session");
+                session.live = false;
+                session.terminal = Some("session.execution.interrupted".to_owned());
+            }
+            let seq = next_seq(fixture, id).await;
+            let mut data = json!({"sessionID": id});
+            data["reason"] = Value::String("user".to_owned());
+            let terminal = json!({
+                "id": format!("evt_{id}_terminal_{seq}"),
+                "created": 2005,
+                "type": "session.execution.interrupted",
+                "data": data,
+                "durable": {"aggregateID": id, "seq": seq, "version": 1},
+            });
+            let _ = fixture.events.send(terminal.to_string());
+            return Some((200, json!({"interrupted": true}).to_string()));
+        }
+        if method == "GET" && tail == "/permission" {
+            let permissions = fixture.permissions.lock().await;
+            let pending = permissions.get(id).cloned().unwrap_or_default();
+            return Some((200, json!({"data": pending}).to_string()));
+        }
+        if method == "GET" && tail == "/form" {
+            let forms = fixture.forms.lock().await;
+            let pending = forms.get(id).cloned().unwrap_or_default();
+            return Some((200, json!({"data": pending}).to_string()));
+        }
+        if method == "GET" && tail == "/inbox" {
+            return Some((200, json!({"data": []}).to_string()));
+        }
+        if method == "POST" && tail == "/model" {
+            let request: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+            let model = request.get("model").cloned().unwrap_or(Value::Null);
+            {
+                let mut sessions = fixture.sessions.lock().await;
+                let session = sessions.get_mut(id).expect("fixture session");
+                session.model = model.clone();
+            }
+            let seq = next_seq(fixture, id).await;
+            let selected = json!({
+                "id": format!("evt_{id}_model_{seq}"),
+                "created": 3000,
+                "type": "session.model.selected",
+                "data": {"sessionID": id, "model": model},
+                "durable": {"aggregateID": id, "seq": seq, "version": 1},
+            });
+            let _ = fixture.events.send(selected.to_string());
+            return Some((204, String::new()));
+        }
+        if method == "POST" && tail == "/agent" {
+            let request: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+            let agent = request
+                .get("agent")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            {
+                let mut sessions = fixture.sessions.lock().await;
+                let session = sessions.get_mut(id).expect("fixture session");
+                session.agent = Some(agent.clone());
+            }
+            let seq = next_seq(fixture, id).await;
+            let selected = json!({
+                "id": format!("evt_{id}_agent_{seq}"),
+                "created": 3000,
+                "type": "session.agent.selected",
+                "data": {"sessionID": id, "agent": agent},
+                "durable": {"aggregateID": id, "seq": seq, "version": 1},
+            });
+            let _ = fixture.events.send(selected.to_string());
+            return Some((204, String::new()));
+        }
+        if let Some(request_id) = tail
+            .strip_prefix("/permission/")
+            .and_then(|rest| rest.strip_suffix("/reply"))
+        {
+            if fixture.script.reply_drop {
+                return None;
+            }
+            if method != "POST" {
+                return Some((404, not_found(id)));
+            }
+            let request: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+            let decision = request
+                .get("decision")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !["once", "always", "reject"].contains(&decision) {
+                return Some((400, String::new()));
+            }
+            let mut permissions = fixture.permissions.lock().await;
+            let pending = permissions.entry(id.to_owned()).or_default();
+            if !pending
+                .iter()
+                .any(|entry| entry.get("id").and_then(Value::as_str) == Some(request_id))
+            {
+                return Some((404, not_found(id)));
+            }
+            // Installed behavior: a reject settles every pending permission
+            // of the session; once/always settle only the targeted one.
+            let settled = if decision == "reject" {
+                std::mem::take(pending)
+            } else {
+                let position = pending
+                    .iter()
+                    .position(|entry| entry.get("id").and_then(Value::as_str) == Some(request_id))
+                    .expect("pending permission");
+                vec![pending.remove(position)]
+            };
+            drop(permissions);
+            for entry in settled {
+                let replied = json!({
+                    "id": format!("evt_replied_{}", entry.get("id").and_then(Value::as_str).unwrap_or_default()),
+                    "created": 4000,
+                    "type": "permission.replied",
+                    "data": {
+                        "sessionID": id,
+                        "requestID": entry.get("id").cloned().unwrap_or(Value::Null),
+                        "reply": decision,
+                    },
+                });
+                let _ = fixture.events.send(replied.to_string());
+            }
+            maybe_emit_reply_terminal(fixture, id).await;
+            return Some((204, String::new()));
+        }
+        if let Some(form_id) = tail
+            .strip_prefix("/form/")
+            .and_then(|rest| rest.strip_suffix("/reply"))
+        {
+            if fixture.script.reply_drop {
+                return None;
+            }
+            if method != "POST" {
+                return Some((404, not_found(id)));
+            }
+            let mut forms = fixture.forms.lock().await;
+            let pending = forms.entry(id.to_owned()).or_default();
+            let position = pending
+                .iter()
+                .position(|entry| entry.get("id").and_then(Value::as_str) == Some(form_id));
+            let Some(position) = position else {
+                if fixture
+                    .settled_forms
+                    .lock()
+                    .await
+                    .contains(&(id.to_owned(), form_id.to_owned()))
+                {
+                    return Some((409, String::new()));
+                }
+                return Some((404, not_found(id)));
+            };
+            let request: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+            let answer = request.get("answer").cloned().unwrap_or(Value::Null);
+            if !form_answer_valid(&pending[position], &answer) {
+                return Some((400, String::new()));
+            }
+            pending.remove(position);
+            drop(forms);
+            fixture
+                .settled_forms
+                .lock()
+                .await
+                .insert((id.to_owned(), form_id.to_owned()));
+            let replied = json!({
+                "id": format!("evt_form_replied_{form_id}"),
+                "created": 4000,
+                "type": "form.replied",
+                "data": {"id": form_id, "sessionID": id, "answer": answer},
+            });
+            let _ = fixture.events.send(replied.to_string());
+            maybe_emit_reply_terminal(fixture, id).await;
+            return Some((204, String::new()));
+        }
+        if let Some(form_id) = tail.strip_prefix("/form/") {
+            if method != "DELETE" || form_id.contains('/') {
+                return Some((404, not_found(id)));
+            }
+            if fixture.script.reply_drop {
+                return None;
+            }
+            let mut forms = fixture.forms.lock().await;
+            let pending = forms.entry(id.to_owned()).or_default();
+            let Some(position) = pending
+                .iter()
+                .position(|entry| entry.get("id").and_then(Value::as_str) == Some(form_id))
+            else {
+                return Some((404, not_found(id)));
+            };
+            pending.remove(position);
+            drop(forms);
+            let cancelled = json!({
+                "id": format!("evt_form_cancelled_{form_id}"),
+                "created": 4000,
+                "type": "form.cancelled",
+                "data": {"id": form_id, "sessionID": id},
+            });
+            let _ = fixture.events.send(cancelled.to_string());
+            maybe_emit_reply_terminal(fixture, id).await;
+            return Some((204, String::new()));
         }
         if method == "DELETE" && tail.is_empty() {
             if fixture.script.delete_status != 204 {
@@ -722,13 +1061,10 @@ async fn route(
                 return None;
             }
             if fixture.script.prompt_status != 200 {
-                let payload = json!({
-                    "_tag": "InvalidRequestError",
-                    "message": "scripted prompt refusal",
-                    "kind": "Payload",
-                });
+                // The installed server refuses invalid writes with an
+                // empty 400; the fixture matches it.
                 fixture.log_marker(0).await;
-                return Some((fixture.script.prompt_status, payload.to_string()));
+                return Some((fixture.script.prompt_status, String::new()));
             }
             let request: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
             let text = request
@@ -737,13 +1073,15 @@ async fn route(
                 .unwrap_or_default();
             let mut counter = fixture.inbox_counter.lock().await;
             *counter += 1;
-            let inbox_id = format!("msg_fixture_{:03}", *counter);
+            let prompt_index = *counter as usize;
+            let inbox_id = format!("msg_fixture_{prompt_index:03}");
             drop(counter);
             {
                 let mut sessions = fixture.sessions.lock().await;
                 let session = sessions.get_mut(id).expect("fixture session");
                 session.inbox_id = Some(inbox_id.clone());
                 session.terminal = Some(fixture.script.terminal.clone());
+                session.live = true;
             }
             if fixture.script.drop_sse_on_prompt {
                 // Admit the input, then lose the stream before any
@@ -763,9 +1101,8 @@ async fn route(
             let enqueued_seq = next_seq(fixture, id).await;
             let started_seq = next_seq(fixture, id).await;
             let delivered_seq = next_seq(fixture, id).await;
-            let terminal_seq = next_seq(fixture, id).await;
             let started_id = format!("evt_{id}_started_{enqueued_seq}");
-            let envelopes = [
+            let mut envelopes = vec![
                 json!({
                     "id": format!("evt_{id}_enqueued_{enqueued_seq}"),
                     "created": 2000,
@@ -788,8 +1125,14 @@ async fn route(
                     "data": {"sessionID": id, "inboxID": inbox_id},
                     "durable": {"aggregateID": id, "seq": delivered_seq, "version": 1},
                 }),
-                terminal_envelope(fixture, id, terminal_seq),
             ];
+            envelopes.extend(emit_asks(fixture, id, prompt_index).await);
+            if !fixture.script.manual_terminal && !fixture.script.terminal_on_reply {
+                let terminal_seq = next_seq(fixture, id).await;
+                envelopes.push(terminal_envelope(fixture, id, terminal_seq));
+                let mut sessions = fixture.sessions.lock().await;
+                sessions.get_mut(id).expect("fixture session").live = false;
+            }
             let emitted = envelopes.len();
             for envelope in envelopes {
                 let _ = fixture.events.send(envelope.to_string());
@@ -840,8 +1183,118 @@ async fn route(
             return Some((200, payload.to_string()));
         }
     }
+    if method == "GET" && path == "/api/agent" {
+        let data = fixture
+            .script
+            .agents
+            .iter()
+            .map(|agent| json!({"id": agent}))
+            .collect::<Vec<_>>();
+        return Some((200, json!({"data": data}).to_string()));
+    }
     let payload = json!({"_tag": "UnknownError", "message": "fixture has no such route"});
     Some((404, payload.to_string()))
+}
+
+/// With `terminal_on_reply`, the first applied reply or cancel resumes
+/// the live execution to its scripted terminal.
+async fn maybe_emit_reply_terminal(fixture: &Fixture, id: &str) {
+    if !fixture.script.terminal_on_reply {
+        return;
+    }
+    let live = {
+        let sessions = fixture.sessions.lock().await;
+        sessions
+            .get(id)
+            .map(|session| session.live)
+            .unwrap_or(false)
+    };
+    if !live {
+        return;
+    }
+    {
+        let mut sessions = fixture.sessions.lock().await;
+        sessions.get_mut(id).expect("fixture session").live = false;
+    }
+    let seq = next_seq(fixture, id).await;
+    let terminal = terminal_envelope(fixture, id, seq);
+    let _ = fixture.events.send(terminal.to_string());
+}
+
+/// Emit this prompt's scripted asks as ephemeral request envelopes,
+/// storing their pending entries first. With `ghost_settle` the entries
+/// settle natively at once without their settle events (the lost
+/// ephemeral), so a later reply meets a gone target.
+async fn emit_asks(fixture: &Fixture, id: &str, prompt_index: usize) -> Vec<Value> {
+    let Some(bundle) = fixture.script.asks.get(prompt_index - 1).cloned() else {
+        return Vec::new();
+    };
+    let mut envelopes = Vec::new();
+    for seed in ask_seeds(&bundle, "permission") {
+        let entry = permission_entry(id, &seed);
+        let asked = json!({
+            "id": format!("evt_asked_{}", entry.get("id").and_then(Value::as_str).unwrap_or_default()),
+            "created": 2003,
+            "type": "permission.asked",
+            "data": entry,
+        });
+        fixture
+            .permissions
+            .lock()
+            .await
+            .entry(id.to_owned())
+            .or_default()
+            .push(entry);
+        envelopes.push(asked);
+    }
+    for seed in ask_seeds(&bundle, "form") {
+        let entry = form_entry(id, &seed);
+        let created = json!({
+            "id": format!("evt_form_created_{}", entry.get("id").and_then(Value::as_str).unwrap_or_default()),
+            "created": 2003,
+            "type": "form.created",
+            "data": {"form": entry},
+        });
+        fixture
+            .forms
+            .lock()
+            .await
+            .entry(id.to_owned())
+            .or_default()
+            .push(entry);
+        envelopes.push(created);
+    }
+    if fixture.script.ghost_settle {
+        fixture
+            .permissions
+            .lock()
+            .await
+            .entry(id.to_owned())
+            .or_default()
+            .clear();
+        let mut forms = fixture.forms.lock().await;
+        if let Some(pending) = forms.get_mut(id) {
+            for entry in pending.drain(..) {
+                if let Some(form_id) = entry.get("id").and_then(Value::as_str) {
+                    fixture
+                        .settled_forms
+                        .lock()
+                        .await
+                        .insert((id.to_owned(), form_id.to_owned()));
+                }
+            }
+        }
+    }
+    envelopes
+}
+
+/// One ask bundle's seeds for a family: a single object or an array.
+fn ask_seeds(bundle: &Value, family: &str) -> Vec<Value> {
+    match bundle.get(family) {
+        Some(Value::Array(seeds)) => seeds.clone(),
+        Some(seed) if !seed.is_null() => vec![seed.clone()],
+        _ => Vec::new(),
+    }
 }
 
 fn idle_message(fixture: &Fixture, outcome: &str) -> Value {
@@ -885,13 +1338,150 @@ async fn next_seq(fixture: &Fixture, id: &str) -> u64 {
     seq
 }
 
-fn not_found(id: &str) -> String {
+/// The installed server answers missing subjects with an EMPTY 404 on
+/// every session/permission/form route; the fixture matches it.
+fn not_found(_id: &str) -> String {
+    String::new()
+}
+
+/// Boot the seeded retained session and its pending requests: the
+/// stable-store stand-in a resumed generation reattaches to.
+async fn seed_fixture(fixture: &Fixture) {
+    let Some(seed) = fixture.script.seed_session.clone() else {
+        return;
+    };
+    let id = seed
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    if id.is_empty() {
+        return;
+    }
+    let model = json!({
+        "id": seed.get("model_id").cloned().unwrap_or(Value::Null),
+        "providerID": seed.get("provider_id").cloned().unwrap_or(Value::Null),
+    });
+    fixture.sessions.lock().await.insert(
+        id.clone(),
+        FixtureSession {
+            model,
+            agent: seed.get("agent").and_then(Value::as_str).map(str::to_owned),
+            directory: seed
+                .get("directory")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            seq: seed.get("seq").and_then(Value::as_u64).unwrap_or(0),
+            inbox_id: None,
+            terminal: None,
+            live: false,
+        },
+    );
+    if !fixture.script.seed_permissions.is_empty() {
+        let pending = fixture
+            .script
+            .seed_permissions
+            .iter()
+            .map(|seed| permission_entry(&id, seed))
+            .collect::<Vec<_>>();
+        fixture.permissions.lock().await.insert(id.clone(), pending);
+    }
+    if !fixture.script.seed_forms.is_empty() {
+        let pending = fixture
+            .script
+            .seed_forms
+            .iter()
+            .map(|seed| form_entry(&id, seed))
+            .collect::<Vec<_>>();
+        fixture.forms.lock().await.insert(id.clone(), pending);
+    }
+}
+
+/// One stored permission request in the installed `Permission.Request`
+/// shape.
+fn permission_entry(session_id: &str, seed: &Value) -> Value {
     json!({
-        "_tag": "SessionNotFoundError",
-        "sessionID": id,
-        "message": format!("Session not found: {id}"),
+        "id": seed.get("id").cloned().unwrap_or(Value::Null),
+        "sessionID": session_id,
+        "action": seed.get("action").cloned().unwrap_or(json!("read")),
+        "resources": seed.get("resources").cloned().unwrap_or(json!([])),
+        "save": seed.get("save").cloned().unwrap_or(json!([])),
+        "message": seed.get("message").cloned().unwrap_or(Value::Null),
     })
-    .to_string()
+}
+
+/// One stored form in the installed `Form.Info` shape.
+fn form_entry(session_id: &str, seed: &Value) -> Value {
+    json!({
+        "id": seed.get("id").cloned().unwrap_or(Value::Null),
+        "sessionID": session_id,
+        "title": seed.get("title").cloned().unwrap_or(json!("")),
+        "fields": seed.get("fields").cloned().unwrap_or(json!([])),
+    })
+}
+
+/// The installed server refuses answers outside the offered schema with an
+/// empty 400: unknown keys, non-offered option values, and mistyped values.
+fn form_answer_valid(form: &Value, answer: &Value) -> bool {
+    let Some(answers) = answer.as_object() else {
+        return false;
+    };
+    let fields = form
+        .get("fields")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let offered = fields
+        .iter()
+        .filter_map(|field| {
+            field
+                .get("key")
+                .and_then(Value::as_str)
+                .map(|key| (key, field))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    for (key, value) in answers {
+        let Some(field) = offered.get(key.as_str()) else {
+            return false;
+        };
+        let field_type = field.get("type").and_then(Value::as_str).unwrap_or("");
+        let typed = match field_type {
+            "boolean" => value.is_boolean(),
+            "number" | "integer" => value.is_number(),
+            "multiselect" => value.is_array(),
+            _ => value.is_string(),
+        };
+        if !typed {
+            return false;
+        }
+        let options = field
+            .get("options")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let custom = field
+            .get("custom")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if options.is_empty() || custom {
+            continue;
+        }
+        let values = match value {
+            Value::String(one) => vec![one.as_str()],
+            Value::Array(many) => many.iter().filter_map(Value::as_str).collect(),
+            _ => return false,
+        };
+        for value in values {
+            if !options
+                .iter()
+                .any(|option| option.get("value").and_then(Value::as_str) == Some(value))
+            {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 impl Fixture {
@@ -1326,8 +1916,27 @@ struct FailedAttempt {
 impl Scenario {
     async fn start(script: &Value, profile: Value, owned: OwnedChildren) -> Self {
         let agent_id = ulid::Ulid::new().to_string();
-        let (pending, rx) = Self::setup_start(script, profile, agent_id, 1, owned).await;
-        pending.finish(rx).await
+        let root: PathBuf = std::env::temp_dir().join(format!(
+            "eliot-opencode-plugin-test-{}",
+            ulid::Ulid::new().to_string().to_lowercase()
+        ));
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        std::fs::create_dir_all(root.join("workspace")).unwrap();
+        let (pending, rx) = Self::setup_start_in(
+            &root,
+            "instance",
+            "requests.jsonl",
+            "report.json",
+            script,
+            profile,
+            agent_id,
+            1,
+            None,
+            None,
+            owned,
+        )
+        .await;
+        pending.finish(rx).await.0
     }
 
     async fn setup_start(
@@ -1342,16 +1951,52 @@ impl Scenario {
             ulid::Ulid::new().to_string().to_lowercase()
         ));
         std::fs::create_dir_all(root.join("data")).unwrap();
-        std::fs::create_dir_all(root.join("instance")).unwrap();
         std::fs::create_dir_all(root.join("workspace")).unwrap();
+        Self::setup_start_in(
+            &root,
+            "instance",
+            "requests.jsonl",
+            "report.json",
+            script,
+            profile,
+            agent_id,
+            generation,
+            None,
+            None,
+            owned,
+        )
+        .await
+    }
+
+    /// Start a generation in an explicit root/instance with its own fake
+    /// log/report files. Resume scenarios share the root (the per-Agent
+    /// store lives beside the instance dirs) with a fresh instance dir,
+    /// generation number, and resume subject per generation.
+    #[allow(clippy::too_many_arguments)]
+    async fn setup_start_in(
+        root: &Path,
+        instance: &str,
+        log_file: &str,
+        report_file: &str,
+        script: &Value,
+        profile: Value,
+        agent_id: String,
+        generation: i64,
+        resume: Option<(Value, Value)>,
+        credential: Option<String>,
+        owned: OwnedChildren,
+    ) -> (PendingStart, oneshot::Receiver<Result<Value, String>>) {
+        let root = root.to_owned();
+        std::fs::create_dir_all(root.join(instance)).unwrap();
         let mut host = Host::spawn(&root, owned).await;
+        let credential = credential.unwrap_or_else(|| format!("credential-{}", ulid::Ulid::new()));
         let manifest = host
             .call(
                 "initialize",
                 json!({
                     "protocol": "eliot-plugin/1",
-                    "credential": format!("credential-{}", ulid::Ulid::new()),
-                    "instance_dir": root.join("instance").to_string_lossy(),
+                    "credential": credential,
+                    "instance_dir": root.join(instance).to_string_lossy(),
                     "config": {},
                 }),
             )
@@ -1365,15 +2010,28 @@ impl Scenario {
             manifest.get("protocol").and_then(Value::as_str),
             Some("eliot-plugin/1")
         );
-        assert_eq!(manifest["verbs"], json!(["launch", "send", "stop"]));
+        assert_eq!(
+            manifest["verbs"],
+            json!([
+                "launch",
+                "resume",
+                "send",
+                "interrupt",
+                "approve",
+                "deny",
+                "answer",
+                "stop"
+            ])
+        );
         assert_eq!(
             manifest["sources"]["controlled"],
-            json!({"message": "stream", "session": "stream", "turn": "stream"})
+            json!({"message": "stream", "request": "stream", "session": "stream", "turn": "stream"})
         );
         let start_id = ulid::Ulid::new().to_string();
         let self_exe = std::env::current_exe().expect("test executable");
         let mut full_profile = profile;
         full_profile["cmd"] = Value::String(self_exe.to_string_lossy().into_owned());
+        let (resume_from, source_state) = resume.unwrap_or((Value::Null, Value::Null));
         let params = json!({
             "agent_id": agent_id,
             "generation": generation,
@@ -1382,13 +2040,13 @@ impl Scenario {
             "workspace": root.join("workspace").to_string_lossy(),
             "target_environment": {
                 "ELIOT_FAKE_OPENCODE_SCRIPT": script.to_string(),
-                "ELIOT_FAKE_OPENCODE_LOG": root.join("requests.jsonl").to_string_lossy(),
-                "ELIOT_FAKE_OPENCODE_REPORT": root.join("report.json").to_string_lossy(),
+                "ELIOT_FAKE_OPENCODE_LOG": root.join(log_file).to_string_lossy(),
+                "ELIOT_FAKE_OPENCODE_REPORT": root.join(report_file).to_string_lossy(),
             },
             "note": null,
-            "source_plan": {"session": "stream", "turn": "stream", "message": "stream"},
-            "source_state": null,
-            "resume_from": null,
+            "source_plan": {"session": "stream", "turn": "stream", "message": "stream", "request": "stream"},
+            "source_state": source_state,
+            "resume_from": resume_from,
             "initial": null,
         });
         let rx = host.begin_call("agent.start", params.clone()).await;
@@ -1420,7 +2078,7 @@ impl Scenario {
 }
 
 impl PendingStart {
-    async fn finish(mut self, rx: oneshot::Receiver<Result<Value, String>>) -> Scenario {
+    async fn finish(mut self, rx: oneshot::Receiver<Result<Value, String>>) -> (Scenario, Value) {
         let deadline = tokio::time::Instant::now() + OP_TIMEOUT;
         let mut rx = std::pin::pin!(tokio::time::timeout_at(deadline, rx));
         let mut ready_data: Option<Value> = None;
@@ -1507,11 +2165,14 @@ impl PendingStart {
                 .and_then(Value::as_bool),
             Some(true)
         );
-        Scenario {
-            root: self.root,
-            agent_id: self.agent_id,
-            host: self.host,
-        }
+        (
+            Scenario {
+                root: self.root,
+                agent_id: self.agent_id,
+                host: self.host,
+            },
+            ready,
+        )
     }
 
     async fn finish_expecting_error(
@@ -1630,7 +2291,11 @@ fn script(fields: Value) -> Value {
 /// One send round trip. Returns the send id, the applied turn id, and every
 /// committed `(kind, data)` in commit order (commits may land on either
 /// side of the response).
-async fn send_turn(scenario: &mut Scenario, text: &str) -> (String, String, Vec<(String, Value)>) {
+async fn send_turn(
+    scenario: &mut Scenario,
+    generation: i64,
+    text: &str,
+) -> (String, String, Vec<(String, Value)>) {
     let send_id = ulid::Ulid::new().to_string();
     let agent_id = scenario.agent_id.clone();
     let (outcome, committed) = scenario
@@ -1639,7 +2304,7 @@ async fn send_turn(scenario: &mut Scenario, text: &str) -> (String, String, Vec<
             "agent.command",
             json!({
                 "agent_id": agent_id,
-                "generation": 1,
+                "generation": generation,
                 "command_id": send_id,
                 "verb": "send",
                 "args": {"text": text},
@@ -1664,7 +2329,7 @@ async fn send_turn(scenario: &mut Scenario, text: &str) -> (String, String, Vec<
     (send_id, turn_id, committed)
 }
 
-async fn stop_agent(scenario: &mut Scenario, force: bool) -> Vec<(String, Value)> {
+async fn stop_agent(scenario: &mut Scenario, generation: i64, force: bool) -> Vec<(String, Value)> {
     let stop_id = ulid::Ulid::new().to_string();
     let agent_id = scenario.agent_id.clone();
     let (outcome, committed) = scenario
@@ -1673,7 +2338,7 @@ async fn stop_agent(scenario: &mut Scenario, force: bool) -> Vec<(String, Value)
             "agent.stop",
             json!({
                 "agent_id": agent_id,
-                "generation": 1,
+                "generation": generation,
                 "command_id": stop_id,
                 "force": force,
             }),
@@ -1691,6 +2356,149 @@ async fn stop_agent(scenario: &mut Scenario, force: bool) -> Vec<(String, Value)
 
 fn kinds(committed: &[(String, Value)]) -> Vec<&str> {
     committed.iter().map(|(kind, _)| kind.as_str()).collect()
+}
+
+/// One send against a held terminal (`manual_terminal` /
+/// `terminal_on_reply`): drains through the first `request.opened` and
+/// returns the send, turn and request ids with every commit so far.
+async fn send_until_ask(
+    scenario: &mut Scenario,
+    generation: i64,
+    text: &str,
+) -> (String, String, String, Vec<(String, Value)>) {
+    let send_id = ulid::Ulid::new().to_string();
+    let agent_id = scenario.agent_id.clone();
+    let (outcome, committed) = scenario
+        .host
+        .pump_call(
+            "agent.command",
+            json!({
+                "agent_id": agent_id,
+                "generation": generation,
+                "command_id": send_id,
+                "verb": "send",
+                "args": {"text": text},
+                "turn_id": null,
+                "request_id": null,
+            }),
+            OP_TIMEOUT,
+            Quiesce::UntilKind("request.opened"),
+        )
+        .await;
+    let applied = outcome.expect("send applies");
+    let turn_id = applied
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .expect("applied turn id")
+        .to_owned();
+    let request_id = committed
+        .iter()
+        .find(|(kind, _)| kind == "request.opened")
+        .and_then(|(_, data)| data.get("request_id").and_then(Value::as_str))
+        .expect("opened request id")
+        .to_owned();
+    (send_id, turn_id, request_id, committed)
+}
+
+/// One control round trip (interrupt/approve/deny/answer) with the given
+/// quiesce. Returns the command id, the outcome and every commit so far.
+async fn control(
+    scenario: &mut Scenario,
+    generation: i64,
+    verb: &str,
+    turn_id: Option<&str>,
+    request_id: Option<&str>,
+    args: Value,
+    quiesce: Quiesce,
+) -> (String, Result<Value, String>, Vec<(String, Value)>) {
+    control_as(
+        scenario,
+        generation,
+        &ulid::Ulid::new().to_string(),
+        verb,
+        turn_id,
+        request_id,
+        args,
+        quiesce,
+    )
+    .await
+}
+
+/// One control round trip under an explicit command id (for retries).
+#[allow(clippy::too_many_arguments)]
+async fn control_as(
+    scenario: &mut Scenario,
+    generation: i64,
+    command_id: &str,
+    verb: &str,
+    turn_id: Option<&str>,
+    request_id: Option<&str>,
+    args: Value,
+    quiesce: Quiesce,
+) -> (String, Result<Value, String>, Vec<(String, Value)>) {
+    let agent_id = scenario.agent_id.clone();
+    let (outcome, committed) = scenario
+        .host
+        .pump_call(
+            "agent.command",
+            json!({
+                "agent_id": agent_id,
+                "generation": generation,
+                "command_id": command_id,
+                "verb": verb,
+                "args": args,
+                "turn_id": turn_id,
+                "request_id": request_id,
+            }),
+            OP_TIMEOUT,
+            quiesce,
+        )
+        .await;
+    (command_id.to_owned(), outcome, committed)
+}
+
+/// Drain inbound until `kind` commits (bounded): the follow-up commits a
+/// `terminal_on_reply` settle or an interrupt terminal lands after the
+/// control response quiesced.
+async fn drain_until(host: &mut Host, kind: &str) -> Vec<(String, Value)> {
+    let deadline = tokio::time::Instant::now() + OP_TIMEOUT;
+    let mut committed = Vec::new();
+    loop {
+        let request = tokio::time::timeout_at(deadline, host.inbound.recv())
+            .await
+            .expect("follow-up commit deadline")
+            .expect("plugin request channel");
+        committed.push(ack_inbound(host, &request, "drain").await);
+        if committed.last().map(|(kind, _)| kind.as_str()) == Some(kind) {
+            return committed;
+        }
+    }
+}
+
+fn report_at(root: &Path, file: &str) -> Value {
+    let text = std::fs::read_to_string(root.join(file)).expect("fake server report");
+    serde_json::from_str(&text).expect("fake server report JSON")
+}
+
+fn requests_at(root: &Path, file: &str) -> Vec<Value> {
+    let text = std::fs::read_to_string(root.join(file)).unwrap_or_default();
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("request log JSON"))
+        .collect()
+}
+
+fn count_requests(requests: &[Value], method: &str, suffix: &str) -> usize {
+    requests
+        .iter()
+        .filter(|entry| {
+            entry.get("method").and_then(Value::as_str) == Some(method)
+                && entry
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .is_some_and(|path| path.ends_with(suffix))
+        })
+        .count()
 }
 
 async fn scenario_launch_send_snapshot_stop(owned: OwnedChildren) {
@@ -1719,7 +2527,7 @@ async fn scenario_launch_send_snapshot_stop(owned: OwnedChildren) {
         Some(true)
     );
 
-    let (send_id, turn_id, committed) = send_turn(&mut scenario, "reply PONG").await;
+    let (send_id, turn_id, committed) = send_turn(&mut scenario, 1, "reply PONG").await;
     assert_eq!(
         kinds(&committed),
         ["turn.started", "message.completed", "turn.completed"]
@@ -1776,7 +2584,7 @@ async fn scenario_launch_send_snapshot_stop(owned: OwnedChildren) {
         Some(true)
     );
 
-    let committed = stop_agent(&mut scenario, false).await;
+    let committed = stop_agent(&mut scenario, 1, false).await;
     assert_eq!(kinds(&committed), ["session.ended"]);
 
     // Exactly one prompt reached the server; stop closed the session
@@ -1837,7 +2645,7 @@ async fn scenario_failed_turn_reports_native_error(owned: OwnedChildren) {
         owned,
     )
     .await;
-    let (send_id, turn_id, committed) = send_turn(&mut scenario, "doomed").await;
+    let (send_id, turn_id, committed) = send_turn(&mut scenario, 1, "doomed").await;
     // No assistant text: no message.completed, and the failed turn carries
     // the exact native error.
     assert_eq!(kinds(&committed), ["turn.started", "turn.completed"]);
@@ -1864,7 +2672,7 @@ async fn scenario_failed_turn_reports_native_error(owned: OwnedChildren) {
         "no text was produced: {}",
         committed[1].1
     );
-    let committed = stop_agent(&mut scenario, false).await;
+    let committed = stop_agent(&mut scenario, 1, false).await;
     assert_eq!(kinds(&committed), ["session.ended"]);
     scenario.host.call("shutdown", json!({})).await.unwrap();
     scenario.host.shutdown_child().await;
@@ -1965,7 +2773,7 @@ async fn scenario_prompt_400_is_rejected_without_rewrite(owned: OwnedChildren) {
         })
         .count();
     assert_eq!(prompts, 1, "the replay sends no second write");
-    let committed = stop_agent(&mut scenario, false).await;
+    let committed = stop_agent(&mut scenario, 1, false).await;
     assert_eq!(kinds(&committed), ["session.ended"]);
     scenario.host.call("shutdown", json!({})).await.unwrap();
     scenario.host.shutdown_child().await;
@@ -2045,7 +2853,7 @@ async fn scenario_stop_of_gone_session_applies(owned: OwnedChildren) {
         owned,
     )
     .await;
-    let committed = stop_agent(&mut scenario, false).await;
+    let committed = stop_agent(&mut scenario, 1, false).await;
     assert_eq!(kinds(&committed), ["session.ended"]);
     scenario.host.call("shutdown", json!({})).await.unwrap();
     scenario.host.shutdown_child().await;
@@ -2111,7 +2919,7 @@ async fn scenario_invalid_profile_rejected_before_spawn(owned: OwnedChildren) {
                     "workspace": workspace,
                     "target_environment": {},
                     "note": null,
-                    "source_plan": {"session": "stream", "turn": "stream", "message": "stream"},
+                    "source_plan": {"session": "stream", "turn": "stream", "message": "stream", "request": "stream"},
                     "source_state": null,
                     "resume_from": null,
                     "initial": null,
@@ -2204,5 +3012,1058 @@ async fn scenario_sse_loss_during_send_gaps(owned: OwnedChildren) {
         Some("shutdown")
     );
     assert_eq!(kinds(&committed), ["session.ended"]);
+    scenario.host.shutdown_child().await;
+}
+
+/// Build the daemon resume subject for a retained generation-1 ready: the
+/// exact scope/ref plus the retained source readback with its completed
+/// turn.
+fn resume_subject(agent_id: &str, ready: &Value, turn_id: &str) -> (Value, Value) {
+    let resume_from = json!({
+        "native_scope": ready.get("native_scope").cloned().unwrap_or(Value::Null),
+        "native_ref": ready.get("native_ref").cloned().unwrap_or(Value::Null),
+    });
+    let source_state = json!({
+        "retained_generation": 1,
+        "retained_source": {
+            "agent_id": agent_id,
+            "generation": 1,
+            "source": "controlled",
+            "families": ["session", "turn", "message"],
+        },
+        "current_turn": {"turn_id": turn_id, "state": "completed"},
+    });
+    (resume_from, source_state)
+}
+
+async fn scenario_resume_reattaches_retained_session(owned: OwnedChildren) {
+    let root: PathBuf = std::env::temp_dir().join(format!(
+        "eliot-opencode-resume-test-{}",
+        ulid::Ulid::new().to_string().to_lowercase()
+    ));
+    std::fs::create_dir_all(root.join("data")).unwrap();
+    std::fs::create_dir_all(root.join("workspace")).unwrap();
+    let agent_id = ulid::Ulid::new().to_string();
+    let workspace = root.join("workspace").to_string_lossy().into_owned();
+    // Generation 1 runs one completed turn, then dies without stopping
+    // (the Failed/Lost shape): its plugin is dropped, so kill_on_drop ends
+    // it while the retained session survives in the per-Agent store.
+    let (pending, rx) = Scenario::setup_start_in(
+        &root,
+        "instance",
+        "requests.jsonl",
+        "report.json",
+        &script(json!({})),
+        opencode_profile(),
+        agent_id.clone(),
+        1,
+        None,
+        None,
+        owned.clone(),
+    )
+    .await;
+    let (mut gen1, ready1) = pending.finish(rx).await;
+    let (_, turn_id, _) = send_turn(&mut gen1, 1, "retained work").await;
+    let retained_ref = ready1
+        .get("native_ref")
+        .and_then(Value::as_str)
+        .expect("retained ref")
+        .to_owned();
+    let retained_scope = ready1
+        .get("native_scope")
+        .and_then(Value::as_str)
+        .expect("retained scope")
+        .to_owned();
+    let home1 = report_at(&root, "report.json")["data_home"]
+        .as_str()
+        .expect("gen-1 data home")
+        .to_owned();
+    let resume = resume_subject(&agent_id, &ready1, &turn_id);
+    drop(gen1);
+    // Generation 2 reattaches: the seeded fake stands in for the persisted
+    // store, continuing the aggregate at the honest next sequence.
+    let (pending, rx) = Scenario::setup_start_in(
+        &root,
+        "instance2",
+        "requests2.jsonl",
+        "report2.json",
+        &script(json!({
+            "seed_session": {
+                "id": retained_ref,
+                "model_id": "test-model",
+                "provider_id": "test-provider",
+                "directory": workspace,
+                "seq": 5,
+            },
+        })),
+        opencode_profile(),
+        agent_id.clone(),
+        2,
+        Some(resume),
+        None,
+        owned,
+    )
+    .await;
+    let (mut gen2, ready2) = pending.finish(rx).await;
+    assert_eq!(
+        ready2.get("native_ref").and_then(Value::as_str),
+        Some(retained_ref.as_str()),
+        "resume reattaches the exact retained session without replay"
+    );
+    assert_eq!(
+        ready2.get("native_scope").and_then(Value::as_str),
+        Some(retained_scope.as_str())
+    );
+    let home2 = report_at(&root, "report2.json")["data_home"]
+        .as_str()
+        .expect("gen-2 data home")
+        .to_owned();
+    assert_eq!(home1, home2, "both generations serve the stable store");
+    assert!(
+        home2.contains(&format!("opencode-{agent_id}")),
+        "stable store is per Agent: {home2}"
+    );
+    // The adopted live edge tracks the continued aggregate: no gap, and a
+    // post-resume send completes on it.
+    let (_, _, committed) = send_turn(&mut gen2, 2, "continued work").await;
+    assert_eq!(
+        kinds(&committed),
+        ["turn.started", "message.completed", "turn.completed"]
+    );
+    let committed = stop_agent(&mut gen2, 2, false).await;
+    assert_eq!(kinds(&committed), ["session.ended"]);
+    gen2.host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    gen2.host.shutdown_child().await;
+}
+
+async fn scenario_resume_of_deleted_session_is_not_found(owned: OwnedChildren) {
+    let root: PathBuf = std::env::temp_dir().join(format!(
+        "eliot-opencode-resume-gone-test-{}",
+        ulid::Ulid::new().to_string().to_lowercase()
+    ));
+    std::fs::create_dir_all(root.join("data")).unwrap();
+    std::fs::create_dir_all(root.join("workspace")).unwrap();
+    let agent_id = ulid::Ulid::new().to_string();
+    let (pending, rx) = Scenario::setup_start_in(
+        &root,
+        "instance",
+        "requests.jsonl",
+        "report.json",
+        &script(json!({})),
+        opencode_profile(),
+        agent_id.clone(),
+        1,
+        None,
+        None,
+        owned.clone(),
+    )
+    .await;
+    let (mut gen1, ready1) = pending.finish(rx).await;
+    let (_, turn_id, _) = send_turn(&mut gen1, 1, "doomed work").await;
+    let resume = resume_subject(&agent_id, &ready1, &turn_id);
+    // A clean stop deletes the native session: nothing remains to resume.
+    stop_agent(&mut gen1, 1, false).await;
+    gen1.host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    gen1.host.shutdown_child().await;
+    let (pending, rx) = Scenario::setup_start_in(
+        &root,
+        "instance2",
+        "requests2.jsonl",
+        "report2.json",
+        &script(json!({})),
+        opencode_profile(),
+        agent_id.clone(),
+        2,
+        Some(resume),
+        None,
+        owned,
+    )
+    .await;
+    let mut failed = pending.finish_expecting_error(rx, "not_found").await;
+    failed.retry("not_found").await;
+    // The preflight read the retained id and proved it absent.
+    let requests = requests_at(&root, "requests2.jsonl");
+    assert!(
+        requests.iter().any(|entry| {
+            entry.get("method").and_then(Value::as_str) == Some("GET")
+                && entry
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .is_some_and(|path| path.starts_with("/api/session/ses_"))
+        }),
+        "resume read the retained session"
+    );
+}
+
+async fn scenario_resume_refuses_pending_requests(owned: OwnedChildren) {
+    let root: PathBuf = std::env::temp_dir().join(format!(
+        "eliot-opencode-resume-busy-test-{}",
+        ulid::Ulid::new().to_string().to_lowercase()
+    ));
+    std::fs::create_dir_all(root.join("data")).unwrap();
+    std::fs::create_dir_all(root.join("workspace")).unwrap();
+    let agent_id = ulid::Ulid::new().to_string();
+    let workspace = root.join("workspace").to_string_lossy().into_owned();
+    let (pending, rx) = Scenario::setup_start_in(
+        &root,
+        "instance",
+        "requests.jsonl",
+        "report.json",
+        &script(json!({})),
+        opencode_profile(),
+        agent_id.clone(),
+        1,
+        None,
+        None,
+        owned.clone(),
+    )
+    .await;
+    let (mut gen1, ready1) = pending.finish(rx).await;
+    let (_, turn_id, _) = send_turn(&mut gen1, 1, "retained work").await;
+    let retained_ref = ready1
+        .get("native_ref")
+        .and_then(Value::as_str)
+        .expect("retained ref")
+        .to_owned();
+    let resume = resume_subject(&agent_id, &ready1, &turn_id);
+    drop(gen1);
+    // The retained session still holds a permission and a form: the resume
+    // quiesces first, then refuses without adopting either.
+    let (pending, rx) = Scenario::setup_start_in(
+        &root,
+        "instance2",
+        "requests2.jsonl",
+        "report2.json",
+        &script(json!({
+            "seed_session": {
+                "id": retained_ref,
+                "model_id": "test-model",
+                "provider_id": "test-provider",
+                "directory": workspace,
+                "seq": 5,
+            },
+            "seed_permissions": [
+                {"id": "per_stuck1", "action": "read", "resources": ["stuck.env"]},
+            ],
+            "seed_forms": [
+                {"id": "frm_stuck1", "title": "stuck?", "fields": [
+                    {"key": "yn", "type": "boolean"},
+                ]},
+            ],
+        })),
+        opencode_profile(),
+        agent_id.clone(),
+        2,
+        Some(resume),
+        None,
+        owned,
+    )
+    .await;
+    let mut failed = pending.finish_expecting_error(rx, "unknown").await;
+    failed.retry("unknown").await;
+    let requests = requests_at(&root, "requests2.jsonl");
+    assert_eq!(count_requests(&requests, "POST", "/interrupt"), 1);
+    assert_eq!(count_requests(&requests, "GET", "/permission"), 1);
+    assert_eq!(count_requests(&requests, "GET", "/form"), 1);
+}
+
+async fn scenario_resume_realigns_model_and_agent(owned: OwnedChildren) {
+    let root: PathBuf = std::env::temp_dir().join(format!(
+        "eliot-opencode-resume-config-test-{}",
+        ulid::Ulid::new().to_string().to_lowercase()
+    ));
+    std::fs::create_dir_all(root.join("data")).unwrap();
+    std::fs::create_dir_all(root.join("workspace")).unwrap();
+    let agent_id = ulid::Ulid::new().to_string();
+    let workspace = root.join("workspace").to_string_lossy().into_owned();
+    let (pending, rx) = Scenario::setup_start_in(
+        &root,
+        "instance",
+        "requests.jsonl",
+        "report.json",
+        &script(json!({})),
+        opencode_profile(),
+        agent_id.clone(),
+        1,
+        None,
+        None,
+        owned.clone(),
+    )
+    .await;
+    let (mut gen1, ready1) = pending.finish(rx).await;
+    let (_, turn_id, _) = send_turn(&mut gen1, 1, "retained work").await;
+    let retained_ref = ready1
+        .get("native_ref")
+        .and_then(Value::as_str)
+        .expect("retained ref")
+        .to_owned();
+    let resume = resume_subject(&agent_id, &ready1, &turn_id);
+    drop(gen1);
+    // The retained session runs another model and agent: resume switches
+    // both to the frozen profile (agent "general" must be installed) and
+    // proves the effective values with a fresh readback.
+    let mut profile = opencode_profile();
+    profile["agent"] = Value::String("general".to_owned());
+    let (pending, rx) = Scenario::setup_start_in(
+        &root,
+        "instance2",
+        "requests2.jsonl",
+        "report2.json",
+        &script(json!({
+            "seed_session": {
+                "id": retained_ref,
+                "model_id": "other-model",
+                "provider_id": "other-provider",
+                "agent": "build",
+                "directory": workspace,
+                "seq": 5,
+            },
+        })),
+        profile,
+        agent_id.clone(),
+        2,
+        Some(resume),
+        None,
+        owned,
+    )
+    .await;
+    let (mut gen2, ready2) = pending.finish(rx).await;
+    assert_eq!(
+        ready2.get("native_ref").and_then(Value::as_str),
+        Some(retained_ref.as_str())
+    );
+    assert_eq!(
+        ready2["effective"].get("model").and_then(Value::as_str),
+        Some("test-provider/test-model")
+    );
+    assert_eq!(
+        ready2["effective"].get("agent").and_then(Value::as_str),
+        Some("general")
+    );
+    assert_eq!(
+        ready2["effective"]
+            .get("agent_verified")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    let requests = requests_at(&root, "requests2.jsonl");
+    assert_eq!(count_requests(&requests, "GET", "/api/agent"), 1);
+    assert_eq!(count_requests(&requests, "POST", "/model"), 1);
+    assert_eq!(count_requests(&requests, "POST", "/agent"), 1);
+    // The configure confirmations flow through the adopted edge; a
+    // post-resume send still completes without a gap.
+    let (_, _, committed) = send_turn(&mut gen2, 2, "continued work").await;
+    assert_eq!(
+        kinds(&committed),
+        ["turn.started", "message.completed", "turn.completed"]
+    );
+    let committed = stop_agent(&mut gen2, 2, false).await;
+    assert_eq!(kinds(&committed), ["session.ended"]);
+    gen2.host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    gen2.host.shutdown_child().await;
+}
+
+async fn scenario_permission_approve_deny_roundtrip(owned: OwnedChildren) {
+    let mut scenario = Scenario::start(
+        &script(json!({
+            "manual_terminal": true,
+            "asks": [
+                {"permission": [
+                    {"id": "per_a1", "action": "read", "resources": ["a.env"]},
+                    {"id": "per_b1", "action": "edit", "resources": ["b.txt"]},
+                ]},
+                {"permission": [
+                    {"id": "per_c1", "action": "read", "resources": ["c.env"]},
+                    {"id": "per_d1", "action": "read", "resources": ["d.env"]},
+                ]},
+            ],
+        })),
+        opencode_profile(),
+        owned,
+    )
+    .await;
+    // First turn: two asks open; `once` settles only its own request.
+    let (_, turn1, first, _) = send_until_ask(&mut scenario, 1, "first asks").await;
+    assert_eq!(first, "per_a1");
+    let opened = drain_until(&mut scenario.host, "request.opened").await;
+    let second = opened
+        .iter()
+        .find(|(kind, _)| kind == "request.opened")
+        .and_then(|(_, data)| data.get("request_id").and_then(Value::as_str))
+        .expect("second opened id");
+    assert_eq!(second, "per_b1");
+    let (approve_id, outcome, committed) = control(
+        &mut scenario,
+        1,
+        "approve",
+        Some(&turn1),
+        Some("per_a1"),
+        json!({"choice_id": "always"}),
+        Quiesce::UntilKind("request.resolved"),
+    )
+    .await;
+    let applied = outcome.expect("approve applies");
+    assert_eq!(
+        applied.get("state").and_then(Value::as_str),
+        Some("applied")
+    );
+    assert_eq!(kinds(&committed), ["request.resolved"]);
+    assert_eq!(
+        committed[0].1.get("command_id").and_then(Value::as_str),
+        Some(approve_id.as_str())
+    );
+    // The sibling survives `once`-style selects: deny rejects it.
+    let (deny_id, outcome, committed) = control(
+        &mut scenario,
+        1,
+        "deny",
+        Some(&turn1),
+        Some("per_b1"),
+        json!({}),
+        Quiesce::UntilKind("request.resolved"),
+    )
+    .await;
+    let applied = outcome.expect("deny applies");
+    assert_eq!(
+        applied.get("state").and_then(Value::as_str),
+        Some("applied")
+    );
+    assert_eq!(kinds(&committed), ["request.resolved"]);
+    assert_eq!(
+        committed[0].1.get("command_id").and_then(Value::as_str),
+        Some(deny_id.as_str())
+    );
+    let (_, outcome, committed) = control(
+        &mut scenario,
+        1,
+        "interrupt",
+        Some(&turn1),
+        None,
+        json!({}),
+        Quiesce::UntilKind("turn.completed"),
+    )
+    .await;
+    assert_eq!(
+        outcome
+            .expect("interrupt applies")
+            .get("state")
+            .and_then(Value::as_str),
+        Some("applied")
+    );
+    assert_eq!(kinds(&committed), ["message.completed", "turn.completed"]);
+    // Second turn: a `reject` settles every pending permission â€” the
+    // sibling closes without a command binding.
+    let (_, turn2, first, _) = send_until_ask(&mut scenario, 1, "second asks").await;
+    assert_eq!(first, "per_c1");
+    drain_until(&mut scenario.host, "request.opened").await;
+    let (_, outcome, committed) = control(
+        &mut scenario,
+        1,
+        "deny",
+        Some(&turn2),
+        Some("per_c1"),
+        json!({}),
+        Quiesce::UntilKind("request.closed"),
+    )
+    .await;
+    assert_eq!(
+        outcome
+            .expect("deny applies")
+            .get("state")
+            .and_then(Value::as_str),
+        Some("applied")
+    );
+    assert_eq!(kinds(&committed), ["request.resolved", "request.closed"]);
+    assert_eq!(
+        committed[0].1.get("request_id").and_then(Value::as_str),
+        Some("per_c1")
+    );
+    assert!(committed[0].1.get("command_id").is_some());
+    assert_eq!(
+        committed[1].1.get("request_id").and_then(Value::as_str),
+        Some("per_d1")
+    );
+    assert!(committed[1].1.get("command_id").is_none());
+    let (_, outcome, _) = control(
+        &mut scenario,
+        1,
+        "interrupt",
+        Some(&turn2),
+        None,
+        json!({}),
+        Quiesce::UntilKind("turn.completed"),
+    )
+    .await;
+    assert_eq!(
+        outcome
+            .expect("interrupt applies")
+            .get("state")
+            .and_then(Value::as_str),
+        Some("applied")
+    );
+    // Exactly three reply writes ran (always, reject, reject): every other
+    // reply round tripped without new native I/O.
+    let requests = requests_at(&scenario.root, "requests.jsonl");
+    assert_eq!(count_requests(&requests, "POST", "/reply"), 3);
+    let committed = stop_agent(&mut scenario, 1, false).await;
+    assert_eq!(kinds(&committed), ["session.ended"]);
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+}
+
+async fn scenario_form_answer_and_deny_cancel(owned: OwnedChildren) {
+    let mut scenario = Scenario::start(
+        &script(json!({
+            "terminal_on_reply": true,
+            "asks": [
+                {"form": {"id": "frm_ans1", "title": "Pick one", "fields": [
+                    {"key": "choice", "title": "Pick", "type": "string",
+                     "options": [{"value": "a", "label": "Alpha"},
+                                 {"value": "b", "label": "Beta"}]},
+                    {"key": "note", "type": "string"},
+                ]}},
+                {"form": {"id": "frm_can1", "title": "Skip me", "fields": [
+                    {"key": "t", "type": "string"},
+                ]}},
+            ],
+        })),
+        opencode_profile(),
+        owned,
+    )
+    .await;
+    let (_, turn1, asked, _) = send_until_ask(&mut scenario, 1, "first form").await;
+    assert_eq!(asked, "frm_ans1");
+    let (answer_id, outcome, committed) = control(
+        &mut scenario,
+        1,
+        "answer",
+        Some(&turn1),
+        Some("frm_ans1"),
+        json!({"answers": {"choice": "a", "note": "free text"}}),
+        Quiesce::UntilKind("request.resolved"),
+    )
+    .await;
+    assert_eq!(
+        outcome
+            .expect("answer applies")
+            .get("state")
+            .and_then(Value::as_str),
+        Some("applied")
+    );
+    assert_eq!(kinds(&committed), ["request.resolved"]);
+    assert_eq!(
+        committed[0].1.get("command_id").and_then(Value::as_str),
+        Some(answer_id.as_str())
+    );
+    // The execution resumes past the answer and completes on the stream.
+    let rest = drain_until(&mut scenario.host, "turn.completed").await;
+    assert_eq!(kinds(&rest), ["message.completed", "turn.completed"]);
+    let (_, turn2, asked, _) = send_until_ask(&mut scenario, 1, "second form").await;
+    assert_eq!(asked, "frm_can1");
+    let (_, outcome, committed) = control(
+        &mut scenario,
+        1,
+        "deny",
+        Some(&turn2),
+        Some("frm_can1"),
+        json!({}),
+        Quiesce::UntilKind("request.closed"),
+    )
+    .await;
+    assert_eq!(
+        outcome
+            .expect("deny cancels")
+            .get("state")
+            .and_then(Value::as_str),
+        Some("applied")
+    );
+    assert_eq!(kinds(&committed), ["request.closed"]);
+    assert!(
+        committed[0].1.get("command_id").is_none(),
+        "a native cancel carries no Eliot command binding"
+    );
+    let rest = drain_until(&mut scenario.host, "turn.completed").await;
+    assert_eq!(kinds(&rest), ["message.completed", "turn.completed"]);
+    // One answer write plus one native cancel ran.
+    let requests = requests_at(&scenario.root, "requests.jsonl");
+    assert_eq!(count_requests(&requests, "POST", "/reply"), 1);
+    assert_eq!(count_requests(&requests, "DELETE", "/form/frm_can1"), 1);
+    let committed = stop_agent(&mut scenario, 1, false).await;
+    assert_eq!(kinds(&committed), ["session.ended"]);
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+}
+
+async fn scenario_stale_choice_rejected_without_write(owned: OwnedChildren) {
+    let mut scenario = Scenario::start(
+        &script(json!({
+            "terminal_on_reply": true,
+            "asks": [
+                {"form": {"id": "frm_stale1", "title": "Pick one", "fields": [
+                    {"key": "choice", "type": "string",
+                     "options": [{"value": "a", "label": "Alpha"}]},
+                ]}},
+            ],
+        })),
+        opencode_profile(),
+        owned,
+    )
+    .await;
+    let (_, turn_id, asked, _) = send_until_ask(&mut scenario, 1, "stale choice").await;
+    assert_eq!(asked, "frm_stale1");
+    // A non-offered option never reaches the wire: rejected, silent.
+    let (_, outcome, committed) = control(
+        &mut scenario,
+        1,
+        "answer",
+        Some(&turn_id),
+        Some("frm_stale1"),
+        json!({"answers": {"choice": "zzz"}}),
+        Quiesce::SilenceNow,
+    )
+    .await;
+    let rejected = outcome.expect("stale answer is rejected, not failed");
+    assert_eq!(
+        rejected.get("state").and_then(Value::as_str),
+        Some("rejected")
+    );
+    assert!(committed.is_empty());
+    let requests = requests_at(&scenario.root, "requests.jsonl");
+    assert_eq!(count_requests(&requests, "POST", "/reply"), 0);
+    // The offered answer still applies afterwards: the lane never latched.
+    let (_, outcome, committed) = control(
+        &mut scenario,
+        1,
+        "answer",
+        Some(&turn_id),
+        Some("frm_stale1"),
+        json!({"answers": {"choice": "a"}}),
+        Quiesce::UntilKind("request.resolved"),
+    )
+    .await;
+    assert_eq!(
+        outcome
+            .expect("offered answer applies")
+            .get("state")
+            .and_then(Value::as_str),
+        Some("applied")
+    );
+    assert_eq!(kinds(&committed), ["request.resolved"]);
+    drain_until(&mut scenario.host, "turn.completed").await;
+    let requests = requests_at(&scenario.root, "requests.jsonl");
+    assert_eq!(count_requests(&requests, "POST", "/reply"), 1);
+    let committed = stop_agent(&mut scenario, 1, false).await;
+    assert_eq!(kinds(&committed), ["session.ended"]);
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+}
+
+async fn scenario_server_refused_answer_is_rejected(owned: OwnedChildren) {
+    let mut scenario = Scenario::start(
+        &script(json!({
+            "terminal_on_reply": true,
+            "asks": [
+                {"form": {"id": "frm_type1", "title": "Flag?", "fields": [
+                    {"key": "flag", "type": "boolean"},
+                ]}},
+            ],
+        })),
+        opencode_profile(),
+        owned,
+    )
+    .await;
+    let (_, turn_id, asked, _) = send_until_ask(&mut scenario, 1, "typed answer").await;
+    assert_eq!(asked, "frm_type1");
+    // The client stages keys and options; the server owns value types and
+    // answers an empty 400: rejected, and the request stays open.
+    let (_, outcome, committed) = control(
+        &mut scenario,
+        1,
+        "answer",
+        Some(&turn_id),
+        Some("frm_type1"),
+        json!({"answers": {"flag": "yes"}}),
+        Quiesce::SilenceNow,
+    )
+    .await;
+    let rejected = outcome.expect("mistyped answer is rejected, not failed");
+    assert_eq!(
+        rejected.get("state").and_then(Value::as_str),
+        Some("rejected")
+    );
+    assert!(committed.is_empty());
+    let requests = requests_at(&scenario.root, "requests.jsonl");
+    assert_eq!(count_requests(&requests, "POST", "/reply"), 1);
+    let (_, outcome, committed) = control(
+        &mut scenario,
+        1,
+        "answer",
+        Some(&turn_id),
+        Some("frm_type1"),
+        json!({"answers": {"flag": true}}),
+        Quiesce::UntilKind("request.resolved"),
+    )
+    .await;
+    assert_eq!(
+        outcome
+            .expect("typed answer applies")
+            .get("state")
+            .and_then(Value::as_str),
+        Some("applied")
+    );
+    assert_eq!(kinds(&committed), ["request.resolved"]);
+    drain_until(&mut scenario.host, "turn.completed").await;
+    let committed = stop_agent(&mut scenario, 1, false).await;
+    assert_eq!(kinds(&committed), ["session.ended"]);
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+}
+
+async fn scenario_lost_reply_is_unknown_without_rewrite(owned: OwnedChildren) {
+    let mut scenario = Scenario::start(
+        &script(json!({
+            "terminal_on_reply": true,
+            "reply_drop": true,
+            "asks": [
+                {"permission": {"id": "per_lost1", "action": "read",
+                                "resources": ["lost.env"]}},
+            ],
+        })),
+        opencode_profile(),
+        owned,
+    )
+    .await;
+    let (_, turn_id, asked, _) = send_until_ask(&mut scenario, 1, "lost reply").await;
+    assert_eq!(asked, "per_lost1");
+    let command_id = ulid::Ulid::new().to_string();
+    let (_, outcome, committed) = control_as(
+        &mut scenario,
+        1,
+        &command_id,
+        "approve",
+        Some(&turn_id),
+        Some("per_lost1"),
+        json!({}),
+        Quiesce::SilenceNow,
+    )
+    .await;
+    let unknown = outcome.expect("lost reply settles unknown, not failed");
+    assert_eq!(
+        unknown.get("state").and_then(Value::as_str),
+        Some("unknown")
+    );
+    assert!(committed.is_empty());
+    // The same command retries unknown without a second write.
+    let (_, outcome, committed) = control_as(
+        &mut scenario,
+        1,
+        &command_id,
+        "approve",
+        Some(&turn_id),
+        Some("per_lost1"),
+        json!({}),
+        Quiesce::SilenceNow,
+    )
+    .await;
+    let unknown = outcome.expect("retry settles unknown, not failed");
+    assert_eq!(
+        unknown.get("state").and_then(Value::as_str),
+        Some("unknown")
+    );
+    assert!(committed.is_empty());
+    let requests = requests_at(&scenario.root, "requests.jsonl");
+    assert_eq!(count_requests(&requests, "POST", "/reply"), 1);
+    let committed = stop_agent(&mut scenario, 1, false).await;
+    assert_eq!(kinds(&committed), ["session.ended"]);
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+}
+
+async fn scenario_reply_to_settled_request_closes_it(owned: OwnedChildren) {
+    let mut scenario = Scenario::start(
+        &script(json!({
+            "manual_terminal": true,
+            "ghost_settle": true,
+            "asks": [
+                {"permission": {"id": "per_ghost1", "action": "read",
+                                "resources": ["ghost.env"]}},
+            ],
+        })),
+        opencode_profile(),
+        owned,
+    )
+    .await;
+    let (_, turn_id, asked, _) = send_until_ask(&mut scenario, 1, "ghost ask").await;
+    assert_eq!(asked, "per_ghost1");
+    // The settle event was lost, so the request is open locally but gone
+    // natively: the reply meets a 404, rejects, and closes the phantom
+    // instead of rotting it open.
+    let (_, outcome, committed) = control(
+        &mut scenario,
+        1,
+        "approve",
+        Some(&turn_id),
+        Some("per_ghost1"),
+        json!({}),
+        Quiesce::UntilKind("request.closed"),
+    )
+    .await;
+    let rejected = outcome.expect("ghost reply is rejected, not failed");
+    assert_eq!(
+        rejected.get("state").and_then(Value::as_str),
+        Some("rejected")
+    );
+    assert_eq!(kinds(&committed), ["request.closed"]);
+    assert_eq!(
+        committed[0].1.get("request_id").and_then(Value::as_str),
+        Some("per_ghost1")
+    );
+    assert!(committed[0].1.get("command_id").is_none());
+    // A second reply finds nothing pending.
+    let (_, outcome, _) = control(
+        &mut scenario,
+        1,
+        "approve",
+        Some(&turn_id),
+        Some("per_ghost1"),
+        json!({}),
+        Quiesce::SilenceNow,
+    )
+    .await;
+    assert_eq!(
+        outcome.expect_err("closed request is not_found"),
+        "not_found"
+    );
+    let (_, outcome, _) = control(
+        &mut scenario,
+        1,
+        "interrupt",
+        Some(&turn_id),
+        None,
+        json!({}),
+        Quiesce::UntilKind("turn.completed"),
+    )
+    .await;
+    assert_eq!(
+        outcome
+            .expect("interrupt applies")
+            .get("state")
+            .and_then(Value::as_str),
+        Some("applied")
+    );
+    let committed = stop_agent(&mut scenario, 1, false).await;
+    assert_eq!(kinds(&committed), ["session.ended"]);
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+}
+
+async fn scenario_interrupt_applies_and_terminal_settles(owned: OwnedChildren) {
+    let mut scenario = Scenario::start(
+        &script(json!({ "manual_terminal": true })),
+        opencode_profile(),
+        owned,
+    )
+    .await;
+    let (_, outcome, committed) = control(
+        &mut scenario,
+        1,
+        "send",
+        None,
+        None,
+        json!({"text": "long work"}),
+        Quiesce::UntilKind("turn.started"),
+    )
+    .await;
+    let applied = outcome.expect("send applies");
+    let turn_id = applied
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .expect("applied turn id")
+        .to_owned();
+    assert_eq!(kinds(&committed), ["turn.started"]);
+    // The interrupt aborts the exact live execution; its `interrupted`
+    // terminal settles the turn on the stream with the interrupted status.
+    let (interrupt_id, outcome, committed) = control(
+        &mut scenario,
+        1,
+        "interrupt",
+        Some(&turn_id),
+        None,
+        json!({}),
+        Quiesce::UntilKind("turn.completed"),
+    )
+    .await;
+    let applied = outcome.expect("interrupt applies");
+    assert_eq!(
+        applied.get("state").and_then(Value::as_str),
+        Some("applied")
+    );
+    assert_eq!(
+        applied.get("command_id").and_then(Value::as_str),
+        Some(interrupt_id.as_str())
+    );
+    assert_eq!(
+        applied.get("turn_id").and_then(Value::as_str),
+        Some(turn_id.as_str())
+    );
+    assert!(applied.get("request_id").is_none());
+    assert_eq!(kinds(&committed), ["message.completed", "turn.completed"]);
+    assert_eq!(
+        committed[1].1.get("status").and_then(Value::as_str),
+        Some("interrupted")
+    );
+    let requests = requests_at(&scenario.root, "requests.jsonl");
+    assert_eq!(count_requests(&requests, "POST", "/interrupt"), 1);
+    let committed = stop_agent(&mut scenario, 1, false).await;
+    assert_eq!(kinds(&committed), ["session.ended"]);
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+}
+
+async fn scenario_interrupt_after_terminal_is_stale(owned: OwnedChildren) {
+    let mut scenario = Scenario::start(&script(json!({})), opencode_profile(), owned).await;
+    let (_, turn_id, _) = send_turn(&mut scenario, 1, "quick work").await;
+    let (_, outcome, committed) = control(
+        &mut scenario,
+        1,
+        "interrupt",
+        Some(&turn_id),
+        None,
+        json!({}),
+        Quiesce::SilenceNow,
+    )
+    .await;
+    assert_eq!(outcome.expect_err("finished turn is stale"), "stale_turn");
+    assert!(committed.is_empty());
+    // A bogus turn id is stale too, and neither wrote anything.
+    let (_, outcome, committed) = control(
+        &mut scenario,
+        1,
+        "interrupt",
+        Some("evt_bogus_turn"),
+        None,
+        json!({}),
+        Quiesce::SilenceNow,
+    )
+    .await;
+    assert_eq!(outcome.expect_err("bogus turn is stale"), "stale_turn");
+    assert!(committed.is_empty());
+    let requests = requests_at(&scenario.root, "requests.jsonl");
+    assert_eq!(count_requests(&requests, "POST", "/interrupt"), 0);
+    let committed = stop_agent(&mut scenario, 1, false).await;
+    assert_eq!(kinds(&committed), ["session.ended"]);
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+}
+
+async fn scenario_request_details_commit_redacted(owned: OwnedChildren) {
+    let credential = format!("redact-me-{}", ulid::Ulid::new());
+    let root: PathBuf = std::env::temp_dir().join(format!(
+        "eliot-opencode-redact-test-{}",
+        ulid::Ulid::new().to_string().to_lowercase()
+    ));
+    std::fs::create_dir_all(root.join("data")).unwrap();
+    std::fs::create_dir_all(root.join("workspace")).unwrap();
+    let agent_id = ulid::Ulid::new().to_string();
+    let (pending, rx) = Scenario::setup_start_in(
+        &root,
+        "instance",
+        "requests.jsonl",
+        "report.json",
+        &script(json!({
+            "terminal_on_reply": true,
+            "asks": [
+                {"permission": {"id": "per_sec1", "action": "read",
+                                "resources": ["secret.env"],
+                                "message": format!("token {credential} inside")}},
+            ],
+        })),
+        opencode_profile(),
+        agent_id.clone(),
+        1,
+        None,
+        Some(credential.clone()),
+        owned,
+    )
+    .await;
+    let (mut scenario, _) = pending.finish(rx).await;
+    let (_, turn_id, asked, committed) = send_until_ask(&mut scenario, 1, "secret ask").await;
+    assert_eq!(asked, "per_sec1");
+    // The committed offer masks the credential while the raw in-memory
+    // offer keeps matching: the reply still applies.
+    let opened = committed
+        .iter()
+        .find(|(kind, _)| kind == "request.opened")
+        .map(|(_, data)| data)
+        .expect("opened details");
+    let encoded = serde_json::to_string(opened).expect("encode opened");
+    assert!(!encoded.contains(&credential), "{encoded}");
+    let (_, outcome, committed) = control(
+        &mut scenario,
+        1,
+        "approve",
+        Some(&turn_id),
+        Some("per_sec1"),
+        json!({}),
+        Quiesce::UntilKind("request.resolved"),
+    )
+    .await;
+    assert_eq!(
+        outcome
+            .expect("approve applies")
+            .get("state")
+            .and_then(Value::as_str),
+        Some("applied")
+    );
+    assert_eq!(kinds(&committed), ["request.resolved"]);
+    drain_until(&mut scenario.host, "turn.completed").await;
+    let committed = stop_agent(&mut scenario, 1, false).await;
+    assert_eq!(kinds(&committed), ["session.ended"]);
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
     scenario.host.shutdown_child().await;
 }
