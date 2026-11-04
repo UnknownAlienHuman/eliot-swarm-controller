@@ -10,7 +10,7 @@
 //! (`opencode serve` 2.0.32, routes under `/api/...`, `{"data": ...}`
 //! success bodies, `{"_tag": ...}` errors, Basic auth as
 //! `opencode:OPENCODE_PASSWORD`, SSE envelopes with durable sequences);
-//! the plugin under test is the real `eliot plugin opencode` binary driven
+//! the plugin under test is the real `swarm plugin opencode` binary driven
 //! over the Eliot plugin protocol, with this file emulating the host side
 //! (`process.put`, `events.put`, `source.gap`). No model is ever called.
 
@@ -23,7 +23,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 
-const CLI: &str = env!("CARGO_BIN_EXE_eliot");
+const CLI: &str = env!("CARGO_BIN_EXE_swarm");
 const MODEL: &str = "test-provider/test-model";
 const OP_TIMEOUT: Duration = Duration::from_secs(15);
 
