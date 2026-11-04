@@ -1,14 +1,13 @@
-use eliot_core::{Error, NativeEvent, Result, SecretPolicy, SourceBatch};
+use eliot_core::{Error, Result, SecretPolicy};
 use eliot_plugin::{
-    CommitSink, MAX_EVENT_BYTES, PeerClient, native_stdio::StreamState,
+    CommitSink, MAX_EVENT_BYTES, PeerClient,
+    native_stdio::StreamState,
     protocol::MAX_COMMAND_ID_BYTES,
+    session::{EVENT_DEADLINE, StreamSource, attach_final_text},
 };
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::{
-    collections::{HashMap, VecDeque},
-    time::Duration,
-};
+use std::collections::{HashMap, VecDeque};
 use tokio::{
     sync::{mpsc, oneshot, watch},
     time::{Instant, timeout_at},
@@ -19,7 +18,6 @@ use crate::native::{
     types::{CanUseToolBody, CommandLifecycle, PermissionResult, ResultRecord, assistant_text},
 };
 
-const EVENT_DEADLINE: Duration = Duration::from_secs(30);
 const CONTROL_QUEUE: usize = 16;
 const EARLY_EVENT_LIMIT: usize = 128;
 const EARLY_EVENT_BYTES: usize = 256 * 1024;
@@ -1242,7 +1240,9 @@ impl EventProcessor {
             "status": terminal_reason.clone(),
         });
         if let Some(text) = self.final_text.as_ref() {
-            attach_final_text(&mut data, text, &secrets);
+            // Stream-json carries no failed flag: keep the PR1 omit-on-overflow
+            // behavior for every terminal by reporting the bound case as failed.
+            attach_final_text(&mut data, &secrets.redact_text(text), true, &secrets);
         }
         let session_id = self.status.session_id.as_deref().unwrap_or_default();
         let native_id = format!("claude:{session_id}:{turn_id}:turn.completed");
@@ -1378,113 +1378,32 @@ impl EventProcessor {
     }
 
     async fn commit_event(&mut self, kind: &str, native_id: String, data: Value) -> Result<()> {
-        if self.writes_blocked {
-            return Err(Error::new(
-                "unknown",
-                "Claude event acknowledgement is unresolved",
-            ));
-        }
-        let batch = SourceBatch {
-            batch_id: format!("{native_id}:batch"),
-            agent_id: self.agent_id.clone(),
-            generation: self.generation,
-            source: "stream".to_owned(),
-            events: vec![NativeEvent {
-                kind: kind.to_owned(),
-                native_id,
-                data,
-                ts: None,
-            }],
-            cursor: None,
-        };
-        let error = match self
-            .sink
-            .commit(batch, Instant::now() + EVENT_DEADLINE)
+        self.stream_source()
+            .commit_event(kind, native_id, data)
             .await
-        {
-            Ok(_) => return Ok(()),
-            Err(error) => error,
-        };
-        if self.sink.is_unknown() {
-            self.writes_blocked = true;
-            self.status.source_unknown = true;
-            self.status.failure = Some("Claude event batch acknowledgement is unknown".to_owned());
-            self.status.batch_unknown = true;
-            return Err(Error::new(
-                "unknown",
-                "Claude event batch acknowledgement is unknown",
-            ));
-        }
-        let reason = format!("{kind} could not be committed: {}", error.code);
-        self.record_gap(&reason).await?;
-        Err(Error::new(
-            "unknown",
-            "Claude native fact was not committed; no replay is allowed",
-        ))
     }
 
     async fn record_gap(&mut self, reason: &str) -> Result<()> {
-        if self.writes_blocked {
-            self.status.source_unknown = true;
-            return Err(Error::new(
-                "unknown",
-                "Claude event acknowledgement is unresolved; no source gap was issued",
-            ));
-        }
-        if self.gap_reported {
-            return Err(Error::new(
-                "unknown",
-                "Claude source already has an unresolved gap",
-            ));
-        }
-        self.status.source_unknown = true;
-        self.gap_reported = true;
-        self.gap_number = self.gap_number.saturating_add(1);
-        let gap_id = format!(
-            "claude:{}:{}:gap-{}",
-            self.agent_id, self.generation, self.gap_number
-        );
-        let ack_id = gap_id.clone();
-        let result = self
-            .host
-            .call(
-                "source.gap",
-                json!({
-                    "credential": self.credential,
-                    "agent_id": self.agent_id,
-                    "generation": self.generation,
-                    "source": "stream",
-                    "gap_id": gap_id,
-                    "families": ["session", "turn", "message", "request"],
-                    "reason": reason,
-                    "from": null,
-                    "to": null,
-                }),
-                Instant::now() + EVENT_DEADLINE,
-            )
-            .await;
-        match result {
-            Ok(ack)
-                if ack.get("gap_id").and_then(Value::as_str) == Some(ack_id.as_str())
-                    && ack
-                        .get("seq")
-                        .and_then(Value::as_i64)
-                        .is_some_and(|seq| seq > 0) =>
-            {
-                self.status.failure = Some(format!("{reason}; terminal outcome is unknown"));
-                Ok(())
-            }
-            Ok(_) | Err(_) => {
-                self.writes_blocked = true;
-                self.status.source_unknown = true;
-                self.status.batch_unknown = true;
-                self.status.failure =
-                    Some("Claude source gap acknowledgement is unknown".to_owned());
-                Err(Error::new(
-                    "unknown",
-                    "Claude source gap acknowledgement is unknown",
-                ))
-            }
+        self.stream_source().record_gap(reason).await
+    }
+
+    /// The shared stream-commit half of this processor.
+    fn stream_source(&mut self) -> StreamSource<'_> {
+        StreamSource {
+            sink: &mut self.sink,
+            host: &self.host,
+            credential: &self.credential,
+            agent_id: &self.agent_id,
+            generation: self.generation,
+            harness: "Claude",
+            id_prefix: "claude",
+            families: &["session", "turn", "message", "request"],
+            writes_blocked: &mut self.writes_blocked,
+            gap_reported: &mut self.gap_reported,
+            gap_number: &mut self.gap_number,
+            source_unknown: &mut self.status.source_unknown,
+            batch_unknown: &mut self.status.batch_unknown,
+            failure: &mut self.status.failure,
         }
     }
 }
@@ -1519,31 +1438,6 @@ pub(crate) fn rejected_control(reason: &str) -> Value {
 
 pub(crate) fn unknown_control(reason: &str) -> Value {
     json!({"state": "unknown", "reason": reason})
-}
-
-/// Bounded terminal text: when the accumulated reply cannot fit the persisted
-/// event, omit it with the explicit marker instead of truncating.
-fn attach_final_text(data: &mut Value, text: &str, secrets: &SecretPolicy) {
-    let redacted = secrets.redact_text(text);
-    let candidate = json!({
-        "command_id": data.get("command_id").cloned().unwrap_or(Value::Null),
-        "turn_id": data.get("turn_id").cloned().unwrap_or(Value::Null),
-        "status": data.get("status").cloned().unwrap_or(Value::Null),
-        "final_text": redacted,
-    });
-    if serde_json::to_vec(&candidate).map_or(usize::MAX, |bytes| bytes.len()) <= MAX_EVENT_BYTES {
-        data["final_text"] = Value::String(redacted);
-        return;
-    }
-    let marker = json!({
-        "command_id": data.get("command_id").cloned().unwrap_or(Value::Null),
-        "turn_id": data.get("turn_id").cloned().unwrap_or(Value::Null),
-        "status": data.get("status").cloned().unwrap_or(Value::Null),
-        "final_text_unavailable": "event_budget",
-    });
-    if serde_json::to_vec(&marker).map_or(usize::MAX, |bytes| bytes.len()) <= MAX_EVENT_BYTES {
-        data["final_text_unavailable"] = Value::String("event_budget".to_owned());
-    }
 }
 
 #[cfg(test)]

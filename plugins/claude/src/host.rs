@@ -1,16 +1,20 @@
 use crate::{
     events::{self, EventConfig, EventHandle, TurnOutcome, unknown_control},
     native::{
-        ClaudeClient, ClaudeProcess, native_no_write,
+        ClaudeClient, ClaudeProcess,
         types::{InitializeReadback, OutboundUserInput, OutboundUserMessage},
     },
 };
-use eliot_core::{Error, ProcessRecord, ProcessState, Result, SecretPolicy};
+use eliot_core::{Error, Result, SecretPolicy};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
     native_transport::NativeLaunch,
-    protocol::{MAX_COMMAND_ID_BYTES, MAX_CREDENTIAL_BYTES},
+    protocol::MAX_CREDENTIAL_BYTES,
+    session::{
+        self, contextual_error, decode, native_no_write, not_initialized, register_native_process,
+        unknown_snapshot, validate_binding, validate_identity, validate_source_plan,
+    },
 };
 use serde_json::{Value, json};
 use std::{
@@ -271,7 +275,10 @@ impl ClaudePlugin {
     /// Validate the frozen profile and freeze the start inputs. No spawn yet:
     /// every `profile_error` returns before any native process exists.
     fn plan_start(&self, params: &AgentStartParams) -> Result<StartPlan> {
-        let initialized = self.initialized.as_ref().ok_or_else(not_initialized)?;
+        let initialized = self
+            .initialized
+            .as_ref()
+            .ok_or_else(|| not_initialized("Claude"))?;
         if params.initial.is_some() {
             return Err(Error::new(
                 "unsupported",
@@ -290,7 +297,11 @@ impl ClaudePlugin {
                 )
             })
             .transpose()?;
-        validate_source_plan(params.source_plan.as_ref())?;
+        validate_source_plan(
+            "Claude",
+            &["session", "turn", "message", "request"],
+            params.source_plan.as_ref(),
+        )?;
         let frozen_profile = params.profile.as_ref().ok_or_else(|| {
             Error::new("profile_error", "Claude requires a frozen profile object")
         })?;
@@ -570,7 +581,12 @@ impl ClaudePlugin {
 
     async fn start(&mut self, raw: &Value, peer: &PeerClient) -> Result<Value> {
         let params: AgentStartParams = decode(raw, "Claude agent.start params are invalid")?;
-        validate_identity(&params.agent_id, params.generation, &params.command_id)?;
+        validate_identity(
+            &params.agent_id,
+            params.generation,
+            &params.command_id,
+            "Claude",
+        )?;
         if let Some(replay) = self.replay_start(&params) {
             return replay;
         }
@@ -581,7 +597,10 @@ impl ClaudePlugin {
             &plan.credential,
             &session.agent_id,
             session.generation,
-            &session.native,
+            session.native.pid(),
+            "Claude",
+            "CLI",
+            RPC_TIMEOUT,
         )
         .await
         {
@@ -597,7 +616,12 @@ impl ClaudePlugin {
 
     async fn command(&mut self, raw: &Value) -> Result<Value> {
         let params: AgentCommandParams = decode(raw, "Claude agent.command params are invalid")?;
-        validate_identity(&params.agent_id, params.generation, &params.command_id)?;
+        validate_identity(
+            &params.agent_id,
+            params.generation,
+            &params.command_id,
+            "Claude",
+        )?;
         match params.verb.as_str() {
             "send" => self.send_command(params).await,
             "interrupt" => self.interrupt_command(params).await,
@@ -614,7 +638,13 @@ impl ClaudePlugin {
             .session
             .as_mut()
             .ok_or_else(|| Error::new("bad_state", "Claude Agent session has not started"))?;
-        validate_binding(session, &params.agent_id, params.generation)?;
+        validate_binding(
+            &session.agent_id,
+            session.generation,
+            &params.agent_id,
+            params.generation,
+            "Claude",
+        )?;
         if session.phase != SessionPhase::Ready {
             return Err(Error::new(
                 "unknown",
@@ -637,7 +667,13 @@ impl ClaudePlugin {
             .session
             .as_mut()
             .ok_or_else(|| Error::new("bad_state", "Claude Agent session has not started"))?;
-        validate_binding(session, &params.agent_id, params.generation)?;
+        validate_binding(
+            &session.agent_id,
+            session.generation,
+            &params.agent_id,
+            params.generation,
+            "Claude",
+        )?;
         if session.phase != SessionPhase::Ready {
             return Err(Error::new(
                 "unknown",
@@ -736,7 +772,13 @@ impl ClaudePlugin {
             .session
             .as_mut()
             .ok_or_else(|| Error::new("bad_state", "Claude Agent session has not started"))?;
-        validate_binding(session, &params.agent_id, params.generation)?;
+        validate_binding(
+            &session.agent_id,
+            session.generation,
+            &params.agent_id,
+            params.generation,
+            "Claude",
+        )?;
         if session.phase != SessionPhase::Ready {
             return Err(Error::new(
                 "unknown",
@@ -807,12 +849,23 @@ impl ClaudePlugin {
 
     async fn snapshot(&mut self, raw: &Value) -> Result<Value> {
         let params: AgentSnapshotParams = decode(raw, "Claude agent.snapshot params are invalid")?;
-        validate_identity(&params.agent_id, params.generation, &params.command_id)?;
+        validate_identity(
+            &params.agent_id,
+            params.generation,
+            &params.command_id,
+            "Claude",
+        )?;
         let session = self
             .session
             .as_mut()
             .ok_or_else(|| Error::new("not_found", "Claude Agent session is not retained"))?;
-        validate_binding(session, &params.agent_id, params.generation)?;
+        validate_binding(
+            &session.agent_id,
+            session.generation,
+            &params.agent_id,
+            params.generation,
+            "Claude",
+        )?;
         // PR1 has no live native session poll: the snapshot is the committed
         // stream position (session/turn bindings plus the latest terminal
         // facts), never a fresh native query.
@@ -924,12 +977,23 @@ impl ClaudePlugin {
 
     async fn stop(&mut self, raw: &Value) -> Result<Value> {
         let params: AgentStopParams = decode(raw, "Claude agent.stop params are invalid")?;
-        validate_identity(&params.agent_id, params.generation, &params.command_id)?;
+        validate_identity(
+            &params.agent_id,
+            params.generation,
+            &params.command_id,
+            "Claude",
+        )?;
         let session = self
             .session
             .as_mut()
             .ok_or_else(|| Error::new("not_found", "Claude Agent session is not retained"))?;
-        validate_binding(session, &params.agent_id, params.generation)?;
+        validate_binding(
+            &session.agent_id,
+            session.generation,
+            &params.agent_id,
+            params.generation,
+            "Claude",
+        )?;
         if session.phase == SessionPhase::Stopped
             && session.stop_command_id.as_deref() == Some(params.command_id.as_str())
         {
@@ -1234,58 +1298,6 @@ async fn launch_session(
     })
 }
 
-async fn register_native_process(
-    peer: &PeerClient,
-    credential: &str,
-    agent_id: &str,
-    generation: i64,
-    native: &ClaudeProcess,
-) -> Result<()> {
-    let pid = native.pid().filter(|pid| *pid > 0).ok_or_else(|| {
-        Error::new(
-            "process_registration",
-            "Claude CLI PID is unavailable; no session or input was sent",
-        )
-    })?;
-    let value = peer
-        .call(
-            "process.put",
-            json!({
-                "credential": credential,
-                "agent_id": agent_id,
-                "generation": generation,
-                "pid": pid,
-                "role": "harness",
-            }),
-            Instant::now() + RPC_TIMEOUT,
-        )
-        .await
-        .map_err(|error| {
-            let message = format!("Claude CLI process registration failed ({})", error.code);
-            contextual_error(error, "process_registration", message)
-        })?;
-    let record: ProcessRecord = serde_json::from_value(value).map_err(|_| {
-        Error::new(
-            "process_registration",
-            "Claude host returned an invalid process.put acknowledgement",
-        )
-    })?;
-    if record.identity.pid != pid
-        || record.identity.host_boot_id.trim().is_empty()
-        || record.identity.start_time == 0
-        || record.owner != format!("agent:{agent_id}#{generation}")
-        || record.role != "harness"
-        || record.state != ProcessState::Running
-        || record.exit_code.is_some()
-    {
-        return Err(Error::new(
-            "process_registration",
-            "Claude host did not verify the running CLI under this Agent generation",
-        ));
-    }
-    Ok(())
-}
-
 async fn discard_unstarted(session: &mut AgentSession) {
     session.events.close().await;
     let _ = session
@@ -1516,69 +1528,16 @@ fn claude_scope(config_dir: Option<&str>) -> String {
     }
 }
 
-fn unknown_snapshot(params: &AgentSnapshotParams, reason: &str) -> Result<Value> {
-    Ok(json!({
-        "agent_id": params.agent_id,
-        "generation": params.generation,
-        "command_id": params.command_id,
-        "state": "unknown",
-        "active_turn": null,
-        "last_turn": null,
-        "source_unknown": true,
-        "result_known": false,
-        "reason": reason,
-    }))
-}
-
+/// The shared start/input/stop commands plus the Claude-only interrupt and
+/// request-reply commands.
 fn known_command(session: &AgentSession, command_id: &str) -> bool {
-    session.start_command_id == command_id
-        || session.command_inputs.contains_key(command_id)
-        || session.interrupt_applied.contains_key(command_id)
+    session::known_command(
+        &session.start_command_id,
+        &session.command_inputs,
+        &session.stop_command_id,
+        command_id,
+    ) || session.interrupt_applied.contains_key(command_id)
         || session.reply_outcomes.contains_key(command_id)
-        || session.stop_command_id.as_deref() == Some(command_id)
-}
-
-fn validate_binding(session: &AgentSession, agent_id: &str, generation: i64) -> Result<()> {
-    if session.agent_id != agent_id || session.generation != generation {
-        return Err(Error::new(
-            "stale_generation",
-            "Claude request does not match the bound Agent generation",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_identity(agent_id: &str, generation: i64, command_id: &str) -> Result<()> {
-    if agent_id.trim().is_empty()
-        || generation <= 0
-        || command_id.trim().is_empty()
-        || command_id.len() > MAX_COMMAND_ID_BYTES
-    {
-        return Err(Error::new(
-            "invalid",
-            "Claude request requires a bounded Agent, generation, and command identity",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_source_plan(source_plan: Option<&Value>) -> Result<()> {
-    let Some(plan) = source_plan.and_then(Value::as_object) else {
-        return Err(Error::new(
-            "unsupported",
-            "Claude start requires an installed stream source plan",
-        ));
-    };
-    if ["session", "turn", "message", "request"]
-        .iter()
-        .any(|family| plan.get(*family).and_then(Value::as_str) != Some("stream"))
-    {
-        return Err(Error::new(
-            "unsupported",
-            "Claude start requires stream ownership for session, turn, message, and request",
-        ));
-    }
-    Ok(())
 }
 
 fn optional_profile_text(
@@ -1595,89 +1554,37 @@ fn optional_profile_text(
     }
 }
 
-fn contextual_error(error: Error, code: impl Into<String>, message: impl Into<String>) -> Error {
-    error.with_code(code).with_message(message)
-}
-
-fn decode<T: serde::de::DeserializeOwned>(raw: &Value, message: &str) -> Result<T> {
-    serde_json::from_value(raw.clone()).map_err(|_| Error::new("invalid", message))
-}
-
-fn not_initialized() -> Error {
-    Error::new("bad_state", "Claude plugin has not been initialized")
-}
-
+/// The shared environment mapping plus the Claude-only config-dir identity:
+/// the first `CLAUDE_CONFIG_DIR` value names the native scope.
 fn target_environment(
     environment: Option<&Value>,
     pass_env: Option<&Value>,
 ) -> Result<TargetEnvironment> {
-    let Some(environment) = environment else {
-        return Ok(TargetEnvironment {
-            variables: Vec::new(),
-            secrets: Vec::new(),
-            config_dir: None,
-        });
-    };
-    let object = environment.as_object().ok_or_else(|| {
-        Error::new(
-            "profile_error",
-            "Claude target_environment must be an object",
-        )
-    })?;
-    let pass_env = pass_env.and_then(Value::as_array);
-    let mut vars = Vec::with_capacity(object.len());
-    let mut secrets = Vec::new();
-    let mut config_dir = None;
-    for (name, value) in object {
-        if name.is_empty() || name.contains('=') || name.contains('\0') {
-            return Err(Error::new(
-                "profile_error",
-                "Claude environment contains an invalid variable name",
-            ));
-        }
-        let value = value.as_str().ok_or_else(|| {
-            Error::new("profile_error", "Claude environment values must be strings")
-        })?;
-        let explicitly_passed = pass_env.is_some_and(|names| {
-            names.iter().filter_map(Value::as_str).any(|passed| {
-                if cfg!(windows) {
-                    name.eq_ignore_ascii_case(passed)
-                } else {
-                    name == passed
-                }
-            })
-        });
-        if (is_secret_name(name) || explicitly_passed) && !value.is_empty() {
-            secrets.push(value.to_owned());
-        }
-        if name.eq_ignore_ascii_case("CLAUDE_CONFIG_DIR") && config_dir.is_none() {
-            config_dir = Some(value.to_owned());
-        }
-        vars.push((OsString::from(name), OsString::from(value)));
-    }
+    let mapped = session::target_environment(environment, pass_env, "Claude")?;
+    let config_dir = environment.and_then(Value::as_object).and_then(|object| {
+        object.iter().find_map(|(name, value)| {
+            if name.eq_ignore_ascii_case("CLAUDE_CONFIG_DIR") {
+                value.as_str().map(str::to_owned)
+            } else {
+                None
+            }
+        })
+    });
     Ok(TargetEnvironment {
-        variables: vars,
-        secrets,
+        variables: mapped.variables,
+        secrets: mapped.secrets,
         config_dir,
     })
 }
 
-fn is_secret_name(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    upper.contains("TOKEN")
-        || upper.contains("SECRET")
-        || upper.contains("PASSWORD")
-        || upper.contains("API_KEY")
-        || upper.contains("AUTH")
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        claude_manifest, claude_scope, new_uuid, parse_resume_subject, validate_source_plan,
-    };
+    use super::{claude_manifest, claude_scope, new_uuid, parse_resume_subject};
+    use eliot_plugin::session::validate_source_plan;
     use serde_json::json;
     use std::collections::{BTreeMap, HashSet};
+
+    const FAMILIES: &[&str] = &["session", "turn", "message", "request"];
 
     #[test]
     fn uuid_mints_unique_hyphenated_ids() {
@@ -1738,22 +1645,30 @@ mod tests {
 
     #[test]
     fn source_plan_requires_the_stream_families() {
-        assert!(validate_source_plan(None).is_err());
+        assert!(validate_source_plan("Claude", FAMILIES, None).is_err());
         assert!(
-            validate_source_plan(Some(&json!({
-                "session": "stream",
-                "turn": "stream",
-                "message": "stream",
-                "request": "stream",
-            })))
+            validate_source_plan(
+                "Claude",
+                FAMILIES,
+                Some(&json!({
+                    "session": "stream",
+                    "turn": "stream",
+                    "message": "stream",
+                    "request": "stream",
+                }))
+            )
             .is_ok()
         );
         assert!(
-            validate_source_plan(Some(&json!({
-                "session": "stream",
-                "turn": "stream",
-                "message": "stream",
-            })))
+            validate_source_plan(
+                "Claude",
+                FAMILIES,
+                Some(&json!({
+                    "session": "stream",
+                    "turn": "stream",
+                    "message": "stream",
+                }))
+            )
             .is_err()
         );
     }

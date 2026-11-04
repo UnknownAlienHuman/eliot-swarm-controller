@@ -627,6 +627,11 @@ mod tests {
                 "session, turn, message, and request",
             ),
             (
+                "Claude",
+                &["session", "turn", "message", "request"][..],
+                "session, turn, message, and request",
+            ),
+            (
                 "Codex",
                 &["session", "turn", "message", "tool", "request"][..],
                 "session, turn, message, tool, and request",
