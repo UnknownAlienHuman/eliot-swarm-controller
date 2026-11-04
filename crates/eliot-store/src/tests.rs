@@ -6258,11 +6258,13 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
              DROP TABLE messages; DROP TABLE vars; DROP TABLE mail_notices;
              DELETE FROM schema_migrations WHERE version = 21;
              DROP TABLE claims;
-             DELETE FROM schema_migrations WHERE version = 24;",
+             DELETE FROM schema_migrations WHERE version = 24;
+             DROP TABLE owned_exits;
+             DELETE FROM schema_migrations WHERE version = 25;",
         )
         .expect("roll back to schema 16");
     drop(store);
-    let mut store = Store::open(&path).expect("migrate 16 to 24");
+    let mut store = Store::open(&path).expect("migrate 16 to 25");
     store.recover_on_restart(now + 2).expect("recover");
     let retained = store
         .restart_retained_generations(None)
@@ -7980,8 +7982,9 @@ fn stop_and_source_closure_alone_do_not_release_capacity_or_fail_host_settlement
     assert!(numeric_agent > 0);
 }
 
-/// A stopped generation that never committed `session.ended`, with the exit
-/// facts recorded in the given order; returns the Store with capacity still held.
+/// A force-stopped generation that never committed `session.ended`, with its
+/// plugin process recorded as exited; returns the Agent id. The stop already
+/// closed its native sources administratively.
 fn stopped_capacity_agent_without_session_end(
     store: &mut Store,
     project: &str,
@@ -8030,65 +8033,56 @@ fn owned_exit_capacity_releases_when_the_os_source_closes_last() {
     let mut store = Store::open(Path::new(":memory:")).expect("open Store");
     let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
     let agent = stopped_capacity_agent_without_session_end(&mut store, "capacity-os-last", now);
-    store
-        .close_native_sources(&agent, 1, now + 5)
-        .expect("reader drained");
-    // The host records the owned exit before the monitor's next sweep closes `os`.
+    // The host proves exit and drain before the monitor's next sweep closes `os`.
     assert!(
         store
-            .record_owned_control_exit(&agent, 1, now + 6)
+            .record_owned_control_exit(&agent, 1, now + 5)
             .expect("owned exit with OS still open")
             .is_empty()
     );
     assert_eq!(capacity_generation(&store, &agent), Some(1));
     let events = store
-        .set_process_source_status(&agent, 1, "ok", true, now + 7)
+        .set_process_source_status(&agent, 1, "ok", true, now + 6)
         .expect("monitor closes the OS source");
-    assert!(
-        events.iter().any(|event| event.kind == "capacity.released"),
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "capacity.released")
+            .count(),
+        1,
         "the last exit fact releases the reservation: {events:?}"
     );
     assert_eq!(capacity_generation(&store, &agent), None);
+    let repeated = store
+        .set_process_source_status(&agent, 1, "ok", true, now + 7)
+        .expect("repeated closure");
+    assert!(
+        repeated
+            .iter()
+            .all(|event| event.kind != "capacity.released")
+    );
 }
 
 #[test]
-fn owned_exit_capacity_releases_when_the_reader_drains_last() {
-    // A generation whose processes exited without a stop: its native reader
-    // is still open when the monitor closes `os`, and drains afterwards.
+fn os_closure_without_a_host_drain_proof_keeps_capacity() {
+    // A forced stop whose reader never drained: the host records no owned-exit
+    // proof, so closing `os` must not release although the stop closed the
+    // native sources administratively.
     let mut store = Store::open(Path::new(":memory:")).expect("open Store");
     let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
-    let (agent, _) = ready_capacity_agent(&mut store, "capacity-reader-last", now);
-    store
-        .ensure_process_source(&agent, 1, now + 1)
-        .expect("install OS process source");
-    store
-        .connection
-        .execute(
-            "INSERT INTO processes(host_boot_id, pid, start_time, owner, role, state, exit_code, updated_at)
-             VALUES ('capacity-reader-boot', 81004, 1, ?1, 'plugin', 'exited', 0, ?2)",
-            rusqlite::params![format!("agent:{agent}#1"), now + 2],
-        )
-        .expect("persist exact exited plugin process");
-    let open_native: i64 = store
-        .connection
-        .query_row(
-            "SELECT COUNT(*) FROM source_state WHERE agent = ?1 AND generation = 1
-             AND source NOT IN ('daemon','os','git','workspace_process') AND state = 'open'",
-            [eliot_core::parse_agent_id(&agent).unwrap()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert!(open_native > 0, "the native reader is still open");
-    store
-        .set_process_source_status(&agent, 1, "ok", true, now + 3)
-        .expect("OS source closes while the reader is open");
-    assert_eq!(capacity_generation(&store, &agent), Some(1));
+    let agent = stopped_capacity_agent_without_session_end(&mut store, "capacity-no-drain", now);
     let events = store
-        .close_native_sources(&agent, 1, now + 4)
-        .expect("reader drains last");
+        .set_process_source_status(&agent, 1, "ok", true, now + 5)
+        .expect("monitor closes the OS source");
+    assert!(events.iter().all(|event| event.kind != "capacity.released"));
+    assert_eq!(capacity_generation(&store, &agent), Some(1));
+    let released = store
+        .record_owned_control_exit(&agent, 1, now + 6)
+        .expect("the host drain proof arrives last");
     assert!(
-        events.iter().any(|event| event.kind == "capacity.released"),
-        "the last exit fact releases the reservation: {events:?}"
+        released
+            .iter()
+            .any(|event| event.kind == "capacity.released")
     );
     assert_eq!(capacity_generation(&store, &agent), None);
 }

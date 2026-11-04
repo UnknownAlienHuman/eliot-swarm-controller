@@ -454,16 +454,19 @@ control with `capacity_unavailable`. That request is not admitted or persisted, 
 creates no command, Agent, event or reservation; the same ID may be submitted again
 after capacity changes. An already admitted command retains its result under its ID, and
 replay never starts another native generation or reservation. A capacity reservation is
-released only after the owned generation is proven closed: the OS source closed, every
-native reader drained and every recorded plugin/harness process exited. Those facts
-arrive in any order, so each of them re-checks the proof and the last one releases.
+released only after the owned generation is proven closed: the OS source closed
+with every recorded process of the generation exited (at least one plugin or
+harness), no native source open, and the plugin host's record that it saw the
+plugin exit and drained its reader (a stop or lost transition closes sources
+without a drain). The host record and the OS closure arrive in either order;
+each re-checks the proof and the later one releases.
 Uncertain starts retain their reservation across daemon replacement. These limits describe Eliot's admitted workload,
 not vendor entitlements, account permissions or provider quotas. Fake profiles may use
 named profile/account caps; Fake does not acquire a proxy route.
 
 Restart recovery reconciles reservations that a daemon replacement leaves behind. After
-`recover_on_restart` and before IPC bind, the daemon reads every `lost` or `stopped`
-(a forced stop records no `session.ended`) controlled generation whose `capacity_generation` still equals its generation, with the process
+`recover_on_restart` and before IPC bind, the daemon reads every `lost` or
+`stopped` (a forced stop records no `session.ended`) controlled generation whose `capacity_generation` still equals its generation, with the process
 identities recorded for owner `agent:<id>#<generation>`. It checks custody outside the
 Store lock, then commits the closure and `capacity.released` (or the transfer to an
 admitted resume) in one Store transaction conditional on `capacity_generation` still

@@ -1315,10 +1315,11 @@ impl Store {
         Ok(events)
     }
 
-    /// Release one generation only at the Host boundary that has proved both
-    /// owned-process exit and reader drain. Closing sources or marking an Agent
-    /// lost is not sufficient by itself. Missing persisted OS/process/reader
-    /// facts leave the reservation in place without failing Host settlement.
+    /// Record the Host's proof of owned-process exit and reader drain, then
+    /// release the generation if the OS source has already closed; otherwise
+    /// the OS-source closure releases it later. Closing sources or marking an
+    /// Agent lost is not sufficient by itself, and missing facts never fail
+    /// Host settlement.
     pub fn record_owned_control_exit(
         &mut self,
         agent: &str,
@@ -1341,6 +1342,7 @@ impl Store {
                     "owned-exit generation does not exist",
                 ));
             }
+            capacity::record_owned_exit_proof_tx(&tx, agent_num, generation, now)?;
             let events = capacity::release_owned_exit_event_tx(
                 &tx,
                 agent_num,
