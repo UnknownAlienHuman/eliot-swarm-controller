@@ -414,6 +414,7 @@ dependencies = [
  "eliot-plugin-claude",
  "eliot-plugin-codex",
  "eliot-plugin-muse",
+ "eliot-plugin-opencode",
  "serde_json",
  "tokio",
  "ulid",
@@ -512,6 +513,19 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-util",
+ "ulid",
+]
+
+[[package]]
+name = "eliot-plugin-opencode"
+version = "0.2.0-dev"
+dependencies = [
+ "eliot-core",
+ "eliot-plugin",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
  "ulid",
 ]
 

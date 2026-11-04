@@ -32,12 +32,12 @@ Catalogue preflight may retry only before any session/input may have been admitt
 
 | Eliot operation | Mechanism / settlement |
 | --- | --- |
-| launch | create session without input; exact readiness, linked send separate |
-| send | async prompt/inbox; 204 is intermediate, applied needs exact input-to-execution association |
+| launch | installed `POST /api/session` with the workspace directory, no input; per-Agent `serve` on loopback with a generated `OPENCODE_PASSWORD` and per-Agent `XDG_CONFIG_HOME`/`XDG_DATA_HOME`; exact session/model/directory echo required before Eliot `session.ready` (PR1, fake-server verified) |
+| send | installed `POST /api/session/{id}/prompt`; the 200 inbox id is intermediate, applied needs the exact input-to-execution association on SSE (`session.inbox.enqueued`/`delivered` plus `session.execution.started`; turn id is the exact `started` event id) (PR1, fake-server verified) |
 | steer | exact-current-execution method only; queueing another prompt is not steer |
 | inject | verified safe point or explicit next-send prepend |
 | interrupt | captured session/execution abort, with installed child scope verified |
-| stop | only a native close/disable operation that proves the session ended; abort-plus-detach is **not** stop |
+| stop | installed `DELETE /api/session/{id}` (`204` removed, `404` already gone) plus a `404` session readback proving the session is gone, then the owned per-Agent server ends through the generation's process custody; abort-plus-detach is **not** stop (PR1, fake-server verified) |
 | detach | explicitly stop controlling/observing as defined, leaving native service/session alive |
 | resume | installed exact native session reattachment/resume; no old input replay |
 | approve/deny/answer | exact native permission/input id and offered response schema |

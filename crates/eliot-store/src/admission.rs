@@ -389,7 +389,7 @@ pub(super) fn submit_tx(
             } else {
                 required_string(&request.args, "harness")?
             };
-            if !matches!(harness.as_str(), "fake" | "codex" | "muse" | "claude") {
+            if !matches!(harness.as_str(), "fake" | "codex" | "muse" | "claude" | "opencode") {
                 return Err(Error::new(
                     "unsupported",
                     format!("unsupported launch harness {harness}"),

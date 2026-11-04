@@ -716,6 +716,9 @@ enum PluginCommand {
     /// Internal Claude plugin entry point (hidden).
     #[command(hide = true)]
     Claude,
+    /// Internal OpenCode plugin entry point (hidden).
+    #[command(hide = true)]
+    Opencode,
 }
 
 struct Failure {
@@ -1962,6 +1965,12 @@ async fn dispatch(cli: Cli, data_dir: PathBuf) -> Result<u8, Failure> {
             }
             PluginCommand::Claude => {
                 eliot_plugin_claude::run_claude()
+                    .await
+                    .map_err(|error| Failure::new(1, error.to_string()))?;
+                Ok(0)
+            }
+            PluginCommand::Opencode => {
+                eliot_plugin_opencode::run_opencode()
                     .await
                     .map_err(|error| Failure::new(1, error.to_string()))?;
                 Ok(0)
