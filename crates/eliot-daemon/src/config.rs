@@ -1400,9 +1400,14 @@ fn claude_snapshot_from_entry(
         None => Vec::new(),
     };
     let cmd = match entry.cmd.as_deref() {
-        Some(cmd) => reject_script_wrapper(
+        Some(cmd) => require_native_claude_cmd(
             name,
-            validate_cmd(name, cmd, source, table_offset)?,
+            reject_script_wrapper(
+                name,
+                validate_cmd(name, cmd, source, table_offset)?,
+                source,
+                table_offset,
+            )?,
             source,
             table_offset,
         )?,
@@ -1788,6 +1793,50 @@ fn reject_script_wrapper(
             profile,
             "cmd",
             "must name one native executable path, not a .cmd/.bat/.ps1 wrapper",
+            "profile_error",
+        ));
+    }
+    Ok(cmd)
+}
+
+/// Claude is a native executable: its cmd must be an absolute path (no PATH
+/// lookup, so no bare `claude`), and on Windows it must name the `.exe`
+/// itself. A script wrapper (`.js` here, `.cmd`/`.bat`/`.ps1` above) would
+/// orphan the real CLI on stop, when only the wrapper PID is owned.
+fn require_native_claude_cmd(
+    profile: &str,
+    cmd: String,
+    source: &str,
+    offset: usize,
+) -> core::Result<String> {
+    if !std::path::Path::new(&cmd).is_absolute() {
+        return Err(profile_field_error(
+            source,
+            offset,
+            profile,
+            "cmd",
+            "must be an absolute native executable path, not a bare command name",
+            "profile_error",
+        ));
+    }
+    let lower = cmd.to_ascii_lowercase();
+    if lower.ends_with(".js") {
+        return Err(profile_field_error(
+            source,
+            offset,
+            profile,
+            "cmd",
+            "must name the native executable, not a .js script wrapper",
+            "profile_error",
+        ));
+    }
+    if cfg!(windows) && !lower.ends_with(".exe") {
+        return Err(profile_field_error(
+            source,
+            offset,
+            profile,
+            "cmd",
+            "must name the native .exe, not a script wrapper",
             "profile_error",
         ));
     }
@@ -3035,16 +3084,18 @@ pass_env = ["EXAMPLE_API_KEY"]
 
     #[test]
     fn claude_profile_freezes_model_and_cmd() {
-        let source = r#"
-[profiles.claude]
-harness = "claude"
-cmd = "C:/Users/test/.local/bin/claude.exe"
-model = "claude-opus-4-6"
-pass_env = ["EXAMPLE_API_KEY"]
-"#;
-        let snapshot = resolve_text_profile(source, "claude").unwrap();
+        // Absolute native path on every platform (no existence check).
+        let cmd = if cfg!(windows) {
+            "C:/Users/test/.local/bin/claude.exe"
+        } else {
+            "/tmp/eliot-claude-cmd-test/claude"
+        };
+        let source = format!(
+            "[profiles.claude]\nharness = \"claude\"\ncmd = '{cmd}'\nmodel = \"claude-opus-4-6\"\npass_env = [\"EXAMPLE_API_KEY\"]\n"
+        );
+        let snapshot = resolve_text_profile(&source, "claude").unwrap();
         assert_eq!(snapshot["harness"], "claude");
-        assert_eq!(snapshot["cmd"], "C:/Users/test/.local/bin/claude.exe");
+        assert_eq!(snapshot["cmd"], cmd);
         assert_eq!(snapshot["model"], "claude-opus-4-6");
         assert_eq!(snapshot["permissions"], "workspace-write");
         assert_eq!(snapshot["approval_policy"], "never");
@@ -3070,6 +3121,44 @@ pass_env = ["EXAMPLE_API_KEY"]
         ] {
             let error = resolve_text_profile(source, "claude").expect_err("must reject");
             assert_eq!(error.code, "profile_error", "{source}");
+        }
+    }
+
+    #[test]
+    fn claude_cmd_requires_an_absolute_native_path() {
+        // Bare names, relative paths and script wrappers are rejected on
+        // every platform (same code; the Windows/Unix reason differs where
+        // the path is absolute on one and relative on the other).
+        for cmd in [
+            "claude",
+            "claude.exe",
+            "./claude.exe",
+            "Tools/Claude/claude.exe",
+            "C:/Tools/Claude/claude.js",
+            "/tmp/claude.js",
+            "/tmp/claude.cmd",
+            "/tmp/claude.bat",
+            "/tmp/claude.ps1",
+        ] {
+            let source = format!(
+                "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\ncmd='{cmd}'\n"
+            );
+            let error = resolve_text_profile(&source, "claude").expect_err("must reject");
+            assert_eq!(error.code, "profile_error", "{cmd}");
+        }
+        // Unix native binaries carry no extension; Windows must name the .exe.
+        #[cfg(unix)]
+        {
+            let source = "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\ncmd='/tmp/eliot-claude-cmd-test/claude'\n";
+            let snapshot =
+                resolve_text_profile(source, "claude").expect("unix accepts an absolute path");
+            assert_eq!(snapshot["cmd"], "/tmp/eliot-claude-cmd-test/claude");
+        }
+        #[cfg(windows)]
+        {
+            let source = "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\ncmd='C:/Tools/Claude/claude'\n";
+            let error = resolve_text_profile(source, "claude").expect_err("windows needs .exe");
+            assert_eq!(error.code, "profile_error");
         }
     }
 
