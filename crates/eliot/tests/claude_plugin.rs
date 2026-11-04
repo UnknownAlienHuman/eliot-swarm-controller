@@ -66,6 +66,12 @@ fn main() {
         )
         .await;
         run_scenario(
+            "terminal reason is redacted",
+            OwnedChildren::default(),
+            scenario_terminal_reason_is_redacted,
+        )
+        .await;
+        run_scenario(
             "cancelled input is rejected without a second write",
             OwnedChildren::default(),
             scenario_cancelled_input_is_rejected_without_rewrite,
@@ -396,11 +402,15 @@ impl FakeClaude {
                     self.emit_assistant(stdout, &text);
                 }
                 let terminal_reason = if self.script == "failed-turn" {
-                    "failed"
+                    "failed".to_owned()
+                } else if self.script == "secret-reason" {
+                    // The report path is a pass_env secret: the committed
+                    // status must carry the redaction marker, never the path.
+                    format!("completed {}", self.report_path.to_string_lossy())
                 } else {
-                    "completed"
+                    "completed".to_owned()
                 };
-                self.emit_turn_result(stdout, terminal_reason);
+                self.emit_turn_result(stdout, &terminal_reason);
                 true
             }
             _ => true,
@@ -1322,6 +1332,29 @@ async fn scenario_failed_turn_reports_terminal_reason(owned: OwnedChildren) {
     assert_eq!(
         terminal.get("status").and_then(Value::as_str),
         Some("failed")
+    );
+    stop_agent(&mut scenario.host, &agent_id).await;
+    scenario.assert_cli_exit("stdin-eof");
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+}
+
+async fn scenario_terminal_reason_is_redacted(owned: OwnedChildren) {
+    let mut scenario = Scenario::start("secret-reason", claude_profile(), &owned).await;
+    let agent_id = scenario.agent_id.clone();
+    let (_, _, committed) = send_turn(&mut scenario.host, &agent_id, "hello").await;
+    let terminal = committed
+        .iter()
+        .find(|(kind, _)| kind == "turn.completed")
+        .map(|(_, data)| data)
+        .expect("terminal data");
+    assert_eq!(
+        terminal.get("status").and_then(Value::as_str),
+        Some("completed [REDACTED]")
     );
     stop_agent(&mut scenario.host, &agent_id).await;
     scenario.assert_cli_exit("stdin-eof");

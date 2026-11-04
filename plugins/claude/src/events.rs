@@ -863,10 +863,11 @@ impl EventProcessor {
             return Ok(());
         }
         let secrets = SecretPolicy::new(self.secrets.iter().cloned());
+        let terminal_reason = secrets.redact_text(&parsed.terminal_reason);
         let mut data = json!({
             "command_id": command_id.clone(),
             "turn_id": turn_id.clone(),
-            "status": parsed.terminal_reason.clone(),
+            "status": terminal_reason.clone(),
         });
         if let Some(text) = self.final_text.as_ref() {
             attach_final_text(&mut data, text, &secrets);
@@ -881,7 +882,7 @@ impl EventProcessor {
         self.status.last_turn = Some(TurnFacts {
             command_id,
             turn_id,
-            status: Some(parsed.terminal_reason),
+            status: Some(terminal_reason),
             final_text: self.final_text.take(),
             terminal: true,
         });
