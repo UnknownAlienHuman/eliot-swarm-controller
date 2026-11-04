@@ -22,6 +22,7 @@ use eliot_plugin::{
     InitializeParams, MAX_EVENT_BYTES, MAX_TEXT_BYTES, ObserverAttachParams, ObserverDetachParams,
     ObserverSnapshotParams, Peer, PeerClient, PluginManifest, RpcRequest,
     protocol::{MAX_COMMAND_ID_BYTES, MAX_CREDENTIAL_BYTES, ProfileStoreParams},
+    session::{is_passed_env, is_secret_name, target_environment as shared_target_environment},
 };
 use serde_json::{Value, json};
 use std::{
@@ -2509,75 +2510,33 @@ fn target_environment(
     environment: Option<&Value>,
     pass_env: Option<&Value>,
 ) -> Result<TargetEnvironment> {
-    let Some(environment) = environment else {
-        return Ok(TargetEnvironment {
-            variables: Vec::new(),
-            secrets: Vec::new(),
-            metadata_secrets: Vec::new(),
-        });
-    };
-    let object = environment.as_object().ok_or_else(|| {
-        Error::new(
-            "profile_error",
-            "Codex target_environment must be an object",
-        )
-    })?;
-    let pass_env = pass_env.and_then(Value::as_array);
-    let mut vars = Vec::with_capacity(object.len());
-    let mut secrets = Vec::new();
+    let shared = shared_target_environment(environment, pass_env, "Codex")?;
+    // Only selector contributions are public store metadata. Never
+    // remove by value: a credential may have the same bytes as a path.
     let mut metadata_secrets = Vec::new();
-    for (name, value) in object {
-        if name.is_empty() || name.contains('=') || name.contains('\0') {
-            return Err(Error::new(
-                "profile_error",
-                "Codex environment contains an invalid variable name",
-            ));
-        }
-        let value = value.as_str().ok_or_else(|| {
-            Error::new("profile_error", "Codex environment values must be strings")
-        })?;
-        let explicitly_passed = pass_env.is_some_and(|names| {
-            names.iter().filter_map(Value::as_str).any(|passed| {
+    for (name, value) in &shared.variables {
+        let name = name.to_string_lossy();
+        let selector = ["CODEX_HOME", "CODEX_SQLITE_HOME"]
+            .into_iter()
+            .any(|selector| {
                 if cfg!(windows) {
-                    name.eq_ignore_ascii_case(passed)
+                    name.eq_ignore_ascii_case(selector)
                 } else {
-                    name == passed
+                    name.as_ref() == selector
                 }
-            })
-        });
-        if (is_secret_name(name) || explicitly_passed) && !value.is_empty() {
-            secrets.push(value.to_owned());
-            // Only selector contributions are public store metadata. Never
-            // remove by value: a credential may have the same bytes as a path.
-            let selector = ["CODEX_HOME", "CODEX_SQLITE_HOME"]
-                .into_iter()
-                .any(|selector| {
-                    if cfg!(windows) {
-                        name.eq_ignore_ascii_case(selector)
-                    } else {
-                        name == selector
-                    }
-                });
-            if !selector {
-                metadata_secrets.push(value.to_owned());
-            }
+            });
+        if !selector
+            && !value.is_empty()
+            && (is_secret_name(name.as_ref()) || is_passed_env(name.as_ref(), pass_env))
+        {
+            metadata_secrets.push(value.to_string_lossy().into_owned());
         }
-        vars.push((OsString::from(name), OsString::from(value)));
     }
     Ok(TargetEnvironment {
-        variables: vars,
-        secrets,
+        variables: shared.variables,
+        secrets: shared.secrets,
         metadata_secrets,
     })
-}
-
-fn is_secret_name(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    upper.contains("TOKEN")
-        || upper.contains("SECRET")
-        || upper.contains("PASSWORD")
-        || upper.contains("API_KEY")
-        || upper.contains("AUTH")
 }
 
 fn frozen_store_binding(profile: &serde_json::Map<String, Value>) -> Result<NativeStoreBinding> {

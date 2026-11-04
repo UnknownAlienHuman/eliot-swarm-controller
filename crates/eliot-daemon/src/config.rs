@@ -960,7 +960,7 @@ fn snapshot_from_entry(
         }
         return Ok(fake_profile_snapshot());
     }
-    if harness != "codex" && harness != "muse" && harness != "claude" {
+    if harness != "codex" && harness != "muse" && harness != "claude" && harness != "opencode" {
         return Err(profile_field_error(
             source,
             table_offset,
@@ -975,6 +975,9 @@ fn snapshot_from_entry(
     }
     if harness == "claude" {
         return claude_snapshot_from_entry(name, entry, table_offset, source);
+    }
+    if harness == "opencode" {
+        return opencode_snapshot_from_entry(name, entry, table_offset, source);
     }
     let model = entry
         .model
@@ -1122,6 +1125,94 @@ fn snapshot_from_entry(
     Ok(Value::Object(snapshot))
 }
 
+/// Validated profile tail shared by the Muse and OpenCode slices: an
+/// explicit pass_env list, a required explicit native `cmd` (no script
+/// wrapper), and validated setup/scratch. Each harness snapshot validates
+/// its own head (model, effort, ...) then folds this tail in.
+struct ProfileTail {
+    pass_env: Vec<String>,
+    cmd: String,
+    scratch: Vec<String>,
+}
+
+fn validate_profile_tail(
+    name: &str,
+    entry: &ProfileEntry,
+    table_offset: usize,
+    source: &str,
+) -> core::Result<ProfileTail> {
+    let pass_env = match entry.pass_env.as_deref() {
+        Some(names) => validate_pass_env(name, names, source, table_offset)?,
+        None => Vec::new(),
+    };
+    let cmd = match entry.cmd.as_deref() {
+        Some(cmd) => reject_script_wrapper(
+            name,
+            validate_cmd(name, cmd, source, table_offset)?,
+            source,
+            table_offset,
+        )?,
+        None => {
+            return Err(profile_field_error(
+                source,
+                table_offset,
+                name,
+                "cmd",
+                "required explicit cmd is missing",
+                "profile_error",
+            ));
+        }
+    };
+    crate::setup::validate_entries(&entry.setup).map_err(|error| {
+        profile_field_error(
+            source,
+            table_offset,
+            name,
+            "setup",
+            &error.message,
+            "profile_error",
+        )
+    })?;
+    let scratch = normalize_scratch(&entry.scratch).map_err(|error| {
+        profile_field_error(
+            source,
+            table_offset,
+            name,
+            "scratch",
+            &error.message,
+            "profile_error",
+        )
+    })?;
+    Ok(ProfileTail {
+        pass_env,
+        cmd,
+        scratch,
+    })
+}
+
+/// Fold the validated tail into the harness snapshot: the required cmd,
+/// pass_env, scratch, and setup (when non-empty).
+fn insert_profile_tail(
+    snapshot: &mut serde_json::Map<String, Value>,
+    tail: ProfileTail,
+    setup: &[crate::setup::SetupEntry],
+) -> core::Result<()> {
+    snapshot.insert("cmd".to_owned(), Value::String(tail.cmd));
+    snapshot.insert(
+        "pass_env".to_owned(),
+        Value::Array(tail.pass_env.into_iter().map(Value::String).collect()),
+    );
+    snapshot.insert("scratch".to_owned(), json!(tail.scratch));
+    if !setup.is_empty() {
+        snapshot.insert(
+            "setup".to_owned(),
+            serde_json::to_value(setup)
+                .map_err(|_| core::Error::new("profile_error", "setup could not be encoded"))?,
+        );
+    }
+    Ok(())
+}
+
 /// Freeze a Muse profile. The PR1 slice carries an explicit model id, a
 /// required explicit native `cmd` (no PATH default: resolving `muse` would
 /// land on the launcher wrapper and orphan the host on stop) and an optional
@@ -1219,51 +1310,9 @@ fn muse_snapshot_from_entry(
             "unsupported",
         ));
     }
-    let pass_env = match entry.pass_env.as_deref() {
-        Some(names) => validate_pass_env(name, names, source, table_offset)?,
-        None => Vec::new(),
-    };
-    let cmd = match entry.cmd.as_deref() {
-        Some(cmd) => reject_script_wrapper(
-            name,
-            validate_cmd(name, cmd, source, table_offset)?,
-            source,
-            table_offset,
-        )?,
-        None => {
-            return Err(profile_field_error(
-                source,
-                table_offset,
-                name,
-                "cmd",
-                "required explicit cmd is missing",
-                "profile_error",
-            ));
-        }
-    };
-    crate::setup::validate_entries(&entry.setup).map_err(|error| {
-        profile_field_error(
-            source,
-            table_offset,
-            name,
-            "setup",
-            &error.message,
-            "profile_error",
-        )
-    })?;
-    let scratch = normalize_scratch(&entry.scratch).map_err(|error| {
-        profile_field_error(
-            source,
-            table_offset,
-            name,
-            "scratch",
-            &error.message,
-            "profile_error",
-        )
-    })?;
+    let tail = validate_profile_tail(name, entry, table_offset, source)?;
     let mut snapshot = serde_json::Map::new();
     snapshot.insert("harness".to_owned(), Value::String("muse".to_owned()));
-    snapshot.insert("cmd".to_owned(), Value::String(cmd));
     snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
     if let Some(effort) = effort {
         snapshot.insert("effort".to_owned(), Value::String(effort.to_owned()));
@@ -1286,18 +1335,7 @@ fn muse_snapshot_from_entry(
         source,
         table_offset,
     )?;
-    snapshot.insert(
-        "pass_env".to_owned(),
-        Value::Array(pass_env.into_iter().map(Value::String).collect()),
-    );
-    snapshot.insert("scratch".to_owned(), json!(scratch));
-    if !entry.setup.is_empty() {
-        snapshot.insert(
-            "setup".to_owned(),
-            serde_json::to_value(&entry.setup)
-                .map_err(|_| core::Error::new("profile_error", "setup could not be encoded"))?,
-        );
-    }
+    insert_profile_tail(&mut snapshot, tail, &entry.setup)?;
     Ok(Value::Object(snapshot))
 }
 
@@ -1466,6 +1504,88 @@ fn claude_snapshot_from_entry(
                 .map_err(|_| core::Error::new("profile_error", "setup could not be encoded"))?,
         );
     }
+    Ok(Value::Object(snapshot))
+}
+
+/// Freeze an OpenCode profile. The L6.2 PR1 slice carries an explicit model
+/// id in the installed `provider/model` slash form and a required explicit
+/// native `cmd` (the Muse treatment: stop and process registration address
+/// the exact spawned PID, so `.cmd`/`.bat`/`.ps1` wrappers are rejected).
+/// Effort, approval, collaboration, permission and approval-policy presets
+/// have no OpenCode mapping and stay rejected until one lands.
+fn opencode_snapshot_from_entry(
+    name: &str,
+    entry: &ProfileEntry,
+    table_offset: usize,
+    source: &str,
+) -> core::Result<Value> {
+    let model = entry
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .ok_or_else(|| {
+            profile_field_error(
+                source,
+                table_offset,
+                name,
+                "model",
+                "required non-empty model is missing",
+                "profile_error",
+            )
+        })?;
+    validate_model(name, model, source, table_offset)?;
+    let slash = model.split('/').count() == 2
+        && !model.starts_with('/')
+        && !model.ends_with('/')
+        && !model.contains("//");
+    if !slash {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "model",
+            "must be provider/model in the installed model-id syntax",
+            "profile_error",
+        ));
+    }
+    for field in [
+        "effort",
+        "approval",
+        "collaboration_mode",
+        "permissions",
+        "approval_policy",
+    ] {
+        let present = match field {
+            "effort" => entry.effort.as_deref(),
+            "approval" => entry.approval.as_deref(),
+            "collaboration_mode" => entry.collaboration_mode.as_deref(),
+            "permissions" => entry.permissions.as_deref(),
+            _ => entry.approval_policy.as_deref(),
+        };
+        if present.is_some() {
+            return Err(profile_field_error(
+                source,
+                table_offset,
+                name,
+                field,
+                "the OpenCode slice has no mapping for this preset",
+                "unsupported",
+            ));
+        }
+    }
+    let tail = validate_profile_tail(name, entry, table_offset, source)?;
+    let mut snapshot = serde_json::Map::new();
+    snapshot.insert("harness".to_owned(), Value::String("opencode".to_owned()));
+    snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
+    insert_control(
+        &mut snapshot,
+        name,
+        entry.control.as_deref(),
+        source,
+        table_offset,
+    )?;
+    insert_profile_tail(&mut snapshot, tail, &entry.setup)?;
     Ok(Value::Object(snapshot))
 }
 
@@ -3180,6 +3300,66 @@ pass_env = ["EXAMPLE_API_KEY"]
         let source = "[profiles.codex-luna]\nharness='codex'\nmodel='gpt-6-luna'\ncmd='C:/Tools/Codex/codex.exe'\n";
         let snapshot = resolve_text_profile(source, "codex-luna").unwrap();
         assert_eq!(snapshot["cmd"], "C:/Tools/Codex/codex.exe");
+    }
+
+    #[test]
+    fn opencode_profile_freezes_slash_model_and_explicit_cmd() {
+        let source = r#"
+[profiles.oc]
+harness = "opencode"
+cmd = "C:/Users/owner/AppData/Roaming/npm/node_modules/@opencode/cli/bin/opencode.exe"
+model = "opencode/big-pickle"
+pass_env = ["OPENAI_API_KEY"]
+"#;
+        let snapshot = resolve_text_profile(source, "oc").unwrap();
+        assert_eq!(snapshot["harness"], "opencode");
+        assert_eq!(
+            snapshot["cmd"],
+            "C:/Users/owner/AppData/Roaming/npm/node_modules/@opencode/cli/bin/opencode.exe"
+        );
+        assert_eq!(snapshot["model"], "opencode/big-pickle");
+        assert_eq!(snapshot["pass_env"], json!(["OPENAI_API_KEY"]));
+        // Control freezes like every other harness snapshot (#269): unset
+        // means self, an explicit tree survives the freeze.
+        assert_eq!(snapshot["control"], "self");
+        let source = format!("{source}control = \"tree\"\n");
+        let snapshot = resolve_text_profile(&source, "oc").unwrap();
+        assert_eq!(snapshot["control"], "tree");
+
+        // The installed model-id syntax is provider/model, slashes included.
+        for model in ["big-pickle", "/big-pickle", "opencode/", "a/b/c", ""] {
+            let source = format!(
+                "[profiles.oc]\nharness='opencode'\nmodel='{model}'\ncmd='C:/Tools/opencode.exe'\n"
+            );
+            let error = resolve_text_profile(&source, "oc").expect_err("must reject");
+            assert_eq!(error.code, "profile_error", "{source}");
+        }
+        // Unconnected presets stay rejected, never silently frozen.
+        for field in [
+            "effort='high'",
+            "approval='allowAll'",
+            "collaboration_mode='plan'",
+            "permissions='read-only'",
+            "approval_policy='on-request'",
+        ] {
+            let source = format!(
+                "[profiles.oc]\nharness='opencode'\nmodel='opencode/big-pickle'\ncmd='C:/Tools/opencode.exe'\n{field}\n"
+            );
+            let error = resolve_text_profile(&source, "oc").expect_err("must reject");
+            assert_eq!(error.code, "unsupported", "{source}");
+        }
+        // The Muse treatment: an explicit native cmd is required, and script
+        // wrappers are rejected (stop and registration address the exact
+        // spawned server PID; `opencode.cmd` would interpose `cmd.exe`).
+        for source in [
+            "[profiles.oc]\nharness='opencode'\nmodel='opencode/big-pickle'\n",
+            "[profiles.oc]\nharness='opencode'\nmodel='opencode/big-pickle'\ncmd='C:/Tools/OpenCodeCLI/opencode.cmd'\n",
+            "[profiles.oc]\nharness='opencode'\nmodel='opencode/big-pickle'\ncmd='C:/Tools/opencode.bat'\n",
+            "[profiles.oc]\nharness='opencode'\nmodel='opencode/big-pickle'\ncmd='C:/Tools/launch.ps1'\n",
+        ] {
+            let error = resolve_text_profile(source, "oc").expect_err("must reject");
+            assert_eq!(error.code, "profile_error", "{source}");
+        }
     }
 
     #[test]

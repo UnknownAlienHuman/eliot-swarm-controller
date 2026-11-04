@@ -4829,7 +4829,7 @@ fn install_frozen_profile(
     snapshot: Value,
     require_snapshot_harness: bool,
 ) -> Result<()> {
-    if !matches!(harness, "fake" | "codex" | "muse" | "claude") {
+    if !matches!(harness, "fake" | "codex" | "muse" | "claude" | "opencode") {
         return Err(Error::new(
             "unsupported",
             format!("unsupported launch harness {harness}"),

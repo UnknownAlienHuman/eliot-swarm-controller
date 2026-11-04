@@ -283,8 +283,10 @@ impl PluginHost {
                 "Agent launch workspace must be an existing directory",
             ));
         }
-        if !matches!(agent.harness.as_str(), "fake" | "codex" | "muse" | "claude")
-            || agent.generation <= 0
+        if !matches!(
+            agent.harness.as_str(),
+            "fake" | "codex" | "muse" | "claude" | "opencode"
+        ) || agent.generation <= 0
         {
             return Err(Error::new(
                 "unsupported",
@@ -2108,7 +2110,7 @@ fn manifest_source_plan(manifest: &PluginManifest, harness: &str) -> Result<Valu
         return Err(unsupported_manifest());
     }
 
-    if !matches!(harness, "fake" | "codex" | "muse" | "claude") {
+    if !matches!(harness, "fake" | "codex" | "muse" | "claude" | "opencode") {
         return Err(unsupported_manifest());
     }
     let expected_families = ["message", "session", "turn"];

@@ -4,6 +4,7 @@ pub mod native_stdio;
 pub mod native_transport;
 pub mod peer;
 pub mod protocol;
+pub mod session;
 mod stderr;
 pub mod sync;
 

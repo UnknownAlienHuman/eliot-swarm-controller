@@ -86,6 +86,10 @@ fn initial_source_families_match_fake_and_codex_harness_boundaries() {
         &["session", "turn", "message"][..]
     );
     assert_eq!(
+        super::source_families_for_harness("opencode").unwrap(),
+        &["session", "turn", "message"][..]
+    );
+    assert_eq!(
         super::source_families_for_harness("other")
             .unwrap_err()
             .code,
@@ -8645,6 +8649,67 @@ fn ordered_store_reads_paginate_processes_by_owner_identity() {
         "processes",
         "SEARCH processes USING INDEX processes_owner_identity (owner=?",
     );
+}
+
+#[test]
+fn opencode_launch_passes_admission_and_dispatch_gates() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let mut launch = SubmitCommand::new(Ulid::new().to_string(), "launch");
+    launch.args = json!({
+        "project": "opencode-launch-gates",
+        "harness": "opencode",
+        "profile": "opencode-test",
+        "profile_snapshot": {"harness": "opencode", "model": "test-provider/test-model"},
+        "workspace": "synthetic-opencode-launch",
+    });
+    launch.expected_generation = Some(0);
+    let launch_id = launch.id.clone();
+    let agent = store
+        .submit("owner", launch, now)
+        .expect("admit opencode launch")
+        .command
+        .target
+        .expect("opencode launch Agent");
+    store
+        .dispatch(&launch_id, now + 1)
+        .expect("dispatch opencode launch");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "opencode-launch-gates:ready".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ready".to_owned(),
+                    native_id: "opencode-launch-gates:ready".to_owned(),
+                    data: json!({
+                        "command_id": launch_id.as_str(),
+                        "native_scope": "opencode-store:test",
+                        "native_ref": "ses_test00000000000000000001",
+                    }),
+                }],
+                cursor: None,
+            },
+            now + 2,
+        )
+        .expect("commit opencode session readiness");
+    store
+        .settle(&launch_id, CommandState::Applied, None, now + 3)
+        .expect("settle opencode launch");
+    assert_eq!(
+        store.get_agent(&agent).unwrap().unwrap().harness,
+        "opencode"
+    );
+
+    // PR1 connects launch/send/stop only: resume stays unsupported for the
+    // opencode harness until its exact reattachment lands.
+    let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
+    resume.target = Some(agent.clone());
+    let error = store.submit("owner", resume, now + 4).unwrap_err();
+    assert_eq!(error.code, "unsupported");
 }
 
 /// Launch a `muse`-harness Agent through generation-1 readiness, returning
