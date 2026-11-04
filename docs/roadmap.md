@@ -245,7 +245,7 @@ the existing protocol. Start with Claude Code and OpenCode for the product accep
 scenarios. Muse, Antigravity, ACP and other adapters are opt-in tasks, not blockers for
 Codex or for unrelated adapters.
 
-- [ ] **L6.1 Claude Code.** Native SDK/stream, exact callbacks and reported application
+- [x] **L6.1 Claude Code.** Native SDK/stream, exact callbacks and reported application
       points. Delayed hook context is inject, not exact-turn steer.
 - [ ] **L6.2 OpenCode.** Select one installed API. Shared mode only if per-session
       attribution/environment/stop are supported; otherwise per-Agent server.

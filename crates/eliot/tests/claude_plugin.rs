@@ -2225,7 +2225,7 @@ async fn scenario_rejected_send_does_not_wedge_session(owned: OwnedChildren) {
     );
     // The session is not wedged behind the withdrawn pending turn: a normal
     // send on the same session applies (without the 64c fix this is `busy`).
-    let (_, _, committed) = send_turn(&mut scenario.host, &agent_id, "hello").await;
+    let (_, _, committed) = send_turn(&mut scenario.host, &agent_id, 1, "hello").await;
     assert!(
         committed.iter().any(|(kind, _)| kind == "turn.completed"),
         "follow-up turn completes"
@@ -2234,7 +2234,7 @@ async fn scenario_rejected_send_does_not_wedge_session(owned: OwnedChildren) {
         scenario.report().get("user_inputs").and_then(Value::as_u64),
         Some(1)
     );
-    stop_agent(&mut scenario.host, &agent_id).await;
+    stop_agent(&mut scenario.host, &agent_id, 1).await;
     scenario.assert_cli_exit("stdin-eof");
     scenario
         .host

@@ -22,8 +22,7 @@ use eliot_core::{Error, Result, SecretPolicy, StderrSnapshot, StderrSource};
 
 use crate::StderrView;
 use crate::native_transport::{
-    NativeChild, NativeLabels, NativeWriter, PendingCalls, PumpAction, encode_frame,
-    native_frame_channel, pump_framed_lines,
+    NativeChild, NativeLabels, NativeWriter, PendingCalls, PumpAction, encode_frame, spawn_pumped,
 };
 use std::sync::Arc;
 
@@ -149,27 +148,22 @@ impl<C: NativeStdioConfig> StdioProcess<C> {
             short: C::SHORT,
             server: C::SERVER,
         };
-        let (mut transport, stdout) = NativeChild::spawn(launch, policy.clone(), labels).await?;
-        let pending = PendingCalls::new(C::ID_PREFIX, labels);
+        let (transport, pending, frame_rx, stream_rx) = spawn_pumped(
+            launch,
+            policy.clone(),
+            labels,
+            C::ID_PREFIX,
+            classify_jsonrpc_frame::<C>,
+        )
+        .await?;
         let client = StdioClient {
             writer: transport.writer(),
-            pending: pending.clone(),
+            pending,
             pending_slots: Arc::new(Semaphore::new(MAX_PENDING_CALLS)),
             stderr: transport.stderr_view(),
             policy,
             config: PhantomData,
         };
-        let (frame_tx, frame_rx) = native_frame_channel();
-        let (stream_tx, stream_rx) = watch::channel(StreamState::Open);
-        let output_reader = tokio::spawn(pump_framed_lines(
-            stdout,
-            frame_tx,
-            stream_tx,
-            pending,
-            C::SERVER,
-            classify_jsonrpc_frame::<C>,
-        ));
-        transport.set_output_reader(output_reader);
 
         Ok(Self {
             transport,

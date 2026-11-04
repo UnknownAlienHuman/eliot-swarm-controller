@@ -21,7 +21,7 @@ use eliot_plugin::{
     StderrView,
     native_transport::{
         NativeChild, NativeLabels, NativeLaunch, NativeWriter, PendingCalls, PumpAction,
-        StreamState, encode_frame, native_frame_channel, pump_framed_lines,
+        StreamState, encode_frame, spawn_pumped,
     },
 };
 
@@ -58,25 +58,20 @@ pub(crate) struct ClaudeProcess {
 
 impl ClaudeProcess {
     pub async fn spawn(launch: NativeLaunch, policy: SecretPolicy) -> Result<Self> {
-        let (mut transport, stdout) = NativeChild::spawn(launch, policy.clone(), LABELS).await?;
-        let pending = PendingCalls::new(ID_PREFIX, LABELS);
+        let (transport, pending, frame_rx, stream_rx) = spawn_pumped(
+            launch,
+            policy.clone(),
+            LABELS,
+            ID_PREFIX,
+            classify_claude_frame,
+        )
+        .await?;
         let client = ClaudeClient {
             writer: transport.writer(),
-            pending: pending.clone(),
+            pending,
             stderr: transport.stderr_view(),
             policy,
         };
-        let (frame_tx, frame_rx) = native_frame_channel();
-        let (stream_tx, stream_rx) = watch::channel(StreamState::Open);
-        let output_reader = tokio::spawn(pump_framed_lines(
-            stdout,
-            frame_tx,
-            stream_tx,
-            pending,
-            LABELS.server,
-            classify_claude_frame,
-        ));
-        transport.set_output_reader(output_reader);
 
         Ok(Self {
             transport,

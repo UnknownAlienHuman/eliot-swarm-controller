@@ -3230,21 +3230,18 @@ pass_env = ["EXAMPLE_API_KEY"]
         assert_eq!(snapshot["pass_env"], json!(["EXAMPLE_API_KEY"]));
 
         // The approval vocabulary is the CLI permission-mode vocabulary and
-        // freezes under the CLI-exact key.
-        let source = r#"
-[profiles.claude]
-harness = "claude"
-cmd = "C:/Users/test/.local/bin/claude.exe"
-model = "claude-opus-4-6"
-approval = "plan"
-"#;
-        let snapshot = resolve_text_profile(source, "claude").unwrap();
+        // freezes under the CLI-exact key. Both cases use the platform-native
+        // cmd so Unix rejects (or accepts) for the approval value, not the path.
+        let source = format!(
+            "[profiles.claude]\nharness = \"claude\"\ncmd = '{cmd}'\nmodel = \"claude-opus-4-6\"\napproval = \"plan\"\n"
+        );
+        let snapshot = resolve_text_profile(&source, "claude").unwrap();
         assert_eq!(snapshot["permission_mode"], "plan");
-        let error = resolve_text_profile(
-            "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\ncmd='C:/bin/claude.exe'\napproval='promptUnmatched'\n",
-            "claude",
-        )
-        .expect_err("unknown permission mode must fail");
+        let source = format!(
+            "[profiles.claude]\nharness='claude'\nmodel='claude-opus-4-6'\ncmd='{cmd}'\napproval='promptUnmatched'\n"
+        );
+        let error =
+            resolve_text_profile(&source, "claude").expect_err("unknown permission mode must fail");
         assert_eq!(error.code, "profile_error");
 
         for source in [
