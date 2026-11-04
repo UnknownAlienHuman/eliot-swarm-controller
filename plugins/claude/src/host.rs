@@ -70,6 +70,20 @@ struct AgentSession {
     stop_command_id: Option<String>,
 }
 
+/// Validated start inputs: the frozen profile plus the minted session id.
+/// Built before any spawn; every later start phase reads from it.
+struct StartPlan {
+    workspace: PathBuf,
+    program: OsString,
+    environment: Vec<(OsString, OsString)>,
+    secrets: Vec<String>,
+    config_dir: Option<String>,
+    credential: String,
+    session_id: String,
+    requested_model: String,
+    requested_permission_mode: Value,
+}
+
 struct TargetEnvironment {
     variables: Vec<(OsString, OsString)>,
     secrets: Vec<String>,
@@ -200,15 +214,15 @@ impl ClaudePlugin {
             .map_err(|_| Error::new("internal", "Claude plugin manifest could not be encoded"))
     }
 
-    async fn start(&mut self, raw: &Value, peer: &PeerClient) -> Result<Value> {
-        let params: AgentStartParams = decode(raw, "Claude agent.start params are invalid")?;
-        validate_identity(&params.agent_id, params.generation, &params.command_id)?;
+    /// Replay a retained start outcome, or refuse a conflicting generation.
+    /// `None` means this is a fresh start that proceeds to spawn.
+    fn replay_start(&self, params: &AgentStartParams) -> Option<Result<Value>> {
         if let Some(session) = &self.session {
             if session.agent_id == params.agent_id
                 && session.generation == params.generation
                 && session.start_command_id == params.command_id
             {
-                return match session.phase {
+                return Some(match session.phase {
                     SessionPhase::Ready => session.start_result.clone().ok_or_else(|| {
                         Error::new("unknown", "Claude start result was not retained")
                     }),
@@ -220,25 +234,31 @@ impl ClaudePlugin {
                         "bad_state",
                         "Claude Agent generation has already stopped",
                     )),
-                };
+                });
             }
-            return Err(Error::new(
+            return Some(Err(Error::new(
                 "stale_generation",
                 "Claude plugin is already bound to another Agent generation",
-            ));
+            )));
         }
         if let Some(failed) = &self.failed_start {
             if failed.agent_id == params.agent_id
                 && failed.generation == params.generation
                 && failed.command_id == params.command_id
             {
-                return Err(failed.error.clone());
+                return Some(Err(failed.error.clone()));
             }
-            return Err(Error::new(
+            return Some(Err(Error::new(
                 "bad_state",
                 "Claude plugin already settled a different start command",
-            ));
+            )));
         }
+        None
+    }
+
+    /// Validate the frozen profile and freeze the start inputs. No spawn yet:
+    /// every `profile_error` returns before any native process exists.
+    fn plan_start(&self, params: &AgentStartParams) -> Result<StartPlan> {
         let initialized = self.initialized.as_ref().ok_or_else(not_initialized)?;
         if params.initial.is_some() {
             return Err(Error::new(
@@ -312,93 +332,77 @@ impl ClaudePlugin {
         // Eliot mints the session id and pre-assigns it: SessionStart hook
         // lines carry it before any input, so no `start_requires_input`.
         let session_id = new_uuid();
-        let launch = NativeLaunch {
+        Ok(StartPlan {
+            workspace,
             program,
-            args: vec![
-                OsString::from("-p"),
-                OsString::from("--input-format"),
-                OsString::from("stream-json"),
-                OsString::from("--output-format"),
-                OsString::from("stream-json"),
-                OsString::from("--verbose"),
-                OsString::from("--session-id"),
-                OsString::from(&session_id),
-                OsString::from("--model"),
-                OsString::from(&requested_model),
-            ],
-            cwd: workspace.clone(),
             environment,
-        };
-        let mut native =
-            ClaudeProcess::spawn(launch, SecretPolicy::new(secrets.iter().cloned())).await?;
-        let frames = native.take_frames()?;
-        let stream = native.stream_state();
-        let native_client = native.client();
-        let events = events::spawn(
-            frames,
-            stream,
-            peer.clone(),
-            EventConfig {
-                credential: initialized.credential.clone(),
-                agent_id: params.agent_id.clone(),
-                generation: params.generation,
-                secrets: secrets.clone(),
-            },
-        );
-        let mut session = AgentSession {
+            secrets,
+            config_dir,
+            credential: initialized.credential.clone(),
+            session_id,
+            requested_model,
+            requested_permission_mode,
+        })
+    }
+
+    /// Settle a start whose native process the host would not register. No
+    /// session or input was sent; if the owned CLI's cleanup is unconfirmed
+    /// the session is kept unknown instead of dropped.
+    async fn fail_unregistered_start(
+        &mut self,
+        mut session: AgentSession,
+        params: &AgentStartParams,
+        error: Error,
+    ) -> Error {
+        session.events.close().await;
+        if session
+            .native
+            .terminate(true, Instant::now() + RPC_TIMEOUT)
+            .await
+            .is_err()
+        {
+            self.session = Some(session);
+            let message = format!(
+                "{}; owned CLI cleanup is unconfirmed; no session or input was sent",
+                error.message
+            );
+            return contextual_error(error, "unknown", message);
+        }
+        let error = session.native_client.diagnostic_error(error);
+        self.failed_start = Some(FailedStart {
             agent_id: params.agent_id.clone(),
             generation: params.generation,
-            start_command_id: params.command_id.clone(),
-            start_result: None,
-            phase: SessionPhase::Unknown,
-            session_id: None,
-            native_scope: claude_scope(config_dir.as_deref()),
-            native,
-            native_client,
-            events,
-            command_inputs: HashMap::new(),
-            command_turns: HashMap::new(),
-            unknown_commands: HashSet::new(),
-            rejected_commands: HashSet::new(),
-            interrupt_applied: HashMap::new(),
-            interrupted_turns: HashSet::new(),
-            unknown_interrupt_turns: HashSet::new(),
-            stop_command_id: None,
-        };
+            command_id: params.command_id.clone(),
+            error: error.clone(),
+        });
+        error
+    }
 
-        if let Err(error) = register_native_process(
-            peer,
-            &initialized.credential,
-            &session.agent_id,
-            session.generation,
-            &session.native,
-        )
-        .await
-        {
-            session.events.close().await;
-            if session
-                .native
-                .terminate(true, Instant::now() + RPC_TIMEOUT)
-                .await
-                .is_err()
-            {
-                self.session = Some(session);
-                let message = format!(
-                    "{}; owned CLI cleanup is unconfirmed; no session or input was sent",
-                    error.message
-                );
-                return Err(contextual_error(error, "unknown", message));
-            }
-            let error = session.native_client.diagnostic_error(error);
-            self.failed_start = Some(FailedStart {
-                agent_id: params.agent_id,
-                generation: params.generation,
-                command_id: params.command_id,
-                error: error.clone(),
-            });
-            return Err(error);
-        }
+    /// Discard a failed start and retain its error for replays.
+    async fn reject_start(
+        &mut self,
+        session: &mut AgentSession,
+        params: &AgentStartParams,
+        error: Error,
+    ) -> Error {
+        let error = discard_failed_start(session, error).await;
+        self.failed_start = Some(FailedStart {
+            agent_id: params.agent_id.clone(),
+            generation: params.generation,
+            command_id: params.command_id.clone(),
+            error: error.clone(),
+        });
+        error
+    }
 
+    /// Run `initialize` and check the effective profile BEFORE readiness: on
+    /// any mismatch no `session.ready` is published and no session is kept.
+    async fn read_effective_profile(
+        &mut self,
+        session: &mut AgentSession,
+        params: &AgentStartParams,
+        requested_model: &str,
+    ) -> Result<Value> {
         let readback = match session
             .native_client
             .control(
@@ -410,75 +414,69 @@ impl ClaudePlugin {
         {
             Ok(value) => value,
             Err(error) => {
-                let error = discard_failed_start(
-                    &mut session,
-                    contextual_error(error, "profile_error", "Claude initialize failed"),
-                )
-                .await;
-                self.failed_start = Some(FailedStart {
-                    agent_id: params.agent_id,
-                    generation: params.generation,
-                    command_id: params.command_id,
-                    error: error.clone(),
-                });
-                return Err(error);
+                return Err(self
+                    .reject_start(
+                        session,
+                        params,
+                        contextual_error(error, "profile_error", "Claude initialize failed"),
+                    )
+                    .await);
             }
         };
         let readback: InitializeReadback = match serde_json::from_value(readback) {
             Ok(readback) => readback,
             Err(_) => {
-                let error = discard_failed_start(
-                    &mut session,
-                    Error::new(
-                        "profile_error",
-                        "Claude initialize readback did not match its envelope",
-                    ),
-                )
-                .await;
-                self.failed_start = Some(FailedStart {
-                    agent_id: params.agent_id,
-                    generation: params.generation,
-                    command_id: params.command_id,
-                    error: error.clone(),
-                });
-                return Err(error);
+                return Err(self
+                    .reject_start(
+                        session,
+                        params,
+                        Error::new(
+                            "profile_error",
+                            "Claude initialize readback did not match its envelope",
+                        ),
+                    )
+                    .await);
             }
         };
-        // The effective settings are checked BEFORE readiness: on any
-        // mismatch no `session.ready` is published and no session is kept.
         let model_available = readback.models.iter().any(|model| {
-            model.value.as_deref() == Some(requested_model.as_str())
-                || model.resolved_model.as_deref() == Some(requested_model.as_str())
+            model.value.as_deref() == Some(requested_model)
+                || model.resolved_model.as_deref() == Some(requested_model)
         });
         if !model_available || readback.session_state.as_deref() != Some("idle") {
-            let error = discard_failed_start(
-                &mut session,
-                Error::new(
-                    "profile_error",
-                    "Claude effective model or session state did not match the frozen profile",
-                ),
-            )
-            .await;
-            self.failed_start = Some(FailedStart {
-                agent_id: params.agent_id,
-                generation: params.generation,
-                command_id: params.command_id,
-                error: error.clone(),
-            });
-            return Err(error);
+            return Err(self
+                .reject_start(
+                    session,
+                    params,
+                    Error::new(
+                        "profile_error",
+                        "Claude effective model or session state did not match the frozen profile",
+                    ),
+                )
+                .await);
         }
-        let effective = json!({
+        Ok(json!({
             "model": requested_model,
             "permission_mode": readback.current_permission_mode,
             "session_state": readback.session_state,
             "pid": readback.pid,
-        });
-        session.session_id = Some(session_id.clone());
+        }))
+    }
+
+    /// Commit `session.ready` and retain the ready session. If readiness is
+    /// not acknowledged the known session is kept unknown, never retried.
+    async fn commit_readiness(
+        &mut self,
+        mut session: AgentSession,
+        params: &AgentStartParams,
+        plan: &StartPlan,
+        effective: Value,
+    ) -> Result<Value> {
+        session.session_id = Some(plan.session_id.clone());
         if let Err(error) = session
             .events
             .ready(
                 session.native_scope.clone(),
-                session_id.clone(),
+                plan.session_id.clone(),
                 effective.clone(),
             )
             .await
@@ -495,22 +493,49 @@ impl ClaudePlugin {
         }
         session.phase = SessionPhase::Ready;
         let result = json!({
-            "agent_id": params.agent_id,
+            "agent_id": params.agent_id.clone(),
             "generation": params.generation,
-            "command_id": params.command_id,
+            "command_id": params.command_id.clone(),
             "state": "ready",
             "native_scope": session.native_scope.clone(),
-            "native_ref": session_id,
+            "native_ref": plan.session_id.clone(),
             "requested": {
-                "model": requested_model,
-                "permission_mode": requested_permission_mode,
-                "cwd": workspace.to_string_lossy(),
+                "model": plan.requested_model.clone(),
+                "permission_mode": plan.requested_permission_mode.clone(),
+                "cwd": plan.workspace.to_string_lossy(),
             },
             "effective": effective,
         });
         session.start_result = Some(result.clone());
         self.session = Some(session);
         Ok(result)
+    }
+
+    async fn start(&mut self, raw: &Value, peer: &PeerClient) -> Result<Value> {
+        let params: AgentStartParams = decode(raw, "Claude agent.start params are invalid")?;
+        validate_identity(&params.agent_id, params.generation, &params.command_id)?;
+        if let Some(replay) = self.replay_start(&params) {
+            return replay;
+        }
+        let plan = self.plan_start(&params)?;
+        let mut session = launch_session(&plan, &params, peer).await?;
+        if let Err(error) = register_native_process(
+            peer,
+            &plan.credential,
+            &session.agent_id,
+            session.generation,
+            &session.native,
+        )
+        .await
+        {
+            return Err(self.fail_unregistered_start(session, &params, error).await);
+        }
+
+        let effective = self
+            .read_effective_profile(&mut session, &params, &plan.requested_model)
+            .await?;
+        self.commit_readiness(session, &params, &plan, effective)
+            .await
     }
 
     async fn command(&mut self, raw: &Value) -> Result<Value> {
@@ -538,148 +563,15 @@ impl ClaudePlugin {
                 "Claude session or event source outcome is unresolved",
             ));
         }
-        let text = params
-            .args
-            .get("text")
-            .and_then(Value::as_str)
-            .ok_or_else(|| Error::new("invalid", "Claude send requires args.text"))?;
-        if text.len() > MAX_TEXT_BYTES {
-            return Err(Error::new(
-                "frame_too_large",
-                "Claude input exceeds 512 KiB",
-            ));
+        let text = send_text(&params)?;
+        if let Some(replay) = replay_send(session, &params.command_id, text) {
+            return replay;
         }
-        if let Some(previous) = session.command_inputs.get(&params.command_id) {
-            if previous != text {
-                return Err(Error::new(
-                    "source_integrity",
-                    "Claude command id was reused with different input",
-                ));
-            }
-            if let Some(turn_id) = session.command_turns.get(&params.command_id) {
-                return Ok(json!({"state": "applied", "turn_id": turn_id}));
-            }
-            if session.unknown_commands.contains(&params.command_id) {
-                return Err(Error::new(
-                    "unknown",
-                    "Claude input outcome is unresolved and will not be repeated",
-                ));
-            }
-            if session.rejected_commands.contains(&params.command_id) {
-                return Ok(json!({
-                    "state": "rejected",
-                    "reason": "Claude input was known not to apply",
-                }));
-            }
-            return Err(Error::new(
-                "unknown",
-                "Claude command was already dispatched without a retained exact outcome",
-            ));
-        }
-        let event_status = session.events.status();
-        if let Some(reason) = event_status.failure {
-            return Err(Error::new("unknown", reason));
-        }
-        if event_status.active_turn_id.is_some() {
-            return Err(Error::new("busy", "Claude already has an active turn"));
-        }
-        let command_id = params.command_id.clone();
-        if session.command_inputs.len() >= MAX_COMMAND_HISTORY {
-            return Err(Error::new(
-                "unsupported",
-                "Claude L6.1 per-generation command history bound has been reached",
-            ));
-        }
+        check_send_ready(session)?;
         session
             .command_inputs
-            .insert(command_id.clone(), text.to_owned());
-        // Mint the exact turn association before the write and register it
-        // with the event task first: an early lifecycle can never miss its
-        // waiter, and a lost association latches unknown without a rewrite.
-        let turn_id = new_uuid();
-        let outcome = match session
-            .events
-            .expect_turn(command_id.clone(), turn_id.clone())
-            .await
-        {
-            Ok(outcome) => outcome,
-            Err(error) if error.code == "busy" => {
-                session.command_inputs.remove(&command_id);
-                return Err(Error::new("busy", "Claude already has an active turn"));
-            }
-            Err(error) => {
-                session.unknown_commands.insert(command_id);
-                session.phase = SessionPhase::Unknown;
-                return Err(Error::new("unknown", error.message));
-            }
-        };
-        let input = OutboundUserInput {
-            kind: "user",
-            uuid: turn_id.clone(),
-            session_id: session
-                .session_id
-                .clone()
-                .ok_or_else(|| Error::new("unknown", "Claude session identity is unresolved"))?,
-            parent_tool_use_id: None,
-            message: OutboundUserMessage {
-                role: "user",
-                content: text.to_owned(),
-            },
-        };
-        if let Err(error) = session
-            .native_client
-            .send_user(input, Instant::now() + RPC_TIMEOUT)
-            .await
-        {
-            if native_no_write(&error.code) {
-                // Proven never dispatched: withdraw the pending turn before
-                // answering, or every later send wedges `busy` behind it.
-                session.events.cancel_turn(command_id.clone()).await;
-                session.rejected_commands.insert(command_id);
-                return Ok(json!({
-                    "state": "rejected",
-                    "reason": "Claude input was not dispatched",
-                }));
-            }
-            session.unknown_commands.insert(command_id);
-            session.phase = SessionPhase::Unknown;
-            return Err(Error::new(
-                "unknown",
-                "Claude input may have applied; it will not be repeated",
-            ));
-        }
-        let outcome = tokio::time::timeout(RPC_TIMEOUT, outcome)
-            .await
-            .map_err(|_| {
-                Error::new(
-                    "unknown",
-                    "Claude turn association was not observed; the input will not be repeated",
-                )
-            })?;
-        let outcome = outcome.map_err(|_| {
-            Error::new(
-                "unknown",
-                "Claude turn association was lost; the input will not be repeated",
-            )
-        })?;
-        match outcome {
-            TurnOutcome::Associated => {
-                session.command_turns.insert(command_id, turn_id.clone());
-                Ok(json!({"state": "applied", "turn_id": turn_id}))
-            }
-            TurnOutcome::Rejected(reason) => {
-                session.rejected_commands.insert(command_id);
-                Ok(json!({"state": "rejected", "reason": reason}))
-            }
-            TurnOutcome::Unknown => {
-                session.unknown_commands.insert(command_id);
-                session.phase = SessionPhase::Unknown;
-                Err(Error::new(
-                    "unknown",
-                    "Claude input outcome is unresolved and will not be repeated",
-                ))
-            }
-        }
+            .insert(params.command_id.clone(), text.to_owned());
+        dispatch_send(session, &params.command_id, text).await
     }
 
     async fn interrupt_command(&mut self, params: AgentCommandParams) -> Result<Value> {
@@ -968,6 +860,227 @@ async fn terminate_session(session: &mut AgentSession, force: bool) -> Result<()
     }
     session.phase = SessionPhase::Stopped;
     Ok(())
+}
+
+/// The send text plus its bound. Runs before any registration, so an
+/// oversized input never wedges the session.
+fn send_text(params: &AgentCommandParams) -> Result<&str> {
+    let text = params
+        .args
+        .get("text")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::new("invalid", "Claude send requires args.text"))?;
+    if text.len() > MAX_TEXT_BYTES {
+        return Err(Error::new(
+            "frame_too_large",
+            "Claude input exceeds 512 KiB",
+        ));
+    }
+    Ok(text)
+}
+
+/// Replay a known send, or refuse a reused command id with different input.
+/// `None` means this is a fresh send that proceeds to dispatch.
+fn replay_send(session: &AgentSession, command_id: &str, text: &str) -> Option<Result<Value>> {
+    let previous = session.command_inputs.get(command_id)?;
+    if previous != text {
+        return Some(Err(Error::new(
+            "source_integrity",
+            "Claude command id was reused with different input",
+        )));
+    }
+    if let Some(turn_id) = session.command_turns.get(command_id) {
+        return Some(Ok(json!({"state": "applied", "turn_id": turn_id})));
+    }
+    if session.unknown_commands.contains(command_id) {
+        return Some(Err(Error::new(
+            "unknown",
+            "Claude input outcome is unresolved and will not be repeated",
+        )));
+    }
+    if session.rejected_commands.contains(command_id) {
+        return Some(Ok(json!({
+            "state": "rejected",
+            "reason": "Claude input was known not to apply",
+        })));
+    }
+    Some(Err(Error::new(
+        "unknown",
+        "Claude command was already dispatched without a retained exact outcome",
+    )))
+}
+
+/// Pre-dispatch gates for a fresh send: a failed event source, an already
+/// active turn, and the per-generation command history bound.
+fn check_send_ready(session: &AgentSession) -> Result<()> {
+    let event_status = session.events.status();
+    if let Some(reason) = event_status.failure {
+        return Err(Error::new("unknown", reason));
+    }
+    if event_status.active_turn_id.is_some() {
+        return Err(Error::new("busy", "Claude already has an active turn"));
+    }
+    if session.command_inputs.len() >= MAX_COMMAND_HISTORY {
+        return Err(Error::new(
+            "unsupported",
+            "Claude L6.1 per-generation command history bound has been reached",
+        ));
+    }
+    Ok(())
+}
+
+/// Mint the exact turn association before the write and register it with
+/// the event task first: an early lifecycle can never miss its waiter, and
+/// a lost association latches unknown without a rewrite.
+async fn dispatch_send(session: &mut AgentSession, command_id: &str, text: &str) -> Result<Value> {
+    let turn_id = new_uuid();
+    let outcome = match session
+        .events
+        .expect_turn(command_id.to_owned(), turn_id.clone())
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) if error.code == "busy" => {
+            session.command_inputs.remove(command_id);
+            return Err(Error::new("busy", "Claude already has an active turn"));
+        }
+        Err(error) => {
+            session.unknown_commands.insert(command_id.to_owned());
+            session.phase = SessionPhase::Unknown;
+            return Err(Error::new("unknown", error.message));
+        }
+    };
+    let input = OutboundUserInput {
+        kind: "user",
+        uuid: turn_id.clone(),
+        session_id: session
+            .session_id
+            .clone()
+            .ok_or_else(|| Error::new("unknown", "Claude session identity is unresolved"))?,
+        parent_tool_use_id: None,
+        message: OutboundUserMessage {
+            role: "user",
+            content: text.to_owned(),
+        },
+    };
+    if let Err(error) = session
+        .native_client
+        .send_user(input, Instant::now() + RPC_TIMEOUT)
+        .await
+    {
+        if native_no_write(&error.code) {
+            // Proven never dispatched: withdraw the pending turn before
+            // answering, or every later send wedges `busy` behind it.
+            session.events.cancel_turn(command_id.to_owned()).await;
+            session.rejected_commands.insert(command_id.to_owned());
+            return Ok(json!({
+                "state": "rejected",
+                "reason": "Claude input was not dispatched",
+            }));
+        }
+        session.unknown_commands.insert(command_id.to_owned());
+        session.phase = SessionPhase::Unknown;
+        return Err(Error::new(
+            "unknown",
+            "Claude input may have applied; it will not be repeated",
+        ));
+    }
+    let outcome = tokio::time::timeout(RPC_TIMEOUT, outcome)
+        .await
+        .map_err(|_| {
+            Error::new(
+                "unknown",
+                "Claude turn association was not observed; the input will not be repeated",
+            )
+        })?;
+    let outcome = outcome.map_err(|_| {
+        Error::new(
+            "unknown",
+            "Claude turn association was lost; the input will not be repeated",
+        )
+    })?;
+    match outcome {
+        TurnOutcome::Associated => {
+            session
+                .command_turns
+                .insert(command_id.to_owned(), turn_id.clone());
+            Ok(json!({"state": "applied", "turn_id": turn_id}))
+        }
+        TurnOutcome::Rejected(reason) => {
+            session.rejected_commands.insert(command_id.to_owned());
+            Ok(json!({"state": "rejected", "reason": reason}))
+        }
+        TurnOutcome::Unknown => {
+            session.unknown_commands.insert(command_id.to_owned());
+            session.phase = SessionPhase::Unknown;
+            Err(Error::new(
+                "unknown",
+                "Claude input outcome is unresolved and will not be repeated",
+            ))
+        }
+    }
+}
+
+/// Spawn the owned CLI and bind the event task: the only start phase that
+/// creates native resources.
+async fn launch_session(
+    plan: &StartPlan,
+    params: &AgentStartParams,
+    peer: &PeerClient,
+) -> Result<AgentSession> {
+    let launch = NativeLaunch {
+        program: plan.program.clone(),
+        args: vec![
+            OsString::from("-p"),
+            OsString::from("--input-format"),
+            OsString::from("stream-json"),
+            OsString::from("--output-format"),
+            OsString::from("stream-json"),
+            OsString::from("--verbose"),
+            OsString::from("--session-id"),
+            OsString::from(&plan.session_id),
+            OsString::from("--model"),
+            OsString::from(&plan.requested_model),
+        ],
+        cwd: plan.workspace.clone(),
+        environment: plan.environment.clone(),
+    };
+    let mut native =
+        ClaudeProcess::spawn(launch, SecretPolicy::new(plan.secrets.iter().cloned())).await?;
+    let frames = native.take_frames()?;
+    let stream = native.stream_state();
+    let native_client = native.client();
+    let events = events::spawn(
+        frames,
+        stream,
+        peer.clone(),
+        EventConfig {
+            credential: plan.credential.clone(),
+            agent_id: params.agent_id.clone(),
+            generation: params.generation,
+            secrets: plan.secrets.clone(),
+        },
+    );
+    Ok(AgentSession {
+        agent_id: params.agent_id.clone(),
+        generation: params.generation,
+        start_command_id: params.command_id.clone(),
+        start_result: None,
+        phase: SessionPhase::Unknown,
+        session_id: None,
+        native_scope: claude_scope(plan.config_dir.as_deref()),
+        native,
+        native_client,
+        events,
+        command_inputs: HashMap::new(),
+        command_turns: HashMap::new(),
+        unknown_commands: HashSet::new(),
+        rejected_commands: HashSet::new(),
+        interrupt_applied: HashMap::new(),
+        interrupted_turns: HashSet::new(),
+        unknown_interrupt_turns: HashSet::new(),
+        stop_command_id: None,
+    })
 }
 
 async fn register_native_process(
