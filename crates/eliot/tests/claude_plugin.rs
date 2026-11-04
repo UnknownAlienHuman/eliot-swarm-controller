@@ -11,6 +11,13 @@
 //! `swarm plugin claude` binary driven over the Eliot plugin protocol, with
 //! this file emulating the host side (`process.put`, `events.put`,
 //! `source.gap`).
+//!
+//! Hang safety (note 61): every scenario runs under a hard per-scenario
+//! timeout that fails the run instead of living for hours. On timeout the
+//! plugin child dies by its `kill_on_drop` handle and the fake CLI's
+//! stdin-EOF exit is confirmed through the `exit` marker it writes into its
+//! report; on success the plugin's own reaped exit wait plus the shutdown
+//! assertions prove both children died.
 
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -23,6 +30,12 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 const CLI: &str = env!("CARGO_BIN_EXE_swarm");
 const MODEL: &str = "claude-opus-4-6";
 const OP_TIMEOUT: Duration = Duration::from_secs(15);
+/// Hard backstop per scenario: a hang fails the run instead of living for
+/// hours (note 61). Generous: a healthy scenario takes seconds.
+const SCENARIO_TIMEOUT: Duration = Duration::from_secs(120);
+/// Grace for an owned child to exit once its stdin closes or its owner dies.
+const CHILD_GRACE: Duration = Duration::from_secs(15);
+const EXIT_POLL: Duration = Duration::from_millis(50);
 
 fn main() {
     if let Ok(script) = std::env::var("ELIOT_FAKE_CLAUDE_SCRIPT") {
@@ -34,28 +47,101 @@ fn main() {
         .build()
         .expect("test runtime");
     runtime.block_on(async {
-        scenario_launch_send_snapshot_stop().await;
-        println!("ok - launch/send/snapshot/stop");
-        scenario_two_assistant_messages_snapshot_matches_stream().await;
-        println!("ok - two assistant messages: snapshot matches the stream fold");
-        scenario_failed_turn_reports_terminal_reason().await;
-        println!("ok - failed turn reports its terminal reason");
-        scenario_cancelled_input_is_rejected_without_rewrite().await;
-        println!("ok - cancelled input is rejected without a second write");
-        scenario_dropped_input_is_unknown_without_rewrite().await;
-        println!("ok - dropped input is unknown without a second write");
-        scenario_interrupt_applied_then_stale().await;
-        println!("ok - interrupt applied once, then stale_turn");
-        scenario_model_not_in_catalogue_rejected_before_ready().await;
-        println!("ok - unknown model is rejected before session.ready");
-        scenario_session_mismatch_is_unknown_with_gap().await;
-        println!("ok - session mismatch is unknown with an explicit gap");
-        scenario_not_idle_rejected_before_ready().await;
-        println!("ok - non-idle initialize is rejected before session.ready");
-        scenario_invalid_profile_rejected_before_spawn().await;
-        println!("ok - invalid profile rejected before spawn");
+        run_scenario(
+            "launch/send/snapshot/stop",
+            OwnedChildren::default(),
+            scenario_launch_send_snapshot_stop,
+        )
+        .await;
+        run_scenario(
+            "two assistant messages: snapshot matches the stream fold",
+            OwnedChildren::default(),
+            scenario_two_assistant_messages_snapshot_matches_stream,
+        )
+        .await;
+        run_scenario(
+            "failed turn reports its terminal reason",
+            OwnedChildren::default(),
+            scenario_failed_turn_reports_terminal_reason,
+        )
+        .await;
+        run_scenario(
+            "cancelled input is rejected without a second write",
+            OwnedChildren::default(),
+            scenario_cancelled_input_is_rejected_without_rewrite,
+        )
+        .await;
+        run_scenario(
+            "dropped input is unknown without a second write",
+            OwnedChildren::default(),
+            scenario_dropped_input_is_unknown_without_rewrite,
+        )
+        .await;
+        run_scenario(
+            "interrupt applied once, then stale_turn",
+            OwnedChildren::default(),
+            scenario_interrupt_applied_then_stale,
+        )
+        .await;
+        run_scenario(
+            "unknown model is rejected before session.ready",
+            OwnedChildren::default(),
+            scenario_model_not_in_catalogue_rejected_before_ready,
+        )
+        .await;
+        run_scenario(
+            "session mismatch is unknown with an explicit gap",
+            OwnedChildren::default(),
+            scenario_session_mismatch_is_unknown_with_gap,
+        )
+        .await;
+        run_scenario(
+            "non-idle initialize is rejected before session.ready",
+            OwnedChildren::default(),
+            scenario_not_idle_rejected_before_ready,
+        )
+        .await;
+        run_scenario(
+            "invalid profile rejected before spawn",
+            OwnedChildren::default(),
+            scenario_invalid_profile_rejected_before_spawn,
+        )
+        .await;
     });
     println!("claude_plugin: all scenarios passed");
+}
+
+/// Run one scenario under the hard per-scenario timeout. On success the
+/// scenario's own assertions already prove both children died: every scenario
+/// ends with `shutdown_child` (which waits for the plugin's successful exit),
+/// and before that the plugin's stop/shutdown reaps the fake CLI by handle on
+/// every branch, returning `unknown` (which the scenario rejects) if the
+/// fake's exit cannot be confirmed. On timeout the scenario future is dropped
+/// — which drops its [`Host`], killing the owned plugin child by its
+/// `kill_on_drop` handle — the fake CLI's stdin-EOF exit is confirmed through
+/// its report marker, and then the run panics with the scenario name.
+async fn run_scenario<F, Fut>(name: &'static str, owned: OwnedChildren, scenario: F)
+where
+    F: FnOnce(OwnedChildren) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    match tokio::time::timeout(SCENARIO_TIMEOUT, scenario(owned.clone())).await {
+        Ok(()) => {
+            println!("ok - {name}");
+        }
+        Err(_) => {
+            let cli = if owned.cli_exited().await {
+                "exit confirmed"
+            } else {
+                "exit UNCONFIRMED"
+            };
+            panic!(
+                "scenario {name} timed out after {SCENARIO_TIMEOUT:?}; \
+                 the owned plugin child was killed, fake CLI {cli} ({})",
+                owned.describe().await
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -70,6 +156,9 @@ struct FakeClaude {
     argv: Vec<String>,
     controls: HashMap<String, u64>,
     user_inputs: u64,
+    /// Set only on an exit path, so the scenario can verify this exact CLI
+    /// died with it instead of leaking (note 61).
+    exit: Option<String>,
 }
 
 fn fake_claude_main(script: &str) {
@@ -92,9 +181,41 @@ fn fake_claude_main(script: &str) {
         argv,
         controls: HashMap::new(),
         user_inputs: 0,
+        exit: None,
     };
     fake.write_report();
+    let _panic_marker = PanicMarker {
+        report_path: fake.report_path.clone(),
+    };
     fake.run();
+}
+
+/// Marks the fake CLI's exit even when it panics (e.g. a broken-pipe write
+/// racing the owner's death on a scenario timeout), so a missing marker
+/// always means a live CLI rather than an unwitnessed panic. Only adds the
+/// marker to the last report; counts stay as the fixture left them.
+struct PanicMarker {
+    report_path: PathBuf,
+}
+
+impl Drop for PanicMarker {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        let Ok(text) = std::fs::read_to_string(&self.report_path) else {
+            return;
+        };
+        let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
+            return;
+        };
+        value["exit"] = Value::String("panicked".to_owned());
+        let Ok(text) = serde_json::to_string(&value) else {
+            return;
+        };
+        let tmp = self.report_path.with_extension("tmp");
+        let _ = std::fs::write(&tmp, &text).and_then(|()| std::fs::rename(&tmp, &self.report_path));
+    }
 }
 
 impl FakeClaude {
@@ -114,6 +235,9 @@ impl FakeClaude {
             stdout.flush().expect("fixture stdout");
             self.write_report();
         }
+        // Stdin EOF: the owner closed input (or died). Mark the exit so the
+        // scenario observes this exact CLI is gone.
+        self.exit = Some("stdin-eof".to_owned());
         self.write_report();
     }
 
@@ -202,6 +326,8 @@ impl FakeClaude {
                 self.user_inputs += 1;
                 self.write_report();
                 if self.script == "drop-input" {
+                    self.exit = Some("scripted-drop".to_owned());
+                    self.write_report();
                     std::process::exit(0);
                 }
                 let uuid = frame
@@ -326,6 +452,7 @@ impl FakeClaude {
             "model": self.argv_model,
             "controls": self.controls,
             "user_inputs": self.user_inputs,
+            "exit": self.exit,
         });
         let text = serde_json::to_string(&report).expect("report JSON");
         let tmp = self.report_path.with_extension("tmp");
@@ -337,6 +464,73 @@ impl FakeClaude {
 // ---------------------------------------------------------------------------
 // Host side: drive the real plugin binary over the Eliot plugin protocol
 // ---------------------------------------------------------------------------
+
+/// Owned native children recorded while one scenario runs, so the scenario
+/// timeout path can verify the exact owned processes — never by name.
+///
+/// The plugin child is owned by [`Host`] and dies by its `kill_on_drop`
+/// handle whenever the scenario future is dropped. The fake CLI is owned by
+/// the plugin and exits on stdin EOF; its exit is observed through the
+/// `exit` marker it writes into its report (atomic temp + rename, so a
+/// concurrently read report is never truncated).
+#[derive(Clone, Default)]
+struct OwnedChildren {
+    inner: std::sync::Arc<Mutex<OwnedChildrenInner>>,
+}
+
+#[derive(Default)]
+struct OwnedChildrenInner {
+    report: Option<PathBuf>,
+    cli_pid: Option<u64>,
+}
+
+impl OwnedChildren {
+    async fn set_report(&self, report: PathBuf) {
+        self.inner.lock().await.report = Some(report);
+    }
+
+    async fn set_cli_pid(&self, pid: u64) {
+        self.inner.lock().await.cli_pid = Some(pid);
+    }
+
+    /// True once the fake CLI's exit marker is observed, when the scenario
+    /// never spawned one, or when its report never appeared (the CLI never
+    /// started). Bounded by [`CHILD_GRACE`]: never hangs the run.
+    async fn cli_exited(&self) -> bool {
+        let report = self.inner.lock().await.report.clone();
+        let Some(report) = report else {
+            return true;
+        };
+        let deadline = tokio::time::Instant::now() + CHILD_GRACE;
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&report)
+                && let Ok(value) = serde_json::from_str::<Value>(&text)
+                && value.get("exit").and_then(Value::as_str).is_some()
+            {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                // A live CLI writes its report within milliseconds of exec;
+                // a report that never appeared means it never started.
+                return !report.exists();
+            }
+            tokio::time::sleep(EXIT_POLL).await;
+        }
+    }
+
+    async fn describe(&self) -> String {
+        let inner = self.inner.lock().await;
+        format!(
+            "report={}, cli_pid={}",
+            inner.report.as_ref().map_or("none".to_owned(), |path| path
+                .to_string_lossy()
+                .into_owned()),
+            inner
+                .cli_pid
+                .map_or("none".to_owned(), |pid| pid.to_string())
+        )
+    }
+}
 
 struct HostRequest {
     id: Value,
@@ -366,6 +560,9 @@ impl Host {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            // A dropped scenario (timeout, panic) kills the owned plugin by
+            // this handle; the fake CLI it owns then exits on stdin EOF.
+            .kill_on_drop(true)
             .spawn()
             .expect("spawn claude plugin");
         let stdin = child.stdin.take().expect("plugin stdin");
@@ -547,8 +744,8 @@ struct Scenario {
 }
 
 impl Scenario {
-    async fn start(script: &str, profile: Value) -> Self {
-        let (scenario, _) = Self::start_raw(script, profile, true).await;
+    async fn start(script: &str, profile: Value, owned: &OwnedChildren) -> Self {
+        let (scenario, _) = Self::start_raw(script, profile, true, owned).await;
         scenario
     }
 
@@ -559,11 +756,13 @@ impl Scenario {
         script: &str,
         profile: Value,
         expect_ready: bool,
+        owned: &OwnedChildren,
     ) -> (Self, Result<(Value, Value), String>) {
         let root: PathBuf = std::env::temp_dir().join(format!(
             "eliot-claude-plugin-test-{}",
             ulid::Ulid::new().to_string().to_lowercase()
         ));
+        owned.set_report(root.join("report.json")).await;
         std::fs::create_dir_all(root.join("data")).unwrap();
         std::fs::create_dir_all(root.join("instance")).unwrap();
         std::fs::create_dir_all(root.join("workspace")).unwrap();
@@ -633,6 +832,7 @@ impl Scenario {
                         "process.put" => {
                             let pid = request.params.get("pid").and_then(Value::as_u64).unwrap_or(0);
                             assert!(pid > 0);
+                            owned.set_cli_pid(pid).await;
                             assert_eq!(request.params.get("role").and_then(Value::as_str), Some("harness"));
                             host.respond(&request.id, json!({
                                 "identity": {"host_boot_id": "test-boot", "pid": pid, "start_time": 1},
@@ -911,8 +1111,8 @@ async fn stop_agent(host: &mut Host, agent_id: &str) {
     assert!(ended, "stop commits session.ended");
 }
 
-async fn scenario_launch_send_snapshot_stop() {
-    let mut scenario = Scenario::start("ok", claude_profile()).await;
+async fn scenario_launch_send_snapshot_stop(owned: OwnedChildren) {
+    let mut scenario = Scenario::start("ok", claude_profile(), &owned).await;
     let agent_id = scenario.agent_id.clone();
     let (send_id, turn_id, committed) = send_turn(&mut scenario.host, &agent_id, "hello").await;
     assert_eq!(
@@ -1031,8 +1231,8 @@ async fn scenario_launch_send_snapshot_stop() {
     scenario.host.shutdown_child().await;
 }
 
-async fn scenario_two_assistant_messages_snapshot_matches_stream() {
-    let mut scenario = Scenario::start("two-messages", claude_profile()).await;
+async fn scenario_two_assistant_messages_snapshot_matches_stream(owned: OwnedChildren) {
+    let mut scenario = Scenario::start("two-messages", claude_profile(), &owned).await;
     let agent_id = scenario.agent_id.clone();
     let (send_id, _, committed) = send_turn(&mut scenario.host, &agent_id, "hello").await;
     let messages: Vec<&str> = committed
@@ -1078,8 +1278,8 @@ async fn scenario_two_assistant_messages_snapshot_matches_stream() {
     scenario.host.shutdown_child().await;
 }
 
-async fn scenario_failed_turn_reports_terminal_reason() {
-    let mut scenario = Scenario::start("failed-turn", claude_profile()).await;
+async fn scenario_failed_turn_reports_terminal_reason(owned: OwnedChildren) {
+    let mut scenario = Scenario::start("failed-turn", claude_profile(), &owned).await;
     let agent_id = scenario.agent_id.clone();
     let (_, _, committed) = send_turn(&mut scenario.host, &agent_id, "hello").await;
     let terminal = committed
@@ -1100,8 +1300,8 @@ async fn scenario_failed_turn_reports_terminal_reason() {
     scenario.host.shutdown_child().await;
 }
 
-async fn scenario_cancelled_input_is_rejected_without_rewrite() {
-    let mut scenario = Scenario::start("cancelled-turn", claude_profile()).await;
+async fn scenario_cancelled_input_is_rejected_without_rewrite(owned: OwnedChildren) {
+    let mut scenario = Scenario::start("cancelled-turn", claude_profile(), &owned).await;
     let agent_id = scenario.agent_id.clone();
     let send_id = ulid::Ulid::new().to_string();
     let send_params = json!({
@@ -1158,8 +1358,8 @@ async fn scenario_cancelled_input_is_rejected_without_rewrite() {
     scenario.host.shutdown_child().await;
 }
 
-async fn scenario_dropped_input_is_unknown_without_rewrite() {
-    let mut scenario = Scenario::start("drop-input", claude_profile()).await;
+async fn scenario_dropped_input_is_unknown_without_rewrite(owned: OwnedChildren) {
+    let mut scenario = Scenario::start("drop-input", claude_profile(), &owned).await;
     let agent_id = scenario.agent_id.clone();
     let send_id = ulid::Ulid::new().to_string();
     let send_params = json!({
@@ -1217,8 +1417,8 @@ async fn scenario_dropped_input_is_unknown_without_rewrite() {
     scenario.host.shutdown_child().await;
 }
 
-async fn scenario_interrupt_applied_then_stale() {
-    let mut scenario = Scenario::start("interrupt-race", claude_profile()).await;
+async fn scenario_interrupt_applied_then_stale(owned: OwnedChildren) {
+    let mut scenario = Scenario::start("interrupt-race", claude_profile(), &owned).await;
     let agent_id = scenario.agent_id.clone();
     // Park one turn: the association commits, the terminal stays pending.
     let send_id = ulid::Ulid::new().to_string();
@@ -1351,9 +1551,9 @@ async fn scenario_interrupt_applied_then_stale() {
     scenario.host.shutdown_child().await;
 }
 
-async fn scenario_model_not_in_catalogue_rejected_before_ready() {
+async fn scenario_model_not_in_catalogue_rejected_before_ready(owned: OwnedChildren) {
     let (mut scenario, outcome) =
-        Scenario::start_raw("model-mismatch", claude_profile(), false).await;
+        Scenario::start_raw("model-mismatch", claude_profile(), false, &owned).await;
     let error = outcome.expect_err("unknown model must fail start");
     assert!(error.contains("profile_error"), "{error}");
     assert_eq!(
@@ -1370,9 +1570,9 @@ async fn scenario_model_not_in_catalogue_rejected_before_ready() {
     scenario.host.shutdown_child().await;
 }
 
-async fn scenario_session_mismatch_is_unknown_with_gap() {
+async fn scenario_session_mismatch_is_unknown_with_gap(owned: OwnedChildren) {
     let (mut scenario, outcome) =
-        Scenario::start_raw("session-mismatch", claude_profile(), false).await;
+        Scenario::start_raw("session-mismatch", claude_profile(), false, &owned).await;
     let error = outcome.expect_err("session mismatch must fail start");
     assert!(error.contains("unknown"), "{error}");
     // Shutdown still settles the owned session: `session.ended` commits
@@ -1410,8 +1610,9 @@ async fn scenario_session_mismatch_is_unknown_with_gap() {
     scenario.host.shutdown_child().await;
 }
 
-async fn scenario_not_idle_rejected_before_ready() {
-    let (mut scenario, outcome) = Scenario::start_raw("not-idle", claude_profile(), false).await;
+async fn scenario_not_idle_rejected_before_ready(owned: OwnedChildren) {
+    let (mut scenario, outcome) =
+        Scenario::start_raw("not-idle", claude_profile(), false, &owned).await;
     let error = outcome.expect_err("non-idle initialize must fail start");
     assert!(error.contains("profile_error"), "{error}");
     scenario
@@ -1422,7 +1623,7 @@ async fn scenario_not_idle_rejected_before_ready() {
     scenario.host.shutdown_child().await;
 }
 
-async fn scenario_invalid_profile_rejected_before_spawn() {
+async fn scenario_invalid_profile_rejected_before_spawn(_owned: OwnedChildren) {
     let root: PathBuf = std::env::temp_dir().join(format!(
         "eliot-claude-plugin-test-{}",
         ulid::Ulid::new().to_string().to_lowercase()
