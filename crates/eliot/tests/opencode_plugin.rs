@@ -3204,16 +3204,25 @@ async fn scenario_unknown_stop_with_committed_end_closes_owned_family(owned: Own
         {
             break pid;
         }
-        assert!(std::time::Instant::now() < pid_deadline, "descendant pid deadline");
+        assert!(
+            std::time::Instant::now() < pid_deadline,
+            "descendant pid deadline"
+        );
         tokio::task::yield_now().await;
         std::thread::sleep(Duration::from_millis(50));
     };
-    assert!(pid_is_live(descendant_pid), "owned descendant must be live before stop");
+    assert!(
+        pid_is_live(descendant_pid),
+        "owned descendant must be live before stop"
+    );
     owned.record(descendant_pid);
     let server_pid = report_at(&fixture.root, "report.json")["server_pid"]
         .as_u64()
         .expect("server pid report") as u32;
-    assert!(pid_is_live(server_pid), "fake server must be live before stop");
+    assert!(
+        pid_is_live(server_pid),
+        "fake server must be live before stop"
+    );
     owned.record(server_pid);
 
     let stop_id = ulid::Ulid::new().to_string();
@@ -3241,7 +3250,10 @@ async fn scenario_unknown_stop_with_committed_end_closes_owned_family(owned: Own
                 break;
             }
         }
-        assert!(std::time::Instant::now() < end_deadline, "session end deadline");
+        assert!(
+            std::time::Instant::now() < end_deadline,
+            "session end deadline"
+        );
         tokio::task::yield_now().await;
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -3281,9 +3293,16 @@ async fn scenario_unknown_stop_with_committed_end_closes_owned_family(owned: Own
                 && event["agent"] == agent
                 && event["generation"] == generation
         });
-        assert!(!released_before, "capacity must not release before owned-exit proof");
+        assert!(
+            !released_before,
+            "capacity must not release before owned-exit proof"
+        );
         let blocked = support::cli(&fixture.data, &blocked_args);
-        assert_eq!(blocked.status.code(), Some(3), "fenced cap must reject before admission");
+        assert_eq!(
+            blocked.status.code(),
+            Some(3),
+            "fenced cap must reject before admission"
+        );
         assert!(
             blocked.stderr.contains("capacity_unavailable"),
             "fenced cap did not return capacity_unavailable"
@@ -3311,7 +3330,10 @@ async fn scenario_unknown_stop_with_committed_end_closes_owned_family(owned: Own
         if !pid_is_live(descendant_pid) {
             break;
         }
-        assert!(std::time::Instant::now() < reaped_deadline, "descendant exit deadline");
+        assert!(
+            std::time::Instant::now() < reaped_deadline,
+            "descendant exit deadline"
+        );
         tokio::task::yield_now().await;
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -3323,7 +3345,10 @@ async fn scenario_unknown_stop_with_committed_end_closes_owned_family(owned: Own
         Some("unknown"),
         "original StopUnknown must be preserved, never Applied: {settled}"
     );
-    assert_eq!(fixture.json(&["show", &agent])["state"].as_str(), Some("stopped"));
+    assert_eq!(
+        fixture.json(&["show", &agent])["state"].as_str(),
+        Some("stopped")
+    );
     let ended = fixture
         .events()
         .iter()
@@ -3381,7 +3406,10 @@ async fn scenario_unknown_stop_with_committed_end_closes_owned_family(owned: Own
         }
         assert_eq!(reply.status.code(), Some(3));
         assert!(reply.stderr.contains("capacity_unavailable"));
-        assert!(std::time::Instant::now() < release_deadline, "capacity release deadline");
+        assert!(
+            std::time::Instant::now() < release_deadline,
+            "capacity release deadline"
+        );
         tokio::task::yield_now().await;
         std::thread::sleep(Duration::from_millis(500));
     };
