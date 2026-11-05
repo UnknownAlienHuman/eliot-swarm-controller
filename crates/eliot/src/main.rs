@@ -2515,7 +2515,6 @@ fn print_value(value: &Value, json_output: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser as _;
 
     #[test]
     fn approval_cli_parser_keeps_explicit_choice_and_feedback() {
