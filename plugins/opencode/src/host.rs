@@ -2076,7 +2076,9 @@ async fn terminate_session(session: &mut AgentSession, force: bool) -> Result<()
     if ended.as_ref().is_some_and(|result| result.is_ok()) {
         session.stop_end_ack_proved = true;
     }
-    session.server.finish_diagnostics(deadline).await;
+    if process_exit.is_ok() {
+        session.server.finish_diagnostics(deadline).await;
+    }
     if semantic_error
         || process_exit.is_err()
         || ended.as_ref().is_none_or(|result| result.is_err())
