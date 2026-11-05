@@ -59,7 +59,18 @@ async fn run_owned(
     policy: Arc<SecretPolicy>,
 ) -> Result<()> {
     let store_path = data_dir.path().join("eliot.db");
-    let store = eliot_store::Store::open(&store_path)?;
+    logging::record(&policy, "daemon.store_opening", &[], None);
+    let store = eliot_store::Store::open_with_observer(&store_path, |phase| match phase {
+        eliot_store::StoreOpenPhase::ConnectionOpened => {
+            logging::record(&policy, "daemon.store_connection_opened", &[], None);
+        }
+        eliot_store::StoreOpenPhase::PragmasApplied => {
+            logging::record(&policy, "daemon.store_pragmas_applied", &[], None);
+        }
+        eliot_store::StoreOpenPhase::Migrated => {
+            logging::record(&policy, "daemon.store_migrated", &[], None);
+        }
+    })?;
     // Startup phase markers: a readiness timeout names the phase that stalled.
     logging::record(&policy, "daemon.store_opened", &[], None);
     let store = std::sync::Arc::new(Mutex::new(store));
@@ -333,10 +344,13 @@ pub async fn client_call(path: &Path, method: &str, params: Value) -> Result<Val
         .read_daemon_info()?
         .ok_or_else(|| Error::new("unavailable", "daemon is not running"))?;
     let auth = match identity {
-        ClientIdentity::Owner => json!({
-            "kind": "owner",
-            "credential": data_dir.owner_token(),
-        }),
+        ClientIdentity::Owner => {
+            let token = data_dir.read_owner_token()?;
+            json!({
+                "kind": "owner",
+                "credential": token,
+            })
+        }
         ClientIdentity::Agent {
             id,
             generation,
@@ -356,10 +370,46 @@ pub async fn client_call(path: &Path, method: &str, params: Value) -> Result<Val
             "credential": token,
         }),
     };
-    let policy = SecretPolicy::new([
-        data_dir.owner_token(),
-        auth["credential"].as_str().unwrap_or(""),
-    ]);
+    let credential = auth["credential"].as_str().unwrap_or("");
+    let policy = SecretPolicy::new([credential]);
+    raw_client_call(&info.endpoint, method, params, auth, &policy).await
+}
+
+/// Make one JSON-RPC call using an explicitly supplied owner credential.
+///
+/// Discovers the validated daemon endpoint without inspecting ambient role
+/// credentials or reading owner.token from disk.
+pub async fn client_call_with_owner_credential(
+    path: &Path,
+    method: &str,
+    params: Value,
+    owner_credential: &str,
+) -> Result<Value> {
+    if method.trim().is_empty() || !params.is_object() {
+        return Err(Error::new(
+            "invalid",
+            "daemon RPC requires a method and object params",
+        ));
+    }
+    let data_dir = DataDir::open_existing(path)?;
+    let info = data_dir
+        .read_daemon_info()?
+        .ok_or_else(|| Error::new("unavailable", "daemon is not running"))?;
+    let auth = json!({
+        "kind": "owner",
+        "credential": owner_credential,
+    });
+    let policy = SecretPolicy::new([owner_credential]);
+    raw_client_call(&info.endpoint, method, params, auth, &policy).await
+}
+
+async fn raw_client_call(
+    endpoint: &str,
+    method: &str,
+    params: Value,
+    auth: Value,
+    policy: &SecretPolicy,
+) -> Result<Value> {
     let mut envelope = serde_json::Map::new();
     envelope.insert("_auth".to_owned(), auth);
     envelope.insert("_payload".to_owned(), params.clone());
@@ -377,8 +427,9 @@ pub async fn client_call(path: &Path, method: &str, params: Value) -> Result<Val
 
     let timeout = call_timeout(method, &params);
     let deadline = Instant::now() + timeout;
+    let endpoint = endpoint.to_owned();
     timeout_at(deadline, async move {
-        let stream = IpcStream::connect(&info.endpoint, deadline).await?;
+        let stream = IpcStream::connect(&endpoint, deadline).await?;
         let mut framed = Framed::new(
             stream,
             LinesCodec::new_with_max_length(MAX_RPC_FRAME_BYTES.saturating_sub(1)),
@@ -408,7 +459,7 @@ pub async fn client_call(path: &Path, method: &str, params: Value) -> Result<Val
         }
         match (response.result, response.error) {
             (Some(value), None) => Ok(value),
-            (None, Some(error)) => Err(core_error(error, &policy)),
+            (None, Some(error)) => Err(core_error(error, policy)),
             _ => Err(Error::new(
                 "invalid",
                 "daemon response must contain exactly one result or error",
@@ -834,6 +885,29 @@ mod tests {
         );
         assert!(!error.message.contains("dummy-private"));
         assert_eq!(params.0.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_owner_credential_rejects_empty_method_or_non_object_params() {
+        let error = client_call_with_owner_credential(
+            Path::new("unused-data-dir"),
+            "",
+            json!({}),
+            "dummy-credential",
+        )
+        .await
+        .expect_err("empty method");
+        assert_eq!(error.code, "invalid");
+
+        let error = client_call_with_owner_credential(
+            Path::new("unused-data-dir"),
+            "daemon.status",
+            json!([]),
+            "dummy-credential",
+        )
+        .await
+        .expect_err("non-object params");
+        assert_eq!(error.code, "invalid");
     }
 
     #[test]

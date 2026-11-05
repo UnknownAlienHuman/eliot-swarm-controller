@@ -15,7 +15,7 @@ use eliot_core::api::{
     EventsReadRequest, EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse,
     MAX_OBSERVATION_CURSOR_BYTES, ObservationPage, PROCESS_CURSOR_MAX_BYTES,
     ProjectRegistrationView, ProviderClearHoldResponse, ProviderHoldsResponse, RuleStateView,
-    ShutdownMode, TimerSchedule, TimerStateView, TurnGetRequest,
+    ShutdownMode, TimerSchedule, TimerStateView, TurnGetRequest, WhoResponse,
 };
 use eliot_core::{
     AgentState, Command as CoreCommand, CommandState, ProviderHoldState, ProviderRestrictionKind,
@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 use std::{collections::HashSet, fs, path::Path, process::Command, thread};
 use support::Captured;
-use support::{CLI, Fixture, cli, run};
+use support::{AMBIENT_IDENTITY_ENV_KEYS, CLI, Fixture, cli, run, scrub_ambient_identity};
 
 fn public_rpc(
     runtime: &tokio::runtime::Runtime,
@@ -33,14 +33,99 @@ fn public_rpc(
     method: &str,
     params: Value,
 ) -> eliot_core::Result<Value> {
+    let owner_credential =
+        fs::read_to_string(fixture.data.join("owner.token")).expect("fixture owner token");
     runtime.block_on(async {
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            eliot_daemon::client_call(&fixture.data, method, params),
+            eliot_daemon::client_call_with_owner_credential(
+                &fixture.data,
+                method,
+                params,
+                &owner_credential,
+            ),
         )
         .await
         .unwrap_or_else(|_| panic!("{method} exceeded the bounded public RPC deadline"))
     })
+}
+
+#[test]
+fn explicit_owner_credential_works_over_actual_ipc_with_renamed_token_file() {
+    let mut fixture = Fixture::new("explicit owner credential IPC");
+    fixture.start();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("public RPC runtime");
+
+    let token_path = fixture.data.join("owner.token");
+    let token = fs::read_to_string(&token_path).expect("capture fixture owner token");
+    let backup_path = fixture.data.join("owner.token.renamed");
+    fs::rename(&token_path, &backup_path).expect("temporarily rename owner.token");
+
+    struct TokenRestoreGuard<'a> {
+        from: &'a Path,
+        to: &'a Path,
+        active: bool,
+    }
+    impl<'a> Drop for TokenRestoreGuard<'a> {
+        fn drop(&mut self) {
+            if self.active {
+                let _ = fs::rename(self.from, self.to);
+            }
+        }
+    }
+    let mut guard = TokenRestoreGuard {
+        from: &backup_path,
+        to: &token_path,
+        active: true,
+    };
+
+    let correct_result = runtime.block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            eliot_daemon::client_call_with_owner_credential(
+                &fixture.data,
+                "daemon.status",
+                json!({}),
+                &token,
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("daemon.status timed out"))
+    });
+
+    let wrong_token = format!("{}{}", ulid::Ulid::new(), ulid::Ulid::new());
+    let wrong_result = runtime.block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            eliot_daemon::client_call_with_owner_credential(
+                &fixture.data,
+                "daemon.status",
+                json!({}),
+                &wrong_token,
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("daemon.status timed out"))
+    });
+
+    // Restore file BEFORE assertions/stop
+    fs::rename(&backup_path, &token_path).expect("restore owner.token");
+    guard.active = false;
+
+    let value = correct_result.expect("correct explicit credential must work over actual IPC");
+    let status: DaemonStatusResponse =
+        serde_json::from_value(value).expect("typed DaemonStatusResponse");
+    DaemonStatusRequest {}
+        .validate_response(&status)
+        .expect("valid DaemonStatusResponse");
+    assert_eq!(status.state, "running");
+    assert_eq!(status.agents, 0);
+
+    let error = wrong_result.expect_err("wrong valid-shaped credential must get not_allowed");
+    assert_eq!(error.code, "not_allowed");
 }
 
 fn assert_invalid_read_rpc(
@@ -117,6 +202,7 @@ fn cli_launch_rejects_selector_credential_collision_before_persistence() {
     let mut data_argument = fixture.data.as_os_str().to_os_string();
     data_argument.push(std::path::MAIN_SEPARATOR_STR);
     let mut daemon_command = Command::new(CLI);
+    scrub_ambient_identity(&mut daemon_command);
     daemon_command
         .arg("--data-dir")
         .arg(data_argument)
@@ -158,6 +244,7 @@ pass_env = ["CODEX_HOME", "CODEX_SQLITE_HOME", "EPHEMERAL_TOKEN"]
     .expect("write privacy regression profile under the initialized private root");
 
     let mut launch = Command::new(CLI);
+    scrub_ambient_identity(&mut launch);
     launch
         .arg("--data-dir")
         .arg(&fixture.data)
@@ -3103,6 +3190,7 @@ fn fake_observer_live_rollout_preserves_unknown_and_detaches_reader() {
     let generation = attach_command["generation"].as_i64().unwrap();
     let watch_path = fixture.root.join("observer-watch.ndjson");
     let mut command = Command::new(CLI);
+    scrub_ambient_identity(&mut command);
     command
         .arg("--data-dir")
         .arg(&fixture.data)
@@ -3519,6 +3607,7 @@ fn shutdown_retains_drain_result_and_force_waits_for_owned_exit() {
 fn foreground_startup_and_cli_help() {
     for argument in ["--version", "--help"] {
         let mut command = Command::new(CLI);
+        scrub_ambient_identity(&mut command);
         command.arg(argument);
         let reply = run(command);
         assert!(reply.status.success(), "{}", reply.stderr);
@@ -3538,6 +3627,7 @@ fn background_startup_releases_capture_before_daemon_exit() {
     let mut data_argument = fixture.data.as_os_str().to_os_string();
     data_argument.push(std::path::MAIN_SEPARATOR_STR);
     let mut command = Command::new(CLI);
+    scrub_ambient_identity(&mut command);
     command
         .arg("--data-dir")
         .arg(data_argument)
@@ -14882,4 +14972,53 @@ fn attribution_claim_release_and_generation_drop_claims() {
     stop_attribution_agent(&fixture, &a);
     stop_attribution_agent(&fixture, &b);
     fixture.stop(false);
+}
+
+#[test]
+fn fixture_cli_under_synthetic_ambient_identity_helper() {
+    let mut fixture = Fixture::new("synthetic ambient identity helper");
+    fixture.start();
+    let status = fixture.json(&["status"]);
+    assert_eq!(status["state"], "running");
+    let who = fixture.json(&["who"]);
+    let who_response: WhoResponse = serde_json::from_value(who).expect("typed WhoResponse");
+    assert!(who_response.workers.is_empty());
+    fixture.stop(false);
+}
+
+#[test]
+fn fixture_cli_scrubs_ambient_identity_under_nested_runner() {
+    let outer_identity: Vec<(String, Option<std::ffi::OsString>)> = AMBIENT_IDENTITY_ENV_KEYS
+        .iter()
+        .map(|&key| (key.to_owned(), std::env::var_os(key)))
+        .collect();
+
+    let self_exe = std::env::current_exe().expect("test binary path");
+    let mut command = Command::new(self_exe);
+    command.args([
+        "--exact",
+        "fixture_cli_under_synthetic_ambient_identity_helper",
+        "--nocapture",
+        "--test-threads=1",
+    ]);
+    for &key in AMBIENT_IDENTITY_ENV_KEYS {
+        command.env(key, format!("synthetic-{key}-value"));
+    }
+
+    let reply = run(command);
+    assert!(
+        reply.status.success(),
+        "nested test under synthetic ambient identity failed (exit {:?}):\nstdout:\n{}\nstderr:\n{}",
+        reply.status.code(),
+        reply.stdout,
+        reply.stderr,
+    );
+
+    for (key, original_value) in outer_identity {
+        let current = std::env::var_os(&key);
+        assert!(
+            current == original_value,
+            "outer ambient context for {key} changed"
+        );
+    }
 }

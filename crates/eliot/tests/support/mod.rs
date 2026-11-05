@@ -5,7 +5,10 @@ use std::{
     io::{self, Read},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
-    sync::mpsc::{self, Receiver},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc::{self, Receiver},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -15,6 +18,43 @@ const WAIT: Duration = Duration::from_secs(20);
 // Bounded first-line CLI stderr snippets in failure diagnostics. Full outcome
 // text stays out; the daemon's timestamped log in the retained fixture has it.
 const MAX_ERROR_SNIPPET_CHARS: usize = 240;
+
+static CURRENTLY_STARTING_DAEMONS_PER_PROCESS: AtomicUsize = AtomicUsize::new(0);
+static PEAK_STARTING_DAEMONS_PER_PROCESS: AtomicUsize = AtomicUsize::new(0);
+
+pub const AMBIENT_IDENTITY_ENV_KEYS: &[&str] = &[
+    "ELIOT_AGENT_ID",
+    "ELIOT_AGENT_GENERATION",
+    "ELIOT_AGENT_TOKEN",
+    "ELIOT_OWNER_ID",
+    "ELIOT_OWNER_TOKEN",
+    "ELIOT_OWNER_CREDENTIAL",
+    "ELIOT_RUN_COMMAND_ID",
+    "ELIOT_RUN_TOKEN",
+];
+
+pub fn scrub_ambient_identity(command: &mut Command) -> &mut Command {
+    for &key in AMBIENT_IDENTITY_ENV_KEYS {
+        command.env_remove(key);
+    }
+    command
+}
+
+struct DaemonStartGuard;
+
+impl DaemonStartGuard {
+    fn enter() -> Self {
+        let current = CURRENTLY_STARTING_DAEMONS_PER_PROCESS.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = PEAK_STARTING_DAEMONS_PER_PROCESS.fetch_max(current, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for DaemonStartGuard {
+    fn drop(&mut self) {
+        CURRENTLY_STARTING_DAEMONS_PER_PROCESS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 fn error_snippet(stderr: &str) -> String {
     let line = stderr.lines().next().unwrap_or("").trim();
@@ -255,6 +295,7 @@ pub fn run(command: Command) -> Reply {
 
 pub fn cli(data: &Path, args: &[&str]) -> Reply {
     let mut command = Command::new(CLI);
+    scrub_ambient_identity(&mut command);
     command.args([
         OsStr::new("--data-dir"),
         data.as_os_str(),
@@ -291,10 +332,12 @@ impl Fixture {
 
     pub fn start(&mut self) {
         assert!(self.daemon.is_none());
+        let _start_guard = DaemonStartGuard::enter();
         self.starts += 1;
         let mut data_argument = self.data.as_os_str().to_os_string();
         data_argument.push(std::path::MAIN_SEPARATOR_STR);
         let mut command = Command::new(CLI);
+        scrub_ambient_identity(&mut command);
         command
             .arg("--data-dir")
             .arg(data_argument)
@@ -325,7 +368,9 @@ impl Fixture {
                     ""
                 };
                 panic!(
-                    "foreground daemon exited during startup (status={status:?}); stderr:\n{}{}",
+                    "foreground daemon exited during startup (status={status:?}, per_process currently_starting={}, per_process peak_starting={}); stderr:\n{}{}",
+                    CURRENTLY_STARTING_DAEMONS_PER_PROCESS.load(Ordering::SeqCst),
+                    PEAK_STARTING_DAEMONS_PER_PROCESS.load(Ordering::SeqCst),
                     &stderr[..end],
                     truncated,
                 );
@@ -346,9 +391,11 @@ impl Fixture {
             }
             assert!(
                 Instant::now() < deadline,
-                "daemon readiness deadline (start #{}, {polls} status polls in {:?}): child={}; daemon.json={}; first_error={}; last_error={}; log={}",
+                "daemon readiness deadline (start #{}, {polls} status polls in {:?}, per_process currently_starting={}, per_process peak_starting={}): child={}; daemon.json={}; first_error={}; last_error={}; log={}",
                 self.starts,
                 started.elapsed(),
+                CURRENTLY_STARTING_DAEMONS_PER_PROCESS.load(Ordering::SeqCst),
+                PEAK_STARTING_DAEMONS_PER_PROCESS.load(Ordering::SeqCst),
                 match self.daemon.as_mut().unwrap().child.try_wait() {
                     Ok(None) => "alive".to_owned(),
                     Ok(Some(status)) => format!("exited({status:?})"),
