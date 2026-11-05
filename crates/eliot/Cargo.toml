@@ -32,6 +32,11 @@ name = "antigravity_plugin"
 path = "tests/antigravity_plugin.rs"
 harness = false
 
+[[test]]
+name = "cross_harness_mail_cas"
+path = "tests/cross_harness_mail_cas.rs"
+harness = false
+
 [target.'cfg(unix)'.dev-dependencies]
 libc.workspace = true
 
