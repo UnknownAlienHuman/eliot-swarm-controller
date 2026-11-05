@@ -179,8 +179,6 @@ struct EventProcessor {
     loss_reason: Option<&'static str>,
     frames_drained: bool,
     pending_end_stop: Option<oneshot::Sender<Result<()>>>,
-    pending_end_stop_started: Option<std::time::Instant>,
-    stop_trace_path: Option<std::path::PathBuf>,
     writes_blocked: bool,
     gap_reported: bool,
     pending: Option<PendingInbox>,
@@ -219,10 +217,8 @@ pub(crate) fn spawn(
     http: OpenCodeHttp,
     host: PeerClient,
     config: EventConfig,
-    stop_trace_path: Option<std::path::PathBuf>,
 ) -> EventHandle {
-    let mut processor = EventProcessor::new(http, host, config);
-    processor.stop_trace_path = stop_trace_path;
+    let processor = EventProcessor::new(http, host, config);
     let (control, control_rx) = mpsc::channel(CONTROL_QUEUE);
     let (status_tx, status) = watch::channel(EventStatus::default());
     tokio::spawn(run(frames, stream, processor, control_rx, status_tx));
@@ -449,8 +445,6 @@ impl EventProcessor {
             loss_reason: None,
             frames_drained: false,
             pending_end_stop: None,
-            pending_end_stop_started: None,
-            stop_trace_path: None,
             writes_blocked: false,
             gap_reported: false,
             pending: None,
@@ -531,38 +525,21 @@ impl EventProcessor {
                 true
             }
             Control::EndStop { reply } => {
-                let started = std::time::Instant::now();
                 if self.frames_drained {
                     let result = self.finish_stop().await;
-                    self.trace_stop_stage(
-                        "end_ack_result",
-                        match &result {
-                            Ok(()) => "acked",
-                            Err(error) => crate::host::stop_error_class(&error.code),
-                        },
-                        started.elapsed(),
-                    );
                     let _ = reply.send(result);
                 } else if self.pending_end_stop.is_some() {
-                    self.trace_stop_stage("end_ack_result", "already_waiting", started.elapsed());
                     let _ = reply.send(Err(Error::new(
                         "bad_state",
                         "OpenCode stop is already waiting for native output drain",
                     )));
                 } else {
-                    self.pending_end_stop_started = Some(started);
                     self.pending_end_stop = Some(reply);
-                    self.trace_stop_stage("end_ack_wait", "frames_drained", started.elapsed());
                 }
                 true
             }
             Control::Close { reply } => {
                 if let Some(pending) = self.pending_end_stop.take() {
-                    let started = self
-                        .pending_end_stop_started
-                        .take()
-                        .unwrap_or_else(std::time::Instant::now);
-                    self.trace_stop_stage("end_ack_result", "stream_closed", started.elapsed());
                     let _ = pending.send(Err(Error::new(
                         "unknown",
                         "OpenCode native event queue closed before stop settlement",
@@ -629,12 +606,6 @@ impl EventProcessor {
             }
             None => {
                 self.frames_drained = true;
-                let elapsed = self
-                    .pending_end_stop_started
-                    .as_ref()
-                    .map(std::time::Instant::elapsed)
-                    .unwrap_or_default();
-                self.trace_stop_stage("frames_drained", "sse_eof", elapsed);
                 self.accept_frames = false;
                 if !self.buffer.is_empty() {
                     self.buffer.clear();
@@ -1366,30 +1337,11 @@ impl EventProcessor {
         })
     }
 
-    fn trace_stop_stage(
-        &self,
-        stage: &'static str,
-        class: &'static str,
-        elapsed: std::time::Duration,
-    ) {
-        crate::host::record_stop_stage(self.stop_trace_path.as_deref(), stage, class, elapsed);
-    }
-
     async fn finish_stop(&mut self) -> Result<()> {
         if self.status.stopped {
-            self.trace_stop_stage(
-                "session_ended_commit",
-                "already_stopped",
-                std::time::Duration::ZERO,
-            );
             return Ok(());
         }
         if self.writes_blocked {
-            self.trace_stop_stage(
-                "session_ended_commit",
-                "writes_blocked",
-                std::time::Duration::ZERO,
-            );
             return Err(Error::new(
                 "unknown",
                 "OpenCode source acknowledgement is unresolved",
@@ -1399,19 +1351,8 @@ impl EventProcessor {
             "opencode:{}:session.ended",
             self.status.session_id.as_deref().unwrap_or("unresolved")
         );
-        let commit_started = std::time::Instant::now();
-        let commit_result = self
-            .commit_event("session.ended", native_id, json!({}))
-            .await;
-        self.trace_stop_stage(
-            "session_ended_commit",
-            match &commit_result {
-                Ok(()) => "committed",
-                Err(error) => crate::host::stop_error_class(&error.code),
-            },
-            commit_started.elapsed(),
-        );
-        commit_result?;
+        self.commit_event("session.ended", native_id, json!({}))
+            .await?;
         if let (Some(command_id), Some(turn_id)) = (
             self.status.active_command_id.clone(),
             self.status.active_turn_id.clone(),
@@ -1440,19 +1381,7 @@ impl EventProcessor {
             return;
         }
         if let Some(reply) = self.pending_end_stop.take() {
-            let started = self
-                .pending_end_stop_started
-                .take()
-                .unwrap_or_else(std::time::Instant::now);
             let result = self.finish_stop().await;
-            self.trace_stop_stage(
-                "end_ack_result",
-                match &result {
-                    Ok(()) => "acked",
-                    Err(error) => crate::host::stop_error_class(&error.code),
-                },
-                started.elapsed(),
-            );
             let _ = reply.send(result);
         }
     }

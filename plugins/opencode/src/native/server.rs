@@ -70,7 +70,6 @@ pub struct OwnedServer {
     http: OpenCodeHttp,
     config_dir: PathBuf,
     data_dir: PathBuf,
-    stop_trace_path: Option<PathBuf>,
 }
 
 impl OwnedServer {
@@ -82,7 +81,6 @@ impl OwnedServer {
     /// roots — exactly like the Codex/Muse stdio servers, with no
     /// `env_clear` and no third allowlist.
     pub async fn spawn(launch: ServerLaunch, secrets: &[String]) -> Result<Self> {
-        let stop_trace_path = crate::host::stop_trace_path_from_environment(&launch.environment);
         let config_dir = launch.instance_dir.join("config").join("opencode");
         let data_dir = stable_store_dir(&launch.store_root, &launch.agent_id)?;
         std::fs::create_dir_all(&config_dir).map_err(|error| {
@@ -179,7 +177,6 @@ impl OwnedServer {
             http,
             config_dir,
             data_dir,
-            stop_trace_path,
         };
         if let Err(error) = server.await_ready(Instant::now() + READINESS_TIMEOUT).await {
             server
@@ -282,77 +279,30 @@ impl OwnedServer {
     /// Prove the exact server leader exited without waiting for its diagnostic
     /// pipe readers. Stop commits the native EndAck before finishing those pipes.
     pub(crate) async fn terminate_leader(&mut self, force: bool, deadline: Instant) -> Result<()> {
-        let leader_check_started = Instant::now();
-        let leader_check = self.child.try_wait();
-        crate::host::record_stop_stage(
-            self.stop_trace_path.as_deref(),
-            "leader_try_wait",
-            match &leader_check {
-                Ok(Some(status)) if status.success() => "already_exited_success",
-                Ok(Some(_)) => "already_exited_nonzero",
-                Ok(None) => "running",
-                Err(_) => "read_error",
-            },
-            leader_check_started.elapsed(),
-        );
-        let leader_status = leader_check.map_err(|error| {
-            Error::new(
-                "native_process",
-                format!("OpenCode serve exit readback failed: {error}"),
-            )
-        })?;
-        if let Some(_status) = leader_status {
+        if self
+            .child
+            .try_wait()
+            .map_err(|error| {
+                Error::new(
+                    "native_process",
+                    format!("OpenCode serve exit readback failed: {error}"),
+                )
+            })?
+            .is_some()
+        {
             return Ok(());
         }
         if !force {
             // No graceful RPC exists; a short grace lets an in-flight native
             // close settle before the process ends.
             let grace = (Instant::now() + Duration::from_secs(2)).min(deadline);
-            let grace_started = Instant::now();
-            let grace_result = timeout_at(grace, self.child.wait()).await;
-            crate::host::record_stop_stage(
-                self.stop_trace_path.as_deref(),
-                "leader_grace_wait",
-                match &grace_result {
-                    Ok(Ok(status)) if status.success() => "exited_success",
-                    Ok(Ok(_)) => "exited_nonzero",
-                    Ok(Err(_)) => "wait_error",
-                    Err(_) => "deadline",
-                },
-                grace_started.elapsed(),
-            );
-            if matches!(&grace_result, Ok(Ok(_))) {
+            if matches!(timeout_at(grace, self.child.wait()).await, Ok(Ok(_))) {
                 return Ok(());
             }
         }
-        let kill_started = Instant::now();
-        let kill_result = timeout_at(deadline, self.child.kill()).await;
-        crate::host::record_stop_stage(
-            self.stop_trace_path.as_deref(),
-            "leader_kill",
-            match &kill_result {
-                Ok(Ok(())) => "ok",
-                Ok(Err(_)) => "io_error",
-                Err(_) => "deadline",
-            },
-            kill_started.elapsed(),
-        );
-        if let Err(error) = kill_result {
+        if let Err(error) = timeout_at(deadline, self.child.kill()).await {
             // Kill outcome is ambiguous without the wait proof below.
-            let proof_started = Instant::now();
-            let proof = timeout_at(deadline, self.child.wait()).await;
-            crate::host::record_stop_stage(
-                self.stop_trace_path.as_deref(),
-                "leader_wait_proof",
-                match &proof {
-                    Ok(Ok(status)) if status.success() => "exited_success",
-                    Ok(Ok(_)) => "exited_nonzero",
-                    Ok(Err(_)) => "wait_error",
-                    Err(_) => "deadline",
-                },
-                proof_started.elapsed(),
-            );
-            if !matches!(&proof, Ok(Ok(_))) {
+            if !matches!(timeout_at(deadline, self.child.wait()).await, Ok(Ok(_))) {
                 return Err(Error::new(
                     "unknown",
                     "OpenCode serve termination outcome is unknown",
@@ -361,20 +311,7 @@ impl OwnedServer {
             let _ = error;
             return Ok(());
         }
-        let proof_started = Instant::now();
-        let proof = timeout_at(deadline, self.child.wait()).await;
-        crate::host::record_stop_stage(
-            self.stop_trace_path.as_deref(),
-            "leader_wait_proof",
-            match &proof {
-                Ok(Ok(status)) if status.success() => "exited_success",
-                Ok(Ok(_)) => "exited_nonzero",
-                Ok(Err(_)) => "wait_error",
-                Err(_) => "deadline",
-            },
-            proof_started.elapsed(),
-        );
-        if !matches!(&proof, Ok(Ok(_))) {
+        if !matches!(timeout_at(deadline, self.child.wait()).await, Ok(Ok(_))) {
             return Err(Error::new(
                 "unknown",
                 "OpenCode serve exit proof is unknown",
@@ -384,45 +321,12 @@ impl OwnedServer {
     }
 
     pub(crate) async fn finish_diagnostics(&mut self, deadline: Instant) {
-        let drain_started = Instant::now();
         if let Some(stdout) = self.stdout.take() {
-            let stage_started = Instant::now();
-            let snapshot = stdout.finish(deadline).await;
-            crate::host::record_stop_stage(
-                self.stop_trace_path.as_deref(),
-                "stdout_drain",
-                capture_drain_class(snapshot.eof, snapshot.read_error, deadline),
-                stage_started.elapsed(),
-            );
+            let _ = stdout.finish(deadline).await;
         }
         if let Some(stderr) = self.stderr.take() {
-            let stage_started = Instant::now();
-            let snapshot = stderr.finish(deadline).await;
-            crate::host::record_stop_stage(
-                self.stop_trace_path.as_deref(),
-                "stderr_drain",
-                capture_drain_class(snapshot.eof, snapshot.read_error, deadline),
-                stage_started.elapsed(),
-            );
+            let _ = stderr.finish(deadline).await;
         }
-        crate::host::record_stop_stage(
-            self.stop_trace_path.as_deref(),
-            "pipe_drain_total",
-            "returned",
-            drain_started.elapsed(),
-        );
-    }
-}
-
-fn capture_drain_class(eof: bool, read_error: bool, deadline: Instant) -> &'static str {
-    if Instant::now() >= deadline && !eof {
-        "deadline"
-    } else if read_error {
-        "read_error"
-    } else if eof {
-        "eof"
-    } else {
-        "incomplete"
     }
 }
 
