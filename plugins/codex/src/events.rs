@@ -4698,15 +4698,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retained_unconfirmed_b_survives_root_completion_through_handle_frame() {
+    async fn retained_unconfirmed_b_terminal_survives_root_completion_through_handle_frame() {
         use eliot_plugin::RpcRequest;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, split};
 
         let (_native, mut processor, host_io, peer_task) = connected_child_processor("a1").await;
+        processor.status.ready = true;
         processor.status.thread_id = Some("root".to_owned());
-        processor.native_scope = "codex:test".to_owned();
-        // A is bound and actively tracked; B was retained unconfirmed under
-        // A's nested window, which is still open here.
+        processor.status.active_turn_id = Some("turn-root".to_owned());
+        processor.status.active_command_id = Some("cmd-root".to_owned());
+        let registration_a = build_registration("call-root", "a1", 1, "root", "codex:test", "a");
+        let mut state_a = ChildState::new(ChildBinding {
+            registration: registration_a,
+            agent_id: "a2".to_owned(),
+            agent_generation: 1,
+            native_ref: "a".to_owned(),
+        });
+        state_a.ready_committed = true;
+        state_a.active_turn_id = Some("turn-a".to_owned());
+        processor.child_states.insert("a".to_owned(), state_a);
         processor.children.confirm("root", "a").unwrap();
         processor
             .children
@@ -4715,173 +4725,183 @@ mod tests {
         processor
             .children
             .spawn_items
-            .insert("a".to_owned(), "call-a".to_owned());
+            .insert("a".to_owned(), "call-root".to_owned());
         processor
             .children
-            .spawn_started("a", "call-b".to_owned())
+            .spawn_started("root", "call-root".to_owned())
             .unwrap();
-        assert_eq!(processor.children.take_frame("b"), Ok(true));
-        assert!(processor.children.is_unconfirmed("b"));
-        let reg_a = build_registration("call-a", "a1", 1, "root", "codex:test", "a");
-        let mut state_a = ChildState::new(ChildBinding {
-            registration: reg_a,
-            agent_id: "a2".to_owned(),
-            agent_generation: 1,
-            native_ref: "a".to_owned(),
-        });
-        state_a.ready_committed = true;
-        state_a.active_turn_id = Some("turn-a".to_owned());
-        processor.child_states.insert("a".to_owned(), state_a);
-        // Root completes via the pump's own entry point. No parent turn is
-        // running, so the parent is idle; the settle removes root's last
-        // named window while B stays retained by A's open window.
-        processor
-            .handle_frame(Some(NativeFrame::Notification {
-                method: "turn/completed".to_owned(),
-                params: json!({
-                    "threadId": "root",
-                    "turn": {"id": "turn-r", "items": [], "status": "completed"}
-                }),
-            }))
-            .await;
-        assert_eq!(processor.status.active_turn_id, None);
-        assert!(
-            !processor.children.producers().contains(&"root".to_owned()),
-            "root named window must be settled"
-        );
-        assert!(processor.children.is_unconfirmed("b"));
-        // B's terminal arrives while the parent is idle. It must route to
-        // the child buffer, never the parent early-event queue.
-        processor
-            .handle_frame(Some(NativeFrame::Notification {
-                method: "turn/completed".to_owned(),
-                params: json!({
-                    "threadId": "b",
-                    "turn": {"id": "turn-b", "items": [], "status": "completed"}
-                }),
-            }))
-            .await;
-        assert!(
-            processor.buffer.is_empty(),
-            "B terminal stranded in parent buffer: {:?}",
-            processor.buffer.len()
-        );
-        assert_eq!(
-            processor.child_buffers.get("b").map(|queue| queue.len()),
-            Some(1),
-            "B terminal must be retained in the child buffer"
-        );
-        // A's spawn result names B; confirm + register only after the result.
-        assert_eq!(
-            processor
-                .children
-                .spawn_completed("a", "root", "call-b", &["b".to_owned()]),
-            Ok(())
-        );
-        assert!(processor.children.is_bound("b"));
-        assert!(!processor.children.is_unconfirmed("b"));
-        // Drive the fake host for registration + session.ready + flushed
-        // B terminal. No parent turn is started afterwards.
+        assert_eq!(processor.children.pending_items("root").len(), 1);
+
         let (host_read, mut host_write) = split(host_io);
         let mut host_reader = BufReader::new(host_read);
-        let mut recorded_rpc = Vec::new();
-        let reg_b = build_registration("call-b", "a2", 1, "a", "codex:test", "b");
         let fake_host = async {
-            let mut line = String::new();
-            line.clear();
-            host_reader
-                .read_line(&mut line)
-                .await
-                .expect("read B registration");
-            let req: RpcRequest = serde_json::from_str(&line).expect("decode registration");
-            recorded_rpc.push((req.method.clone(), req.params.clone()));
-            assert_eq!(req.method, "child");
-            let reg_b_sent = &req.params["registration"];
-            assert_eq!(reg_b_sent["native_ref"], "b");
-            assert_eq!(reg_b_sent["parent_native_ref"], "a");
-            assert_eq!(reg_b_sent["parent_id"], "a2");
-            let ack = crate::native_child::tests::test_ack(&reg_b);
-            let ack_reply = json!({
-                "jsonrpc": "2.0", "id": req.id, "result": ack
-            });
-            host_write
-                .write_all(format!("{ack_reply}\n").as_bytes())
-                .await
-                .expect("send B ack");
-            for expected in ["session.ready", "turn.completed"] {
-                line.clear();
+            let mut requests = Vec::new();
+            let mut last_seq = HashMap::<String, i64>::new();
+            for _ in 0..5 {
+                let mut line = String::new();
                 host_reader
                     .read_line(&mut line)
                     .await
-                    .expect("read B commit");
-                let commit: RpcRequest = serde_json::from_str(&line).expect("decode commit");
-                recorded_rpc.push((commit.method.clone(), commit.params.clone()));
-                assert_eq!(commit.method, "events.put");
-                assert_eq!(
-                    commit.params["events"][0]["kind"], expected,
-                    "B terminal must land as a child fact"
-                );
-                let ack = json!({
-                    "jsonrpc": "2.0",
-                    "id": commit.id,
-                    "result": {"first_seq": 1, "last_seq": 1, "cursor": null}
-                });
+                    .expect("read fake-host request");
+                let request: RpcRequest = serde_json::from_str(&line).expect("decode request");
+                requests.push((request.method.clone(), request.params.clone()));
+                let result = match request.method.as_str() {
+                    "child" => {
+                        let registration: eliot_core::ChildRegistration =
+                            serde_json::from_value(request.params["registration"].clone())
+                                .expect("decode child registration");
+                        let mut ack = crate::native_child::tests::test_ack(&registration);
+                        ack.agent.id = "a3".to_owned();
+                        ack.agent.root = "a1".to_owned();
+                        ack.agent.depth = 2;
+                        serde_json::to_value(ack).expect("encode child ACK")
+                    }
+                    "events.put" => {
+                        let agent_id = request.params["agent_id"]
+                            .as_str()
+                            .expect("agent id")
+                            .to_owned();
+                        let count = request.params["events"]
+                            .as_array()
+                            .expect("event batch")
+                            .len() as i64;
+                        let sequence = last_seq.entry(agent_id).or_default();
+                        let first_seq = *sequence + 1;
+                        let end = first_seq + count - 1;
+                        *sequence = end;
+                        json!({
+                            "first_seq": first_seq,
+                            "last_seq": end,
+                            "cursor": request.params.get("cursor").cloned().unwrap_or(Value::Null),
+                        })
+                    }
+                    method => panic!("unexpected fake-host request: {method}"),
+                };
+                let response = json!({"jsonrpc": "2.0", "id": request.id, "result": result});
                 host_write
-                    .write_all(format!("{ack}\n").as_bytes())
+                    .write_all(format!("{response}\n").as_bytes())
                     .await
-                    .expect("send B commit ack");
+                    .expect("send ACK");
             }
-            drop(host_write);
-            drop(host_reader);
-            recorded_rpc
+            requests
         };
-        // The thread/started frame (the pump's own entry) drives identity
-        // confirmation and registration; the retained terminal then flushes.
-        // No parent turn is started afterwards.
         let driver = async {
+            processor
+                .handle_frame(Some(NativeFrame::Notification {
+                    method: "turn/started".to_owned(),
+                    params: json!({"threadId": "b", "turn": {"id": "turn-b"}}),
+                }))
+                .await;
+            assert!(processor.children.is_unconfirmed("b"));
+            assert_eq!(
+                processor.child_buffers.get("b").map(|queue| queue.len()),
+                Some(1)
+            );
+
+            processor
+                .handle_frame(Some(NativeFrame::Notification {
+                    method: "turn/completed".to_owned(),
+                    params: json!({
+                        "threadId": "root",
+                        "turn": {"id": "turn-root", "items": [], "status": "completed"},
+                    }),
+                }))
+                .await;
+            assert!(processor.status.active_turn_id.is_none());
+            assert_eq!(
+                processor
+                    .status
+                    .last_turn
+                    .as_ref()
+                    .map(|turn| turn.turn_id.as_str()),
+                Some("turn-root")
+            );
+            assert!(processor.children.is_unconfirmed("b"));
+            assert!(!processor.children.has_any_window());
+
+            processor
+                .handle_frame(Some(NativeFrame::Notification {
+                    method: "turn/completed".to_owned(),
+                    params: json!({
+                        "threadId": "b",
+                        "turn": {"id": "turn-b", "items": [], "status": "completed"},
+                    }),
+                }))
+                .await;
+            assert!(processor.buffer.is_empty());
+            assert_eq!(
+                processor.child_buffers.get("b").map(|queue| queue.len()),
+                Some(2)
+            );
+
+            processor
+                .children
+                .spawn_started("a", "call-b".to_owned())
+                .unwrap();
             processor
                 .handle_frame(Some(NativeFrame::Notification {
                     method: "thread/started".to_owned(),
                     params: json!({
-                        "thread": {
-                            "id": "b",
-                            "source": {"subAgent": {"thread_spawn": {
-                                "parent_thread_id": "a", "depth": 1
-                            }}}
-                        }
+                        "thread": {"id": "b", "source": {"subAgent": {"thread_spawn": {
+                            "parent_thread_id": "a", "call_id": "call-b",
+                        }}}},
                     }),
                 }))
                 .await;
-        };
-        let recorded = tokio::join!(fake_host, driver).0;
-        peer_task.await.expect("peer task clean shutdown");
-        assert_eq!(recorded.len(), 3);
-        assert!(
-            recorded
-                .iter()
-                .all(|(method, _)| method == "child" || method == "events.put"),
-            "no parent facts expected: {recorded:?}"
-        );
-        let state = processor
-            .child_states
-            .get("b")
-            .expect("B must be fully registered");
-        assert!(state.ready_committed);
-        assert_eq!(state.active_turn_id, None, "B turn must be fully completed");
-        assert!(
-            processor.buffer.is_empty(),
-            "no B terminal may be stranded in the parent buffer at end"
-        );
-        assert!(
+            assert!(processor.children.is_bound("b"));
             processor
-                .child_buffers
-                .get("b")
-                .is_none_or(|queue| queue.is_empty()),
-            "child buffer must be drained after flush"
+                .children
+                .spawn_completed("a", "root", "call-b", &["b".to_owned()])
+                .unwrap();
+            assert!(
+                processor
+                    .child_states
+                    .get("b")
+                    .is_some_and(|state| state.active_turn_id.is_none())
+            );
+            assert!(
+                processor
+                    .child_buffers
+                    .get("b")
+                    .is_none_or(|queue| queue.is_empty())
+            );
+            assert!(processor.buffer.is_empty());
+        };
+        let (requests, ()) = tokio::join!(fake_host, driver);
+        peer_task.abort();
+
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(method, _)| method == "child")
+                .count(),
+            1
+        );
+        let mut parent_completions = 0;
+        let mut b_completed = false;
+        for (method, params) in &requests {
+            if method != "events.put" {
+                continue;
+            }
+            for event in params["events"].as_array().expect("recorded event batch") {
+                if params["agent_id"] == "a1" && event["kind"] == "turn.completed" {
+                    parent_completions += 1;
+                }
+                if params["agent_id"] == "a3"
+                    && event["kind"] == "turn.completed"
+                    && event["data"]["turn_id"] == "turn-b"
+                {
+                    b_completed = true;
+                }
+            }
+        }
+        assert_eq!(
+            parent_completions, 1,
+            "B completion must not create a parent turn"
         );
         assert!(
-            !processor.child_early_lost.contains("b"),
-            "no early-loss gap must be recorded for retained B"
+            b_completed,
+            "registered child batch must contain B's completion"
         );
     }
 }
