@@ -24,7 +24,7 @@ pub struct DaemonInfo {
 /// acquired separately so clients can read the owner token while the daemon is live.
 pub struct DataDir {
     path: PathBuf,
-    owner_token: String,
+    owner_token: Option<String>,
 }
 
 /// Holds the OS file lock for one daemon lifetime.
@@ -39,7 +39,10 @@ impl DataDir {
         let path = absolute_path(path.as_ref())?;
         ensure_private_root(&path)?;
         let owner_token = load_or_create_owner_token(&path)?;
-        Ok(Self { path, owner_token })
+        Ok(Self {
+            path,
+            owner_token: Some(owner_token),
+        })
     }
 
     /// Open a previously initialized data root for a client without creating
@@ -54,8 +57,10 @@ impl DataDir {
             Ok(_) => {}
         }
         validate_private_root(&path)?;
-        let owner_token = read_existing_owner_token(&path)?;
-        Ok(Self { path, owner_token })
+        Ok(Self {
+            path,
+            owner_token: None,
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -64,7 +69,14 @@ impl DataDir {
 
     /// Read the bearer token from the current-user-only owner.token file.
     pub fn owner_token(&self) -> &str {
-        &self.owner_token
+        self.owner_token
+            .as_deref()
+            .expect("owner token is present when opened for daemon")
+    }
+
+    /// Read and validate the bearer token from owner.token for a client.
+    pub fn read_owner_token(&self) -> Result<String> {
+        read_existing_owner_token(&self.path)
     }
 
     /// Acquire the single-daemon lock. The returned guard releases it on drop.
@@ -300,7 +312,7 @@ fn load_or_create_owner_token(root: &Path) -> Result<String> {
     }
 }
 
-fn read_existing_owner_token(root: &Path) -> Result<String> {
+pub(crate) fn read_existing_owner_token(root: &Path) -> Result<String> {
     let path = root.join(OWNER_TOKEN_FILE);
     match fs::symlink_metadata(&path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -635,6 +647,39 @@ mod tests {
                 .expect_err("read must leave the unsafe DACL in place")
                 .code,
             "unsafe_data_dir"
+        );
+    }
+
+    #[test]
+    fn open_existing_discovers_daemon_info_without_requiring_owner_token() {
+        let root = TestRoot::new();
+        let data = DataDir::open(&root.path).expect("initialize private data directory");
+        let lock = data.acquire_daemon_lock().expect("daemon lock");
+        data.publish_daemon(&lock, "test-endpoint", "test")
+            .expect("publish daemon info");
+        let token_path = data.path().join(OWNER_TOKEN_FILE);
+        let backup_path = data.path().join("owner.token.bak");
+        fs::rename(&token_path, &backup_path).expect("rename owner.token");
+
+        let existing =
+            DataDir::open_existing(&root.path).expect("open_existing succeeds without owner.token");
+        let info = existing
+            .read_daemon_info()
+            .expect("read_daemon_info")
+            .expect("daemon info present");
+        assert_eq!(info.endpoint, "test-endpoint");
+        assert_eq!(
+            existing
+                .read_owner_token()
+                .expect_err("owner.token absent")
+                .code,
+            "data_dir_unavailable"
+        );
+
+        fs::rename(&backup_path, &token_path).expect("restore owner.token");
+        assert_eq!(
+            existing.read_owner_token().expect("owner.token present"),
+            data.owner_token()
         );
     }
 }

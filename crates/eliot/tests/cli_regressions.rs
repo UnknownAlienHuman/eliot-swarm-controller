@@ -33,14 +33,99 @@ fn public_rpc(
     method: &str,
     params: Value,
 ) -> eliot_core::Result<Value> {
+    let owner_credential =
+        fs::read_to_string(fixture.data.join("owner.token")).expect("fixture owner token");
     runtime.block_on(async {
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            eliot_daemon::client_call(&fixture.data, method, params),
+            eliot_daemon::client_call_with_owner_credential(
+                &fixture.data,
+                method,
+                params,
+                &owner_credential,
+            ),
         )
         .await
         .unwrap_or_else(|_| panic!("{method} exceeded the bounded public RPC deadline"))
     })
+}
+
+#[test]
+fn explicit_owner_credential_works_over_actual_ipc_with_renamed_token_file() {
+    let mut fixture = Fixture::new("explicit owner credential IPC");
+    fixture.start();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("public RPC runtime");
+
+    let token_path = fixture.data.join("owner.token");
+    let token = fs::read_to_string(&token_path).expect("capture fixture owner token");
+    let backup_path = fixture.data.join("owner.token.renamed");
+    fs::rename(&token_path, &backup_path).expect("temporarily rename owner.token");
+
+    struct TokenRestoreGuard<'a> {
+        from: &'a Path,
+        to: &'a Path,
+        active: bool,
+    }
+    impl<'a> Drop for TokenRestoreGuard<'a> {
+        fn drop(&mut self) {
+            if self.active {
+                let _ = fs::rename(self.from, self.to);
+            }
+        }
+    }
+    let mut guard = TokenRestoreGuard {
+        from: &backup_path,
+        to: &token_path,
+        active: true,
+    };
+
+    let correct_result = runtime.block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            eliot_daemon::client_call_with_owner_credential(
+                &fixture.data,
+                "daemon.status",
+                json!({}),
+                &token,
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("daemon.status timed out"))
+    });
+
+    let wrong_token = format!("{}{}", ulid::Ulid::new(), ulid::Ulid::new());
+    let wrong_result = runtime.block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            eliot_daemon::client_call_with_owner_credential(
+                &fixture.data,
+                "daemon.status",
+                json!({}),
+                &wrong_token,
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("daemon.status timed out"))
+    });
+
+    // Restore file BEFORE assertions/stop
+    fs::rename(&backup_path, &token_path).expect("restore owner.token");
+    guard.active = false;
+
+    let value = correct_result.expect("correct explicit credential must work over actual IPC");
+    let status: DaemonStatusResponse =
+        serde_json::from_value(value).expect("typed DaemonStatusResponse");
+    DaemonStatusRequest {}
+        .validate_response(&status)
+        .expect("valid DaemonStatusResponse");
+    assert_eq!(status.state, "running");
+    assert_eq!(status.agents, 0);
+
+    let error = wrong_result.expect_err("wrong valid-shaped credential must get not_allowed");
+    assert_eq!(error.code, "not_allowed");
 }
 
 fn assert_invalid_read_rpc(
