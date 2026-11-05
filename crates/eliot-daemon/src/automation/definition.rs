@@ -631,8 +631,9 @@ pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<SubmitCom
         .transpose()?
         .map(|text| json!({"text": text}))
         .or_else(|| action.answers().map(|answers| json!({"answers": answers})))
-        .or_else(|| approval_reply_args(action, &roots, verb))
-        .or_else(|| Some(json!({})))
+        .map(Ok)
+        .or_else(|| approval_reply_args(action, &roots, verb).transpose())
+        .transpose()?
         .unwrap_or_else(|| json!({}));
     let expected_turn_id = action
         .turn_binding()
@@ -661,17 +662,17 @@ fn approval_reply_args(
     action: &AgentActionDefinition,
     roots: &TemplateRoots<'_>,
     verb: &str,
-) -> Option<Value> {
+) -> Result<Option<Value>, Error> {
     let choice = action.approval_choice();
     let feedback = action.approval_feedback();
     if choice.is_none() && feedback.is_none() {
-        return None;
+        return Ok(None);
     }
     let mut args = serde_json::Map::new();
     if let Some(source) = choice {
         args.insert(
             "choice_id".to_owned(),
-            Value::String(render_exact_string(source, roots, verb, "choice").ok()?),
+            Value::String(render_exact_string(source, roots, verb, "choice")?),
         );
     }
     if let Some(source) = feedback {
@@ -684,12 +685,11 @@ fn approval_reply_args(
                     MAX_EVENT_BYTES,
                     verb,
                     "64 KiB persisted-text bound",
-                )
-                .ok()?,
+                )?,
             ),
         );
     }
-    Some(Value::Object(args))
+    Ok(Some(Value::Object(args)))
 }
 
 fn render_event_binding(
@@ -2688,6 +2688,24 @@ do = [{ action = 'git.fetch', repository = 'project-one', remote = 'origin', sou
             assert_eq!(
                 restored.semantic_digest().unwrap(),
                 rule.semantic_digest().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_dynamic_choice_or_feedback_rendering_errors_without_a_command() {
+        for fragment in [
+            "choice = '${data.missing_choice}'",
+            "choice = 'always', feedback = 'note ${data.missing_feedback}'",
+        ] {
+            let source = APPROVE_REQUEST_RULE.replace(
+                "request_id = '${event.data.request_id}' }]",
+                &format!("request_id = '${{event.data.request_id}}', {fragment} }}]"),
+            );
+            let rule = load(Cursor::new(source)).unwrap().remove(0);
+            assert_eq!(
+                evaluate(&rule, &request_opened_event()).unwrap_err().code,
+                "invalid"
             );
         }
     }

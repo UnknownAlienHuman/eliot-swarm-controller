@@ -2511,3 +2511,45 @@ fn print_value(value: &Value, json_output: bool) {
         println!("{value}");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser as _;
+
+    #[test]
+    fn approval_cli_parser_keeps_explicit_choice_and_feedback() {
+        for verb in ["approve", "deny"] {
+            let cli = Cli::try_parse_from([
+                "swarm",
+                verb,
+                "a7",
+                "--generation",
+                "3",
+                "--request",
+                "request-id",
+                "--choice",
+                "always",
+                "--feedback",
+                "trust it",
+            ])
+            .unwrap();
+            let Some(command) = cli.command else {
+                panic!("approve/deny command required");
+            };
+            let (choice, feedback) = match command {
+                CliCommand::Approve {
+                    choice, feedback, ..
+                } => (choice, feedback),
+                CliCommand::Deny {
+                    choice, feedback, ..
+                } => (choice, feedback),
+                _ => panic!("expected an approve or deny command"),
+            };
+            assert_eq!(
+                approval_reply_args(choice, feedback),
+                serde_json::json!({"choice_id": "always", "feedback": "trust it"})
+            );
+        }
+    }
+}
