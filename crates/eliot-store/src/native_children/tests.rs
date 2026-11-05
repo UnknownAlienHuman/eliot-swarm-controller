@@ -872,9 +872,7 @@ fn old_producer_cleanup_does_not_touch_new_generation_children_or_active_binding
     );
 }
 
-fn seed_restart_recovery_children(
-    path: &Path,
-) -> (String, String, String, String) {
+fn seed_restart_recovery_children(path: &Path) -> (String, String, String, String) {
     let mut store = Store::open(path).unwrap();
     let root = producer(&mut store, "root");
     let running = register(&mut store, &root, request(&root, "root", "running"));
@@ -944,12 +942,7 @@ fn seed_restart_recovery_children(
         )
         .unwrap();
 
-    (
-        root,
-        running.agent.id,
-        partial.agent.id,
-        completed.agent.id,
-    )
+    (root, running.agent.id, partial.agent.id, completed.agent.id)
 }
 
 fn recover_and_assert_child_turns(
@@ -1030,7 +1023,11 @@ fn release_restart_custody(store: &mut Store, root: &str) {
     let released = store
         .release_restart_closed_generation(root, 1, "windows_job_closed", false, NOW + 51)
         .unwrap();
-    assert!(released.iter().any(|event| event.kind == "capacity.released"));
+    assert!(
+        released
+            .iter()
+            .any(|event| event.kind == "capacity.released")
+    );
     assert!(store.restart_retained_generations(None).unwrap().is_empty());
 }
 

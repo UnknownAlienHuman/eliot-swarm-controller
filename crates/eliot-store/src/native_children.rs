@@ -253,7 +253,16 @@ impl Store {
             };
             let mut events = Vec::new();
             for (child_num, ack) in registrations {
-                mark_one_native_child_unavailable_tx(&tx, (producer, producer_generation), child_num, &ack, reason, reader_closed, now, &mut events)?;
+                mark_one_native_child_unavailable_tx(
+                    &tx,
+                    (producer, producer_generation),
+                    child_num,
+                    &ack,
+                    reason,
+                    reader_closed,
+                    now,
+                    &mut events,
+                )?;
             }
             commit_transaction(tx, &self.write_faulted)?;
             Ok(events)
@@ -262,49 +271,118 @@ impl Store {
         result
     }
 
-    pub(crate) fn recover_lost_native_children_tx(tx: &Transaction<'_>, now: i64, events: &mut Vec<Event>) -> Result<()> {
+    pub(crate) fn recover_lost_native_children_tx(
+        tx: &Transaction<'_>,
+        now: i64,
+        events: &mut Vec<Event>,
+    ) -> Result<()> {
         let keys = {
             let mut statement = tx.prepare("SELECT DISTINCT producer, producer_generation FROM native_child_registrations ORDER BY producer, producer_generation").map_err(sql_error)?;
-            let rows = statement.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))).map_err(sql_error)?;
-            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_error)?
+            let rows = statement
+                .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+                .map_err(sql_error)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(sql_error)?
         };
         for (producer_num, producer_generation) in keys {
             let producer = format_agent_id(producer_num);
             let registrations = {
                 let mut statement = tx.prepare("SELECT child, ack FROM native_child_registrations WHERE producer = ?1 AND producer_generation = ?2 ORDER BY child").map_err(sql_error)?;
-                let rows = statement.query_map(params![producer_num, producer_generation], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))).map_err(sql_error)?;
-                rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_error)?
+                let rows = statement
+                    .query_map(params![producer_num, producer_generation], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .map_err(sql_error)?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(sql_error)?
             };
             for (child_num, ack) in registrations {
-                mark_one_native_child_unavailable_tx(tx, (&producer, producer_generation), child_num, &ack, "daemon_restart", false, now, events)?;
+                mark_one_native_child_unavailable_tx(
+                    tx,
+                    (&producer, producer_generation),
+                    child_num,
+                    &ack,
+                    "daemon_restart",
+                    false,
+                    now,
+                    events,
+                )?;
             }
         }
         Ok(())
     }
 }
 
-fn mark_one_native_child_unavailable_tx(tx: &Transaction<'_>, producer: (&str, i64), child_num: i64, ack_json: &str, reason: &str, reader_closed: bool, now: i64, events: &mut Vec<Event>) -> Result<()> {
+fn mark_one_native_child_unavailable_tx(
+    tx: &Transaction<'_>,
+    producer: (&str, i64),
+    child_num: i64,
+    ack_json: &str,
+    reason: &str,
+    reader_closed: bool,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
     let (producer, producer_generation) = producer;
     let ack: ChildRegistrationAck = decode_child_registration_ack(ack_json)?;
-    let child = load_agent_by_num(tx, child_num)?.ok_or_else(|| Error::new("source_integrity", "registered native child disappeared"))?;
-    if parse_agent_id(&ack.agent.id)? != child_num || ack.agent.generation <= 0 || ack.agent.generation > child.generation || child.origin != core::AgentOrigin::Native || !child.observe_only || child.own_identity {
-        return Err(Error::new("source_integrity", "native child cleanup binding changed"));
+    let child = load_agent_by_num(tx, child_num)?
+        .ok_or_else(|| Error::new("source_integrity", "registered native child disappeared"))?;
+    if parse_agent_id(&ack.agent.id)? != child_num
+        || ack.agent.generation <= 0
+        || ack.agent.generation > child.generation
+        || child.origin != core::AgentOrigin::Native
+        || !child.observe_only
+        || child.own_identity
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "native child cleanup binding changed",
+        ));
     }
     let generation = ack.agent.generation;
-    record_child_unavailable_gap_tx(tx, (producer, producer_generation), (child_num, generation), reason, now, events)?;
+    record_child_unavailable_gap_tx(
+        tx,
+        (producer, producer_generation),
+        (child_num, generation),
+        reason,
+        now,
+        events,
+    )?;
     let running = {
         let mut statement = tx.prepare("SELECT turn_id FROM turns WHERE agent = ?1 AND generation = ?2 AND state = 'running' ORDER BY turn_id").map_err(sql_error)?;
-        let rows = statement.query_map(params![child_num, generation], |row| row.get::<_, String>(0)).map_err(sql_error)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_error)?
+        let rows = statement
+            .query_map(params![child_num, generation], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(sql_error)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql_error)?
     };
     for turn_id in running {
         let changed = db!(tx.execute("UPDATE turns SET state = 'unknown' WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3 AND state = 'running'", params![child_num, generation, turn_id]));
         if changed != 1 {
-            return Err(Error::new("source_integrity", "native child running turn changed during unavailable commit"));
+            return Err(Error::new(
+                "source_integrity",
+                "native child running turn changed during unavailable commit",
+            ));
         }
-        events.push(insert_daemon_event(tx, now, "turn.unknown", "turn", Some(child_num), Some(generation), json!({"turn_id":turn_id,"reason":reason}))?);
+        events.push(insert_daemon_event(
+            tx,
+            now,
+            "turn.unknown",
+            "turn",
+            Some(child_num),
+            Some(generation),
+            json!({"turn_id":turn_id,"reason":reason}),
+        )?);
     }
-    events.extend(source_handoff::native_unavailable_tx(tx, child_num, generation, reader_closed, now)?);
+    events.extend(source_handoff::native_unavailable_tx(
+        tx,
+        child_num,
+        generation,
+        reader_closed,
+        now,
+    )?);
     Ok(())
 }
 
