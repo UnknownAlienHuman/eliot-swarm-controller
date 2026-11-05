@@ -40,8 +40,7 @@ impl FakeCodex {
         let report_path = std::env::var("ELIOT_FAKE_CODEX_REPORT")
             .map(PathBuf::from)
             .expect("ELIOT_FAKE_CODEX_REPORT");
-        let codex_home = std::env::var("ELIOT_FAKE_CODEX_HOME")
-            .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
+        let codex_home = std::env::var("CODEX_HOME").expect("CODEX_HOME fixture selector");
         Self {
             script: script.to_owned(),
             report_path,
@@ -128,7 +127,11 @@ impl FakeCodex {
                     stdout,
                     id,
                     json!({
-                        "config": {"sqlite_home": self.codex_home},
+                        "config": {
+                            "sqlite_home": self.codex_home,
+                            "model_provider": "openai",
+                            "openai_base_url": "https://chatgpt.com/backend-api/codex",
+                        },
                         "origins": {
                             "sqlite_home": {
                                 "name": {"type": "sessionFlags"},
@@ -577,7 +580,7 @@ async fn scenario_native_child_observation() {
     fixture
         .env("ELIOT_FAKE_CODEX_SCRIPT", "scenario-children")
         .env("ELIOT_FAKE_CODEX_REPORT", &report_path)
-        .env("ELIOT_FAKE_CODEX_HOME", &codex_home);
+        .env("CODEX_HOME", &codex_home);
 
     let self_exe = std::env::current_exe().expect("current test exe");
     let config_toml = format!(
@@ -589,7 +592,7 @@ effort = "medium"
 pass_env = [
     "ELIOT_FAKE_CODEX_SCRIPT",
     "ELIOT_FAKE_CODEX_REPORT",
-    "ELIOT_FAKE_CODEX_HOME",
+    "CODEX_HOME",
 ]
 "#,
         self_exe.to_string_lossy()

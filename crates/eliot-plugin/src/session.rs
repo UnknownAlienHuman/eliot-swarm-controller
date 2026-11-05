@@ -906,12 +906,45 @@ impl StreamSource<'_> {
         let Some(gap) = retained.clone() else {
             return true;
         };
-        match self.send_gap(&gap).await {
-            Ok(ack) if Self::is_canonical_gap_ack(&gap, &ack) => {
+        let result = self.send_gap(&gap).await;
+        self.apply_retained_attempt(retained, &gap, &result)
+    }
+
+    /// Serialize one retained-gap attempt for an owned send. Same wire body
+    /// as `send_gap`; the caller owns the RPC future.
+    pub fn gap_request_params(credential: &str, gap: &SourceGap) -> Value {
+        json!({
+            "credential": credential,
+            "agent_id": gap.agent_id,
+            "generation": gap.generation,
+            "source": gap.source,
+            "gap_id": gap.gap_id,
+            "families": gap.families,
+            "reason": gap.reason,
+            "from": gap.from,
+            "to": gap.to,
+        })
+    }
+
+    /// Apply one owned attempt result to the retained slot and latches.
+    /// Only the matching retained gap is settled; a stale attempt (retained
+    /// changed or cleared while the RPC was in flight) mutates nothing.
+    /// Returns true when the retained gap just settled.
+    pub fn apply_retained_attempt(
+        &mut self,
+        retained: &mut Option<SourceGap>,
+        attempted: &SourceGap,
+        result: &Result<Value, Error>,
+    ) -> bool {
+        if retained.as_ref() != Some(attempted) {
+            return false;
+        }
+        match result {
+            Ok(ack) if Self::is_canonical_gap_ack(attempted, ack) => {
                 *retained = None;
                 *self.writes_blocked = false;
                 *self.source_unknown = true;
-                *self.failure = Some(format!("{}; terminal outcome is unknown", gap.reason));
+                *self.failure = Some(format!("{}; terminal outcome is unknown", attempted.reason));
                 true
             }
             _ => {
@@ -926,23 +959,14 @@ impl StreamSource<'_> {
         self.host
             .call(
                 "source.gap",
-                json!({
-                    "credential": self.credential,
-                    "agent_id": gap.agent_id,
-                    "generation": gap.generation,
-                    "source": gap.source,
-                    "gap_id": gap.gap_id,
-                    "families": gap.families,
-                    "reason": gap.reason,
-                    "from": gap.from,
-                    "to": gap.to,
-                }),
+                Self::gap_request_params(self.credential, gap),
                 Instant::now() + EVENT_DEADLINE,
             )
             .await
     }
 
-    fn is_canonical_gap_ack(gap: &SourceGap, ack: &Value) -> bool {
+    /// Whether `ack` canonically establishes `gap` (same gap_id, positive seq).
+    pub fn is_canonical_gap_ack(gap: &SourceGap, ack: &Value) -> bool {
         ack.get("gap_id").and_then(Value::as_str) == Some(gap.gap_id.as_str())
             && ack
                 .get("seq")
