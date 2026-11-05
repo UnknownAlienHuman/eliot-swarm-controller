@@ -181,9 +181,10 @@ impl ClaudeClient {
             .map_err(|error| self.diagnostic_error(error))
     }
 
-    /// True once the owned CLI waiter observed the OS exit.
-    pub(crate) fn process_exited(&self) -> bool {
-        self.writer.process_exited()
+    /// True once the owned CLI waiter finished and fenced input.
+    /// Conservative unavailability only; it does NOT prove an OS exit.
+    pub(crate) fn process_unavailable(&self) -> bool {
+        self.writer.process_unavailable()
     }
 
     pub fn stderr_snapshot(&self) -> StderrSnapshot {

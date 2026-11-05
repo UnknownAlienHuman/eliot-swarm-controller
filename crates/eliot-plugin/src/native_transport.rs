@@ -446,10 +446,12 @@ impl NativeWriter {
         }
     }
 
-    /// True once the owned child waiter observed the OS exit. Protocol
-    /// layers use it to distinguish a dead child (unknown) from a live
-    /// pre-dispatch refusal (rejected).
-    pub fn process_exited(&self) -> bool {
+    /// True once the owned child waiter finished (exit or wait error)
+    /// and fenced input. Conservative input unavailability only; it does
+    /// NOT prove an OS exit. Protocol layers use it to distinguish an
+    /// unavailable destination (unknown) from a live pre-dispatch
+    /// refusal (rejected).
+    pub fn process_unavailable(&self) -> bool {
         self.process_exited.load(Ordering::Acquire)
     }
 

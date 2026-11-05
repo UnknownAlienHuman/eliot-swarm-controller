@@ -1294,13 +1294,13 @@ impl EventProcessor {
             Ok(result) => result,
             Err(outcome) => return Ok(outcome),
         };
-        // The child may have exited after admission but before any write:
-        // a dead destination is unknown, never a live refusal, and no
-        // permission frame is attempted.
-        if native.process_exited() {
+        // The destination may be unavailable after admission but before
+        // any write: an unavailable destination is unknown, never a live
+        // refusal, and no permission frame is attempted.
+        if native.process_unavailable() {
             self.retain_unknown_reply(request_id, command_id).await;
             return Ok(unknown_control(
-                "Claude process exited before the request reply dispatched; it will not be repeated",
+                "Claude request reply destination is unavailable before dispatch; it will not be repeated",
             ));
         }
         let Some(entry) = self.pending_requests.get_mut(request_id) else {
@@ -1312,17 +1312,17 @@ impl EventProcessor {
             .await
         {
             // Proven not written (bound, encode, or deadline before
-            // dispatch): the ask stays available for a later reply. A
-            // child that died under the write leaves a stale ask: latch
-            // unknown instead of restoring availability.
+            // dispatch): the ask stays available for a later reply. An
+            // unavailable destination under the write leaves a stale ask:
+            // latch unknown instead of restoring availability.
             if matches!(
                 error.code.as_str(),
                 "native_not_dispatched" | "frame_too_large" | "native_encode"
             ) {
-                if native.process_exited() {
+                if native.process_unavailable() {
                     self.retain_unknown_reply(request_id, command_id).await;
                     return Ok(unknown_control(
-                        "Claude request reply destination was lost; it will not be repeated",
+                        "Claude request reply destination is unavailable; it will not be repeated",
                     ));
                 }
                 if let Some(entry) = self.pending_requests.get_mut(request_id) {
