@@ -269,6 +269,24 @@ fn main() {
             scenario_repeated_dropped_id_never_rewritten_nor_retried,
         )
         .await;
+        run_scenario(
+            "permission identity exhaustion fences and closes the native input",
+            OwnedChildren::default(),
+            scenario_permission_identity_exhaustion_fails_closed,
+        )
+        .await;
+        run_scenario(
+            "unknown owner reply never denies a conflicting callback again",
+            OwnedChildren::default(),
+            scenario_unknown_owner_reply_conflict_no_second_io,
+        )
+        .await;
+        run_scenario(
+            "turn result never clears a live callback fence",
+            OwnedChildren::default(),
+            scenario_callback_fence_survives_turn_result,
+        )
+        .await;
     });
     println!("claude_plugin: all scenarios passed");
 }
@@ -622,6 +640,9 @@ impl FakeClaude {
             "result": body.get("response").cloned().unwrap_or(Value::Null),
         }));
         self.write_report();
+        if self.handle_permission_fault_response(&body, stdout) {
+            return;
+        }
         if self.script == "overflow-repeat-asks"
             && body
                 .get("response")
@@ -762,6 +783,18 @@ impl FakeClaude {
     /// Parked permission scripts: the turn stays open on its asks. True when
     /// this script was handled and the caller must return without a terminal.
     fn handle_parked_permission_scripts(&mut self, stdout: &mut std::io::StdoutLock) -> bool {
+        if self.script == "owner-unknown-conflict" {
+            self.emit_permission_range(stdout, 16);
+            return true;
+        }
+        if self.script == "permission-fence-exhausted" {
+            self.emit_permission_range(stdout, 34);
+            return true;
+        }
+        if self.script == "deny-result-repeat" {
+            self.emit_permission_range(stdout, 17);
+            return true;
+        }
         if matches!(
             self.script.as_str(),
             "approve" | "approve-secret" | "deny" | "drop-reply"
@@ -851,19 +884,93 @@ impl FakeClaude {
     }
 
     /// One documented-shape `can_use_tool` ask on the active turn.
+    fn emit_permission_range(&self, stdout: &mut std::io::StdoutLock, end: usize) {
+        for index in 1..=end {
+            self.emit_permission_request_with(
+                stdout,
+                &format!("fake-perm-{index}"),
+                "Bash",
+                &format!("fake-tooluse-{index}"),
+                json!({"command":"ls /tmp"}),
+            );
+        }
+    }
+
+    fn handle_permission_fault_response(
+        &mut self,
+        body: &Value,
+        stdout: &mut std::io::StdoutLock,
+    ) -> bool {
+        let request_id = body
+            .get("request_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        match self.script.as_str() {
+            "permission-fence-exhausted" => true,
+            "owner-unknown-conflict" => {
+                if request_id == "fake-perm-1" && self.permission_replies.len() == 1 {
+                    self.emit_permission_request_with(
+                        stdout,
+                        "fake-perm-1",
+                        "Bash",
+                        "replacement-tool",
+                        json!({"command":"replacement"}),
+                    );
+                    self.emit_permission_request_with(
+                        stdout,
+                        "fake-perm-17",
+                        "Bash",
+                        "barrier-tool",
+                        json!({"command":"barrier"}),
+                    );
+                    stdout.flush().expect("permission fault frames");
+                } else if request_id == "fake-perm-17" {
+                    self.finish_permission_barrier();
+                }
+                true
+            }
+            "deny-result-repeat" => {
+                if request_id == "fake-perm-17" && self.permission_replies.len() == 1 {
+                    self.emit_turn_result(stdout, "completed");
+                    self.emit_permission_request_with(
+                        stdout,
+                        "fake-perm-17",
+                        "Bash",
+                        "replacement-tool",
+                        json!({"command":"replacement"}),
+                    );
+                    self.emit_permission_request_with(
+                        stdout,
+                        "fake-perm-18",
+                        "Bash",
+                        "barrier-tool",
+                        json!({"command":"barrier"}),
+                    );
+                    stdout.flush().expect("post-result fault frames");
+                } else if request_id == "fake-perm-18" {
+                    self.finish_permission_barrier();
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn finish_permission_barrier(&mut self) -> ! {
+        // The last ordinary deny proves every earlier callback on this pipe
+        // was processed while native input was live; no timing inference.
+        self.exit = Some("permission-barrier".to_owned());
+        self.write_report();
+        std::process::exit(0)
+    }
+
     fn emit_permission_request(&self, stdout: &mut std::io::StdoutLock) {
         let input = if self.script == "approve-secret" {
             json!({"command": "deploy token-abc-123"})
         } else {
             json!({"command": "ls /tmp"})
         };
-        self.emit_permission_request_with(
-            stdout,
-            "fake-perm-1",
-            "Bash",
-            "fake-tooluse-1",
-            input,
-        );
+        self.emit_permission_request_with(stdout, "fake-perm-1", "Bash", "fake-tooluse-1", input);
     }
 
     fn emit_permission_request_with(
@@ -4082,7 +4189,10 @@ async fn scenario_duplicate_permission_id_denied_and_original_fenced(owned: Owne
         .to_owned();
     scenario
         .host
-        .respond(&gap.id, json!({"gap_id": gap_id, "seq": scenario.host.next_seq}))
+        .respond(
+            &gap.id,
+            json!({"gap_id": gap_id, "seq": scenario.host.next_seq}),
+        )
         .await;
     scenario.host.next_seq += 1;
     for verb in ["approve", "deny"] {
@@ -4102,7 +4212,11 @@ async fn scenario_duplicate_permission_id_denied_and_original_fenced(owned: Owne
             "{verb} after a conflicting deny stays unknown"
         );
         assert!(
-            reply.get("reason").and_then(Value::as_str).unwrap_or_default().contains("unresolved"),
+            reply
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("unresolved"),
             "unknown keeps its reason: {reply:?}"
         );
         assert!(collected.is_empty(), "fenced reply commits nothing");
@@ -4125,7 +4239,10 @@ async fn scenario_duplicate_permission_id_denied_and_original_fenced(owned: Owne
     );
     assert_eq!(report.get("user_inputs").and_then(Value::as_u64), Some(1));
     assert_eq!(
-        report.get("controls").and_then(|c| c.get("initialize")).and_then(Value::as_u64),
+        report
+            .get("controls")
+            .and_then(|c| c.get("initialize"))
+            .and_then(Value::as_u64),
         Some(1)
     );
     scenario
@@ -4144,29 +4261,70 @@ async fn scenario_pending_overflow_denied_without_opening(owned: OwnedChildren) 
     let (_, turn_id, first) =
         send_until_permission_asked(&mut scenario.host, &agent_id, 1, "list files").await;
     let mut opened: Vec<String> = vec![
-        first.get("request_id").and_then(Value::as_str).unwrap_or_default().to_owned(),
+        first
+            .get("request_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
     ];
     let mut gap_reason: Option<String> = None;
     while opened.len() < 16 || gap_reason.is_none() {
         let request = scenario.host.next_request().await;
         match request.method.as_str() {
             "events.put" => {
-                let events = request.params.get("events").and_then(Value::as_array).cloned().unwrap_or_default();
+                let events = request
+                    .params
+                    .get("events")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
                 assert_eq!(events.len(), 1, "one native record per batch");
-                assert_eq!(events[0].get("kind").and_then(Value::as_str), Some("request.opened"));
+                assert_eq!(
+                    events[0].get("kind").and_then(Value::as_str),
+                    Some("request.opened")
+                );
                 let data = events[0].get("data").cloned().unwrap_or(Value::Null);
-                opened.push(data.get("request_id").and_then(Value::as_str).unwrap_or_default().to_owned());
+                opened.push(
+                    data.get("request_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                );
                 let first_seq = scenario.host.next_seq;
                 scenario.host.next_seq += 1;
-                scenario.host.respond(&request.id, json!({
-                    "first_seq": first_seq, "last_seq": first_seq,
-                    "cursor": request.params.get("cursor").cloned().unwrap_or(Value::Null),
-                })).await;
+                scenario
+                    .host
+                    .respond(
+                        &request.id,
+                        json!({
+                            "first_seq": first_seq, "last_seq": first_seq,
+                            "cursor": request.params.get("cursor").cloned().unwrap_or(Value::Null),
+                        }),
+                    )
+                    .await;
             }
             "source.gap" => {
-                gap_reason = Some(request.params.get("reason").and_then(Value::as_str).unwrap_or_default().to_owned());
-                let gap_id = request.params.get("gap_id").and_then(Value::as_str).unwrap_or_default().to_owned();
-                scenario.host.respond(&request.id, json!({"gap_id": gap_id, "seq": scenario.host.next_seq})).await;
+                gap_reason = Some(
+                    request
+                        .params
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                );
+                let gap_id = request
+                    .params
+                    .get("gap_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                scenario
+                    .host
+                    .respond(
+                        &request.id,
+                        json!({"gap_id": gap_id, "seq": scenario.host.next_seq}),
+                    )
+                    .await;
                 scenario.host.next_seq += 1;
             }
             other => panic!("unexpected host request: {other}"),
@@ -4174,23 +4332,45 @@ async fn scenario_pending_overflow_denied_without_opening(owned: OwnedChildren) 
     }
     let expected: Vec<String> = (1..=16).map(|i| format!("fake-perm-{i}")).collect();
     assert_eq!(opened, expected);
-    assert!(gap_reason.unwrap_or_default().contains("pending native request bound was exceeded"));
+    assert!(
+        gap_reason
+            .unwrap_or_default()
+            .contains("pending native request bound was exceeded")
+    );
     let (rejected, collected, _) = reply_for_permission(
-        &mut scenario.host, &agent_id, 1, "deny", json!({}), "fake-perm-17", &turn_id,
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "deny",
+        json!({}),
+        "fake-perm-17",
+        &turn_id,
     )
     .await;
-    assert_eq!(rejected.get("state").and_then(Value::as_str), Some("rejected"));
+    assert_eq!(
+        rejected.get("state").and_then(Value::as_str),
+        Some("rejected")
+    );
     assert_eq!(
         rejected.get("reason").and_then(Value::as_str),
         Some("Claude request is no longer pending")
     );
     assert!(collected.is_empty(), "overflow id was never opened");
     let (reply, collected, reply_id) = reply_for_permission(
-        &mut scenario.host, &agent_id, 1, "approve", json!({}), "fake-perm-1", &turn_id,
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "approve",
+        json!({}),
+        "fake-perm-1",
+        &turn_id,
     )
     .await;
     assert_eq!(reply.get("state").and_then(Value::as_str), Some("applied"));
-    assert_eq!(collected.first().map(|(kind, _)| kind.as_str()), Some("request.resolved"));
+    assert_eq!(
+        collected.first().map(|(kind, _)| kind.as_str()),
+        Some("request.resolved")
+    );
     assert_eq!(
         collected[0].1.get("command_id").and_then(Value::as_str),
         Some(reply_id.as_str())
@@ -4198,7 +4378,11 @@ async fn scenario_pending_overflow_denied_without_opening(owned: OwnedChildren) 
     stop_agent(&mut scenario.host, &agent_id, 1).await;
     scenario.assert_cli_exit("stdin-eof");
     let report = scenario.report();
-    let replies = report.get("permission_replies").and_then(Value::as_array).cloned().unwrap_or_default();
+    let replies = report
+        .get("permission_replies")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     assert_eq!(
         replies.as_slice(),
         &[
@@ -4215,7 +4399,237 @@ async fn scenario_pending_overflow_denied_without_opening(owned: OwnedChildren) 
         ]
     );
     assert_eq!(report.get("user_inputs").and_then(Value::as_u64), Some(1));
-    scenario.host.call("shutdown", json!({})).await.expect("shutdown");
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+}
+
+async fn permission_fault_turn(scenario: &mut Scenario, expect_gap: bool) -> (String, String) {
+    let command_id = ulid::Ulid::new().to_string();
+    let rx = scenario
+        .host
+        .begin_call(
+            "agent.command",
+            json!({
+                "agent_id":scenario.agent_id, "generation":1, "command_id":command_id,
+                "verb":"send", "args":{"text":"list files"}, "turn_id":null, "request_id":null,
+            }),
+        )
+        .await;
+    let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
+    let mut applied: Option<Value> = None;
+    let mut opened = Vec::new();
+    let mut gapped = false;
+    while applied.is_none() || opened.len() < 16 || (expect_gap && !gapped) {
+        tokio::select! {
+            biased;
+            request = scenario.host.next_request() => {
+                match request.method.as_str() {
+                    "events.put" => {
+                        let event = &request.params["events"][0];
+                        let kind = event["kind"].as_str().unwrap_or_default();
+                        assert!(matches!(kind, "turn.started" | "request.opened"),
+                            "no fabricated terminal or stopped fact: {kind}");
+                        if kind == "request.opened" {
+                            opened.push(event["data"]["request_id"].as_str().unwrap().to_owned());
+                        }
+                        let seq = scenario.host.next_seq;
+                        scenario.host.next_seq += 1;
+                        scenario.host.respond(&request.id, json!({"first_seq":seq,"last_seq":seq,
+                            "cursor":request.params.get("cursor").cloned().unwrap_or(Value::Null)})).await;
+                    }
+                    "source.gap" => {
+                        gapped = true;
+                        scenario.host.respond(&request.id, json!({"gap_id":request.params["gap_id"],
+                            "seq":scenario.host.next_seq})).await;
+                        scenario.host.next_seq += 1;
+                    }
+                    other => panic!("unexpected permission fault request: {other}"),
+                }
+            }
+            result = &mut rx, if applied.is_none() => {
+                applied = Some(result.expect("send deadline").expect("send channel").expect("send admission"));
+            }
+        }
+    }
+    assert_eq!(
+        opened,
+        (1..=16)
+            .map(|i| format!("fake-perm-{i}"))
+            .collect::<Vec<_>>()
+    );
+    let applied = applied.unwrap();
+    assert_eq!(applied["state"], "applied");
+    (command_id, applied["turn_id"].as_str().unwrap().to_owned())
+}
+
+async fn scenario_permission_identity_exhaustion_fails_closed(owned: OwnedChildren) {
+    let mut scenario =
+        Scenario::start("permission-fence-exhausted", claude_profile(), &owned).await;
+    let agent = scenario.agent_id.clone();
+    let (command, turn) = permission_fault_turn(&mut scenario, true).await;
+    assert!(
+        owned.cli_exited().await,
+        "exhaustion must close owned native input before an explicit stop"
+    );
+    scenario.assert_cli_exit("stdin-eof");
+    let snapshot = scenario
+        .host
+        .call(
+            "agent.snapshot",
+            json!({
+                "agent_id":agent,"generation":1,"command_id":command,"turn_id":turn,
+            }),
+        )
+        .await
+        .expect("unknown native session snapshot");
+    assert_eq!(snapshot["state"], "unknown");
+    assert_eq!(snapshot["source_unknown"], true);
+    assert_eq!(snapshot["last_turn"], Value::Null);
+    let (reply, events, _) = reply_for_permission(
+        &mut scenario.host,
+        &agent,
+        1,
+        "approve",
+        json!({}),
+        "fake-perm-1",
+        &turn,
+    )
+    .await;
+    assert_eq!(reply["state"], "unknown");
+    assert!(
+        events.is_empty(),
+        "a fenced session never admits a later owner decision"
+    );
+    let report = scenario.report();
+    let replies = report["permission_replies"].as_array().unwrap();
+    assert_eq!(replies.len(), 16);
+    assert_eq!(
+        replies
+            .iter()
+            .map(|reply| reply["request_id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>(),
+        (17..=32)
+            .map(|i| format!("fake-perm-{i}"))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        replies
+            .iter()
+            .all(|reply| reply["result"]["behavior"] == "deny")
+    );
+    assert_eq!(report["user_inputs"], 1);
+    stop_agent(&mut scenario.host, &agent, 1).await;
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+}
+
+async fn owner_reply_with_unknown_commit(scenario: &mut Scenario, turn: &str) -> Value {
+    let rx = scenario.host.begin_call("agent.command", json!({
+        "agent_id":scenario.agent_id,"generation":1,"command_id":ulid::Ulid::new().to_string(),
+        "verb":"approve","args":{},"request_id":"fake-perm-1","turn_id":turn,
+    })).await;
+    let mut rx = std::pin::pin!(tokio::time::timeout(OP_TIMEOUT, rx));
+    let mut attempted = 0;
+    let result = loop {
+        tokio::select! {
+            biased;
+            request = scenario.host.next_request() => {
+                assert_eq!(request.method, "events.put");
+                assert_eq!(request.params["events"][0]["kind"], "request.resolved");
+                attempted += 1;
+                // Existing host-ACK fault: malformed acknowledgement leaves
+                // the normal owner's delivered decision unknown, CLI still live.
+                scenario.host.respond(&request.id, json!({"first_seq":0,"last_seq":0,
+                    "cursor":request.params.get("cursor").cloned().unwrap_or(Value::Null)})).await;
+            }
+            result = &mut rx => break result,
+        }
+    };
+    assert_eq!(attempted, 1);
+    result
+        .expect("reply deadline")
+        .expect("reply channel")
+        .expect("unknown reply value")
+}
+
+async fn scenario_unknown_owner_reply_conflict_no_second_io(owned: OwnedChildren) {
+    let mut scenario = Scenario::start("owner-unknown-conflict", claude_profile(), &owned).await;
+    let agent = scenario.agent_id.clone();
+    let (command, turn) = permission_fault_turn(&mut scenario, false).await;
+    let reply = owner_reply_with_unknown_commit(&mut scenario, &turn).await;
+    assert_eq!(reply["state"], "unknown");
+    // Overflow callback 17 follows the conflicting callback on the same pipe.
+    // Its deny/exit is a deterministic processing barrier, not a timed absence.
+    assert!(
+        owned.cli_exited().await,
+        "callback processing barrier must finish"
+    );
+    scenario.assert_cli_exit("permission-barrier");
+    let report = scenario.report();
+    let replies = report["permission_replies"].as_array().unwrap();
+    assert_eq!(replies.len(), 2);
+    assert_eq!(replies[0]["request_id"], "fake-perm-1");
+    assert_eq!(replies[0]["result"]["behavior"], "allow");
+    assert_eq!(replies[1]["request_id"], "fake-perm-17");
+    assert_eq!(replies[1]["result"]["behavior"], "deny");
+    let snapshot = scenario
+        .host
+        .call(
+            "agent.snapshot",
+            json!({
+                "agent_id":agent,"generation":1,"command_id":command,"turn_id":turn,
+            }),
+        )
+        .await
+        .expect("uncertain snapshot");
+    assert_eq!(snapshot["state"], "unknown");
+    assert_eq!(snapshot["last_turn"], Value::Null);
+    assert_eq!(
+        scenario.host.call("shutdown", json!({})).await,
+        Err("unknown".to_owned()),
+        "an uncertain batch must not fabricate session.ended"
+    );
+    scenario.host.shutdown_child().await;
+}
+
+async fn scenario_callback_fence_survives_turn_result(owned: OwnedChildren) {
+    let mut scenario = Scenario::start("deny-result-repeat", claude_profile(), &owned).await;
+    let agent = scenario.agent_id.clone();
+    let (_, sequence, gaps) =
+        send_until_gapped_turn_ends(&mut scenario.host, &agent, 1, "list files").await;
+    assert_eq!(gaps.len(), 1);
+    assert!(sequence.iter().any(|kind| kind == "turn.completed"));
+    assert!(!sequence.iter().any(|kind| kind == "session.ended"));
+    assert!(
+        owned.cli_exited().await,
+        "post-result callback processing barrier must finish"
+    );
+    scenario.assert_cli_exit("permission-barrier");
+    let report = scenario.report();
+    let replies = report["permission_replies"].as_array().unwrap();
+    assert_eq!(replies.len(), 2);
+    assert_eq!(replies[0]["request_id"], "fake-perm-17");
+    assert_eq!(replies[1]["request_id"], "fake-perm-18");
+    assert!(
+        replies
+            .iter()
+            .all(|reply| reply["result"]["behavior"] == "deny")
+    );
+    assert_eq!(report["user_inputs"], 1);
+    stop_agent(&mut scenario.host, &agent, 1).await;
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
     scenario.host.shutdown_child().await;
 }
 
@@ -4228,29 +4642,70 @@ async fn scenario_repeated_dropped_id_never_rewritten_nor_retried(owned: OwnedCh
     let (_, turn_id, first) =
         send_until_permission_asked(&mut scenario.host, &agent_id, 1, "list files").await;
     let mut opened: Vec<String> = vec![
-        first.get("request_id").and_then(Value::as_str).unwrap_or_default().to_owned(),
+        first
+            .get("request_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
     ];
     let mut gap_reason: Option<String> = None;
     while opened.len() < 16 || gap_reason.is_none() {
         let request = scenario.host.next_request().await;
         match request.method.as_str() {
             "events.put" => {
-                let events = request.params.get("events").and_then(Value::as_array).cloned().unwrap_or_default();
+                let events = request
+                    .params
+                    .get("events")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
                 assert_eq!(events.len(), 1, "one native record per batch");
-                assert_eq!(events[0].get("kind").and_then(Value::as_str), Some("request.opened"));
+                assert_eq!(
+                    events[0].get("kind").and_then(Value::as_str),
+                    Some("request.opened")
+                );
                 let data = events[0].get("data").cloned().unwrap_or(Value::Null);
-                opened.push(data.get("request_id").and_then(Value::as_str).unwrap_or_default().to_owned());
+                opened.push(
+                    data.get("request_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                );
                 let first_seq = scenario.host.next_seq;
                 scenario.host.next_seq += 1;
-                scenario.host.respond(&request.id, json!({
-                    "first_seq": first_seq, "last_seq": first_seq,
-                    "cursor": request.params.get("cursor").cloned().unwrap_or(Value::Null),
-                })).await;
+                scenario
+                    .host
+                    .respond(
+                        &request.id,
+                        json!({
+                            "first_seq": first_seq, "last_seq": first_seq,
+                            "cursor": request.params.get("cursor").cloned().unwrap_or(Value::Null),
+                        }),
+                    )
+                    .await;
             }
             "source.gap" => {
-                gap_reason = Some(request.params.get("reason").and_then(Value::as_str).unwrap_or_default().to_owned());
-                let gap_id = request.params.get("gap_id").and_then(Value::as_str).unwrap_or_default().to_owned();
-                scenario.host.respond(&request.id, json!({"gap_id": gap_id, "seq": scenario.host.next_seq})).await;
+                gap_reason = Some(
+                    request
+                        .params
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                );
+                let gap_id = request
+                    .params
+                    .get("gap_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                scenario
+                    .host
+                    .respond(
+                        &request.id,
+                        json!({"gap_id": gap_id, "seq": scenario.host.next_seq}),
+                    )
+                    .await;
                 scenario.host.next_seq += 1;
             }
             other => panic!("unexpected host request: {other}"),
@@ -4258,25 +4713,57 @@ async fn scenario_repeated_dropped_id_never_rewritten_nor_retried(owned: OwnedCh
     }
     let expected: Vec<String> = (1..=16).map(|i| format!("fake-perm-{i}")).collect();
     assert_eq!(opened, expected);
-    assert!(gap_reason.unwrap_or_default().contains("pending native request bound was exceeded"));
+    assert!(
+        gap_reason
+            .unwrap_or_default()
+            .contains("pending native request bound was exceeded")
+    );
     let (rejected, collected, _) = reply_for_permission(
-        &mut scenario.host, &agent_id, 1, "deny", json!({}), "fake-perm-17", &turn_id,
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "deny",
+        json!({}),
+        "fake-perm-17",
+        &turn_id,
     )
     .await;
-    assert_eq!(rejected.get("state").and_then(Value::as_str), Some("rejected"));
+    assert_eq!(
+        rejected.get("state").and_then(Value::as_str),
+        Some("rejected")
+    );
     assert!(collected.is_empty(), "dropped id was never opened");
     let (reply, collected, _) = reply_for_permission(
-        &mut scenario.host, &agent_id, 1, "approve", json!({}), "fake-perm-1", &turn_id,
+        &mut scenario.host,
+        &agent_id,
+        1,
+        "approve",
+        json!({}),
+        "fake-perm-1",
+        &turn_id,
     )
     .await;
     assert_eq!(reply.get("state").and_then(Value::as_str), Some("applied"));
-    assert_eq!(collected.first().map(|(kind, _)| kind.as_str()), Some("request.resolved"));
+    assert_eq!(
+        collected.first().map(|(kind, _)| kind.as_str()),
+        Some("request.resolved")
+    );
     stop_agent(&mut scenario.host, &agent_id, 1).await;
     scenario.assert_cli_exit("stdin-eof");
     let report = scenario.report();
-    let replies = report.get("permission_replies").and_then(Value::as_array).cloned().unwrap_or_default();
-    let denies_17 = replies.iter().filter(|r| r.get("request_id").and_then(Value::as_str) == Some("fake-perm-17")).count();
-    assert_eq!(denies_17, 1, "exactly one deny for the dropped id: {replies:?}");
+    let replies = report
+        .get("permission_replies")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let denies_17 = replies
+        .iter()
+        .filter(|r| r.get("request_id").and_then(Value::as_str) == Some("fake-perm-17"))
+        .count();
+    assert_eq!(
+        denies_17, 1,
+        "exactly one deny for the dropped id: {replies:?}"
+    );
     assert_eq!(
         replies.as_slice(),
         &[
@@ -4293,6 +4780,10 @@ async fn scenario_repeated_dropped_id_never_rewritten_nor_retried(owned: OwnedCh
         ]
     );
     assert_eq!(report.get("user_inputs").and_then(Value::as_u64), Some(1));
-    scenario.host.call("shutdown", json!({})).await.expect("shutdown");
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
     scenario.host.shutdown_child().await;
 }

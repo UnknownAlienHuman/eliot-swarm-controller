@@ -174,6 +174,13 @@ impl ClaudeClient {
         self.write_encoded(encoded, deadline).await
     }
 
+    pub async fn shutdown_input(&self, deadline: Instant) -> Result<()> {
+        self.writer
+            .shutdown_input(deadline)
+            .await
+            .map_err(|error| self.diagnostic_error(error))
+    }
+
     pub fn stderr_snapshot(&self) -> StderrSnapshot {
         self.stderr.snapshot()
     }
