@@ -611,7 +611,9 @@ pass_env = [
 "#,
         self_exe.to_string_lossy()
     );
-    std::fs::create_dir_all(&fixture.data).expect("create data dir");
+    // Bootstrap private owner ACL before config.
+    fixture.start();
+    fixture.stop(false);
     std::fs::write(fixture.data.join("config.toml"), config_toml).expect("write config.toml");
 
     fixture.start();
