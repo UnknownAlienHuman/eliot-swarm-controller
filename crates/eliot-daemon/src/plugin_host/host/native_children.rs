@@ -191,7 +191,7 @@ pub(super) async fn is_codex_producer(store: &StoreHandle, producer: &str) -> Re
     let agent = store
         .get_agent(producer)?
         .ok_or_else(|| Error::new("not_found", "native child producer was not found"))?;
-    Ok(agent.harness == "codex")
+    Ok(eliot_core::native_child_families_for_harness(&agent.harness).is_some())
 }
 
 pub(super) async fn mark_children_unavailable(

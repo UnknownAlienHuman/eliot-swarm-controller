@@ -69,7 +69,7 @@ for its pointer set and opens only what still binds to the live turn; anything
 naming the dead generation's turn is receipted and dropped as an orphan, never
 answered, and a failed pull never fails the resume.
 
-## Host permissions, route and final checks
+## Host permissions
 
 Sandbox posture is fixed at owned host birth (`muse serve` flags); MSP session/turn
 wire carries no sandbox field and posture is not negotiable per session. Profile
@@ -80,6 +80,51 @@ so effective permissions are reported as unknown (`permissions: null`,
 `permissions_verified: false`) and never derived from the requested flag or any
 unproven wire alias. The host flag remains applied at birth; a real native tool probe
 is still required to confirm effective posture.
+
+## Workflow children (native, observe-only)
+
+One connected observer over the actual `workflow` item wire (wave3b recorded
+wire, 2026-11-05, Muse Code 1.4.0, bundle fingerprint
+`sha256:36466f63…0d3d7f`, plus the installed `WorkflowChild` schema in the
+probe receipt). One native `host.agent` child is one Eliot Agent per canonical
+key `K(parentSessionId, workflowRunId, childId, attempt)` — the
+plugin-owned `WorkflowChildKey` builds the collision-free canonical opaque
+`native_ref`, registration id, and turn key (stable across revisions; the
+shared core carries only the harness-generic registration RPC). The wire
+carries no session or turn id on the child itself, so the ONE normalized
+Eliot turn key is synthesized and is explicitly NOT an MSP turn id.
+
+Turn-only coverage (`turn` family): `scheduled` registers the observe-only
+tokenless child (Agent `Unknown`, no principal, no control verbs) through the
+shared `ChildRegistration` RPC; the first live actual-wire state (`started`,
+`usage`, `completed` without terminal) commits exactly one `turn.started`;
+`completed` WITHOUT an explicit `terminal` never completes; an explicit
+terminal commits exactly one `turn.completed` with the existing Muse status
+mapping (`completed`/`failed`/`cancelled` to
+`completed`/`failed`/`interrupted`, unknown terminals gap instead); a repeated
+terminal revision dedups. Never `session.ready`/`session.ended` or
+`message.completed`: there is no child session to fake (`childSessionId` is
+null on the wire), and `resultRef`/`message` history composites are
+unsupported — no fact is ever synthesized from them, and public history
+composites stay with the shared-boundary owner for dispatch.
+
+Workflow revisions route ahead of active-parent-turn buffering: the actual
+wire schedules the child AFTER the parent `turn/completed`, and parent
+completion keeps child tracking. Each key preserves its
+ParentSession/run/child/attempt binding plus the latest actual wire
+revision/status/sourceRange.
+Terminal stream loss unknowns open children (with a child gap when a turn
+started) and keeps already-completed ones; transient view gaps self-heal
+because every revision re-emits the full child list, so tracking continues.
+Detailed tracking is bounded (256 keys plus 256 unknown markers), but the
+bound never hides a proven child: an over-limit newcomer is still persisted
+through one idempotent registration plus an observation-unavailable child
+gap (visible Agent row, Unknown state, no turn facts, no replay), then marked
+unknown — never evicting a proven tracked child. Final text, usage
+provenance/transitive attribution, and timing stay unknown: no totals, and no
+timestamp is invented from `durationMs`. No new wire fields are introduced.
+
+## Route and final checks
 
 Do not assume a generic base-URL override. Use explicit native account/billing profiles
 and report what the host actually exposes. L7 covers lost replies, exact request/turn

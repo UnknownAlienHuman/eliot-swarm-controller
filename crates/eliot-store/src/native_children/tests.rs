@@ -104,7 +104,9 @@ fn registration_commits_tokenless_child_and_only_its_observation_source() {
     let change = store
         .register_native_child(&parent, 1, request.clone(), NOW + 1)
         .unwrap();
-    request.validate_ack(&change.value).unwrap();
+    request
+        .validate_ack(&change.value, "codex", &CODEX_NATIVE_CHILD_FAMILIES)
+        .unwrap();
     assert_eq!(change.events.len(), 1);
     assert_eq!(change.events[0].kind, "agent.created");
     let child = &change.value.agent;
@@ -651,12 +653,20 @@ fn child_wire_rejects_undeclared_authority_and_ack_identity_changes() {
     let ack = register(&mut store, &parent, registration.clone());
     let mut forged = ack.clone();
     forged.agent.own_identity = true;
-    assert!(registration.validate_ack(&forged).is_err());
+    assert!(
+        registration
+            .validate_ack(&forged, "codex", &CODEX_NATIVE_CHILD_FAMILIES)
+            .is_err()
+    );
     forged = ack.clone();
     forged
         .source_plan
         .insert("process".to_owned(), "os".to_owned());
-    assert!(registration.validate_ack(&forged).is_err());
+    assert!(
+        registration
+            .validate_ack(&forged, "codex", &CODEX_NATIVE_CHILD_FAMILIES)
+            .is_err()
+    );
     let token = store.get_agent_token(&parent, 1).unwrap().unwrap();
     let mut secret = request(&parent, "parent", "secret-child");
     secret.registration_id = token;
@@ -1286,4 +1296,428 @@ fn parent_turn_completion_does_not_retire_child_observation() {
     assert_eq!(source["health"], "ok");
     assert_eq!(source["state"], "open");
     assert_eq!(source["gap_id"], Value::Null);
+}
+
+const MUSE_SCOPE: &str = "muse:test-native-store";
+
+fn muse_producer(store: &mut Store, native_ref: &str) -> String {
+    let command_id = Ulid::from_parts(NOW as u64, (count(store, "agents") + 1) as u128);
+    let mut launch = SubmitCommand::new(command_id.to_string(), "launch");
+    launch.expected_generation = Some(0);
+    launch.args = json!({
+        "harness": "muse",
+        "profile": "muse-test",
+        "profile_snapshot": {},
+        "project": "native-child-muse-test",
+        "workspace": "synthetic-workspace"
+    });
+    let command = launch.id.clone();
+    let id = store
+        .submit("owner", launch, NOW)
+        .unwrap()
+        .command
+        .target
+        .unwrap();
+    store.dispatch(&command, NOW).unwrap();
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: format!("{native_ref}:ready"),
+                agent_id: id.clone(),
+                generation: 1,
+                source: INITIAL_SOURCE.to_owned(),
+                cursor: None,
+                events: vec![NativeEvent {
+                    kind: "session.ready".to_owned(),
+                    native_id: format!("{native_ref}:ready"),
+                    ts: None,
+                    data: json!({"command_id": command, "native_scope": MUSE_SCOPE, "native_ref": native_ref}),
+                }],
+            },
+            NOW,
+        )
+        .unwrap();
+    store
+        .settle(&command, CommandState::Applied, None, NOW)
+        .unwrap();
+    id
+}
+
+fn muse_child_native_ref(session: &str, run_id: &str, child_id: &str, attempt: u32) -> String {
+    format!("muse:child:{}", json!([session, run_id, child_id, attempt]))
+}
+
+fn muse_child_registration_id(session: &str, run_id: &str, child_id: &str, attempt: u32) -> String {
+    format!("muse:spawn:{}", json!([session, run_id, child_id, attempt]))
+}
+
+fn muse_child_turn_id(session: &str, run_id: &str, child_id: &str, attempt: u32) -> String {
+    format!("muse:turn:{}", json!([session, run_id, child_id, attempt]))
+}
+
+fn muse_child_request(
+    parent: &str,
+    parent_ref: &str,
+    run_id: &str,
+    child_id: &str,
+    attempt: u32,
+) -> ChildRegistration {
+    ChildRegistration {
+        registration_id: muse_child_registration_id(parent_ref, run_id, child_id, attempt),
+        parent_id: parent.to_owned(),
+        parent_generation: 1,
+        parent_native_ref: parent_ref.to_owned(),
+        native_scope: MUSE_SCOPE.to_owned(),
+        native_ref: muse_child_native_ref(parent_ref, run_id, child_id, attempt),
+    }
+}
+
+#[test]
+fn muse_child_registration_derives_muse_harness_and_turn_only_coverage() {
+    let mut store = store();
+    let parent = muse_producer(&mut store, "muse-session-1");
+    let request = muse_child_request(&parent, "muse-session-1", "wf-run-1", "child-step-1", 1);
+    let expected_native_ref =
+        muse_child_native_ref("muse-session-1", "wf-run-1", "child-step-1", 1);
+    let change = store
+        .register_native_child(&parent, 1, request.clone(), NOW + 1)
+        .unwrap();
+    request
+        .validate_ack(&change.value, "muse", &MUSE_NATIVE_CHILD_FAMILIES)
+        .unwrap();
+
+    let child = &change.value.agent;
+    assert_eq!(child.harness, "muse");
+    assert_eq!(child.generation, 1);
+    assert_eq!(child.depth, 1);
+    assert_eq!(child.origin, core::AgentOrigin::Native);
+    assert!(child.observe_only);
+    assert!(!child.own_identity);
+    assert_eq!(child.state, AgentState::Unknown);
+    assert_eq!(child.parent.as_deref(), Some(parent.as_str()));
+    assert_eq!(child.root, parent);
+    assert_eq!(child.native_scope.as_deref(), Some(MUSE_SCOPE));
+    assert_eq!(
+        child.native_ref.as_deref(),
+        Some(expected_native_ref.as_str())
+    );
+    assert_eq!(store.get_agent_token(&child.id, 1).unwrap(), None);
+
+    let sources = store.list_source_states(&child.id, 1).unwrap();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0]["families"], json!(["turn"]));
+    assert_eq!(sources[0]["source"], "stream");
+    assert_eq!(sources[0]["state"], "open");
+
+    assert_eq!(
+        change.value.source_plan,
+        BTreeMap::from([("turn".to_owned(), "stream".to_owned())])
+    );
+
+    assert_eq!(
+        request
+            .validate_ack(&change.value, "codex", &CODEX_NATIVE_CHILD_FAMILIES)
+            .unwrap_err()
+            .code,
+        "source_integrity"
+    );
+
+    assert_eq!(
+        request
+            .validate_ack(&change.value, "muse", &["turn", "session"])
+            .unwrap_err()
+            .code,
+        "source_integrity"
+    );
+    assert_eq!(
+        request
+            .validate_ack(&change.value, "muse", &["turn", "message"])
+            .unwrap_err()
+            .code,
+        "source_integrity"
+    );
+}
+
+#[test]
+fn muse_child_grant_accepts_turn_and_denies_session_or_message() {
+    let mut store = store();
+    let parent = muse_producer(&mut store, "muse-session-1");
+    let request = muse_child_request(&parent, "muse-session-1", "wf-run-1", "child-step-1", 1);
+    let child_ack = store
+        .register_native_child(&parent, 1, request.clone(), NOW + 1)
+        .unwrap()
+        .value;
+    let child_id = child_ack.agent.id;
+
+    let turn_id = muse_child_turn_id("muse-session-1", "wf-run-1", "child-step-1", 1);
+    let turn_batch = batch(
+        &child_id,
+        "muse-turn-1",
+        vec![
+            event("turn.started", "turn-start", json!({"turn_id": &turn_id})),
+            event(
+                "turn.completed",
+                "turn-end",
+                json!({"turn_id": &turn_id, "status": "completed"}),
+            ),
+        ],
+    );
+    let commit = store
+        .put_native_child_batch(&parent, 1, turn_batch, NOW + 2)
+        .unwrap();
+    assert_eq!(commit.events.len(), 2);
+    let turns = store.list_turns(&child_id, 1, 100).unwrap();
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].turn_id, turn_id);
+    assert_eq!(turns[0].state, TurnState::Completed);
+
+    // DENY session.ready (no session.ready/ended for MUSE attempts)
+    let session_ready_batch = batch(
+        &child_id,
+        "session-ready-attempt",
+        vec![event(
+            "session.ready",
+            "child-ready",
+            json!({"native_scope": MUSE_SCOPE, "native_ref": request.native_ref}),
+        )],
+    );
+    assert_eq!(
+        store
+            .put_native_child_batch(&parent, 1, session_ready_batch, NOW + 3)
+            .unwrap_err()
+            .code,
+        "source_integrity"
+    );
+
+    // DENY session.ended
+    let session_ended_batch = batch(
+        &child_id,
+        "session-ended-attempt",
+        vec![event(
+            "session.ended",
+            "child-ended",
+            json!({"reason": "completed"}),
+        )],
+    );
+    assert_eq!(
+        store
+            .put_native_child_batch(&parent, 1, session_ended_batch, NOW + 3)
+            .unwrap_err()
+            .code,
+        "source_integrity"
+    );
+
+    // DENY message.completed (turn-only grant)
+    let message_batch = batch(
+        &child_id,
+        "message-attempt",
+        vec![event(
+            "message.completed",
+            "msg-1",
+            json!({"turn_id": &turn_id, "text": "hello"}),
+        )],
+    );
+    assert_eq!(
+        store
+            .put_native_child_batch(&parent, 1, message_batch, NOW + 3)
+            .unwrap_err()
+            .code,
+        "source_integrity"
+    );
+
+    // DENY family outside any native child (not_allowed)
+    let tool_batch = batch(
+        &child_id,
+        "tool-attempt",
+        vec![event(
+            "tool.started",
+            "tool-1",
+            json!({"turn_id": &turn_id, "tool": "exec"}),
+        )],
+    );
+    assert_eq!(
+        store
+            .put_native_child_batch(&parent, 1, tool_batch, NOW + 3)
+            .unwrap_err()
+            .code,
+        "not_allowed"
+    );
+}
+
+#[test]
+fn muse_child_source_gap_accepts_turn_and_denies_wrong_families() {
+    let mut store = store();
+    let parent = muse_producer(&mut store, "muse-session-1");
+    let request = muse_child_request(&parent, "muse-session-1", "wf-run-1", "child-step-1", 1);
+    let child_ack = store
+        .register_native_child(&parent, 1, request, NOW + 1)
+        .unwrap()
+        .value;
+    let child_id = child_ack.agent.id;
+
+    // Gap with turn family succeeds:
+    let turn_gap = SourceGap {
+        gap_id: "muse-turn-gap".to_owned(),
+        agent_id: child_id.clone(),
+        generation: 1,
+        source: INITIAL_SOURCE.to_owned(),
+        families: vec!["turn".to_owned()],
+        reason: "stream drop".to_owned(),
+        from: None,
+        to: None,
+    };
+    store
+        .record_native_child_source_gap(&parent, 1, turn_gap, NOW + 2)
+        .unwrap();
+
+    // Gap claiming session family denied:
+    let session_gap = SourceGap {
+        gap_id: "muse-session-gap".to_owned(),
+        agent_id: child_id.clone(),
+        generation: 1,
+        source: INITIAL_SOURCE.to_owned(),
+        families: vec!["session".to_owned()],
+        reason: "wrong family".to_owned(),
+        from: None,
+        to: None,
+    };
+    assert_eq!(
+        store
+            .record_native_child_source_gap(&parent, 1, session_gap, NOW + 3)
+            .unwrap_err()
+            .code,
+        "source_integrity"
+    );
+
+    // Gap claiming process family denied by require_families:
+    let process_gap = SourceGap {
+        gap_id: "muse-process-gap".to_owned(),
+        agent_id: child_id,
+        generation: 1,
+        source: INITIAL_SOURCE.to_owned(),
+        families: vec!["process".to_owned()],
+        reason: "wrong family".to_owned(),
+        from: None,
+        to: None,
+    };
+    assert_eq!(
+        store
+            .record_native_child_source_gap(&parent, 1, process_gap, NOW + 3)
+            .unwrap_err()
+            .code,
+        "not_allowed"
+    );
+}
+
+#[test]
+fn muse_child_preserves_generation_fencing() {
+    let mut store = store();
+    let parent = muse_producer(&mut store, "muse-session-1");
+    let request = muse_child_request(&parent, "muse-session-1", "wf-run-1", "child-step-1", 1);
+
+    // Stale producer generation rejected:
+    assert_eq!(
+        store
+            .register_native_child(&parent, 2, request.clone(), NOW + 1)
+            .unwrap_err()
+            .code,
+        "stale_generation"
+    );
+
+    // Stale parent generation rejected:
+    let mut stale_parent = request.clone();
+    stale_parent.parent_generation = 2;
+    assert_eq!(
+        store
+            .register_native_child(&parent, 1, stale_parent, NOW + 1)
+            .unwrap_err()
+            .code,
+        "stale_generation"
+    );
+
+    let child_ack = store
+        .register_native_child(&parent, 1, request, NOW + 1)
+        .unwrap()
+        .value;
+    let child_id = child_ack.agent.id;
+
+    // Advance producer generation:
+    store
+        .connection
+        .execute(
+            "UPDATE agents SET generation = 2 WHERE id = ?1",
+            [parse_agent_id(&parent).unwrap()],
+        )
+        .unwrap();
+
+    // Batch with old producer generation 1 is fenced out:
+    let turn_id = muse_child_turn_id("muse-session-1", "wf-run-1", "child-step-1", 1);
+    let turn_batch = batch(
+        &child_id,
+        "muse-turn-fenced",
+        vec![event(
+            "turn.started",
+            "turn-start",
+            json!({"turn_id": &turn_id}),
+        )],
+    );
+    assert_eq!(
+        store
+            .put_native_child_batch(&parent, 1, turn_batch, NOW + 2)
+            .unwrap_err()
+            .code,
+        "stale_generation"
+    );
+}
+
+#[test]
+fn muse_child_unavailable_cleanup_gaps_only_turn_family() {
+    let mut store = store();
+    let parent = muse_producer(&mut store, "muse-session-1");
+    let request = muse_child_request(&parent, "muse-session-1", "wf-run-1", "child-step-1", 1);
+    let child_ack = store
+        .register_native_child(&parent, 1, request, NOW + 1)
+        .unwrap()
+        .value;
+    let child_id = child_ack.agent.id;
+
+    let turn_id = muse_child_turn_id("muse-session-1", "wf-run-1", "child-step-1", 1);
+    store
+        .put_native_child_batch(
+            &parent,
+            1,
+            batch(
+                &child_id,
+                "muse-turn-live",
+                vec![event(
+                    "turn.started",
+                    "turn-start",
+                    json!({"turn_id": &turn_id}),
+                )],
+            ),
+            NOW + 2,
+        )
+        .unwrap();
+
+    let events = store
+        .mark_native_children_unavailable(&parent, 1, "producer disconnected", true, NOW + 3)
+        .unwrap();
+
+    assert_eq!(
+        store
+            .get_turn(&child_id, 1, &turn_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        TurnState::Unknown
+    );
+
+    let gap_event = events
+        .iter()
+        .find(|e| e.kind == "source.gap" && e.agent.as_deref() == Some(child_id.as_str()))
+        .expect("child gap event");
+    assert_eq!(gap_event.data["families"], json!(["turn"]));
+
+    let source = store.read_source_state(&child_id, 1, "stream").unwrap();
+    assert_eq!(source["state"], "closed");
 }

@@ -1,3 +1,6 @@
+#[path = "workflow_child.rs"]
+mod workflow_child;
+
 use eliot_core::{Error, ProviderRestriction, Result, SecretPolicy};
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
@@ -15,6 +18,11 @@ use tokio::{
     time::{Instant, timeout_at},
 };
 
+use self::workflow_child::{
+    MAX_WORKFLOW_CHILDREN, PlannedAction, WorkflowChildKey, WorkflowChildState, binding_from_ack,
+    child_event_id, complete_event_data, is_admission_rejection, is_workflow_item_frame,
+    muse_child_key, register_child, should_bypass_parent_buffer, start_event_data,
+};
 use crate::native::{
     NativeClient, NativeFrame, StreamState,
     requests::{
@@ -28,7 +36,8 @@ use crate::native::{
         NativeSessionViewHealthChangedNotification, NativeTurnCompletedNotification,
         NativeTurnError, NativeTurnStartedNotification, NativeTurnTerminal,
         NativeUserInputAnswerResult, NativeUserInputCancelResult,
-        NativeUserInputSettledNotification, NativeViewHealth,
+        NativeUserInputSettledNotification, NativeViewHealth, NativeWorkflowChild,
+        NativeWorkflowItemNotification,
     },
 };
 
@@ -199,6 +208,17 @@ struct EventProcessor {
     expected_requests: HashSet<String>,
     /// Pulled snapshot entries waiting for a live turn to bind to.
     stashed_entries: Vec<StashedPending>,
+    /// Native scope bound at readiness: workflow-child registration needs the
+    /// exact scope the parent session committed.
+    native_scope: Option<String>,
+    /// Workflow-child tracking by canonical key K. Children outlive the
+    /// parent turn: parent completion never clears this map.
+    workflow_children: HashMap<WorkflowChildKey, WorkflowChildState>,
+    /// Bounded unknown markers for children whose observation was lost
+    /// (overflow, rejected registration, stream end). Repeats stay silent;
+    /// eviction only re-gaps, never re-hides a proven tracked child.
+    workflow_unknown: HashSet<WorkflowChildKey>,
+    workflow_unknown_order: VecDeque<WorkflowChildKey>,
 }
 
 struct StashedPending {
@@ -395,6 +415,10 @@ impl EventProcessor {
             dropped_native_order: VecDeque::new(),
             expected_requests: HashSet::new(),
             stashed_entries: Vec::new(),
+            native_scope: None,
+            workflow_children: HashMap::new(),
+            workflow_unknown: HashSet::new(),
+            workflow_unknown_order: VecDeque::new(),
         }
     }
 
@@ -552,7 +576,15 @@ impl EventProcessor {
                 }
             }
             Some(NativeFrame::Notification { method, params }) => {
-                if self.should_buffer(&method) {
+                // Workflow children ride the parent stream but outlive the
+                // parent turn: route them before active-parent-turn buffering.
+                let bypass_buffer = should_bypass_parent_buffer(
+                    self.status.ready,
+                    self.status.session_id.is_some(),
+                    &method,
+                    &params,
+                );
+                if !bypass_buffer && self.should_buffer(&method) {
                     self.buffer_frame(BufferedNativeFrame::Notification { method, params });
                 } else if let Err(error) = self.process_notification(method, params).await {
                     self.status.source_unknown = true;
@@ -580,6 +612,7 @@ impl EventProcessor {
                 if !self.planned_stop && self.loss_reason.is_none() {
                     self.defer_gap("Muse native event reader closed");
                 }
+                self.settle_workflow_children().await;
                 self.report_gap_if_queue_empty(true).await;
                 self.finish_pending_end_stop().await;
             }
@@ -675,6 +708,7 @@ impl EventProcessor {
             ));
         }
         self.status.session_id = Some(session_id.clone());
+        self.native_scope = Some(native_scope.clone());
         self.flush_buffered_health().await?;
         if self.status.view_unavailable {
             return Err(Error::new(
@@ -753,7 +787,14 @@ impl EventProcessor {
         while let Some(frame) = self.buffer.pop_front() {
             self.buffer_bytes = self.buffer_bytes.saturating_sub(frame.size);
             let should_buffer = match &frame.frame {
-                BufferedNativeFrame::Notification { method, .. } => self.should_buffer(method),
+                BufferedNativeFrame::Notification { method, params } => {
+                    !should_bypass_parent_buffer(
+                        self.status.ready,
+                        self.status.session_id.is_some(),
+                        method,
+                        params,
+                    ) && self.should_buffer(method)
+                }
                 BufferedNativeFrame::Request { .. } => {
                     !self.status.ready || self.status.active_turn_id.is_none()
                 }
@@ -1265,6 +1306,9 @@ impl EventProcessor {
     }
 
     async fn process_notification(&mut self, method: String, params: Value) -> Result<()> {
+        if is_workflow_item_frame(&method, &params) {
+            return self.observe_workflow_item(params).await;
+        }
         match method.as_str() {
             "session/viewHealthChanged" => {
                 let notification: NativeSessionViewHealthChangedNotification =
@@ -1557,6 +1601,8 @@ impl EventProcessor {
             }
         }
         self.expected_requests.clear();
+        // Parent completion keeps child tracking: workflow children outlive
+        // the parent turn and settle on their own terminal revisions.
         Ok(())
     }
 
@@ -1850,6 +1896,398 @@ impl EventProcessor {
         }
     }
 
+    /// Fold one workflow-item revision: every `children[]` entry drives its
+    /// canonical key K independently. One malformed entry gaps the parent
+    /// source; proven siblings still fold.
+    async fn observe_workflow_item(&mut self, params: Value) -> Result<()> {
+        let notification: NativeWorkflowItemNotification =
+            serde_json::from_value(params).map_err(|_| {
+                Error::new(
+                    "native_protocol",
+                    "Muse workflow item did not match the installed schema",
+                )
+            })?;
+        if self.status.session_id.as_deref() != Some(notification.session_id.as_str()) {
+            return self
+                .record_gap("Muse workflow update named another native session")
+                .await;
+        }
+        for child in &notification.item.children {
+            if let Err(error) = self.observe_workflow_child(&notification, child).await {
+                self.status.source_unknown = true;
+                if !self.gap_reported && !self.writes_blocked {
+                    let _ = self
+                        .record_gap("Muse workflow child entry could not be normalized")
+                        .await;
+                }
+                if self.status.failure.is_none() {
+                    self.status.failure = Some(error.message);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Drive one child entry to its plan. Child-scoped failures become child
+    /// gaps; only a malformed binding errors to the parent gap above.
+    async fn observe_workflow_child(
+        &mut self,
+        notification: &NativeWorkflowItemNotification,
+        child: &NativeWorkflowChild,
+    ) -> Result<()> {
+        let key = muse_child_key(
+            &notification.session_id,
+            &notification.item.workflow_run_id,
+            &child.child_id,
+            child.attempt,
+        )?;
+        if self.workflow_unknown.contains(&key) {
+            return Ok(());
+        }
+        if !self.workflow_children.contains_key(&key) {
+            if self.workflow_children.len() >= MAX_WORKFLOW_CHILDREN {
+                // Detailed tracking is full, but this proven child must stay
+                // visible: persist it through one idempotent registration
+                // plus an honest observation-unavailable child gap. No state
+                // retained, no replay, no eviction, no turn facts.
+                self.persist_overflow_child(&key).await;
+                self.remember_workflow_unknown(key);
+                return Ok(());
+            }
+            self.workflow_children
+                .insert(key.clone(), WorkflowChildState::new());
+        }
+        if let Some(state) = self.workflow_children.get_mut(&key) {
+            state.observe_rev(
+                notification.item.revision,
+                &notification.item.status,
+                notification.source_range.clone(),
+            );
+        }
+        loop {
+            let planned = self
+                .workflow_children
+                .get(&key)
+                .map(|state| state.plan(&child.status, child.terminal.as_deref()))
+                .unwrap_or(PlannedAction::Ignore);
+            match planned {
+                PlannedAction::Ignore => return Ok(()),
+                PlannedAction::ChildGap {
+                    reason,
+                    mark_unknown,
+                } => {
+                    let host = self.host.clone();
+                    let credential = self.credential.clone();
+                    let sink = &mut self.sink;
+                    if let Some(state) = self.workflow_children.get_mut(&key) {
+                        let _ = state.record_gap(sink, &host, &credential, reason).await;
+                        if mark_unknown {
+                            state.unknown = true;
+                        }
+                    }
+                    return Ok(());
+                }
+                PlannedAction::Register => {
+                    if !self.register_workflow_child(&key).await {
+                        return Ok(());
+                    }
+                }
+                PlannedAction::Start => {
+                    self.start_workflow_child_turn(&key).await;
+                    return Ok(());
+                }
+                PlannedAction::Complete { status } => {
+                    self.complete_workflow_child_turn(&key, status, notification.item.revision)
+                        .await;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// Persist one proven over-limit child without detailed tracking: a
+    /// single idempotent registration makes the Agent row visible with
+    /// Unknown state, and one child-scoped gap marks turn observation
+    /// unavailable. No turn facts are committed, no state is retained, and
+    /// an uncertain outcome is never replayed — the unknown marker stops
+    /// later revisions, and idempotent re-registration stays safe if the
+    /// bounded marker ever expires. Only registration failure falls back to
+    /// a parent gap, mirroring the tracked-key rejection path.
+    async fn persist_overflow_child(&mut self, key: &WorkflowChildKey) {
+        let Some(native_scope) = self.native_scope.clone() else {
+            let _ = self
+                .record_gap("Muse workflow child registration lacks its native scope")
+                .await;
+            return;
+        };
+        let registration =
+            match key.build_registration(&self.agent_id, self.generation, &native_scope) {
+                Ok(registration) => registration,
+                Err(_) => {
+                    let _ = self
+                        .record_gap("Muse workflow child registration could not be built")
+                        .await;
+                    return;
+                }
+            };
+        let ack = match register_child(&self.host, &self.credential, registration.clone()).await {
+            Ok(ack) => ack,
+            Err(error) if is_admission_rejection(&error) => {
+                let _ = self
+                    .record_gap("Muse workflow child registration was rejected")
+                    .await;
+                return;
+            }
+            Err(_) => {
+                let _ = self
+                    .record_gap("Muse workflow child registration outcome is unknown")
+                    .await;
+                return;
+            }
+        };
+        let mut ephemeral = WorkflowChildState::new();
+        ephemeral.binding = Some(binding_from_ack(registration, &ack));
+        let host = self.host.clone();
+        let credential = self.credential.clone();
+        let sink = &mut self.sink;
+        // Best-effort explicit unavailability: even if this RPC is lost, the
+        // visible Unknown row with no turns stays honest (nothing claimed),
+        // while a parent gap here would misattribute parent-source loss.
+        let _ = ephemeral
+            .record_gap(
+                sink,
+                &host,
+                &credential,
+                "Muse workflow-child observation unavailable: tracking exceeded its bound",
+            )
+            .await;
+    }
+
+    /// Register one workflow child, retrying the retained identical
+    /// registration after a lost ACK. Returns true when the caller should
+    /// re-plan the same revision against the new binding.
+    async fn register_workflow_child(&mut self, key: &WorkflowChildKey) -> bool {
+        let Some(native_scope) = self.native_scope.clone() else {
+            // Readiness always binds the scope before workflow routing; a
+            // missing scope retries on the next revision, never unknowns.
+            let _ = self
+                .record_gap("Muse workflow child registration lacks its native scope")
+                .await;
+            return false;
+        };
+        let retained = self
+            .workflow_children
+            .get(key)
+            .and_then(|state| state.pending_registration.clone());
+        let registration = match retained {
+            Some(registration) => registration,
+            None => match key.build_registration(&self.agent_id, self.generation, &native_scope) {
+                Ok(registration) => registration,
+                Err(_) => {
+                    if let Some(state) = self.workflow_children.get_mut(key) {
+                        state.unknown = true;
+                    }
+                    let _ = self
+                        .record_gap("Muse workflow child registration could not be built")
+                        .await;
+                    return false;
+                }
+            },
+        };
+        if let Some(state) = self.workflow_children.get_mut(key) {
+            state.pending_registration = Some(registration.clone());
+        }
+        match register_child(&self.host, &self.credential, registration.clone()).await {
+            Ok(ack) => {
+                let binding = binding_from_ack(registration, &ack);
+                if let Some(state) = self.workflow_children.get_mut(key) {
+                    state.pending_registration = None;
+                    state.binding = Some(binding);
+                }
+                true
+            }
+            Err(error) if is_admission_rejection(&error) => {
+                if let Some(state) = self.workflow_children.get_mut(key) {
+                    state.pending_registration = None;
+                    state.unknown = true;
+                }
+                let _ = self
+                    .record_gap("Muse workflow child registration was rejected")
+                    .await;
+                false
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Commit the ONE `turn.started` for a registered child. A failed commit
+    /// already recorded its child gap; the key unknowns and stops.
+    async fn start_workflow_child_turn(&mut self, key: &WorkflowChildKey) {
+        let native_id = match child_event_id(key, "turn.started") {
+            Ok(native_id) => native_id,
+            Err(_) => {
+                let host = self.host.clone();
+                let credential = self.credential.clone();
+                let sink = &mut self.sink;
+                if let Some(state) = self.workflow_children.get_mut(key) {
+                    let _ = state
+                        .record_gap(
+                            sink,
+                            &host,
+                            &credential,
+                            "Muse workflow child turn identity exceeded its bound",
+                        )
+                        .await;
+                    state.unknown = true;
+                }
+                return;
+            }
+        };
+        let data = start_event_data(key);
+        let host = self.host.clone();
+        let credential = self.credential.clone();
+        let sink = &mut self.sink;
+        let committed = match self.workflow_children.get_mut(key) {
+            Some(state) => state
+                .commit_event(sink, &host, &credential, "turn.started", native_id, data)
+                .await
+                .is_ok(),
+            None => return,
+        };
+        if let Some(state) = self.workflow_children.get_mut(key) {
+            if committed {
+                state.started = true;
+            } else {
+                state.unknown = true;
+            }
+        }
+    }
+
+    /// Commit the ONE `turn.completed`, starting first when the live states
+    /// were never observed: an explicit terminal proves the turn ran.
+    async fn complete_workflow_child_turn(
+        &mut self,
+        key: &WorkflowChildKey,
+        status: &'static str,
+        revision: i64,
+    ) {
+        if self
+            .workflow_children
+            .get(key)
+            .is_some_and(|state| !state.started)
+        {
+            self.start_workflow_child_turn(key).await;
+            if self
+                .workflow_children
+                .get(key)
+                .is_some_and(|state| !state.started)
+            {
+                return;
+            }
+        }
+        let native_id = match child_event_id(key, "turn.completed") {
+            Ok(native_id) => native_id,
+            Err(_) => {
+                let host = self.host.clone();
+                let credential = self.credential.clone();
+                let sink = &mut self.sink;
+                if let Some(state) = self.workflow_children.get_mut(key) {
+                    let _ = state
+                        .record_gap(
+                            sink,
+                            &host,
+                            &credential,
+                            "Muse workflow child turn identity exceeded its bound",
+                        )
+                        .await;
+                    state.unknown = true;
+                }
+                return;
+            }
+        };
+        let data = complete_event_data(key, status);
+        let host = self.host.clone();
+        let credential = self.credential.clone();
+        let sink = &mut self.sink;
+        let committed = match self.workflow_children.get_mut(key) {
+            Some(state) => state
+                .commit_event(sink, &host, &credential, "turn.completed", native_id, data)
+                .await
+                .is_ok(),
+            None => return,
+        };
+        if let Some(state) = self.workflow_children.get_mut(key) {
+            if committed {
+                state.completed_status = Some(status.to_owned());
+                state.completed_revision = Some(revision);
+            } else {
+                state.unknown = true;
+            }
+        }
+    }
+
+    /// Stream end settles child tracking: completed children keep their
+    /// terminal, open children go unknown — their terminal can never be
+    /// observed now. A pending registration is a parent gap.
+    async fn settle_workflow_children(&mut self) {
+        let open: Vec<WorkflowChildKey> = self
+            .workflow_children
+            .iter()
+            .filter(|entry| entry.1.completed_status.is_none() && !entry.1.unknown)
+            .map(|entry| entry.0.clone())
+            .collect();
+        if open.is_empty() {
+            return;
+        }
+        let mut pending_lost = false;
+        for key in &open {
+            if let Some(state) = self.workflow_children.get_mut(key) {
+                if state.pending_registration.is_some() {
+                    state.pending_registration = None;
+                    pending_lost = true;
+                }
+                state.unknown = true;
+            }
+        }
+        for key in &open {
+            let running = self.workflow_children.get(key).is_some_and(|state| {
+                state.started && state.completed_status.is_none() && state.binding.is_some()
+            });
+            if !running {
+                continue;
+            }
+            let host = self.host.clone();
+            let credential = self.credential.clone();
+            let sink = &mut self.sink;
+            if let Some(state) = self.workflow_children.get_mut(key) {
+                let _ = state
+                    .record_gap(
+                        sink,
+                        &host,
+                        &credential,
+                        "Muse workflow child observation ended before its terminal",
+                    )
+                    .await;
+            }
+        }
+        if pending_lost {
+            let _ = self
+                .record_gap("Muse workflow child registration acknowledgement is unresolved")
+                .await;
+        }
+    }
+
+    fn remember_workflow_unknown(&mut self, key: WorkflowChildKey) {
+        if self.workflow_unknown.insert(key.clone()) {
+            self.workflow_unknown_order.push_back(key);
+            while self.workflow_unknown_order.len() > MAX_WORKFLOW_CHILDREN {
+                if let Some(expired) = self.workflow_unknown_order.pop_front() {
+                    self.workflow_unknown.remove(&expired);
+                }
+            }
+        }
+    }
+
     async fn commit_event(&mut self, kind: &str, native_id: String, data: Value) -> Result<()> {
         self.stream_source()
             .commit_event(kind, native_id, data)
@@ -2028,8 +2466,9 @@ fn pending_native_id(request: &CorePending) -> Option<&str> {
 
 /// Map the MSP terminal to the stored turn status. `cancelled` folds to
 /// `interrupted`, matching the Codex path; an unknown wire terminal settles
-/// nothing and the caller records a gap instead.
-fn turn_status(terminal: &NativeTurnTerminal) -> Option<&'static str> {
+/// nothing and the caller records a gap instead. Shared with the
+/// workflow-child observer: child terminals use this same mapping.
+pub(crate) fn turn_status(terminal: &NativeTurnTerminal) -> Option<&'static str> {
     match terminal {
         NativeTurnTerminal::Completed => Some("completed"),
         NativeTurnTerminal::Failed => Some("failed"),

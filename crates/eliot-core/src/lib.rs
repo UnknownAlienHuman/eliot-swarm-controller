@@ -33,7 +33,10 @@ pub use diagnostics::{
     bound_stderr_diagnostics,
 };
 pub use ids::parse_agent_id;
-pub use native_child::{ChildRegistration, ChildRegistrationAck, NATIVE_CHILD_FAMILIES};
+pub use native_child::{
+    CODEX_NATIVE_CHILD_FAMILIES, ChildRegistration, ChildRegistrationAck,
+    MUSE_NATIVE_CHILD_FAMILIES, NATIVE_CHILD_FAMILIES, native_child_families_for_harness,
+};
 pub use native_store::NativeStoreBinding;
 pub use routing::{
     CapacityScope, ProviderHold, ProviderHoldState, ProviderRestriction, ProviderRestrictionKind,

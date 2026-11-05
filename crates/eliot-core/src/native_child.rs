@@ -6,7 +6,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
-pub const NATIVE_CHILD_FAMILIES: [&str; 3] = ["session", "turn", "message"];
+pub const CODEX_NATIVE_CHILD_FAMILIES: [&str; 3] = ["session", "turn", "message"];
+pub const MUSE_NATIVE_CHILD_FAMILIES: [&str; 1] = ["turn"];
+pub const NATIVE_CHILD_FAMILIES: [&str; 3] = CODEX_NATIVE_CHILD_FAMILIES;
+
+/// Observation stream families currently implemented for each supported native-child harness.
+pub fn native_child_families_for_harness(harness: &str) -> Option<&'static [&'static str]> {
+    match harness {
+        "codex" => Some(&CODEX_NATIVE_CHILD_FAMILIES),
+        "muse" => Some(&MUSE_NATIVE_CHILD_FAMILIES),
+        _ => None,
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(remote = "Self", deny_unknown_fields)]
@@ -83,8 +94,27 @@ impl ChildRegistration {
         Ok(())
     }
 
-    pub fn validate_ack(&self, ack: &ChildRegistrationAck) -> Result<()> {
+    /// Validate the registration acknowledgement against caller-specified
+    /// expected harness and coverage. No silent default harness fallback is allowed.
+    pub fn validate_ack(
+        &self,
+        ack: &ChildRegistrationAck,
+        expected_harness: &str,
+        expected_families: &[&str],
+    ) -> Result<()> {
         self.validate()?;
+        let allowed = native_child_families_for_harness(expected_harness).ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "child acknowledgement named an unsupported harness",
+            )
+        })?;
+        if expected_families != allowed {
+            return Err(Error::new(
+                "source_integrity",
+                "expected coverage does not match the implemented harness coverage",
+            ));
+        }
         let agent = &ack.agent;
         parse_agent_id(&agent.id)?;
         parse_agent_id(&agent.root)?;
@@ -98,10 +128,11 @@ impl ChildRegistration {
             || agent.own_identity
             || agent.control != AgentControl::Slf
             || agent.state != AgentState::Unknown
+            || agent.harness != expected_harness
             || agent.native_scope.as_deref() != Some(self.native_scope.as_str())
             || agent.native_ref.as_deref() != Some(self.native_ref.as_str())
-            || ack.source_plan.len() != NATIVE_CHILD_FAMILIES.len()
-            || NATIVE_CHILD_FAMILIES
+            || ack.source_plan.len() != expected_families.len()
+            || expected_families
                 .iter()
                 .any(|family| ack.source_plan.get(*family).map(String::as_str) != Some("stream"))
         {
@@ -111,5 +142,113 @@ impl ChildRegistration {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_agent(id: &str, harness: &str, reg: &ChildRegistration) -> Agent {
+        let mut agent = Agent::new(
+            id,
+            "proj".to_owned(),
+            harness.to_owned(),
+            "prof".to_owned(),
+            1,
+        );
+        agent.generation = 1;
+        agent.origin = AgentOrigin::Native;
+        agent.observe_only = true;
+        agent.parent = Some(reg.parent_id.clone());
+        agent.root = reg.parent_id.clone();
+        agent.depth = 1;
+        agent.control = AgentControl::Slf;
+        agent.state = AgentState::Unknown;
+        agent.native_scope = Some(reg.native_scope.clone());
+        agent.native_ref = Some(reg.native_ref.clone());
+        agent
+    }
+
+    #[test]
+    fn validate_ack_checks_expected_harness_and_coverage_for_codex() {
+        let reg = ChildRegistration {
+            registration_id: "codex:spawn:1".to_owned(),
+            parent_id: "a1".to_owned(),
+            parent_generation: 1,
+            parent_native_ref: "p-ref".to_owned(),
+            native_scope: "codex:scope".to_owned(),
+            native_ref: "c-ref".to_owned(),
+        };
+        let ack = ChildRegistrationAck {
+            registration_id: reg.registration_id.clone(),
+            agent: test_agent("a2", "codex", &reg),
+            source_plan: BTreeMap::from([
+                ("session".to_owned(), "stream".to_owned()),
+                ("turn".to_owned(), "stream".to_owned()),
+                ("message".to_owned(), "stream".to_owned()),
+            ]),
+        };
+        reg.validate_ack(&ack, "codex", &CODEX_NATIVE_CHILD_FAMILIES)
+            .unwrap();
+
+        // Wrong harness requested:
+        assert_eq!(
+            reg.validate_ack(&ack, "muse", &MUSE_NATIVE_CHILD_FAMILIES)
+                .unwrap_err()
+                .code,
+            "source_integrity"
+        );
+
+        // Producer widening attempt:
+        assert_eq!(
+            reg.validate_ack(&ack, "codex", &["session", "turn", "message", "extra"])
+                .unwrap_err()
+                .code,
+            "source_integrity"
+        );
+    }
+
+    #[test]
+    fn validate_ack_checks_expected_harness_and_coverage_for_muse() {
+        let reg = ChildRegistration {
+            registration_id: "muse:spawn:step-1".to_owned(),
+            parent_id: "a1".to_owned(),
+            parent_generation: 1,
+            parent_native_ref: "sess-1".to_owned(),
+            native_scope: "muse:scope".to_owned(),
+            native_ref: "muse:child:step-1".to_owned(),
+        };
+        let ack = ChildRegistrationAck {
+            registration_id: reg.registration_id.clone(),
+            agent: test_agent("a2", "muse", &reg),
+            source_plan: BTreeMap::from([("turn".to_owned(), "stream".to_owned())]),
+        };
+        reg.validate_ack(&ack, "muse", &MUSE_NATIVE_CHILD_FAMILIES)
+            .unwrap();
+
+        // Codex families rejected for Muse:
+        assert_eq!(
+            reg.validate_ack(&ack, "codex", &CODEX_NATIVE_CHILD_FAMILIES)
+                .unwrap_err()
+                .code,
+            "source_integrity"
+        );
+
+        // Widening coverage for Muse rejected:
+        assert_eq!(
+            reg.validate_ack(&ack, "muse", &["turn", "session"])
+                .unwrap_err()
+                .code,
+            "source_integrity"
+        );
+
+        // Unknown harness rejected:
+        assert_eq!(
+            reg.validate_ack(&ack, "unknown", &["turn"])
+                .unwrap_err()
+                .code,
+            "source_integrity"
+        );
     }
 }

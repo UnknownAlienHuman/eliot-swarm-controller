@@ -2249,7 +2249,8 @@ fn manifest_source_plan(manifest: &PluginManifest, harness: &str) -> Result<Valu
         || verbs.iter().any(|verb| !implemented_verbs.contains(verb))
         || !manifest.child_verbs.is_empty()
         || manifest.features.start_requires_input
-        || (manifest.features.native_children && harness != "codex")
+        || (manifest.features.native_children
+            && eliot_core::native_child_families_for_harness(harness).is_none())
     {
         return Err(unsupported_manifest());
     }

@@ -167,12 +167,20 @@ terminal members instead of failing on them (an all-terminal send applies with n
 children); `stop` still names every member. A plain `stop` affects only its target:
 parent completion or stop never marks children complete and sends nothing to them.
 `stop --tree` is the only stop that names a subtree, as an explicit expansion, not
-a cascade. Native-child observation is implemented for Codex only through the shared
+a cascade. Native-child observation is implemented for Codex (3 families) and Muse
+workflow attempts through the shared
 [`ChildParams`](../../crates/eliot-plugin/src/protocol.rs) and
-[`ChildRegistration`](../../crates/eliot-core/src/native_child.rs) contract; Muse
-native children and child control stay later increments, as do tree forms for mail
-recipients (non-Agent ids stay `invalid`) and watch filters (a tree value matches
-no events today).
+[`ChildRegistration`](../../crates/eliot-core/src/native_child.rs) contract.
+Muse workflow-attempt observation registers an observe-only tokenless
+[`Agent`](../../crates/eliot-core/src/lib.rs) bound to
+$K(\text{parentSession}, \text{workflowRunId}, \text{childId}, \text{attempt})$ with
+generation 1, unknown state, normalized Eliot turn key rather than native MSP turn
+identity, strictly turn-only coverage ([`MUSE_NATIVE_CHILD_FAMILIES`](../../crates/eliot-core/src/native_child.rs)),
+no native MSP turn identity/child principal/control, and private history
+([`agent.history`](../../crates/eliot-daemon/src/router.rs)) returning `unsupported`
+at the owning daemon dispatch boundary. Child control stays a later increment,
+as do tree forms for mail recipients (non-Agent ids stay `invalid`) and watch filters
+(a tree value matches no events today).
 
 ## Prompt guidance
 

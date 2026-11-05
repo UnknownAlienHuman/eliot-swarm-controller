@@ -3,7 +3,10 @@
 //! Agent and source rows remain authoritative for identity and publication.
 
 use super::*;
-use eliot_core::{ChildRegistration, ChildRegistrationAck, NATIVE_CHILD_FAMILIES};
+use eliot_core::{
+    CODEX_NATIVE_CHILD_FAMILIES, ChildRegistration, ChildRegistrationAck,
+    MUSE_NATIVE_CHILD_FAMILIES, native_child_families_for_harness,
+};
 use std::collections::BTreeMap;
 
 impl Store {
@@ -44,6 +47,15 @@ impl Store {
             .map_err(sql_error)?;
         let producer_row = require_producer(&tx, producer, producer_generation)?;
         let parent = require_parent(&tx, &producer_row, &request)?;
+        let families = native_child_families_for_harness(&parent.harness).ok_or_else(|| {
+            Error::new(
+                "not_allowed",
+                format!(
+                    "harness {} does not support native children",
+                    parent.harness
+                ),
+            )
+        })?;
         observer::check_nonsecret(&tx, &request_value)?;
         let producer_num = parse_agent_id(producer)?;
         let parent_num = parse_agent_id(&parent.id)?;
@@ -111,10 +123,11 @@ impl Store {
             "INSERT INTO agents(generation, project, harness, profile, profile_snapshot,
                  native_scope, native_ref, state, origin, observe_only, token,
                  parent, root, depth, control, created_at, updated_at)
-             VALUES (1, ?1, 'codex', ?2, ?3, ?4, ?5, 'unknown', 'native', 1, NULL,
-                 ?6, ?7, ?8, 'self', ?9, ?9)",
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, 'unknown', 'native', 1, NULL,
+                 ?7, ?8, ?9, 'self', ?10, ?10)",
             params![
                 parent.project,
+                parent.harness,
                 parent.profile,
                 encode_json(&parent.profile_snapshot)?,
                 request.native_scope,
@@ -126,18 +139,18 @@ impl Store {
             ],
         ));
         let child_num = tx.last_insert_rowid();
-        install_stream_source_plan(&tx, child_num, 1, &NATIVE_CHILD_FAMILIES, now)?;
+        install_stream_source_plan(&tx, child_num, 1, families, now)?;
         let child = load_agent_by_num(&tx, child_num)?
             .ok_or_else(|| Error::new("internal", "new native child disappeared"))?;
         let ack = ChildRegistrationAck {
             registration_id: request.registration_id.clone(),
             agent: child,
-            source_plan: NATIVE_CHILD_FAMILIES
+            source_plan: families
                 .iter()
                 .map(|family| ((*family).to_owned(), INITIAL_SOURCE.to_owned()))
                 .collect::<BTreeMap<_, _>>(),
         };
-        request.validate_ack(&ack)?;
+        request.validate_ack(&ack, &parent.harness, families)?;
         let ack_json = encode_json(&ack)?;
         if ack_json.len() > MAX_PAGE_BYTES {
             return Err(Error::new(
@@ -229,10 +242,13 @@ impl Store {
                     "native child cleanup producer generation does not exist",
                 ));
             }
-            if current.harness != "codex" {
+            if native_child_families_for_harness(&current.harness).is_none() {
                 return Err(Error::new(
                     "not_allowed",
-                    "native child producer is not Codex",
+                    format!(
+                        "native child producer harness {} is not supported",
+                        current.harness
+                    ),
                 ));
             }
             observer::check_nonsecret(&tx, &json!(reason))?;
@@ -341,7 +357,7 @@ fn mark_one_native_child_unavailable_tx(
     record_child_unavailable_gap_tx(
         tx,
         (producer, producer_generation),
-        (child_num, generation),
+        (child_num, generation, &child.harness),
         reason,
         now,
         events,
@@ -387,13 +403,13 @@ fn mark_one_native_child_unavailable_tx(
 fn record_child_unavailable_gap_tx(
     tx: &Transaction<'_>,
     producer: (&str, i64),
-    child: (i64, i64),
+    child: (i64, i64, &str),
     reason: &str,
     now: i64,
     events: &mut Vec<Event>,
 ) -> Result<()> {
     let (producer, producer_generation) = producer;
-    let (child, generation) = child;
+    let (child, generation, child_harness) = child;
     let state = load_source_state(tx, child, generation, INITIAL_SOURCE)?
         .ok_or_else(|| Error::new("source_integrity", "registered child stream disappeared"))?;
     let gap_id = format!(
@@ -410,7 +426,13 @@ fn record_child_unavailable_gap_tx(
         // reader later becomes confirmed closed, even if its diagnostic changes.
         return Ok(());
     }
-    let mut families = NATIVE_CHILD_FAMILIES;
+    let allowed = native_child_families_for_harness(child_harness).ok_or_else(|| {
+        Error::new(
+            "source_integrity",
+            "native child harness has no observation grant",
+        )
+    })?;
+    let mut families = allowed.to_vec();
     families.sort_unstable();
     let data = json!({
         "gap_id":gap_id, "agent_id":format_agent_id(child), "generation":generation,
@@ -468,7 +490,7 @@ fn require_producer(connection: &Connection, producer: &str, generation: i64) ->
         ));
     }
     observer::require_controlled(&row)?;
-    if row.harness != "codex"
+    if native_child_families_for_harness(&row.harness).is_none()
         || !row.own_identity
         || row.is_terminal()
         || row.native_scope.is_none()
@@ -483,7 +505,7 @@ fn require_producer(connection: &Connection, producer: &str, generation: i64) ->
     {
         return Err(Error::new(
             "not_allowed",
-            "native child requires a live bound Codex producer",
+            "native child requires a live bound producer",
         ));
     }
     Ok(row)
@@ -505,7 +527,8 @@ fn require_parent(
     if parent.native_scope.as_deref() != Some(request.native_scope.as_str())
         || producer.native_scope.as_deref() != Some(request.native_scope.as_str())
         || parent.native_ref.as_deref() != Some(request.parent_native_ref.as_str())
-        || parent.harness != "codex"
+        || parent.harness != producer.harness
+        || native_child_families_for_harness(&parent.harness).is_none()
         || parent.root != producer.root
         || request.native_ref == producer.native_ref.as_deref().unwrap_or_default()
     {
@@ -567,7 +590,7 @@ fn require_child_identity(
         || child.generation != 1
         || child.state != AgentState::Unknown
         || child.control != AgentControl::Slf
-        || child.harness != "codex"
+        || child.harness != parent.harness
         || child.native_scope.as_deref() != Some(request.native_scope.as_str())
         || child.native_ref.as_deref() != Some(request.native_ref.as_str())
         || child.parent.as_deref() != Some(parent.id.as_str())
@@ -608,9 +631,17 @@ pub(super) fn require_grant(
             "native child only publishes its registered stream",
         ));
     }
-    let mut owners = connection.prepare(
-        "SELECT family, source, mechanism FROM source_owners WHERE agent = ?1 AND generation = ?2",
-    ).map_err(sql_error)?;
+    let expected_families = native_child_families_for_harness(&child.harness).ok_or_else(|| {
+        Error::new(
+            "source_integrity",
+            "native child harness has no observation grant",
+        )
+    })?;
+    let mut owners = connection
+        .prepare(
+            "SELECT family, source, mechanism FROM source_owners WHERE agent = ?1 AND generation = ?2",
+        )
+        .map_err(sql_error)?;
     let owners = owners
         .query_map(params![parse_agent_id(&child.id)?, generation], |row| {
             Ok((
@@ -622,9 +653,9 @@ pub(super) fn require_grant(
         .map_err(sql_error)?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(sql_error)?;
-    if owners.len() != NATIVE_CHILD_FAMILIES.len()
+    if owners.len() != expected_families.len()
         || owners.iter().any(|(family, owner, mechanism)| {
-            !NATIVE_CHILD_FAMILIES.contains(&family.as_str())
+            !expected_families.contains(&family.as_str())
                 || owner != INITIAL_SOURCE
                 || mechanism != "stream"
         })
@@ -638,10 +669,10 @@ pub(super) fn require_grant(
 }
 
 pub(super) fn require_families(families: &[String]) -> Result<()> {
-    if families
-        .iter()
-        .any(|family| !NATIVE_CHILD_FAMILIES.contains(&family.as_str()))
-    {
+    if families.iter().any(|family| {
+        !CODEX_NATIVE_CHILD_FAMILIES.contains(&family.as_str())
+            && !MUSE_NATIVE_CHILD_FAMILIES.contains(&family.as_str())
+    }) {
         return Err(Error::new(
             "not_allowed",
             "family is outside the native child observation grant",

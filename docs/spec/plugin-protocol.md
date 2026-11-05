@@ -285,11 +285,17 @@ of the predecessor's `last_store_seq`. For a gap-backed handoff, `0 < gap_seq < 
 significant, and Store sorts it before hashing the canonical operation and forming the
 ACK. Store rechecks the selected harness subset: Fake supports `session`, `turn` and
 `message`; Codex supports those plus `tool` and `request`. Handoff transfer for
-`child`, `goal` and `usage` stays `unsupported`; Codex native-child observation is
+`child`, `goal` and `usage` stays `unsupported`. Native-child observation is
 implemented separately through the shared
 [`ChildParams`](../../crates/eliot-plugin/src/protocol.rs) /
 [`ChildRegistration`](../../crates/eliot-core/src/native_child.rs) contract and its
-[observation grant](../../crates/eliot-store/src/native_children.rs). Daemon-owned
+[observation grant](../../crates/eliot-store/src/native_children.rs): Codex supports
+three observation families (`session`, `turn`, `message`), while Muse workflow-attempt
+observation provides turn-only coverage ([`MUSE_NATIVE_CHILD_FAMILIES`](../../crates/eliot-core/src/native_child.rs))
+for observe-only tokenless agents under normalized Eliot turn keys (no native MSP turn
+identity, child principal, or control), with private history
+([`agent.history`](../../crates/eliot-daemon/src/router.rs)) returning `unsupported`
+at the daemon dispatch boundary. Daemon-owned
 families and reserved `daemon`, `os`, `git` and `workspace_process` sources return
 `not_allowed`. Exactly one
 of `cursor` or `gap` is non-null. A cursor must equal the predecessor's committed
