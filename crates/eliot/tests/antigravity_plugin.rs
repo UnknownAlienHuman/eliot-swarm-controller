@@ -1490,40 +1490,17 @@ fn scenario_exit_with_held_stdout_public_projection() {
     let holder_ready = fixture.root.join("holder-ready");
     let holder_release = fixture.root.join("holder-release");
     let holder_exited = fixture.root.join("holder-exited");
-    let workspace_path = fixture.workspace.clone();
     let _release_holder = ReleaseOnDrop(holder_release.clone());
 
-    fixture.env("ELIOT_FAKE_AGY_SCRIPT", "exit3-held-stdout");
-    fixture.env("ELIOT_FAKE_AGY_REPORT", report.as_os_str());
-    fixture.env("ELIOT_FAKE_AGY_WORKSPACE", workspace_path.as_os_str());
-    fixture.env("ELIOT_FAKE_AGY_EXIT_AFTER_TURN", allow_exit.as_os_str());
-    fixture.env("ELIOT_FAKE_AGY_HOLDER_PID", holder_pid.as_os_str());
-    fixture.env("ELIOT_FAKE_AGY_HOLDER_READY", holder_ready.as_os_str());
-    fixture.env("ELIOT_FAKE_AGY_HOLDER_RELEASE", holder_release.as_os_str());
-    fixture.env("ELIOT_FAKE_AGY_HOLDER_EXITED", holder_exited.as_os_str());
-    fixture.start();
-
-    let executable = std::env::current_exe()
-        .expect("test executable")
-        .to_string_lossy()
-        .into_owned();
-    let config = format!(
-        "[profiles.agy-exit]\nharness = \"antigravity\"\nmodel = \"{MODEL}\"\ncmd = {executable:?}\npass_env = [\"ELIOT_FAKE_AGY_SCRIPT\", \"ELIOT_FAKE_AGY_REPORT\", \"ELIOT_FAKE_AGY_WORKSPACE\", \"ELIOT_FAKE_AGY_EXIT_AFTER_TURN\", \"ELIOT_FAKE_AGY_HOLDER_PID\", \"ELIOT_FAKE_AGY_HOLDER_READY\", \"ELIOT_FAKE_AGY_HOLDER_RELEASE\", \"ELIOT_FAKE_AGY_HOLDER_EXITED\"]\n"
+    let (agent, generation, generation_argument) = setup_held_stdout_public_projection(
+        &mut fixture,
+        &report,
+        &allow_exit,
+        &holder_pid,
+        &holder_ready,
+        &holder_release,
+        &holder_exited,
     );
-    std::fs::write(fixture.data.join("config.toml"), config)
-        .expect("write Antigravity profile into the initialized private fixture");
-
-    let workspace = fixture.workspace.to_string_lossy().into_owned();
-    let launched = fixture.json(&["launch", "--profile", "agy-exit", "--workspace", &workspace]);
-    assert_eq!(launched["state"], "applied");
-    let agent = launched["target"]
-        .as_str()
-        .expect("launched Agent")
-        .to_owned();
-    let generation = launched["generation"]
-        .as_i64()
-        .expect("launched generation");
-    let generation_argument = generation.to_string();
 
     let send_id = ulid::Ulid::new().to_string();
     let prompt = "held stdout public prompt";
@@ -1555,7 +1532,106 @@ fn scenario_exit_with_held_stdout_public_projection() {
     std::fs::write(&allow_exit, "exit").expect("release leader");
 
     let deadline = std::time::Instant::now() + OP_TIMEOUT;
-    let events = loop {
+    let events = wait_for_public_source_loss(
+        &mut fixture,
+        &agent,
+        generation,
+        &generation_argument,
+        turn_id,
+        &holder_pid,
+        deadline,
+    );
+
+    assert_public_source_loss_projection(
+        &mut fixture,
+        &agent,
+        generation,
+        &generation_argument,
+        turn_id,
+        &events,
+    );
+
+    let process_deadline = std::time::Instant::now() + OP_TIMEOUT;
+    wait_for_harness_exit_readback(
+        &mut fixture,
+        &agent,
+        generation,
+        &generation_argument,
+        process_deadline,
+    );
+
+    assert_public_send_replay(
+        &mut fixture,
+        &agent,
+        &generation_argument,
+        &send_id,
+        prompt,
+        &report,
+    );
+    release_holder_and_stop(
+        &mut fixture,
+        &agent,
+        &generation_argument,
+        &holder_pid,
+        &holder_release,
+        &holder_exited,
+    );
+}
+
+fn setup_held_stdout_public_projection(
+    fixture: &mut support::Fixture,
+    report: &Path,
+    allow_exit: &Path,
+    holder_pid: &Path,
+    holder_ready: &Path,
+    holder_release: &Path,
+    holder_exited: &Path,
+) -> (String, i64, String) {
+    let workspace_path = fixture.workspace.clone();
+    fixture.env("ELIOT_FAKE_AGY_SCRIPT", "exit3-held-stdout");
+    fixture.env("ELIOT_FAKE_AGY_REPORT", report.as_os_str());
+    fixture.env("ELIOT_FAKE_AGY_WORKSPACE", workspace_path.as_os_str());
+    fixture.env("ELIOT_FAKE_AGY_EXIT_AFTER_TURN", allow_exit.as_os_str());
+    fixture.env("ELIOT_FAKE_AGY_HOLDER_PID", holder_pid.as_os_str());
+    fixture.env("ELIOT_FAKE_AGY_HOLDER_READY", holder_ready.as_os_str());
+    fixture.env("ELIOT_FAKE_AGY_HOLDER_RELEASE", holder_release.as_os_str());
+    fixture.env("ELIOT_FAKE_AGY_HOLDER_EXITED", holder_exited.as_os_str());
+    fixture.start();
+
+    let executable = std::env::current_exe()
+        .expect("test executable")
+        .to_string_lossy()
+        .into_owned();
+    let config = format!(
+        "[profiles.agy-exit]\nharness = \"antigravity\"\nmodel = \"{MODEL}\"\ncmd = {executable:?}\npass_env = [\"ELIOT_FAKE_AGY_SCRIPT\", \"ELIOT_FAKE_AGY_REPORT\", \"ELIOT_FAKE_AGY_WORKSPACE\", \"ELIOT_FAKE_AGY_EXIT_AFTER_TURN\", \"ELIOT_FAKE_AGY_HOLDER_PID\", \"ELIOT_FAKE_AGY_HOLDER_READY\", \"ELIOT_FAKE_AGY_HOLDER_RELEASE\", \"ELIOT_FAKE_AGY_HOLDER_EXITED\"]\n"
+    );
+    std::fs::write(fixture.data.join("config.toml"), config)
+        .expect("write Antigravity profile into the initialized private fixture");
+
+    let workspace = fixture.workspace.to_string_lossy().into_owned();
+    let launched = fixture.json(&["launch", "--profile", "agy-exit", "--workspace", &workspace]);
+    assert_eq!(launched["state"], "applied");
+    let agent = launched["target"]
+        .as_str()
+        .expect("launched Agent")
+        .to_owned();
+    let generation = launched["generation"]
+        .as_i64()
+        .expect("launched generation");
+    let generation_argument = generation.to_string();
+    (agent, generation, generation_argument)
+}
+
+fn wait_for_public_source_loss(
+    fixture: &mut support::Fixture,
+    agent: &str,
+    generation: i64,
+    generation_argument: &str,
+    turn_id: &str,
+    holder_pid: &Path,
+    deadline: std::time::Instant,
+) -> Vec<Value> {
+    loop {
         let events = fixture.events();
         let has_gap = events.iter().any(|event| {
             event["kind"] == "source.gap"
@@ -1571,141 +1647,170 @@ fn scenario_exit_with_held_stdout_public_projection() {
                 && event["data"]["health"] == "stale"
         });
         if has_gap && has_stale_health {
-            break events;
+            return events;
         }
         if std::time::Instant::now() >= deadline {
-            let show = fixture.json(&["show", &agent]);
-            let source_state = show
-                .get("source_states")
-                .and_then(Value::as_array)
-                .and_then(|sources| {
-                    sources.iter().find(|source| {
-                        source.get("source").and_then(Value::as_str) == Some("stream")
-                    })
-                });
-            let lifecycle = source_state
-                .and_then(|source| source.get("state"))
-                .and_then(Value::as_str)
-                .filter(|state| matches!(*state, "open" | "closed"))
-                .unwrap_or("unknown");
-            let health = source_state
-                .and_then(|source| source.get("health"))
-                .and_then(Value::as_str)
-                .filter(|health| matches!(*health, "ok" | "slow" | "stale" | "error"))
-                .unwrap_or("unknown");
-            let gap = events.iter().rev().find(|event| {
-                event["kind"] == "source.gap"
-                    && event["agent"] == agent
-                    && event["generation"] == generation
-                    && event["data"]["source"] == "stream"
-            });
-            let stale_health = events.iter().rev().find(|event| {
-                event["kind"] == "source.health"
-                    && event["agent"] == agent
-                    && event["generation"] == generation
-                    && event["data"]["source"] == "stream"
-                    && event["data"]["health"] == "stale"
-            });
-            let leader_exit = events.iter().rev().find(|event| {
-                event["kind"] == "process.exited"
-                    && event["agent"] == agent
-                    && event["generation"] == generation
-                    && event["data"]["role"] == "harness"
-                    && harness_exit_code_accepted(&event["data"]["exit_code"])
-            });
-            let event_time = |event: Option<&Value>| {
-                event.map_or(
-                    Value::Null,
-                    |event| json!({"seq": event["seq"], "ts": event["ts"]}),
-                )
-            };
-
-            let processes = fixture.json(&[
-                "processes",
-                &agent,
-                "--generation",
-                &generation_argument,
-                "--limit",
-                "50",
-            ]);
-            let process_rows = processes.get("processes").and_then(Value::as_array);
-            let holder_process_id = std::fs::read_to_string(&holder_pid)
-                .ok()
-                .and_then(|pid| pid.trim().parse::<u32>().ok());
-            let holder_alive = holder_process_id.and_then(|pid| {
-                process_rows
-                    .and_then(|rows| {
-                        rows.iter().find(|process| {
-                            process.get("pid").and_then(Value::as_u64) == Some(u64::from(pid))
-                        })
-                    })
-                    .map(|process| process["state"] == "running")
-            });
-            let plugin_alive = process_rows
-                .and_then(|rows| rows.iter().find(|process| process["role"] == "plugin"))
-                .map(|process| process["state"] == "running");
-            let turn_result = fixture.json(&[
-                "result",
-                &agent,
-                "--generation",
-                &generation_argument,
-                "--limit",
-                "10",
-            ]);
-            let turn_state = turn_result
-                .get("turns")
-                .and_then(Value::as_array)
-                .and_then(|turns| {
-                    turns
-                        .iter()
-                        .find(|turn| turn.get("turn_id").and_then(Value::as_str) == Some(turn_id))
-                })
-                .and_then(|turn| turn.get("state"))
-                .and_then(Value::as_str)
-                .filter(|state| {
-                    matches!(
-                        *state,
-                        "started" | "running" | "completed" | "failed" | "unknown"
-                    )
-                })
-                .unwrap_or("other");
-            let last_event_seq = events
-                .iter()
-                .filter_map(|event| event.get("seq").and_then(Value::as_i64))
-                .max();
-            let snapshot = json!({
-                "harness_leader_exit_seen": leader_exit.is_some(),
-                "holder_alive": holder_alive,
-                "source_gap_seen": gap.is_some(),
-                "stale_health_seen": stale_health.is_some(),
-                "plugin_alive": plugin_alive,
-                "stream_lifecycle": lifecycle,
-                "stream_health": health,
-                "gap_present": source_state.is_some_and(|source| !source["gap_id"].is_null()),
-                "last_store_seq": source_state.and_then(|source| source.get("last_store_seq")),
-                "last_event_seq": last_event_seq,
-                "last_turn_state": turn_state,
-                "events": {
-                    "harness_exit": event_time(leader_exit),
-                    "stream_gap": event_time(gap),
-                    "stream_stale_health": event_time(stale_health),
-                },
-            });
-            panic!("public source-loss projection deadline: {snapshot}");
+            panic_public_source_loss_deadline(
+                fixture,
+                agent,
+                generation,
+                generation_argument,
+                turn_id,
+                holder_pid,
+                &events,
+            );
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn panic_public_source_loss_deadline(
+    fixture: &mut support::Fixture,
+    agent: &str,
+    generation: i64,
+    generation_argument: &str,
+    turn_id: &str,
+    holder_pid: &Path,
+    events: &[Value],
+) -> ! {
+    let show = fixture.json(&["show", agent]);
+    let source_state = show
+        .get("source_states")
+        .and_then(Value::as_array)
+        .and_then(|sources| {
+            sources
+                .iter()
+                .find(|source| source.get("source").and_then(Value::as_str) == Some("stream"))
+        });
+    let lifecycle = source_state
+        .and_then(|source| source.get("state"))
+        .and_then(Value::as_str)
+        .filter(|state| matches!(*state, "open" | "closed"))
+        .unwrap_or("unknown");
+    let health = source_state
+        .and_then(|source| source.get("health"))
+        .and_then(Value::as_str)
+        .filter(|health| matches!(*health, "ok" | "slow" | "stale" | "error"))
+        .unwrap_or("unknown");
+    let gap = events.iter().rev().find(|event| {
+        event["kind"] == "source.gap"
+            && event["agent"] == agent
+            && event["generation"] == generation
+            && event["data"]["source"] == "stream"
+    });
+    let stale_health = events.iter().rev().find(|event| {
+        event["kind"] == "source.health"
+            && event["agent"] == agent
+            && event["generation"] == generation
+            && event["data"]["source"] == "stream"
+            && event["data"]["health"] == "stale"
+    });
+    let leader_exit = events.iter().rev().find(|event| {
+        event["kind"] == "process.exited"
+            && event["agent"] == agent
+            && event["generation"] == generation
+            && event["data"]["role"] == "harness"
+            && harness_exit_code_accepted(&event["data"]["exit_code"])
+    });
+    let event_time = |event: Option<&Value>| {
+        event.map_or(
+            Value::Null,
+            |event| json!({"seq": event["seq"], "ts": event["ts"]}),
+        )
     };
 
-    let view = fixture.json(&["show", &agent]);
+    let processes = fixture.json(&[
+        "processes",
+        agent,
+        "--generation",
+        generation_argument,
+        "--limit",
+        "50",
+    ]);
+    let process_rows = processes.get("processes").and_then(Value::as_array);
+    let holder_process_id = std::fs::read_to_string(holder_pid)
+        .ok()
+        .and_then(|pid| pid.trim().parse::<u32>().ok());
+    let holder_alive = holder_process_id.and_then(|pid| {
+        process_rows
+            .and_then(|rows| {
+                rows.iter().find(|process| {
+                    process.get("pid").and_then(Value::as_u64) == Some(u64::from(pid))
+                })
+            })
+            .map(|process| process["state"] == "running")
+    });
+    let plugin_alive = process_rows
+        .and_then(|rows| rows.iter().find(|process| process["role"] == "plugin"))
+        .map(|process| process["state"] == "running");
+    let turn_result = fixture.json(&[
+        "result",
+        agent,
+        "--generation",
+        generation_argument,
+        "--limit",
+        "10",
+    ]);
+    let turn_state = turn_result
+        .get("turns")
+        .and_then(Value::as_array)
+        .and_then(|turns| {
+            turns
+                .iter()
+                .find(|turn| turn.get("turn_id").and_then(Value::as_str) == Some(turn_id))
+        })
+        .and_then(|turn| turn.get("state"))
+        .and_then(Value::as_str)
+        .filter(|state| {
+            matches!(
+                *state,
+                "started" | "running" | "completed" | "failed" | "unknown"
+            )
+        })
+        .unwrap_or("other");
+    let last_event_seq = events
+        .iter()
+        .filter_map(|event| event.get("seq").and_then(Value::as_i64))
+        .max();
+    let snapshot = json!({
+        "harness_leader_exit_seen": leader_exit.is_some(),
+        "holder_alive": holder_alive,
+        "source_gap_seen": gap.is_some(),
+        "stale_health_seen": stale_health.is_some(),
+        "plugin_alive": plugin_alive,
+        "stream_lifecycle": lifecycle,
+        "stream_health": health,
+        "gap_present": source_state.is_some_and(|source| !source["gap_id"].is_null()),
+        "last_store_seq": source_state.and_then(|source| source.get("last_store_seq")),
+        "last_event_seq": last_event_seq,
+        "last_turn_state": turn_state,
+        "events": {
+            "harness_exit": event_time(leader_exit),
+            "stream_gap": event_time(gap),
+            "stream_stale_health": event_time(stale_health),
+        },
+    });
+    panic!("public source-loss projection deadline: {snapshot}");
+}
+
+fn assert_public_source_loss_projection(
+    fixture: &mut support::Fixture,
+    agent: &str,
+    generation: i64,
+    generation_argument: &str,
+    turn_id: &str,
+    events: &[Value],
+) {
+    let view = fixture.json(&["show", agent]);
     // Agent state remains its last committed busy state; source health exposes the loss.
     assert_eq!(view["state"], "busy");
     assert_eq!(view["observation"]["liveness"]["state"], "busy");
     assert_eq!(view["observation"]["liveness"]["source_healthy"], false);
     let result = fixture.json(&[
         "result",
-        &agent,
+        agent,
         "--generation",
-        &generation_argument,
+        generation_argument,
         "--limit",
         "10",
     ]);
@@ -1730,14 +1835,21 @@ fn scenario_exit_with_held_stdout_public_projection() {
                 Some("session.ended" | "session.lost")
             )
     }));
+}
 
-    let process_deadline = std::time::Instant::now() + OP_TIMEOUT;
+fn wait_for_harness_exit_readback(
+    fixture: &mut support::Fixture,
+    agent: &str,
+    generation: i64,
+    generation_argument: &str,
+    process_deadline: std::time::Instant,
+) {
     loop {
         let processes = fixture.json(&[
             "processes",
-            &agent,
+            agent,
             "--generation",
-            &generation_argument,
+            generation_argument,
             "--limit",
             "50",
         ]);
@@ -1790,31 +1902,49 @@ fn scenario_exit_with_held_stdout_public_projection() {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+}
 
+fn assert_public_send_replay(
+    fixture: &mut support::Fixture,
+    agent: &str,
+    generation_argument: &str,
+    send_id: &str,
+    prompt: &str,
+    report: &Path,
+) {
     // Replaying the same public command id returns the retained applied ACK without a new input.
     let replay = fixture.json(&[
         "--id",
-        &send_id,
+        send_id,
         "send",
-        &agent,
+        agent,
         "--generation",
-        &generation_argument,
+        generation_argument,
         prompt,
     ]);
     assert_eq!(replay["state"], "applied");
-    assert_eq!(fake_report_path(&report)["input_count"], json!(1));
+    assert_eq!(fake_report_path(report)["input_count"], json!(1));
+}
 
+fn release_holder_and_stop(
+    fixture: &mut support::Fixture,
+    agent: &str,
+    generation_argument: &str,
+    holder_pid: &Path,
+    holder_release: &Path,
+    holder_exited: &Path,
+) {
     assert!(
-        std::fs::read_to_string(&holder_pid)
+        std::fs::read_to_string(holder_pid)
             .expect("exact holder pid marker")
             .trim()
             .parse::<u32>()
             .is_ok()
     );
-    std::fs::write(&holder_release, "release").expect("release held stdout child");
-    wait_for_marker(&holder_exited);
+    std::fs::write(holder_release, "release").expect("release held stdout child");
+    wait_for_marker(holder_exited);
 
-    let stopped = fixture.json(&["stop", &agent, "--generation", &generation_argument]);
+    let stopped = fixture.json(&["stop", agent, "--generation", generation_argument]);
     fixture.wait_command(stopped["command_id"].as_str().unwrap(), "applied");
     fixture.stop(false);
 }
