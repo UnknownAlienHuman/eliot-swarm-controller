@@ -1771,7 +1771,7 @@ fn scenario_exit_with_held_stdout_public_projection() {
                 })
                 .collect();
             panic!(
-                "public harness exit readback deadline: total_rows={} harness_count={} harness={} processes_truncated={:?}",
+                "public harness exit readback deadline: total_rows={} harness_count={} harness={:?} processes_truncated={:?}",
                 rows.len(),
                 harness.len(),
                 harness,
