@@ -114,6 +114,18 @@ fn main() {
         )
         .await;
         run_scenario(
+            "late trailing record still rejects with known exit and drain",
+            OwnedChildren::default(),
+            scenario_late_trailing_record_rejects_with_known_drain,
+        )
+        .await;
+        run_scenario(
+            "poisoned drain keeps unknown with the controller retained",
+            OwnedChildren::default(),
+            scenario_poisoned_drain_keeps_unknown_controller,
+        )
+        .await;
+        run_scenario(
             "a logged-out CLI logs in through its own login, then launches",
             OwnedChildren::default(),
             scenario_logged_out_cli_logs_in_then_launches,
@@ -398,8 +410,24 @@ impl FakeClaude {
             stdout.flush().expect("fixture stdout");
             self.write_report();
         }
-        // Stdin EOF: the owner closed input (or died). Mark the exit so the
-        // scenario observes this exact CLI is gone.
+        // Stdin EOF: the owner closed input (graceful terminate) or died.
+        // Late scripts emit their trailing record here, during drain: clean
+        // late proves profile_error with known exit/drain, poisoned proves
+        // true drain uncertainty stays unknown with the controller retained.
+        if self.script == "model-mismatch-late" {
+            self.emit(
+                &mut stdout,
+                json!({
+                    "type": "system",
+                    "subtype": "session_start",
+                    "session_id": self.session_id(),
+                }),
+            );
+            stdout.flush().expect("fixture stdout");
+        } else if self.script == "model-mismatch-poisoned" {
+            writeln!(stdout, "{{invalid-json").expect("fixture stdout");
+            stdout.flush().expect("fixture stdout");
+        }
         self.exit = Some("stdin-eof".to_owned());
         self.write_report();
     }
@@ -538,6 +566,16 @@ impl FakeClaude {
                 },
             }),
         );
+        if matches!(
+            self.script.as_str(),
+            "model-mismatch-late" | "model-mismatch-poisoned"
+        ) {
+            // Late trailing record arrives only after stdin EOF during
+            // graceful terminate+drain, so the close-before-drain race is
+            // deterministic without sleeps: old code drops the queue before
+            // EOF and overflows, fixed code buffers through drain.
+            return;
+        }
         // SessionStart hook lines carry the session id before
         // any input, exactly like the installed CLI. A resumed
         // CLI re-announces the same retained id; the missing
@@ -736,7 +774,10 @@ impl FakeClaude {
     }
 
     fn initialize_response(&self) -> Value {
-        let models = if self.script == "model-mismatch" {
+        let models = if matches!(
+            self.script.as_str(),
+            "model-mismatch" | "model-mismatch-late" | "model-mismatch-poisoned"
+        ) {
             json!([{"value": "other-model", "resolvedModel": "other-model"}])
         } else {
             json!([{"value": MODEL, "resolvedModel": MODEL}])
@@ -1193,6 +1234,7 @@ struct StartConfig {
     profile: Value,
     agent_id: Option<String>,
     generation: i64,
+    command_id: Option<String>,
     resume_from: Value,
     source_state: Value,
     extra_env: Vec<(String, String)>,
@@ -1208,6 +1250,7 @@ impl StartConfig {
             profile,
             agent_id: None,
             generation: 1,
+            command_id: None,
             resume_from: Value::Null,
             source_state: Value::Null,
             extra_env: Vec::new(),
@@ -1267,6 +1310,7 @@ impl Scenario {
             profile,
             agent_id,
             generation,
+            command_id,
             resume_from,
             source_state,
             extra_env,
@@ -1298,7 +1342,7 @@ impl Scenario {
             .await
             .expect("initialize");
         assert_claude_manifest(&manifest);
-        let start_id = ulid::Ulid::new().to_string();
+        let start_id = command_id.unwrap_or_else(|| ulid::Ulid::new().to_string());
         let self_exe = std::env::current_exe().expect("test executable");
         let mut full_profile = profile;
         full_profile["cmd"] = Value::String(self_exe.to_string_lossy().into_owned());
@@ -2689,6 +2733,176 @@ async fn scenario_model_not_in_catalogue_rejected_before_ready(owned: OwnedChild
     scenario.host.shutdown_child().await;
 }
 
+async fn scenario_late_trailing_record_rejects_with_known_drain(owned: OwnedChildren) {
+    // The trailing session_start arrives only after stdin EOF during
+    // graceful terminate+drain: closing the event consumer first would drop
+    // the queue and overflow even with a confirmed child exit (PR284 race).
+    // Fixed order keeps the suppressed consumer alive through drain, so the
+    // start still fails profile_error with known exit/drain and no I/O.
+    let start_command_id = ulid::Ulid::new().to_string();
+    let mut config = StartConfig::fresh("model-mismatch-late", claude_profile());
+    config.expect_ready = false;
+    config.command_id = Some(start_command_id.clone());
+    let (mut scenario, outcome) = Scenario::start_full(config, &owned).await;
+    let error = outcome.expect_err("late trailing record must still fail profile");
+    assert!(error.contains("profile_error"), "{error}");
+    assert!(!error.contains("unknown"), "{error}");
+    assert_eq!(
+        scenario.report()["controls"]
+            .get("initialize")
+            .and_then(Value::as_u64),
+        Some(1),
+        "no second initialize write"
+    );
+    assert_eq!(
+        scenario.report().get("user_inputs").and_then(Value::as_u64),
+        Some(0),
+        "no session input was sent"
+    );
+    scenario.assert_cli_exit("stdin-eof");
+    retry_same_start_expects(
+        &mut scenario,
+        &start_command_id,
+        "model-mismatch-late",
+        "profile_error",
+    )
+    .await;
+    scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect("shutdown");
+    scenario.host.shutdown_child().await;
+}
+
+async fn scenario_poisoned_drain_keeps_unknown_controller(owned: OwnedChildren) {
+    // True drain uncertainty (invalid trailing JSON during graceful drain)
+    // stays unknown with the controller retained, never recoded to the
+    // underlying profile mismatch. Exit is known, drain is not.
+    let start_command_id = ulid::Ulid::new().to_string();
+    let mut config = StartConfig::fresh("model-mismatch-poisoned", claude_profile());
+    config.expect_ready = false;
+    config.command_id = Some(start_command_id.clone());
+    let (mut scenario, outcome) = Scenario::start_full(config, &owned).await;
+    let error = outcome.expect_err("poisoned drain must fail start");
+    assert!(error.contains("unknown"), "{error}");
+    assert!(!error.contains("profile_error"), "{error}");
+    assert!(
+        error.contains("unconfirmed at"),
+        "bounded cleanup stage and cause retained: {error}"
+    );
+    assert_eq!(
+        scenario.report()["controls"]
+            .get("initialize")
+            .and_then(Value::as_u64),
+        Some(1),
+        "no second initialize write"
+    );
+    assert_eq!(
+        scenario.report().get("user_inputs").and_then(Value::as_u64),
+        Some(0),
+        "no session input was sent"
+    );
+    scenario.assert_cli_exit("stdin-eof");
+    retry_same_start_expects(
+        &mut scenario,
+        &start_command_id,
+        "model-mismatch-poisoned",
+        "unknown",
+    )
+    .await;
+    // Genuine drain uncertainty: shutdown must stay unknown, never success.
+    // Contract: terminate_session requires begin/exit/drain/ended all Ok;
+    // here drain is malformed and the event consumer is already closed, so
+    // shutdown reports the exact unknown while the plugin still exits 0
+    // after responding. Failed-start (no controller) would succeed here, so
+    // this unknown also proves the controller is retained.
+    let shutdown_error = scenario
+        .host
+        .call("shutdown", json!({}))
+        .await
+        .expect_err("poisoned shutdown must stay unknown");
+    assert!(shutdown_error.contains("unknown"), "{shutdown_error}");
+    assert!(
+        shutdown_error.contains("Claude process/output drain or session.ended outcome is unknown"),
+        "{shutdown_error}"
+    );
+    assert_eq!(
+        scenario.report()["controls"]
+            .get("initialize")
+            .and_then(Value::as_u64),
+        Some(1),
+        "shutdown performs no new native I/O"
+    );
+    assert_eq!(
+        scenario.report().get("user_inputs").and_then(Value::as_u64),
+        Some(0),
+        "shutdown sends no input"
+    );
+    scenario.assert_cli_exit("stdin-eof");
+    scenario.host.shutdown_child().await;
+}
+
+/// Retry the exact same start ids: the retained outcome replays with no new
+/// native I/O (controls and inputs unchanged, no new CLI spawn).
+async fn retry_same_start_expects(
+    scenario: &mut Scenario,
+    start_command_id: &str,
+    script: &str,
+    expected_code: &str,
+) {
+    let agent_id = scenario.agent_id.clone();
+    let workspace = scenario
+        .root
+        .join("workspace")
+        .to_string_lossy()
+        .into_owned();
+    let report_path = scenario
+        .root
+        .join("report.json")
+        .to_string_lossy()
+        .into_owned();
+    let self_exe = std::env::current_exe().expect("test executable");
+    let mut full_profile = claude_profile();
+    full_profile["cmd"] = Value::String(self_exe.to_string_lossy().into_owned());
+    let outcome = scenario
+        .host
+        .call(
+            "agent.start",
+            json!({
+                "agent_id": agent_id,
+                "generation": 1,
+                "command_id": start_command_id,
+                "profile": full_profile,
+                "workspace": workspace,
+                "target_environment": {
+                    "ELIOT_FAKE_CLAUDE_SCRIPT": script,
+                    "ELIOT_FAKE_CLAUDE_REPORT": report_path,
+                },
+                "note": null,
+                "source_plan": {"session": "stream", "turn": "stream", "message": "stream", "request": "stream"},
+                "source_state": null,
+                "resume_from": null,
+                "initial": null,
+            }),
+        )
+        .await;
+    let error = outcome.expect_err("same-start retry must replay its failure");
+    assert!(error.contains(expected_code), "{error}");
+    assert_eq!(
+        scenario.report()["controls"]
+            .get("initialize")
+            .and_then(Value::as_u64),
+        Some(1),
+        "retry performs no new native I/O"
+    );
+    assert_eq!(
+        scenario.report().get("user_inputs").and_then(Value::as_u64),
+        Some(0),
+        "retry sends no input"
+    );
+}
+
 async fn scenario_session_mismatch_is_unknown_with_gap(owned: OwnedChildren) {
     let mut config = StartConfig::fresh("session-mismatch", claude_profile());
     config.expect_ready = false;
@@ -2779,6 +2993,7 @@ async fn scenario_resume_realigns_drifted_settings_and_sends(owned: OwnedChildre
         profile: claude_profile_with_mode("plan"),
         agent_id: Some(agent_id.clone()),
         generation: 2,
+        command_id: None,
         resume_from: json!({"native_scope": native_scope, "native_ref": native_ref}),
         source_state: resume_source_state(&agent_id),
         extra_env: Vec::new(),
@@ -2863,6 +3078,7 @@ async fn scenario_resume_without_drift_skips_permission_setter(owned: OwnedChild
         profile: claude_profile_with_mode("plan"),
         agent_id: Some(agent_id.clone()),
         generation: 2,
+        command_id: None,
         resume_from: json!({"native_scope": native_scope, "native_ref": native_ref}),
         source_state: resume_source_state(&agent_id),
         extra_env: Vec::new(),
@@ -2899,6 +3115,7 @@ async fn scenario_resume_scope_mismatch_rejected_before_spawn(owned: OwnedChildr
         profile: claude_profile_with_mode("plan"),
         agent_id: Some(agent_id.clone()),
         generation: 2,
+        command_id: None,
         resume_from: json!({
             "native_scope": "claude-config:/elsewhere",
             "native_ref": native_ref,
@@ -2935,6 +3152,7 @@ async fn scenario_permission_mode_quirk_reported(owned: OwnedChildren) {
         profile: claude_profile_with_mode("manual"),
         agent_id: None,
         generation: 1,
+        command_id: None,
         resume_from: Value::Null,
         source_state: Value::Null,
         extra_env: Vec::new(),
@@ -3069,6 +3287,7 @@ async fn scenario_approve_redacts_tool_input_secrets(owned: OwnedChildren) {
         profile: claude_profile(),
         agent_id: None,
         generation: 1,
+        command_id: None,
         resume_from: Value::Null,
         source_state: Value::Null,
         extra_env: vec![("FAKE_CLAUDE_TOKEN".to_owned(), "token-abc-123".to_owned())],
@@ -3515,6 +3734,7 @@ async fn scenario_setter_echo_mismatch_is_unknown(owned: OwnedChildren) {
         profile: claude_profile_with_mode("manual"),
         agent_id: Some(agent_id.clone()),
         generation: 2,
+        command_id: None,
         resume_from: json!({"native_scope": native_scope, "native_ref": native_ref}),
         source_state: resume_source_state(&agent_id),
         extra_env: Vec::new(),
@@ -3559,6 +3779,7 @@ async fn scenario_retained_session_missing_is_unknown(owned: OwnedChildren) {
         profile: claude_profile(),
         agent_id: Some(agent_id.clone()),
         generation: 2,
+        command_id: None,
         resume_from: json!({"native_scope": native_scope, "native_ref": native_ref}),
         source_state: resume_source_state(&agent_id),
         extra_env: Vec::new(),
@@ -3586,6 +3807,7 @@ async fn scenario_stale_generation_resume_rejected_before_spawn(owned: OwnedChil
         profile: claude_profile(),
         agent_id: Some(agent_id.clone()),
         generation: 3,
+        command_id: None,
         resume_from: json!({"native_scope": native_scope, "native_ref": native_ref}),
         source_state: resume_source_state(&agent_id),
         extra_env: Vec::new(),
