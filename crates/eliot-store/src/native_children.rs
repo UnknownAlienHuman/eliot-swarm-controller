@@ -256,8 +256,7 @@ impl Store {
                 mark_one_native_child_unavailable_tx(
                     &tx,
                     (producer, producer_generation),
-                    child_num,
-                    &ack,
+                    (child_num, &ack),
                     reason,
                     reader_closed,
                     now,
@@ -300,8 +299,7 @@ impl Store {
                 mark_one_native_child_unavailable_tx(
                     tx,
                     (&producer, producer_generation),
-                    child_num,
-                    &ack,
+                    (child_num, &ack),
                     "daemon_restart",
                     false,
                     now,
@@ -316,14 +314,14 @@ impl Store {
 fn mark_one_native_child_unavailable_tx(
     tx: &Transaction<'_>,
     producer: (&str, i64),
-    child_num: i64,
-    ack_json: &str,
+    registration: (i64, &str),
     reason: &str,
     reader_closed: bool,
     now: i64,
     events: &mut Vec<Event>,
 ) -> Result<()> {
     let (producer, producer_generation) = producer;
+    let (child_num, ack_json) = registration;
     let ack: ChildRegistrationAck = decode_child_registration_ack(ack_json)?;
     let child = load_agent_by_num(tx, child_num)?
         .ok_or_else(|| Error::new("source_integrity", "registered native child disappeared"))?;

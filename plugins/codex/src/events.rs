@@ -304,6 +304,9 @@ impl ChildThreads {
         if self.confirmed.contains(thread) || self.bound.contains(thread) {
             return Ok(true);
         }
+        if self.unconfirmed.contains_key(thread) {
+            return Ok(true);
+        }
         if !self.has_any_window() {
             return Ok(false);
         }
@@ -445,10 +448,6 @@ impl ChildThreads {
 
     fn is_unconfirmed(&self, thread: &str) -> bool {
         self.unconfirmed.contains_key(thread)
-    }
-
-    fn has_spawn_window(&self) -> bool {
-        self.has_pending()
     }
 
     fn parent_of(&self, thread: &str) -> Option<String> {
@@ -825,6 +824,13 @@ impl EventProcessor {
             .is_none_or(|owned| owned == thread)
         {
             return false;
+        }
+        // A thread already retained as unconfirmed while a spawn window was
+        // open must keep routing to the child after that window closes
+        // (e.g. the root turn completed while A was still active). New
+        // unannounced threads still require an open window below.
+        if self.children.is_unconfirmed(thread) {
+            return true;
         }
         if self.children.is_bound(thread) || self.child_states.contains_key(thread) {
             return true;
@@ -4553,13 +4559,13 @@ mod tests {
         assert_eq!(children.take_frame("child-b"), Ok(true));
         assert_eq!(children.settle("owned"), Ok(()));
         assert!(children.is_unconfirmed("child-b"));
-        assert!(children.has_spawn_window());
+        assert!(children.has_pending());
         assert_eq!(
             children.spawn_completed("child-a", "owned", "call-nested", &["child-b".to_owned()]),
             Ok(())
         );
         assert!(children.is_bound("child-b"));
-        assert!(!children.has_spawn_window());
+        assert!(!children.has_pending());
     }
 
     #[tokio::test]
@@ -4689,5 +4695,193 @@ mod tests {
             .children
             .spawn_started("a", "call-b".to_owned())
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn retained_unconfirmed_b_survives_root_completion_through_handle_frame() {
+        use eliot_plugin::RpcRequest;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, split};
+
+        let (_native, mut processor, host_io, peer_task) = connected_child_processor("a1").await;
+        processor.status.thread_id = Some("root".to_owned());
+        processor.native_scope = "codex:test".to_owned();
+        // A is bound and actively tracked; B was retained unconfirmed under
+        // A's nested window, which is still open here.
+        processor.children.confirm("root", "a").unwrap();
+        processor
+            .children
+            .parents
+            .insert("a".to_owned(), "root".to_owned());
+        processor
+            .children
+            .spawn_items
+            .insert("a".to_owned(), "call-a".to_owned());
+        processor
+            .children
+            .spawn_started("a", "call-b".to_owned())
+            .unwrap();
+        assert_eq!(processor.children.take_frame("b"), Ok(true));
+        assert!(processor.children.is_unconfirmed("b"));
+        let reg_a = build_registration("call-a", "a1", 1, "root", "codex:test", "a");
+        let mut state_a = ChildState::new(ChildBinding {
+            registration: reg_a,
+            agent_id: "a2".to_owned(),
+            agent_generation: 1,
+            native_ref: "a".to_owned(),
+        });
+        state_a.ready_committed = true;
+        state_a.active_turn_id = Some("turn-a".to_owned());
+        processor.child_states.insert("a".to_owned(), state_a);
+        // Root completes via the pump's own entry point. No parent turn is
+        // running, so the parent is idle; the settle removes root's last
+        // named window while B stays retained by A's open window.
+        processor
+            .handle_frame(Some(NativeFrame::Notification {
+                method: "turn/completed".to_owned(),
+                params: json!({
+                    "threadId": "root",
+                    "turn": {"id": "turn-r", "items": [], "status": "completed"}
+                }),
+            }))
+            .await;
+        assert_eq!(processor.status.active_turn_id, None);
+        assert!(
+            !processor.children.producers().contains(&"root".to_owned()),
+            "root named window must be settled"
+        );
+        assert!(processor.children.is_unconfirmed("b"));
+        // B's terminal arrives while the parent is idle. It must route to
+        // the child buffer, never the parent early-event queue.
+        processor
+            .handle_frame(Some(NativeFrame::Notification {
+                method: "turn/completed".to_owned(),
+                params: json!({
+                    "threadId": "b",
+                    "turn": {"id": "turn-b", "items": [], "status": "completed"}
+                }),
+            }))
+            .await;
+        assert!(
+            processor.buffer.is_empty(),
+            "B terminal stranded in parent buffer: {:?}",
+            processor.buffer.len()
+        );
+        assert_eq!(
+            processor.child_buffers.get("b").map(|queue| queue.len()),
+            Some(1),
+            "B terminal must be retained in the child buffer"
+        );
+        // A's spawn result names B; confirm + register only after the result.
+        assert_eq!(
+            processor
+                .children
+                .spawn_completed("a", "root", "call-b", &["b".to_owned()]),
+            Ok(())
+        );
+        assert!(processor.children.is_bound("b"));
+        assert!(!processor.children.is_unconfirmed("b"));
+        // Drive the fake host for registration + session.ready + flushed
+        // B terminal. No parent turn is started afterwards.
+        let (host_read, mut host_write) = split(host_io);
+        let mut host_reader = BufReader::new(host_read);
+        let mut recorded_rpc = Vec::new();
+        let reg_b = build_registration("call-b", "a2", 1, "a", "codex:test", "b");
+        let fake_host = async {
+            let mut line = String::new();
+            line.clear();
+            host_reader
+                .read_line(&mut line)
+                .await
+                .expect("read B registration");
+            let req: RpcRequest = serde_json::from_str(&line).expect("decode registration");
+            recorded_rpc.push((req.method.clone(), req.params.clone()));
+            assert_eq!(req.method, "child");
+            let reg_b_sent = &req.params["registration"];
+            assert_eq!(reg_b_sent["native_ref"], "b");
+            assert_eq!(reg_b_sent["parent_native_ref"], "a");
+            assert_eq!(reg_b_sent["parent_id"], "a2");
+            let ack = crate::native_child::tests::test_ack(&reg_b);
+            let ack_reply = json!({
+                "jsonrpc": "2.0", "id": req.id, "result": ack
+            });
+            host_write
+                .write_all(format!("{ack_reply}\n").as_bytes())
+                .await
+                .expect("send B ack");
+            for expected in ["session.ready", "turn.completed"] {
+                line.clear();
+                host_reader
+                    .read_line(&mut line)
+                    .await
+                    .expect("read B commit");
+                let commit: RpcRequest = serde_json::from_str(&line).expect("decode commit");
+                recorded_rpc.push((commit.method.clone(), commit.params.clone()));
+                assert_eq!(commit.method, "events.put");
+                assert_eq!(
+                    commit.params["events"][0]["kind"], expected,
+                    "B terminal must land as a child fact"
+                );
+                let ack = json!({
+                    "jsonrpc": "2.0",
+                    "id": commit.id,
+                    "result": {"first_seq": 1, "last_seq": 1, "cursor": null}
+                });
+                host_write
+                    .write_all(format!("{ack}\n").as_bytes())
+                    .await
+                    .expect("send B commit ack");
+            }
+            drop(host_write);
+            drop(host_reader);
+            recorded_rpc
+        };
+        // The thread/started frame (the pump's own entry) drives identity
+        // confirmation and registration; the retained terminal then flushes.
+        // No parent turn is started afterwards.
+        let driver = async {
+            processor
+                .handle_frame(Some(NativeFrame::Notification {
+                    method: "thread/started".to_owned(),
+                    params: json!({
+                        "thread": {
+                            "id": "b",
+                            "source": {"subAgent": {"thread_spawn": {
+                                "parent_thread_id": "a", "depth": 1
+                            }}}
+                        }
+                    }),
+                }))
+                .await;
+        };
+        let recorded = tokio::join!(fake_host, driver).0;
+        peer_task.await.expect("peer task clean shutdown");
+        assert_eq!(recorded.len(), 3);
+        assert!(
+            recorded
+                .iter()
+                .all(|(method, _)| method == "child" || method == "events.put"),
+            "no parent facts expected: {recorded:?}"
+        );
+        let state = processor
+            .child_states
+            .get("b")
+            .expect("B must be fully registered");
+        assert!(state.ready_committed);
+        assert_eq!(state.active_turn_id, None, "B turn must be fully completed");
+        assert!(
+            processor.buffer.is_empty(),
+            "no B terminal may be stranded in the parent buffer at end"
+        );
+        assert!(
+            processor
+                .child_buffers
+                .get("b")
+                .is_none_or(|queue| queue.is_empty()),
+            "child buffer must be drained after flush"
+        );
+        assert!(
+            !processor.child_early_lost.contains("b"),
+            "no early-loss gap must be recorded for retained B"
+        );
     }
 }
